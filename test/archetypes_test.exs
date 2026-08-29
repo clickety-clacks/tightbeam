@@ -246,7 +246,7 @@ defmodule Tightbeam.ArchetypesTest do
              end)
 
     assert retirement_gate.pattern ==
-             "(tool_input[^:]*:[^:]*command[^:]*:[^[:alnum:]_./-]*|[;&|][[:space:]]*)([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$)"
+             "(tool_input[^:]*:[^:]*command[^:]*:[^[:alnum:]_./-]*|[;&|][[:space:]]*|\\\\n[[:space:]]*)((then|do|else|elif)[[:space:]]+)?([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$)"
 
     %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings()
 
@@ -273,7 +273,9 @@ defmodule Tightbeam.ArchetypesTest do
 
     for relative_command <- [
           "./tightbeam retire --session child",
-          "bin/tightbeam retire --session child"
+          "bin/tightbeam retire --session child",
+          "tightbeam list\\ntightbeam retire --session child",
+          "if true; then tightbeam retire --session child; fi"
         ] do
       relative_call =
         ~s({"tool_name":"Bash","tool_input":{"command":"#{relative_command}"}})
