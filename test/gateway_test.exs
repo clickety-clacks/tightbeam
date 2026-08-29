@@ -4259,6 +4259,32 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert Org.get_setting(ctx.db, "default-archetype") == "coder"
+
+    assert %{setting: "default-priority", value: 4} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "get", setting: "default-priority"}
+             })
+
+    assert %{code: "invalid_priority"} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-priority", value: 9}
+             })
+
+    assert %{code: "forbidden", message: "admin required"} =
+             config.(%{
+               origin: "user:not-admin",
+               params: %{action: "set", setting: "default-priority", value: 6}
+             })
+
+    assert %{setting: "default-priority", value: 6, changed: true} =
+             config.(%{
+               origin: "user:flynn",
+               params: %{action: "set", setting: "default-priority", value: 6}
+             })
+
+    assert Org.get_setting(ctx.db, "default-priority") == "6"
   end
 
   test "spawn readiness denial creates no session, role, or idempotency row", ctx do
