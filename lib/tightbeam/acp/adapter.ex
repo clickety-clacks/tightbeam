@@ -53,6 +53,7 @@ defmodule Tightbeam.Acp.Adapter do
     :cwd,
     :stderr_path,
     :on_auth_event,
+    :on_usage_event,
     :on_subagent_event,
     stderr_offset: 0,
     chunks: %{},
@@ -163,6 +164,10 @@ defmodule Tightbeam.Acp.Adapter do
   @doc "Queue a close request without blocking the caller behind an in-progress boot."
   @spec request_close(adapter()) :: :ok
   def request_close(adapter), do: GenServer.cast(adapter, :close)
+
+  @doc false
+  def request_codex_usage(adapter, claim),
+    do: GenServer.cast(adapter, {:request_codex_usage, claim})
 
   # An adapter that cannot BOOT dies in handle_continue, so the turn's first
   # call exits carrying only the death reason — that is how an actionable spawn
@@ -387,6 +392,7 @@ defmodule Tightbeam.Acp.Adapter do
       stderr_path: stderr_path,
       stderr_offset: offset,
       on_auth_event: Keyword.get(opts, :on_auth_event),
+      on_usage_event: Keyword.get(opts, :on_usage_event),
       on_subagent_event: Keyword.get(opts, :on_subagent_event)
     }
 
@@ -824,6 +830,25 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
+  def handle_cast({:request_codex_usage, claim}, state) do
+    adapter = self()
+    conn = state.conn
+    handler = state.on_usage_event
+
+    if Harness.usage_capture?(state.harness) and is_function(handler, 1) do
+      Task.start(fn ->
+        result =
+          conn
+          |> Conn.request(Tightbeam.CodexUsage.read_method(), %{})
+          |> Tightbeam.CodexUsage.map_read_result(System.system_time(:millisecond))
+
+        handler.({:adapter_event, adapter, {:full, claim, result}})
+      end)
+    end
+
+    {:noreply, state}
+  end
+
   def handle_cast(:close, state) do
     if state.conn, do: Conn.close(state.conn)
     {:stop, :normal, state}
@@ -920,6 +945,7 @@ defmodule Tightbeam.Acp.Adapter do
     sid = params["sessionId"]
     update = params["update"] || %{}
     maybe_emit_account_update(state, update)
+    maybe_emit_usage_update(state, update)
     state = maybe_emit_subagent_event(state, sid, update)
     state = emit_progress(state, sid, update)
     state = remember_config_model(state, sid, update)
@@ -1069,10 +1095,27 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp emit_auth_classification(state, event) do
-    with classification when classification != :unknown <-
-           Harness.module!(state.harness).classify_auth_event(event),
-         handler when is_function(handler, 2) <- state.on_auth_event do
-      handler.(classification, event)
+    classification = Harness.module!(state.harness).classify_auth_event(event)
+
+    if classification != :unknown do
+      with handler when is_function(handler, 1) <- state.on_usage_event do
+        handler.({:adapter_event, self(), {:auth, classification}})
+      end
+
+      with handler when is_function(handler, 2) <- state.on_auth_event do
+        handler.(classification, event)
+      end
+    end
+  end
+
+  defp maybe_emit_usage_update(state, update) do
+    module = Harness.module!(state.harness)
+
+    with handler when is_function(handler, 1) <- state.on_usage_event,
+         true <- Harness.usage_capture?(module),
+         raw when is_map(raw) <- module.usage_update(update) do
+      sparse = Tightbeam.CodexUsage.normalize_sparse(raw)
+      handler.({:adapter_event, self(), {:sparse, sparse, System.system_time(:millisecond)}})
     end
   end
 

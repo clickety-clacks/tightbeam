@@ -78,6 +78,26 @@ defmodule Tightbeam.Harness.Codex do
       "      case \"account/updated\":\n        return this.createCodexSessionInfoUpdate({ accountUpdated: notification.params });\n      case \"fs/changed\":"
     },
     {
+      "      case \"account/rateLimits/updated\":\n        this.handleRateLimitsUpdated(notification.params);\n        return null;",
+      "      case \"account/rateLimits/updated\":\n        this.handleRateLimitsUpdated(notification.params);\n        return this.createCodexSessionInfoUpdate({ rateLimitsUpdated: notification.params });"
+    },
+    {
+      "var GOAL_CONTROL_METHOD = \"_codex/session/goal_control\";\nfunction isExtMethodRequest(request) {\n  return request.method === \"authentication/status\" || request.method === \"authentication/logout\" || request.method === LEGACY_SET_SESSION_MODEL_METHOD || request.method === GOAL_CONTROL_METHOD;\n}",
+      "var GOAL_CONTROL_METHOD = \"_codex/session/goal_control\";\nvar RATE_LIMITS_READ_METHOD = \"_codex/account/rate_limits/read\";\nfunction isExtMethodRequest(request) {\n  return request.method === \"authentication/status\" || request.method === \"authentication/logout\" || request.method === LEGACY_SET_SESSION_MODEL_METHOD || request.method === GOAL_CONTROL_METHOD || request.method === RATE_LIMITS_READ_METHOD;\n}"
+    },
+    {
+      "  async accountRead(params) {\n    return await this.sendRequest({ method: \"account/read\", params });\n  }",
+      "  async accountRead(params) {\n    return await this.sendRequest({ method: \"account/read\", params });\n  }\n  async accountRateLimitsRead() {\n    return await this.sendRequest({ method: \"account/rateLimits/read\", params: void 0 });\n  }"
+    },
+    {
+      "      case GOAL_CONTROL_METHOD: {",
+      "      case RATE_LIMITS_READ_METHOD:\n        return await this.runWithProcessCheck(() => this.codexAcpClient.codexClient.accountRateLimitsRead());\n      case GOAL_CONTROL_METHOD: {"
+    },
+    {
+      ".onRequest(GOAL_CONTROL_METHOD, goalControlParamsParser, (ctx) => getAgent().extMethod(GOAL_CONTROL_METHOD, ctx.params)).connect(acpJsonStream);",
+      ".onRequest(GOAL_CONTROL_METHOD, goalControlParamsParser, (ctx) => getAgent().extMethod(GOAL_CONTROL_METHOD, ctx.params)).onRequest(RATE_LIMITS_READ_METHOD, emptyExtensionParamsParser, (ctx) => getAgent().extMethod(RATE_LIMITS_READ_METHOD, ctx.params)).connect(acpJsonStream);"
+    },
+    {
       "  activeSubAgentActivities = /* @__PURE__ */ new Set();\n",
       "  activeSubAgentActivities = /* @__PURE__ */ new Set();\n  subAgentActivityCallIds = /* @__PURE__ */ new Map();\n"
     },
@@ -114,6 +134,18 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def credential_env_vars, do: []
+
+  @impl true
+  def usage_snapshot(raw) do
+    case get_in(raw, ["rateLimitsByLimitId", wire_name()]) do
+      value when is_map(value) -> value
+      _ -> Map.get(raw, "rateLimits", %{})
+    end
+  end
+
+  @impl true
+  def usage_update(update),
+    do: get_in(update, ["_meta", wire_name(), "rateLimitsUpdated"])
 
   @impl true
   def default_model, do: Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")

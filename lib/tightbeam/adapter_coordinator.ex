@@ -177,6 +177,7 @@ defmodule Tightbeam.AdapterCoordinator do
        adapter_sup: Keyword.fetch!(opts, :adapter_sup),
        adapter_context: Keyword.fetch!(opts, :adapter_context),
        adapter_opts: Keyword.fetch!(opts, :adapter_opts),
+       codex_usage: Keyword.get(opts, :codex_usage, Tightbeam.CodexUsage),
        db: db,
        park_grace_ms: Keyword.get(opts, :park_grace_ms, 10_000),
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
@@ -506,6 +507,7 @@ defmodule Tightbeam.AdapterCoordinator do
   defp retire_adapter(key, state) do
     case state.adapters[key] do
       %{pid: pid, monitor: monitor} = entry ->
+        notify_usage_down(state, key, pid)
         if is_reference(monitor), do: Process.demonitor(monitor, [:flush])
         if is_pid(pid) and Process.alive?(pid), do: Process.exit(pid, :kill)
 
@@ -528,7 +530,7 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   @impl true
-  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+  def handle_info({:DOWN, ref, :process, pid, reason}, state) do
     context_request = context_request_for_monitor(state.context_requests, ref)
 
     cond do
@@ -541,6 +543,7 @@ defmodule Tightbeam.AdapterCoordinator do
          finish_context_request(request, {:error, {:context_worker_exit, reason}}, state)}
 
       key = state.monitors[ref] ->
+        notify_usage_down(state, key, pid)
         # Was the instance that just died a WORKING engine? Asked of the ref, so
         # the answer survives a replacement having already taken the entry over.
         was_ready? = MapSet.member?(state.ready_refs, ref)
@@ -623,6 +626,14 @@ defmodule Tightbeam.AdapterCoordinator do
       %{pid: ^pid} = entry when is_pid(pid) ->
         entry = %{entry | failures: 0, circuit: :closed, ready: true, last_failure: nil}
         state = %{state | ready_refs: put_ready_ref(state.ready_refs, entry.monitor)}
+
+        Tightbeam.CodexUsage.adapter_ready(
+          state.codex_usage,
+          key,
+          pid,
+          entry.context[:credential_kind]
+        )
+
         {:noreply, %{state | adapters: Map.put(state.adapters, key, entry)}}
 
       # A ready message from an instance this entry no longer points at. It
@@ -758,6 +769,11 @@ defmodule Tightbeam.AdapterCoordinator do
         {{:error, :degraded}, %{state | adapters: Map.put(state.adapters, key, entry)}}
     end
   end
+
+  defp notify_usage_down(state, key, pid) when is_pid(pid),
+    do: Tightbeam.CodexUsage.adapter_down(state.codex_usage, key, pid)
+
+  defp notify_usage_down(_state, _key, _pid), do: :ok
 
   defp fresh_entry do
     %{

@@ -5893,6 +5893,18 @@ defmodule Tightbeam.GatewayTest do
         model: Model.new("claude-sonnet-5", effort: "medium")
       })
 
+      Org.create(ctx.db, %{
+        session_key: "k-codex-kind",
+        display_name: "Codex Kind",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "kindhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
       %{cred_base: base}
     end
 
@@ -5917,16 +5929,28 @@ defmodule Tightbeam.GatewayTest do
       :ok = Credentials.finish_onboard(:anthropic, kind, lease_id, server)
     end
 
+    defp bank_openai!(base, kind) do
+      server = owner!(base)
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:openai, server)
+      File.write!(Path.join(staging, "auth.json"), ~S({"token":"test"}))
+      :ok = Credentials.finish_onboard(:openai, kind, lease_id, server)
+      server
+    end
+
     test "an API-key host reports apiKey", ctx do
       bank!(ctx.cred_base, :api_key)
 
-      assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
+      display = Gateway.session_status("k-kind", ctx.db).display
+      assert display.credentialKind == "apiKey"
+      assert display.authMode == "api_key"
     end
 
     test "a subscription host reports subscription", ctx do
       bank!(ctx.cred_base, :subscription)
 
-      assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "subscription"
+      display = Gateway.session_status("k-kind", ctx.db).display
+      assert display.credentialKind == "subscription"
+      assert display.authMode == "oauth"
     end
 
     test "a host with no credential reports its own state, not a missing field", ctx do
@@ -5938,6 +5962,7 @@ defmodule Tightbeam.GatewayTest do
       # "no credential here" from a decoder change.
       assert Map.has_key?(display, :credentialKind)
       assert display.credentialKind == "none"
+      assert display.authMode == nil
     end
 
     test "an unreadable credential store refuses status instead of reporting none", ctx do
@@ -5965,6 +5990,43 @@ defmodule Tightbeam.GatewayTest do
 
       # The session row was never touched between the two reads.
       assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
+    end
+
+    test "a Codex subscription exposes an OAuth-scoped unavailable projection", ctx do
+      start_supervised!({Tightbeam.CodexUsage, name: Tightbeam.CodexUsage})
+      bank_openai!(ctx.cred_base, :subscription)
+
+      status = Gateway.session_status("k-codex-kind", ctx.db)
+
+      assert status.display.authMode == "oauth"
+
+      assert status.display.codexUsage == %{
+               freshness: "unavailable",
+               windows: [],
+               unavailableReason: "provider_unavailable"
+             }
+
+      assert is_binary(status.metadataContextGeneration)
+    end
+
+    test "Codex API-key bindings omit usage", ctx do
+      start_supervised!({Tightbeam.CodexUsage, name: Tightbeam.CodexUsage})
+      bank_openai!(ctx.cred_base, :api_key)
+
+      api_key = Gateway.session_status("k-codex-kind", ctx.db)
+      assert api_key.display.authMode == "api_key"
+      refute Map.has_key?(api_key.display, :codexUsage)
+      refute Map.has_key?(api_key, :metadataContextGeneration)
+    end
+
+    test "absent Codex bindings omit usage", ctx do
+      start_supervised!({Tightbeam.CodexUsage, name: Tightbeam.CodexUsage})
+      owner!(ctx.cred_base)
+
+      absent = Gateway.session_status("k-codex-kind", ctx.db)
+      assert absent.display.authMode == nil
+      refute Map.has_key?(absent.display, :codexUsage)
+      refute Map.has_key?(absent, :metadataContextGeneration)
     end
   end
 
