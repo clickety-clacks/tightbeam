@@ -1635,7 +1635,7 @@ mod tests {
         assert!(matches!(
             validate_host_identity_file(
                 true,
-                libc::S_IFREG | 0o400,
+                u32::from(libc::S_IFREG) | 0o400,
                 1,
                 0,
                 Path::new("/etc/tightbeam/deploy-host-id"),
@@ -1647,11 +1647,21 @@ mod tests {
     #[test]
     fn host_identity_policy_rejects_unsafe_ancestors() {
         assert!(matches!(
-            validate_host_identity_ancestor_values(1, libc::S_IFDIR | 0o755, 0, Path::new("/etc")),
+            validate_host_identity_ancestor_values(
+                1,
+                u32::from(libc::S_IFDIR) | 0o755,
+                0,
+                Path::new("/etc"),
+            ),
             Err(FsError::InvalidPointer(reason)) if reason.contains("root-owned")
         ));
         assert!(matches!(
-            validate_host_identity_ancestor_values(0, libc::S_IFDIR | 0o775, 0, Path::new("/etc")),
+            validate_host_identity_ancestor_values(
+                0,
+                u32::from(libc::S_IFDIR) | 0o775,
+                0,
+                Path::new("/etc"),
+            ),
             Err(FsError::InvalidPointer(reason)) if reason.contains("not group/world writable")
         ));
     }
