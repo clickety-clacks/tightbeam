@@ -480,26 +480,31 @@ defmodule FeatureSmoke do
   defp with_home_evidence!(base_dir, fun, ops) do
     path = Path.join(base_dir, @home_evidence_name)
 
-    case ops.open_evidence.(path) do
-      {:ok, io} ->
-        created? =
-          ops.chmod.(path, 0o600) == :ok and
-            match?(
-              {:ok, info}
-              when file_info(info, :type) == :regular and
-                     Bitwise.band(file_info(info, :mode), 0o7777) == 0o600,
-              ops.lstat.(path)
-            )
+    case ops.create_evidence.(path) do
+      :ok ->
+        case ops.open_evidence.(path) do
+          {:ok, io} ->
+            created? =
+              match?(
+                {:ok, info}
+                when file_info(info, :type) == :regular and
+                       Bitwise.band(file_info(info, :mode), 0o7777) == 0o600,
+                ops.lstat.(path)
+              )
 
-        if created? do
-          try do
-            fun.(%{io: io, sequence: 1, phase_index: 0, ops: ops})
-          after
-            ops.close.(io)
-          end
-        else
-          ops.close.(io)
-          emit_evidence_refusal!(ops, "all", "run-start", "run-start")
+            if created? do
+              try do
+                fun.(%{io: io, sequence: 1, phase_index: 0, ops: ops})
+              after
+                ops.close.(io)
+              end
+            else
+              ops.close.(io)
+              emit_evidence_refusal!(ops, "all", "run-start", "run-start")
+            end
+
+          {:error, _reason} ->
+            emit_evidence_refusal!(ops, "all", "run-start", "run-start")
         end
 
       {:error, _reason} ->
@@ -1006,6 +1011,7 @@ defmodule FeatureSmoke do
 
       if file_info(info, :type) == :regular and
            Bitwise.band(file_info(info, :mode), 0o7777) == 0o600 and
+           count_case({:created_mode, 0o600}) == 1 and
            length(lines) == 7 and String.ends_with?(bytes, "\n") and
            count_case(:write) == 7 and count_case(:sync) == 7 and
            Enum.map(records, & &1["sequence"]) == Enum.to_list(1..7) and
@@ -1036,9 +1042,21 @@ defmodule FeatureSmoke do
     with_case_dir(fn root ->
       path = Path.join(root, @home_evidence_name)
       reset_case_trace!()
+      default_ops = home_ops()
 
       ops =
         home_ops(%{
+          create_evidence: fn path ->
+            case default_ops.create_evidence.(path) do
+              :ok ->
+                {:ok, info} = :file.read_link_info(path)
+                trace_case({:created_mode, Bitwise.band(file_info(info, :mode), 0o7777)})
+                :ok
+
+              error ->
+                error
+            end
+          end,
           write: fn io, data ->
             trace_case(:write)
             :file.write(io, data)
@@ -1551,17 +1569,24 @@ defmodule FeatureSmoke do
     root =
       Path.join(System.tmp_dir!(), "tightbeam-home-case-#{System.unique_integer([:positive])}")
 
+    raw_path = :filename.join(root, <<255>>)
+
     File.mkdir_p!(Path.join(root, "sessions"))
     File.write!(Path.join(root, ".claude.json"), "{}")
     File.write!(Path.join(root, "sessions/123.json"), "{\"pid\":123}")
+    :ok = :file.write_file(raw_path, "{}")
 
     try do
       case snapshot_home(root, fn relative -> String.ends_with?(relative, ".json") end) do
         {:ok, entries, _finished_at} ->
           paths = Enum.map(entries, & &1.raw_path)
 
-          if paths == [".claude.json", "sessions", "sessions/123.json"] and
-               Enum.all?(Enum.filter(entries, &(&1.type == :regular)), &is_binary(&1.sha256)),
+          if paths == [".claude.json", "sessions", "sessions/123.json", <<255>>] and
+               evidence_token(List.last(paths)) == "%FF" and
+               Enum.find(entries, &(&1.raw_path == <<255>>)).type == :regular and
+               entries
+               |> Enum.filter(&(&1.type == :regular and &1.raw_path != <<255>>))
+               |> Enum.all?(&is_binary(&1.sha256)),
              do: :pass,
              else: :failed
 
@@ -1569,6 +1594,7 @@ defmodule FeatureSmoke do
           :failed
       end
     after
+      :file.delete(raw_path)
       File.rm_rf!(root)
     end
   end
@@ -1668,9 +1694,9 @@ defmodule FeatureSmoke do
 
   defp home_ops do
     %{
-      open_evidence: fn path -> :file.open(path, [:write, :exclusive, :binary, :raw]) end,
-      chmod: &File.chmod/2,
-      list_dir: &:file.list_dir/1,
+      create_evidence: &create_evidence_file/1,
+      open_evidence: fn path -> :file.open(path, [:read, :write, :binary, :raw]) end,
+      list_dir: &:file.list_dir_all/1,
       lstat: &:file.read_link_info/1,
       open_read: fn path -> :file.open(path, [:read, :binary, :raw]) end,
       read_info: &:file.read_file_info/1,
@@ -1679,6 +1705,17 @@ defmodule FeatureSmoke do
       sync: &:file.sync/1,
       close: &:file.close/1
     }
+  end
+
+  defp create_evidence_file(path) do
+    case System.cmd(
+           "sh",
+           ["-c", "umask 077; set -C; : > \"$1\"", "feature-smoke-evidence", path],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} -> :ok
+      {_output, _status} -> {:error, :create_failed}
+    end
   end
 
   defp home_ops(overrides), do: Map.merge(home_ops(), overrides)
