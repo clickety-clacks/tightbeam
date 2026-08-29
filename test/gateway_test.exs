@@ -1437,6 +1437,9 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "children installs the release Rust CLI, and refuses instead of falling back", ctx do
+    release_root = System.get_env("RELEASE_ROOT")
+    System.delete_env("RELEASE_ROOT")
+
     repo_dir =
       Path.join(
         System.tmp_dir!(),
@@ -1449,7 +1452,15 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(Path.dirname(rust_cli))
     File.write!(rust_cli, "rust-cli-binary")
 
-    on_exit(fn -> File.rm_rf!(repo_dir) end)
+    on_exit(fn ->
+      File.rm_rf!(repo_dir)
+
+      if release_root do
+        System.put_env("RELEASE_ROOT", release_root)
+      else
+        System.delete_env("RELEASE_ROOT")
+      end
+    end)
 
     File.cd!(repo_dir, fn ->
       Gateway.children(gateway_config(rust_base, ctx.db, 0))
@@ -9207,6 +9218,7 @@ defmodule Tightbeam.GatewayTest do
       owner_user_id: owner_user_id,
       origin: "user:#{owner_user_id}",
       spawned_by: spawned_by,
+      operational_parent: spawned_by,
       archetype: "default",
       host: "testhost",
       harness: "claude",

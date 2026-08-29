@@ -436,19 +436,21 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert live.lineage_rung == 1
     assert notified_rungs(ctx.db) == ["mid", "top"]
 
-    # Rung 2 — the ancestor is retired, so routing SKIPS it to the owner user.
+    # Rung 2 — the ancestor is retired, so routing falls back to the owner's
+    # canonical Main session without creating it.
     :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='top'")
     skipped = expire_rung!(ctx, live)
-    assert skipped.expecter_session_key == nil
-    assert skipped.expecter_user_id == "flynn"
-    assert skipped.lineage_rung == 2
     personal = Org.personal_session_key("flynn")
+    assert skipped.expecter_session_key == personal
+    assert skipped.expecter_user_id == nil
+    assert skipped.lineage_rung == 2
     assert notified_rungs(ctx.db) == ["mid", "top", personal]
 
-    # Terminal user rung — expiry re-arms against the SAME user, same rung.
+    # Terminal Main rung — expiry re-arms against the same effective parent.
     terminal = expire_rung!(ctx, skipped)
-    assert terminal.expecter_user_id == "flynn"
-    assert terminal.lineage_rung == 2
+    assert terminal.expecter_session_key == personal
+    assert terminal.expecter_user_id == nil
+    assert terminal.lineage_rung == 3
     assert notified_rungs(ctx.db) == ["mid", "top", personal, personal]
   end
 
@@ -518,8 +520,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
              # The fault bubble's notice enqueue (production-machine-v1): a
              # substrate-authored turn to the failing session's nearest active
              # ancestor, deduped by deterministic wakeId.
-             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt/4",
-              "enqueue_notice/4"} => 1,
+             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
+              "climb_with_cause/3"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
               "notify_stranded_ancestor/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
@@ -696,7 +698,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
       harness: "claude",
       provider: "anthropic",
       model: Model.new("claude-fable-5"),
-      spawned_by: spawned_by
+      spawned_by: spawned_by,
+      operational_parent: spawned_by
     })
   end
 

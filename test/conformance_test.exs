@@ -2873,12 +2873,23 @@ defmodule Tightbeam.ConformanceSupport do
         else
           message_id = "conformance-terminal-#{System.unique_integer([:positive])}"
 
+          assignment_id =
+            case DB.query(
+                   db,
+                   "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id LIMIT 1",
+                   [turn["session"]]
+                 ) do
+              {:ok, [[id]]} -> id
+              {:ok, []} -> nil
+            end
+
           assert {:ok, seq} =
                    Ledger.enqueue(db, %{
                      session_key: turn["session"],
                      message_id: message_id,
                      origin: "user:conformance",
-                     prompt: "terminal"
+                     prompt: "terminal",
+                     assignment_id: assignment_id
                    })
 
           assert seq == turn["seq"]

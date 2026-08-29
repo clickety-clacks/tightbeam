@@ -91,7 +91,16 @@ defmodule Tightbeam.ExecutionMapTest do
     assert ids(all) == ["wi_user", "wi_session"]
 
     assert node(all, "wi_user").origin == %{principal: "user", created_by: "flynn"}
-    assert node(all, "wi_session").origin == %{principal: "session", created_by: "s_creator"}
+
+    assert node(all, "wi_session").origin == %{
+             principal: "session",
+             created_by: "s_creator",
+             session: %{
+               operational_parent: nil,
+               effective_parent: Org.personal_session_key("flynn"),
+               effective_parent_source: :owner_main
+             }
+           }
 
     assert ids(roster(ctx, %{origin: "user"})) == ["wi_user"]
     assert ids(roster(ctx, %{origin: "session"})) == ["wi_session"]

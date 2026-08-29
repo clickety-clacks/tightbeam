@@ -32,7 +32,7 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, DB, Schema}
+  alias Tightbeam.{Assignments, DB, Ledger, Model, Org, Schema, Wakes}
 
   @shape "nullable-effective-parent-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
@@ -144,6 +144,169 @@ defmodule Tightbeam.SchemaShapeTest do
                db,
                "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='supervision_controller_root_immutable_update'"
              )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name='supervision_controller_turn_identity_immutable_update'"
+             )
+  end
+
+  test "the exact batching predecessor preserves a historical null controller root", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+    _root = session(db, "root", "flynn")
+    _child = session(db, "child", "flynn", spawned_by: "root")
+
+    downgrade_to_notice_batching(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt)
+      VALUES ('asg_historical_root','historical controller','child','flynn',1);
+      INSERT INTO wakes
+        (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,assignmentId)
+      VALUES
+        ('w_historical_root','root','process:tightbeam','historical','prompt',0,'pending',1,
+         'asg_historical_root');
+      INSERT INTO supervision_liveness_sidecar
+        (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
+      VALUES
+        ('w_historical_root','asg_historical_root','scheduled','prod','pending',1);
+      """)
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert "operationalParent" in table_columns(db, "sessions")
+    assert "rootTurnSeq" in table_columns(db, "supervision_liveness_sidecar")
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               db,
+               "SELECT rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+             )
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               db,
+               "SELECT rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+             )
+  end
+
+  test "every nullable effective-parent migration interruption rolls back and retries", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+    _root = session(db, "root", "flynn")
+
+    for point <- [
+          :after_root_copy,
+          :after_root_drop,
+          :after_root_restore,
+          :after_root_link,
+          :after_operational_parent,
+          :after_migration,
+          :after_stamp
+        ] do
+      downgrade_to_notice_batching(db)
+
+      error =
+        assert_raise Schema.ShapeError, fn ->
+          Schema.upgrade_nullable_effective_parent_v1(db, fail_at: point)
+        end
+
+      assert error.message =~ "forced nullable-effective-parent migration interruption"
+
+      assert {:ok, [["notice-batching-v1-019"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+
+      refute "operationalParent" in table_columns(db, "sessions")
+      refute "rootTurnSeq" in table_columns(db, "supervision_liveness_sidecar")
+
+      assert :ok = Schema.upgrade_nullable_effective_parent_v1(db)
+      assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    end
+  end
+
+  test "a scheduled controller rejects a root terminal from another assignment", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    :ok = DB.execute(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+    _holder = session(db, "holder", "flynn")
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt)
+      VALUES
+        ('asg_controller','controller work','holder','flynn',1),
+        ('asg_other','other work','holder','flynn',2)
+      """)
+
+    {:ok, root_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "holder",
+        message_id: "other-assignment-root",
+        origin: "user:flynn",
+        prompt: "other assignment terminal",
+        assignment_id: "asg_other"
+      })
+
+    assert {:ok, %{seq: ^root_seq}} = Ledger.claim_next(db, "holder", "schema-root")
+    assert :ok = Ledger.finish(db, root_seq, "delivered")
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "holder",
+        origin: "process:tightbeam",
+        prompt: "controller",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: "asg_controller"
+      })
+
+    assert {:error, %DB.Error{message: message}} =
+             DB.query(
+               db,
+               """
+               INSERT INTO supervision_liveness_sidecar
+                 (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,
+                  chargedGeneration,rootTurnSeq)
+               VALUES (?1,'asg_controller','scheduled','prod','pending',1,?2)
+               """,
+               [wake.wake_id, root_seq]
+             )
+
+    assert message =~ "supervision sidecar requires coherent pending wake"
+  end
+
+  test "the nullable effective-parent migration survives a database-owner restart", %{db: _db} do
+    unique = System.unique_integer([:positive])
+    path = Path.join(System.tmp_dir!(), "nullable-effective-parent-restart-#{unique}.sqlite3")
+    first = :"nullable_parent_before_#{unique}"
+    second = :"nullable_parent_after_#{unique}"
+
+    on_exit(fn -> File.rm(path) end)
+
+    {:ok, first_pid} = DB.start_link(path: path, name: first)
+    assert :ok = Schema.ensure_all(first)
+
+    :ok =
+      DB.execute(first, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+
+    _root = session(first, "root", "flynn")
+    downgrade_to_notice_batching(first)
+    assert :ok = GenServer.stop(first_pid)
+
+    {:ok, second_pid} = DB.start_link(path: path, name: second)
+
+    try do
+      assert :ok = Schema.ensure_all(second)
+      assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
+      assert "operationalParent" in table_columns(second, "sessions")
+      assert "rootTurnSeq" in table_columns(second, "supervision_liveness_sidecar")
+    after
+      if Process.alive?(second_pid), do: GenServer.stop(second_pid)
+    end
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
@@ -906,6 +1069,70 @@ defmodule Tightbeam.SchemaShapeTest do
     rows == [[1]]
   end
 
+  defp session(db, key, owner, opts \\ []) do
+    Org.create(db, %{
+      session_key: key,
+      display_name: key,
+      kind: "custom",
+      is_built_in: false,
+      owner_user_id: owner,
+      origin: "user:#{owner}",
+      spawned_by: Keyword.get(opts, :spawned_by),
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+  end
+
+  defp downgrade_to_notice_batching(db) do
+    remove_controller_root_link(db)
+
+    :ok =
+      with_foreign_keys_disabled(db, fn ->
+        :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN operationalParent")
+
+        {:ok, _} =
+          DB.query(
+            db,
+            "UPDATE schema_stamp SET shape='notice-batching-v1-019', stampedAt=1"
+          )
+      end)
+
+    :ok
+  end
+
+  defp remove_controller_root_link(db) do
+    :ok =
+      with_foreign_keys_disabled(db, fn ->
+        {:ok, objects} =
+          DB.query(
+            db,
+            "SELECT type, name FROM sqlite_master WHERE type IN ('index','trigger') AND sql LIKE '%rootTurnSeq%'"
+          )
+
+        Enum.each(objects, fn [type, name] ->
+          :ok = DB.execute(db, "DROP #{String.upcase(type)} IF EXISTS #{name}")
+        end)
+
+        :ok = DB.execute(db, "ALTER TABLE supervision_liveness_sidecar DROP COLUMN rootTurnSeq")
+      end)
+
+    :ok
+  end
+
+  defp with_foreign_keys_disabled(db, fun) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      fun.()
+      :ok
+    after
+      {:ok, _} = DB.query(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
   defp downgrade_decision_requests_to_model_identity(db) do
     :ok =
       DB.execute(db, """
@@ -1105,6 +1332,8 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TRIGGER IF EXISTS supervision_controller_wake_immutable_delete;
       DROP TRIGGER IF EXISTS supervision_controller_root_turn_immutable_update;
       DROP TRIGGER IF EXISTS supervision_controller_root_turn_immutable_delete;
+      DROP TRIGGER IF EXISTS supervision_controller_turn_identity_immutable_update;
+      DROP TRIGGER IF EXISTS supervision_controller_turn_immutable_delete;
       DROP TRIGGER IF EXISTS wakes_typed_cancellation_required;
       DROP TRIGGER IF EXISTS wake_cancellations_pending_insert;
       DROP TABLE IF EXISTS wake_cancellations;

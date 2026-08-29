@@ -700,7 +700,7 @@ defmodule Tightbeam.Schema do
           NEW.rootTurnSeq IS NULL
           OR NOT EXISTS (
             SELECT 1 FROM turns t
-            WHERE t.seq=NEW.rootTurnSeq
+            WHERE t.seq=NEW.rootTurnSeq AND t.assignmentId=NEW.assignmentId
           )
         )
       )
@@ -900,10 +900,15 @@ defmodule Tightbeam.Schema do
       name: "supervision_controller_root_immutable_update",
       sql: """
       CREATE TRIGGER IF NOT EXISTS supervision_controller_root_immutable_update
-      BEFORE UPDATE OF rootTurnSeq
+      BEFORE UPDATE OF wakeId, assignmentId, controllerOrigin, wakeKind, rootTurnSeq
       ON supervision_liveness_sidecar
       WHEN OLD.controllerOrigin IS NOT NULL
-        AND NEW.rootTurnSeq IS NOT OLD.rootTurnSeq
+        AND (
+          NEW.wakeId IS NOT OLD.wakeId OR NEW.assignmentId IS NOT OLD.assignmentId
+          OR NEW.controllerOrigin IS NOT OLD.controllerOrigin
+          OR NEW.wakeKind IS NOT OLD.wakeKind
+          OR NEW.rootTurnSeq IS NOT OLD.rootTurnSeq
+        )
       BEGIN
         SELECT RAISE(ABORT, 'supervision controller root link is immutable');
       END
@@ -916,20 +921,6 @@ defmodule Tightbeam.Schema do
       CREATE TRIGGER IF NOT EXISTS supervision_controller_root_immutable_delete
       BEFORE DELETE ON supervision_liveness_sidecar
       WHEN OLD.controllerOrigin IS NOT NULL
-        AND NOT (
-          OLD.controllerOrigin='scheduled' AND OLD.controllerState='pending'
-          AND EXISTS (
-            SELECT 1 FROM wakes w
-            WHERE w.wakeId=OLD.wakeId AND w.assignmentId=OLD.assignmentId
-              AND w.state='pending'
-            )
-        )
-        AND NOT EXISTS (
-          SELECT 1 FROM wakes w
-          WHERE w.wakeId=OLD.wakeId AND w.assignmentId=OLD.assignmentId
-            AND w.state='fired' AND w.consumer='prompt'
-            AND w.origin='process:tightbeam' AND w.reresolve='lineage'
-        )
       BEGIN
         SELECT RAISE(ABORT, 'supervision controller root link is required');
       END
@@ -946,16 +937,6 @@ defmodule Tightbeam.Schema do
         WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
           AND s.controllerOrigin IS NOT NULL
       )
-        AND NOT EXISTS (
-          SELECT 1 FROM supervision_liveness_sidecar s
-          WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
-            AND s.controllerOrigin='scheduled' AND s.controllerState='pending'
-            AND EXISTS (
-              SELECT 1 FROM wakes w
-              WHERE w.wakeId=OLD.wakeId AND w.assignmentId=OLD.assignmentId
-                AND w.state='pending'
-            )
-        )
         AND (
           NEW.wakeId IS NOT OLD.wakeId OR NEW.sessionKey IS NOT OLD.sessionKey
           OR NEW.assignmentId IS NOT OLD.assignmentId
@@ -1009,6 +990,48 @@ defmodule Tightbeam.Schema do
       )
       BEGIN
         SELECT RAISE(ABORT, 'supervision controller root turn is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_turn_identity_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_turn_identity_immutable_update
+      BEFORE UPDATE OF seq, sessionKey, wakeId, assignmentId ON turns
+      WHEN EXISTS (
+        SELECT 1
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId AND w.assignmentId=s.assignmentId
+        WHERE s.controllerOrigin IS NOT NULL
+          AND OLD.wakeId=w.wakeId AND OLD.assignmentId=w.assignmentId
+          AND OLD.sessionKey=w.sessionKey
+      )
+        AND (
+          NEW.seq IS NOT OLD.seq OR NEW.sessionKey IS NOT OLD.sessionKey
+          OR NEW.wakeId IS NOT OLD.wakeId OR NEW.assignmentId IS NOT OLD.assignmentId
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller turn identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_turn_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_turn_immutable_delete
+      BEFORE DELETE ON turns
+      WHEN EXISTS (
+        SELECT 1
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId AND w.assignmentId=s.assignmentId
+        WHERE s.controllerOrigin IS NOT NULL
+          AND OLD.wakeId=w.wakeId AND OLD.assignmentId=w.assignmentId
+          AND OLD.sessionKey=w.sessionKey
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller turn is required');
       END
       """
     }

@@ -1073,7 +1073,7 @@ defmodule Tightbeam.SupervisionTest do
              supervisionActionNeeded: true
            } = Supervision.prod_state(ctx.db, "asg_1")
 
-    assert {:ok, [[2, 2]]} =
+    assert {:ok, [[3, 2]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*), COUNT(DISTINCT wakeId) FROM turns WHERE assignmentId='asg_1'"
@@ -1082,7 +1082,7 @@ defmodule Tightbeam.SupervisionTest do
     assert :ok = stop_supervised(Supervision)
     _replay = start_liveness!(ctx, sweep_ms: 60_000)
 
-    assert {:ok, [[2, 2]]} =
+    assert {:ok, [[3, 2]]} =
              DB.query(
                ctx.db,
                "SELECT COUNT(*), COUNT(DISTINCT wakeId) FROM turns WHERE assignmentId='asg_1'"
@@ -1935,7 +1935,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert pending_sidecar_update =~ "pending supervision controller permits settlement only"
+    assert pending_sidecar_update =~ "immutable"
 
     assert {:error, %DB.Error{message: pending_sidecar_delete}} =
              DB.query(
@@ -1944,7 +1944,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert pending_sidecar_delete =~ "pending supervision controller sidecar is required"
+    assert pending_sidecar_delete =~ "supervision controller root link is required"
 
     assert {:error, %DB.Error{message: pending_wake_update}} =
              DB.query(
@@ -1953,7 +1953,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert pending_wake_update =~ "pending supervision controller wake identity is immutable"
+    assert pending_wake_update =~ "supervision controller wake identity is immutable"
 
     incoherent =
       Wakes.schedule(ctx.db, %{
@@ -2004,7 +2004,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert delete_message =~ "fired supervision lineage sidecar is required"
+    assert delete_message =~ "supervision controller root link is required"
 
     assert {:error, %DB.Error{message: update_message}} =
              DB.query(
@@ -2013,7 +2013,7 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert update_message =~ "fired supervision lineage sidecar identity is immutable"
+    assert update_message =~ "supervision controller root link is immutable"
 
     assert {:error, %DB.Error{message: state_message}} =
              DB.query(
@@ -2036,12 +2036,12 @@ defmodule Tightbeam.SupervisionTest do
                [escalation.wake_id]
              )
 
-    assert turn_update_message =~ "fired supervision lineage turn attribution is immutable"
+    assert turn_update_message =~ "supervision controller turn identity is immutable"
 
     assert {:error, %DB.Error{message: turn_delete_message}} =
              DB.query(ctx.db, "DELETE FROM turns WHERE wakeId=?1", [escalation.wake_id])
 
-    assert turn_delete_message =~ "fired supervision lineage turn is required"
+    assert turn_delete_message =~ "supervision controller turn is required"
 
     assert {:ok, [["escalation", "settled"]]} =
              DB.query(
@@ -3075,12 +3075,23 @@ defmodule Tightbeam.SupervisionTest do
   defp terminal!(db, session_key) do
     message_id = "m_#{System.unique_integer([:positive])}"
 
+    assignment_id =
+      case DB.query(
+             db,
+             "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id LIMIT 1",
+             [session_key]
+           ) do
+        {:ok, [[id]]} -> id
+        {:ok, []} -> nil
+      end
+
     {:ok, seq} =
       Ledger.enqueue(db, %{
         session_key: session_key,
         message_id: message_id,
         origin: "user:flynn",
-        prompt: "external"
+        prompt: "external",
+        assignment_id: assignment_id
       })
 
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(db, session_key, "test")
