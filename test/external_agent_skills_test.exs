@@ -9,14 +9,16 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
 
   @cli_name "tightbeam-cli"
   @rest_name "tightbeam-rest-0-2-0"
-  @delegation_sentence "you should probably get main to do what you need it to instead of trying to do it yourself since main knows how to operate tightbeam."
+  @rest_delegation_sentence "you should probably get main to do what you need it to instead of trying to do it yourself since main knows how to operate tightbeam."
 
-  @cli_description "Operate an existing Tightbeam organization through its current-line CLI. Use when an external agent has the tightbeam executable and must read assigned work, record results, or contact Main without a served Tightbeam identity."
+  @cli_description "Operate an existing Tightbeam organization through its current-line CLI. Use when an external agent must inspect or direct the organization on a user's behalf without a served Tightbeam identity."
   @rest_description "Operate an existing Tightbeam 0.2.0 organization through its authenticated HTTP dispatch interface. Use when an external agent must read assigned work, record results, or contact Main without invoking the Tightbeam CLI."
 
   @cli_commands [
     "tightbeam --help",
     "tightbeam list",
+    "tightbeam toplines",
+    "tightbeam work-item-create",
     "tightbeam assignments",
     "tightbeam work-item-get",
     "tightbeam work-item-trace",
@@ -25,8 +27,9 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     "tightbeam artifacts",
     "tightbeam artifact-record",
     "tightbeam wake",
-    "tightbeam ask",
-    "tightbeam decision-requests"
+    "tightbeam decision-requests",
+    "tightbeam effort-rule",
+    "tightbeam operator-rule"
   ]
 
   @required_markers [
@@ -114,21 +117,78 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     }
   end
 
-  test "the two external editions ship as isolated valid skills" do
+  test "the two external editions ship with valid frontmatter and package inclusion" do
     assert external_edition_names() == [@cli_name, @rest_name]
 
     assert_skill(@cli_name, @cli_description)
     assert_skill(@rest_name, @rest_description)
 
     for bytes <- [skill_bytes(@cli_name), skill_bytes(@rest_name)] do
-      assert bytes =~ @delegation_sentence
-
       for marker <- @required_markers do
         assert bytes =~ marker
       end
 
       refute bytes =~ "tightbeam kungfu"
       refute bytes =~ ~s({"verb":"kungfu)
+    end
+
+    assert skill_bytes(@rest_name) =~ @rest_delegation_sentence
+  end
+
+  test "the CLI edition delegates staffing through a parented product-owner assignment" do
+    cli = skill_bytes(@cli_name)
+
+    for marker <- [
+          "Direct the organization; do not run it",
+          "product-owner session",
+          "`openedBySession` as `(none)`",
+          "no parent session receives the completion",
+          "no opener must",
+          "dispose of the result",
+          "`wi_32ff8f5c`",
+          "remained uncut for 21 hours",
+          "Do not run `assign`, `dispatch`, or `spawn`",
+          "completion a parent and a disposal path"
+        ] do
+      assert cli =~ marker
+    end
+  end
+
+  test "the CLI edition requires successor-card custody after a plan" do
+    cli = skill_bytes(@cli_name) |> String.replace(~r/\s+/, " ")
+
+    assert cli =~ "A plan is not progress"
+    assert cli =~ "name its successor card"
+    assert cli =~ "confirm that an agent holds that card"
+    assert cli =~ "successor assignment is open and held by a session"
+    assert cli =~ "Do not treat an unstaffed implementation list as forward motion"
+  end
+
+  test "the CLI edition is generic and keeps credentials unread" do
+    cli = skill_bytes(@cli_name)
+
+    assert cli =~ "Default to read-only inspection"
+    assert cli =~ "Never read credentials"
+    assert cli =~ "Report the exact\nerror code and message"
+    assert cli =~ "Never bypass the refusal"
+
+    for installation_detail <- [
+          "gibson",
+          "eezo",
+          "tb02",
+          "mike",
+          "/home/",
+          "~/",
+          "127.0.0.1",
+          "localhost:",
+          "claude-",
+          "gpt-"
+        ] do
+      refute cli =~ installation_detail
+    end
+
+    for credential_location <- [".tightbeam-session", "gateway.json", "/auth/"] do
+      refute cli =~ credential_location
     end
   end
 
@@ -145,7 +205,9 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
 
     for command <- @cli_commands -- ["tightbeam --help"] do
       name = String.replace_prefix(command, "tightbeam ", "")
-      assert help =~ name, "compiled help does not contain #{name}"
+
+      assert help =~ ~r/^  #{Regex.escape(name)}(?:\s|$)/m,
+             "compiled help does not contain exact command #{name}"
     end
 
     refute cli =~ "/agent/dispatch"
