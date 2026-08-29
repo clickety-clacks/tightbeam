@@ -134,7 +134,13 @@ defmodule Tightbeam.Homes do
     %{
       home_path: home,
       manifest_path: manifest_path,
-      linked_auth_files: link_auth(auth_dir, home, credential_names)
+      linked_auth_files:
+        project_auth(
+          auth_dir,
+          home,
+          credential_names,
+          Keyword.get(mechanics, :credential_projection, :link)
+        )
     }
   end
 
@@ -467,16 +473,29 @@ defmodule Tightbeam.Homes do
   defp provider_of(%{harness: harness}),
     do: Harness.module!(harness).credential_provider()
 
-  defp link_auth(auth_dir, home, credential_names) do
+  defp project_auth(auth_dir, home, credential_names, projection) do
     auth_dir
     |> credential_store_files(credential_names)
     |> Enum.map(fn file ->
       source = Path.join(auth_dir, file)
       target = Path.join(home, file)
 
-      case File.lstat(target) do
-        {:error, :enoent} -> File.ln_s!(source, target)
-        _ -> :ok
+      case projection do
+        :link ->
+          case File.lstat(target) do
+            {:error, :enoent} -> File.ln_s!(source, target)
+            _ -> :ok
+          end
+
+        :copy_readable ->
+          case File.rm(target) do
+            :ok -> :ok
+            {:error, :enoent} -> :ok
+            {:error, reason} -> raise File.Error, reason: reason, action: "remove", path: target
+          end
+
+          File.cp!(source, target)
+          File.chmod!(target, 0o640)
       end
 
       file

@@ -427,6 +427,7 @@ defmodule Tightbeam.CursorRegistrationTest do
     File.mkdir_p!(Path.join(home, ".tightbeam"))
     File.write!(Path.join(home, ".tightbeam/execution-owned"), "preserve")
     File.write!(Path.join(auth, "cli-config.json"), ~s({"authInfo":{"email":"user@example.com"}}))
+    File.ln_s!(Path.join(auth, "cli-config.json"), Path.join(home, "cli-config.json"))
 
     target = %{
       base_dir: base,
@@ -444,6 +445,12 @@ defmodule Tightbeam.CursorRegistrationTest do
                auth_dir: auth,
                rails: %{"hooks" => %{"PreToolUse" => []}}
              })
+
+    projected_config = Path.join(home, "cli-config.json")
+    assert {:ok, %File.Stat{type: :regular}} = File.lstat(projected_config)
+    assert File.read!(projected_config) == File.read!(Path.join(auth, "cli-config.json"))
+    assert Bitwise.band(File.stat!(projected_config).mode, 0o777) == 0o640
+    assert File.stat!(projected_config).gid == File.stat!(home).gid
 
     assert JSON.decode!(File.read!(Path.join([home, ".cursor", "hooks.json"]))) == %{
              "hooks" => %{}
