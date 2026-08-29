@@ -105,6 +105,14 @@ defmodule Tightbeam.Wire.RouterTest do
         send(parent, {:call, call})
         %{activation_id: call.params.activation_id, state: "declared", events: []}
       end,
+      "activation-renotify" => fn call ->
+        send(parent, {:call, call})
+        %{event: %{kind: "notice-requeued"}}
+      end,
+      "activation-ack" => fn call ->
+        send(parent, {:call, call})
+        %{event: %{kind: "acknowledged"}}
+      end,
       "identity-status" => fn call ->
         send(parent, {:call, call})
         %{live: "abc123", conflict: false}
@@ -352,6 +360,99 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert refused.status == 400
     assert JSON.decode!(refused.resp_body)["error"]["code"] == "invalid_message"
+  end
+
+  test "activation wire rejects substrate-owned fields and accepts the two wake references",
+       ctx do
+    actual_status =
+      Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+      |> Map.take(["activation-status"])
+
+    actual_ctx = %{
+      ctx
+      | opts:
+          Keyword.update!(ctx.opts, :handlers, fn handlers ->
+            Map.merge(handlers, actual_status)
+          end)
+    }
+
+    owned_fields = [
+      %{eventId: "aev_forged"},
+      %{bySession: "forged-session"},
+      %{byUser: "forged-user"},
+      %{principal: "user:forged"},
+      %{workItemId: "wi_forged"},
+      %{requestSha256: String.duplicate("a", 64)},
+      %{noticeWakeId: "w_forged"},
+      %{seq: 7},
+      %{ts: 8}
+    ]
+
+    Enum.each(owned_fields, fn supplied ->
+      response =
+        dispatch_cli(actual_ctx, "tbc_test", %{
+          verb: "activation-status",
+          asUser: "flynn",
+          params: Map.merge(%{activationId: "act_example"}, supplied)
+        })
+
+      assert response.status == 400
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_activation_payload"
+    end)
+
+    renotify =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-renotify",
+        asUser: "flynn",
+        params: %{
+          activationId: "act_example",
+          predecessorEventId: "aev_head",
+          noticedEventId: "aev_noticed",
+          replacesWakeId: "w_canceled",
+          idempotencyKey: "renotify-key"
+        }
+      })
+
+    assert renotify.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "activation-renotify",
+                      params: %{
+                        activation_id: "act_example",
+                        predecessor_event_id: "aev_head",
+                        noticed_event_id: "aev_noticed",
+                        replaces_wake_id: "w_canceled",
+                        idempotency_key: "renotify-key"
+                      }
+                    }}
+
+    acknowledged =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-ack",
+        asUser: "flynn",
+        params: %{
+          activationId: "act_example",
+          predecessorEventId: "aev_requeued",
+          noticedEventId: "aev_noticed",
+          acknowledgedWakeId: "w_fired",
+          idempotencyKey: "ack-key"
+        }
+      })
+
+    assert acknowledged.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "activation-ack",
+                      params: %{
+                        activation_id: "act_example",
+                        predecessor_event_id: "aev_requeued",
+                        noticed_event_id: "aev_noticed",
+                        acknowledged_wake_id: "w_fired",
+                        idempotency_key: "ack-key"
+                      }
+                    }}
   end
 
   test "the change socket requires protocolVersion 1 at upgrade", ctx do
