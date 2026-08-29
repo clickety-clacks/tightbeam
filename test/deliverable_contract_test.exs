@@ -1,7 +1,7 @@
 defmodule Tightbeam.DeliverableContractTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Artifacts, Assignments, DB, DeliverableContract, Model, Org, WorkItems}
+  alias Tightbeam.{Artifacts, Assignments, DB, DeliverableContract, Model, Org, Wakes, WorkItems}
 
   setup do
     db = :"deliverable_contract_#{System.unique_integer([:positive])}"
@@ -327,13 +327,26 @@ defmodule Tightbeam.DeliverableContractTest do
                [assignment.id]
              )
 
+    request_id = open_effort_request!(ctx.db, assignment.id, "product-owner")
+
+    assert [[deadline_wake_id]] =
+             rows!(ctx.db, "SELECT deadlineWakeId FROM decision_requests WHERE id=?1", [
+               request_id
+             ])
+
     probes = [
       {"effort_wake_cancel",
        "BEFORE UPDATE ON wakes WHEN OLD.wakeId='#{effort_wake_id}' AND NEW.state='canceled'"},
       {"effort_cancellation_receipt",
        "BEFORE INSERT ON wake_cancellations WHEN NEW.wakeId='#{effort_wake_id}'"},
       {"effort_generation_cancel",
-       "BEFORE UPDATE ON effort_checkin_generations WHEN NEW.state='canceled'"}
+       "BEFORE UPDATE ON effort_checkin_generations WHEN NEW.state='canceled'"},
+      {"effort_request_supersede",
+       "BEFORE UPDATE ON decision_requests WHEN OLD.id='#{request_id}' AND NEW.status='superseded'"},
+      {"effort_deadline_wake_cancel",
+       "BEFORE UPDATE ON wakes WHEN OLD.wakeId='#{deadline_wake_id}' AND NEW.state='canceled'"},
+      {"effort_deadline_cancellation_receipt",
+       "BEFORE INSERT ON wake_cancellations WHEN NEW.wakeId='#{deadline_wake_id}'"}
     ]
 
     Enum.each(probes, fn {name, event} ->
@@ -356,6 +369,61 @@ defmodule Tightbeam.DeliverableContractTest do
 
     assert %{assignment: %{state: "closed"}} =
              complete(ctx, assignment.id, "complete dispatched work", "dispatch-completion-key")
+
+    assert [["superseded"]] =
+             rows!(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
+
+    assert [["canceled"]] =
+             rows!(ctx.db, "SELECT state FROM wakes WHERE wakeId=?1", [deadline_wake_id])
+  end
+
+  test "parent-unavailable completion rollback creates no excluded route", ctx do
+    register_hosts(ctx.db, %{
+      "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
+    })
+
+    session(ctx.db, "retired-parent", "flynn", %{spawned_by: "product-owner"})
+    Org.set_operational_parent(ctx.db, "holder", "retired-parent")
+
+    :ok =
+      DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='retired-parent'")
+
+    card = create_card(ctx, "Parent unavailable completion")
+
+    assignment =
+      dispatch_to(ctx, card.id, "Complete without a live direct parent", true, "holder")
+
+    request_id = open_effort_request!(ctx.db, assignment.id, "product-owner")
+
+    for {name, event} <- [
+          {"parent_unavailable_request",
+           "BEFORE UPDATE ON decision_requests WHEN OLD.id='#{request_id}' AND NEW.status='superseded'"},
+          {"parent_unavailable_lifecycle",
+           "BEFORE INSERT ON lifecycle_events WHEN NEW.kind='supervision_entitlement_cleared'"}
+        ] do
+      before = completion_snapshot(ctx.db, assignment.id, card.id)
+      trigger = "completion_probe_#{name}"
+
+      :ok =
+        DB.execute(
+          ctx.db,
+          "CREATE TRIGGER #{trigger} #{event} BEGIN SELECT RAISE(ABORT, '#{name}'); END"
+        )
+
+      assert_raise Tightbeam.DB.Error, ~r/#{name}/, fn ->
+        complete(ctx, assignment.id, "complete with retired direct parent", name)
+      end
+
+      assert completion_snapshot(ctx.db, assignment.id, card.id) == before
+      :ok = DB.execute(ctx.db, "DROP TRIGGER #{trigger}")
+    end
+
+    assert [] ==
+             rows!(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE assignmentId=?1 AND consumer NOT IN ('effort_probe','effort_deadline') ORDER BY wakeId",
+               [assignment.id]
+             )
   end
 
   test "each post-commit completion marker may fail without changing authoritative reads", ctx do
@@ -890,26 +958,47 @@ defmodule Tightbeam.DeliverableContractTest do
   end
 
   test "captured wi_113442f5 rows and real artifact cannot recur without explicit ruling", ctx do
+    captured = captured_wi_113442f5_fixture!()
+    captured_assignments = captured["assignments"]
+    captured_attests = captured["attests"]
+
+    spec_row =
+      Enum.find(captured_assignments, &(&1["id"] == "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0"))
+
+    completion_row =
+      Enum.find(captured_attests, &(&1["id"] == "att_1ab4c74f-d4a3-4af2-8c61-c467062367e4"))
+
     fixture = %{
-      work_item_id: "wi_113442f5-22ae-457b-a971-1b620069d490",
-      title: "REST read plane D3 — CLI direct-GET migration and legacy read removal",
-      assignment_id: "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0",
-      subject:
-        "SPEC D3 — author the CLI direct-REST read migration and legacy-read removal build specification. This work belongs only to wi_113442f5-22ae-457b-a971-1b620069d490. Read your served “Where specs live (mike, 2026-08-21; org-local)” and “Match the wake to what you wait on (mike’s rule, 2026-08-20)” sections. Clone clickety-clacks/tightbeam-specs into your OWN ~/.tightbeam/work/<workspace>; never use/adopt a shared checkout or worktree. Read repo law. Author a build spec on your own branch against canonical REST art_971f45b5 / 8b96e512 / SHA 49b86ec8 and rest-vs-cli-adjudication r2. Inventory each in-product CLI read wrapper and legacy dispatch-read/compatibility alias. Define direct REST GET using the existing bearer plus asUser solely as transport for existing dispatch principal selection, with no new credential, binding, authorization, or tailnet identity. Preserve dispatch writes. Specify shared query/serializer reuse, parity/security/error tests, removal gates, rollback boundaries, and D2 reviewed-clean canonical integration as code-start dependency. Exclude cross-project Clawline/ATC implementation. Push exact spec commit and file artifact/SHA/lint evidence for independent review. Do not review yourself, edit canonical main, implement, merge, deploy, or release. Answer ambiguity from spec/rows; route only unresolved questions to this PO. Preserve failures before one corrected retry.",
-      completion_attest_id: "att_1ab4c74f-d4a3-4af2-8c61-c467062367e4",
-      coder_assignment_id: nil,
-      note:
-        "Completed D3 spec authoring and push only. Exact successor commit 85ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f, artifact art_b6dbcd51, file SHA-256 3f097d9e18ab51cfc24f39599113baad98a562a736a28e88c8aebd7a68f1942f. Sole exact-successor review asg_0b3cc29a-bf12-4296-9064-6f9779884a08 filed reviewed-clean verdict att_025eb266-d184-47c2-a000-2c2d898f944c and report art_f24eb46d; prior 64408a9 review history remains immutable changes-requested. The initial short-id verdict read failed with unknown_assignment and was corrected once using the full canonical id. Bytes remain frozen and the remote review branch is exact. D3-R1 code start remains BLOCKED: origin/main does not contain 85ae5ecb, and both reviewed contract closures plus reviewed-clean D2 canonical integration and all ten receipts must land before product code starts. This assignment did not edit canonical main, implement product code, merge, deploy, release, or self-review.",
+      work_item_id: captured["workItem"]["id"],
+      title: captured["workItem"]["title"],
+      assignment_id: spec_row["id"],
+      subject: spec_row["subject"],
+      completion_attest_id: completion_row["id"],
+      note: completion_row["note"],
       commit_ref: %{
         repo: nil,
-        commit: "85ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f"
+        commit: hd(completion_row["commitRefs"])["commit"]
       }
     }
 
     assert fixture.work_item_id == "wi_113442f5-22ae-457b-a971-1b620069d490"
     assert fixture.assignment_id == "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0"
     assert fixture.completion_attest_id == "att_1ab4c74f-d4a3-4af2-8c61-c467062367e4"
-    assert fixture.coder_assignment_id == nil
+
+    assert Enum.map(captured_assignments, & &1["effectKind"]) |> Enum.sort() ==
+             ~w(evidence policy review review)
+
+    refute Enum.any?(captured_assignments, &(&1["effectKind"] == "code"))
+
+    assert Enum.sort(Enum.map(captured["trace"]["assignments"], & &1["id"])) ==
+             Enum.sort(Enum.map(captured_assignments, & &1["id"]))
+
+    assert Enum.map(captured["trace"]["terminalTimeline"], & &1["verdict"])
+           |> Enum.reject(&is_nil/1) ==
+             ["spirit-approved", "changes-requested", "reviewed-clean"]
+
+    assert List.last(captured["trace"]["terminalTimeline"])["kind"] ==
+             "disposition_transition"
 
     repo = exact_wi_113442f5_commit_repo!()
     fixture = put_in(fixture, [:commit_ref, :repo], "testhost:#{repo}")
@@ -921,6 +1010,32 @@ defmodule Tightbeam.DeliverableContractTest do
     card =
       create_card(ctx, fixture.title)
 
+    session(ctx.db, "reviewer", "other")
+
+    spirit =
+      assign_to(
+        ctx,
+        card.id,
+        "Review REST D3 CLI direct-GET migration and legacy read removal for product spirit",
+        false,
+        "reviewer",
+        effect_kind: "evidence"
+      )
+
+    assert %{attest: %{verdictKind: "spirit-approved"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               call("attest", {:session, "reviewer"}, nil, %{
+                 assignment_id: spirit.id,
+                 kind: "verdict",
+                 verdict_kind: "spirit-approved"
+               })
+             )
+
+    assert %{assignment: %{state: "closed"}} =
+             complete_as(ctx, spirit.id, "spirit review complete", nil, "reviewer")
+
     assignment =
       assign(
         ctx,
@@ -929,11 +1044,30 @@ defmodule Tightbeam.DeliverableContractTest do
         false
       )
 
-    session(ctx.db, "reviewer", "other")
+    first_review =
+      assign_to(ctx, nil, "Review the first exact D3 specification", false, "reviewer",
+        reviews_assignment_id: assignment.id,
+        effect_kind: "review"
+      )
 
-    review =
-      assign_to(ctx, nil, "Independently review the exact D3 specification", false, "reviewer",
-        reviews_assignment_id: assignment.id
+    assert %{attest: %{verdictKind: "changes-requested"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               call("attest", {:session, "reviewer"}, nil, %{
+                 assignment_id: first_review.id,
+                 kind: "verdict",
+                 verdict_kind: "changes-requested"
+               })
+             )
+
+    assert %{assignment: %{state: "closed"}} =
+             complete_as(ctx, first_review.id, nil, nil, "reviewer")
+
+    clean_review =
+      assign_to(ctx, nil, "Review the exact D3 successor", false, "reviewer",
+        reviews_assignment_id: assignment.id,
+        effect_kind: "review"
       )
 
     assert %{attest: %{verdictKind: "reviewed-clean"}} =
@@ -941,13 +1075,14 @@ defmodule Tightbeam.DeliverableContractTest do
                ctx.db,
                "attest",
                call("attest", {:session, "reviewer"}, nil, %{
-                 assignment_id: review.id,
+                 assignment_id: clean_review.id,
                  kind: "verdict",
                  verdict_kind: "reviewed-clean"
                })
              )
 
-    assert %{assignment: %{state: "closed"}} = complete_as(ctx, review.id, nil, nil, "reviewer")
+    assert %{assignment: %{state: "closed"}} =
+             complete_as(ctx, clean_review.id, nil, nil, "reviewer")
 
     artifact =
       Artifacts.record(ctx.db, %{
@@ -983,7 +1118,7 @@ defmodule Tightbeam.DeliverableContractTest do
       )
 
     assert Enum.sort(Enum.map(trace.assignments, & &1.id)) ==
-             Enum.sort([assignment.id, review.id])
+             Enum.sort([spirit.id, assignment.id, first_review.id, clean_review.id])
 
     refute Enum.any?(trace.assignments, &String.starts_with?(&1.deliverable.name, "Implement "))
 
@@ -1022,125 +1157,101 @@ defmodule Tightbeam.DeliverableContractTest do
     assert narrowed.closure.acceptedDeliverable.id == narrowing_assignment.deliverable.id
   end
 
-  test "upgrade preserves historical domain bytes and creates no historical claims", ctx do
-    closed_card = create_card(ctx, "Historical closed card")
-    closed_assignment = assign(ctx, closed_card.id, "Historical whole result", true)
-    closed_completion = complete(ctx, closed_assignment.id, "historical completion")
-    assert %{ok: true} = close(ctx, {:user, "flynn"}, closed_card.id, closed_completion.attest.id)
+  test "captured phase1-v9 history upgrades byte-exactly and its binary refuses v10" do
+    db = :"captured_phase1_v9_history_#{System.unique_integer([:positive])}"
 
-    failed_card = create_card(ctx, "Historical failed card")
+    start_supervised!(%{
+      id: db,
+      start: {DB, :start_link, [[path: ":memory:", name: db]]}
+    })
 
-    assert %{ok: true} =
-             WorkItems.__handle__(
-               ctx.db,
-               "work-item-fail",
-               call("work-item-fail", {:user, "flynn"}, nil, %{
-                 work_item_id: failed_card.id,
-                 reason: "historical failure"
-               })
-             )
+    v9_schema = captured_v9_schema_module!()
+    assert :ok = apply(v9_schema, :ensure_all, [db])
 
-    active_card = create_card(ctx, "Historical assignment states")
-    surrendered = assign(ctx, active_card.id, "Historical surrender", false)
+    assert [["coordination-fabric-v1-phase1-v9"]] = rows!(db, "SELECT shape FROM schema_stamp")
 
-    assert %{assignment: %{outcome: "surrendered"}} =
-             Assignments.__handle__(
-               ctx.db,
-               "attest",
-               call("attest", {:session, "holder"}, nil, %{
-                 assignment_id: surrendered.id,
-                 kind: "surrender"
-               })
-             )
+    fixture =
+      Path.expand("fixtures/deliverable_contract/phase1_v9_history.sql", __DIR__)
+      |> File.read!()
 
-    revoked = assign(ctx, active_card.id, "Historical revocation", false)
-    assert %{outcome: "revoked"} = revoke(ctx, {:user, "flynn"}, revoked.id)
+    assert :ok = DB.execute(db, fixture)
 
-    reopened = assign(ctx, active_card.id, "Historical reopened completion", false)
-    old_completion = complete(ctx, reopened.id, "old completion")
-
-    assert %{state: "open"} =
-             Assignments.__handle__(
-               ctx.db,
-               "reopen-assignment",
-               call("reopen-assignment", {:user, "flynn"}, nil, %{
-                 assignment_id: reopened.id,
-                 reason: "continue after activation"
-               })
-               |> Map.put(:supervision_interval_ms, 1_000)
-             )
-
-    before = historical_snapshot(ctx.db)
-    strip_contract_to_v9!(ctx.db)
-
-    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
-             DB.query(ctx.db, "SELECT shape FROM schema_stamp")
-
-    predecessor_counts = historical_counts(ctx.db)
+    before = historical_snapshot(db)
+    predecessor_counts = historical_counts(db)
 
     assert :ok =
              DeliverableContract.upgrade_v1(
-               ctx.db,
+               db,
                "coordination-fabric-v1-phase1-v9",
                "coordination-fabric-v1-phase1-v10"
              )
 
-    assert historical_snapshot(ctx.db) == before
-    assert historical_counts(ctx.db) == predecessor_counts
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM completion_claims")
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM work_item_closures")
+    assert historical_snapshot(db) == before
+    assert historical_counts(db) == predecessor_counts
+    assert [[0]] = rows!(db, "SELECT count(*) FROM completion_claims")
+    assert [[0]] = rows!(db, "SELECT count(*) FROM work_item_closures")
 
-    assert {:ok, [[1, 1, 3, 3]]} =
-             DB.query(
-               ctx.db,
+    assert [[1, 1, 3, 3]] =
+             rows!(
+               db,
                "SELECT (SELECT count(*) FROM work_item_deliverables),(SELECT count(*) FROM assignment_deliverables),(SELECT count(*) FROM assignment_product_lineage_captures),(SELECT count(*) FROM assignment_product_owner_ancestry)"
              )
 
     assert %{deliverableClaim: nil} =
-             Assignments.list_attests(ctx.db, reopened.id)
-             |> Enum.find(&(&1.id == old_completion.attest.id))
+             Assignments.list_attests(db, "asg_v9_reopened")
+             |> Enum.find(&(&1.id == "att_v9_reopened_old"))
 
-    assert %{deliverableContract: "v1", deliverable: %{name: "Historical reopened completion"}} =
-             DeliverableContract.assignment_projection(ctx.db, reopened.id)
+    assert %{deliverableContract: "v1", deliverable: %{name: "Captured reopened result"}} =
+             DeliverableContract.assignment_projection(db, "asg_v9_reopened")
 
-    for legacy <- [closed_assignment, surrendered, revoked] do
+    for legacy <- ~w(asg_v9_completed asg_v9_surrendered asg_v9_revoked) do
       assert %{deliverableContract: "legacy", deliverable: nil} =
-               DeliverableContract.assignment_projection(ctx.db, legacy.id)
+               DeliverableContract.assignment_projection(db, legacy)
     end
 
     assert %{workItem: %{deliverableContract: "legacy", deliverable: nil, closure: nil}} =
              WorkItems.__handle__(
-               ctx.db,
+               db,
                "work-item-get",
-               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: closed_card.id})
+               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: "wi_v9_closed"})
              )
 
     assert %{workItem: %{deliverableContract: "legacy", deliverable: nil, state: "failed"}} =
              WorkItems.__handle__(
-               ctx.db,
+               db,
                "work-item-get",
-               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: failed_card.id})
+               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: "wi_v9_failed"})
              )
 
     assert %{
              workItem: %{
                deliverableContract: "v1",
-               deliverable: %{name: "Historical assignment states"}
+               deliverable: %{name: "Captured active card"}
              }
            } =
              WorkItems.__handle__(
-               ctx.db,
+               db,
                "work-item-get",
-               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: active_card.id})
+               call("work-item-get", {:user, "flynn"}, nil, %{work_item_id: "wi_v9_active"})
              )
 
     for {assignment_id, attest_id} <- [
-          {closed_assignment.id, closed_completion.attest.id},
-          {reopened.id, old_completion.attest.id}
+          {"asg_v9_completed", "att_v9_completed"},
+          {"asg_v9_reopened", "att_v9_reopened_old"}
         ] do
       assert %{deliverableClaim: nil} =
-               Assignments.list_attests(ctx.db, assignment_id)
+               Assignments.list_attests(db, assignment_id)
                |> Enum.find(&(&1.id == attest_id))
+    end
+
+    try do
+      apply(v9_schema, :ensure_all, [db])
+      flunk("the exact phase1-v9 schema binary accepted a phase1-v10 stamp")
+    rescue
+      error ->
+        assert error.__struct__ == Module.concat(v9_schema, ShapeError)
+        assert Exception.message(error) =~ "stamped: coordination-fabric-v1-phase1-v10"
+        assert Exception.message(error) =~ "this build: coordination-fabric-v1-phase1-v9"
     end
   end
 
@@ -1794,6 +1905,99 @@ defmodule Tightbeam.DeliverableContractTest do
     register_hosts(db, %{
       "testhost" => %{ssh: nil, base_dir: System.tmp_dir!(), cli_bin: nil}
     })
+  end
+
+  defp open_effort_request!(db, assignment_id, expecter_session_key) do
+    [[generation]] =
+      rows!(
+        db,
+        "SELECT MAX(generation) FROM effort_checkin_generations WHERE assignmentId=?1",
+        [assignment_id]
+      )
+
+    now = System.system_time(:millisecond)
+
+    deadline =
+      Wakes.schedule(db, %{
+        session_key: expecter_session_key,
+        origin: "process:tightbeam",
+        consumer: "effort_deadline",
+        due_at: now + 60_000,
+        assignment_id: assignment_id
+      })
+
+    request_id = "dr_completion_effort_#{System.unique_integer([:positive])}"
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
+                  effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
+               VALUES (?1,'effort','process:tightbeam','flynn',?2,?3,1,?4,?5,?6,?7,
+                       'Continue or dismiss?','["continue","dismiss"]',
+                       '{"actions":["continue","dismiss"]}','open')
+               """,
+               [
+                 request_id,
+                 assignment_id,
+                 expecter_session_key,
+                 generation,
+                 deadline.wake_id,
+                 now,
+                 now + 60_000
+               ]
+             )
+
+    request_id
+  end
+
+  defp captured_v9_schema_module! do
+    module = Tightbeam.CapturedPhase1V9Schema
+
+    unless Code.ensure_loaded?(module) do
+      repo = Path.expand("..", __DIR__)
+
+      {source, 0} =
+        System.cmd(
+          "git",
+          [
+            "show",
+            "724e5c96f9513b37e937dc52eb014ba1ef2d1b5e:lib/tightbeam/schema.ex"
+          ],
+          cd: repo,
+          stderr_to_stdout: true
+        )
+
+      assert :crypto.hash(:sha256, source) |> Base.encode16(case: :lower) ==
+               "cbaa8a3f2aabde64e20cb372be343f8d583d08219a6e95d92d73ad7e93de008a"
+
+      renamed =
+        String.replace(
+          source,
+          "defmodule Tightbeam.Schema do",
+          "defmodule Tightbeam.CapturedPhase1V9Schema do",
+          global: false
+        )
+
+      assert Enum.any?(Code.compile_string(renamed, "captured-phase1-v9/schema.ex"), fn
+               {^module, _bytecode} -> true
+               _ -> false
+             end)
+    end
+
+    module
+  end
+
+  defp captured_wi_113442f5_fixture! do
+    path = Path.expand("fixtures/deliverable_contract/wi_113442f5.json", __DIR__)
+    bytes = File.read!(path)
+
+    assert :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower) ==
+             "29d5caad12b7eb9f1d8f8046e8a7acbdd1b36f9c3c5c2e00cd41fb100323df39"
+
+    JSON.decode!(bytes)
   end
 
   defp exact_wi_113442f5_commit_repo! do
