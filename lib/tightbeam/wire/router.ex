@@ -509,6 +509,7 @@ defmodule Tightbeam.Wire.Router do
         verb: verb,
         origin: origin,
         principal: principal,
+        firehose_hub: deps(conn)[:firehose_hub] || Tightbeam.Firehose.Hub,
         session_key: artifact_caller_session(verb, session_key, principal),
         target_role: target_meta.role,
         role_fallback: target_meta.fallback,
