@@ -246,7 +246,7 @@ defmodule Tightbeam.ArchetypesTest do
              end)
 
     assert retirement_gate.pattern ==
-             "tool_input[^:]*:[^:]*command[^:]*:[^[:alnum:]_./-]*(((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=[^[:space:];&|(){}]+[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$)|([^'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*([;&|(){}]|\\\\n)[[:space:]]*((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=[^[:space:];&|(){}]+[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$))"
+             "tool_input[^:]*:[^:]*command[^:]*:[^[:alnum:]_./-]*(((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=([^[:space:];&|(){}'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$)|([^'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*([;&|(){}]|\\\\n)[[:space:]]*((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=([^[:space:];&|(){}'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$))"
 
     %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings()
 
@@ -291,6 +291,18 @@ defmodule Tightbeam.ArchetypesTest do
                  stderr_to_stdout: true
                )
     end
+
+    quoted_assignment_call =
+      JSON.encode!(%{
+        "tool_name" => "Bash",
+        "tool_input" => %{"command" => ~s(TB_NOTE="a b" tightbeam retire --session child)}
+      })
+
+    assert {_denial, 2} =
+             System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+               env: [{"TB_RETIRE_GATE_INPUT", quoted_assignment_call}],
+               stderr_to_stdout: true
+             )
 
     mention_call =
       ~s({"tool_name":"Bash","tool_input":{"command":"echo tightbeam retire --session child"}})
