@@ -418,6 +418,347 @@ defmodule Tightbeam.ActivationsTest do
     assert states == %{original_wake => "canceled", replacement => "fired"}
   end
 
+  test "concurrent successors after one head commit exactly one row", %{db: db} do
+    declared = apply(db, "activation-declare", {:session, "holder"}, declare_params())
+
+    authority = fn suffix ->
+      apply(db, "activation-authority", {:user, "owner"}, %{
+        activation_id: declared.event.activation_id,
+        predecessor_event_id: declared.event.event_id,
+        authorizer: identity("authorizer-#{suffix}"),
+        basis: resource("basis-#{suffix}", @sha),
+        decision: code("decision-#{suffix}"),
+        idempotency_key: "concurrent-authority-#{suffix}"
+      })
+    end
+
+    results =
+      ["one", "two"]
+      |> Enum.map(fn suffix -> Task.async(fn -> authority.(suffix) end) end)
+      |> Enum.map(&Task.await(&1, 5_000))
+
+    assert [winner] = Enum.filter(results, &match?(%{event: %{kind: "authority-attached"}}, &1))
+
+    assert [%{code: "activation_head_changed", current_head: winning_head}] =
+             Enum.filter(results, &match?(%{code: "activation_head_changed"}, &1))
+
+    assert winning_head == winner.event.event_id
+    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM activation_events")
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM activation_events WHERE kind!='declared'")
+  end
+
+  test "successor bridge admits only a held same-work-item root after a terminal predecessor",
+       %{db: db} do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('successor',0,'admin_add',1)"
+      )
+
+    session(db, "successor-holder", "successor")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES ('asg_successor','successor','successor-holder','owner',2,'open','wi_activation')"
+      )
+
+    declared =
+      apply(
+        db,
+        "activation-declare",
+        {:session, "holder"},
+        declare_params()
+        |> Map.put(:prepared_input, resource("old-secret-input", @sha))
+        |> Map.put(:correlation_key, "old-secret-correlation")
+      )
+
+    authority =
+      apply(db, "activation-authority", {:user, "owner"}, %{
+        activation_id: declared.event.activation_id,
+        predecessor_event_id: declared.event.event_id,
+        authorizer: identity("old-authorizer"),
+        basis: resource("old-secret-basis", @sha),
+        decision: code("old-decision"),
+        idempotency_key: "old-authority"
+      })
+
+    withdrawn =
+      apply(db, "activation-withdraw", {:user, "owner"}, %{
+        activation_id: declared.event.activation_id,
+        predecessor_event_id: authority.event.event_id,
+        reason: code("transferred"),
+        basis: resource("transfer", @sha2),
+        idempotency_key: "withdraw-transfer"
+      })
+
+    successor =
+      apply(db, "activation-declare", {:session, "successor-holder"}, %{
+        root_assignment_id: "asg_successor",
+        owner_user_id: "successor",
+        domain: "example",
+        correlation_key: "successor-correlation",
+        prepared_input: resource("successor-input", @sha2),
+        target: resource("successor-target", nil),
+        prior_activation_id: declared.event.activation_id,
+        relation: "supersedes",
+        idempotency_key: "successor-declare"
+      })
+
+    assert successor.state == "declared"
+
+    assert successor.event.payload["prior"] == %{
+             "activationId" => declared.event.activation_id,
+             "relation" => "supersedes"
+           }
+
+    refute inspect(successor) =~ "old-secret"
+
+    assert %{code: "not_found"} =
+             apply(db, "activation-status", {:session, "successor-holder"}, %{
+               activation_id: declared.event.activation_id
+             })
+
+    assert %{activations: [%{activation_id: successor_id}], count: 1} =
+             apply(db, "activations", {:session, "successor-holder"}, %{})
+
+    assert successor_id == successor.event.activation_id
+
+    assert %{code: "activation_transition_refused"} =
+             apply(db, "activation-attempt", {:session, "holder"}, %{
+               activation_id: declared.event.activation_id,
+               predecessor_event_id: withdrawn.event.event_id,
+               actor_assignment_id: "asg_root",
+               authority_event_ids: [authority.event.event_id],
+               executor: identity("stale-executor"),
+               external_attempt: resource("stale-attempt", nil),
+               target_state_before: nil,
+               idempotency_key: "stale-attempt"
+             })
+
+    successor_authority =
+      apply(db, "activation-authority", {:user, "successor"}, %{
+        activation_id: successor.event.activation_id,
+        predecessor_event_id: successor.event.event_id,
+        authorizer: identity("successor-authorizer"),
+        basis: resource("successor-basis", @sha2),
+        decision: code("successor-decision"),
+        idempotency_key: "successor-authority"
+      })
+
+    assert %{code: "activation_authority_refused"} =
+             apply(db, "activation-attempt", {:session, "successor-holder"}, %{
+               activation_id: successor.event.activation_id,
+               predecessor_event_id: successor_authority.event.event_id,
+               actor_assignment_id: "asg_successor",
+               authority_event_ids: [authority.event.event_id],
+               executor: identity("successor-executor"),
+               external_attempt: resource("successor-attempt", nil),
+               target_state_before: nil,
+               idempotency_key: "successor-old-authority-attempt"
+             })
+
+    nonterminal =
+      apply(
+        db,
+        "activation-declare",
+        {:session, "holder"},
+        declare_params()
+        |> Map.put(:correlation_key, "nonterminal-prior")
+        |> Map.put(:idempotency_key, "nonterminal-prior")
+      )
+
+    assert %{code: "not_found"} =
+             apply(
+               db,
+               "activation-declare",
+               {:session, "successor-holder"},
+               declare_params()
+               |> Map.put(:root_assignment_id, "asg_successor")
+               |> Map.put(:owner_user_id, "successor")
+               |> Map.put(:correlation_key, "nonterminal-successor")
+               |> Map.put(:prior_activation_id, nonterminal.event.activation_id)
+               |> Map.put(:relation, "supersedes")
+               |> Map.put(:idempotency_key, "nonterminal-successor")
+             )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdAt) VALUES ('wi_other','other','owner','open','owner',3)"
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES ('asg_other','other','successor-holder','owner',3,'open','wi_other')"
+      )
+
+    assert %{code: "not_found"} =
+             apply(db, "activation-declare", {:session, "successor-holder"}, %{
+               root_assignment_id: "asg_other",
+               owner_user_id: "successor",
+               domain: "example",
+               correlation_key: "different-work-item",
+               prepared_input: resource("different-input", @sha),
+               target: resource("different-target", nil),
+               prior_activation_id: declared.event.activation_id,
+               relation: "supersedes",
+               idempotency_key: "different-work-item"
+             })
+  end
+
+  test "noticed event and wake roll back together at each injected transaction boundary",
+       %{db: db} do
+    {declared, authority} = authority_stream(db, "atomic")
+    base_event_count = row_count(db, "activation_events")
+    base_wake_count = row_count(db, "wakes")
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        CREATE TRIGGER fail_before_activation_wake
+        BEFORE INSERT ON wakes
+        BEGIN SELECT RAISE(ABORT, 'injected-before-wake'); END;
+        """
+      )
+
+    assert_raise Tightbeam.DB.Error, fn -> attempt(db, declared, authority, "before-wake") end
+    assert row_count(db, "activation_events") == base_event_count
+    assert row_count(db, "wakes") == base_wake_count
+    :ok = DB.execute(db, "DROP TRIGGER fail_before_activation_wake")
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        CREATE TRIGGER fail_between_activation_wake_and_event
+        BEFORE INSERT ON activation_events WHEN NEW.kind = 'attempted'
+        BEGIN SELECT RAISE(ABORT, 'injected-before-event'); END;
+        """
+      )
+
+    assert_raise Tightbeam.DB.Error, fn -> attempt(db, declared, authority, "before-event") end
+    assert row_count(db, "activation_events") == base_event_count
+    assert row_count(db, "wakes") == base_wake_count
+    :ok = DB.execute(db, "DROP TRIGGER fail_between_activation_wake_and_event")
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        CREATE TABLE activation_commit_probe (
+          eventId TEXT REFERENCES activation_events(eventId) DEFERRABLE INITIALLY DEFERRED
+        );
+        CREATE TRIGGER fail_activation_commit
+        AFTER INSERT ON activation_events WHEN NEW.kind = 'attempted'
+        BEGIN INSERT INTO activation_commit_probe(eventId) VALUES ('aev_missing_at_commit'); END;
+        """
+      )
+
+    assert_raise MatchError, ~r/FOREIGN KEY constraint failed/, fn ->
+      attempt(db, declared, authority, "at-commit")
+    end
+
+    assert row_count(db, "activation_events") == base_event_count
+    assert row_count(db, "wakes") == base_wake_count
+
+    :ok =
+      DB.execute(db, "DROP TRIGGER fail_activation_commit; DROP TABLE activation_commit_probe;")
+
+    accepted = attempt(db, declared, authority, "accepted")
+    assert accepted.event.notice_wake_id
+    assert row_count(db, "activation_events") == base_event_count + 1
+    assert row_count(db, "wakes") == base_wake_count + 1
+
+    assert {:ok, [[accepted.event.notice_wake_id]]} ==
+             DB.query(
+               db,
+               "SELECT wakeId FROM wakes WHERE wakeId=?1",
+               [accepted.event.notice_wake_id]
+             )
+  end
+
+  test "additive bootstrap preserves stamped rows and synthesizes no activation facts", %{db: db} do
+    assert {:ok, old_users} = DB.query(db, "SELECT * FROM users ORDER BY userId")
+    assert {:ok, old_stamp} = DB.query(db, "SELECT * FROM schema_stamp")
+    :ok = DB.execute(db, "DROP TABLE activation_events")
+
+    :ok = Activations.ensure_schema(db)
+
+    assert {:ok, ^old_users} = DB.query(db, "SELECT * FROM users ORDER BY userId")
+    assert {:ok, ^old_stamp} = DB.query(db, "SELECT * FROM schema_stamp")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM activation_events")
+
+    assert {:ok, indexes} = DB.query(db, "PRAGMA index_list(activation_events)")
+    assert length(indexes) == 12
+  end
+
+  test "an older reader opens a database containing activation rows without adopting them" do
+    root =
+      Path.join(
+        System.tmp_dir!(),
+        "activation-downgrade-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(root)
+    path = Path.join(root, "state.db")
+    writer = :activation_downgrade_writer
+    reader = :activation_downgrade_reader
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    {:ok, writer_pid} = DB.start_link(path: path, name: writer)
+    :ok = Tightbeam.Schema.ensure_all(writer)
+
+    {:ok, _} =
+      DB.query(
+        writer,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('legacy',0,'admin_add',1)"
+      )
+
+    personal(writer, "legacy")
+    session(writer, "legacy-holder", "legacy")
+
+    {:ok, _} =
+      DB.query(
+        writer,
+        "INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdAt) VALUES ('wi_legacy','legacy-readable','legacy','open','legacy',1)"
+      )
+
+    {:ok, _} =
+      DB.query(
+        writer,
+        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES ('asg_legacy','legacy','legacy-holder','legacy',1,'open','wi_legacy')"
+      )
+
+    current =
+      apply(writer, "activation-declare", {:session, "legacy-holder"}, %{
+        root_assignment_id: "asg_legacy",
+        owner_user_id: "legacy",
+        domain: "example",
+        correlation_key: "downgrade",
+        prepared_input: resource("downgrade-input", @sha),
+        target: resource("downgrade-target", nil),
+        idempotency_key: "downgrade-declare"
+      })
+
+    GenServer.stop(writer_pid)
+    {:ok, reader_pid} = DB.start_link(path: path, name: reader)
+    on_exit(fn -> if Process.alive?(reader_pid), do: GenServer.stop(reader_pid) end)
+
+    assert {:ok, [["wi_legacy", "legacy-readable", "open"]]} =
+             DB.query(reader, "SELECT id,title,state FROM work_items WHERE id='wi_legacy'")
+
+    assert {:ok, [[current.event.activation_id]]} ==
+             DB.query(reader, "SELECT activationId FROM activation_events")
+
+    legacy_version = %{"protocolVersion" => 1}
+    refute Map.has_key?(legacy_version, "features")
+  end
+
   test "dispatch and work trace expose activation metadata without protected payload objects", %{
     db: db
   } do
@@ -502,6 +843,48 @@ defmodule Tightbeam.ActivationsTest do
       })
 
     {declared, authority, attempted}
+  end
+
+  defp authority_stream(db, suffix) do
+    declared =
+      apply(
+        db,
+        "activation-declare",
+        {:session, "holder"},
+        declare_params()
+        |> Map.put(:correlation_key, "correlation-#{suffix}")
+        |> Map.put(:idempotency_key, "declare-#{suffix}")
+      )
+
+    authority =
+      apply(db, "activation-authority", {:user, "owner"}, %{
+        activation_id: declared.event.activation_id,
+        predecessor_event_id: declared.event.event_id,
+        authorizer: identity("owner"),
+        basis: resource("basis-#{suffix}", @sha),
+        decision: code("recorded"),
+        idempotency_key: "authority-#{suffix}"
+      })
+
+    {declared, authority}
+  end
+
+  defp attempt(db, declared, authority, suffix) do
+    apply(db, "activation-attempt", {:session, "holder"}, %{
+      activation_id: declared.event.activation_id,
+      predecessor_event_id: authority.event.event_id,
+      actor_assignment_id: "asg_root",
+      authority_event_ids: [authority.event.event_id],
+      executor: identity("executor-#{suffix}"),
+      external_attempt: resource("attempt-#{suffix}", nil),
+      target_state_before: nil,
+      idempotency_key: "attempt-#{suffix}"
+    })
+  end
+
+  defp row_count(db, table) when table in ~w(activation_events wakes) do
+    {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM #{table}")
+    count
   end
 
   defp identity(id), do: %{"namespace" => "example", "id" => id}
