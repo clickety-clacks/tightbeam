@@ -10,4 +10,7 @@
 {"case":"resolved-path-retire-passes-after-proof","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"/opt/tightbeam/bin/tightbeam retire --session child\"}}"}
 {"case":"retire-phrase-as-argument-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo tightbeam retire --session child\"}}"}
 {"case":"quoted-multiline-retire-data-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"printf 'safe\\ntightbeam retire --session child'\"}}"}
+{"case":"double-quoted-multiline-retire-data-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"printf \\\"safe\\ntightbeam retire --session child\\\"\"}}"}
+{"case":"double-quoted-semicolon-retire-data-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"printf \\\"safe; tightbeam retire --session child\\\"\"}}"}
+{"case":"escaped-semicolon-retire-data-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"echo safe\\\\; tightbeam retire --session child\"}}"}
 {"case":"retirement-denial-is-legible","kind":"legibility","expect":"deny","reason":"preserve-repository-work-before-retire","emits":"gate:preserve-repository-work-before-retire","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"tightbeam retire --session child\"}}"}
