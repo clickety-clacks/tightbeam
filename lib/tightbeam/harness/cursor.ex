@@ -141,7 +141,35 @@ defmodule Tightbeam.Harness.Cursor do
     bytes = settings |> CursorRails.compile() |> JSON.encode!()
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, bytes)
+    File.chmod!(path, 0o644)
     Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+  end
+
+  @doc false
+  def prepare_projection_runtime!(home) do
+    # Cursor 2026.08.11 writes ACP session state beneath CURSOR_CONFIG_DIR.
+    # The dedicated execution account reaches this operator-owned projection
+    # through tightbeam-workspace. Keep the writable surface to the projection
+    # root and the runtime directory; cli-config.json remains a read-only auth
+    # projection because launches select the in-memory credential store.
+    runtime_dirs = [home, Path.join(home, "acp-sessions")]
+
+    Enum.each(runtime_dirs, fn path ->
+      File.mkdir_p!(path)
+      File.chmod!(path, 0o2770)
+    end)
+
+    root_gid = File.stat!(home).gid
+
+    Enum.each(runtime_dirs, fn path ->
+      stat = File.stat!(path)
+
+      if stat.gid != root_gid or Bitwise.band(stat.mode, 0o7777) != 0o2770 do
+        raise "Cursor runtime projection #{path} must inherit the projection group and mode 2770"
+      end
+    end)
+
+    :ok
   end
 
   @impl true

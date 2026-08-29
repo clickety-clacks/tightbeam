@@ -1303,6 +1303,12 @@ defmodule Tightbeam.PlacementTest do
     db: db
   } do
     execution_home = Path.join(base_dir, "dedicated-cursor-home")
+    auth_dir = Path.join(base_dir, "auth/cursor")
+    auth_file = Path.join(auth_dir, "cli-config.json")
+    File.mkdir_p!(auth_dir)
+    File.write!(auth_file, ~s({"authInfo":{"email":"cursor@example.com"}}))
+    File.chmod!(auth_dir, 0o700)
+    File.chmod!(auth_file, 0o600)
     File.mkdir_p!(Path.join(execution_home, ".cursor"))
     File.mkdir_p!(Path.join(execution_home, ".tightbeam"))
     sentinel = Path.join(execution_home, ".tightbeam/execution-owned")
@@ -1322,8 +1328,24 @@ defmodule Tightbeam.PlacementTest do
     assert projected == Homes.home_path(base_dir, "testhost", :cursor)
     refute projected == execution_home
     assert File.read!(sentinel) == "preserve"
-    assert File.regular?(Path.join(execution_home, ".cursor/hooks.json"))
+    hooks = Path.join(execution_home, ".cursor/hooks.json")
+    assert File.regular?(hooks)
+    hooks_stat = File.stat!(hooks)
+    assert Bitwise.band(hooks_stat.mode, 0o777) == 0o644
+    assert hooks_stat.uid == File.stat!(execution_home).uid
     refute File.exists?(Path.join(execution_home, "cli-config.json"))
+
+    projection_stat = File.stat!(projected)
+    sessions_stat = File.stat!(Path.join(projected, "acp-sessions"))
+    assert Bitwise.band(projection_stat.mode, 0o7777) == 0o2770
+    assert Bitwise.band(sessions_stat.mode, 0o7777) == 0o2770
+    assert sessions_stat.gid == projection_stat.gid
+
+    credential = Path.join(projected, "cli-config.json")
+    assert {:ok, %File.Stat{type: :symlink}} = File.lstat(credential)
+    assert File.read_link!(credential) == Path.join(base_dir, "auth/cursor/cli-config.json")
+    assert Bitwise.band(File.stat!(auth_dir).mode, 0o777) == 0o700
+    assert Bitwise.band(File.stat!(auth_file).mode, 0o777) == 0o600
   end
 
   # wi_263814d3 — accepted-then-dead: the claude adapter's offered/accepted model

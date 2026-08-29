@@ -1683,6 +1683,8 @@ defmodule Tightbeam.Placement do
 
     cursor_rails_sha256 =
       if harness == :cursor do
+        Tightbeam.Harness.Cursor.prepare_projection_runtime!(Map.fetch!(result, :home_path))
+
         Tightbeam.Harness.Cursor.project_execution_rails!(
           Map.get(config, :cursor_execution_home),
           rails
