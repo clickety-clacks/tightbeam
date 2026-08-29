@@ -479,6 +479,8 @@ defmodule FeatureSmoke do
                {:ok, path_info} <- ops.lstat.(path) do
             file_info(handle_info, :type) == :regular and
               Bitwise.band(file_info(handle_info, :mode), 0o7777) == 0o600 and
+              file_info(path_info, :type) == :regular and
+              Bitwise.band(file_info(path_info, :mode), 0o7777) == 0o600 and
               regular_identity(handle_info) == regular_identity(path_info)
           else
             _ -> false
@@ -1011,10 +1013,9 @@ defmodule FeatureSmoke do
 
   defp codex_clock_scope_case do
     with_case_dir(fn root ->
-      path = Path.join(root, @home_evidence_name)
       reset_case_trace!()
 
-      result =
+      {result, bytes} =
         with_home_evidence!(
           root,
           fn evidence ->
@@ -1023,24 +1024,29 @@ defmodule FeatureSmoke do
               evidence: %{evidence | sequence: 6, phase_index: 5}
             }
 
-            try do
-              validate_runtime_home!(
-                state,
-                root,
-                MapSet.new([@home_evidence_name]),
-                "agent:fixture",
-                "/unused",
-                System.system_time(:millisecond) + 60_000,
-                "pre-wake"
-              )
-            catch
-              {:home_case_refusal, refusal} -> refusal
-            end
+            result =
+              try do
+                validate_runtime_home!(
+                  state,
+                  root,
+                  MapSet.new([@home_evidence_name]),
+                  "agent:fixture",
+                  "/unused",
+                  System.system_time(:millisecond) + 60_000,
+                  "pre-wake"
+                )
+              catch
+                {:home_case_refusal, refusal} -> refusal
+              end
+
+            {:ok, 0} = :file.position(evidence.io, :bof)
+            {:ok, bytes} = :file.read(evidence.io, 1_000_000)
+            {result, bytes}
           end,
           home_ops(%{refusal: &case_refusal!/6})
         )
 
-      record = path |> File.read!() |> String.trim() |> JSON.decode!()
+      record = bytes |> String.trim() |> JSON.decode!()
       clock = Enum.at(record["checks"], 2)
       snapshot = Enum.at(record["checks"], 3)
       codex_delta = Enum.at(record["checks"], 6)
@@ -1084,7 +1090,9 @@ defmodule FeatureSmoke do
 
       if file_info(info, :type) == :regular and
            Bitwise.band(file_info(info, :mode), 0o7777) == 0o600 and
-           count_case({:created_mode, 0o600}) == 1 and
+           count_case(:evidence_create) == 1 and
+           count_case({:evidence_handle_info, :regular, 0o600}) == 1 and
+           count_case({:evidence_path_info, :regular, 0o600}) == 1 and
            length(lines) == 7 and String.ends_with?(bytes, "\n") and
            count_case(:write) == 7 and count_case(:sync) == 7 and
            Enum.map(records, & &1["sequence"]) == Enum.to_list(1..7) and
@@ -1120,11 +1128,32 @@ defmodule FeatureSmoke do
       ops =
         home_ops(%{
           create_evidence: fn path ->
-            case default_ops.create_evidence.(path) do
-              {:ok, io} = created ->
-                {:ok, info} = :file.read_file_info(io)
-                trace_case({:created_mode, Bitwise.band(file_info(info, :mode), 0o7777)})
-                created
+            trace_case(:evidence_create)
+            default_ops.create_evidence.(path)
+          end,
+          read_info: fn io ->
+            case default_ops.read_info.(io) do
+              {:ok, info} = result ->
+                trace_case(
+                  {:evidence_handle_info, file_info(info, :type),
+                   Bitwise.band(file_info(info, :mode), 0o7777)}
+                )
+
+                result
+
+              error ->
+                error
+            end
+          end,
+          lstat: fn path ->
+            case default_ops.lstat.(path) do
+              {:ok, info} = result ->
+                trace_case(
+                  {:evidence_path_info, file_info(info, :type),
+                   Bitwise.band(file_info(info, :mode), 0o7777)}
+                )
+
+                result
 
               error ->
                 error
@@ -1143,24 +1172,26 @@ defmodule FeatureSmoke do
       with_home_evidence!(
         root,
         fn evidence ->
-          Enum.reduce(@home_phase_plan, evidence, fn {harness, phase}, current ->
-            phase_entries =
-              if harness == "claude" and phase in ["pre-wake", "post-turn"],
-                do: entries,
-                else: []
+          evidence =
+            Enum.reduce(@home_phase_plan, evidence, fn {harness, phase}, current ->
+              phase_entries =
+                if harness == "claude" and phase in ["pre-wake", "post-turn"],
+                  do: entries,
+                  else: []
 
-            principal =
-              if phase in ["run-start", "pre-spawn"], do: phase, else: "agent:fixture"
+              principal =
+                if phase in ["run-start", "pre-spawn"], do: phase, else: "agent:fixture"
 
-            finish_home_phase!(current, harness, phase, principal, phase_entries, nil)
-          end)
+              finish_home_phase!(current, harness, phase, principal, phase_entries, nil)
+            end)
+
+          {:ok, 0} = :file.position(evidence.io, :bof)
+          {:ok, bytes} = :file.read(evidence.io, 1_000_000)
+          records = bytes |> String.split("\n", trim: true) |> Enum.map(&JSON.decode!/1)
+          assertion.(path, bytes, records)
         end,
         ops
       )
-
-      bytes = File.read!(path)
-      records = bytes |> String.split("\n", trim: true) |> Enum.map(&JSON.decode!/1)
-      assertion.(path, bytes, records)
     end)
   end
 
@@ -1272,7 +1303,15 @@ defmodule FeatureSmoke do
       reset_case_trace!()
       invalid = replace_json(entries, "sessions/123.json", &Map.put(&1, "cwd", "/wrong"))
       {candidate, _identity} = runtime_failure(%{}, "claude", "pre-wake", invalid, cwd, now, now)
-      ops = home_ops(%{refusal: &case_refusal!/6})
+
+      ops =
+        home_ops(%{
+          refusal: &case_refusal!/6,
+          write: fn io, data ->
+            trace_case({:evidence_write, data})
+            :file.write(io, data)
+          end
+        })
 
       refusal =
         catch_case_refusal(fn ->
@@ -1298,7 +1337,17 @@ defmodule FeatureSmoke do
         end)
 
       path = Path.join(root, @home_evidence_name)
-      lines = path |> File.read!() |> String.split("\n", trim: true)
+
+      lines =
+        case_trace()
+        |> Enum.reverse()
+        |> Enum.flat_map(fn
+          {:evidence_write, data} -> [data]
+          _event -> []
+        end)
+        |> IO.iodata_to_binary()
+        |> String.split("\n", trim: true)
+
       current = lines |> List.last() |> JSON.decode!()
       wrong = Enum.at(current["checks"], 18)
       later = Enum.at(current["checks"], 19)
@@ -1831,35 +1880,7 @@ defmodule FeatureSmoke do
   end
 
   defp create_evidence_file(path) do
-    case :file.open(path, [:read, :write, :exclusive, :binary, :raw]) do
-      {:ok, io} ->
-        case secure_evidence_mode(io) do
-          :ok ->
-            {:ok, io}
-
-          {:error, reason} ->
-            :file.close(io)
-            {:error, reason}
-        end
-
-      {:error, reason} ->
-        {:error, reason}
-    end
-  end
-
-  defp secure_evidence_mode(io) do
-    with handle when is_binary(handle) <- :prim_file.get_handle(io),
-         endian when endian in [:little, :big] <- :erlang.system_info(:endian),
-         fd <- :binary.decode_unsigned(handle, endian),
-         :ok <- :file.change_mode(~c"/proc/self/fd/#{fd}", 0o600),
-         {:ok, info} <- :file.read_file_info(io),
-         true <-
-           file_info(info, :type) == :regular and
-             Bitwise.band(file_info(info, :mode), 0o7777) == 0o600 do
-      :ok
-    else
-      _ -> {:error, :secure_mode_failed}
-    end
+    :file.open(path, [:read, :write, :exclusive, :binary, :raw])
   end
 
   defp home_ops(overrides), do: Map.merge(home_ops(), overrides)
