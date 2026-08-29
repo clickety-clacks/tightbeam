@@ -49,7 +49,6 @@
     }
   ],
   "constant_accessor_callbacks": [
-    "adapter_provisioning",
     "cli_binary",
     "conformance_vectors",
     "credential_env_vars",

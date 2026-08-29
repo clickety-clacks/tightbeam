@@ -117,176 +117,185 @@ defmodule Tightbeam.HarnessProcessTest do
     :ok
   end
 
-  describe "assert_zero_listeners/3 (rails invariant 3)" do
-    if @darwin? do
-      test "the real probe ignores a daemon-minimal PATH and passes an empty selection", ctx do
-        :ok = insert_launch!(ctx.db, "l-daemon-path", nil, 2_147_483_647)
-        previous_path = System.get_env("PATH")
+  if function_exported?(HarnessProcess, :assert_zero_listeners, 3) do
+    describe "assert_zero_listeners/3 (rails invariant 3)" do
+      if @darwin? do
+        test "the real probe ignores a daemon-minimal PATH and passes an empty selection", ctx do
+          :ok = insert_launch!(ctx.db, "l-daemon-path", nil, 2_147_483_647)
+          previous_path = System.get_env("PATH")
 
-        on_exit(fn ->
-          if previous_path,
-            do: System.put_env("PATH", previous_path),
-            else: System.delete_env("PATH")
-        end)
+          on_exit(fn ->
+            if previous_path,
+              do: System.put_env("PATH", previous_path),
+              else: System.delete_env("PATH")
+          end)
 
-        System.put_env("PATH", "/usr/bin:/bin")
-        assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-daemon-path")
+          System.put_env("PATH", "/usr/bin:/bin")
+          assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-daemon-path")
+        end
+
+        test "the real probe detects the listening socket held by this process group", ctx do
+          {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
+          on_exit(fn -> :gen_tcp.close(socket) end)
+          {:ok, {{127, 0, 0, 1}, port}} = :inet.sockname(socket)
+
+          {pgid, 0} =
+            System.cmd("/bin/ps", ["-o", "pgid=", "-p", System.pid()], stderr_to_stdout: true)
+
+          pgid = pgid |> String.trim() |> String.to_integer()
+          :ok = insert_launch!(ctx.db, "l-real-listener", nil, pgid)
+
+          assert {:error, {:listeners_present, listeners}} =
+                   HarnessProcess.assert_zero_listeners(ctx.db, "l-real-listener")
+
+          assert Enum.any?(listeners, &String.ends_with?(&1, ":#{port}"))
+        end
       end
 
-      test "the real probe detects the listening socket held by this process group", ctx do
-        {:ok, socket} = :gen_tcp.listen(0, [:binary, active: false, ip: {127, 0, 0, 1}])
-        on_exit(fn -> :gen_tcp.close(socket) end)
-        {:ok, {{127, 0, 0, 1}, port}} = :inet.sockname(socket)
+      test "a missing absolute lsof executable is refused with its classified path" do
+        path = Path.join(System.tmp_dir!(), "tightbeam-no-lsof-#{System.unique_integer()}")
 
-        {pgid, 0} =
-          System.cmd("/bin/ps", ["-o", "pgid=", "-p", System.pid()], stderr_to_stdout: true)
+        assert {:error, {:lsof_executable_absent, ^path}} =
+                 HarnessProcess.lsof_listen_probe_for_test(4244, path)
+      end
 
-        pgid = pgid |> String.trim() |> String.to_integer()
-        :ok = insert_launch!(ctx.db, "l-real-listener", nil, pgid)
+      test "a non-executable lsof file is refused before spawn", ctx do
+        path = Path.join(ctx.test_dir, "not-executable-lsof")
+        File.write!(path, "#!/bin/sh\nexit 1\n")
+        File.chmod!(path, 0o644)
 
-        assert {:error, {:listeners_present, listeners}} =
-                 HarnessProcess.assert_zero_listeners(ctx.db, "l-real-listener")
+        assert {:error, {:lsof_not_executable, ^path}} =
+                 HarnessProcess.lsof_listen_probe_for_test(4244, path)
+      end
 
-        assert Enum.any?(listeners, &String.ends_with?(&1, ":#{port}"))
+      test "a LISTEN socket in the group is caught and refused", ctx do
+        :ok = insert_launch!(ctx.db, "l-present", nil, 4242)
+        # lsof -Fn output: a socket name is an `n`-prefixed line.
+        run = fn 4242 -> {"p4242\nf10\nn127.0.0.1:4096\n", 0} end
+
+        assert {:error, {:listeners_present, ["n127.0.0.1:4096"]}} =
+                 HarnessProcess.assert_zero_listeners(ctx.db, "l-present", run)
+      end
+
+      test "zero listeners across the settle window passes", ctx do
+        :ok = insert_launch!(ctx.db, "l-zero", nil, 4243)
+        # lsof exit 1 with no output = empty selection.
+        run = fn 4243 -> {"", 1} end
+        assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-zero", run)
+      end
+
+      test "the real local probe does not depend on the LaunchDaemon PATH", ctx do
+        # No process group can have this value on Darwin. The system lsof therefore
+        # returns its documented empty-selection status, which the probe accepts.
+        :ok = insert_launch!(ctx.db, "l-system-path", nil, 2_147_483_647)
+
+        assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-system-path")
+      end
+
+      test "an lsof that is not on PATH fails CLOSED (never silently passes)", ctx do
+        :ok = insert_launch!(ctx.db, "l-absent", nil, 4244)
+        run = fn 4244 -> {"lsof is not on this gateway's PATH", 127} end
+
+        assert {:error, {:listener_probe_failed, {:lsof_failed, 127, _}}} =
+                 HarnessProcess.assert_zero_listeners(ctx.db, "l-absent", run)
+      end
+
+      test "an lsof: diagnostic is inconclusive and fails CLOSED", ctx do
+        :ok = insert_launch!(ctx.db, "l-diag", nil, 4245)
+        run = fn 4245 -> {"lsof: WARNING: can't stat() ...", 1} end
+
+        assert {:error, {:listener_probe_failed, {:lsof_diagnostic, _}}} =
+                 HarnessProcess.assert_zero_listeners(ctx.db, "l-diag", run)
+      end
+
+      test "the Gibson tracefs warning passes only for an empty socket selection", ctx do
+        tracefs_warning =
+          "lsof: WARNING: can't stat() tracefs file system /sys/kernel/debug/tracing\n" <>
+            "      Output information may be incomplete.\n"
+
+        :ok = insert_launch!(ctx.db, "l-tracefs-empty", nil, 4247)
+        empty = fn 4247 -> {tracefs_warning, 1} end
+        assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-tracefs-empty", empty)
+
+        :ok = insert_launch!(ctx.db, "l-tracefs-listener", nil, 4248)
+        listening = fn 4248 -> {tracefs_warning <> "p4248\nf10\nn127.0.0.1:4096\n", 0} end
+
+        assert {:error, {:listener_probe_failed, {:lsof_diagnostic, _}}} =
+                 HarnessProcess.assert_zero_listeners(ctx.db, "l-tracefs-listener", listening)
+      end
+
+      test "a remote (ssh) launch is refused — probe unimplemented, not silently passed", ctx do
+        :ok = insert_launch!(ctx.db, "l-remote", "vector@remote", 4246)
+        run = fn _ -> flunk("remote must not run the local probe") end
+
+        assert {:error, :remote_listener_probe_unimplemented} =
+                 HarnessProcess.assert_zero_listeners(ctx.db, "l-remote", run)
+      end
+
+      test "a launch with no recorded process group cannot be probed and is refused", ctx do
+        :ok = insert_launch!(ctx.db, "l-nopgid", nil, nil)
+        run = fn _ -> flunk("must not probe without a pgid") end
+
+        assert {:error, :no_process_group_id} =
+                 HarnessProcess.assert_zero_listeners(ctx.db, "l-nopgid", run)
+      end
+
+      test "the adapter REFUSES (stops) when the assert fails, for a :shim harness", ctx do
+        # A remote row makes assert_zero_listeners return {:error, :remote_...} deterministically.
+        :ok = insert_launch!(ctx.db, "l-guard", "vector@remote", 4247)
+        state = %Tightbeam.Acp.Adapter{harness: :shimstub, cwd: "/tmp"}
+
+        opts = [
+          harness_process_launch_id: "l-guard",
+          db: ctx.db,
+          process_identity_dir: ctx.test_dir
+        ]
+
+        assert {:stop, {:listener_present, :shimstub, :remote_listener_probe_unimplemented},
+                ^state} =
+                 Tightbeam.Acp.Adapter.listener_guard_for_test(
+                   opts,
+                   __MODULE__.ShimStub,
+                   :shimstub,
+                   state,
+                   "/no/such/stderr",
+                   0
+                 )
+      end
+
+      test "the adapter PROCEEDS (:ok) for an :npm harness — invariant 3 does not apply", ctx do
+        state = %Tightbeam.Acp.Adapter{harness: :claude}
+
+        assert :ok =
+                 Tightbeam.Acp.Adapter.listener_guard_for_test(
+                   [db: ctx.db],
+                   Tightbeam.Harness.Claude,
+                   :claude,
+                   state,
+                   "/no/such/stderr",
+                   0
+                 )
+      end
+
+      test "the adapter REFUSES (stops) when a :shim harness has no launch identity", ctx do
+        state = %Tightbeam.Acp.Adapter{harness: :shimstub, cwd: "/tmp"}
+
+        assert {:stop, {:listener_present, :shimstub, :launch_identity_missing}, ^state} =
+                 Tightbeam.Acp.Adapter.listener_guard_for_test(
+                   [db: ctx.db, process_identity_dir: ctx.test_dir],
+                   __MODULE__.ShimStub,
+                   :shimstub,
+                   state,
+                   "/no/such/stderr",
+                   0
+                 )
       end
     end
-
-    test "a missing absolute lsof executable is refused with its classified path" do
-      path = Path.join(System.tmp_dir!(), "tightbeam-no-lsof-#{System.unique_integer()}")
-
-      assert {:error, {:lsof_executable_absent, ^path}} =
-               HarnessProcess.lsof_listen_probe_for_test(4244, path)
-    end
-
-    test "a non-executable lsof file is refused before spawn", ctx do
-      path = Path.join(ctx.test_dir, "not-executable-lsof")
-      File.write!(path, "#!/bin/sh\nexit 1\n")
-      File.chmod!(path, 0o644)
-
-      assert {:error, {:lsof_not_executable, ^path}} =
-               HarnessProcess.lsof_listen_probe_for_test(4244, path)
-    end
-
-    test "a LISTEN socket in the group is caught and refused", ctx do
-      :ok = insert_launch!(ctx.db, "l-present", nil, 4242)
-      # lsof -Fn output: a socket name is an `n`-prefixed line.
-      run = fn 4242 -> {"p4242\nf10\nn127.0.0.1:4096\n", 0} end
-
-      assert {:error, {:listeners_present, ["n127.0.0.1:4096"]}} =
-               HarnessProcess.assert_zero_listeners(ctx.db, "l-present", run)
-    end
-
-    test "zero listeners across the settle window passes", ctx do
-      :ok = insert_launch!(ctx.db, "l-zero", nil, 4243)
-      # lsof exit 1 with no output = empty selection.
-      run = fn 4243 -> {"", 1} end
-      assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-zero", run)
-    end
-
-    test "the real local probe does not depend on the LaunchDaemon PATH", ctx do
-      # No process group can have this value on Darwin. The system lsof therefore
-      # returns its documented empty-selection status, which the probe accepts.
-      :ok = insert_launch!(ctx.db, "l-system-path", nil, 2_147_483_647)
-
-      assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-system-path")
-    end
-
-    test "an lsof that is not on PATH fails CLOSED (never silently passes)", ctx do
-      :ok = insert_launch!(ctx.db, "l-absent", nil, 4244)
-      run = fn 4244 -> {"lsof is not on this gateway's PATH", 127} end
-
-      assert {:error, {:listener_probe_failed, {:lsof_failed, 127, _}}} =
-               HarnessProcess.assert_zero_listeners(ctx.db, "l-absent", run)
-    end
-
-    test "an lsof: diagnostic is inconclusive and fails CLOSED", ctx do
-      :ok = insert_launch!(ctx.db, "l-diag", nil, 4245)
-      run = fn 4245 -> {"lsof: WARNING: can't stat() ...", 1} end
-
-      assert {:error, {:listener_probe_failed, {:lsof_diagnostic, _}}} =
-               HarnessProcess.assert_zero_listeners(ctx.db, "l-diag", run)
-    end
-
-    test "the Gibson tracefs warning passes only for an empty socket selection", ctx do
-      tracefs_warning =
-        "lsof: WARNING: can't stat() tracefs file system /sys/kernel/debug/tracing\n" <>
-          "      Output information may be incomplete.\n"
-
-      :ok = insert_launch!(ctx.db, "l-tracefs-empty", nil, 4247)
-      empty = fn 4247 -> {tracefs_warning, 1} end
-      assert :ok = HarnessProcess.assert_zero_listeners(ctx.db, "l-tracefs-empty", empty)
-
-      :ok = insert_launch!(ctx.db, "l-tracefs-listener", nil, 4248)
-      listening = fn 4248 -> {tracefs_warning <> "p4248\nf10\nn127.0.0.1:4096\n", 0} end
-
-      assert {:error, {:listener_probe_failed, {:lsof_diagnostic, _}}} =
-               HarnessProcess.assert_zero_listeners(ctx.db, "l-tracefs-listener", listening)
-    end
-
-    test "a remote (ssh) launch is refused — probe unimplemented, not silently passed", ctx do
-      :ok = insert_launch!(ctx.db, "l-remote", "vector@remote", 4246)
-      run = fn _ -> flunk("remote must not run the local probe") end
-
-      assert {:error, :remote_listener_probe_unimplemented} =
-               HarnessProcess.assert_zero_listeners(ctx.db, "l-remote", run)
-    end
-
-    test "a launch with no recorded process group cannot be probed and is refused", ctx do
-      :ok = insert_launch!(ctx.db, "l-nopgid", nil, nil)
-      run = fn _ -> flunk("must not probe without a pgid") end
-
-      assert {:error, :no_process_group_id} =
-               HarnessProcess.assert_zero_listeners(ctx.db, "l-nopgid", run)
-    end
-
-    test "the adapter REFUSES (stops) when the assert fails, for a :shim harness", ctx do
-      # A remote row makes assert_zero_listeners return {:error, :remote_...} deterministically.
-      :ok = insert_launch!(ctx.db, "l-guard", "vector@remote", 4247)
-      state = %Tightbeam.Acp.Adapter{harness: :shimstub, cwd: "/tmp"}
-
-      opts = [
-        harness_process_launch_id: "l-guard",
-        db: ctx.db,
-        process_identity_dir: ctx.test_dir
-      ]
-
-      assert {:stop, {:listener_present, :shimstub, :remote_listener_probe_unimplemented}, ^state} =
-               Tightbeam.Acp.Adapter.listener_guard_for_test(
-                 opts,
-                 __MODULE__.ShimStub,
-                 :shimstub,
-                 state,
-                 "/no/such/stderr",
-                 0
-               )
-    end
-
-    test "the adapter PROCEEDS (:ok) for an :npm harness — invariant 3 does not apply", ctx do
-      state = %Tightbeam.Acp.Adapter{harness: :claude}
-
-      assert :ok =
-               Tightbeam.Acp.Adapter.listener_guard_for_test(
-                 [db: ctx.db],
-                 Tightbeam.Harness.Claude,
-                 :claude,
-                 state,
-                 "/no/such/stderr",
-                 0
-               )
-    end
-
-    test "the adapter REFUSES (stops) when a :shim harness has no launch identity", ctx do
-      state = %Tightbeam.Acp.Adapter{harness: :shimstub, cwd: "/tmp"}
-
-      assert {:stop, {:listener_present, :shimstub, :launch_identity_missing}, ^state} =
-               Tightbeam.Acp.Adapter.listener_guard_for_test(
-                 [db: ctx.db, process_identity_dir: ctx.test_dir],
-                 __MODULE__.ShimStub,
-                 :shimstub,
-                 state,
-                 "/no/such/stderr",
-                 0
-               )
+  else
+    test "the ruled-out shared listener seam stays absent" do
+      refute function_exported?(HarnessProcess, :assert_zero_listeners, 2)
+      refute function_exported?(HarnessProcess, :assert_zero_listeners, 3)
+      refute function_exported?(Tightbeam.Acp.Adapter, :listener_guard_for_test, 6)
     end
   end
 

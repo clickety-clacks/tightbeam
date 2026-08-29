@@ -7,6 +7,21 @@ defmodule Tightbeam.Acp.AdapterTest do
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.Model
 
+  setup do
+    previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
+    Application.put_env(:tightbeam, :enabled_dormant_harnesses, [:cursor])
+
+    on_exit(fn ->
+      if is_nil(previous) do
+        Application.delete_env(:tightbeam, :enabled_dormant_harnesses)
+      else
+        Application.put_env(:tightbeam, :enabled_dormant_harnesses, previous)
+      end
+    end)
+
+    :ok
+  end
+
   defmodule SlowBootAdapter do
     use GenServer
 

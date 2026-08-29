@@ -1964,7 +1964,7 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_cursor_provider_v1_020_in_txn(%Txn{} = txn) do
-    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+    harnesses = Enum.map_join(Tightbeam.Harness.known(), ",", &"'#{&1.wire_name()}'")
 
     :ok =
       Txn.exec(

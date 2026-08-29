@@ -21,6 +21,7 @@
     "wire_name": "cursor",
     "install_package": "cursor-agent",
     "cli_binary": "cursor-agent",
-    "process_markers": ["cursor-agent acp"]
+    "process_markers": ["cursor-agent acp"],
+    "enabled": false
   }
 ]

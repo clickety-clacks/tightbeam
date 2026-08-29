@@ -236,6 +236,15 @@ defmodule Tightbeam.ReadinessTest do
     module = Tightbeam.Harness.Cursor
     install_adapter!(ctx.base, module)
 
+    previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
+    Application.put_env(:tightbeam, :enabled_dormant_harnesses, [:cursor])
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :enabled_dormant_harnesses),
+        else: Application.put_env(:tightbeam, :enabled_dormant_harnesses, previous)
+    end)
+
     catalog =
       catalog!(%{module.wire_name() => {[], {:unavailable, {:needs_onboarding, :missing}}}})
 

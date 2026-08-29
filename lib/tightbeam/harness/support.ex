@@ -456,82 +456,7 @@ defmodule Tightbeam.Harness.Support do
   end
 
   defp observe_adapter(module, profile, locality, presence) do
-    case Map.get(profile, :provisioning, :npm) do
-      :npm -> observe_adapter_npm(module, profile, locality, presence)
-      :shim -> observe_adapter_shim(module, profile, locality)
-    end
-  end
-
-  # A binary-native (:shim) harness provisions its adapter by writing a shell shim over the
-  # operator-installed CLI (`Spinup.ensure_shim_adapter`), never by npm-installing a package. The
-  # vector asserts the shim FILE (content + mode) and the shared install line staying empty; it
-  # deliberately does not assert any out-of-tree gate the harness also materializes, only the
-  # shim. `find_executable` resolves the CLI locally; the remote `sh` mock resolves `command -v`
-  # and executes the ssh-carried write script so the shim file actually lands.
-  defp observe_adapter_shim(module, profile, locality) do
-    with_tmp("adapter", fn base ->
-      local? = locality == :local
-      adapter = adapter_path(base, profile.adapter_bin, locality)
-
-      cli_path =
-        if module.id() == :cursor,
-          do: Path.join([base, "2026.08.11-e8db854", "cursor-agent"]),
-          else: Path.join(base, "#{profile.cli_name}-cli")
-
-      File.mkdir_p!(Path.dirname(cli_path))
-      File.write!(cli_path, "vector cli")
-
-      ref = make_ref()
-
-      sh = fn command ->
-        send(self(), {ref, command})
-        joined = Enum.join(command, " ")
-
-        cond do
-          # The shim resolves the operator CLI with `command -v`; hand back the fake path.
-          String.contains?(joined, "command -v") ->
-            {cli_path <> "\n", 0}
-
-          # An ssh-carried `sh -c <script>`: emulate the remote shell exactly as ssh does —
-          # join the args after the destination and run them through `sh -c` — so the shim (and
-          # any gate) write EFFECT actually happens on disk and the shim file can be read back.
-          match?(["ssh" | _], command) ->
-            script_args = Enum.drop(command, 1 + length(@ssh_opts) + 1)
-            System.cmd("sh", ["-c", Enum.join(script_args, " ")])
-
-          true ->
-            {"", 0}
-        end
-      end
-
-      target = %{
-        base_dir: base,
-        host_name: "vector",
-        host_config: %{base_dir: base, ssh: if(local?, do: nil, else: "vector@remote")},
-        adapter_binary: adapter,
-        find_executable: fn _ -> cli_path end,
-        realpath: fn path -> {:ok, path} end,
-        sha256: &cursor_vector_sha256/1,
-        sh: sh
-      }
-
-      result = Tightbeam.Harness.ensure_adapter(module, target)
-      commands = drain_commands(ref, [])
-      stat = File.stat!(adapter)
-
-      %{
-        result: normalize_paths(result, base, nil),
-        install_contribution:
-          commands
-          |> Enum.map(&Enum.join(&1, " "))
-          |> Enum.find_value("", fn command ->
-            if String.contains?(command, "npm install"), do: command, else: false
-          end)
-          |> normalize_paths(base, nil),
-        shim: normalize_paths(File.read!(adapter), base, nil),
-        mode: Bitwise.band(stat.mode, 0o777)
-      }
-    end)
+    observe_adapter_npm(module, profile, locality, presence)
   end
 
   defp cursor_vector_sha256(path) do
@@ -612,31 +537,7 @@ defmodule Tightbeam.Harness.Support do
   end
 
   defp expected_adapter(profile, locality, presence) do
-    case Map.get(profile, :provisioning, :npm) do
-      :npm -> expected_adapter_npm(profile, locality, presence)
-      :shim -> expected_adapter_shim(profile)
-    end
-  end
-
-  # A :shim provision is presence- and locality-invariant in its RESULT: `ensure_shim_adapter`
-  # rewrites the shim over the resolved CLI every time and returns the same `{:ok, detail}`; the
-  # shared npm install line stays empty (a binary-native harness contributes no package). The
-  # shim content is `exec "<cli>" <args> "$@"` at mode 0o755.
-  defp expected_adapter_shim(profile) do
-    # Parameterized per-harness by the profile's shim exec args (default ["acp"]) so a second
-    # binary-native harness (e.g. cursor) reuses this vector by supplying its own values, with no
-    # edit to the shared machinery — the same reuse contract as `Spinup.ensure_shim_adapter/4`.
-    args = Enum.join(Map.get(profile, :shim_exec_args, ["acp"]), " ")
-
-    cli_path =
-      Map.get(profile, :pinned_cli_path, "#{profile.cli_name}-cli")
-
-    %{
-      result: {:ok, "shim adapter present"},
-      install_contribution: "",
-      shim: "#!/bin/sh\nexec \"<BASE>/#{cli_path}\" #{args} \"$@\"\n",
-      mode: 0o755
-    }
+    expected_adapter_npm(profile, locality, presence)
   end
 
   defp expected_adapter_npm(profile, locality, presence) do
@@ -663,12 +564,9 @@ defmodule Tightbeam.Harness.Support do
   defp expected_install_contribution(_locality, :present), do: ""
 
   defp expected_install_contribution(locality, :absent) do
-    # npm_provisioned/0, not all/0 — mirrors Spinup.install_command: a binary-native (:shim)
-    # harness contributes no npm package to the shared install line, so it must be absent from the
-    # EXPECTED contribution too, or every npm harness's ensure_adapter vector would mismatch.
     packages =
       Enum.map_join(
-        Tightbeam.Harness.npm_provisioned(),
+        Tightbeam.Harness.all(),
         " ",
         &"#{&1.install_package()}@#{&1.adapter_version()}"
       )

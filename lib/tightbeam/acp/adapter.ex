@@ -402,65 +402,12 @@ defmodule Tightbeam.Acp.Adapter do
            timeout: :infinity
          ) do
       {:ok, %{"protocolVersion" => 1}} ->
-        case listener_guard(opts, module, harness, state, stderr_path, offset) do
-          :ok -> gate(opts, state)
-          stop -> stop
-        end
+        gate(opts, state)
 
       other ->
         {:stop, adapter_failure_reason({:initialize_failed, other}, stderr_path, offset), state}
     end
   end
-
-  # Rails-critical launch invariant 3 (ZERO LISTEN sockets in the launched process group), asserted
-  # AFTER `initialize` returns — the harness is fully booted by the time it answers, so a listener
-  # it binds DURING boot is now observable. A pre-initialize probe raced the bind: OpenCode's
-  # :4096 HTTP server comes up ~0.3–1.1s after spawn, AFTER `capture_identity`. Fail-closed: a
-  # listener (or an inconclusive probe) refuses the launch. Applies automatically to the :shim
-  # harness class (`Harness.requires_zero_listeners?/1`) on production launches that
-  # recorded a process identity directory; a launch with identity dir but no recorded
-  # launch id cannot be probed and is refused for :shim harnesses.
-  #
-  # RESIDUAL (honest, unclosable by this mechanism): even a settle-window probe cannot catch a
-  # listener bound strictly AFTER the last sample. That gap is input for the go-live threat-model
-  # adjudication, not something the assert can eliminate.
-  defp listener_guard(opts, module, harness, state, stderr_path, offset) do
-    cond do
-      not Harness.requires_zero_listeners?(module) ->
-        :ok
-
-      not Keyword.has_key?(opts, :process_identity_dir) ->
-        :ok
-
-      match?({:ok, _launch_id}, Keyword.fetch(opts, :harness_process_launch_id)) ->
-        launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
-        db = Keyword.get(opts, :db, Tightbeam.DB)
-
-        case Tightbeam.HarnessProcess.assert_zero_listeners(db, launch_id) do
-          :ok ->
-            :ok
-
-          {:error, reason} ->
-            {:stop,
-             adapter_failure_reason({:listener_present, harness, reason}, stderr_path, offset),
-             state}
-        end
-
-      true ->
-        {:stop,
-         adapter_failure_reason(
-           {:listener_present, harness, :launch_identity_missing},
-           stderr_path,
-           offset
-         ), state}
-    end
-  end
-
-  @doc false
-  # Test seam for the invariant-3 refuse-wiring: a full adapter boot needs a registered :shim
-  # harness (Phase-2), so exercise the guard directly here.
-  def listener_guard_for_test(opts, module, harness, state, stderr_path, offset),
-    do: listener_guard(opts, module, harness, state, stderr_path, offset)
 
   defp gate(opts, state) do
     case Keyword.fetch(opts, :probe_cwd) do

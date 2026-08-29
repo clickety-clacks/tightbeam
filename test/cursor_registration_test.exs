@@ -4,12 +4,30 @@ defmodule Tightbeam.CursorRegistrationTest do
   alias Tightbeam.Harness
   alias Tightbeam.Harness.Cursor
 
-  test "Cursor registers as the only new shim harness" do
-    assert Cursor in Harness.all()
+  setup do
+    previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
+    Application.put_env(:tightbeam, :enabled_dormant_harnesses, [:cursor])
+    on_exit(fn -> restore_enablement(previous) end)
+    :ok
+  end
+
+  test "Cursor stays dormant until an explicit enablement election" do
+    previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
+    on_exit(fn -> restore_enablement(previous) end)
+
+    Application.delete_env(:tightbeam, :enabled_dormant_harnesses)
+    refute Cursor in Harness.all()
     refute "opencode" in Enum.map(Harness.all(), & &1.wire_name())
-    assert Cursor.adapter_provisioning() == :shim
-    assert Harness.requires_zero_listeners?(Cursor)
-    refute function_exported?(Cursor, :requires_zero_listeners?, 0)
+
+    Application.put_env(:tightbeam, :enabled_dormant_harnesses, [:cursor])
+    assert Cursor in Harness.all()
+
+    refute function_exported?(Cursor, :adapter_provisioning, 0)
+    refute function_exported?(Harness, :npm_provisioned, 0)
+    refute function_exported?(Harness, :requires_zero_listeners?, 1)
+    refute function_exported?(Tightbeam.Spinup, :ensure_shim_adapter, 4)
+    refute function_exported?(Tightbeam.Acp.Adapter, :listener_guard_for_test, 6)
+    refute function_exported?(Tightbeam.HarnessProcess, :assert_zero_listeners, 2)
   end
 
   test "Cursor pins the binary-native launch and API-key seams" do
@@ -475,4 +493,9 @@ defmodule Tightbeam.CursorRegistrationTest do
     |> then(&:crypto.hash(:sha256, &1))
     |> Base.encode16(case: :lower)
   end
+
+  defp restore_enablement(nil), do: Application.delete_env(:tightbeam, :enabled_dormant_harnesses)
+
+  defp restore_enablement(value),
+    do: Application.put_env(:tightbeam, :enabled_dormant_harnesses, value)
 end

@@ -27,13 +27,16 @@ defmodule Tightbeam.HarnessSeamTest do
       |> File.read!()
       |> JSON.decode!()
 
-    modules = Enum.map(rows, &(&1["module"] |> String.split(".") |> Module.concat()))
+    enabled_rows = Enum.reject(rows, &(&1["enabled"] == false))
+    modules = Enum.map(enabled_rows, &(&1["module"] |> String.split(".") |> Module.concat()))
     assert modules == Enum.reject(Harness.all(), &(&1 == Harness.Fixture))
 
-    Enum.zip(rows, modules)
+    Enum.zip(enabled_rows, modules)
     |> Enum.each(fn {row, module} ->
-      assert Map.delete(row, "module") == JSON.decode!(module.wire_projection())
+      assert row |> Map.drop(["module", "enabled"]) == JSON.decode!(module.wire_projection())
     end)
+
+    assert Enum.find(rows, &(&1["wire_name"] == "cursor"))["enabled"] == false
   end
 
   test "fixture fetches a catalog and reconciles its home through the shared seam" do
