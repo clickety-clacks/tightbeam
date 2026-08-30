@@ -102,9 +102,13 @@ defmodule Tightbeam.CodexUsage do
     {entry, state} = ensure_binding(state, key, kind)
 
     if eligible?(key, kind) do
+      settled_usage =
+        if entry.settled_failure and is_nil(entry.accepted) and is_nil(entry.claim),
+          do: wire_usage(entry)
+
       {entry, state} = refresh_if_needed(state, key, entry, now_ms)
 
-      {:reply, %{generation: entry.generation, usage: wire_usage(entry)},
+      {:reply, %{generation: entry.generation, usage: settled_usage || wire_usage(entry)},
        put_entry(state, key, entry)}
     else
       {:reply, nil, state}
@@ -191,6 +195,8 @@ defmodule Tightbeam.CodexUsage do
   def handle_cast({:adapter_event, _key, _adapter, {:auth, _classification}}, state),
     do: {:noreply, state}
 
+  def handle_cast(_unexpected, state), do: {:stop, :unexpected_cast, state}
+
   @impl GenServer
   def format_status(status) do
     entries =
@@ -247,7 +253,9 @@ defmodule Tightbeam.CodexUsage do
       claim: nil,
       baseline: nil,
       accepted: nil,
+      invalid_fetched_at: nil,
       reason: reason,
+      settled_failure: false,
       stale: false
     }
   end
@@ -300,7 +308,14 @@ defmodule Tightbeam.CodexUsage do
         }
 
         state.request.(entry.adapter, claim)
-        {%{entry | claim: claim, stale: not is_nil(entry.accepted), reason: nil}, state}
+
+        {%{
+           entry
+           | claim: claim,
+             settled_failure: false,
+             stale: not is_nil(entry.accepted),
+             reason: nil
+         }, state}
     end
   end
 
@@ -312,8 +327,16 @@ defmodule Tightbeam.CodexUsage do
       mutation_sequence: sequence
     }
 
-    {%{entry | claim: nil, baseline: baseline, accepted: accepted, stale: false, reason: nil},
-     if(invalid?, do: :invalid, else: :accepted)}
+    {%{
+       entry
+       | claim: nil,
+         baseline: baseline,
+         accepted: accepted,
+         invalid_fetched_at: nil,
+         stale: false,
+         settled_failure: false,
+         reason: nil
+     }, if(invalid?, do: :invalid, else: :accepted)}
   end
 
   defp settle_full(entry, {:invalid_usage, baseline, fetched_at, _invalid?}, _sequence) do
@@ -326,19 +349,23 @@ defmodule Tightbeam.CodexUsage do
            baseline: baseline,
            stale: false,
            reason: :invalid_usage,
-           invalid_fetched_at: fetched_at
+           invalid_fetched_at: fetched_at,
+           settled_failure: true
        }, :invalid}
     end
   end
 
   defp settle_full(entry, {:error, reason}, _sequence)
        when reason in [:timeout, :provider_unavailable] do
-    {entry |> Map.put(:claim, nil) |> mark_unavailable(reason), reason}
+    {entry |> Map.put(:claim, nil) |> mark_unavailable(reason) |> Map.put(:settled_failure, true),
+     reason}
   end
 
   defp settle_full(entry, _result, _sequence) do
-    {entry |> Map.put(:claim, nil) |> mark_unavailable(:provider_unavailable),
-     :provider_unavailable}
+    {entry
+     |> Map.put(:claim, nil)
+     |> mark_unavailable(:provider_unavailable)
+     |> Map.put(:settled_failure, true), :provider_unavailable}
   end
 
   defp accept_sparse(state, key, %{baseline: nil} = entry, _sparse, _fetched_at) do
@@ -419,17 +446,33 @@ defmodule Tightbeam.CodexUsage do
 
   defp sanitize_window(value, mode) do
     [
-      {:used_percent, "usedPercent"},
+      {:remaining_percent, "usedPercent"},
       {:duration, "windowDurationMins"},
-      {:resets_at, "resetsAt"}
+      {:reset_at, "resetsAt"}
     ]
     |> Enum.reduce(%{}, fn {target, source}, acc ->
       case Map.fetch(value, source) do
-        {:ok, nil} when mode == :sparse -> acc
-        {:ok, nil} when target == :resets_at -> Map.put(acc, target, nil)
-        {:ok, integer} when is_integer(integer) -> Map.put(acc, target, integer)
-        {:ok, _invalid} -> Map.put(acc, target, :invalid)
-        :error -> acc
+        {:ok, nil} when mode == :sparse ->
+          acc
+
+        {:ok, nil} when target == :reset_at ->
+          Map.put(acc, target, nil)
+
+        {:ok, integer}
+        when target == :remaining_percent and is_integer(integer) and integer in 0..100 ->
+          Map.put(acc, target, 100 - integer)
+
+        {:ok, integer} when target == :reset_at and is_integer(integer) ->
+          Map.put(acc, target, integer * 1_000)
+
+        {:ok, integer} when is_integer(integer) ->
+          Map.put(acc, target, integer)
+
+        {:ok, _invalid} ->
+          Map.put(acc, target, :invalid)
+
+        :error ->
+          acc
       end
     end)
   end
@@ -461,15 +504,15 @@ defmodule Tightbeam.CodexUsage do
   defp project_window(nil), do: :empty
   defp project_window(window) when map_size(window) == 0, do: :empty
 
-  defp project_window(%{used_percent: used, duration: duration} = window)
-       when is_integer(used) and used in 0..100 and duration in [300, 10_080] do
-    case Map.get(window, :resets_at) do
+  defp project_window(%{remaining_percent: remaining, duration: duration} = window)
+       when is_integer(remaining) and remaining in 0..100 and duration in [300, 10_080] do
+    case Map.get(window, :reset_at) do
       reset when is_integer(reset) or is_nil(reset) ->
         {:ok,
          %{
            label: if(duration == 300, do: "5h", else: "Week"),
-           remaining_percent: 100 - used,
-           reset_at: if(is_integer(reset), do: reset * 1_000, else: nil)
+           remaining_percent: remaining,
+           reset_at: reset
          }}
 
       _ ->

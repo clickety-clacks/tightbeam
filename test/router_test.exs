@@ -1384,6 +1384,93 @@ defmodule Tightbeam.Wire.RouterTest do
            }
   end
 
+  test "session status preserves recursive base parity across every Codex usage state", ctx do
+    key = "codex-usage-state-matrix"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    base_status = %{
+      session_key: key,
+      session_usage: %{input_tokens: 12, cached_input_tokens: 3},
+      display: %{status: "ready", nested: %{preserved: [1, %{value: true}]}}
+    }
+
+    request = fn status ->
+      opts = Keyword.put(ctx.opts, :session_status, fn ^key -> status end)
+
+      response =
+        Plug.Test.conn(:get, "/api/session-status?sessionKey=#{key}")
+        |> Plug.Conn.put_req_header("authorization", "Bearer " <> ctx.device.token)
+        |> Router.call(Router.init(opts))
+
+      assert response.status == 200
+      JSON.decode!(response.resp_body)
+    end
+
+    base_response = request.(base_status)
+
+    states = [
+      {"fresh", "oauth",
+       %{
+         freshness: "fresh",
+         fetched_at: 1_770_000_000_000,
+         windows: [
+           %{label: "5h", remaining_percent: 72, reset_at: 1_770_003_600_000},
+           %{label: "Week", remaining_percent: 41, reset_at: nil}
+         ]
+       }},
+      {"stale", "oauth",
+       %{
+         freshness: "stale",
+         fetched_at: 1_770_000_000_001,
+         windows: [%{label: "5h", remaining_percent: 66, reset_at: nil}]
+       }},
+      {"loading", "oauth", %{freshness: "loading", windows: []}},
+      {"unavailable", "oauth",
+       %{
+         freshness: "unavailable",
+         windows: [],
+         unavailable_reason: "provider_unavailable"
+       }}
+    ]
+
+    for {state, auth_mode, usage} <- states do
+      response =
+        request.(
+          base_status
+          |> Map.put(:metadata_context_generation, "generation-#{state}")
+          |> Map.put(
+            :display,
+            Map.merge(base_status.display, %{
+              auth_mode: auth_mode,
+              codex_usage: usage
+            })
+          )
+        )
+
+      assert response["metadataContextGeneration"] == "generation-#{state}"
+      assert response["display"]["authMode"] == auth_mode
+      assert response["display"]["codexUsage"]["freshness"] == state
+      assert is_list(response["display"]["codexUsage"]["windows"])
+
+      if state in ["loading", "unavailable"] do
+        assert response["display"]["codexUsage"]["windows"] == []
+      end
+
+      assert strip_codex_usage_additions(response) == base_response
+    end
+
+    ineligible =
+      request.(%{
+        base_status
+        | display: Map.put(base_status.display, :auth_mode, "api_key")
+      })
+
+    assert ineligible["display"]["authMode"] == "api_key"
+    refute Map.has_key?(ineligible, "metadataContextGeneration")
+    refute Map.has_key?(ineligible["display"], "codexUsage")
+    assert strip_codex_usage_additions(ineligible) == base_response
+  end
+
   test "facts-read routes as a read verb and list sessions use createdAt on the wire", ctx do
     parent = self()
 
@@ -2149,4 +2236,16 @@ defmodule Tightbeam.Wire.RouterTest do
       })
     end
   end
+
+  defp strip_codex_usage_additions(value) when is_list(value) do
+    Enum.map(value, &strip_codex_usage_additions/1)
+  end
+
+  defp strip_codex_usage_additions(value) when is_map(value) do
+    value
+    |> Map.drop(["metadataContextGeneration", "authMode", "codexUsage"])
+    |> Map.new(fn {key, nested} -> {key, strip_codex_usage_additions(nested)} end)
+  end
+
+  defp strip_codex_usage_additions(value), do: value
 end

@@ -1283,7 +1283,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert_receive {:adapter_event, ^adapter, {:sparse, sparse, fetched_at}}
     assert is_integer(fetched_at)
-    assert sparse == %{primary: %{used_percent: 28, duration: 300}}
+    assert sparse == %{primary: %{remaining_percent: 72, duration: 300}}
     refute inspect(sparse) =~ "PRIVATE"
   end
 
