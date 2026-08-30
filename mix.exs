@@ -6,7 +6,7 @@ defmodule Tightbeam.MixProject do
       app: :tightbeam,
       version: cli_version(),
       elixir: "~> 1.19",
-      compilers: [:elixir_make] ++ Mix.compilers(),
+      compilers: [:topline_unicode, :elixir_make] ++ Mix.compilers(),
       make_clean: ["clean"],
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -68,5 +68,40 @@ defmodule Tightbeam.MixProject do
       {:toml, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
+  end
+end
+
+defmodule Mix.Tasks.Compile.ToplineUnicode do
+  @moduledoc false
+  use Mix.Task.Compiler
+
+  @impl Mix.Task.Compiler
+  def run(_args) do
+    root = File.cwd!()
+    manifest = Path.join(root, "native/topline_unicode/Cargo.toml")
+    cargo = System.find_executable("cargo") || Mix.raise("cargo is required to build Toplines")
+
+    {output, status} =
+      System.cmd(
+        cargo,
+        ["build", "--locked", "--release", "--manifest-path", manifest],
+        cd: root,
+        stderr_to_stdout: true
+      )
+
+    if status != 0, do: Mix.raise("Toplines Unicode extension build failed:\n#{output}")
+
+    {source_name, target_name} =
+      case :os.type() do
+        {:unix, :darwin} -> {"libtopline_unicode.dylib", "topline_unicode.dylib"}
+        {:unix, _} -> {"libtopline_unicode.so", "topline_unicode.so"}
+        other -> Mix.raise("Toplines Unicode extension does not support #{inspect(other)}")
+      end
+
+    source = Path.join(root, "native/topline_unicode/target/release/#{source_name}")
+    target = Path.join(root, "priv/#{target_name}")
+    File.mkdir_p!(Path.dirname(target))
+    File.cp!(source, target)
+    {:ok, []}
   end
 end
