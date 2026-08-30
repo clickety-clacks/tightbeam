@@ -38,6 +38,25 @@ see `priv/kungfu/agentic-engineering/guidance/harness-support.md`.
 `--api-key` will not read from a terminal — a key typed at a prompt lands in
 shell scrollback.
 
+### The pinned Cursor bundle is an obtainable operand
+
+Cursor support is pinned to one `cursor-agent` version, `2026.08.11-e8db854`,
+verified by SHA-256 at every launch (`Tightbeam.Harness.Cursor`:
+`cursor-agent` `eed61c52…`, `index.js` `6aceb24b…`). Nothing is vendored or
+patched: the bundle is Cursor's own published archive, at the URL shape its
+installer script downloads from, and every version stays published:
+
+    https://downloads.cursor.com/lab/2026.08.11-e8db854/<darwin|linux>/<x64|arm64>/agent-cli-package.tar.gz
+
+Its `dist-package/` is byte-identical to the pinned bundle. `tightbeam onboard
+cursor` prints the exact admin block for the dedicated execution account: an
+unprivileged download and extraction into a temp dir, `shasum -a 256 -c`
+(`sha256sum -c` on Linux) against both digests, and only on a pass the root
+extraction into the execution account's home (`--no-same-owner
+--no-same-permissions`). Provisioning a host therefore never depends on the
+operator having that version installed, and wrong bytes are refused before
+they reach the execution account — and again at every launch.
+
 Both paths validate against the provider BEFORE banking. A rejection names the
 provider, the host and the kind, and leaves the existing credential untouched.
 An `onboarded` result from the CLI is therefore a claim about the ceremony, not

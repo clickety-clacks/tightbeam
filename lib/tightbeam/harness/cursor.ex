@@ -167,8 +167,11 @@ defmodule Tightbeam.Harness.Cursor do
   config ON ITS CANONICAL PATH (`<base>/auth/github/gh`): no copy, so rotation
   semantics are exactly the bank's. Applied only when the host is provisioned —
   the execution home carries the `tightbeam-workspace` gid, resolved by NAME —
-  and never widened to any other group. `tightbeam onboard github` resets the
-  bank to 0700; the next Cursor delivery re-applies this grant.
+  and never widened to any other group. `tightbeam onboard github` (credential
+  rotation) detects the grant by that same name on the gh dir and keeps it —
+  traversal 0710, gh 0750, exactly these two files 0640 on the group,
+  including the `hosts.yml` gh rewrites — so a live Cursor session never loses git auth between a
+  rotation and its next delivery (`cli/src/github_auth/bank.rs` `BankLayout`).
   """
   @spec grant_bank_access!(String.t(), String.t() | nil) :: :ok
   def grant_bank_access!(base_dir, execution_home_override \\ nil) do

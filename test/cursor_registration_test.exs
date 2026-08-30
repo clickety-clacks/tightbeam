@@ -502,6 +502,25 @@ defmodule Tightbeam.CursorRegistrationTest do
     |> Base.encode16(case: :lower)
   end
 
+  test "the CLI's admin instructions obtain the same pinned bundle this adapter verifies" do
+    # The admin block `tightbeam onboard cursor` prints downloads Cursor's
+    # published archive for one exact version and checks two digests. Those
+    # three values must be the ones this module verifies at every launch, or a
+    # host provisioned by the book would be refused.
+    elixir = File.read!("lib/tightbeam/harness/cursor.ex")
+    rust = File.read!("cli/src/cursor_execution_identity.rs")
+
+    for attribute <- ["@launcher_sha256", "@bundle_sha256"] do
+      [_, digest] = Regex.run(~r/#{attribute} "([0-9a-f]{64})"/, elixir)
+      assert rust =~ ~s("#{digest}"), "#{attribute} #{digest} is not pinned in the CLI"
+    end
+
+    assert rust =~ ~s(const CURSOR_VERSION: &str = "#{Cursor.adapter_version()}")
+
+    assert rust =~
+             "https://downloads.cursor.com/lab/{CURSOR_VERSION}/{OS}/{ARCH}/agent-cli-package.tar.gz"
+  end
+
   defp restore_enablement(nil), do: Application.delete_env(:tightbeam, :enabled_dormant_harnesses)
 
   defp restore_enablement(value),
