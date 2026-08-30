@@ -77,6 +77,16 @@ defmodule Mix.Tasks.Compile.ToplineUnicode do
   def run(_args) do
     root = File.cwd!()
     manifest = Path.join(root, "native/topline_unicode/Cargo.toml")
+    target = Path.join(root, "priv/#{target_name()}")
+
+    if current?(root, target) do
+      {:noop, []}
+    else
+      build(root, manifest, target)
+    end
+  end
+
+  defp build(root, manifest, target) do
     cargo = System.find_executable("cargo") || Mix.raise("cargo is required to build Toplines")
 
     {output, status} =
@@ -89,17 +99,43 @@ defmodule Mix.Tasks.Compile.ToplineUnicode do
 
     if status != 0, do: Mix.raise("Toplines Unicode extension build failed:\n#{output}")
 
-    {source_name, target_name} =
-      case :os.type() do
-        {:unix, :darwin} -> {"libtopline_unicode.dylib", "topline_unicode.dylib"}
-        {:unix, _} -> {"libtopline_unicode.so", "topline_unicode.so"}
-        other -> Mix.raise("Toplines Unicode extension does not support #{inspect(other)}")
-      end
-
-    source = Path.join(root, "native/topline_unicode/target/release/#{source_name}")
-    target = Path.join(root, "priv/#{target_name}")
+    source = Path.join(root, "native/topline_unicode/target/release/#{source_name()}")
     File.mkdir_p!(Path.dirname(target))
     File.cp!(source, target)
     {:ok, []}
+  end
+
+  defp current?(root, target) do
+    with {:ok, target_stat} <- File.stat(target, time: :posix) do
+      sources =
+        [
+          Path.join(root, "native/topline_unicode/Cargo.toml"),
+          Path.join(root, "native/topline_unicode/Cargo.lock")
+          | Path.wildcard(Path.join(root, "native/topline_unicode/src/**/*.rs"))
+        ]
+
+      Enum.all?(sources, fn source ->
+        {:ok, source_stat} = File.stat(source, time: :posix)
+        source_stat.mtime <= target_stat.mtime
+      end)
+    else
+      _ -> false
+    end
+  end
+
+  defp source_name do
+    case :os.type() do
+      {:unix, :darwin} -> "libtopline_unicode.dylib"
+      {:unix, _} -> "libtopline_unicode.so"
+      other -> Mix.raise("Toplines Unicode extension does not support #{inspect(other)}")
+    end
+  end
+
+  defp target_name do
+    case :os.type() do
+      {:unix, :darwin} -> "topline_unicode.dylib"
+      {:unix, _} -> "topline_unicode.so"
+      other -> Mix.raise("Toplines Unicode extension does not support #{inspect(other)}")
+    end
   end
 end
