@@ -12,7 +12,7 @@ defmodule Tightbeam.Firehose.Hub do
 
   alias Tightbeam.StateVisibility
 
-  @max_queue 1_000
+  @default_queue_limit 1_000
 
   defmodule Socket do
     @moduledoc false
@@ -30,13 +30,16 @@ defmodule Tightbeam.Firehose.Hub do
               overflowed: false
   end
 
-  defstruct sockets: %{}, shutting_down: false, shutdown_waiter: nil
+  defstruct sockets: %{},
+            queue_limit: @default_queue_limit,
+            shutting_down: false,
+            shutdown_waiter: nil
 
   @type server :: GenServer.server()
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []),
-    do: GenServer.start_link(__MODULE__, :ok, name: Keyword.get(opts, :name, __MODULE__))
+    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
 
   @doc "Register a raw all-notice sink. Production change sockets use register/3."
   @spec register(server(), pid()) :: :ok
@@ -99,7 +102,8 @@ defmodule Tightbeam.Firehose.Hub do
     do: GenServer.cast(server, {:committed, class, payload, refs})
 
   @impl true
-  def init(:ok), do: {:ok, %__MODULE__{}}
+  def init(opts),
+    do: {:ok, %__MODULE__{queue_limit: Keyword.get(opts, :queue_limit, @default_queue_limit)}}
 
   @impl true
   def handle_call({:register, pid, opts}, _from, state) do
@@ -217,15 +221,16 @@ defmodule Tightbeam.Firehose.Hub do
   defp fanout(state, notice) do
     sockets =
       Map.new(state.sockets, fn {pid, socket} ->
-        {pid, deliver_notice(pid, socket, notice)}
+        {pid, deliver_notice(pid, socket, notice, state.queue_limit)}
       end)
 
     %{state | sockets: sockets}
   end
 
-  defp deliver_notice(_pid, %{overflowed: true} = socket, _notice), do: socket
+  defp deliver_notice(_pid, %{overflowed: true} = socket, _notice, _queue_limit),
+    do: socket
 
-  defp deliver_notice(pid, socket, notice) do
+  defp deliver_notice(pid, socket, notice, queue_limit) do
     cond do
       socket.mode == :pending ->
         socket
@@ -235,23 +240,23 @@ defmodule Tightbeam.Firehose.Hub do
         socket
 
       socket.mode == :all ->
-        enqueue_frames(pid, socket, [notice])
+        enqueue_frames(pid, socket, [notice], queue_limit)
 
       visible?(notice, socket) ->
         {frames, seq} = matching_frames(notice, socket.subscriptions, socket.seq)
-        enqueue_frames(pid, %{socket | seq: seq}, frames)
+        enqueue_frames(pid, %{socket | seq: seq}, frames, queue_limit)
 
       true ->
         socket
     end
   end
 
-  defp enqueue_frames(_pid, socket, []), do: socket
+  defp enqueue_frames(_pid, socket, [], _queue_limit), do: socket
 
-  defp enqueue_frames(pid, socket, frames) do
+  defp enqueue_frames(pid, socket, frames, queue_limit) do
     occupied = socket.queued + if(socket.in_flight, do: 1, else: 0)
 
-    if occupied + length(frames) > @max_queue do
+    if occupied + length(frames) > queue_limit do
       send(pid, :firehose_overflow)
 
       %{
