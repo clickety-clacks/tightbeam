@@ -78,7 +78,8 @@ defmodule Tightbeam.Schema do
   # its one exact predecessor, and historical rows remain null.
   # Terminal operator decisions advance v7 to v8. Nullable effective parent
   # then relaxes the stored parent constraint from that exact predecessor.
-  @shape "coordination-fabric-v1-phase1-v9"
+  @shape "coordination-fabric-v1-phase1-v10"
+  @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v9"
   @nullable_effective_parent_previous_shape "coordination-fabric-v1-phase1-v8"
   @terminal_decision_previous_shape "coordination-fabric-v1-phase1-v7"
   @message_type_previous_shape "coordination-fabric-v1-phase1-v6"
@@ -273,6 +274,13 @@ defmodule Tightbeam.Schema do
            dispositionKind IS NOT NULL AND dispositionId IS NOT NULL AND
            ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
              livenessTriggerId IS NOT NULL AND actionNeeded = 1)
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND
+             requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND
+             reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND
+             dispositionKind = 'decision_request_transition' AND
+             causalSourceId = dispositionId)
             OR
             (workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND
              livenessTriggerId IS NULL AND actionNeeded = 0)))
@@ -968,6 +976,90 @@ defmodule Tightbeam.Schema do
   end
 
   @doc false
+  @spec upgrade_effort_request_exit_v1(DB.server()) :: :ok
+  def upgrade_effort_request_exit_v1(db) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@effort_request_exit_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_effort_request_exit_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           for name <- [
+                 "wakes_typed_cancellation_required",
+                 "wake_cancellations_pending_insert"
+               ] do
+             :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{name}")
+           end
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_exit_v1"
+             )
+
+           table = Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
+           :ok = Txn.exec(txn, table.sql)
+
+           columns =
+             "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+               "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+               "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+               "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+           :ok =
+             Txn.exec(
+               txn,
+               "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_effort_exit_v1"
+             )
+
+           :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_effort_exit_v1")
+
+           for name <- [
+                 "wake_cancellations_pending_insert",
+                 "wakes_typed_cancellation_required"
+               ] do
+             object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+             :ok = Txn.exec(txn, object.sql)
+           end
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @effort_request_exit_previous_shape,
+             @shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_effort_request_exit_v1: stamp race")
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_effort_request_exit_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_effort_request_exit_v1: migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
   @spec upgrade_operational_parent_v1(DB.server(), keyword()) :: :ok
   def upgrade_operational_parent_v1(db, opts \\ []) when is_list(opts) do
     case DB.foreign_key_rebuild(db, fn txn ->
@@ -1290,7 +1382,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @nullable_effective_parent_previous_shape,
-             @shape,
+             @effort_request_exit_previous_shape,
              System.system_time(:millisecond)
            ])
 
@@ -1558,30 +1650,38 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@effort_request_exit_previous_shape]]} ->
+        upgrade_effort_request_exit_v1(db)
+
       {:ok, [[@nullable_effective_parent_previous_shape]]} ->
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_effort_request_exit_v1(db)
 
       {:ok, [[@terminal_decision_previous_shape]]} ->
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_effort_request_exit_v1(db)
 
       {:ok, [[@message_type_previous_shape]]} ->
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_effort_request_exit_v1(db)
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_effort_request_exit_v1(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_effort_request_exit_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1600,7 +1700,7 @@ defmodule Tightbeam.Schema do
         There is no migration from #{found}. The only supported upgrade sources
         are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
         #{@message_type_previous_shape}, #{@terminal_decision_previous_shape}, and
-        #{@nullable_effective_parent_previous_shape}.
+        #{@nullable_effective_parent_previous_shape}, and #{@effort_request_exit_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
