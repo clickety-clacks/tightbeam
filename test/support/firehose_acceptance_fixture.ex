@@ -23,6 +23,12 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     :user_id
   ]
 
+  # A restarted leg can pay the cold Mix/BEAM startup cost again after the
+  # first gateway has been torn down. Keep this bound finite, but do not let
+  # the restart proof fail merely because the second boot is colder than the
+  # first one.
+  @restart_boot_timeout_ms 120_000
+
   def start!(opts \\ []) do
     id = System.unique_integer([:positive, :monotonic])
     base_dir = Path.join(System.tmp_dir!(), "tightbeam-firehose-acceptance-#{id}")
@@ -206,7 +212,10 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     end
 
     restarted =
-      case LegGateway.boot(fixture.base_dir, fixture.port, repo_root: fixture.repo_root) do
+      case LegGateway.boot(fixture.base_dir, fixture.port,
+             repo_root: fixture.repo_root,
+             boot_timeout_ms: @restart_boot_timeout_ms
+           ) do
         {:ok, gateway} ->
           gateway
 
