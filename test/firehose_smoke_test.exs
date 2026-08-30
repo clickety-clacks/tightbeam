@@ -14,9 +14,10 @@ defmodule Tightbeam.FirehoseSmokeTest do
   real socket, but current main has no R8b registry or emission rows. A4 therefore
   remains partial for the excluded delete/recreate edge and production R8b emission.
 
-  A5 slow-consumer 4008/reconnect/rebuild is automated here. A5 remains partial
-  for gateway-kill recovery until Card 4 promotes the existing restart smoke into
-  ExUnit.
+  A5 slow-consumer 4008/reconnect/rebuild and gateway-kill recovery are automated
+  here. `Tightbeam.FirehoseRestartSmokeTest` keeps that Card 1 journey in the
+  normal suite and adds automated A5 gateway-kill recovery and A7 external-client
+  restart proof on Linux and macOS CI.
   """
 
   @a4_versioned %{
