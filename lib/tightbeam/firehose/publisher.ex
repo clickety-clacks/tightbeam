@@ -213,9 +213,14 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc false
   def encode_wire_notice(%{"class" => class, "payload" => payload} = notice) do
     case Registry.fetch(class) do
+      {:ok, %{resource: "productions"}} ->
+        JSON.encode!(notice)
+
       {:ok, %{resource: resource}} when is_map(payload) ->
-        if StateResources.admin_resource?(resource) do
-          bytes = StateResources.encode_admin_item(resource, payload)
+        # Some current-main producers still publish result-shaped partial maps. Only a closed
+        # R7/R7a item is eligible for RawJSON; the shared encoder remains strict for REST parity.
+        if StateResources.complete_item?(resource, payload) do
+          bytes = StateResources.encode_item(resource, payload)
           JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
         else
           JSON.encode!(notice)

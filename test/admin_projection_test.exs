@@ -227,8 +227,8 @@ defmodule Tightbeam.AdminProjectionTest do
       row = Map.fetch!(Registry.rows(), expected.class)
       detail_item = apply(StateResources, row.serializer, [expected.raw])
       notice_item = expected.notice["payload"]
-      detail_bytes = StateResources.encode_admin_item(expected.resource, detail_item)
-      notice_bytes = StateResources.encode_admin_item(expected.resource, notice_item)
+      detail_bytes = StateResources.encode_item(expected.resource, detail_item)
+      notice_bytes = StateResources.encode_item(expected.resource, notice_item)
 
       assert row.resource == expected.resource
       assert row.op == "upsert"
@@ -435,8 +435,8 @@ defmodule Tightbeam.AdminProjectionTest do
              ) ==
                detail_item
 
-      assert StateResources.encode_admin_item(test_case.resource, detail_item) ==
-               StateResources.encode_admin_item(
+      assert StateResources.encode_item(test_case.resource, detail_item) ==
+               StateResources.encode_item(
                  test_case.resource,
                  Enum.find(
                    collection_items,
@@ -480,7 +480,7 @@ defmodule Tightbeam.AdminProjectionTest do
         Enum.map(test_case.collection.(%{}), fn row ->
           row
           |> test_case.serializer.()
-          |> then(&StateResources.encode_admin_item(test_case.resource, &1))
+          |> then(&StateResources.encode_item(test_case.resource, &1))
         end)
       end)
       |> Enum.join("\n")
@@ -910,7 +910,7 @@ defmodule Tightbeam.AdminProjectionTest do
         end) <> "}"
 
     item = StateResources.identity(raw)
-    item_bytes = StateResources.encode_admin_item("identity", item)
+    item_bytes = StateResources.encode_item("identity", item)
     notice = Publisher.committed_notice("identity.updated", raw, %{"name" => "served"})
     wire_bytes = Publisher.encode_wire_notice(notice)
 
@@ -1309,7 +1309,7 @@ defmodule Tightbeam.AdminProjectionTest do
          StateResources.kungfu(StateResources.query_kungfu(ctx.db, "rebuild-demo"))}
       ]
       |> Map.new(fn {resource, key, item} ->
-        {{resource, key}, {item["rowVersion"], StateResources.encode_admin_item(resource, item)}}
+        {{resource, key}, {item["rowVersion"], StateResources.encode_item(resource, item)}}
       end)
 
     buffered =
@@ -1319,7 +1319,7 @@ defmodule Tightbeam.AdminProjectionTest do
         resource = notice["resource"]
         item = notice["payload"]
         key = notice_primary_key(notice)
-        candidate = {item["rowVersion"], StateResources.encode_admin_item(resource, item)}
+        candidate = {item["rowVersion"], StateResources.encode_item(resource, item)}
 
         Map.update(model, {resource, key}, candidate, fn {version, _bytes} = current ->
           if item["rowVersion"] > version, do: candidate, else: current
@@ -1456,7 +1456,7 @@ defmodule Tightbeam.AdminProjectionTest do
 
     raw_item = Map.put(item, "rowVersion", 1)
     shared_item = StateResources.kungfu(raw_item)
-    shared_bytes = StateResources.encode_admin_item("kungfu", shared_item)
+    shared_bytes = StateResources.encode_item("kungfu", shared_item)
 
     notice =
       Publisher.committed_notice("kungfu.updated", raw_item, %{

@@ -10,6 +10,7 @@ defmodule Tightbeam.StateResources do
 
   @secret_keys MapSet.new(["cliToken", "token", "identityToken"])
   @identity_resource "identity"
+  @identity_metadata_floor_ns 100_000
   @identity_descriptor_cipher :aes_256_gcm
   @identity_metadata_sql """
   SELECT CASE WHEN v.rowVersion IS NULL THEN 0 ELSE 1 END AS present,
@@ -63,14 +64,47 @@ defmodule Tightbeam.StateResources do
 
   alias Tightbeam.DB.Txn
 
-  @admin_field_order %{
+  @item_field_order %{
+    "work items" =>
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt rowVersion),
+    "assignments" =>
+      ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closingAttestId workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
+    "attests" =>
+      ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs ts rowVersion),
+    "wakes" =>
+      ~w(wakeId sessionKey targetRole origin prompt consumer dueAt state createdAt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey rumination workItemId assignmentId canceledAt targetGate class classElection deliveryRule digest summon rowVersion),
+    "turns" =>
+      ~w(seq sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness replyAttention status owner adapterGen requestRef error createdAt startedAt endedAt publishedAt rowVersion),
+    "decision requests" =>
+      ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId lineageRung effortGeneration deadlineWakeId raisedAt deadlineAt statuteName question options context status decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt rowVersion),
+    "sessions" =>
+      ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
+    "roles" => ~w(name boundSessionKey ownerUserId createdAt updatedAt rowVersion),
+    "users" => ~w(userId isAdmin createdAt rowVersion),
+    "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
+    "artifacts" =>
+      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
+    "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
+    "transcript messages" =>
+      ~w(id seq sessionKey role messageType content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq assignmentId jobRef harness provider model effort context rowVersion),
+    "condition facts" => ~w(id ts kind scope origin rowVersion),
+    "critical state" =>
+      ~w(sessionKey reason startedAt expiresAt hardDeadline updatedAt rowVersion),
     "config" => ~w(key value updatedAt rowVersion),
     "host environment" => ~w(host harness name value valuePresent updatedAt rowVersion),
     "hosts" => ~w(host rowVersion),
-    "users" => ~w(userId isAdmin createdAt rowVersion),
     "identity" => ~w(name liveRevision state sessionRevisions staleness conflicts rowVersion),
     "kungfu" =>
       ~w(name purpose phrases rootArchetype installedRevision status documents rowVersion)
+  }
+
+  @item_resource_aliases %{
+    "work-items" => "work items",
+    "decision-requests" => "decision requests",
+    "read-markers" => "read markers",
+    "messages" => "transcript messages",
+    "condition-facts" => "condition facts",
+    "critical-state" => "critical state"
   }
 
   def query_work_item(db, id, call) do
@@ -320,32 +354,38 @@ defmodule Tightbeam.StateResources do
 
   def query_identity(source, {:metadata, name, request_binding, principal_binding})
       when is_binary(name) do
-    with {:ok, principal_binding} <- canonical_identity_principal_binding(principal_binding) do
-      [[present, row_version]] =
-        query(source, @identity_metadata_sql, [@identity_resource, AdminProjection.key(name)])
+    started_at = System.monotonic_time(:nanosecond)
 
-      nonce = System.unique_integer([:positive, :monotonic])
+    result =
+      with {:ok, principal_binding} <- canonical_identity_principal_binding(principal_binding) do
+        [[present, row_version]] =
+          query(source, @identity_metadata_sql, [@identity_resource, AdminProjection.key(name)])
 
-      descriptor =
-        seal_identity_descriptor(%{
-          resource: @identity_resource,
-          name: name,
-          present: present == 1,
-          row_version: row_version,
-          source_identity: identity_source_identity(source),
-          source_generation: identity_source_generation(source),
-          request_binding: request_binding,
-          principal_binding: principal_binding,
-          issuer: self(),
-          nonce: nonce
-        })
+        nonce = System.unique_integer([:positive, :monotonic])
 
-      :ok = open_identity_operation_nonce(request_binding, nonce)
-      {:ok, descriptor}
-    else
-      {:error, :invalid_principal_binding} ->
-        invalid_identity_descriptor(:invalid_principal_binding)
-    end
+        descriptor =
+          seal_identity_descriptor(%{
+            resource: @identity_resource,
+            name: name,
+            present: present == 1,
+            row_version: row_version,
+            source_identity: identity_source_identity(source),
+            source_generation: identity_source_generation(source),
+            request_binding: request_binding,
+            principal_binding: principal_binding,
+            issuer: self(),
+            nonce: nonce
+          })
+
+        :ok = open_identity_operation_nonce(request_binding, nonce)
+        {:ok, descriptor}
+      else
+        {:error, :invalid_principal_binding} ->
+          invalid_identity_descriptor(:invalid_principal_binding)
+      end
+
+    wait_for_identity_metadata_floor(started_at)
+    result
   end
 
   def query_identity(source, {:hydrate, descriptor, request_binding, principal_binding}) do
@@ -638,21 +678,42 @@ defmodule Tightbeam.StateResources do
     )
   end
 
-  @doc "Encode one admin item in its ruled field order with compact UTF-8 JSON."
-  def encode_admin_item(resource, item) do
-    fields = Map.fetch!(@admin_field_order, resource)
+  @doc "Encode one rebuildable R7/R7a item in its ruled order with compact UTF-8 JSON."
+  def encode_item(resource, item) when is_binary(resource) and is_map(item) do
+    resource = Map.get(@item_resource_aliases, resource, resource)
+    fields = Map.fetch!(@item_field_order, resource)
+    fields = conditional_fields!(resource, fields, item)
+    exact_item_keys!(resource, item, fields)
 
     encoded =
       Enum.map_join(fields, ",", fn field ->
         JSON.encode!(field) <>
-          ":" <> encode_admin_field(resource, field, Map.fetch!(item, field))
+          ":" <> encode_item_field(resource, field, Map.fetch!(item, field))
       end)
 
     "{" <> encoded <> "}"
   end
 
   @doc false
-  def admin_resource?(resource), do: Map.has_key?(@admin_field_order, resource)
+  def complete_item?(resource, item) when is_binary(resource) and is_map(item) do
+    resource = Map.get(@item_resource_aliases, resource, resource)
+
+    case Map.fetch(@item_field_order, resource) do
+      {:ok, fields} ->
+        fields =
+          if resource == "transcript messages" and not Map.has_key?(item, "messageType") do
+            List.delete(fields, "messageType")
+          else
+            fields
+          end
+
+        Enum.sort(Map.keys(item)) == Enum.sort(fields)
+
+      :error ->
+        false
+    end
+  end
+
   def read_marker(row), do: public(row)
   def observation(row), do: public(row)
 
@@ -716,7 +777,7 @@ defmodule Tightbeam.StateResources do
   end
 
   defp exact!(resource, item) do
-    expected = Map.fetch!(@admin_field_order, resource)
+    expected = Map.fetch!(@item_field_order, resource)
 
     if Enum.sort(Map.keys(item)) == Enum.sort(expected) do
       item
@@ -729,7 +790,7 @@ defmodule Tightbeam.StateResources do
     keys = Map.keys(row)
 
     if keys != [] and Enum.all?(keys, &is_binary/1) do
-      expected = Map.fetch!(@admin_field_order, resource)
+      expected = Map.fetch!(@item_field_order, resource)
 
       unless Enum.sort(keys) == Enum.sort(expected) do
         raise ArgumentError, "#{resource} public item has an extra or missing field"
@@ -806,7 +867,56 @@ defmodule Tightbeam.StateResources do
   defp sorted_string_map!(_value),
     do: raise(ArgumentError, "sessionRevisions must be a string-to-string map")
 
-  defp encode_admin_field("identity", "sessionRevisions", value) do
+  defp conditional_fields!("transcript messages", fields, item) do
+    case Map.fetch(item, "messageType") do
+      {:ok, value} when is_binary(value) and value != "" ->
+        fields
+
+      {:ok, _value} ->
+        raise ArgumentError, "messageType must be a non-empty string when present"
+
+      :error ->
+        List.delete(fields, "messageType")
+    end
+  end
+
+  defp conditional_fields!(_resource, fields, _item), do: fields
+
+  defp exact_item_keys!(resource, item, fields) do
+    unless Enum.sort(Map.keys(item)) == Enum.sort(fields) do
+      raise ArgumentError, "#{resource} item has an extra or missing field"
+    end
+  end
+
+  defp encode_item_field("sessions", "overrides", nil), do: "null"
+
+  defp encode_item_field("sessions", "overrides", value) do
+    encode_closed_object!(value, ~w(skillsAdd guidanceExtra), "sessions.overrides")
+  end
+
+  defp encode_item_field("transcript messages", "attachments", value) do
+    encode_closed_list!(
+      value,
+      ~w(assetId mimeType filename size),
+      "transcript messages.attachments"
+    )
+  end
+
+  defp encode_item_field("transcript messages", "context", value), do: encode_j!(value)
+
+  defp encode_item_field("attests", "commitRefs", nil), do: "null"
+
+  defp encode_item_field("attests", "commitRefs", value) do
+    encode_closed_list!(value, ~w(repo commit), "attests.commitRefs")
+  end
+
+  defp encode_item_field("decision requests", "options", value) do
+    encode_closed_list!(value, ~w(label), "decision requests.options")
+  end
+
+  defp encode_item_field("decision requests", "context", value), do: encode_j!(value)
+
+  defp encode_item_field("identity", "sessionRevisions", value) do
     encoded =
       value
       |> sorted_string_pairs!()
@@ -817,7 +927,56 @@ defmodule Tightbeam.StateResources do
     "{" <> encoded <> "}"
   end
 
-  defp encode_admin_field(_resource, _field, value), do: JSON.encode!(value)
+  defp encode_item_field("kungfu", "documents", value) do
+    encode_closed_list!(value, ~w(path content sha256), "kungfu.documents")
+  end
+
+  defp encode_item_field(_resource, _field, value), do: JSON.encode!(value)
+
+  defp encode_closed_list!(value, fields, label) when is_list(value) do
+    encoded = Enum.map_join(value, ",", &encode_closed_object!(&1, fields, label))
+    "[" <> encoded <> "]"
+  end
+
+  defp encode_closed_list!(_value, _fields, label),
+    do: raise(ArgumentError, "#{label} must be an array")
+
+  defp encode_closed_object!(value, fields, label) when is_map(value) do
+    unless Enum.sort(Map.keys(value)) == Enum.sort(fields) do
+      raise ArgumentError, "#{label} has an extra or missing field"
+    end
+
+    encoded =
+      Enum.map_join(fields, ",", fn field ->
+        JSON.encode!(field) <> ":" <> JSON.encode!(Map.fetch!(value, field))
+      end)
+
+    "{" <> encoded <> "}"
+  end
+
+  defp encode_closed_object!(_value, _fields, label),
+    do: raise(ArgumentError, "#{label} must be an object")
+
+  defp encode_j!(value) when is_map(value) do
+    unless Enum.all?(Map.keys(value), &is_binary/1) do
+      raise ArgumentError, "opaque JSON object keys must be strings"
+    end
+
+    encoded =
+      value
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map_join(",", fn {key, item} ->
+        JSON.encode!(key) <> ":" <> encode_j!(item)
+      end)
+
+    "{" <> encoded <> "}"
+  end
+
+  defp encode_j!(value) when is_list(value) do
+    "[" <> Enum.map_join(value, ",", &encode_j!/1) <> "]"
+  end
+
+  defp encode_j!(value), do: JSON.encode!(value)
 
   defp sorted_string_pairs!(value) when is_map(value) do
     if Enum.all?(value, fn {key, item} -> is_binary(key) and is_binary(item) end) do
@@ -989,6 +1148,14 @@ defmodule Tightbeam.StateResources do
   defp invalid_identity_descriptor(reason) do
     Logger.error("identity_descriptor_invalid reason=#{reason}")
     {:error, :invalid_identity_descriptor}
+  end
+
+  defp wait_for_identity_metadata_floor(started_at) do
+    if System.monotonic_time(:nanosecond) - started_at < @identity_metadata_floor_ns do
+      wait_for_identity_metadata_floor(started_at)
+    else
+      :ok
+    end
   end
 
   defp identity_descriptor_key do
