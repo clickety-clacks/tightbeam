@@ -1266,11 +1266,16 @@ defmodule Tightbeam.AdminProjectionTest do
       })
       |> Map.put(:invocation_id, invocation)
 
-    assert %{code: "identity_include_invalid"} = handler.(call)
+    assert %{code: "identity_include_invalid", message: message} = denial = handler.(call)
+    assert message =~ "origin=guidance/operating-model.md"
+    assert message =~ "at=guidance/operating-model.md:line 1"
+    assert message =~ "chain=missing.md"
 
     assert %{
              state: "denied",
              cause: "missing_fragment",
+             denial_code: "identity_include_invalid",
+             denial_message: ^message,
              candidate_revision: nil,
              tree_fingerprint: fingerprint
            } = AdminProjection.identity_publication_marker(ctx.db, invocation, live)
@@ -1279,7 +1284,7 @@ defmodule Tightbeam.AdminProjectionTest do
     assert git!(identity_dir, ["rev-parse", "main"]) == main
     assert git!(identity_dir, ["rev-parse", "tightbeam/live"]) == live
 
-    assert %{code: "missing_fragment"} = handler.(call)
+    assert handler.(call) == denial
     assert git!(identity_dir, ["rev-parse", "main"]) == main
   end
 

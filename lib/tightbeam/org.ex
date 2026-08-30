@@ -1357,19 +1357,36 @@ defmodule Tightbeam.Org do
 
   Each enumerated reference carries the supported command sequence that clears
   it. The enumeration and its remedies therefore cannot acquire separate case
-  lists. `release` runs inside the DB owner's transaction when no references
-  remain, fencing every session and setting writer behind the publication.
+  lists. `prepare` runs inside the DB owner's transaction when no references
+  remain. The transaction commits before `release` runs, and the DB owner keeps
+  every session and setting writer fenced until `release` returns.
   """
-  @spec release_archetypes(db(), [String.t()], (Txn.t() -> result)) ::
+  @spec release_archetypes(
+          db(),
+          [String.t()],
+          (Txn.t() -> prepared),
+          (prepared -> result)
+        ) ::
           {:referenced, [map()]} | {:released, result}
-        when result: term()
-  def release_archetypes(db \\ Tightbeam.DB, archetypes, release) when is_function(release, 1) do
-    transaction!(db, fn txn ->
-      case archetype_references_in_txn(txn, archetypes) do
-        [] -> {:released, release.(txn)}
-        references -> {:referenced, references}
-      end
-    end)
+        when prepared: term(), result: term()
+  def release_archetypes(db \\ Tightbeam.DB, archetypes, prepare, release)
+      when is_function(prepare, 1) and is_function(release, 1) do
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             case archetype_references_in_txn(txn, archetypes) do
+               [] -> {:prepared, prepare.(txn)}
+               references -> {:referenced, references}
+             end
+           end,
+           fn
+             {:prepared, prepared} -> {:released, release.(prepared)}
+             {:referenced, references} -> {:referenced, references}
+           end
+         ) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
   end
 
   defp archetype_references_in_txn(txn, archetypes) do

@@ -50,6 +50,8 @@ defmodule Tightbeam.AdminProjection do
     principal         TEXT NOT NULL,
     validationResult  TEXT NOT NULL CHECK (validationResult IN ('accepted', 'denied')),
     cause             TEXT,
+    denialCode        TEXT,
+    denialMessage     TEXT,
     state             TEXT NOT NULL CHECK (state IN ('pending', 'accepted', 'denied')),
     createdAt         INTEGER NOT NULL,
     updatedAt         INTEGER NOT NULL,
@@ -79,7 +81,8 @@ defmodule Tightbeam.AdminProjection do
            source,
            """
            SELECT invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
-                  principal, validationResult, cause, state, createdAt, updatedAt
+                  principal, validationResult, cause, denialCode, denialMessage,
+                  state, createdAt, updatedAt
            FROM identity_publication_markers
            WHERE invocationId = ?1 AND expectedPriorLive = ?2
            """,
@@ -94,6 +97,8 @@ defmodule Tightbeam.AdminProjection do
           principal,
           result,
           cause,
+          denial_code,
+          denial_message,
           state,
           created,
           updated
@@ -107,6 +112,8 @@ defmodule Tightbeam.AdminProjection do
           principal: principal,
           validation_result: result,
           cause: cause,
+          denial_code: denial_code,
+          denial_message: denial_message,
           state: state,
           created_at: created,
           updated_at: updated
@@ -153,8 +160,9 @@ defmodule Tightbeam.AdminProjection do
       """
       INSERT OR IGNORE INTO identity_publication_markers
         (invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
-         principal, validationResult, cause, state, createdAt, updatedAt)
-      VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', NULL, 'pending', ?6, ?6)
+         principal, validationResult, cause, denialCode, denialMessage,
+         state, createdAt, updatedAt)
+      VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', NULL, NULL, NULL, 'pending', ?6, ?6)
       """,
       [
         invocation_id,
@@ -170,15 +178,24 @@ defmodule Tightbeam.AdminProjection do
   end
 
   @doc "Finalize a pending identity marker exactly once."
-  def finish_identity_publication_in_txn(%Txn{} = txn, marker, state, cause \\ nil)
+  def finish_identity_publication_in_txn(
+        %Txn{} = txn,
+        marker,
+        state,
+        cause \\ nil,
+        denial \\ nil
+      )
       when state in ["accepted", "denied"] do
     validation_result = if state == "accepted", do: "accepted", else: "denied"
+    denial_code = if denial, do: Map.get(denial, :code) || Map.get(denial, "code")
+    denial_message = if denial, do: Map.get(denial, :message) || Map.get(denial, "message")
 
     Txn.q(
       txn,
       """
       UPDATE identity_publication_markers
-      SET validationResult = ?3, cause = ?4, state = ?3, updatedAt = ?5
+      SET validationResult = ?3, cause = ?4, denialCode = ?5,
+          denialMessage = ?6, state = ?3, updatedAt = ?7
       WHERE invocationId = ?1 AND expectedPriorLive = ?2 AND state = 'pending'
       """,
       [
@@ -186,6 +203,8 @@ defmodule Tightbeam.AdminProjection do
         marker.expected_prior,
         validation_result,
         cause,
+        denial_code,
+        denial_message,
         System.system_time(:millisecond)
       ]
     )
@@ -194,7 +213,15 @@ defmodule Tightbeam.AdminProjection do
   end
 
   @doc "Record a pre-commit typed validation denial without a candidate revision."
-  def deny_identity_validation(db, invocation_id, expected_prior, fingerprint, principal, cause) do
+  def deny_identity_validation(
+        db,
+        invocation_id,
+        expected_prior,
+        fingerprint,
+        principal,
+        cause,
+        denial
+      ) do
     now = System.system_time(:millisecond)
 
     DB.transaction(db, fn txn ->
@@ -203,10 +230,20 @@ defmodule Tightbeam.AdminProjection do
         """
         INSERT OR IGNORE INTO identity_publication_markers
           (invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
-           principal, validationResult, cause, state, createdAt, updatedAt)
-        VALUES (?1, ?2, NULL, ?3, ?4, 'denied', ?5, 'denied', ?6, ?6)
+           principal, validationResult, cause, denialCode, denialMessage,
+           state, createdAt, updatedAt)
+        VALUES (?1, ?2, NULL, ?3, ?4, 'denied', ?5, ?6, ?7, 'denied', ?8, ?8)
         """,
-        [invocation_id, expected_prior, fingerprint, principal, cause, now]
+        [
+          invocation_id,
+          expected_prior,
+          fingerprint,
+          principal,
+          cause,
+          Map.fetch!(denial, :code),
+          Map.fetch!(denial, :message),
+          now
+        ]
       )
 
       identity_publication_marker(txn, invocation_id, expected_prior)

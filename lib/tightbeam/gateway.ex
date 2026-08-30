@@ -3678,36 +3678,35 @@ defmodule Tightbeam.Gateway do
     archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
     invocation_id = Map.fetch!(call, :invocation_id)
 
-    case Org.release_archetypes(db, archetypes, fn txn ->
-           candidate = Identity.unlearn!(config.base_dir, name, call.origin)
+    case Org.release_archetypes(
+           db,
+           archetypes,
+           fn txn ->
+             candidate = Identity.unlearn!(config.base_dir, name, call.origin)
 
-           marker =
-             AdminProjection.begin_identity_publication_in_txn(
-               txn,
-               invocation_id,
-               candidate,
-               call.origin
-             )
-
-           case Identity.publish_live!(config.base_dir, candidate) do
-             {:ok, revision} ->
-               # Reference writers are queued behind this transaction. Reload
-               # while it still owns the fence, so none can validate against
-               # the pre-unlearn archetype set after the live ref moves.
-               reload_law!(config)
-               {:published, marker, revision}
-
-             {:error, error} ->
-               AdminProjection.finish_identity_publication_in_txn(
+             marker =
+               AdminProjection.begin_identity_publication_in_txn(
                  txn,
-                 marker,
-                 "denied",
-                 error.code
+                 invocation_id,
+                 candidate,
+                 call.origin
                )
 
-               {:denied, error}
+             {candidate, marker}
+           end,
+           fn {candidate, marker} ->
+             case Identity.publish_live!(config.base_dir, candidate) do
+               {:ok, revision} ->
+                 # The pending marker committed before this ref move. The DB
+                 # owner still fences reference writers until law reloads.
+                 reload_law!(config)
+                 {:published, marker, revision}
+
+               {:error, error} ->
+                 {:denied, marker, error}
+             end
            end
-         end) do
+         ) do
       {:referenced, references} ->
         unlearn_referenced_result(name, references)
 
@@ -3722,7 +3721,18 @@ defmodule Tightbeam.Gateway do
           end
         )
 
-      {:released, {:denied, error}} ->
+      {:released, {:denied, marker, error}} ->
+        {:ok, :ok} =
+          DB.transaction(db, fn txn ->
+            AdminProjection.finish_identity_publication_in_txn(
+              txn,
+              marker,
+              "denied",
+              error.code,
+              error
+            )
+          end)
+
         error
     end
   end
@@ -3742,10 +3752,7 @@ defmodule Tightbeam.Gateway do
           Map.put(result, :live_revision, marker.candidate_revision)
 
         "denied" ->
-          %{
-            code: marker.cause || "identity_publication_denied",
-            message: "identity publication denied"
-          }
+          identity_denial_result(marker)
 
         "pending" ->
           case Identity.publish_live!(config.base_dir, candidate) do
@@ -3769,7 +3776,8 @@ defmodule Tightbeam.Gateway do
                     txn,
                     marker,
                     "denied",
-                    error.code
+                    error.code,
+                    error
                   )
 
                   AdminProjection.identity_publication_marker(
@@ -4873,6 +4881,8 @@ defmodule Tightbeam.Gateway do
             fun.(call)
           rescue
             error in Tightbeam.Identity.IncludeError ->
+              denial = %{code: "identity_include_invalid", message: Exception.message(error)}
+
               {:ok, _marker} =
                 AdminProjection.deny_identity_validation(
                   db,
@@ -4880,17 +4890,18 @@ defmodule Tightbeam.Gateway do
                   error.expected_prior || "none",
                   error.tree_fingerprint || String.duplicate("0", 64),
                   call.origin,
-                  Atom.to_string(error.cause)
+                  Atom.to_string(error.cause),
+                  denial
                 )
 
-              %{code: "identity_include_invalid", message: Exception.message(error)}
+              denial
           end
 
         %{state: "accepted"} = marker ->
           %{state: "published", live_revision: marker.candidate_revision}
 
         %{state: "denied"} = marker ->
-          %{code: marker.cause, message: "identity publication denied"}
+          identity_denial_result(marker)
 
         %{state: "pending"} = marker ->
           candidate = %{
@@ -4902,6 +4913,13 @@ defmodule Tightbeam.Gateway do
           publish_identity_candidate(config, db, call, candidate, %{state: "published"})
       end
     end)
+  end
+
+  defp identity_denial_result(marker) do
+    %{
+      code: marker.denial_code || marker.cause || "identity_publication_denied",
+      message: marker.denial_message || "identity publication denied"
+    }
   end
 
   defp notify_session(config, db, session_key, prompt) do
