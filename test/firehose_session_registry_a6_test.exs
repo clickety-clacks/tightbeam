@@ -247,7 +247,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     assert idle_version > 10
     assert running_version > 20
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v13"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v12"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 

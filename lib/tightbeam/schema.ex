@@ -1524,7 +1524,7 @@ defmodule Tightbeam.Schema do
            :ok
          end) do
       {:ok, :ok} ->
-        upgrade_principal_duty_v1(db)
+        :ok
 
       {:error, %ShapeError{} = error} ->
         raise error
@@ -1534,6 +1534,11 @@ defmodule Tightbeam.Schema do
           message:
             "incompatible_session_mechanical_status_v1: upgrade failed: #{Exception.message(error)}"
     end
+  end
+
+  defp upgrade_current_from_session_v12(db) do
+    :ok = upgrade_session_mechanical_status_v1(db)
+    upgrade_principal_duty_v1(db)
   end
 
   @doc false
@@ -1813,29 +1818,29 @@ defmodule Tightbeam.Schema do
         upgrade_principal_duty_v1(db)
 
       {:ok, [[@session_mechanical_status_previous_shape]]} ->
-        upgrade_session_mechanical_status_v1(db)
+        upgrade_current_from_session_v12(db)
 
       {:ok, [[@effort_request_exit_previous_shape]]} ->
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        upgrade_current_from_session_v12(db)
 
       {:ok, [[@identity_render_stamp_previous_shape]]} ->
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        upgrade_current_from_session_v12(db)
 
       {:ok, [[@nullable_effective_parent_previous_shape]]} ->
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        upgrade_current_from_session_v12(db)
 
       {:ok, [[@terminal_decision_previous_shape]]} ->
         :ok = upgrade_terminal_operator_decision_v1(db)
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        upgrade_current_from_session_v12(db)
 
       {:ok, [[@message_type_previous_shape]]} ->
         :ok = upgrade_message_type_v1(db)
@@ -1843,7 +1848,7 @@ defmodule Tightbeam.Schema do
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        upgrade_current_from_session_v12(db)
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
@@ -1852,7 +1857,7 @@ defmodule Tightbeam.Schema do
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        upgrade_current_from_session_v12(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
@@ -1862,7 +1867,7 @@ defmodule Tightbeam.Schema do
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
+        upgrade_current_from_session_v12(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
