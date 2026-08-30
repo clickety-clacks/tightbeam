@@ -4,8 +4,18 @@ defmodule Tightbeam.StateVisibility do
   alias Tightbeam.{DB, Org}
 
   @admin_classes ~w(config.updated host_env.updated host.registered user.added user.promoted identity.updated kungfu.updated)
+  @topline_invalidation_classes ~w(topline.created topline_work_membership.linked topline_work_membership.unlinked)
 
   @spec visible?(DB.server(), map(), String.t(), boolean()) :: boolean()
+  def visible?(db, %{"class" => class} = notice, user_id, is_admin)
+      when class in @topline_invalidation_classes do
+    topline_visible?(db, notice, user_id, is_admin)
+  end
+
+  def visible?(db, %{"class" => "subagent_marker.appended"} = notice, user_id, is_admin) do
+    subagent_marker_visible?(db, notice, user_id, is_admin)
+  end
+
   def visible?(_db, _notice, _user_id, true), do: true
 
   def visible?(_db, %{"class" => class}, _user_id, false) when class in @admin_classes do
@@ -41,6 +51,55 @@ defmodule Tightbeam.StateVisibility do
 
   @doc "Kungfu publication state is admin-only."
   def kungfu_visible?(is_admin), do: is_admin
+
+  @doc "A Topline invalidation uses the committed Topline owner-or-admin grant."
+  def topline_visible?(db, notice, user_id, is_admin) do
+    topline_id = get_in(notice, ["refs", "toplineId"])
+
+    if is_binary(topline_id) do
+      {:ok, rows} = DB.query(db, "SELECT ownerUserId FROM toplines WHERE id = ?1", [topline_id])
+
+      case rows do
+        [[owner_user_id]] -> is_admin or owner_user_id == user_id
+        [] -> false
+      end
+    else
+      false
+    end
+  end
+
+  @doc "A marker invalidation requires its resolved assignment and work-item grants."
+  def subagent_marker_visible?(db, notice, user_id, is_admin) do
+    refs = notice["refs"] || %{}
+
+    with marker_id when is_binary(marker_id) <- refs["markerId"],
+         session_key when is_binary(session_key) <- refs["sessionKey"],
+         assignment_id when is_binary(assignment_id) <- refs["assignmentId"],
+         work_item_id when is_binary(work_item_id) <- refs["workItemId"] do
+      {:ok, rows} =
+        DB.query(
+          db,
+          """
+          SELECT holder.ownerUserId, wi.ownerUserId
+          FROM subagent_markers sm
+          JOIN assignments a ON a.id = sm.assignmentId AND a.holderKey = sm.principal
+          JOIN sessions holder ON holder.sessionKey = a.holderKey
+          JOIN work_items wi ON wi.id = a.workItemId
+          WHERE CAST(sm.id AS TEXT) = ?1 AND sm.principal = ?2
+            AND a.id = ?3 AND wi.id = ?4
+          """,
+          [marker_id, session_key, assignment_id, work_item_id]
+        )
+
+      Enum.any?(rows, fn [holder_owner, work_owner] ->
+        assignment_granted = is_admin or holder_owner == user_id or work_owner == user_id
+        work_item_granted = is_admin or work_owner == user_id
+        assignment_granted and work_item_granted
+      end)
+    else
+      _ -> false
+    end
+  end
 
   defp admin_resource_visible?("config.updated", is_admin), do: config_visible?(is_admin)
 

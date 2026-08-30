@@ -311,7 +311,9 @@ defmodule Tightbeam.Firehose.Hub do
     |> then(fn {frames, seq} -> {Enum.reverse(frames), seq} end)
   end
 
-  defp matches?(notice, filters) do
+  @doc false
+  @spec matches?(map(), map()) :: boolean()
+  def matches?(notice, filters) do
     refs = notice["refs"] || %{}
 
     class_match? =
