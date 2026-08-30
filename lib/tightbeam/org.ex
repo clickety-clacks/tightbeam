@@ -34,6 +34,8 @@ defmodule Tightbeam.Org do
           overrides: map() | nil,
           identity_name: String.t(),
           identity_revision: String.t() | nil,
+          identity_render_contract: String.t() | nil,
+          identity_guidance_digest: String.t() | nil,
           cli_token: String.t() | nil,
           harness: String.t(),
           provider: String.t(),
@@ -79,6 +81,8 @@ defmodule Tightbeam.Org do
     overrides     TEXT,
     identityName  TEXT,
     identityRevision TEXT,
+    identityRenderContract TEXT,
+    identityGuidanceDigest TEXT,
     cliToken      TEXT,
     harness       TEXT NOT NULL CHECK (harness IN (__TIGHTBEAM_HARNESSES__)),
     provider      TEXT NOT NULL CHECK (provider IN (__TIGHTBEAM_PROVIDERS__)),
@@ -872,6 +876,16 @@ defmodule Tightbeam.Org do
     update(db, session_key, "identityRevision = ?2", [revision])
   end
 
+  @doc "Stamp the complete immutable served render provisioned into a session."
+  def set_identity_stamp(db \\ Tightbeam.DB, session_key, revision, contract, digest) do
+    update(
+      db,
+      session_key,
+      "identityRevision = ?2, identityRenderContract = ?3, identityGuidanceDigest = ?4",
+      [revision, contract, digest]
+    )
+  end
+
   @doc """
   Record the history barrier: replay serves only messages with seq > this.
   Rows are never deleted — the chat's past remains in the store (and in any
@@ -1324,7 +1338,8 @@ defmodule Tightbeam.Org do
             """
             UPDATE sessions
             SET archetype = ?2, overrides = NULL, identityName = ?2,
-                identityRevision = NULL, updatedAt = ?3
+                identityRevision = NULL, identityRenderContract = NULL,
+                identityGuidanceDigest = NULL, updatedAt = ?3
             WHERE sessionKey = ?1
             """,
             [session_key, archetype, now()]
@@ -1342,19 +1357,36 @@ defmodule Tightbeam.Org do
 
   Each enumerated reference carries the supported command sequence that clears
   it. The enumeration and its remedies therefore cannot acquire separate case
-  lists. `release` runs inside the DB owner's transaction when no references
-  remain, fencing every session and setting writer behind the publication.
+  lists. `prepare` runs inside the DB owner's transaction when no references
+  remain. The transaction commits before `release` runs, and the DB owner keeps
+  every session and setting writer fenced until `release` returns.
   """
-  @spec release_archetypes(db(), [String.t()], (-> result)) ::
+  @spec release_archetypes(
+          db(),
+          [String.t()],
+          (Txn.t() -> prepared),
+          (prepared -> result)
+        ) ::
           {:referenced, [map()]} | {:released, result}
-        when result: term()
-  def release_archetypes(db \\ Tightbeam.DB, archetypes, release) when is_function(release, 0) do
-    transaction!(db, fn txn ->
-      case archetype_references_in_txn(txn, archetypes) do
-        [] -> {:released, release.()}
-        references -> {:referenced, references}
-      end
-    end)
+        when prepared: term(), result: term()
+  def release_archetypes(db \\ Tightbeam.DB, archetypes, prepare, release)
+      when is_function(prepare, 1) and is_function(release, 1) do
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             case archetype_references_in_txn(txn, archetypes) do
+               [] -> {:prepared, prepare.(txn)}
+               references -> {:referenced, references}
+             end
+           end,
+           fn
+             {:prepared, prepared} -> {:released, release.(prepared)}
+             {:referenced, references} -> {:referenced, references}
+           end
+         ) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
   end
 
   defp archetype_references_in_txn(txn, archetypes) do
@@ -1594,7 +1626,7 @@ defmodule Tightbeam.Org do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, operationalParent, handle, archetype, overrides, identityName,
-           identityRevision, cliToken, harness, provider,
+           identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
            model, thinkingLevel, modelContext, host, clearedThroughSeq, state, createdAt, updatedAt
     FROM sessions
     """
@@ -1616,6 +1648,8 @@ defmodule Tightbeam.Org do
          overrides,
          identity_name,
          identity_revision,
+         identity_render_contract,
+         identity_guidance_digest,
          cli_token,
          harness,
          provider,
@@ -1644,6 +1678,8 @@ defmodule Tightbeam.Org do
       overrides: decode_overrides(overrides),
       identity_name: identity_name || archetype,
       identity_revision: identity_revision,
+      identity_render_contract: identity_render_contract,
+      identity_guidance_digest: identity_guidance_digest,
       cli_token: cli_token,
       harness: harness,
       provider: provider,

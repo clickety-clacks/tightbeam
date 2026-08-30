@@ -11,6 +11,10 @@ defmodule Tightbeam.DB do
   the port spec). Reads share the same serialized connection in E1; a read
   pool is a later, additive concern.
 
+  `transaction_then/3` is the one bounded exception to short database-only
+  calls: it retains the owner as a writer fence while a committed marker guards
+  one external publication.
+
   A function running inside a caller's transaction must never re-enter the DB
   owner by opening another connection or transaction. By convention,
   `*_in_txn(txn, ...)` helpers write only through the supplied transaction and
@@ -64,6 +68,26 @@ defmodule Tightbeam.DB do
         when result: term()
   def transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
     GenServer.call(server, {:transaction, fun})
+  end
+
+  @doc """
+  Commit one transaction, then run `after_commit` before releasing the DB owner.
+
+  This is the publication fence for an external mutation that requires durable
+  database evidence first. `prepare` receives a `Txn`; its result reaches
+  `after_commit` only after COMMIT. Other database calls remain queued until
+  `after_commit` returns. A prepare failure rolls back. An after-commit failure
+  returns an error without rolling back the already durable transaction.
+  """
+  @spec transaction_then(
+          server(),
+          (Tightbeam.DB.Txn.t() -> prepared),
+          (prepared -> result)
+        ) :: {:ok, result} | {:error, Exception.t()}
+        when prepared: term(), result: term()
+  def transaction_then(server \\ __MODULE__, prepare, after_commit)
+      when is_function(prepare, 1) and is_function(after_commit, 1) do
+    GenServer.call(server, {:transaction_then, prepare, after_commit})
   end
 
   @doc """
@@ -180,6 +204,43 @@ defmodule Tightbeam.DB do
       {:rolled_back, error} ->
         {:reply, {:error, error}, state}
     end
+  end
+
+  def handle_call({:transaction_then, prepare, after_commit}, _from, %{conn: conn} = state) do
+    outbox = make_ref()
+    outbox_key = {Txn, outbox}
+    Process.put(outbox_key, [])
+    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+    prepared =
+      try do
+        result = prepare.(%Txn{conn: conn, outbox: outbox})
+        :ok = Sqlite3.execute(conn, "COMMIT")
+        {:committed, result, Process.get(outbox_key, []) |> Enum.reverse()}
+      rescue
+        error ->
+          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          {:rolled_back, error}
+      after
+        Process.delete(outbox_key)
+      end
+
+    reply =
+      case prepared do
+        {:committed, result, handoffs} ->
+          Enum.each(handoffs, &deliver_handoff/1)
+
+          try do
+            {:ok, after_commit.(result)}
+          rescue
+            error -> {:error, error}
+          end
+
+        {:rolled_back, error} ->
+          {:error, error}
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:foreign_key_rebuild, fun}, _from, %{conn: conn} = state) do

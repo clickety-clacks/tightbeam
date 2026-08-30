@@ -192,6 +192,13 @@ defmodule Tightbeam.Dispatch do
     do: RailRemedy.notice(db, handlers, statute, subject, call)
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
+    call =
+      if verb in ["identity-edit", "identity-relearn", "learn", "unlearn", "kungfu-scaffold"] do
+        Map.put_new(call, :invocation_id, "identity-" <> Tightbeam.Id.uuid4())
+      else
+        call
+      end
+
     publisher_call = Publisher.capture_before(db, call)
 
     case Map.fetch(handlers, verb) do

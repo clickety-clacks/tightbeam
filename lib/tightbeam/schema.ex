@@ -78,7 +78,8 @@ defmodule Tightbeam.Schema do
   # its one exact predecessor, and historical rows remain null.
   # Terminal operator decisions advance v7 to v8. Nullable effective parent
   # then relaxes the stored parent constraint from that exact predecessor.
-  @shape "coordination-fabric-v1-phase1-v9"
+  @shape "coordination-fabric-v1-phase1-v10"
+  @identity_render_stamp_previous_shape "coordination-fabric-v1-phase1-v9"
   @nullable_effective_parent_previous_shape "coordination-fabric-v1-phase1-v8"
   @terminal_decision_previous_shape "coordination-fabric-v1-phase1-v7"
   @message_type_previous_shape "coordination-fabric-v1-phase1-v6"
@@ -1116,6 +1117,20 @@ defmodule Tightbeam.Schema do
 
            ensure_no_migration_objects!(txn)
 
+           # Current Org row decoding is used by the cold-start classifier in
+           # this transaction. Add the nullable render-stamp columns before
+           # that read; the later v10 step observes them and only advances the
+           # shape stamp.
+           session_columns =
+             Txn.q(txn, "PRAGMA table_info(sessions)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           unless "identityRenderContract" in session_columns,
+             do: Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityRenderContract TEXT")
+
+           unless "identityGuidanceDigest" in session_columns,
+             do: Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityGuidanceDigest TEXT")
+
            :ok =
              Txn.exec(
                txn,
@@ -1290,7 +1305,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @nullable_effective_parent_previous_shape,
-             @shape,
+             @identity_render_stamp_previous_shape,
              System.system_time(:millisecond)
            ])
 
@@ -1320,6 +1335,45 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_nullable_effective_parent_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  def upgrade_identity_render_stamp_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@identity_render_stamp_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_identity_render_stamp_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           columns =
+             Txn.q(txn, "PRAGMA table_info(sessions)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           unless "identityRenderContract" in columns,
+             do: Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityRenderContract TEXT")
+
+           unless "identityGuidanceDigest" in columns,
+             do: Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityGuidanceDigest TEXT")
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @identity_render_stamp_previous_shape,
+             @shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_identity_render_stamp_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
     end
   end
 
@@ -1558,30 +1612,38 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@identity_render_stamp_previous_shape]]} ->
+        upgrade_identity_render_stamp_v1(db)
+
       {:ok, [[@nullable_effective_parent_previous_shape]]} ->
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_identity_render_stamp_v1(db)
 
       {:ok, [[@terminal_decision_previous_shape]]} ->
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_identity_render_stamp_v1(db)
 
       {:ok, [[@message_type_previous_shape]]} ->
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_identity_render_stamp_v1(db)
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_identity_render_stamp_v1(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_identity_render_stamp_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1599,8 +1661,9 @@ defmodule Tightbeam.Schema do
 
         There is no migration from #{found}. The only supported upgrade sources
         are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
-        #{@message_type_previous_shape}, #{@terminal_decision_previous_shape}, and
-        #{@nullable_effective_parent_previous_shape}.
+        #{@message_type_previous_shape}, #{@terminal_decision_previous_shape},
+        #{@nullable_effective_parent_previous_shape}, and
+        #{@identity_render_stamp_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
