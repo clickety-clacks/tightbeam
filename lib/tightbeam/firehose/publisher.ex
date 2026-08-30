@@ -147,6 +147,66 @@ defmodule Tightbeam.Firehose.Publisher do
     Txn.handoff(txn, Hub, {:committed, class, payload, refs})
   end
 
+  @doc "Queue one exact source-invalidation notice on its committing transaction."
+  @spec source_invalidation_in_txn(
+          Txn.t(),
+          GenServer.server(),
+          String.t(),
+          pos_integer(),
+          integer(),
+          map()
+        ) :: :ok
+  def source_invalidation_in_txn(
+        %Txn{} = txn,
+        hub,
+        class,
+        source_version,
+        occurred_at,
+        refs
+      ) do
+    Txn.handoff(
+      txn,
+      hub,
+      {:publish, source_invalidation_notice(class, source_version, occurred_at, refs)}
+    )
+  end
+
+  @doc false
+  @spec source_invalidation_notice(String.t(), pos_integer(), integer(), map()) :: map()
+  def source_invalidation_notice(class, source_version, occurred_at, refs)
+      when is_binary(class) and is_integer(source_version) and source_version > 0 and
+             is_integer(occurred_at) and is_map(refs) do
+    row =
+      case Registry.fetch_invalidation(class) do
+        {:ok, row} -> row
+        :error -> raise ArgumentError, "unregistered firehose source invalidation: #{class}"
+      end
+
+    actual_ref_set = refs |> Map.keys() |> Enum.sort()
+
+    unless actual_ref_set in row.ref_sets and
+             Enum.all?(refs, fn {_key, value} -> is_binary(value) and value != "" end) do
+      raise ArgumentError,
+            "firehose #{class} invalidation refs do not match the registry: " <>
+              "got=#{inspect(actual_ref_set)} allowed=#{inspect(row.ref_sets)}"
+    end
+
+    %{
+      "class" => class,
+      "op" => row.op,
+      "occurredAt" => occurred_at,
+      "refs" => refs,
+      "payload" => %{"sourceVersion" => source_version}
+    }
+  end
+
+  def source_invalidation_notice(class, source_version, occurred_at, refs) do
+    raise ArgumentError,
+          "invalid firehose source invalidation: class=#{inspect(class)} " <>
+            "sourceVersion=#{inspect(source_version)} occurredAt=#{inspect(occurred_at)} " <>
+            "refs=#{inspect(refs)}"
+  end
+
   @doc "Queue the existing message-created notice on the transaction that appended it."
   @spec message_in_txn(Txn.t(), String.t(), map(), String.t() | nil) :: :ok
   def message_in_txn(%Txn{} = txn, session_key, message, owner_user_id \\ nil) do

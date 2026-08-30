@@ -1,10 +1,11 @@
 defmodule Tightbeam.Firehose.Registry do
   @moduledoc """
-  The v1 class vocabulary and its state-resource mapping.
+  The v1 class vocabulary and its state and source-invalidation mappings.
 
   Observational classes intentionally have no resource mapping. Every state
   row names the shared query, serializer, visibility, primary refs, and durable
-  version source used by rebuilds and notices.
+  version source used by rebuilds and notices. Every source-invalidation row
+  names its production source and every exact allowed reference set.
   """
 
   @observational ~w(
@@ -112,6 +113,48 @@ defmodule Tightbeam.Firehose.Registry do
     }
   ]
 
+  @invalidation_rows [
+    %{
+      class: "topline.created",
+      op: "observe",
+      ref_sets: [["toplineId"]],
+      source: {Tightbeam.Toplines, "topline_created"},
+      version_source: "topline_events.seq",
+      occurred_at_source: "topline_events.eventAt",
+      visibility: :topline_visible?
+    },
+    %{
+      class: "topline_work_membership.linked",
+      op: "observe",
+      ref_sets: [["membershipId", "toplineId", "workItemId"]],
+      source: {Tightbeam.Toplines, "work_linked"},
+      version_source: "topline_events.seq",
+      occurred_at_source: "topline_events.eventAt",
+      visibility: :topline_visible?
+    },
+    %{
+      class: "topline_work_membership.unlinked",
+      op: "observe",
+      ref_sets: [["membershipId", "toplineId", "workItemId"]],
+      source: {Tightbeam.Toplines, "work_unlinked"},
+      version_source: "topline_events.seq",
+      occurred_at_source: "topline_events.eventAt",
+      visibility: :topline_visible?
+    },
+    %{
+      class: "subagent_marker.appended",
+      op: "observe",
+      ref_sets: [
+        ["markerId", "sessionKey"],
+        ["assignmentId", "markerId", "sessionKey", "workItemId"]
+      ],
+      source: {Tightbeam.SubagentMarkers, :insert},
+      version_source: "subagent_markers.id",
+      occurred_at_source: "subagent_markers.at",
+      visibility: :subagent_marker_visible?
+    }
+  ]
+
   @serializers %{
     "work-items" => :work_item,
     "assignments" => :assignment,
@@ -162,15 +205,23 @@ defmodule Tightbeam.Firehose.Registry do
           Map.new(@admin_rows, &{&1.class, Map.put(&1, :primary_ref, hd(&1.primary_refs))})
         )
 
+  @invalidations Map.new(@invalidation_rows, &{&1.class, &1})
+
   @spec rows() :: %{String.t() => map()}
   def rows, do: @rows
+
+  @spec invalidation_rows() :: %{String.t() => map()}
+  def invalidation_rows, do: @invalidations
 
   @spec observational_classes() :: [String.t()]
   def observational_classes, do: @observational
 
   @spec classes() :: [String.t()]
-  def classes, do: Enum.sort(Map.keys(@rows) ++ @observational)
+  def classes, do: Enum.sort(Map.keys(@rows) ++ Map.keys(@invalidations) ++ @observational)
 
   @spec fetch(String.t()) :: {:ok, map()} | :error
   def fetch(class), do: Map.fetch(@rows, class)
+
+  @spec fetch_invalidation(String.t()) :: {:ok, map()} | :error
+  def fetch_invalidation(class), do: Map.fetch(@invalidations, class)
 end
