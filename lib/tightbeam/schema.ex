@@ -43,7 +43,9 @@ defmodule Tightbeam.Schema do
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
+  @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
+  @terminal_decision_liveness_shape "terminal-operator-decision-parity-liveness-v1-019"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
 
@@ -1115,50 +1117,42 @@ defmodule Tightbeam.Schema do
           message: "incompatible_effort_request_exit_v1: predecessor stamp #{inspect(rows)}"
     end
 
-    # The older terminal-decision chain predates the liveness activation. In
-    # that case there is no cancellation table to widen; ensure_all/1 creates
-    # the current table after the exact stamp chain completes.
-    if Txn.q(
-         txn,
-         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
-       ) != [] do
-      for name <- [
-            "wakes_typed_cancellation_required",
-            "wake_cancellations_pending_insert"
-          ] do
-        :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{name}")
-      end
+    for name <- [
+          "wakes_typed_cancellation_required",
+          "wake_cancellations_pending_insert"
+        ] do
+      :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{name}")
+    end
 
-      :ok =
-        Txn.exec(
-          txn,
-          "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_exit_v1"
-        )
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_exit_v1"
+      )
 
-      table = Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
-      :ok = Txn.exec(txn, table.sql)
+    table = Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
+    :ok = Txn.exec(txn, table.sql)
 
-      columns =
-        "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
-          "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
-          "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
-          "livenessTriggerKind,livenessTriggerId,actionNeeded"
+    columns =
+      "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+        "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+        "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+        "livenessTriggerKind,livenessTriggerId,actionNeeded"
 
-      :ok =
-        Txn.exec(
-          txn,
-          "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_effort_exit_v1"
-        )
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_effort_exit_v1"
+      )
 
-      :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_effort_exit_v1")
+    :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_effort_exit_v1")
 
-      for name <- [
-            "wake_cancellations_pending_insert",
-            "wakes_typed_cancellation_required"
-          ] do
-        object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
-        :ok = Txn.exec(txn, object.sql)
-      end
+    for name <- [
+          "wake_cancellations_pending_insert",
+          "wakes_typed_cancellation_required"
+        ] do
+      object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+      :ok = Txn.exec(txn, object.sql)
     end
 
     Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
@@ -1201,22 +1195,24 @@ defmodule Tightbeam.Schema do
         :ok = upgrade_effort_request_exit_v1(db)
         upgrade_identity_render_stamp_v1(db)
 
+      {:ok, [[@notice_batching_pre_liveness_shape]]} ->
+        upgrade_identity_render_stamp_v1(db, @notice_batching_pre_liveness_shape)
+
       {:ok, [[@terminal_decision_shape]]} ->
-        :ok = migrate_notice_batching_v1_019(db)
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_identity_render_stamp_v1(db)
+        :ok = migrate_notice_batching_v1_019(db, @terminal_decision_shape, false)
+        check_shape(db)
+
+      {:ok, [[@terminal_decision_liveness_shape]]} ->
+        :ok = migrate_notice_batching_v1_019(db, @terminal_decision_liveness_shape, true)
+        check_shape(db)
 
       {:ok, [[@operator_decision_shape]]} ->
         :ok = migrate_operator_decision_v1(db)
-        :ok = migrate_notice_batching_v1_019(db)
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_identity_render_stamp_v1(db)
+        check_shape(db)
 
       {:ok, [[@model_identity_shape]]} ->
         :ok = migrate_model_identity_v1(db)
-        :ok = migrate_notice_batching_v1_019(db)
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_identity_render_stamp_v1(db)
+        check_shape(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1233,8 +1229,10 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
-        to #{@terminal_decision_shape}, then #{@terminal_decision_shape} to
-        #{@effort_request_exit_previous_shape}, then #{@effort_request_exit_shape},
+        to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
+        It can migrate #{@terminal_decision_shape} to
+        #{@notice_batching_pre_liveness_shape}, then #{@shape}. It can also migrate
+        #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
         then #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
@@ -1257,10 +1255,13 @@ defmodule Tightbeam.Schema do
     end
   end
 
-  defp upgrade_identity_render_stamp_v1(db) do
+  defp upgrade_identity_render_stamp_v1(
+         db,
+         predecessor \\ @identity_render_stamp_previous_shape
+       ) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@identity_render_stamp_previous_shape]] ->
+             [[^predecessor]] ->
                :ok
 
              rows ->
@@ -1275,7 +1276,7 @@ defmodule Tightbeam.Schema do
            Txn.q(txn, "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3", [
              @shape,
              System.system_time(:millisecond),
-             @identity_render_stamp_previous_shape
+             predecessor
            ])
 
            if Txn.changes(txn) != 1,
@@ -1318,7 +1319,7 @@ defmodule Tightbeam.Schema do
                txn,
                "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
                [
-                 @terminal_decision_shape,
+                 @terminal_decision_liveness_shape,
                  System.system_time(:millisecond),
                  @operator_decision_shape
                ]
@@ -1327,7 +1328,7 @@ defmodule Tightbeam.Schema do
              if Txn.changes(txn) != 1 do
                raise ShapeError,
                  message:
-                   "migration #{@operator_decision_shape} -> #{@terminal_decision_shape} lost its exact stamp transition"
+                   "migration #{@operator_decision_shape} -> #{@terminal_decision_liveness_shape} lost its exact stamp transition"
              end
 
              :ok
@@ -1341,7 +1342,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@operator_decision_shape} -> #{@terminal_decision_shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@operator_decision_shape} -> #{@terminal_decision_liveness_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA ignore_check_constraints = OFF")
@@ -1366,7 +1367,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@model_identity_shape} -> #{@terminal_decision_shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@model_identity_shape} -> #{@terminal_decision_liveness_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
@@ -1421,7 +1422,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != decision_request_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@terminal_decision_shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
+          "migration #{@model_identity_shape} -> #{@terminal_decision_liveness_shape} copied #{Txn.changes(txn)} of #{decision_request_count} decision requests"
     end
 
     [[^decision_request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests_new")
@@ -1450,7 +1451,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != message_count do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@terminal_decision_shape} copied #{Txn.changes(txn)} of #{message_count} messages"
+          "migration #{@model_identity_shape} -> #{@terminal_decision_liveness_shape} copied #{Txn.changes(txn)} of #{message_count} messages"
     end
 
     [[^message_count]] = Txn.q(txn, "SELECT COUNT(*) FROM messages_new")
@@ -1477,31 +1478,35 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@model_identity_shape} -> #{@terminal_decision_shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{@model_identity_shape} -> #{@terminal_decision_liveness_shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-      [@terminal_decision_shape, System.system_time(:millisecond), @model_identity_shape]
+      [
+        @terminal_decision_liveness_shape,
+        System.system_time(:millisecond),
+        @model_identity_shape
+      ]
     )
 
     if Txn.changes(txn) != 1 do
       raise ShapeError,
         message:
-          "migration #{@model_identity_shape} -> #{@terminal_decision_shape} lost its exact stamp transition"
+          "migration #{@model_identity_shape} -> #{@terminal_decision_liveness_shape} lost its exact stamp transition"
     end
 
     :ok
   end
 
-  defp migrate_notice_batching_v1_019(db) do
+  defp migrate_notice_batching_v1_019(db, predecessor, liveness?) do
     # The database owner serializes this call. Disable enforcement only around
     # the exact table replacement, then prove every foreign key before commit.
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
-      case DB.transaction(db, &migrate_notice_batching_v1_019_in_txn/1) do
+      case DB.transaction(db, &migrate_notice_batching_v1_019_in_txn(&1, predecessor, liveness?)) do
         {:ok, :ok} ->
           :ok
 
@@ -1511,24 +1516,29 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{predecessor} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
   end
 
-  defp migrate_notice_batching_v1_019_in_txn(%Txn{} = txn) do
+  defp migrate_notice_batching_v1_019_in_txn(%Txn{} = txn, predecessor, liveness?) do
     [[wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes")
 
     cancellation_object =
       Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
 
     cancellation_count =
-      if owned_object_present?(txn, cancellation_object) do
+      if liveness? do
         [[count]] = Txn.q(txn, "SELECT COUNT(*) FROM wake_cancellations")
         count
       end
+
+    next_shape =
+      if liveness?,
+        do: @effort_request_exit_previous_shape,
+        else: @notice_batching_pre_liveness_shape
 
     :ok = Txn.exec(txn, @notice_batching_wakes_ddl)
 
@@ -1555,7 +1565,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != wake_count do
       raise ShapeError,
         message:
-          "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} copied #{Txn.changes(txn)} of #{wake_count} wakes"
+          "migration #{@terminal_decision_shape} -> #{@notice_batching_pre_liveness_shape} copied #{Txn.changes(txn)} of #{wake_count} wakes"
     end
 
     [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes_notice_batching_v1")
@@ -1575,7 +1585,7 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} classified legacy wakes: #{inspect(rows)}"
+            "migration #{@terminal_decision_shape} -> #{@notice_batching_pre_liveness_shape} classified legacy wakes: #{inspect(rows)}"
     end
 
     wake_bound_objects =
@@ -1635,7 +1645,7 @@ defmodule Tightbeam.Schema do
       if Txn.changes(txn) != cancellation_count do
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+            "migration #{@terminal_decision_shape} -> #{@notice_batching_pre_liveness_shape} copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
       end
 
       :ok =
@@ -1669,7 +1679,7 @@ defmodule Tightbeam.Schema do
       if Txn.changes(txn) != cancellation_count do
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} restored #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+            "migration #{@terminal_decision_shape} -> #{@notice_batching_pre_liveness_shape} restored #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
       end
 
       :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_notice_batching_v1")
@@ -1684,23 +1694,23 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{@terminal_decision_shape} -> #{@notice_batching_pre_liveness_shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
       [
-        @effort_request_exit_previous_shape,
+        next_shape,
         System.system_time(:millisecond),
-        @terminal_decision_shape
+        predecessor
       ]
     )
 
     if Txn.changes(txn) != 1 do
       raise ShapeError,
         message:
-          "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} lost its exact stamp transition"
+          "migration #{@terminal_decision_shape} -> #{next_shape} lost its exact stamp transition"
     end
 
     :ok

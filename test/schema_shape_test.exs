@@ -37,6 +37,7 @@ defmodule Tightbeam.SchemaShapeTest do
   @shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
+  @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
@@ -154,6 +155,24 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     assert "identityRenderContract" in table_columns(db, "sessions")
     assert "identityGuidanceDigest" in table_columns(db, "sessions")
+  end
+
+  test "the exact pre-liveness notice stamp resumes without physical-shape inference", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    drop_liveness_activation(db)
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
+
+    assert {:ok, _rows} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               @notice_batching_pre_liveness_shape
+             ])
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert "identityRenderContract" in table_columns(db, "sessions")
+    assert "identityGuidanceDigest" in table_columns(db, "sessions")
+    assert table?(db, "wake_cancellations")
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
