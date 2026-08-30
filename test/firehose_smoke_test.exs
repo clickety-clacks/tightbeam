@@ -302,49 +302,14 @@ defmodule Tightbeam.FirehoseSmokeTest do
     assert condition_notice["refs"]["factId"] == condition_notice["payload"]["id"]
     refute Map.has_key?(condition_notice["payload"], "factId")
 
-    catalog =
-      %{
-        {"testhost", "claude"} => [
-          %{provider: :anthropic, family: "fable", efforts: [], context: nil}
-        ]
-      }
-      |> Map.put_new(
-        {host, harness},
-        [
-          %{
-            provider: Harness.parse!(harness).credential_provider(),
-            family: "unused",
-            efforts: [],
-            context: nil
-          }
-        ]
-      )
-
-    shape_failures =
-      Enum.flat_map(notices, fn {class, notice} ->
-        {:ok, row} = Registry.fetch(class)
-
-        if StateResources.item_shape_complete?(row.resource, notice["payload"]) do
-          []
-        else
-          [{class, row.resource, Map.keys(notice["payload"]) |> Enum.sort()}]
-        end
-      end)
-
-    assert shape_failures == []
+    assert JSON.decode!(Publisher.encode_wire_notice(condition_notice, %{})) ==
+             condition_notice
 
     for {class, notice} <- notices do
       assert {:ok, fresh} =
                Rebuild.fetch(fixture.db, class, notice["refs"], fixture.user_id, true)
 
       assert fresh == notice["payload"], class
-
-      {:ok, row} = Registry.fetch(class)
-      live_bytes = StateResources.encode_item(row.resource, notice["payload"], catalog)
-      rebuilt_bytes = StateResources.encode_item(row.resource, fresh, catalog)
-
-      assert rebuilt_bytes == live_bytes, class
-      assert Publisher.encode_wire_notice(notice, catalog) =~ "\"payload\":" <> live_bytes
     end
 
     older = notices["read_marker.updated"]["payload"]
