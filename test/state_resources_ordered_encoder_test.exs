@@ -4,6 +4,17 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   alias Tightbeam.Firehose.{Publisher, Registry}
   alias Tightbeam.StateResources
 
+  @catalog %{
+    {"testhost", "fixture"} => [
+      %{
+        family: "fixture-model",
+        context: "1m",
+        efforts: ["medium"],
+        provider: :fixture_provider
+      }
+    ]
+  }
+
   @field_order %{
     "work items" =>
       ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt rowVersion),
@@ -60,7 +71,9 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
     for {resource, fields} <- @field_order do
       item = item(resource, fields)
-      assert StateResources.encode_item(resource, item) == expected_bytes(resource, fields, item)
+
+      assert StateResources.encode_item(resource, item, @catalog) ==
+               expected_bytes(resource, fields, item)
     end
   end
 
@@ -79,7 +92,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     assert session["adopted"] === false
     assert session["state"] == "active"
 
-    bytes = StateResources.encode_item("sessions", session)
+    bytes = StateResources.encode_item("sessions", session, @catalog)
     assert JSON.decode!(bytes) == session
   end
 
@@ -87,14 +100,16 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     expected =
       Map.new(@field_order, fn {resource, fields} ->
         item = item(resource, fields)
-        {resource, StateResources.encode_item(resource, item)}
+        {resource, StateResources.encode_item(resource, item, @catalog)}
       end)
 
     :rand.seed(:exsss, {17, 71, 171})
 
     for _iteration <- 1..1_000, {resource, fields} <- @field_order do
       randomized = resource |> item(fields) |> randomize_item(resource)
-      assert StateResources.encode_item(resource, randomized) == Map.fetch!(expected, resource)
+
+      assert StateResources.encode_item(resource, randomized, @catalog) ==
+               Map.fetch!(expected, resource)
     end
   end
 
@@ -107,16 +122,19 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       resource = Map.get(@resource_aliases, row.resource, row.resource)
       fields = Map.fetch!(@field_order, resource)
       item = item(resource, fields)
-      item_bytes = StateResources.encode_item(row.resource, item)
+      item_bytes = StateResources.encode_item(row.resource, item, @catalog)
 
       wire =
-        Publisher.encode_wire_notice(%{
-          "class" => row.class,
-          "op" => row.op,
-          "occurredAt" => 1,
-          "refs" => %{},
-          "payload" => item
-        })
+        Publisher.encode_wire_notice(
+          %{
+            "class" => row.class,
+            "op" => row.op,
+            "occurredAt" => 1,
+            "refs" => %{},
+            "payload" => item
+          },
+          @catalog
+        )
 
       assert wire =~ "\"payload\":" <> item_bytes
     end)
@@ -220,17 +238,6 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   end
 
   test "session enums and catalog-backed values fail closed at the shared encoder" do
-    catalog = %{
-      {"testhost", "fixture"} => [
-        %{
-          family: "fixture-model",
-          context: "1m",
-          efforts: ["medium"],
-          provider: :fixture_provider
-        }
-      ]
-    }
-
     valid =
       "sessions"
       |> item(Map.fetch!(@field_order, "sessions"))
@@ -244,9 +251,9 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
         "mechanicalStatus" => "idle"
       })
 
-    assert StateResources.complete_item?("sessions", valid, catalog)
+    assert StateResources.complete_item?("sessions", valid, @catalog)
 
-    assert StateResources.encode_item("sessions", valid, catalog) ==
+    assert StateResources.encode_item("sessions", valid, @catalog) ==
              expected_bytes("sessions", Map.fetch!(@field_order, "sessions"), valid)
 
     for {field, value} <- [
@@ -258,12 +265,64 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
           {"modelContext", "2m"}
         ] do
       invalid = Map.put(valid, field, value)
-      refute StateResources.complete_item?("sessions", invalid, catalog)
+      refute StateResources.complete_item?("sessions", invalid, @catalog)
 
       assert_raise ArgumentError, fn ->
-        StateResources.encode_item("sessions", invalid, catalog)
+        StateResources.encode_item("sessions", invalid, @catalog)
       end
     end
+  end
+
+  test "every catalog-backed R7 field matches one served tuple" do
+    valid = [
+      {"assignments", %{"holderHarness" => "fixture", "holderProvider" => "fixture_provider"}},
+      {"attests", %{"byHarness" => "fixture", "byProvider" => "fixture_provider"}},
+      {"turns",
+       %{
+         "harness" => "fixture",
+         "model" => "fixture-model",
+         "thinkingLevel" => "medium",
+         "modelContext" => "1m"
+       }},
+      {"sessions",
+       %{
+         "host" => "testhost",
+         "harness" => "fixture",
+         "provider" => "fixture_provider",
+         "model" => "fixture-model",
+         "thinkingLevel" => "medium",
+         "modelContext" => "1m"
+       }},
+      {"transcript messages",
+       %{
+         "harness" => "fixture",
+         "provider" => "fixture_provider",
+         "model" => "fixture-model",
+         "effort" => "medium",
+         "context" => "1m"
+       }},
+      {"host environment", %{"host" => "testhost", "harness" => "fixture"}}
+    ]
+
+    for {resource, selections} <- valid do
+      canonical = resource |> item(Map.fetch!(@field_order, resource)) |> Map.merge(selections)
+      assert StateResources.complete_item?(resource, canonical, @catalog)
+      assert is_binary(StateResources.encode_item(resource, canonical, @catalog))
+
+      for field <- Map.keys(selections), field != "host" do
+        invalid = Map.put(canonical, field, "not-served")
+        refute StateResources.complete_item?(resource, invalid, @catalog)
+
+        assert_raise ArgumentError, fn ->
+          StateResources.encode_item(resource, invalid, @catalog)
+        end
+      end
+    end
+
+    device =
+      item("devices", Map.fetch!(@field_order, "devices")) |> Map.put("model", "physical-model")
+
+    assert StateResources.complete_item?("devices", device, %{})
   end
 
   test "Publisher rejects known item supersets and secret fields instead of using the raw fallback" do
@@ -317,7 +376,28 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
     additive = put_in(notice, ["payload", "priority"], 4)
     refute StateResources.item_shape_superset?("work-items", additive["payload"])
-    assert Publisher.encode_wire_notice(additive) == JSON.encode!(additive)
+    assert_raise ArgumentError, fn -> Publisher.encode_wire_notice(additive) end
+
+    for {class, payload} <- [
+          {"config.updated", %{"key" => "default-priority", "value" => "private-priority"}},
+          {"host_env.updated",
+           %{
+             "host" => "h",
+             "harness" => "fixture",
+             "name" => "OPENAI_API_KEY",
+             "value" => "sk-private"
+           }},
+          {"work_item.created",
+           %{
+             "id" => "wi_partial",
+             "rowVersion" => 1,
+             "metadata" => %{"cliToken" => "secret"}
+           }}
+        ] do
+      assert_raise ArgumentError, fn ->
+        Publisher.encode_wire_notice(%{"class" => class, "op" => "upsert", "payload" => payload})
+      end
+    end
   end
 
   defp item(resource, fields) do
@@ -328,6 +408,8 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     do: %{"guidanceExtra" => nil, "skillsAdd" => ["beta", "alpha"]}
 
   defp value("sessions", "harness"), do: "fixture"
+  defp value("host environment", "host"), do: "testhost"
+  defp value("host environment", "harness"), do: "fixture"
 
   defp value("assignments", "files"), do: ["second", "first"]
 

@@ -55,8 +55,8 @@ defmodule Tightbeam.StateResources do
     Assignments,
     DB,
     Devices,
-    Identity,
     Harness,
+    Identity,
     ModelCatalog,
     Org,
     ReadMarkers,
@@ -270,11 +270,52 @@ defmodule Tightbeam.StateResources do
   }
 
   @item_catalog_fields %{
+    {"assignments", "holderHarness"} => :harness,
+    {"assignments", "holderProvider"} => :provider,
+    {"attests", "byHarness"} => :harness,
+    {"attests", "byProvider"} => :provider,
+    {"turns", "harness"} => :harness,
+    {"turns", "model"} => :model,
+    {"turns", "thinkingLevel"} => :effort,
+    {"turns", "modelContext"} => :context,
     {"sessions", "harness"} => :harness,
     {"sessions", "provider"} => :provider,
     {"sessions", "model"} => :model,
     {"sessions", "thinkingLevel"} => :effort,
-    {"sessions", "modelContext"} => :context
+    {"sessions", "modelContext"} => :context,
+    {"transcript messages", "harness"} => :harness,
+    {"transcript messages", "provider"} => :provider,
+    {"transcript messages", "model"} => :model,
+    {"transcript messages", "effort"} => :effort,
+    {"transcript messages", "context"} => :context,
+    {"host environment", "harness"} => :harness
+  }
+
+  @item_catalog_selections %{
+    "assignments" => %{harness: "holderHarness", provider: "holderProvider"},
+    "attests" => %{harness: "byHarness", provider: "byProvider"},
+    "turns" => %{
+      harness: "harness",
+      model: "model",
+      effort: "thinkingLevel",
+      context: "modelContext"
+    },
+    "sessions" => %{
+      host: "host",
+      harness: "harness",
+      provider: "provider",
+      model: "model",
+      effort: "thinkingLevel",
+      context: "modelContext"
+    },
+    "transcript messages" => %{
+      harness: "harness",
+      provider: "provider",
+      model: "model",
+      effort: "effort",
+      context: "context"
+    },
+    "host environment" => %{host: "host", harness: "harness"}
   }
 
   @item_enums %{
@@ -949,8 +990,16 @@ defmodule Tightbeam.StateResources do
   end
 
   @doc false
-  def item_has_secret_fields?(item) when is_map(item),
-    do: Enum.any?(Map.keys(item), &MapSet.member?(@secret_keys, &1))
+  def item_has_secret_fields?(item) when is_map(item) do
+    Enum.any?(item, fn {key, value} ->
+      MapSet.member?(@secret_keys, key) or item_has_secret_fields?(value)
+    end)
+  end
+
+  def item_has_secret_fields?(items) when is_list(items),
+    do: Enum.any?(items, &item_has_secret_fields?/1)
+
+  def item_has_secret_fields?(_value), do: false
 
   @doc false
   def item_wire_schema do
@@ -1293,103 +1342,109 @@ defmodule Tightbeam.StateResources do
   defp validate_json_value!(_value, label),
     do: raise(ArgumentError, "#{label} must be a JSON value")
 
-  defp validate_item_relationships!("sessions", item, catalog) do
-    validate_session_catalog!(item, catalog)
+  defp validate_item_relationships!(resource, item, catalog) do
+    if Map.has_key?(@item_catalog_selections, resource) do
+      validate_catalog_selection!(resource, item, catalog)
+    end
+
+    validate_item_invariants!(resource, item)
   end
 
-  defp validate_item_relationships!("condition facts", item, _catalog) do
+  defp validate_item_invariants!("condition facts", item) do
     unless item["id"] == item["rowVersion"] do
       raise ArgumentError, "condition facts id must equal rowVersion"
     end
   end
 
-  defp validate_item_relationships!(
+  defp validate_item_invariants!(
          "attests",
          %{
            "kind" => "verdict",
            "verdictKind" => verdict_kind
-         },
-         _catalog
+         }
        )
        when is_binary(verdict_kind),
        do: :ok
 
-  defp validate_item_relationships!(
+  defp validate_item_invariants!(
          "attests",
-         %{"kind" => kind, "verdictKind" => nil},
-         _catalog
+         %{"kind" => kind, "verdictKind" => nil}
        )
        when kind != "verdict",
        do: :ok
 
-  defp validate_item_relationships!("attests", _item, _catalog),
+  defp validate_item_invariants!("attests", _item),
     do: raise(ArgumentError, "attests verdictKind does not match kind")
 
-  defp validate_item_relationships!(_resource, _item, _catalog), do: :ok
+  defp validate_item_invariants!(_resource, _item), do: :ok
 
   defp served_catalog(resource, item) do
     resource = Map.get(@item_resource_aliases, resource, resource)
 
-    if resource == "sessions" and
-         Enum.any?(~w(provider model thinkingLevel modelContext), &(not is_nil(item[&1]))) do
+    if catalog_selection_present?(resource, item) do
       ModelCatalog.get()
     else
       %{}
     end
   end
 
-  defp validate_session_catalog!(item, catalog) do
-    harness = item["harness"]
+  defp catalog_selection_present?(resource, item) do
+    case Map.get(@item_catalog_selections, resource) do
+      nil -> false
+      fields -> Enum.any?(Map.values(fields), &is_binary(item[&1]))
+    end
+  end
 
-    harness_module =
+  defp validate_catalog_selection!(resource, item, catalog) do
+    fields = Map.fetch!(@item_catalog_selections, resource)
+
+    selection =
+      fields
+      |> Map.take([:harness, :provider, :model, :effort, :context])
+      |> Map.new(fn {kind, field} -> {kind, binary_or_nil(item[field])} end)
+
+    host = fields[:host] && binary_or_nil(item[fields.host])
+    harness = selection[:harness]
+
+    if is_binary(harness) do
       try do
         Harness.parse!(harness)
       rescue
         ArgumentError ->
-          raise ArgumentError, "sessions.harness is absent from the served harness catalog"
+          raise ArgumentError, "#{resource}.harness is absent from the served harness catalog"
       end
+    end
 
-    selection = %{
-      provider: item["provider"],
-      model: item["model"],
-      effort: item["thinkingLevel"],
-      context: item["modelContext"]
-    }
+    keys =
+      Enum.filter(Map.keys(catalog), fn {catalog_host, catalog_harness} ->
+        (is_nil(host) or host == catalog_host) and
+          (is_nil(harness) or harness == catalog_harness)
+      end)
 
-    if Enum.any?(Map.values(selection), &(not is_nil(&1))) do
-      entries = session_catalog_entries(catalog, item["host"], harness)
+    dynamic = Map.drop(selection, [:harness])
 
-      unless Enum.any?(entries, &catalog_entry_matches?(&1, selection)) do
+    if Enum.any?(Map.values(dynamic), &is_binary/1) do
+      entries = Enum.flat_map(keys, &Map.fetch!(catalog, &1))
+
+      unless Enum.any?(entries, &catalog_entry_matches?(&1, dynamic)) do
         raise ArgumentError,
-              "sessions provider, model, effort, and context must match one served catalog entry"
-      end
-
-      expected_provider = harness_module.credential_provider() |> Atom.to_string()
-
-      if is_binary(selection.provider) and selection.provider != expected_provider do
-        raise ArgumentError, "sessions.provider does not belong to sessions.harness"
+              "#{resource} harness, provider, model, effort, and context must match one served catalog entry"
       end
     end
 
     :ok
   end
 
-  defp session_catalog_entries(catalog, host, harness) when is_binary(host),
-    do: Map.get(catalog, {host, harness}, [])
-
-  defp session_catalog_entries(catalog, _host, harness) do
-    for {{_host, ^harness}, entries} <- catalog,
-        entry <- entries,
-        do: entry
-  end
+  defp binary_or_nil(value) when is_binary(value), do: value
+  defp binary_or_nil(_value), do: nil
 
   defp catalog_entry_matches?(entry, selection) do
     provider = entry.provider |> Atom.to_string()
 
-    (is_nil(selection.provider) or selection.provider == provider) and
-      (is_nil(selection.model) or selection.model == entry.family) and
-      (is_nil(selection.effort) or selection.effort in entry.efforts) and
-      (is_nil(selection.context) or selection.context == entry.context)
+    (is_nil(selection[:provider]) or selection.provider == provider) and
+      (is_nil(selection[:model]) or selection.model == entry.family) and
+      (is_nil(selection[:effort]) or selection.effort in entry.efforts) and
+      (is_nil(selection[:context]) or selection.context == entry.context)
   end
 
   defp encode_item_field("sessions", "overrides", nil), do: "null"
