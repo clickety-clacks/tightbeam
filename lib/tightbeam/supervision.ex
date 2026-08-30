@@ -3869,7 +3869,7 @@ defmodule Tightbeam.Supervision do
       generation = (transfer.generation || 0) + 1
       outcome_id = "#{assignment_id}##{generation}"
 
-      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch)
+      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch, sync_session: false)
 
       Txn.q(
         txn,
@@ -3915,7 +3915,7 @@ defmodule Tightbeam.Supervision do
       outcome_kind = if target == main, do: "main_elevation", else: "parent_elevation"
       action_needed = outcome_kind == "main_elevation"
 
-      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch)
+      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch, sync_session: false)
 
       wake =
         Wakes.schedule_in_txn(txn, %{
@@ -3980,14 +3980,14 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch) do
+  defp invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch, opts \\ []) do
     Txn.q(
       txn,
       "UPDATE turns SET status='canceled', endedAt=?2 WHERE seq=?1 AND status='queued'",
       [transfer.turn_seq, retirement_epoch]
     )
 
-    if Txn.changes(txn) == 1,
+    if Txn.changes(txn) == 1 and Keyword.get(opts, :sync_session, true),
       do: Tightbeam.Org.sync_mechanical_status_in_txn(txn, transfer.session_key)
   end
 
