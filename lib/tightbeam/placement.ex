@@ -1213,7 +1213,7 @@ defmodule Tightbeam.Placement do
         {"TIGHTBEAM_MACHINE", host},
         {"PATH", path},
         {"TIGHTBEAM_LINEAGE", lineage}
-      ] ++ github_env(config.base_dir) ++ overlay_env
+      ] ++ github_env(harness, config.base_dir, home) ++ overlay_env
 
     remote_env =
       if host_config.ssh do
@@ -1301,19 +1301,26 @@ defmodule Tightbeam.Placement do
   defp adapter_path(config, %{ssh: ssh} = host_config) do
     case Map.fetch(host_config, :toolchain_dirs) do
       {:ok, dirs} ->
-        cli_bin = if ssh, do: host_config[:cli_bin], else: config.cli_bin
+        cli_bin = if ssh, do: host_config[:cli_bin], else: local_cli_bin(config)
 
         [cli_bin | dirs ++ @posix_path]
         |> Enum.reject(&(&1 in [nil, ""]))
         |> Enum.join(":")
 
       :error when is_nil(ssh) ->
-        config.cli_bin <> ":" <> (System.get_env("PATH") || "")
+        local_cli_bin(config) <> ":" <> (System.get_env("PATH") || "")
 
       :error ->
         "#{host_config[:cli_bin] || ""}:$PATH"
     end
   end
+
+  # The gateway installs its own CLI at <base>/bin and puts that on the adapter
+  # config as :cli_bin (Gateway.install_cli_bin/1). Home-only deliveries (turn
+  # boundary, set_harness) run with the plain gateway config, which carries no
+  # :cli_bin — derive the same location rather than crash on the missing key.
+  defp local_cli_bin(config),
+    do: Map.get(config, :cli_bin) || Path.join(config.base_dir, "bin")
 
   defp ensure_toolchain_dirs!(_host, host_config, _sh)
        when not is_map_key(host_config, :toolchain_dirs), do: :ok
@@ -1349,6 +1356,13 @@ defmodule Tightbeam.Placement do
   # honest answer (needs_onboarding) where ambient fallback would let a store
   # agents cannot reach answer "live".
   defp github_env(base_dir), do: Tightbeam.GithubAuth.env(base_dir)
+
+  # The dedicated Cursor identity cannot traverse the 0700 banked dir; it reads
+  # the group-readable projection deliver_home wrote under its config dir.
+  defp github_env(:cursor, _base_dir, home),
+    do: [{"GH_CONFIG_DIR", Tightbeam.Harness.Cursor.github_config_dir(home)}]
+
+  defp github_env(_harness, base_dir, _home), do: github_env(base_dir)
 
   @doc """
   Capture same-tier adapter boot inputs in the higher-tier coordinator.
@@ -1597,6 +1611,12 @@ defmodule Tightbeam.Placement do
       end)
 
     rails = Rails.hook_settings()
+    # Reserved rails call the `tightbeam` helper (and `gh`) by bare name; Cursor's
+    # wrapper carries the same PATH common_env gives every harness (see
+    # CursorRails) because the dedicated identity's launcher pins PATH.
+    # Only Cursor carries it; other harnesses must not require `cli_bin` here
+    # (deliver_home also runs for home-only projections with minimal configs).
+    rails_path = if harness == :cursor, do: adapter_path(config, host_config)
 
     result =
       module.reconcile_home(
@@ -1612,6 +1632,7 @@ defmodule Tightbeam.Placement do
           harness: harness,
           machine: host,
           rails: rails,
+          rails_path: rails_path,
           # The pinned model tracks the SESSION'S resolved selection when the caller
           # supplies one (`:model`), falling back to the org default only when there
           # is no session context (adapter cold-boot). The claude adapter's offered
@@ -1631,9 +1652,16 @@ defmodule Tightbeam.Placement do
       if harness == :cursor do
         Tightbeam.Harness.Cursor.prepare_projection_runtime!(Map.fetch!(result, :home_path))
 
+        Tightbeam.Harness.Cursor.project_github_config!(
+          Map.fetch!(result, :home_path),
+          Tightbeam.GithubAuth.config_dir(host_config.base_dir),
+          Map.get(config, :cursor_execution_home)
+        )
+
         Tightbeam.Harness.Cursor.project_execution_rails!(
           Map.get(config, :cursor_execution_home),
-          rails
+          rails,
+          path: rails_path
         )
       end
 

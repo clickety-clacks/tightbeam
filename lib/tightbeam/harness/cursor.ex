@@ -136,13 +136,118 @@ defmodule Tightbeam.Harness.Cursor do
   end
 
   @doc false
-  def project_execution_rails!(home_override, settings) do
+  def project_execution_rails!(home_override, settings, opts \\ []) do
     path = Path.join(execution_home(home_override), @rails_file)
-    bytes = settings |> CursorRails.compile() |> JSON.encode!()
+    bytes = settings |> CursorRails.compile(rails_opts(opts)) |> JSON.encode!()
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, bytes)
     File.chmod!(path, 0o644)
     Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+  end
+
+  # Both hooks.json writers (projection home and execution home) MUST compile
+  # with identical options: the launcher verifies the execution-home file against
+  # the digest of the bytes the projection wrote.
+  defp rails_opts(opts), do: Keyword.take(opts, [:path])
+
+  @github_config_dirname "gh"
+
+  @doc """
+  Where the dedicated execution identity reads the GitHub CLI config: a
+  group-readable projection under CURSOR_CONFIG_DIR, not the banked
+  `<base>/auth/github/gh`, which `tightbeam onboard github` keeps 0700 (bank.rs
+  `banking_into`) and uid 503 cannot traverse. Same exposure class as the
+  operator's own runs: the banked token is readable by tightbeam-workspace,
+  which holds only the operator and the execution account.
+  """
+  @spec github_config_dir(String.t()) :: String.t()
+  def github_config_dir(home), do: Path.join(home, @github_config_dirname)
+
+  @doc false
+  def project_github_config!(home, banked_dir, execution_home_override \\ nil) do
+    target = github_config_dir(home)
+
+    case provisioned_gid(execution_home(execution_home_override), home) do
+      {:ok, gid} when is_integer(gid) ->
+        if File.dir?(banked_dir) do
+          File.mkdir_p!(target)
+          :ok = :file.change_group(target, gid)
+          File.chmod!(target, 0o2750)
+
+          for name <- ["config.yml", "hosts.yml"] do
+            source = Path.join(banked_dir, name)
+            dest = Path.join(target, name)
+
+            if File.regular?(source) do
+              # Write owner-only first, then widen to the provisioned group: the
+              # token is never group-readable under the wrong group.
+              File.cp!(source, dest)
+              File.chmod!(dest, 0o600)
+              :ok = :file.change_group(dest, gid)
+              File.chmod!(dest, 0o640)
+            else
+              File.rm(dest)
+            end
+          end
+        else
+          # Not onboarded: no projection, so GH_CONFIG_DIR probes as
+          # needs_onboarding rather than reaching any ambient config.
+          File.rm_rf!(target)
+        end
+
+      {:refuse, reason} ->
+        # Never leave a token copy behind on an unprovisioned or mis-grouped
+        # host. The launcher refuses the run independently; this keeps the
+        # secret from being written at all.
+        File.rm_rf!(target)
+        Logger.warning("Cursor GitHub config not projected: #{reason}")
+    end
+
+    :ok
+  end
+
+  # The gid the dedicated execution identity shares with the operator
+  # (tightbeam-workspace), read from the admin-provisioned execution home. It
+  # must differ from the gateway's own primary group (staff on macOS: shared with
+  # every local user) and the projection root must already carry it.
+  defp provisioned_gid(execution_home, home) do
+    # Stat the execution home first: an unprovisioned host short-circuits here
+    # without touching the (cached) primary-gid lookup or the projection root.
+    with {:ok, %File.Stat{gid: gid}} <- File.stat(execution_home),
+         :provisioned <- if(gid == primary_gid(), do: :unprovisioned, else: :provisioned),
+         {:ok, %File.Stat{gid: ^gid}} <- File.stat(home) do
+      {:ok, gid}
+    else
+      {:error, reason} ->
+        {:refuse, "execution home #{execution_home} unavailable (#{inspect(reason)})"}
+
+      :unprovisioned ->
+        {:refuse,
+         "execution home #{execution_home} is in the gateway's primary group; " <>
+           "provision the dedicated account and tightbeam-workspace first"}
+
+      {:ok, %File.Stat{gid: other}} ->
+        {:refuse,
+         "projection root #{home} is group #{other}, not the execution home's group; " <>
+           "chgrp it to tightbeam-workspace (see tightbeam onboard cursor)"}
+    end
+  end
+
+  # The gateway process's primary gid. `id -g` is the only portable source that
+  # is right on macOS too (a fresh file takes its parent directory's gid there,
+  # not the process's). Resolved once per VM and cached: it cannot change for a
+  # running process and must not cost a subprocess on every delivery.
+  defp primary_gid do
+    case :persistent_term.get({__MODULE__, :primary_gid}, nil) do
+      nil ->
+        {out, 0} = System.cmd("id", ["-g"])
+        gid = out |> String.trim() |> String.to_integer()
+        :persistent_term.put({__MODULE__, :primary_gid}, gid)
+        gid
+
+      gid ->
+        gid
+    end
   end
 
   @doc false
@@ -213,7 +318,7 @@ defmodule Tightbeam.Harness.Cursor do
   def reconcile_home(target, home, desired) do
     rails =
       desired.rails
-      |> CursorRails.compile()
+      |> CursorRails.compile(rails_opts(path: Map.get(desired, :rails_path)))
       |> JSON.encode!()
 
     Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
