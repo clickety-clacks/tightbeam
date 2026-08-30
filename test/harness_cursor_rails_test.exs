@@ -54,6 +54,72 @@ defmodule Tightbeam.Harness.CursorRailsTest do
              }
     end
 
+    test "without :path the wrapper does not touch PATH" do
+      pre = %{
+        "hooks" => %{
+          "PreToolUse" => [
+            %{"matcher" => "Bash", "hooks" => [%{"type" => "command", "command" => "true"}]}
+          ]
+        }
+      }
+
+      %{"hooks" => %{"beforeShellExecution" => [%{"command" => command}]}} =
+        CursorRails.compile(pre)
+
+      refute command =~ "PATH="
+      assert String.starts_with?(command, "in=$(cat); ")
+    end
+
+    test ":path is set inside the wrapper and resolves the helper" do
+      # The dedicated Cursor identity runs under a fixed system PATH, so a
+      # reserved rail's bare `tightbeam ...` invocation must resolve through the
+      # operator-configured helper directory carried in the wrapper itself.
+      dir = Path.join(System.tmp_dir!(), "tb-cursor-helper-#{System.unique_integer([:positive])}")
+      File.mkdir_p!(dir)
+      helper = Path.join(dir, "tightbeam")
+      File.write!(helper, "#!/bin/sh\necho \"[gate: helper] resolved $1\" >&2\nexit 2\n")
+      File.chmod!(helper, 0o755)
+      on_exit(fn -> File.rm_rf!(dir) end)
+
+      pre = %{
+        "hooks" => %{
+          "PreToolUse" => [
+            %{
+              "matcher" => "Bash",
+              "hooks" => [%{"type" => "command", "command" => "tightbeam github-auth-check"}]
+            }
+          ]
+        }
+      }
+
+      %{"hooks" => %{"beforeShellExecution" => [hook]}} =
+        CursorRails.compile(pre, path: dir)
+
+      assert String.starts_with?(
+               hook["command"],
+               "PATH='#{dir}':\"$PATH\"; export PATH; in=$(cat); "
+             )
+
+      assert %{"permission" => "deny", "user_message" => msg} =
+               run_hook(hook, shell_stdin("git ls-remote origin"))
+
+      assert msg =~ "[gate: helper] resolved github-auth-check"
+    end
+
+    test ":path containing a single quote is refused rather than mis-quoted" do
+      pre = %{
+        "hooks" => %{
+          "PreToolUse" => [
+            %{"matcher" => "Bash", "hooks" => [%{"type" => "command", "command" => "true"}]}
+          ]
+        }
+      }
+
+      assert_raise ArgumentError, ~r/single quote/, fn ->
+        CursorRails.compile(pre, path: "/tmp/it's")
+      end
+    end
+
     test "Bash routes to beforeShellExecution and the wrap is applied" do
       pre = %{
         "hooks" => %{

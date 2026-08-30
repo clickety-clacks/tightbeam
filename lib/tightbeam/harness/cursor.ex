@@ -136,14 +136,19 @@ defmodule Tightbeam.Harness.Cursor do
   end
 
   @doc false
-  def project_execution_rails!(home_override, settings) do
+  def project_execution_rails!(home_override, settings, opts \\ []) do
     path = Path.join(execution_home(home_override), @rails_file)
-    bytes = settings |> CursorRails.compile() |> JSON.encode!()
+    bytes = settings |> CursorRails.compile(rails_opts(opts)) |> JSON.encode!()
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, bytes)
     File.chmod!(path, 0o644)
     Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
   end
+
+  # Both hooks.json writers (projection home and execution home) MUST compile
+  # with identical options: the launcher verifies the execution-home file against
+  # the digest of the bytes the projection wrote.
+  defp rails_opts(opts), do: Keyword.take(opts, [:path])
 
   @doc false
   def prepare_projection_runtime!(home) do
@@ -213,7 +218,7 @@ defmodule Tightbeam.Harness.Cursor do
   def reconcile_home(target, home, desired) do
     rails =
       desired.rails
-      |> CursorRails.compile()
+      |> CursorRails.compile(rails_opts(path: Map.get(desired, :rails_path)))
       |> JSON.encode!()
 
     Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},

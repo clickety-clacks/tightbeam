@@ -91,15 +91,34 @@ defmodule Tightbeam.Harness.CursorRails do
   `nil` (no rails) and an empty PreToolUse list compile to an empty hooks config.
   Raises `UnmappableRailError` on any rail whose matcher has no enforcing Cursor
   before-execution hook.
-  """
-  @spec compile(map() | nil) :: map()
-  def compile(nil), do: %{"version" => 1, "hooks" => %{}}
 
-  def compile(%{"hooks" => %{"PreToolUse" => entries}}) when is_list(entries) do
+  ## Options
+
+    * `:path` — the PATH the wrapped command runs with. Reserved Tightbeam
+      rails (`github-auth-check`, `tool-call-observed`) invoke the `tightbeam`
+      helper by bare name, and `github-auth-check` in turn needs `gh`; both rely
+      on the harness PATH. Claude and codex inherit it from `common_env`; Cursor
+      runs under the dedicated execution identity whose launcher sets a FIXED
+      system PATH (deliberately — an inherited PATH was a code-execution hole
+      into uid 503). So the Cursor wrapper itself sets PATH before running the
+      carried command, to the SAME value `common_env` gives the other harnesses
+      (`cli_bin` + the gateway's PATH: operator-side config, hashed into the
+      projected hooks and re-verified by the launcher), never anything from the
+      launched process's env. Proven live 2026-08-29: without it the GitHub-auth
+      rail failed closed (`sh: tightbeam: command not found`) and refused git.
+  """
+  @spec compile(map() | nil, keyword()) :: map()
+  def compile(settings, opts \\ [])
+
+  def compile(nil, _opts), do: %{"version" => 1, "hooks" => %{}}
+
+  def compile(%{"hooks" => %{"PreToolUse" => entries}}, opts) when is_list(entries) do
+    path = Keyword.get(opts, :path)
+
     hooks =
       Enum.reduce(entries, %{}, fn %{"matcher" => matcher, "hooks" => cmds}, acc ->
         event = event_for(matcher)
-        cursor_cmds = Enum.map(cmds, &to_cursor_command/1)
+        cursor_cmds = Enum.map(cmds, &to_cursor_command(&1, path))
         Map.update(acc, event, cursor_cmds, &(&1 ++ cursor_cmds))
       end)
 
@@ -118,8 +137,8 @@ defmodule Tightbeam.Harness.CursorRails do
 
   # Wrap one Tightbeam command entry into a Cursor command entry that speaks
   # Cursor's stdout permission protocol.
-  defp to_cursor_command(%{"type" => "command", "command" => tb_command}) do
-    %{"command" => wrap(tb_command)}
+  defp to_cursor_command(%{"type" => "command", "command" => tb_command}, path) do
+    %{"command" => wrap(tb_command, path)}
   end
 
   # JSON-string encoding of the captured stderr reason, pure POSIX (no jq/python
@@ -138,15 +157,30 @@ defmodule Tightbeam.Harness.CursorRails do
   # command (carried base64 so its quoting is inert), capture its stderr as the
   # deny reason, and translate its exit code. Only Tightbeam's defined block code
   # (2) denies; every other exit allows, preserving PreToolUse parity exactly.
-  defp wrap(tb_command) do
+  defp wrap(tb_command, path) do
     b64 = Base.encode64(tb_command)
 
-    "in=$(cat); " <>
+    path_prefix(path) <>
+      "in=$(cat); " <>
       "msg=$(printf '%s' \"$in\" | sh -c \"$(printf '%s' '#{b64}' | base64 -d)\" 2>&1 1>/dev/null); " <>
       "rc=$?; " <>
       "if [ \"$rc\" = 2 ]; then " <>
       "esc=$(printf '%s' \"$msg\" | #{@json_encode_reason}); " <>
       "printf '{\"permission\":\"deny\",\"user_message\":\"%s\"}' \"$esc\"; " <>
       "else printf '{\"permission\":\"allow\"}'; fi"
+  end
+
+  # Set the operator-configured PATH for the wrapped command only (the fixed
+  # launcher PATH is kept as a suffix). Single-quoted so the value is inert to
+  # the shell; a value containing a single quote is refused rather than
+  # mis-quoted.
+  defp path_prefix(nil), do: ""
+
+  defp path_prefix(path) when is_binary(path) do
+    if String.contains?(path, "'") do
+      raise ArgumentError, "Cursor rails :path must not contain a single quote: #{inspect(path)}"
+    end
+
+    "PATH='" <> path <> "':\"$PATH\"; export PATH; "
   end
 end

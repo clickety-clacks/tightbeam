@@ -764,7 +764,9 @@ defmodule Tightbeam.PlacementTest do
 
     expected_digest =
       Rails.hook_settings()
-      |> Tightbeam.Harness.CursorRails.compile()
+      |> Tightbeam.Harness.CursorRails.compile(
+        path: Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+      )
       |> JSON.encode!()
       |> then(&:crypto.hash(:sha256, &1))
       |> Base.encode16(case: :lower)
@@ -801,6 +803,47 @@ defmodule Tightbeam.PlacementTest do
 
     refute opts[:cursor_rails_sha256] ==
              Base.encode16(:crypto.hash(:sha256, "tampered-after-projection"), case: :lower)
+  end
+
+  test "Cursor home delivery with a gateway-shaped config (no :cli_bin) derives the helper PATH",
+       %{base_dir: base_dir, db: db} do
+    # Turn-boundary / set_harness deliveries use the plain gateway config, which
+    # has no :cli_bin. The wrapper PATH must resolve to the gateway's own
+    # <base>/bin rather than crash.
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cursor_execution_home: execution_home,
+      harness_target_overrides: %{
+        find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: fn path ->
+          if Path.basename(path) == "index.js",
+            do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+            else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+        end,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
+      }
+    }
+
+    refute Map.has_key?(config, :cli_bin)
+    home = Placement.deliver_home(config, {:cursor, "shared", "testhost"})
+
+    hooks = JSON.decode!(File.read!(Path.join(execution_home, ".cursor/hooks.json")))
+    expected_path = Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+
+    assert hooks["version"] == 1
+
+    for %{"command" => command} <- hooks["hooks"]["beforeShellExecution"] do
+      assert String.starts_with?(command, "PATH='#{expected_path}':\"$PATH\"; export PATH; ")
+    end
+
+    assert File.read!(Path.join(home, ".cursor/hooks.json")) ==
+             File.read!(Path.join(execution_home, ".cursor/hooks.json"))
   end
 
   test "remote Cursor adapter_opts refuses local-only before credential kind read", %{

@@ -1333,7 +1333,7 @@ defmodule Tightbeam.Placement do
       [
         {"TIGHTBEAM_HOME", config.base_dir},
         {"TIGHTBEAM_MACHINE", host},
-        {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
+        {"PATH", local_cli_bin(config) <> ":" <> (System.get_env("PATH") || "")},
         {"TIGHTBEAM_LINEAGE", lineage}
       ] ++ overlay_env
 
@@ -1404,6 +1404,20 @@ defmodule Tightbeam.Placement do
     {:ok, opts} = adapter_opts(config, key)
     opts
   end
+
+  defp adapter_path(config, %{ssh: ssh} = host_config) do
+    if ssh,
+      do: "#{host_config[:cli_bin] || ""}:$PATH",
+      else: local_cli_bin(config) <> ":" <> (System.get_env("PATH") || "")
+  end
+
+  # The gateway installs its own CLI at <base>/bin and puts that on the adapter
+  # config as :cli_bin (Gateway.install_cli_bin/1). Home-only deliveries (turn
+  # boundary, set_harness) run with the plain gateway config, which carries no
+  # :cli_bin — derive the same location rather than crash on the missing key.
+  defp local_cli_bin(config),
+    do: Map.get(config, :cli_bin) || Path.join(config.base_dir, "bin")
+
   @doc """
   Capture same-tier adapter boot inputs in the higher-tier coordinator.
 
@@ -1651,6 +1665,12 @@ defmodule Tightbeam.Placement do
       end)
 
     rails = Rails.hook_settings()
+    # Reserved rails call the `tightbeam` helper (and `gh`) by bare name; Cursor's
+    # wrapper carries the same PATH common_env gives every harness (see
+    # CursorRails) because the dedicated identity's launcher pins PATH.
+    # Only Cursor carries it; other harnesses must not require `cli_bin` here
+    # (deliver_home also runs for home-only projections with minimal configs).
+    rails_path = if harness == :cursor, do: adapter_path(config, host_config)
 
     result =
       module.reconcile_home(
@@ -1666,6 +1686,7 @@ defmodule Tightbeam.Placement do
           harness: harness,
           machine: host,
           rails: rails,
+          rails_path: rails_path,
           # The pinned model tracks the SESSION'S resolved selection when the caller
           # supplies one (`:model`), falling back to the org default only when there
           # is no session context (adapter cold-boot). The claude adapter's offered
@@ -1687,7 +1708,8 @@ defmodule Tightbeam.Placement do
 
         Tightbeam.Harness.Cursor.project_execution_rails!(
           Map.get(config, :cursor_execution_home),
-          rails
+          rails,
+          path: rails_path
         )
       end
 
