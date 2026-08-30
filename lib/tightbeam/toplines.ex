@@ -1024,7 +1024,9 @@ defmodule Tightbeam.Toplines do
                (SELECT seq FROM topline_events e
                 WHERE e.toplineId = m.toplineId AND e.membershipId = m.id
                   AND e.kind = 'work_linked'),
-               wi.id, wi.createdAt
+               wi.id,
+               COALESCE((SELECT rowVersion FROM work_item_versions v
+                         WHERE v.workItemId = wi.id), wi.createdAt)
         FROM topline_work_memberships m
         JOIN work_items wi ON wi.id = m.workItemId
         WHERE m.toplineId = ?1 AND m.unlinkedAt IS NULL
