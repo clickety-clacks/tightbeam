@@ -309,7 +309,10 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     end
   end
 
-  def connect(%__MODULE__{} = fixture) do
+  def connect(%__MODULE__{} = fixture, opts \\ []) do
+    subscription_id = Keyword.get(opts, :subscription_id, "work-items")
+    filters = Keyword.get(opts, :filters, %{"classes" => ["work_item."]})
+
     {:ok, ws} = WS.connect("127.0.0.1", fixture.port, "/ws/changes?protocolVersion=1")
     track_socket(fixture, ws)
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => fixture.device.token}))
@@ -322,8 +325,8 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
         JSON.encode!(%{
           "type" => "subscribe",
           "protocolVersion" => 1,
-          "subscriptionId" => "work-items",
-          "filters" => %{"classes" => ["work_item."]}
+          "subscriptionId" => subscription_id,
+          "filters" => filters
         })
       )
 
