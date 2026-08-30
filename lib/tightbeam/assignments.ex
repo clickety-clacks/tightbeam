@@ -148,7 +148,20 @@ defmodule Tightbeam.Assignments do
     revokedAt INTEGER NOT NULL,
     revokedByUser TEXT NULL REFERENCES users(userId),
     revokedBySession TEXT NULL REFERENCES sessions(sessionKey),
-    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000 AND length(trim(reason)) >= 1),
+    -- Match String.trim/1's Unicode whitespace contract. SQLite's one-argument
+    -- trim only removes ASCII spaces, so a tab-only reason would otherwise be
+    -- a durable but content-free revocation motive.
+    reason TEXT NOT NULL CHECK(
+      length(reason) BETWEEN 1 AND 2000
+      AND length(trim(reason,
+        char(9) || char(10) || char(11) || char(12) || char(13) || ' ' ||
+        char(133) || char(160) || char(5760) ||
+        char(8192) || char(8193) || char(8194) || char(8195) || char(8196) ||
+        char(8197) || char(8198) || char(8199) || char(8200) || char(8201) ||
+        char(8202) || char(8232) || char(8233) || char(8239) || char(8287) ||
+        char(12288)
+      )) >= 1
+    ),
     CHECK((revokedByUser IS NOT NULL) != (revokedBySession IS NOT NULL))
   );
   CREATE INDEX IF NOT EXISTS assignment_revocations_assignment

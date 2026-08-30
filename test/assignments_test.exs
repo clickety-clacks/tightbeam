@@ -2139,6 +2139,9 @@ defmodule Tightbeam.AssignmentsTest do
     for params <- [
           %{assignment_id: assignment.id},
           %{assignment_id: assignment.id, reason: "   "},
+          %{assignment_id: assignment.id, reason: "\t"},
+          %{assignment_id: assignment.id, reason: "\u00A0"},
+          %{assignment_id: assignment.id, reason: "\u3000"},
           %{assignment_id: assignment.id, reason: String.duplicate("x", 2001)},
           %{assignment_id: assignment.id, reason: 7}
         ] do
@@ -2163,6 +2166,19 @@ defmodule Tightbeam.AssignmentsTest do
                  assignment.id
                ]
              )
+
+    for {reason, suffix} <- [{"\t", "tab"}, {"\u00A0", "nbsp"}, {"\u3000", "ideographic"}] do
+      assert {:error, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                 VALUES (?1, ?2, 1, 'flynn', NULL, ?3)
+                 """,
+                 ["revocation-whitespace-#{suffix}", assignment.id, reason]
+               )
+    end
 
     revoked =
       handle(
