@@ -901,11 +901,7 @@ defmodule Tightbeam.SupervisionTest do
         "UPDATE assignments SET state='closed', outcome='surrendered', closedAt=11, closedBySession='holder', closingAttestId='att_surrendered' WHERE id='asg_surrendered'"
       )
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE assignments SET state='closed', outcome='revoked', closedAt=12, closedByUser='flynn' WHERE id='asg_revoked'"
-      )
+    revoke_assignment!(ctx.db, "asg_revoked", 12)
 
     _name = start_liveness!(ctx, sweep_ms: 60_000)
 
@@ -2835,11 +2831,7 @@ defmodule Tightbeam.SupervisionTest do
     seq = terminal!(ctx.db, "holder")
     assert {:refused, "server_error"} = Supervision.evaluate(ctx.db, transient, 3, "holder", seq)
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE assignments SET state='closed', outcome='revoked', closedAt=2, closedByUser='flynn' WHERE id='asg_1'"
-      )
+    revoke_assignment!(ctx.db, "asg_1", 2)
 
     assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
 
@@ -3772,6 +3764,28 @@ defmodule Tightbeam.SupervisionTest do
         "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES (?1, ?2, ?3, 'flynn', ?4)",
         [id, subject, holder, opened_at]
       )
+  end
+
+  defp revoke_assignment!(db, assignment_id, revoked_at) do
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO assignment_revocations
+          (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+        VALUES (?1, ?2, ?3, 'flynn', NULL, 'supervision test revocation')
+        """,
+        ["revocation:#{assignment_id}:#{revoked_at}", assignment_id, revoked_at]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE assignments SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn' WHERE id=?1",
+        [assignment_id, revoked_at]
+      )
+
+    :ok
   end
 
   defp attach_work_item!(db, assignment_id, work_item_id) do
