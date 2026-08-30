@@ -36,14 +36,28 @@ shell scrollback.
 ### The pinned Cursor bundle is an obtainable operand
 
 Cursor support is pinned to one `cursor-agent` version, `2026.08.11-e8db854`,
-verified by SHA-256 at every launch (`Tightbeam.Harness.Cursor`:
-`cursor-agent` `eed61c52…`, `index.js` `6aceb24b…`). Nothing is vendored or
-patched: the bundle is Cursor's own published archive, at the URL shape its
-installer script downloads from, and every version stays published:
+verified by SHA-256 at every launch (`Tightbeam.Harness.Cursor`). The
+`cursor-agent` launcher script is byte-identical on all four published
+platform archives (`eed61c52…`); `index.js` is platform-specific, so its pin
+is a per-platform table (all four verified against the real archives,
+2026-08-30):
+
+| platform | `index.js` SHA-256 |
+| --- | --- |
+| darwin/arm64 | `6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0` |
+| darwin/x64 | `2def6db128c49b95f33b8b6f9624a15e65616f074ae505c06ffccf35fe0feb7b` |
+| linux/x64 | `f6fd4e6bf3d6ecbf66cc2dcabcf708b8a7c37b400d10c82a58658b5e331c36d0` |
+| linux/arm64 | `468106299df5dcebf227e0d478172a7241a202d25c4b2b7060b6723ee19cabac` |
+
+Nothing is vendored or patched: each bundle is Cursor's own published archive,
+at the URL shape its installer script downloads from, and every version stays
+published:
 
     https://downloads.cursor.com/lab/2026.08.11-e8db854/<darwin|linux>/<x64|arm64>/agent-cli-package.tar.gz
 
-Its `dist-package/` is byte-identical to the pinned bundle. `tightbeam onboard
+Each archive's `dist-package/` is byte-identical to its platform's pinned
+bundle, and the printed admin block resolves the host's platform so the URL
+and the digest it checks always belong together. `tightbeam onboard
 cursor` prints the exact admin block for the dedicated execution account: an
 unprivileged download and extraction into a temp dir, `shasum -a 256 -c`
 (`sha256sum -c` on Linux) against both digests, and only on a pass the root

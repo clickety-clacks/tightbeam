@@ -114,8 +114,7 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert Path.basename(Path.dirname(canonical)) == Cursor.adapter_version()
     assert sha256(canonical) == "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
 
-    assert sha256(bundle_path) ==
-             "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0"
+    assert sha256(bundle_path) == Cursor.bundle_sha256_for_host!()
 
     assert bundle =~ ~s("file"===t?"file":"memory"===t?"memory":"default")
     assert bundle =~ ~s("darwin"===e&&t&&!n&&"default"===r)
@@ -402,7 +401,7 @@ defmodule Tightbeam.CursorRegistrationTest do
               {"eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831\n", 0}
 
             command =~ "index.js" ->
-              {"6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0\n", 0}
+              {Cursor.bundle_sha256_for_host!() <> "\n", 0}
           end
         end
       }
@@ -472,7 +471,7 @@ defmodule Tightbeam.CursorRegistrationTest do
       realpath: fn path -> {:ok, path} end,
       sha256: fn path ->
         if Path.basename(path) == "index.js",
-          do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+          do: Cursor.bundle_sha256_for_host!(),
           else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
       end,
       verify_adapter_shim: fn _shim, _launcher -> :ok end
@@ -504,15 +503,27 @@ defmodule Tightbeam.CursorRegistrationTest do
 
   test "the CLI's admin instructions obtain the same pinned bundle this adapter verifies" do
     # The admin block `tightbeam onboard cursor` prints downloads Cursor's
-    # published archive for one exact version and checks two digests. Those
-    # three values must be the ones this module verifies at every launch, or a
-    # host provisioned by the book would be refused.
+    # published archive for one exact version and platform and checks two
+    # digests. Those values must be the ones this module verifies at every
+    # launch, or a host provisioned by the book would be refused.
     elixir = File.read!("lib/tightbeam/harness/cursor.ex")
     rust = File.read!("cli/src/cursor_execution_identity.rs")
 
-    for attribute <- ["@launcher_sha256", "@bundle_sha256"] do
-      [_, digest] = Regex.run(~r/#{attribute} "([0-9a-f]{64})"/, elixir)
-      assert rust =~ ~s("#{digest}"), "#{attribute} #{digest} is not pinned in the CLI"
+    [_, launcher_digest] = Regex.run(~r/@launcher_sha256 "([0-9a-f]{64})"/, elixir)
+    assert rust =~ ~s("#{launcher_digest}"), "@launcher_sha256 is not pinned in the CLI"
+
+    # index.js differs per platform; every platform pin this adapter can
+    # enforce must be the digest the CLI's admin block prints for it.
+    platforms = Cursor.bundle_sha256_by_platform()
+    assert map_size(platforms) == 4
+    assert Enum.uniq(Map.values(platforms)) |> length() == 4
+
+    for {{os, arch}, digest} <- platforms do
+      assert rust =~ ~s("#{digest}"),
+             "index.js digest for #{os}/#{arch} (#{digest}) is not pinned in the CLI"
+
+      assert rust =~ ~s("#{os}")
+      assert rust =~ ~s("#{arch}")
     end
 
     assert rust =~ ~s(const CURSOR_VERSION: &str = "#{Cursor.adapter_version()}")

@@ -461,7 +461,7 @@ defmodule Tightbeam.Harness.Support do
 
   defp cursor_vector_sha256(path) do
     if Path.basename(path) == "index.js",
-      do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+      do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
       else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
   end
 
