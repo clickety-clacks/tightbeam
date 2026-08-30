@@ -694,6 +694,30 @@ defmodule Tightbeam.FirehoseSmokeTest do
                false
              )
 
+    victim = Devices.add_user(fixture.db, "a4-private-victim", false)
+
+    ReadMarkers.set(fixture.db, victim.user_id, "private", "secret-marker")
+
+    victim_refs = %{"userId" => victim.user_id, "scopeKey" => "private"}
+
+    assert :forbidden ==
+             Rebuild.fetch(
+               fixture.db,
+               "read_marker.updated",
+               victim_refs,
+               fixture.user_id,
+               false
+             )
+
+    assert :forbidden ==
+             Rebuild.fetch(
+               fixture.db,
+               "read_marker.updated",
+               Map.put(victim_refs, "ownerUserId", fixture.user_id),
+               fixture.user_id,
+               false
+             )
+
     assert :unsupported ==
              Rebuild.fetch(
                fixture.db,

@@ -23,7 +23,7 @@ defmodule Tightbeam.Firehose.Rebuild do
              is_boolean(is_admin) do
     with {:ok, %{rebuild: true}} <- Registry.fetch(class),
          raw when not is_nil(raw) <- query(db, class, refs, user_id),
-         notice = Publisher.committed_notice(class, raw, rebuild_refs(class, raw, refs)),
+         notice = Publisher.committed_notice(class, raw, authoritative_refs(class, raw)),
          true <- StateVisibility.visible?(db, notice, user_id, is_admin) do
       {:ok, notice["payload"]}
     else
@@ -87,13 +87,16 @@ defmodule Tightbeam.Firehose.Rebuild do
   defp query(db, "kungfu.updated", refs, _user_id),
     do: StateResources.query_kungfu(db, fetch!(refs, "name"))
 
-  defp rebuild_refs("condition_fact.filed", %{origin: origin}, refs),
-    do: Map.put_new(refs, "principal", origin)
+  # Query refs select the row but are never authorization evidence. Visibility
+  # receives only refs derived from the authoritative row; Publisher fills the
+  # Registry primary refs from the canonical projection.
+  defp authoritative_refs("condition_fact.filed", %{origin: origin}),
+    do: %{"principal" => origin}
 
-  defp rebuild_refs("read_marker.updated", %{user_id: user_id}, refs),
-    do: Map.put_new(refs, "userId", user_id)
+  defp authoritative_refs("read_marker.updated", %{user_id: user_id}),
+    do: %{"userId" => user_id}
 
-  defp rebuild_refs(_class, _raw, refs), do: refs
+  defp authoritative_refs(_class, _raw), do: %{}
 
   defp fetch!(refs, key) do
     case Map.fetch(refs, key) do
