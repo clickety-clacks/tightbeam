@@ -4,11 +4,13 @@ defmodule Tightbeam.FirehoseSmokeTest do
   alias Tightbeam.ClientE2E.WS
 
   alias Tightbeam.{ConditionFacts, Devices, Dispatch, Gateway, Harness, Org, Placement}
-  alias Tightbeam.{Projection, ReadMarkers, StateResources, Wakes}
+  alias Tightbeam.{Projection, ReadMarkers, StateResources, SubagentMarkers, Toplines, Wakes}
   alias Tightbeam.Firehose.{Hub, Rebuild, Registry}
   alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
 
   @a4_replay_seed {7_913, 10_007, 65_537}
+  @a4_r8b_classes Registry.invalidation_rows() |> Map.keys() |> Enum.sort()
+  @a4_delete_classes ~w(role.created role.removed)
 
   @moduledoc """
   Firehose acceptance map: A1 and A3 are automated by the closed inventories,
@@ -23,11 +25,12 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
   test "authoritative production rebuild closes the current Registry both ways" do
     fixture = start_fixture!()
+    :ok = Toplines.ensure_schema(fixture.db)
 
     ws =
       Fixture.connect(fixture,
         subscription_id: "a4-authoritative",
-        filters: %{"classes" => Rebuild.classes()}
+        filters: %{"classes" => Rebuild.classes() ++ @a4_r8b_classes ++ @a4_delete_classes}
       )
 
     :ok = Hub.register(fixture.hub, self())
@@ -317,8 +320,23 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
     :ok = Hub.unregister(fixture.hub, self())
     ws = assert_a4_websocket_convergence(fixture, ws, notices)
-    :ok = WS.close(ws)
     :ok = Hub.register(fixture.hub, self())
+
+    r8b_work_item = Fixture.create_item(fixture, "A4 observe refetch work item")
+
+    {:ok, r8b_assignment} =
+      Dispatch.dispatch(
+        fixture.db,
+        handlers,
+        call.("assign", %{subject: "A4 observe refetch", work_item_id: r8b_work_item})
+        |> Map.merge(%{session_key: main.session_key, target_role: nil, role_fallback: false})
+      )
+
+    r8b_notices = a4_r8b_notices(fixture, main, r8b_assignment, r8b_work_item, scheduler, call)
+    ws = assert_a4_observe_refetch(fixture, ws, r8b_notices)
+
+    ws = assert_a4_delete_recreate(fixture, ws, handlers, call)
+    :ok = WS.close(ws)
 
     older = notices["read_marker.updated"]["payload"]
 
@@ -533,6 +551,7 @@ defmodule Tightbeam.FirehoseSmokeTest do
         fresh = assert_a4_fresh!(fixture, notice)
         model = apply_a4_notice(model, notice)
         assert model[a4_key(notice)].payload == fresh
+        assert model[a4_key(notice)].applications == 1
         {model, ws}
       end)
 
@@ -557,15 +576,31 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
   defp apply_a4_notice(model, notice) do
     key = a4_key(notice)
-    version = notice["payload"]["rowVersion"]
+    version = notice["payload"]["rowVersion"] || notice["occurredAt"]
 
-    case model do
-      %{^key => %{version: current}} when current >= version -> model
-      _ -> Map.put(model, key, %{version: version, payload: notice["payload"]})
+    case {notice["op"], model} do
+      {"delete", _} ->
+        Map.delete(model, key)
+
+      {_, %{^key => %{version: current}}} when current >= version ->
+        model
+
+      {_, %{^key => current}} ->
+        Map.put(model, key, %{
+          version: version,
+          payload: notice["payload"],
+          applications: current.applications + 1
+        })
+
+      _ ->
+        Map.put(model, key, %{version: version, payload: notice["payload"], applications: 1})
     end
   end
 
-  defp a4_key(notice), do: {notice["class"], notice["refs"]}
+  defp a4_key(notice) do
+    {:ok, row} = Registry.fetch(notice["class"])
+    {row.resource, Map.take(notice["refs"], row.primary_refs)}
+  end
 
   defp canonical_notice(notice),
     do: Map.take(notice, ["class", "occurredAt", "op", "payload", "refs", "resource"])
@@ -591,11 +626,175 @@ defmodule Tightbeam.FirehoseSmokeTest do
         {received, ws} = Fixture.recv_change(ws)
         assert canonical_notice(received) == outbound
         fresh = assert_a4_fresh!(fixture, received)
+        applications = model[a4_key(received)].applications
         model = apply_a4_notice(model, received)
         assert model[a4_key(received)].payload == fresh
+        assert model[a4_key(received)].applications == applications
         {model, ws}
       end)
     end)
+  end
+
+  # R8b notices carry only a source version and refs. A client must request a
+  # refetch; it must not put the invalidation in its projection model.
+  defp assert_a4_observe_refetch(fixture, ws, notices) do
+    {refetches, ws} =
+      Enum.reduce(1..map_size(notices), {[], ws}, fn _, {refetches, ws} ->
+        {notice, ws} = Fixture.recv_change(ws)
+        expected = Map.fetch!(notices, notice["class"])
+
+        assert canonical_notice(notice) == expected
+        assert notice["op"] == "observe"
+        assert :error == Registry.fetch(notice["class"])
+
+        assert :unsupported ==
+                 Rebuild.fetch(fixture.db, notice["class"], notice["refs"], fixture.user_id, true)
+
+        {%{effect: :refetch, class: class, refs: refs, source_version: source_version} = refetch,
+         _model} = apply_a4_observe(%{}, notice)
+
+        assert refetch == %{
+                 effect: :refetch,
+                 class: notice["class"],
+                 refs: notice["refs"],
+                 source_version: notice["payload"]["sourceVersion"]
+               }
+
+        assert is_binary(class)
+        assert is_map(refs)
+        assert is_integer(source_version)
+        {[refetch | refetches], ws}
+      end)
+
+    assert Enum.sort_by(refetches, & &1.class) ==
+             notices
+             |> Map.values()
+             |> Enum.map(fn notice ->
+               %{
+                 effect: :refetch,
+                 class: notice["class"],
+                 refs: notice["refs"],
+                 source_version: notice["payload"]["sourceVersion"]
+               }
+             end)
+             |> Enum.sort_by(& &1.class)
+
+    ws
+  end
+
+  defp apply_a4_observe(model, notice) do
+    %{
+      "class" => class,
+      "op" => "observe",
+      "payload" => %{"sourceVersion" => version},
+      "refs" => refs
+    } =
+      notice
+
+    {%{effect: :refetch, class: class, refs: refs, source_version: version}, model}
+  end
+
+  defp a4_r8b_notices(fixture, main, assignment, work_item_id, scheduler, call) do
+    capture_classes(fixture, %{}, @a4_r8b_classes, fn ->
+      created =
+        Toplines.create(
+          fixture.db,
+          call.("topline-create", %{title: "A4 observe refetch", idempotency_key: "a4-r8b-create"})
+        )
+
+      linked =
+        Toplines.link_work(
+          fixture.db,
+          call.("topline-link-work", %{
+            topline_id: created.topline.id,
+            work_item_id: work_item_id,
+            reason: "A4 observe refetch",
+            idempotency_key: "a4-r8b-link"
+          })
+        )
+
+      assert %{membership: _} = linked
+
+      _unlinked =
+        Toplines.unlink_work(
+          fixture.db,
+          call.("topline-unlink-work", %{
+            membership_id: linked.membership.id,
+            reason: "A4 observe refetch complete",
+            idempotency_key: "a4-r8b-unlink"
+          })
+        )
+
+      assert %{appended: true} =
+               SubagentMarkers.append(fixture.db, scheduler, %{
+                 kind: "subagent_start",
+                 principal: main.session_key,
+                 subagent_ref: "subagent:a4-r8b",
+                 source_event_ref: "a4-r8b-marker",
+                 harness: :codex,
+                 at: 7_500,
+                 assignment_id: assignment.id,
+                 firehose_hub: fixture.hub
+               })
+    end)
+  end
+
+  defp assert_a4_delete_recreate(fixture, ws, handlers, call) do
+    role = "a4-delete-recreate"
+
+    {model, ws} =
+      a4_role_delivery(fixture, ws, %{}, "role.created", fn ->
+        assert {:ok, %{role: %{name: ^role}}} =
+                 Dispatch.dispatch(
+                   fixture.db,
+                   handlers,
+                   call.("role-create", %{name: role, bind: nil})
+                 )
+      end)
+
+    {model, ws} =
+      a4_role_delivery(fixture, ws, model, "role.removed", fn ->
+        assert {:ok, %{removed: ^role}} =
+                 Dispatch.dispatch(fixture.db, handlers, call.("role-rm", %{name: role}))
+      end)
+
+    {model, ws} =
+      a4_role_delivery(fixture, ws, model, "role.created", fn ->
+        assert {:ok, %{role: %{name: ^role}}} =
+                 Dispatch.dispatch(
+                   fixture.db,
+                   handlers,
+                   call.("role-create", %{name: role, bind: nil})
+                 )
+      end)
+
+    assert map_size(model) == 1
+    ws
+  end
+
+  defp a4_role_delivery(fixture, ws, model, class, mutation) do
+    expected = capture_classes(fixture, %{}, [class], mutation)[class]
+    {notice, ws} = Fixture.recv_change(ws)
+    assert canonical_notice(notice) == expected
+    model = apply_a4_notice(model, notice)
+    key = a4_key(notice)
+
+    case notice["op"] do
+      "delete" ->
+        refute Map.has_key?(model, key)
+        assert nil == StateResources.query_role(fixture.db, notice["refs"]["role"])
+
+      "upsert" ->
+        fresh =
+          fixture.db
+          |> StateResources.query_role(notice["refs"]["role"])
+          |> StateResources.role()
+
+        assert model[key].payload == fresh
+        assert model[key].applications == 1
+    end
+
+    {model, ws}
   end
 
   defp firehose_call(verb, params) do
