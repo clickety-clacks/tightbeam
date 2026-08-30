@@ -91,11 +91,11 @@ defmodule Tightbeam.WorkItems do
     boundary TEXT NOT NULL CHECK(length(trim(boundary)) BETWEEN 1 AND 2000),
     dueAt INTEGER NOT NULL,
     wakeId TEXT NOT NULL UNIQUE REFERENCES wakes(wakeId),
-    state TEXT NOT NULL CHECK(state IN ('armed','moved','escalated')),
+    state TEXT NOT NULL CHECK(state IN ('armed','moved','escalated','canceled')),
     declaredAt INTEGER NOT NULL,
     escalatedAt INTEGER NULL,
     CHECK((state = 'escalated' AND escalatedAt IS NOT NULL) OR
-          (state IN ('armed','moved') AND escalatedAt IS NULL))
+          (state IN ('armed','moved','canceled') AND escalatedAt IS NULL))
   );
   """
 
@@ -131,6 +131,31 @@ defmodule Tightbeam.WorkItems do
       [[0]] -> :ok
       rows -> raise "principal-duty provenance migration incomplete: #{inspect(rows)}"
     end
+  end
+
+  @doc false
+  def terminal_horizon_cancellation_schema_in_txn(%Txn{} = txn) do
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE work_item_horizons RENAME TO work_item_horizons_principal_duty_v13"
+      )
+
+    :ok = Txn.exec(txn, @duty_ddl)
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        INSERT INTO work_item_horizons
+          (workItemId,generation,boundary,dueAt,wakeId,state,declaredAt,escalatedAt)
+        SELECT workItemId,generation,boundary,dueAt,wakeId,state,declaredAt,escalatedAt
+        FROM work_item_horizons_principal_duty_v13
+        """
+      )
+
+    :ok = Txn.exec(txn, "DROP TABLE work_item_horizons_principal_duty_v13")
+    :ok
   end
 
   @doc false
@@ -866,6 +891,15 @@ defmodule Tightbeam.WorkItems do
             [[transition_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
 
             if verb != :reopen do
+              cancel_horizon_on_terminal_disposition_in_txn(txn, id, %{
+                causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
+                outcome: %{
+                  kind: "disposition",
+                  disposition_kind: "work_item_transition",
+                  disposition_id: to_string(transition_id)
+                }
+              })
+
               cancel_brackets_in_txn(txn, id, %{
                 causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
                 outcome: %{
@@ -913,6 +947,40 @@ defmodule Tightbeam.WorkItems do
   defp transition_allowed?(from, "closed") when from in ["open", "iceboxed"], do: true
   defp transition_allowed?(from, "failed") when from in ["open", "iceboxed"], do: true
   defp transition_allowed?(_from, _target), do: false
+
+  # A terminal disposition discharges the current duty, but it keeps the
+  # declared horizon as history.  State is the delivery CAS: when delivery has
+  # already claimed its wake, changing armed -> canceled still makes that late
+  # delivery a no-op; when the wake remains pending, its typed cancellation and
+  # this row change commit in the same transaction.
+  defp cancel_horizon_on_terminal_disposition_in_txn(txn, item_id, transition) do
+    case Txn.q(
+           txn,
+           "SELECT wakeId FROM work_item_horizons WHERE workItemId=?1 AND state='armed'",
+           [item_id]
+         ) do
+      [[wake_id]] ->
+        Wakes.cancel_in_txn(
+          txn,
+          Map.merge(transition, %{
+            wake_id: wake_id,
+            requester: %{kind: "process", id: "tightbeam:work-items"},
+            reason_kind: "routing_bracket_satisfied"
+          })
+        )
+
+        Txn.q(
+          txn,
+          "UPDATE work_item_horizons SET state='canceled' WHERE workItemId=?1 AND wakeId=?2 AND state='armed'",
+          [item_id, wake_id]
+        )
+
+      [] ->
+        :ok
+    end
+
+    :ok
+  end
 
   defp disposition_allowed?(txn, {:user, user}, item) do
     item.ownerUserId == user or admin_user?(txn, user)
