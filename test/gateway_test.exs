@@ -8604,7 +8604,28 @@ defmodule Tightbeam.GatewayTest do
     assert Org.current_pointer(ctx.db, session.session_key) == nil
     stamped = Org.get(ctx.db, session.session_key)
     assert stamped.identity_render_contract == "universal-root-render-v1"
-    assert is_binary(stamped.identity_guidance_digest)
+
+    base_guidance =
+      Identity.snapshot_at!(base_dir, revision, session.archetype, :codex).guidance
+
+    final_guidance =
+      base_guidance <>
+        "\n\n## Inspect recent Tightbeam transcript\n\n" <>
+        "Before continuing, inspect this session's recent Tightbeam transcript. " <>
+        "Run `tightbeam transcript --session #{inspect(session.session_key)} --limit 50` and read only the bounded result you need. " <>
+        "Do not replay or inject earlier messages, and do not assume another " <>
+        "harness's private memory transferred."
+
+    expected_digest =
+      :crypto.hash(:sha256, final_guidance) |> Base.encode16(case: :lower)
+
+    assert stamped.identity_guidance_digest == expected_digest
+
+    status = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-status"]
+    %{sessions: sessions} = status.(%{origin: "user:flynn", params: %{}})
+    rendered = Enum.find(sessions, &(&1.session_key == session.session_key))
+    assert rendered.expected_guidance_digest == expected_digest
+    refute "guidance_digest_mismatch" in rendered.identity_stale_reasons
     assert_receive {:push, %{"type" => "stream_updated"}}
   end
 

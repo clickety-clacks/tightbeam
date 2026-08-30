@@ -180,7 +180,9 @@ defmodule Tightbeam.Dispatch do
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
     call =
       if verb in ["identity-edit", "identity-relearn", "learn", "unlearn", "kungfu-scaffold"] do
-        Map.put_new(call, :invocation_id, "identity-" <> Tightbeam.Id.uuid4())
+        Map.put_new_lazy(call, :invocation_id, fn ->
+          identity_invocation_id(call, verb, origin)
+        end)
       else
         call
       end
@@ -222,6 +224,17 @@ defmodule Tightbeam.Dispatch do
             :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
             {:error, error}
         end
+    end
+  end
+
+  defp identity_invocation_id(call, verb, origin) do
+    case call.params[:idempotency_key] do
+      key when is_binary(key) and byte_size(key) > 0 ->
+        digest = :crypto.hash(:sha256, [origin, 0, verb, 0, key]) |> Base.encode16(case: :lower)
+        "identity-" <> digest
+
+      _ ->
+        "identity-" <> Tightbeam.Id.uuid4()
     end
   end
 

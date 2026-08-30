@@ -720,6 +720,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         )),
         Command::IdentityEdit {
             identity,
+            idempotency_key,
             archetype,
             manifest,
             skill,
@@ -727,6 +728,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             content,
         } => {
             let mut params = vec![
+                string_field("idempotencyKey", idempotency_key),
                 string_field("archetype", archetype),
                 format!("\"manifest\":{manifest}"),
                 format!("\"remove\":{remove}"),
@@ -751,14 +753,17 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 .map(|value| vec![string_field("archetype", value)])
                 .unwrap_or_default(),
         )),
-        Command::IdentityRelearn { identity, action } => Ok(request(
+        Command::IdentityRelearn {
+            identity,
+            idempotency_key,
+            action,
+        } => Ok(request(
             identity,
             "identity-relearn",
             vec![],
-            action
-                .as_ref()
-                .map(|value| vec![string_field("action", value)])
-                .unwrap_or_default(),
+            std::iter::once(string_field("idempotencyKey", idempotency_key))
+                .chain(action.as_ref().map(|value| string_field("action", value)))
+                .collect(),
         )),
         Command::IdentityRepoint {
             identity,
@@ -770,17 +775,31 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![string_field("sessionKey", session_key)],
             vec![string_field("archetype", archetype)],
         )),
-        Command::Learn { identity, name } => Ok(request(
+        Command::Learn {
+            identity,
+            idempotency_key,
+            name,
+        } => Ok(request(
             identity,
             "learn",
             vec![],
-            vec![string_field("name", name)],
+            vec![
+                string_field("idempotencyKey", idempotency_key),
+                string_field("name", name),
+            ],
         )),
-        Command::Unlearn { identity, name } => Ok(request(
+        Command::Unlearn {
+            identity,
+            idempotency_key,
+            name,
+        } => Ok(request(
             identity,
             "unlearn",
             vec![],
-            vec![string_field("name", name)],
+            vec![
+                string_field("idempotencyKey", idempotency_key),
+                string_field("name", name),
+            ],
         )),
         Command::KungfuList { identity } => Ok(request(identity, "kungfu-list", vec![], vec![])),
         Command::IdentityApply {
@@ -1962,6 +1981,7 @@ mod tests {
         );
         let command = Command::IdentityEdit {
             identity: Identity::User("flynn".to_owned()),
+            idempotency_key: "identity-edit-1".to_owned(),
             archetype: "coder".to_owned(),
             manifest: false,
             skill: Some("swift".to_owned()),
@@ -1970,7 +1990,7 @@ mod tests {
         };
         assert_eq!(
             build_request(&command).unwrap().body_json,
-            r#"{"asUser":"flynn","verb":"identity-edit","params":{"archetype":"coder","manifest":false,"remove":false,"skill":"swift","content":"line one\nline two"}}"#
+            r#"{"asUser":"flynn","verb":"identity-edit","params":{"idempotencyKey":"identity-edit-1","archetype":"coder","manifest":false,"remove":false,"skill":"swift","content":"line one\nline two"}}"#
         );
     }
 
@@ -2456,12 +2476,38 @@ mod tests {
                 r#"{"asUser":"flynn","verb":"kungfu-list","params":{}}"#,
             ),
             (
-                &["learn", "agentic-engineering", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"learn","params":{"name":"agentic-engineering"}}"#,
+                &[
+                    "learn",
+                    "agentic-engineering",
+                    "--key",
+                    "learn-1",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"learn","params":{"idempotencyKey":"learn-1","name":"agentic-engineering"}}"#,
             ),
             (
-                &["unlearn", "agentic-engineering", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"unlearn","params":{"name":"agentic-engineering"}}"#,
+                &[
+                    "unlearn",
+                    "agentic-engineering",
+                    "--key",
+                    "unlearn-1",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"unlearn","params":{"idempotencyKey":"unlearn-1","name":"agentic-engineering"}}"#,
+            ),
+            (
+                &[
+                    "identity",
+                    "relearn",
+                    "--resolve",
+                    "--key",
+                    "relearn-1",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"identity-relearn","params":{"idempotencyKey":"relearn-1","action":"resolve"}}"#,
             ),
         ] {
             assert_eq!(body(args), expected);

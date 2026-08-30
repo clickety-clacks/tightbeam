@@ -1,7 +1,7 @@
 defmodule Tightbeam.IdentityPublicationTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{AdminProjection, Archetypes, DB, Devices, Gateway, Identity, Schema}
+  alias Tightbeam.{AdminProjection, Archetypes, DB, Devices, Dispatch, Gateway, Identity, Schema}
 
   setup do
     base_dir =
@@ -24,10 +24,11 @@ defmodule Tightbeam.IdentityPublicationTest do
   end
 
   test "pending markers recover on either side of the live-ref move", ctx do
-    handler = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-edit"]
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
 
     for {suffix, move_first?} <- [{"before", false}, {"after", true}] do
-      invocation = "identity-crash-#{suffix}"
+      key = "identity-crash-#{suffix}"
+      invocation = keyed_invocation("user:flynn", "identity-edit", key)
 
       candidate =
         Identity.edit!(
@@ -49,10 +50,19 @@ defmodule Tightbeam.IdentityPublicationTest do
       if move_first?,
         do: assert({:ok, _revision} = Identity.publish_live!(ctx.base_dir, candidate))
 
-      call =
-        identity_call(%{archetype: "default", content: "ignored on replay"}, invocation)
+      call = %{
+        verb: "identity-edit",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{
+          archetype: "default",
+          content: "ignored on replay",
+          idempotency_key: key
+        }
+      }
 
-      assert %{live_revision: revision} = handler.(call)
+      assert {:ok, %{live_revision: revision}} = Dispatch.dispatch(ctx.db, handlers, call)
       assert revision == candidate.candidate_revision
 
       assert %{state: "accepted", candidate_revision: ^revision} =
@@ -160,6 +170,11 @@ defmodule Tightbeam.IdentityPublicationTest do
       params: params,
       invocation_id: invocation_id
     }
+  end
+
+  defp keyed_invocation(origin, verb, key) do
+    digest = :crypto.hash(:sha256, [origin, 0, verb, 0, key]) |> Base.encode16(case: :lower)
+    "identity-" <> digest
   end
 
   defp git!(dir, args) do

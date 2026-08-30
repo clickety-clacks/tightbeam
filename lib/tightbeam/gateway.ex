@@ -2625,11 +2625,20 @@ defmodule Tightbeam.Gateway do
   end
 
   defp served_snapshot(config, session, harness, revision) do
-    snapshot =
-      Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)
-      |> Map.update!(:guidance, &append_transcript_self_inspection(&1, session.session_key))
+    config
+    |> complete_session_snapshot(session, harness, revision)
+    |> then(&Placement.materialize_identity(config, session, &1))
+  end
 
-    Placement.materialize_identity(config, session, snapshot)
+  defp complete_session_snapshot(config, session, harness, revision) do
+    snapshot = Identity.snapshot_at!(config.base_dir, revision, session.archetype, harness)
+    guidance = append_transcript_self_inspection(snapshot.guidance, session.session_key)
+
+    %{
+      snapshot
+      | guidance: guidance,
+        guidance_digest: :crypto.hash(:sha256, guidance) |> Base.encode16(case: :lower)
+    }
   end
 
   defp append_transcript_self_inspection(guidance, session_key) do
@@ -3012,7 +3021,7 @@ defmodule Tightbeam.Gateway do
       |> Org.list_for_user("", true)
       |> Enum.map(fn session ->
         harness = Harness.parse!(session.harness).id()
-        expected = Identity.snapshot_at!(config.base_dir, live, session.archetype, harness)
+        expected = complete_session_snapshot(config, session, harness, live)
 
         reasons =
           [

@@ -267,6 +267,7 @@ pub enum Command {
     },
     IdentityEdit {
         identity: Identity,
+        idempotency_key: String,
         archetype: String,
         manifest: bool,
         skill: Option<String>,
@@ -279,6 +280,7 @@ pub enum Command {
     },
     IdentityRelearn {
         identity: Identity,
+        idempotency_key: String,
         action: Option<String>,
     },
     IdentityRepoint {
@@ -288,10 +290,12 @@ pub enum Command {
     },
     Learn {
         identity: Identity,
+        idempotency_key: String,
         name: String,
     },
     Unlearn {
         identity: Identity,
+        idempotency_key: String,
         name: String,
     },
     KungfuList {
@@ -598,18 +602,18 @@ COMMANDS:
       bundle's declared root archetype.
 
   ADMIN (require --as-user of an admin, or an admin-owned agent handle):
-  identity edit <archetype> [--manifest | --skill <name> [--rm]]
+  identity edit <archetype> [--manifest | --skill <name> [--rm]] [--key <idempotencyKey>]
                 [--file <path>]
       Edit the served identity. Without --file, content is read from stdin.
-  identity relearn [--abort | --resolve]
+  identity relearn [--abort | --resolve] [--key <idempotencyKey>]
       Re-import and merge the neutral seed plus every learned kungfu bundle;
       resolve or abort a conflict.
   identity repoint <retired-session> <archetype>
       Repoint a retired session row to an installed archetype.
-  learn <bundle>
+  learn <bundle> [--key <idempotencyKey>]
       Install a shipped kungfu bundle. Available bundles ship with Tightbeam
       under priv/kungfu/; learning an installed bundle is a no-op.
-  unlearn <bundle>
+  unlearn <bundle> [--key <idempotencyKey>]
       Remove a learned kungfu bundle by its committed receipt.
   identity status [<archetype>]
       Report the live revision, session revisions, staleness, and conflicts.
@@ -1678,16 +1682,24 @@ fn parse_with_optional_catalog(
         "learn" | "unlearn" => {
             if parsed.positional.len() != 2 {
                 return Err(format!(
-                    "usage: tightbeam {} <bundle>",
+                    "usage: tightbeam {} <bundle> [--key <idempotencyKey>]",
                     parsed.positional[0]
                 ));
             }
             let name = parsed.positional[1].clone();
             let identity = identity(flags)?;
             if parsed.positional[0] == "learn" {
-                Ok(Command::Learn { identity, name })
+                Ok(Command::Learn {
+                    identity,
+                    idempotency_key: nonempty(flags, "key").unwrap_or_else(generated_key),
+                    name,
+                })
             } else {
-                Ok(Command::Unlearn { identity, name })
+                Ok(Command::Unlearn {
+                    identity,
+                    idempotency_key: nonempty(flags, "key").unwrap_or_else(generated_key),
+                    name,
+                })
             }
         }
         "onboard" => parse_onboard(&parsed, flags),
@@ -1980,10 +1992,10 @@ fn parse_identity_command(
     match parsed.positional.get(1).map(String::as_str) {
         Some("edit") => {
             let archetype = parsed.positional.get(2).cloned().ok_or_else(|| {
-                "usage: tightbeam identity edit <archetype> [--manifest | --skill <name> [--rm]] [--file <path>]".to_owned()
+                "usage: tightbeam identity edit <archetype> [--manifest | --skill <name> [--rm]] [--file <path>] [--key <idempotencyKey>]".to_owned()
             })?;
             if parsed.positional.len() != 3 {
-                return Err("usage: tightbeam identity edit <archetype> [--manifest | --skill <name> [--rm]] [--file <path>]".to_owned());
+                return Err("usage: tightbeam identity edit <archetype> [--manifest | --skill <name> [--rm]] [--file <path>] [--key <idempotencyKey>]".to_owned());
             }
             let manifest = flags.contains_key("manifest");
             let skill = nonempty(flags, "skill");
@@ -2016,6 +2028,7 @@ fn parse_identity_command(
             };
             Ok(Command::IdentityEdit {
                 identity: identity(flags)?,
+                idempotency_key: nonempty(flags, "key").unwrap_or_else(generated_key),
                 archetype,
                 manifest,
                 skill,
@@ -2037,6 +2050,7 @@ fn parse_identity_command(
             }
             Ok(Command::IdentityRelearn {
                 identity: identity(flags)?,
+                idempotency_key: nonempty(flags, "key").unwrap_or_else(generated_key),
                 action: actions.first().map(|value| (*value).to_owned()),
             })
         }
@@ -3658,11 +3672,14 @@ mod tests {
                     "swift".to_owned(),
                     "--file".to_owned(),
                     skill_path.clone(),
+                    "--key".to_owned(),
+                    "edit-key".to_owned(),
                     "--as-user".to_owned(),
                     "flynn".to_owned(),
                 ],
                 Command::IdentityEdit {
                     identity: Identity::User("flynn".to_owned()),
+                    idempotency_key: "edit-key".to_owned(),
                     archetype: "coder".to_owned(),
                     manifest: false,
                     skill: Some("swift".to_owned()),
@@ -3700,16 +3717,32 @@ mod tests {
                 },
             ),
             (
-                strings(&["learn", "agentic-engineering", "--as-user", "flynn"]),
+                strings(&[
+                    "learn",
+                    "agentic-engineering",
+                    "--key",
+                    "learn-key",
+                    "--as-user",
+                    "flynn",
+                ]),
                 Command::Learn {
                     identity: Identity::User("flynn".to_owned()),
+                    idempotency_key: "learn-key".to_owned(),
                     name: "agentic-engineering".to_owned(),
                 },
             ),
             (
-                strings(&["unlearn", "agentic-engineering", "--as-user", "flynn"]),
+                strings(&[
+                    "unlearn",
+                    "agentic-engineering",
+                    "--key",
+                    "unlearn-key",
+                    "--as-user",
+                    "flynn",
+                ]),
                 Command::Unlearn {
                     identity: Identity::User("flynn".to_owned()),
+                    idempotency_key: "unlearn-key".to_owned(),
                     name: "agentic-engineering".to_owned(),
                 },
             ),
