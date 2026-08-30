@@ -76,6 +76,7 @@ defmodule Tightbeam.Wire.Router do
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
   @state_read_specs %{
     config: %{
+      route: "config.collection",
       resource: "config",
       class: "config.updated",
       filters: %{"key" => :string},
@@ -83,6 +84,7 @@ defmodule Tightbeam.Wire.Router do
       detail: true
     },
     host_environment: %{
+      route: "host_environment.collection",
       resource: "host environment",
       class: "host_env.updated",
       filters: %{"host" => :string, "harness" => :string, "name" => :string},
@@ -90,6 +92,7 @@ defmodule Tightbeam.Wire.Router do
       detail: false
     },
     hosts: %{
+      route: "hosts.collection",
       resource: "hosts",
       class: "host.registered",
       filters: %{"host" => :string},
@@ -97,6 +100,7 @@ defmodule Tightbeam.Wire.Router do
       detail: true
     },
     users: %{
+      route: "users.collection",
       resource: "users",
       class: "user.added",
       filters: %{"userId" => :string},
@@ -104,6 +108,7 @@ defmodule Tightbeam.Wire.Router do
       detail: true
     },
     identity: %{
+      route: "identity.collection",
       resource: "identity",
       class: "identity.updated",
       filters: %{
@@ -114,6 +119,7 @@ defmodule Tightbeam.Wire.Router do
       detail: true
     },
     kungfu: %{
+      route: "kungfu.collection",
       resource: "kungfu",
       class: "kungfu.updated",
       filters: %{
@@ -701,10 +707,19 @@ defmodule Tightbeam.Wire.Router do
 
   defp state_principal(:org, query, conn) do
     case Map.get(query, "asUser", []) do
-      [user_id] when user_id != "" -> {:ok, state_user_principal(user_id, conn)}
-      [_empty] -> {:error, 400, "invalid_message", nil}
-      [] -> {:error, 400, "invalid_message", nil}
-      _repeated -> {:error, 400, "invalid_as_user", nil}
+      [user_id] when user_id != "" ->
+        with {:ok, principal} <- resolve_cli_as_user(:org, user_id) do
+          {:ok, state_principal_view(principal, conn)}
+        end
+
+      [_empty] ->
+        {:error, 400, "invalid_message", nil}
+
+      [] ->
+        {:error, 400, "invalid_message", nil}
+
+      _repeated ->
+        {:error, 400, "invalid_as_user", nil}
     end
   end
 
@@ -716,11 +731,10 @@ defmodule Tightbeam.Wire.Router do
       [""] ->
         {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
 
-      [owner] when owner == session.owner_user_id ->
-        {:ok, state_user_principal(owner, conn)}
-
-      [_other] ->
-        {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
+      [as_user] ->
+        with {:ok, principal} <- resolve_cli_as_user({:session, session}, as_user) do
+          {:ok, state_principal_view(principal, conn)}
+        end
 
       _repeated ->
         {:error, 400, "invalid_as_user", nil}
@@ -744,6 +758,20 @@ defmodule Tightbeam.Wire.Router do
 
     %{kind: "user", id: user_id, is_admin: is_admin}
   end
+
+  defp state_principal_view({:user, user_id}, conn), do: state_user_principal(user_id, conn)
+
+  defp state_principal_view({:session, session_key}, _conn),
+    do: %{kind: "session", id: session_key, is_admin: false}
+
+  defp resolve_cli_as_user(:org, user_id) when is_binary(user_id) and user_id != "",
+    do: {:ok, {:user, user_id}}
+
+  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, owner),
+    do: {:ok, {:user, owner}}
+
+  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, _other),
+    do: {:error, 403, "identity_not_yours", "this session belongs to #{owner}"}
 
   defp decode_state_query(conn), do: decode_state_query_string(conn.query_string)
 
@@ -858,19 +886,19 @@ defmodule Tightbeam.Wire.Router do
 
   defp state_cursor_boundary(%{before: cursor} = request, principal, spec, conn)
        when is_binary(cursor) do
-    with {:ok, tuple} <- decode_state_cursor(cursor, request, principal, spec, conn) do
+    with {:ok, tuple} <- decode_state_cursor(cursor, "before", request, principal, spec, conn) do
       {:ok, {:before, tuple}}
     end
   end
 
   defp state_cursor_boundary(%{after: cursor} = request, principal, spec, conn)
        when is_binary(cursor) do
-    with {:ok, tuple} <- decode_state_cursor(cursor, request, principal, spec, conn) do
+    with {:ok, tuple} <- decode_state_cursor(cursor, "after", request, principal, spec, conn) do
       {:ok, {:after, tuple}}
     end
   end
 
-  defp decode_state_cursor(cursor, request, principal, spec, conn) do
+  defp decode_state_cursor(cursor, direction, request, principal, spec, conn) do
     invalid = {:error, 400, "invalid_cursor", nil}
 
     with [payload_part, signature_part] <- String.split(cursor, ".", parts: 2),
@@ -880,7 +908,9 @@ defmodule Tightbeam.Wire.Router do
          {:ok, payload} when is_map(payload) <- JSON.decode(payload_bytes),
          true <- Enum.sort(Map.keys(payload)) == state_cursor_keys(),
          true <- payload["version"] == @state_cursor_version,
+         true <- payload["route"] == spec.route,
          true <- payload["resource"] == spec.resource,
+         true <- payload["direction"] == direction,
          true <- payload["filters"] == request.filter_fingerprint,
          true <- state_cursor_tuple_valid?(payload["tuple"], spec.order) do
       if payload["principalKind"] == principal.kind and payload["principalId"] == principal.id do
@@ -895,7 +925,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp state_cursor_keys do
-    Enum.sort(~w(filters principalId principalKind resource tuple version))
+    Enum.sort(~w(direction filters principalId principalKind resource route tuple version))
   end
 
   defp state_cursor_signature_valid?(payload, signature, conn) do
@@ -982,9 +1012,23 @@ defmodule Tightbeam.Wire.Router do
 
           %{
             oldest_cursor:
-              encode_state_cursor(oldest, request.filter_fingerprint, principal, spec, conn),
+              encode_state_cursor(
+                oldest,
+                "before",
+                request.filter_fingerprint,
+                principal,
+                spec,
+                conn
+              ),
             newest_cursor:
-              encode_state_cursor(newest, request.filter_fingerprint, principal, spec, conn),
+              encode_state_cursor(
+                newest,
+                "after",
+                request.filter_fingerprint,
+                principal,
+                spec,
+                conn
+              ),
             has_more_before: Enum.any?(rows, &(state_row_tuple(&1, spec.order) < oldest)),
             has_more_after: Enum.any?(rows, &(state_row_tuple(&1, spec.order) > newest))
           }
@@ -1014,11 +1058,13 @@ defmodule Tightbeam.Wire.Router do
     }
   end
 
-  defp encode_state_cursor(tuple, filter_fingerprint, principal, spec, conn) do
+  defp encode_state_cursor(tuple, direction, filter_fingerprint, principal, spec, conn) do
     payload =
       JSON.encode!(%{
         "version" => @state_cursor_version,
+        "route" => spec.route,
         "resource" => spec.resource,
+        "direction" => direction,
         "filters" => filter_fingerprint,
         "principalKind" => principal.kind,
         "principalId" => principal.id,
@@ -1227,6 +1273,11 @@ defmodule Tightbeam.Wire.Router do
 
   defp canonical_actor_exists("process:" <> _process, _principal, _conn), do: :ok
 
+  # AU2's org/session asUser path is a self-declared, transport-only principal.
+  # It is deliberately not an existence assertion; downstream authorization
+  # evaluates the same resolved principal used by REST.
+  defp canonical_actor_exists("user:" <> user_id, {:user, user_id}, _conn), do: :ok
+
   defp canonical_actor_exists(_origin, {:user, user_id}, conn),
     do: user_exists(user_id, conn)
 
@@ -1260,22 +1311,8 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp agent_identity(body, :org, conn) do
-    with {:ok, origin} <- agent_origin(body, conn) do
-      principal =
-        cond do
-          is_binary(body["as"]) and body["as"] != "" ->
-            nil
-
-          is_binary(body["asUser"]) and body["asUser"] != "" ->
-            {:user, body["asUser"]}
-
-          is_binary(body["asProcess"]) and body["asProcess"] != "" ->
-            {:process, body["asProcess"]}
-
-          true ->
-            nil
-        end
-
+    with {:ok, origin} <- agent_origin(body, conn),
+         {:ok, principal} <- agent_principal(body, :org) do
       {:ok, origin, principal}
     end
   end
@@ -1300,10 +1337,9 @@ defmodule Tightbeam.Wire.Router do
         end
 
       is_binary(body["asUser"]) and body["asUser"] != "" ->
-        if body["asUser"] == session.owner_user_id do
-          {:ok, "user:#{session.owner_user_id}", {:user, session.owner_user_id}}
-        else
-          {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
+        case resolve_cli_as_user({:session, session}, body["asUser"]) do
+          {:ok, principal} -> {:ok, "user:#{session.owner_user_id}", principal}
+          error -> error
         end
 
       is_binary(body["asProcess"]) and body["asProcess"] != "" ->
@@ -1322,6 +1358,22 @@ defmodule Tightbeam.Wire.Router do
       true ->
         {:error, 400, "ambiguous_identity",
          "this session holds several roles (#{Enum.join(roles, ", ")}); pass --as <role>"}
+    end
+  end
+
+  defp agent_principal(body, auth) do
+    cond do
+      is_binary(body["as"]) and body["as"] != "" ->
+        {:ok, nil}
+
+      is_binary(body["asUser"]) and body["asUser"] != "" ->
+        resolve_cli_as_user(auth, body["asUser"])
+
+      is_binary(body["asProcess"]) and body["asProcess"] != "" ->
+        {:ok, {:process, body["asProcess"]}}
+
+      true ->
+        {:ok, nil}
     end
   end
 

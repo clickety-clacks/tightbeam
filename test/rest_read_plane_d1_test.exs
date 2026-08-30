@@ -34,6 +34,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
   alias Tightbeam.{
     AdminProjection,
     Archetypes,
+    CliCompatibility,
     DB,
     Devices,
     Harness,
@@ -45,6 +46,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
   }
 
   alias Tightbeam.Wire.Router
+  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.RestReadPlaneD1Test.QuerySpyDB
 
   setup do
@@ -82,6 +84,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     operator_session = ensure_main_session(db, "operator")
 
     :ok = Org.put_setting(db, "default-archetype", "default")
+    :ok = Org.put_setting(db, "default-priority", "private-priority-value")
     :ok = Org.put_setting(db, "alpha-fixture", "not-allowlisted-on-the-wire")
     :ok = Org.put_setting(db, "zeta-fixture", "also-not-allowlisted")
 
@@ -112,10 +115,17 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     :ok = AdminProjection.ensure_schema(db)
     :ok = AdminProjection.bootstrap_served(db, base_dir)
 
+    inspect_handler = fn call ->
+      %{
+        "origin" => call.origin,
+        "principal" => inspect(call.principal)
+      }
+    end
+
     opts = [
       db: db,
       base_dir: base_dir,
-      handlers: %{},
+      handlers: %{"inspect" => inspect_handler},
       cli_token: "tbc_rest_d1",
       cursor_signing: cursor_signing!(base_dir),
       session_status: fn _ -> nil end
@@ -141,22 +151,22 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     kungfu_name = first_kungfu_name(ctx.db)
 
     cases = [
-      {"config", "/api/config", "/api/config/default-archetype",
+      {"config.collection", "config", "/api/config", "/api/config/default-archetype",
        StateResources.query_config(ctx.db, "default-archetype"), :config},
-      {"host environment", "/api/host-env", nil,
+      {"host_environment.collection", "host environment", "/api/host-env", nil,
        StateResources.query_host_environment(ctx.db, "alpha-host", ctx.harness, "ALPHA_ENV"),
        :host_environment},
-      {"hosts", "/api/hosts", "/api/hosts/alpha-host",
+      {"hosts.collection", "hosts", "/api/hosts", "/api/hosts/alpha-host",
        StateResources.query_host(ctx.db, "alpha-host"), :host},
-      {"users", "/api/users", "/api/users/flynn", StateResources.query_user(ctx.db, "flynn"),
-       :user},
-      {"identity", "/api/identity", "/api/identity/served",
+      {"users.collection", "users", "/api/users", "/api/users/flynn",
+       StateResources.query_user(ctx.db, "flynn"), :user},
+      {"identity.collection", "identity", "/api/identity", "/api/identity/served",
        hydrated_identity!(ctx.db, "served", {:user, "flynn"}), :identity},
-      {"kungfu", "/api/kungfu", "/api/kungfu/#{kungfu_name}",
+      {"kungfu.collection", "kungfu", "/api/kungfu", "/api/kungfu/#{kungfu_name}",
        StateResources.query_kungfu(ctx.db, kungfu_name), :kungfu}
     ]
 
-    for {resource, collection_path, detail_path, raw, serializer} <- cases do
+    for {route, resource, collection_path, detail_path, raw, serializer} <- cases do
       item = apply(StateResources, serializer, [raw])
       item_bytes = StateResources.encode_item(resource, item)
       {200, headers, collection_bytes} = http_get(port, collection_path, ctx.admin_device.token)
@@ -168,6 +178,14 @@ defmodule Tightbeam.RestReadPlaneD1Test do
       assert collection["resource"] == resource
       assert is_list(collection["items"])
       assert collection_bytes =~ item_bytes
+
+      oldest = decode_cursor_payload(collection["page"]["oldestCursor"])
+      newest = decode_cursor_payload(collection["page"]["newestCursor"])
+
+      assert oldest["route"] == route
+      assert newest["route"] == route
+      assert oldest["direction"] == "before"
+      assert newest["direction"] == "after"
 
       assert collection["page"] == %{
                "oldestCursor" => collection["page"]["oldestCursor"],
@@ -185,6 +203,39 @@ defmodule Tightbeam.RestReadPlaneD1Test do
         assert detail_bytes =~ ~s("item":#{item_bytes})
       end
     end
+  end
+
+  test "SR5 exposes only default-archetype and Publisher uses the same redacted bytes", ctx do
+    rows =
+      ctx.db
+      |> StateResources.query_config(%{})
+      |> Enum.map(&StateResources.config/1)
+
+    assert Map.new(rows, &{&1["key"], &1["value"]}) == %{
+             "alpha-fixture" => nil,
+             "default-archetype" => "default",
+             "default-priority" => nil,
+             "zeta-fixture" => nil
+           }
+
+    detail = get(ctx, "/api/config/default-priority", ctx.admin_device.token)
+    assert detail.status == 200
+    item = JSON.decode!(detail.resp_body)["item"]
+    assert item["value"] == nil
+
+    item_bytes = StateResources.encode_item("config", item)
+
+    notice =
+      Publisher.encode_wire_notice(%{
+        "class" => "config.updated",
+        "op" => "upsert",
+        "occurredAt" => 1,
+        "refs" => %{"configKey" => "default-priority"},
+        "payload" => item
+      })
+
+    assert notice =~ ~s("payload":#{item_bytes})
+    refute notice =~ "private-priority-value"
   end
 
   test "bearer classes and transport-only asUser preserve dispatch principal semantics", ctx do
@@ -238,6 +289,33 @@ defmodule Tightbeam.RestReadPlaneD1Test do
 
     assert get(ctx, "/api/hosts/alpha-host", ctx.operator_session.cli_token).status == 200
     assert get(ctx, "/api/host-env/alpha-host", ctx.admin_device.token).status == 404
+
+    parity_cases = [
+      {"org known", "/api/hosts?asUser=flynn", "tbc_rest_d1", %{"asUser" => "flynn"}, 200, nil},
+      {"org unknown", "/api/hosts?asUser=unknown-user", "tbc_rest_d1",
+       %{"asUser" => "unknown-user"}, 200, nil},
+      {"org empty", "/api/hosts?asUser=", "tbc_rest_d1", %{"asUser" => ""}, 400,
+       "invalid_message"},
+      {"org missing", "/api/hosts", "tbc_rest_d1", %{}, 400, "invalid_message"},
+      {"session absent", "/api/hosts", ctx.admin_session.cli_token, %{}, 200, nil},
+      {"session matching", "/api/hosts?asUser=flynn", ctx.admin_session.cli_token,
+       %{"asUser" => "flynn"}, 200, nil},
+      {"session mismatching", "/api/hosts?asUser=operator", ctx.admin_session.cli_token,
+       %{"asUser" => "operator"}, 403, "identity_not_yours"}
+    ]
+
+    for {label, path, bearer, identity, status, code} <- parity_cases do
+      direct = get(ctx, path, bearer)
+      dispatch = dispatch(ctx, bearer, Map.merge(%{"verb" => "inspect"}, identity))
+
+      assert direct.status == status, "#{label} direct GET"
+      assert dispatch.status == status, "#{label} dispatch"
+
+      if code do
+        assert JSON.decode!(direct.resp_body)["error"]["code"] == code, label
+        assert JSON.decode!(dispatch.resp_body)["error"]["code"] == code, label
+      end
+    end
   end
 
   test "allowlisted filters compose OR within a field and AND across fields", ctx do
@@ -302,14 +380,19 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     first_body = JSON.decode!(first.resp_body)
     assert Enum.map(first_body["items"], & &1["userId"]) == ["cursor-b"]
     boundary = first_body["page"]["oldestCursor"]
+    after_boundary = first_body["page"]["newestCursor"]
 
     payload = decode_cursor_payload(boundary)
 
     assert Enum.sort(Map.keys(payload)) ==
-             Enum.sort(~w(filters principalId principalKind resource tuple version))
+             Enum.sort(
+               ~w(direction filters principalId principalKind resource route tuple version)
+             )
 
     assert payload["version"] == 1
+    assert payload["route"] == "users.collection"
     assert payload["resource"] == "users"
+    assert payload["direction"] == "before"
     assert payload["principalKind"] == "user"
     assert payload["principalId"] == "flynn"
     assert payload["tuple"] == [424_242, "cursor-b"]
@@ -325,7 +408,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
       |> then(&JSON.decode!(&1.resp_body))
 
     forged_cursor =
-      org_page["page"]["oldestCursor"]
+      org_page["page"]["newestCursor"]
       |> decode_cursor_payload()
       |> Map.put("principalId", "operator")
       |> JSON.encode!()
@@ -359,27 +442,39 @@ defmodule Tightbeam.RestReadPlaneD1Test do
 
     assert Enum.map(previous["items"], & &1["userId"]) == ["cursor-a"]
 
+    for {field, cursor} <- [{"after", boundary}, {"before", after_boundary}] do
+      replay =
+        get(
+          ctx,
+          "/api/users?userId=cursor-a&userId=cursor-b&#{field}=#{cursor}",
+          ctx.admin_device.token
+        )
+
+      assert replay.status == 400
+      assert JSON.decode!(replay.resp_body)["error"]["code"] == "invalid_cursor"
+    end
+
     wrong_filter =
-      get(ctx, "/api/users?userId=cursor-a&after=#{boundary}", ctx.admin_device.token)
+      get(ctx, "/api/users?userId=cursor-a&after=#{after_boundary}", ctx.admin_device.token)
 
     assert wrong_filter.status == 400
     assert JSON.decode!(wrong_filter.resp_body)["error"]["code"] == "invalid_cursor"
 
-    wrong_resource = get(ctx, "/api/hosts?after=#{boundary}", ctx.admin_device.token)
+    wrong_resource = get(ctx, "/api/hosts?after=#{after_boundary}", ctx.admin_device.token)
     assert wrong_resource.status == 400
     assert JSON.decode!(wrong_resource.resp_body)["error"]["code"] == "invalid_cursor"
 
     wrong_principal =
       get(
         ctx,
-        "/api/users?userId=cursor-a&userId=cursor-b&after=#{boundary}",
+        "/api/users?userId=cursor-a&userId=cursor-b&after=#{after_boundary}",
         ctx.operator_device.token
       )
 
     assert wrong_principal.status == 404
     assert JSON.decode!(wrong_principal.resp_body)["error"]["code"] == "not_found"
 
-    malformed = get(ctx, "/api/users?after=#{boundary}x", ctx.admin_device.token)
+    malformed = get(ctx, "/api/users?after=#{after_boundary}x", ctx.admin_device.token)
     assert malformed.status == 400
     assert JSON.decode!(malformed.resp_body)["error"]["code"] == "invalid_cursor"
 
@@ -388,7 +483,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     now_hidden =
       get(
         ctx,
-        "/api/users?userId=cursor-a&userId=cursor-b&after=#{boundary}",
+        "/api/users?userId=cursor-a&userId=cursor-b&after=#{after_boundary}",
         ctx.admin_device.token
       )
 
@@ -630,6 +725,14 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     conn(:get, path)
     |> put_req_header("authorization", "Bearer #{bearer}")
     |> Router.call(Router.init(opts))
+  end
+
+  defp dispatch(ctx, bearer, body) do
+    conn(:post, "/agent/dispatch", JSON.encode!(body))
+    |> put_req_header("authorization", "Bearer #{bearer}")
+    |> put_req_header("content-type", "application/json")
+    |> put_req_header("x-tightbeam-cli-version", CliCompatibility.required_version())
+    |> Router.call(Router.init(ctx.opts))
   end
 
   defp start_http!(ctx) do

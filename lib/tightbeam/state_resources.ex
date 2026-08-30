@@ -107,6 +107,190 @@ defmodule Tightbeam.StateResources do
     "critical-state" => "critical state"
   }
 
+  # The normative R7/R7a value schema. Field order remains owned by
+  # @item_field_order; these categories own JSON type and nullability.
+  @item_wire_categories %{
+    "work items" => %{
+      strings:
+        ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
+      integers: ~w(createdInTurnSeq createdAt rowVersion),
+      booleans: ~w(isBug createdContextKnown),
+      nullable:
+        ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
+    },
+    "assignments" => %{
+      strings:
+        ~w(id subject holderKey holderRole openedByUser openedBySession state outcome closedByUser closedBySession closingAttestId workItemId reviewsAssignmentId holderHarness holderProvider effectKind derivedStatus),
+      integers: ~w(openedAt closedAt rowVersion),
+      booleans: ~w(holderFallback),
+      nullable:
+        ~w(holderRole openedByUser openedBySession outcome closedAt closedByUser closedBySession closingAttestId workItemId reviewsAssignmentId holderHarness holderProvider)
+    },
+    "attests" => %{
+      strings:
+        ~w(id assignmentId kind verdictKind note bySession byUser producer producerCommand byHarness byProvider),
+      integers: ~w(ts rowVersion),
+      booleans: [],
+      nullable:
+        ~w(verdictKind note bySession byUser producer producerCommand byHarness byProvider commitRefs)
+    },
+    "wakes" => %{
+      strings:
+        ~w(wakeId sessionKey targetRole origin prompt consumer state reresolve reresolveSeed conditionKind conditionScope firedBy creatorSessionKey workItemId assignmentId class classElection deliveryRule),
+      integers:
+        ~w(dueAt createdAt firedAt reresolveRung conditionAfterId canceledAt targetGate rowVersion),
+      booleans: ~w(rumination digest summon),
+      nullable:
+        ~w(targetRole prompt firedAt reresolve reresolveSeed reresolveRung conditionKind conditionScope conditionAfterId firedBy creatorSessionKey workItemId assignmentId canceledAt class classElection deliveryRule)
+    },
+    "turns" => %{
+      strings:
+        ~w(sessionKey messageId wakeId origin prompt roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness status owner requestRef error),
+      integers:
+        ~w(seq replyAttention adapterGen createdAt startedAt endedAt publishedAt rowVersion),
+      booleans: [],
+      nullable:
+        ~w(messageId wakeId roleRef roleFallback assignmentId jobRef model thinkingLevel modelContext harness owner adapterGen requestRef error startedAt endedAt publishedAt)
+    },
+    "decision requests" => %{
+      strings:
+        ~w(id kind raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId statuteName question status decision rationale ruledBy withdrawnBy withdrawnReason askedOfRole answer answeredBy),
+      integers:
+        ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt rowVersion),
+      booleans: [],
+      nullable:
+        ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context)
+    },
+    "sessions" => %{
+      strings:
+        ~w(sessionKey displayName kind ownerUserId origin spawnedBy handle archetype identityName identityRevision harness provider model thinkingLevel modelContext host state mechanicalStatus),
+      integers: ~w(orderIndex clearedThroughSeq createdAt updatedAt rowVersion),
+      booleans: ~w(isBuiltIn adopted),
+      nullable:
+        ~w(ownerUserId spawnedBy handle identityName identityRevision provider model thinkingLevel modelContext host clearedThroughSeq overrides)
+    },
+    "roles" => %{
+      strings: ~w(name boundSessionKey ownerUserId),
+      integers: ~w(createdAt updatedAt rowVersion),
+      booleans: [],
+      nullable: ~w(boundSessionKey ownerUserId)
+    },
+    "users" => %{
+      strings: ~w(userId),
+      integers: ~w(createdAt rowVersion),
+      booleans: ~w(isAdmin),
+      nullable: []
+    },
+    "devices" => %{
+      strings: ~w(deviceId userId claimedName status platform model),
+      integers: ~w(createdAt rowVersion),
+      booleans: [],
+      nullable: ~w(claimedName platform model)
+    },
+    "artifacts" => %{
+      strings:
+        ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home),
+      integers: ~w(createdAt updatedAt rowVersion),
+      booleans: [],
+      nullable: ~w(description parentSession contentSha256 recordedMessageId home)
+    },
+    "read markers" => %{
+      strings: ~w(userId scopeKey marker),
+      integers: ~w(updatedAt rowVersion),
+      booleans: [],
+      nullable: []
+    },
+    "transcript messages" => %{
+      strings:
+        ~w(id sessionKey role messageType content sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId assignmentId jobRef harness provider model effort),
+      integers: ~w(seq at attentionTier turnSeq rowVersion),
+      booleans: [],
+      nullable:
+        ~w(sender deviceId clientMessageId replyToMessageId replyToClientMessageId assignmentId jobRef harness provider model effort turnSeq context)
+    },
+    "condition facts" => %{
+      strings: ~w(kind scope origin),
+      integers: ~w(id ts rowVersion),
+      booleans: [],
+      nullable: ~w(scope)
+    },
+    "critical state" => %{
+      strings: ~w(sessionKey reason),
+      integers: ~w(startedAt expiresAt hardDeadline updatedAt rowVersion),
+      booleans: [],
+      nullable: []
+    },
+    "config" => %{
+      strings: ~w(key value),
+      integers: ~w(updatedAt rowVersion),
+      booleans: [],
+      nullable: ~w(value)
+    },
+    "host environment" => %{
+      strings: ~w(host harness name value),
+      integers: ~w(updatedAt rowVersion),
+      booleans: ~w(valuePresent),
+      nullable: ~w(value)
+    },
+    "hosts" => %{
+      strings: ~w(host),
+      integers: ~w(rowVersion),
+      booleans: [],
+      nullable: []
+    },
+    "identity" => %{
+      strings: ~w(name liveRevision state),
+      integers: ~w(rowVersion),
+      booleans: [],
+      nullable: []
+    },
+    "kungfu" => %{
+      strings: ~w(name purpose rootArchetype installedRevision status),
+      integers: ~w(rowVersion),
+      booleans: [],
+      nullable: ~w(installedRevision)
+    }
+  }
+
+  @item_complex_types %{
+    {"assignments", "files"} => {:array, :string, :preserve},
+    {"attests", "commitRefs"} => {:array, :commit_ref, :preserve},
+    {"decision requests", "options"} => {:array, :decision_option, :preserve},
+    {"decision requests", "context"} => :json,
+    {"sessions", "overrides"} => :session_overrides,
+    {"transcript messages", "attachments"} => {:array, :attachment, :preserve},
+    {"transcript messages", "context"} => :json,
+    {"identity", "sessionRevisions"} => :string_map,
+    {"identity", "staleness"} => {:array, :string, :sort},
+    {"identity", "conflicts"} => {:array, :string, :sort},
+    {"kungfu", "phrases"} => {:array, :string, :sort},
+    {"kungfu", "documents"} => {:array, :document, :sort_by_path}
+  }
+
+  @item_enums %{
+    {"work items", "state"} => ~w(open iceboxed closed failed),
+    {"assignments", "state"} => ~w(open closed),
+    {"assignments", "outcome"} => ~w(completed surrendered revoked),
+    {"attests", "kind"} => ~w(progress completion surrender verdict),
+    {"wakes", "state"} => ~w(pending fired canceled),
+    {"wakes", "reresolve"} => ~w(lineage),
+    {"wakes", "firedBy"} => ~w(condition fallback),
+    {"wakes", "classElection"} => ~w(sender classifier batcher),
+    {"turns", "status"} => ~w(queued running delivered canceled failed failed_unknown),
+    {"decision requests", "kind"} => ~w(statute effort agent),
+    {"decision requests", "status"} => ~w(open ruled consumed withdrawn superseded answered),
+    {"sessions", "kind"} => ~w(main dm custom),
+    {"sessions", "state"} => ~w(active retired),
+    {"devices", "status"} => ~w(allowlisted pending denied),
+    {"artifacts", "kind"} => ~w(spec report doc data other),
+    {"artifacts", "recordedTurnEvidence"} => ~w(tool-call-observed session-concurrent none),
+    {"artifacts", "state"} => ~w(in-workspace archived released),
+    {"transcript messages", "role"} => ~w(user assistant),
+    {"transcript messages", "attentionTier"} => [-1, 0, 1],
+    {"identity", "state"} => ~w(ready relearn_conflicted),
+    {"kungfu", "status"} => ~w(available installed)
+  }
+
   def query_work_item(db, id, call) do
     case WorkItems.__handle__(db, "work-item-get", %{call | params: %{work_item_id: id}}) do
       %{workItem: row} -> row
@@ -684,6 +868,7 @@ defmodule Tightbeam.StateResources do
     fields = Map.fetch!(@item_field_order, resource)
     fields = conditional_fields!(resource, fields, item)
     exact_item_keys!(resource, item, fields)
+    validate_item_values!(resource, item, fields)
 
     encoded =
       Enum.map_join(fields, ",", fn field ->
@@ -696,6 +881,20 @@ defmodule Tightbeam.StateResources do
 
   @doc false
   def complete_item?(resource, item) when is_binary(resource) and is_map(item) do
+    if item_shape_complete?(resource, item) do
+      try do
+        _bytes = encode_item(resource, item)
+        true
+      rescue
+        _error in [ArgumentError, KeyError] -> false
+      end
+    else
+      false
+    end
+  end
+
+  @doc false
+  def item_shape_complete?(resource, item) when is_binary(resource) and is_map(item) do
     resource = Map.get(@item_resource_aliases, resource, resource)
 
     case Map.fetch(@item_field_order, resource) do
@@ -712,6 +911,13 @@ defmodule Tightbeam.StateResources do
       :error ->
         false
     end
+  end
+
+  @doc false
+  def item_wire_schema do
+    Map.new(@item_field_order, fn {resource, fields} ->
+      {resource, Map.new(fields, &{&1, item_field_type!(resource, &1)})}
+    end)
   end
 
   def read_marker(row), do: public(row)
@@ -869,11 +1075,11 @@ defmodule Tightbeam.StateResources do
 
   defp conditional_fields!("transcript messages", fields, item) do
     case Map.fetch(item, "messageType") do
-      {:ok, value} when is_binary(value) and value != "" ->
+      {:ok, value} when is_binary(value) ->
         fields
 
       {:ok, _value} ->
-        raise ArgumentError, "messageType must be a non-empty string when present"
+        raise ArgumentError, "messageType must be a string when present"
 
       :error ->
         List.delete(fields, "messageType")
@@ -888,10 +1094,194 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  defp validate_item_values!(resource, item, fields) do
+    Enum.each(fields, fn field ->
+      validate_wire_value!(
+        Map.fetch!(item, field),
+        item_field_type!(resource, field),
+        "#{resource}.#{field}"
+      )
+    end)
+
+    validate_item_relationships!(resource, item)
+  end
+
+  defp item_field_type!(resource, field) do
+    category = Map.fetch!(@item_wire_categories, resource)
+
+    type =
+      cond do
+        field == "rowVersion" ->
+          :positive_integer
+
+        resource == "condition facts" and field == "id" ->
+          :positive_integer
+
+        type = Map.get(@item_complex_types, {resource, field}) ->
+          type
+
+        values = Map.get(@item_enums, {resource, field}) ->
+          {:enum, values}
+
+        field in category.strings ->
+          :string
+
+        field in category.integers ->
+          :integer
+
+        field in category.booleans ->
+          :boolean
+
+        true ->
+          raise ArgumentError, "#{resource}.#{field} has no normative wire type"
+      end
+
+    if field in category.nullable, do: {:nullable, type}, else: type
+  end
+
+  defp validate_wire_value!(nil, {:nullable, _type}, _label), do: :ok
+
+  defp validate_wire_value!(value, {:nullable, type}, label),
+    do: validate_wire_value!(value, type, label)
+
+  defp validate_wire_value!(value, :string, _label) when is_binary(value), do: :ok
+  defp validate_wire_value!(value, :integer, _label) when is_integer(value), do: :ok
+
+  defp validate_wire_value!(value, :positive_integer, _label)
+       when is_integer(value) and value > 0,
+       do: :ok
+
+  defp validate_wire_value!(value, :boolean, _label) when is_boolean(value), do: :ok
+
+  defp validate_wire_value!(value, {:enum, values}, label) do
+    if value in values,
+      do: :ok,
+      else: raise(ArgumentError, "#{label} is outside its normative enum domain")
+  end
+
+  defp validate_wire_value!(value, {:array, type, _order}, label) when is_list(value) do
+    value
+    |> Enum.with_index()
+    |> Enum.each(fn {item, index} ->
+      validate_wire_value!(item, type, "#{label}[#{index}]")
+    end)
+  end
+
+  defp validate_wire_value!(value, :session_overrides, label) do
+    validate_closed_wire_object!(
+      value,
+      %{
+        "skillsAdd" => {:array, :string, :sort},
+        "guidanceExtra" => {:nullable, :string}
+      },
+      label
+    )
+  end
+
+  defp validate_wire_value!(value, :attachment, label) do
+    validate_closed_wire_object!(
+      value,
+      %{"assetId" => :string, "mimeType" => :string, "filename" => :string, "size" => :integer},
+      label
+    )
+  end
+
+  defp validate_wire_value!(value, :commit_ref, label) do
+    validate_closed_wire_object!(value, %{"repo" => :string, "commit" => :string}, label)
+  end
+
+  defp validate_wire_value!(value, :decision_option, label) do
+    validate_closed_wire_object!(value, %{"label" => :string}, label)
+  end
+
+  defp validate_wire_value!(value, :document, label) do
+    validate_closed_wire_object!(
+      value,
+      %{"path" => :string, "content" => :string, "sha256" => :string},
+      label
+    )
+  end
+
+  defp validate_wire_value!(value, :string_map, label) when is_map(value) do
+    unless Enum.all?(value, fn {key, item} -> is_binary(key) and is_binary(item) end) do
+      raise ArgumentError, "#{label} must be a string-to-string map"
+    end
+
+    :ok
+  end
+
+  defp validate_wire_value!(value, :json, label), do: validate_json_value!(value, label)
+
+  defp validate_wire_value!(_value, _type, label),
+    do: raise(ArgumentError, "#{label} does not match its normative wire type")
+
+  defp validate_closed_wire_object!(value, types, label) when is_map(value) do
+    unless Enum.sort(Map.keys(value)) == Enum.sort(Map.keys(types)) do
+      raise ArgumentError, "#{label} has an extra or missing field"
+    end
+
+    Enum.each(types, fn {field, type} ->
+      validate_wire_value!(Map.fetch!(value, field), type, "#{label}.#{field}")
+    end)
+  end
+
+  defp validate_closed_wire_object!(_value, _types, label),
+    do: raise(ArgumentError, "#{label} must be an object")
+
+  defp validate_json_value!(value, _label)
+       when is_nil(value) or is_boolean(value) or is_binary(value) or is_integer(value) or
+              is_float(value),
+       do: :ok
+
+  defp validate_json_value!(value, label) when is_list(value) do
+    value
+    |> Enum.with_index()
+    |> Enum.each(fn {item, index} -> validate_json_value!(item, "#{label}[#{index}]") end)
+  end
+
+  defp validate_json_value!(value, label) when is_map(value) do
+    unless Enum.all?(Map.keys(value), &is_binary/1) do
+      raise ArgumentError, "#{label} JSON object keys must be strings"
+    end
+
+    Enum.each(value, fn {key, item} -> validate_json_value!(item, "#{label}.#{key}") end)
+  end
+
+  defp validate_json_value!(_value, label),
+    do: raise(ArgumentError, "#{label} must be a JSON value")
+
+  defp validate_item_relationships!("condition facts", item) do
+    unless item["id"] == item["rowVersion"] do
+      raise ArgumentError, "condition facts id must equal rowVersion"
+    end
+  end
+
+  defp validate_item_relationships!("attests", %{
+         "kind" => "verdict",
+         "verdictKind" => verdict_kind
+       })
+       when is_binary(verdict_kind),
+       do: :ok
+
+  defp validate_item_relationships!("attests", %{"kind" => kind, "verdictKind" => nil})
+       when kind != "verdict",
+       do: :ok
+
+  defp validate_item_relationships!("attests", _item),
+    do: raise(ArgumentError, "attests verdictKind does not match kind")
+
+  defp validate_item_relationships!(_resource, _item), do: :ok
+
   defp encode_item_field("sessions", "overrides", nil), do: "null"
 
   defp encode_item_field("sessions", "overrides", value) do
-    encode_closed_object!(value, ~w(skillsAdd guidanceExtra), "sessions.overrides")
+    "{" <>
+      JSON.encode!("skillsAdd") <>
+      ":" <>
+      JSON.encode!(Enum.sort(Map.fetch!(value, "skillsAdd"))) <>
+      "," <>
+      JSON.encode!("guidanceExtra") <>
+      ":" <> JSON.encode!(Map.fetch!(value, "guidanceExtra")) <> "}"
   end
 
   defp encode_item_field("transcript messages", "attachments", value) do
@@ -927,8 +1317,16 @@ defmodule Tightbeam.StateResources do
     "{" <> encoded <> "}"
   end
 
+  defp encode_item_field("identity", field, value) when field in ~w(staleness conflicts),
+    do: value |> Enum.sort() |> JSON.encode!()
+
+  defp encode_item_field("kungfu", "phrases", value),
+    do: value |> Enum.sort() |> JSON.encode!()
+
   defp encode_item_field("kungfu", "documents", value) do
-    encode_closed_list!(value, ~w(path content sha256), "kungfu.documents")
+    value
+    |> Enum.sort_by(&Map.fetch!(&1, "path"))
+    |> encode_closed_list!(~w(path content sha256), "kungfu.documents")
   end
 
   defp encode_item_field(_resource, _field, value), do: JSON.encode!(value)
@@ -1221,7 +1619,7 @@ defmodule Tightbeam.StateResources do
   defp config_row([key, value, updated_at, row_version]) do
     %{
       key: key,
-      value: if(key in ["default-archetype", "default-priority"], do: value, else: nil),
+      value: if(key == "default-archetype", do: value, else: nil),
       updated_at: updated_at,
       row_version: row_version
     }

@@ -219,7 +219,7 @@ defmodule Tightbeam.Firehose.Publisher do
       {:ok, %{resource: resource}} when is_map(payload) ->
         # Some current-main producers still publish result-shaped partial maps. Only a closed
         # R7/R7a item is eligible for RawJSON; the shared encoder remains strict for REST parity.
-        if StateResources.complete_item?(resource, payload) do
+        if StateResources.item_shape_complete?(resource, payload) do
           bytes = StateResources.encode_item(resource, payload)
           JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
         else

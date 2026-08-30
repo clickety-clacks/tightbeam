@@ -64,6 +64,21 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     end
   end
 
+  test "A17 randomizes map and set order 1,000 times without changing item bytes" do
+    expected =
+      Map.new(@field_order, fn {resource, fields} ->
+        item = item(resource, fields)
+        {resource, StateResources.encode_item(resource, item)}
+      end)
+
+    :rand.seed(:exsss, {17, 71, 171})
+
+    for _iteration <- 1..1_000, {resource, fields} <- @field_order do
+      randomized = resource |> item(fields) |> randomize_item(resource)
+      assert StateResources.encode_item(resource, randomized) == Map.fetch!(expected, resource)
+    end
+  end
+
   test "Publisher RawJSON payload bytes come from the shared encoder for every resource" do
     Registry.rows()
     |> Map.values()
@@ -98,6 +113,9 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     assert_raise ArgumentError, ~r/messageType/, fn ->
       StateResources.encode_item("messages", Map.put(item, "messageType", nil))
     end
+
+    assert StateResources.encode_item("messages", Map.put(item, "messageType", "")) =~
+             ~s("messageType":"")
   end
 
   test "the closed field table rejects extra and missing R7 input" do
@@ -110,6 +128,75 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
     assert_raise ArgumentError, ~r/extra or missing field/, fn ->
       StateResources.encode_item("work-items", Map.delete(item, "title"))
+    end
+  end
+
+  test "the shared schema rejects wrong types, nullability, enums, and versions for every field" do
+    for {resource, types} <- StateResources.item_wire_schema() do
+      fields = Map.fetch!(@field_order, resource)
+      item = item(resource, fields)
+
+      for {field, type} <- types do
+        invalid = Map.put(item, field, invalid_value(type))
+
+        assert_raise ArgumentError, fn -> StateResources.encode_item(resource, invalid) end
+        refute StateResources.complete_item?(resource, invalid)
+      end
+    end
+
+    fact = item("condition facts", Map.fetch!(@field_order, "condition facts"))
+
+    assert_raise ArgumentError, ~r/id must equal rowVersion/, fn ->
+      StateResources.encode_item("condition facts", Map.put(fact, "id", 2))
+    end
+
+    attest = item("attests", Map.fetch!(@field_order, "attests"))
+
+    assert_raise ArgumentError, ~r/verdictKind/, fn ->
+      StateResources.encode_item("attests", Map.put(attest, "verdictKind", "approved"))
+    end
+
+    assert_raise ArgumentError, ~r/verdictKind/, fn ->
+      invalid = Map.put(attest, "kind", "verdict")
+      StateResources.encode_item("attests", invalid)
+    end
+  end
+
+  test "nested shapes validate their exact keys and value types" do
+    cases = [
+      {"sessions", "overrides", %{"skillsAdd" => [1], "guidanceExtra" => nil}},
+      {"transcript messages", "attachments",
+       [%{"assetId" => "a", "mimeType" => "m", "filename" => "f", "size" => "1"}]},
+      {"attests", "commitRefs", [%{"repo" => "r", "commit" => 1}]},
+      {"decision requests", "options", [%{"label" => 1}]},
+      {"identity", "sessionRevisions", %{"session" => 1}},
+      {"kungfu", "documents", [%{"path" => "p", "content" => "c", "sha256" => 1}]}
+    ]
+
+    for {resource, field, invalid_value} <- cases do
+      item = item(resource, Map.fetch!(@field_order, resource))
+
+      assert_raise ArgumentError, fn ->
+        StateResources.encode_item(resource, Map.put(item, field, invalid_value))
+      end
+    end
+  end
+
+  test "Publisher refuses a schema-invalid complete row before emitting JSON" do
+    fields = Map.fetch!(@field_order, "users")
+    invalid = "users" |> item(fields) |> Map.put("isAdmin", "not-a-boolean")
+
+    assert StateResources.item_shape_complete?("users", invalid)
+    refute StateResources.complete_item?("users", invalid)
+
+    assert_raise ArgumentError, fn ->
+      Publisher.encode_wire_notice(%{
+        "class" => "user.added",
+        "op" => "upsert",
+        "occurredAt" => 1,
+        "refs" => %{"userId" => "flynn"},
+        "payload" => invalid
+      })
     end
   end
 
@@ -131,6 +218,8 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   defp value("sessions", "overrides"),
     do: %{"guidanceExtra" => nil, "skillsAdd" => ["beta", "alpha"]}
 
+  defp value("assignments", "files"), do: ["second", "first"]
+
   defp value("transcript messages", "attachments"),
     do: [%{"size" => 1, "filename" => "f", "mimeType" => "m", "assetId" => "a"}]
 
@@ -142,12 +231,34 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   defp value("decision requests", "options"), do: [%{"label" => "one"}]
   defp value("decision requests", "context"), do: opaque_json()
   defp value("identity", "sessionRevisions"), do: %{"z" => "2", "a" => "1"}
+  defp value("identity", "staleness"), do: ["zeta", "alpha"]
+  defp value("identity", "conflicts"), do: ["zeta", "alpha"]
+
+  defp value("kungfu", "phrases"), do: ["zeta", "alpha"]
 
   defp value("kungfu", "documents"),
-    do: [%{"sha256" => "s", "content" => "c", "path" => "p"}]
+    do: [
+      %{"sha256" => "z", "content" => "z", "path" => "z.md"},
+      %{"sha256" => "a", "content" => "a", "path" => "a.md"}
+    ]
 
   defp value("transcript messages", "messageType"), do: "agent"
-  defp value(_resource, field), do: field
+
+  defp value(resource, field) do
+    StateResources.item_wire_schema()
+    |> Map.fetch!(resource)
+    |> Map.fetch!(field)
+    |> valid_value(field)
+  end
+
+  defp valid_value({:nullable, _type}, _field), do: nil
+  defp valid_value(:string, field), do: field
+  defp valid_value(:integer, _field), do: 1
+  defp valid_value(:positive_integer, _field), do: 1
+  defp valid_value(:boolean, _field), do: false
+  defp valid_value({:enum, values}, _field), do: hd(values)
+  defp valid_value({:array, :string, _order}, _field), do: ["second", "first"]
+  defp valid_value(:json, _field), do: opaque_json()
 
   defp opaque_json, do: %{"b" => [%{"z" => 1, "a" => 2}], "a" => %{"z" => 2, "a" => 1}}
 
@@ -161,7 +272,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   end
 
   defp expected_value("sessions", "overrides", _value),
-    do: ~s({"skillsAdd":["beta","alpha"],"guidanceExtra":null})
+    do: ~s({"skillsAdd":["alpha","beta"],"guidanceExtra":null})
 
   defp expected_value("transcript messages", "attachments", _value),
     do: ~s([{"assetId":"a","mimeType":"m","filename":"f","size":1}])
@@ -175,10 +286,89 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   defp expected_value("decision requests", "context", _value), do: expected_opaque_json()
   defp expected_value("identity", "sessionRevisions", _value), do: ~s({"a":"1","z":"2"})
 
+  defp expected_value("identity", field, _value) when field in ~w(staleness conflicts),
+    do: ~s(["alpha","zeta"])
+
+  defp expected_value("kungfu", "phrases", _value), do: ~s(["alpha","zeta"])
+
   defp expected_value("kungfu", "documents", _value),
-    do: ~s([{"path":"p","content":"c","sha256":"s"}])
+    do:
+      ~s([{"path":"a.md","content":"a","sha256":"a"},{"path":"z.md","content":"z","sha256":"z"}])
 
   defp expected_value(_resource, _field, value), do: JSON.encode!(value)
 
   defp expected_opaque_json, do: ~s({"a":{"a":1,"z":2},"b":[{"a":2,"z":1}]})
+
+  defp invalid_value({:nullable, {:enum, _values}}), do: "outside-enum"
+  defp invalid_value({:nullable, _type}), do: :not_a_wire_value
+  defp invalid_value(:string), do: nil
+  defp invalid_value(:integer), do: "not-an-integer"
+  defp invalid_value(:positive_integer), do: 0
+  defp invalid_value(:boolean), do: "not-a-boolean"
+  defp invalid_value({:enum, [value | _values]}) when is_integer(value), do: 99
+  defp invalid_value({:enum, _values}), do: "outside-enum"
+  defp invalid_value({:array, _type, _order}), do: %{}
+  defp invalid_value(:session_overrides), do: %{}
+  defp invalid_value(:string_map), do: []
+  defp invalid_value(:json), do: :not_json
+
+  defp randomize_item(item, "sessions") do
+    update_in(item["overrides"], fn overrides ->
+      overrides
+      |> Map.update!("skillsAdd", &Enum.shuffle/1)
+      |> shuffled_map()
+    end)
+    |> shuffled_map()
+  end
+
+  defp randomize_item(item, "transcript messages") do
+    item
+    |> Map.update!("attachments", fn attachments -> Enum.map(attachments, &shuffled_map/1) end)
+    |> Map.update!("context", &randomize_json/1)
+    |> shuffled_map()
+  end
+
+  defp randomize_item(item, "attests") do
+    item
+    |> Map.update!("commitRefs", fn refs -> Enum.map(refs, &shuffled_map/1) end)
+    |> shuffled_map()
+  end
+
+  defp randomize_item(item, "decision requests") do
+    item
+    |> Map.update!("options", fn options -> Enum.map(options, &shuffled_map/1) end)
+    |> Map.update!("context", &randomize_json/1)
+    |> shuffled_map()
+  end
+
+  defp randomize_item(item, "identity") do
+    item
+    |> Map.update!("sessionRevisions", &shuffled_map/1)
+    |> Map.update!("staleness", &Enum.shuffle/1)
+    |> Map.update!("conflicts", &Enum.shuffle/1)
+    |> shuffled_map()
+  end
+
+  defp randomize_item(item, "kungfu") do
+    item
+    |> Map.update!("phrases", &Enum.shuffle/1)
+    |> Map.update!("documents", fn documents ->
+      documents |> Enum.shuffle() |> Enum.map(&shuffled_map/1)
+    end)
+    |> shuffled_map()
+  end
+
+  defp randomize_item(item, _resource), do: shuffled_map(item)
+
+  defp randomize_json(value) when is_map(value) do
+    value
+    |> Enum.map(fn {key, item} -> {key, randomize_json(item)} end)
+    |> Enum.shuffle()
+    |> Map.new()
+  end
+
+  defp randomize_json(value) when is_list(value), do: Enum.map(value, &randomize_json/1)
+  defp randomize_json(value), do: value
+
+  defp shuffled_map(value), do: value |> Enum.shuffle() |> Map.new()
 end
