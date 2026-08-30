@@ -2,7 +2,9 @@ defmodule Tightbeam.FirehoseSmokeTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.ClientE2E.WS
+  alias Tightbeam.{AdminProjection, Devices, Gateway, Harness, Placement}
   alias Tightbeam.Firehose.{Hub, Publisher, Registry}
+  alias Tightbeam.StateResources
   alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
 
   @moduledoc """
@@ -129,28 +131,25 @@ defmodule Tightbeam.FirehoseSmokeTest do
         filters: %{"classes" => classes}
       )
 
-    model = %{rows: %{}, versions: %{}, views: %{}, refetches: %{}}
-    # The rebuild oracle records the newest committed payload for each resource key.
-    # It never consumes the incremental delivery order below.
-    rebuild_rows = %{}
+    model = %{rows: %{}, versions: %{}, applications: %{}, views: %{}, refetches: %{}}
     random = :rand.seed_s(:exsplus, @model_seed)
 
-    {model, rebuild_rows, ws, _random} =
+    {model, ws, _random} =
       @a4_versioned
       |> Map.keys()
       |> Enum.sort()
       |> Enum.with_index()
       |> Enum.reduce(
-        {model, rebuild_rows, ws, random},
-        fn {class, class_index}, {model, rebuild_rows, ws, random} ->
+        {model, ws, random},
+        fn {class, class_index}, {model, ws, random} ->
           {sequences, random} = seeded_sequences(random)
 
-          {model, rebuild_rows, ws} =
+          {model, ws} =
             sequences
             |> Enum.with_index()
             |> Enum.reduce(
-              {model, rebuild_rows, ws},
-              fn {sequence, sequence_index}, {model, rebuild_rows, ws} ->
+              {model, ws},
+              fn {sequence, sequence_index}, {model, ws} ->
                 label = model_label(class, class_index, sequence_index)
                 older = model_notice(class, label, sequence_index * 2 + 101, :older, fixture)
                 newer = model_notice(class, label, sequence_index * 2 + 102, :newer, fixture)
@@ -158,8 +157,6 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
                 assert model_key(older) == key
                 assert older["payload"]["rowVersion"] < newer["payload"]["rowVersion"]
-
-                rebuild_rows = Map.put(rebuild_rows, key, newer["payload"])
 
                 {model, ws} =
                   Enum.reduce(sequence, {model, ws}, fn step, {model, ws} ->
@@ -171,26 +168,24 @@ defmodule Tightbeam.FirehoseSmokeTest do
                     {apply_model_notice(model, frame, fn _ -> flunk("R8 refetched") end), ws}
                   end)
 
-                assert model.rows == rebuild_rows,
+                assert Map.has_key?(model.rows, key),
                        "A4 seed=#{inspect(@model_seed)} class=#{class} sequence=#{inspect(sequence)}"
 
-                {model, rebuild_rows, ws}
+                {model, ws}
               end
             )
 
-          {model, rebuild_rows, ws, random}
+          {model, ws, random}
         end
       )
 
-    {model, rebuild_rows, ws} =
+    {model, ws} =
       @a4_immutable
       |> Map.keys()
       |> Enum.sort()
       |> Enum.with_index()
-      |> Enum.reduce({model, rebuild_rows, ws}, fn {class, index}, {model, rebuild_rows, ws} ->
+      |> Enum.reduce({model, ws}, fn {class, index}, {model, ws} ->
         notice = model_notice(class, "immutable-#{index}", index + 10_001, :only, fixture)
-        key = model_key(notice)
-        rebuild_rows = Map.put(rebuild_rows, key, notice["payload"])
 
         {model, ws} =
           Enum.reduce(1..2, {model, ws}, fn _duplicate, {model, ws} ->
@@ -201,8 +196,9 @@ defmodule Tightbeam.FirehoseSmokeTest do
             {apply_model_notice(model, frame, fn _ -> flunk("R8 refetched") end), ws}
           end)
 
-        assert model.rows == rebuild_rows
-        {model, rebuild_rows, ws}
+        key = model_key(notice)
+        assert model.applications[key] == 1
+        {model, ws}
       end)
 
     initial_rows = model.rows
@@ -238,7 +234,114 @@ defmodule Tightbeam.FirehoseSmokeTest do
         {model, ws}
       end)
 
-    assert model.rows == rebuild_rows
+    assert model.rows == initial_rows
+    :ok = WS.close(ws)
+  end
+
+  test "A4 live notices converge with a fresh production projection rebuild" do
+    fixture = start_fixture!()
+
+    ws =
+      Fixture.connect(fixture,
+        subscription_id: "a4-authoritative-rebuild",
+        filters: %{"classes" => ~w(config.updated host_env.updated host.registered user.added)}
+      )
+
+    handlers = Gateway.handlers(%{db: fixture.db, base_dir: fixture.base_dir})
+    call = fn verb, params -> Map.delete(firehose_call(verb, params), :firehose_in_txn) end
+
+    fixture_call = fn verb, params ->
+      Map.put(firehose_call(verb, params), :firehose_hub, fixture.hub)
+    end
+
+    assert %{changed: true} =
+             handlers["config"].(
+               call.("config", %{action: "set", setting: "default-priority", value: 0})
+             )
+
+    config = StateResources.query_config(fixture.db, "default-priority")
+    :ok = Hub.committed(fixture.hub, "config.updated", config, %{"key" => "default-priority"})
+    {config_notice, ws} = Fixture.recv_change(ws)
+    assert config_notice["class"] == "config.updated"
+
+    host = Placement.local_host_name()
+    harness = hd(Harness.all()).wire_name()
+
+    assert %{changed: true} =
+             Placement.set_env_overlay_with_firehose(
+               fixture.db,
+               host,
+               harness,
+               "A4_REBUILD",
+               "not-public",
+               "user:#{fixture.user_id}",
+               fixture_call.("host-env-set", %{})
+             )
+
+    host_env = StateResources.query_host_environment(fixture.db, host, harness, "A4_REBUILD")
+    :ok = Hub.committed(fixture.hub, "host_env.updated", host_env, %{})
+    {host_env_notice, ws} = Fixture.recv_change(ws)
+    assert host_env_notice["class"] == "host_env.updated"
+
+    assert {:ok, _entry} =
+             Placement.register_host(
+               fixture.db,
+               "a4-rebuild-host",
+               %{
+                 ssh: "fixture@a4-rebuild-host",
+                 base_dir: "/fixture/a4-rebuild",
+                 cli_bin: nil,
+                 adapter_bin_dir: nil
+               }
+             )
+
+    host_row = StateResources.query_host(fixture.db, "a4-rebuild-host")
+    :ok = Hub.committed(fixture.hub, "host.registered", host_row, %{"host" => "a4-rebuild-host"})
+    {host_notice, ws} = Fixture.recv_change(ws)
+    assert host_notice["class"] == "host.registered"
+
+    user =
+      Devices.add_user(
+        fixture.db,
+        "a4-rebuild-user",
+        false
+      )
+
+    user_row = StateResources.query_user(fixture.db, "a4-rebuild-user")
+    :ok = Hub.committed(fixture.hub, "user.added", user_row, %{"userId" => user.user_id})
+    {user_notice, ws} = Fixture.recv_change(ws)
+    assert user_notice["class"] == "user.added"
+
+    fresh =
+      [
+        {"config", "default-priority",
+         StateResources.config(StateResources.query_config(fixture.db, "default-priority"))},
+        {"host environment", AdminProjection.key([host, harness, "A4_REBUILD"]),
+         StateResources.host_environment(
+           StateResources.query_host_environment(fixture.db, host, harness, "A4_REBUILD")
+         )},
+        {"hosts", "a4-rebuild-host",
+         StateResources.host(StateResources.query_host(fixture.db, "a4-rebuild-host"))},
+        {"users", "a4-rebuild-user",
+         StateResources.user(StateResources.query_user(fixture.db, "a4-rebuild-user"))}
+      ]
+      |> Map.new(fn {resource, key, item} ->
+        {{resource, key}, {item["rowVersion"], StateResources.encode_admin_item(resource, item)}}
+      end)
+
+    buffered =
+      [config_notice, host_env_notice, host_notice, user_notice]
+      |> Enum.map(fn notice ->
+        resource = notice["resource"]
+        key = authoritative_key(notice)
+
+        {{resource, key},
+         {notice["payload"]["rowVersion"],
+          StateResources.encode_admin_item(resource, notice["payload"])}}
+      end)
+      |> Map.new()
+
+    assert buffered == fresh
     :ok = WS.close(ws)
   end
 
@@ -530,7 +633,8 @@ defmodule Tightbeam.FirehoseSmokeTest do
       %{
         model
         | rows: Map.put(model.rows, key, payload),
-          versions: Map.put(model.versions, key, version)
+          versions: Map.put(model.versions, key, version),
+          applications: Map.update(model.applications, key, 1, &(&1 + 1))
       }
     else
       model
@@ -580,6 +684,24 @@ defmodule Tightbeam.FirehoseSmokeTest do
     on_exit(fn -> assert :ok = Fixture.stop(fixture) end)
     fixture
   end
+
+  defp firehose_call(verb, params) do
+    %{
+      verb: verb,
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: params,
+      firehose_in_txn: true
+    }
+  end
+
+  defp authoritative_key(%{"resource" => "host environment", "refs" => refs}),
+    do: AdminProjection.key([refs["host"], refs["harness"], refs["name"]])
+
+  defp authoritative_key(%{"resource" => "config", "refs" => refs}), do: refs["key"]
+  defp authoritative_key(%{"resource" => "hosts", "refs" => refs}), do: refs["host"]
+  defp authoritative_key(%{"resource" => "users", "refs" => refs}), do: refs["userId"]
 
   defp publication_barrier(fixture) do
     marker = %{"fixtureBarrier" => inspect(make_ref())}
