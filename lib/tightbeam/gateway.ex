@@ -60,6 +60,7 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.{
     AdapterCoordinator,
+    AdminProjection,
     Archetypes,
     Artifacts,
     Assignments,
@@ -912,22 +913,31 @@ defmodule Tightbeam.Gateway do
           %{hosts: hosts}
         end),
       "identity-edit" =>
-        admin_call_handler(db, fn call -> identity_edit_result(config, call) end),
+        identity_mutation_handler(config, db, fn call ->
+          identity_edit_result(config, db, call)
+        end),
       "identity-status" =>
         admin_call_handler(db, fn call -> identity_status_result(config, db, call) end),
       "identity-relearn" =>
-        admin_call_handler(db, fn call -> identity_relearn_result(config, call) end),
+        identity_mutation_handler(config, db, fn call ->
+          identity_relearn_result(config, db, call)
+        end),
       "identity-repoint" =>
         admin_call_handler(db, fn call -> identity_repoint_result(config, db, call) end),
-      "learn" => admin_call_handler(db, fn call -> identity_learn_result(config, call) end),
+      "learn" =>
+        identity_mutation_handler(config, db, fn call ->
+          identity_learn_result(config, db, call)
+        end),
       "unlearn" =>
-        admin_call_handler(db, fn call -> identity_unlearn_result(config, db, call) end),
+        identity_mutation_handler(config, db, fn call ->
+          identity_unlearn_result(config, db, call)
+        end),
       "kungfu-list" => fn _call -> %{bundles: Identity.available_bundles()} end,
       "identity-apply" =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
       "kungfu-scaffold" =>
-        admin_call_handler(db, fn call ->
-          paths =
+        identity_mutation_handler(config, db, fn call ->
+          candidate =
             Archetypes.scaffold_kungfu!(
               config.base_dir,
               call.params.name,
@@ -935,7 +945,10 @@ defmodule Tightbeam.Gateway do
               call.origin
             )
 
-          %{kungfu: call.params.name, paths: paths}
+          publish_identity_candidate(config, db, call, candidate, %{
+            kungfu: call.params.name,
+            paths: candidate.paths
+          })
         end),
       "onboard" => admin_call_handler(db, fn call -> onboard_result(config, call) end),
       "promote-user" =>
@@ -2417,7 +2430,7 @@ defmodule Tightbeam.Gateway do
                      snapshot.guidance
                    ) do
               Org.append_pointer(db, session.session_key, sid, "created")
-              Org.set_identity_revision(db, session.session_key, snapshot.revision)
+              stamp_session_identity(db, session.session_key, snapshot)
               {:ok, sid}
             end
           end)
@@ -2466,7 +2479,7 @@ defmodule Tightbeam.Gateway do
                           "loaded"
                         )
 
-                        Org.set_identity_revision(db, session.session_key, snapshot.revision)
+                        stamp_session_identity(db, session.session_key, snapshot)
                         {:ok, pointer.harness_session_id}
 
                       {:error, {:model_apply_failed, _reason}} = error ->
@@ -2501,7 +2514,7 @@ defmodule Tightbeam.Gateway do
                                  snapshot.guidance
                                ) do
                           Org.append_pointer(db, session.session_key, sid, "fallback")
-                          Org.set_identity_revision(db, session.session_key, snapshot.revision)
+                          stamp_session_identity(db, session.session_key, snapshot)
 
                           append_session_restart_marker(
                             db,
@@ -2657,11 +2670,11 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_edit_result(config, call) do
+  defp identity_edit_result(config, db, call) do
     p = call.params
     target = identity_edit_target(p)
 
-    revision =
+    candidate =
       Identity.edit!(
         config.base_dir,
         p.archetype,
@@ -2670,8 +2683,7 @@ defmodule Tightbeam.Gateway do
         call.origin
       )
 
-    Archetypes.load!(config.base_dir)
-    %{live_revision: revision}
+    publish_identity_candidate(config, db, call, candidate, %{})
   end
 
   defp identity_edit_target(%{skill: name, remove: remove}) when is_binary(name),
@@ -2680,22 +2692,20 @@ defmodule Tightbeam.Gateway do
   defp identity_edit_target(%{manifest: true}), do: :manifest
   defp identity_edit_target(_params), do: :guidance
 
-  defp identity_relearn_result(config, %{params: %{action: "abort"}}) do
+  defp identity_relearn_result(config, _db, %{params: %{action: "abort"}}) do
     :ok = Identity.abort_relearn!(config.base_dir)
     %{state: "aborted", live_revision: Identity.live_revision!(config.base_dir)}
   end
 
-  defp identity_relearn_result(config, %{params: %{action: "resolve"}} = call) do
-    revision = Identity.resolve_relearn!(config.base_dir, call.origin)
-    reload_law!(config)
-    %{state: "published", live_revision: revision}
+  defp identity_relearn_result(config, db, %{params: %{action: "resolve"}} = call) do
+    candidate = Identity.resolve_relearn!(config.base_dir, call.origin)
+    publish_identity_candidate(config, db, call, candidate, %{state: "published"})
   end
 
-  defp identity_relearn_result(config, call) do
+  defp identity_relearn_result(config, db, call) do
     case Identity.relearn!(config.base_dir, call.origin) do
-      {:ok, revision} ->
-        reload_law!(config)
-        %{state: "published", live_revision: revision}
+      {:ok, candidate} ->
+        publish_identity_candidate(config, db, call, candidate, %{state: "published"})
 
       {:conflict, paths} ->
         %{
@@ -2714,11 +2724,13 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp identity_learn_result(config, call) do
+  defp identity_learn_result(config, db, call) do
     case Identity.learn!(config.base_dir, call.params.name, call.origin) do
-      {:ok, revision} ->
-        reload_law!(config)
-        %{state: "published", kungfu: call.params.name, live_revision: revision}
+      {:ok, candidate} ->
+        publish_identity_candidate(config, db, call, candidate, %{
+          state: "published",
+          kungfu: call.params.name
+        })
 
       {:noop, revision} ->
         reload_law!(config)
@@ -2745,20 +2757,108 @@ defmodule Tightbeam.Gateway do
   defp identity_unlearn_result(config, db, call) do
     name = call.params.name
     archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
+    invocation_id = Map.fetch!(call, :invocation_id)
 
-    case Org.release_archetypes(db, archetypes, fn ->
-           revision = Identity.unlearn!(config.base_dir, name, call.origin)
-           # Reload before releasing the DB owner. Every reference writer rechecks
-           # the archetype inside that same owner, so a writer queued behind this
-           # publication cannot commit from a pre-unlearn validation snapshot.
-           reload_law!(config)
-           revision
-         end) do
+    case Org.release_archetypes(
+           db,
+           archetypes,
+           fn txn ->
+             candidate = Identity.unlearn!(config.base_dir, name, call.origin)
+
+             marker =
+               AdminProjection.begin_identity_publication_in_txn(
+                 txn,
+                 invocation_id,
+                 candidate,
+                 call.origin
+               )
+
+             {candidate, marker}
+           end,
+           fn {candidate, marker} ->
+             case Identity.publish_live!(config.base_dir, candidate) do
+               {:ok, revision} ->
+                 reload_law!(config)
+                 {:published, marker, revision}
+
+               {:error, error} ->
+                 {:denied, marker, error}
+             end
+           end
+         ) do
       {:referenced, references} ->
         unlearn_referenced_result(name, references)
 
-      {:released, revision} ->
+      {:released, {:published, marker, revision}} ->
+        {:ok, :ok} =
+          DB.transaction(db, fn txn ->
+            AdminProjection.finish_identity_publication_in_txn(txn, marker, "accepted")
+          end)
+
         %{state: "published", kungfu: name, live_revision: revision}
+
+      {:released, {:denied, marker, error}} ->
+        {:ok, :ok} =
+          DB.transaction(db, fn txn ->
+            AdminProjection.finish_identity_publication_in_txn(
+              txn,
+              marker,
+              "denied",
+              error.code,
+              error
+            )
+          end)
+
+        error
+    end
+  end
+
+  defp publish_identity_candidate(config, db, call, candidate, result) do
+    invocation_id = Map.get(call, :invocation_id, "identity-" <> Tightbeam.Id.uuid4())
+
+    with {:ok, marker} <-
+           AdminProjection.begin_identity_publication(
+             db,
+             invocation_id,
+             candidate,
+             call.origin
+           ) do
+      case marker.state do
+        "accepted" ->
+          Map.put(result, :live_revision, marker.candidate_revision)
+
+        "denied" ->
+          identity_denial_result(marker)
+
+        "pending" ->
+          case Identity.publish_live!(config.base_dir, candidate) do
+            {:ok, revision} ->
+              reload_law!(config)
+
+              {:ok, :ok} =
+                DB.transaction(db, fn txn ->
+                  AdminProjection.finish_identity_publication_in_txn(txn, marker, "accepted")
+                end)
+
+              Map.put(result, :live_revision, revision)
+
+            {:error, error} ->
+              {:ok, :ok} =
+                DB.transaction(db, fn txn ->
+                  AdminProjection.finish_identity_publication_in_txn(
+                    txn,
+                    marker,
+                    "denied",
+                    error.code,
+                    error
+                  )
+                end)
+
+              error
+          end
+      end
+    else
+      {:error, error} -> %{code: "identity_marker_failed", message: Exception.message(error)}
     end
   end
 
@@ -2911,10 +3011,39 @@ defmodule Tightbeam.Gateway do
       db
       |> Org.list_for_user("", true)
       |> Enum.map(fn session ->
+        harness = Harness.parse!(session.harness).id()
+        expected = Identity.snapshot_at!(config.base_dir, live, session.archetype, harness)
+
+        reasons =
+          [
+            if(
+              is_nil(session.identity_render_contract) or is_nil(session.identity_guidance_digest),
+              do: "missing_render_stamp"
+            ),
+            if(session.identity_revision != live, do: "revision_mismatch"),
+            if(
+              not is_nil(session.identity_render_contract) and
+                session.identity_render_contract != expected.render_contract,
+              do: "contract_mismatch"
+            ),
+            if(
+              not is_nil(session.identity_guidance_digest) and
+                session.identity_guidance_digest != expected.guidance_digest,
+              do: "guidance_digest_mismatch"
+            )
+          ]
+          |> Enum.reject(&is_nil/1)
+
         %{
           session_key: session.session_key,
           identity_revision: session.identity_revision,
-          identity_stale: session.identity_revision != live
+          identity_render_contract: session.identity_render_contract,
+          identity_guidance_digest: session.identity_guidance_digest,
+          expected_identity_revision: live,
+          expected_render_contract: expected.render_contract,
+          expected_guidance_digest: expected.guidance_digest,
+          identity_stale: reasons != [],
+          identity_stale_reasons: reasons
         }
       end)
 
@@ -2923,7 +3052,7 @@ defmodule Tightbeam.Gateway do
         archetype when is_binary(archetype) ->
           Map.new(Harness.all(), fn module ->
             snapshot = Identity.snapshot_at!(config.base_dir, live, archetype, module.id())
-            {module.id(), module.session_config(%{}, snapshot.guidance).guidance}
+            {module.id(), snapshot.guidance}
           end)
 
         nil ->
@@ -3010,8 +3139,14 @@ defmodule Tightbeam.Gateway do
       # start (§Sessions stamp the revision they materialized from), so it is
       # already on the applied revision by construction. Nothing to do is the
       # true answer here, and the only place it is.
-      nil -> :noop
-      pointer -> identity_apply_at_lane(config, db, session, revision, pointer)
+      nil ->
+        harness = Harness.parse!(session.harness).id()
+        snapshot = served_snapshot(config, session, harness, revision)
+        stamp_session_identity(db, session.session_key, snapshot)
+        :applied
+
+      pointer ->
+        identity_apply_at_lane(config, db, session, revision, pointer)
     end
   end
 
@@ -3084,7 +3219,7 @@ defmodule Tightbeam.Gateway do
              snapshot.guidance
            ) do
       Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
-      Org.set_identity_revision(db, session.session_key, snapshot.revision)
+      stamp_session_identity(db, session.session_key, snapshot)
       :applied
     else
       # No resident session to bounce, so the stamp IS the application. The next
@@ -3094,7 +3229,7 @@ defmodule Tightbeam.Gateway do
       # reporting it applied. No pointer event is appended: nothing was loaded,
       # and the pointer chain does not record things that did not happen.
       false ->
-        Org.set_identity_revision(db, session.session_key, snapshot.revision)
+        stamp_session_identity(db, session.session_key, snapshot)
         :applied
 
       {:error, reason} ->
@@ -3106,6 +3241,16 @@ defmodule Tightbeam.Gateway do
            sessions: [session.session_key]
          }}
     end
+  end
+
+  defp stamp_session_identity(db, session_key, snapshot) do
+    Org.set_identity_stamp(
+      db,
+      session_key,
+      snapshot.revision,
+      snapshot.render_contract,
+      snapshot.guidance_digest
+    )
   end
 
   # A live adapter that fails for its own reasons still surfaces, but as this
@@ -3481,6 +3626,61 @@ defmodule Tightbeam.Gateway do
         else: %{code: "forbidden", message: "admin required"}
     end
   end
+
+  defp identity_mutation_handler(config, db, fun) do
+    admin_call_handler(db, fn call ->
+      invocation_id = Map.get(call, :invocation_id, "identity-" <> Tightbeam.Id.uuid4())
+      call = Map.put(call, :invocation_id, invocation_id)
+
+      case AdminProjection.identity_publication_marker_by_invocation(db, invocation_id) do
+        nil ->
+          try do
+            fun.(call)
+          rescue
+            error in Tightbeam.Identity.IncludeError ->
+              denial = %{code: "identity_include_invalid", message: Exception.message(error)}
+
+              {:ok, _marker} =
+                AdminProjection.deny_identity_validation(
+                  db,
+                  invocation_id,
+                  error.expected_prior || "none",
+                  error.tree_fingerprint || String.duplicate("0", 64),
+                  call.origin,
+                  Atom.to_string(error.cause),
+                  denial
+                )
+
+              denial
+          end
+
+        %{state: "accepted"} = marker ->
+          %{state: "published", live_revision: marker.candidate_revision}
+
+        %{state: "denied"} = marker ->
+          identity_denial_result(marker)
+
+        %{state: "pending"} = marker ->
+          candidate = %{
+            expected_prior: marker.expected_prior,
+            candidate_revision: marker.candidate_revision,
+            tree_fingerprint: marker.tree_fingerprint
+          }
+
+          publish_identity_candidate(config, db, call, candidate, %{state: "published"})
+      end
+    end)
+  end
+
+  defp identity_denial_result(marker) do
+    %{code: marker.denial_code || marker.cause || "identity_publication_denied"}
+    |> put_present(:message, marker.denial_message)
+    |> put_present(:expected, marker.denial_expected)
+    |> put_present(:actual, marker.denial_actual)
+  end
+
+  defp put_present(result, _key, nil), do: result
+  defp put_present(result, key, value), do: Map.put(result, key, value)
 
   defp notify_session(config, db, session_key, prompt) do
     deliver_prompt(session_key, "process:tightbeam", prompt,

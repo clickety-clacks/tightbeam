@@ -39,7 +39,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "notice-batching-v1-019"
+  @shape "identity-universal-root-render-v1-019"
+  @identity_render_stamp_previous_shape "notice-batching-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
@@ -1086,16 +1087,22 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@identity_render_stamp_previous_shape]]} ->
+        upgrade_identity_render_stamp_v1(db)
+
       {:ok, [[@terminal_decision_shape]]} ->
-        migrate_notice_batching_v1_019(db)
+        :ok = migrate_notice_batching_v1_019(db)
+        upgrade_identity_render_stamp_v1(db)
 
       {:ok, [[@operator_decision_shape]]} ->
         :ok = migrate_operator_decision_v1(db)
-        migrate_notice_batching_v1_019(db)
+        :ok = migrate_notice_batching_v1_019(db)
+        upgrade_identity_render_stamp_v1(db)
 
       {:ok, [[@model_identity_shape]]} ->
         :ok = migrate_model_identity_v1(db)
-        migrate_notice_batching_v1_019(db)
+        :ok = migrate_notice_batching_v1_019(db)
+        upgrade_identity_render_stamp_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1112,7 +1119,8 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
-        to #{@terminal_decision_shape}, then #{@terminal_decision_shape} to #{@shape}.
+        to #{@terminal_decision_shape}, then #{@terminal_decision_shape} to
+        #{@identity_render_stamp_previous_shape}, then to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1131,6 +1139,37 @@ defmodule Tightbeam.Schema do
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
+    end
+  end
+
+  defp upgrade_identity_render_stamp_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@identity_render_stamp_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_identity_render_stamp_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityRenderContract TEXT")
+           Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityGuidanceDigest TEXT")
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3", [
+             @shape,
+             System.system_time(:millisecond),
+             @identity_render_stamp_previous_shape
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_identity_render_stamp_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
     end
   end
 
@@ -1357,7 +1396,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@terminal_decision_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
@@ -1401,7 +1440,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != wake_count do
       raise ShapeError,
         message:
-          "migration #{@terminal_decision_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{wake_count} wakes"
+          "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} copied #{Txn.changes(txn)} of #{wake_count} wakes"
     end
 
     [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes_notice_batching_v1")
@@ -1421,7 +1460,7 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@shape} classified legacy wakes: #{inspect(rows)}"
+            "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} classified legacy wakes: #{inspect(rows)}"
     end
 
     wake_bound_objects =
@@ -1481,7 +1520,7 @@ defmodule Tightbeam.Schema do
       if Txn.changes(txn) != cancellation_count do
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+            "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
       end
 
       :ok =
@@ -1515,7 +1554,7 @@ defmodule Tightbeam.Schema do
       if Txn.changes(txn) != cancellation_count do
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@shape} restored #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+            "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} restored #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
       end
 
       :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_notice_batching_v1")
@@ -1530,19 +1569,23 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
-      [@shape, System.system_time(:millisecond), @terminal_decision_shape]
+      [
+        @identity_render_stamp_previous_shape,
+        System.system_time(:millisecond),
+        @terminal_decision_shape
+      ]
     )
 
     if Txn.changes(txn) != 1 do
       raise ShapeError,
         message:
-          "migration #{@terminal_decision_shape} -> #{@shape} lost its exact stamp transition"
+          "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} lost its exact stamp transition"
     end
 
     :ok

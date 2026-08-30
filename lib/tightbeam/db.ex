@@ -64,6 +64,12 @@ defmodule Tightbeam.DB do
     GenServer.call(server, {:transaction, fun})
   end
 
+  @doc "Commit one transaction, then run a bounded publication callback before releasing the owner."
+  def transaction_then(server \\ __MODULE__, prepare, after_commit)
+      when is_function(prepare, 1) and is_function(after_commit, 1) do
+    GenServer.call(server, {:transaction_then, prepare, after_commit})
+  end
+
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
 
   defmodule Txn do
@@ -134,6 +140,36 @@ defmodule Tightbeam.DB do
         :ok = Sqlite3.execute(conn, "ROLLBACK")
         {:reply, {:error, e}, state}
     end
+  end
+
+  def handle_call({:transaction_then, prepare, after_commit}, _from, %{conn: conn} = state) do
+    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+    prepared =
+      try do
+        result = prepare.(%Txn{conn: conn})
+        :ok = Sqlite3.execute(conn, "COMMIT")
+        {:committed, result}
+      rescue
+        error ->
+          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          {:rolled_back, error}
+      end
+
+    reply =
+      case prepared do
+        {:committed, result} ->
+          try do
+            {:ok, after_commit.(result)}
+          rescue
+            error -> {:error, error}
+          end
+
+        {:rolled_back, error} ->
+          {:error, error}
+      end
+
+    {:reply, reply, state}
   end
 
   @doc false

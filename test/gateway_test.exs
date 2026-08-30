@@ -6299,7 +6299,7 @@ defmodule Tightbeam.GatewayTest do
     put_skill!(base, "review", "# Review")
     manifest_path = Path.join([base, "identity", "archetypes", "default.toml"])
 
-    Identity.edit!(
+    identity_edit!(
       base,
       "default",
       :manifest,
@@ -6693,7 +6693,7 @@ defmodule Tightbeam.GatewayTest do
         "name = \"default\"\nwhere = [\"testhost\", \"worker\"]"
       )
 
-    Identity.edit!(base, "default", :manifest, manifest, "test")
+    identity_edit!(base, "default", :manifest, manifest, "test")
 
     old_url = Application.get_env(:tightbeam, :advertised_url)
 
@@ -6825,7 +6825,7 @@ defmodule Tightbeam.GatewayTest do
       |> File.read!()
       |> String.replace("name = \"default\"", "name = \"default\"\nwhere = [\"testhost\"]")
 
-    Identity.edit!(base, "default", :manifest, manifest, "test")
+    identity_edit!(base, "default", :manifest, manifest, "test")
 
     on_exit(fn ->
       File.rm_rf!(base)
@@ -7905,7 +7905,7 @@ defmodule Tightbeam.GatewayTest do
     old_body = File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md"))
 
     next =
-      Identity.edit!(
+      identity_edit!(
         base_dir,
         "coder",
         {:skill, "worktree-session", false},
@@ -8171,7 +8171,7 @@ defmodule Tightbeam.GatewayTest do
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
 
     next =
-      Identity.edit!(
+      identity_edit!(
         base_dir,
         "coder",
         {:skill, "worktree-session", false},
@@ -8268,7 +8268,7 @@ defmodule Tightbeam.GatewayTest do
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
 
     next =
-      Identity.edit!(
+      identity_edit!(
         base_dir,
         "coder",
         {:skill, "worktree-session", false},
@@ -8377,7 +8377,7 @@ defmodule Tightbeam.GatewayTest do
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
 
-    Identity.edit!(
+    identity_edit!(
       base_dir,
       "coder",
       {:skill, "worktree-session", false},
@@ -8469,7 +8469,7 @@ defmodule Tightbeam.GatewayTest do
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
 
     next =
-      Identity.edit!(
+      identity_edit!(
         base_dir,
         "coder",
         {:skill, "worktree-session", false},
@@ -8558,8 +8558,8 @@ defmodule Tightbeam.GatewayTest do
   # has no harness pointer until its first turn. identity-apply once raised on it —
   # bricking `--all` org-wide whenever any never-started session existed (found by
   # feature_smoke: it applied to the session it had just spawned). A pointer-less
-  # session is a no-op: it materializes from live at first start, already current.
-  test "identity apply skips a never-started session instead of raising", ctx do
+  # session has no adapter work, but apply still records the complete live render stamp.
+  test "identity apply stamps a never-started session without touching an adapter", ctx do
     base_dir = role_test_base("identity-apply-unstarted")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -8602,7 +8602,10 @@ defmodule Tightbeam.GatewayTest do
 
     assert session_key == session.session_key
     assert Org.current_pointer(ctx.db, session.session_key) == nil
-    refute_receive {:push, %{"type" => "stream_updated"}}
+    stamped = Org.get(ctx.db, session.session_key)
+    assert stamped.identity_render_contract == "universal-root-render-v1"
+    assert is_binary(stamped.identity_guidance_digest)
+    assert_receive {:push, %{"type" => "stream_updated"}}
   end
 
   # Regression, found live on shrdlu: a pointer row outlives the adapter that
@@ -8636,7 +8639,7 @@ defmodule Tightbeam.GatewayTest do
     start_lane!(ctx.db, session.session_key)
 
     next =
-      Identity.edit!(
+      identity_edit!(
         base_dir,
         "coder",
         {:skill, "worktree-session", false},
@@ -8718,7 +8721,7 @@ defmodule Tightbeam.GatewayTest do
     unstarted = make.("agent:apply-all-unstarted", nil)
 
     next =
-      Identity.edit!(
+      identity_edit!(
         base_dir,
         "coder",
         {:skill, "worktree-session", false},
@@ -8780,7 +8783,7 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, session.session_key, "thread-resident", "created")
     start_lane!(ctx.db, session.session_key)
 
-    Identity.edit!(
+    identity_edit!(
       base_dir,
       "coder",
       {:skill, "worktree-session", false},
@@ -9230,7 +9233,7 @@ defmodule Tightbeam.GatewayTest do
 
   defp learn_engineering_identity!(base_dir) do
     assert :initialized = Identity.init!(base_dir)
-    assert {:ok, _revision} = Identity.learn!(base_dir, "agentic-engineering", "test")
+    assert {:ok, _revision} = identity_learn!(base_dir, "agentic-engineering", "test")
     Archetypes.load!(base_dir)
   end
 
@@ -9424,7 +9427,24 @@ defmodule Tightbeam.GatewayTest do
 
   defp put_skill!(base_dir, name, body) do
     Identity.init!(base_dir)
-    Identity.edit!(base_dir, "default", {:skill, name, false}, body, "test")
+    identity_edit!(base_dir, "default", {:skill, name, false}, body, "test")
     Archetypes.load!(base_dir)
+  end
+
+  defp identity_edit!(base, archetype, target, content, author) do
+    candidate = Identity.edit!(base, archetype, target, content, author)
+    assert {:ok, revision} = Identity.publish_live!(base, candidate)
+    revision
+  end
+
+  defp identity_learn!(base, name, author) do
+    case Identity.learn!(base, name, author) do
+      {:ok, candidate} ->
+        assert {:ok, revision} = Identity.publish_live!(base, candidate)
+        {:ok, revision}
+
+      other ->
+        other
+    end
   end
 end

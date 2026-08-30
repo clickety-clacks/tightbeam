@@ -14,6 +14,7 @@ defmodule Tightbeam.Identity do
 
   alias Tightbeam.{Archetypes, Harness}
   alias Tightbeam.Harness.Support
+  alias Tightbeam.Identity.Renderer
 
   @upstream "tightbeam/upstream"
   @live "tightbeam/live"
@@ -21,33 +22,60 @@ defmodule Tightbeam.Identity do
   @reserved_prefix "tightbeam__"
   @seed_owned_paths ["archetypes/default.toml", "guidance/operating-model.md"]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
+  @render_contract "universal-root-render-v1"
+  @universal_roots ["operating-model.md", "operating-manual.md"]
 
   @type harness :: atom()
   @type snapshot :: %{
           revision: String.t(),
+          render_contract: String.t(),
+          guidance_digest: String.t(),
           archetype: Archetypes.t(),
           guidance: String.t(),
           skills: %{optional(String.t()) => binary()}
         }
+
+  @doc "The immutable served-guidance composition contract."
+  def render_contract, do: @render_contract
 
   @doc "Seed a new organization with the neutral identity substrate."
   @spec init!(String.t()) :: :initialized | :noop
   def init!(base_dir) do
     identity_dir = identity_dir(base_dir)
 
+    lock = {{__MODULE__, :init, Path.expand(identity_dir)}, self()}
+
+    :global.trans(lock, fn ->
+      init_identity!(identity_dir)
+    end)
+  end
+
+  defp init_identity!(identity_dir) do
     if File.dir?(Path.join(identity_dir, ".git")) do
       verify_required_refs!(identity_dir)
       maybe_mint_grandfather_receipt!(identity_dir)
       :noop
     else
-      File.mkdir_p!(identity_dir)
-      git!(identity_dir, ["init", "-b", "main"])
-      replace_with_entries!(identity_dir, seed_entries())
-      git!(identity_dir, ["add", "-A"])
-      git!(identity_dir, ["commit", "-m", "seed: neutral-identity"], "tightbeam")
-      git!(identity_dir, ["branch", @upstream])
-      git!(identity_dir, ["branch", @live])
-      :initialized
+      candidate =
+        identity_dir <> ".candidate-" <> Integer.to_string(System.unique_integer([:positive]))
+
+      try do
+        File.mkdir_p!(candidate)
+        git!(candidate, ["init", "-b", "main"])
+        replace_with_entries!(candidate, seed_entries())
+        validate_tree!(candidate)
+        git!(candidate, ["add", "-A"])
+        git!(candidate, ["commit", "-m", "seed: neutral-identity"], "tightbeam")
+        revision = git_output!(candidate, ["rev-parse", "main"])
+        validate_revision_dir!(candidate, revision)
+        git!(candidate, ["branch", @upstream])
+        git!(candidate, ["branch", @live])
+        File.rm_rf!(identity_dir)
+        File.rename!(candidate, identity_dir)
+        :initialized
+      after
+        File.rm_rf(candidate)
+      end
     end
   end
 
@@ -119,12 +147,7 @@ defmodule Tightbeam.Identity do
     # carries its own operating-manual.md wins; otherwise the built-in fills the
     # name, so an explicit `#include "operating-manual.md"` resolves either way.
     # Absence of the shipped file is a broken install: File.read! raises.
-    fragments =
-      identity_dir
-      |> revision_fragments!(revision)
-      |> Map.put_new_lazy("operating-manual.md", fn ->
-        String.trim_trailing(Archetypes.builtin_fragments()["operating-manual.md"])
-      end)
+    catalog = revision_catalog!(identity_dir, revision)
 
     manifest_path = "archetypes/#{archetype_name}.toml"
     manifest = git_show!(identity_dir, revision, manifest_path)
@@ -138,25 +161,47 @@ defmodule Tightbeam.Identity do
         {name, git_show!(identity_dir, revision, "skills/#{name}/SKILL.md")}
       end)
 
-    archetype_guidance = Archetypes.guidance(archetype, fragments)
-    operating_manual = Map.fetch!(fragments, "operating-manual.md")
+    archetype_render = Archetypes.guidance_render(archetype, catalog)
 
-    # Appended once: an archetype whose guidance already includes the manual
-    # (via `#include`) is not served it twice.
-    manual_part =
-      if String.contains?(archetype_guidance, operating_manual),
-        do: [],
-        else: [operating_manual]
+    root_parts =
+      Enum.flat_map(@universal_roots, fn name ->
+        if MapSet.member?(archetype_render.reachable_roots, name) do
+          []
+        else
+          entry = required_catalog_entry!(catalog, name, revision)
+          [Renderer.render!(entry.bytes, entry.path, catalog, universal_root: name).bytes]
+        end
+      end)
 
     guidance =
-      ([
-         archetype_guidance,
-         required_fragment!(fragments, "operating-model.md", revision)
-       ] ++ manual_part)
+      ([archetype_render.bytes] ++ root_parts)
       |> Enum.join("\n\n")
       |> then(&Harness.module!(harness).session_config(%{identity: true}, &1).guidance)
 
-    %{revision: revision, archetype: archetype, guidance: guidance, skills: skills}
+    case guidance
+         |> String.split("\n")
+         |> Enum.with_index(1)
+         |> Enum.find(fn {line, _} -> String.starts_with?(line, "#include") end) do
+      nil ->
+        :ok
+
+      {_line, line_number} ->
+        raise Tightbeam.Identity.IncludeError,
+          cause: :unrendered_directive,
+          origin: "final-guidance:#{archetype_name}:#{harness}",
+          path: "final-guidance",
+          line: line_number,
+          chain: []
+    end
+
+    %{
+      revision: revision,
+      render_contract: @render_contract,
+      guidance_digest: sha256(guidance),
+      archetype: archetype,
+      guidance: guidance,
+      skills: skills
+    }
   end
 
   # A fragment the SUBSTRATE requires, which an org's tree may predate.
@@ -168,10 +213,10 @@ defmodule Tightbeam.Identity do
   # named the key and then printed the entire fragment map: tens of kilobytes of
   # guidance prose in a message whose actionable content is one filename and one
   # verb.
-  defp required_fragment!(fragments, name, revision) do
-    case Map.fetch(fragments, name) do
-      {:ok, body} ->
-        body
+  defp required_catalog_entry!(catalog, name, revision) do
+    case Map.fetch(catalog, name) do
+      {:ok, entry} ->
+        entry
 
       :error ->
         raise ArgumentError,
@@ -296,31 +341,32 @@ defmodule Tightbeam.Identity do
           {:guidance | :manifest | {:skill, String.t(), boolean()}},
           binary() | nil,
           String.t()
-        ) :: String.t()
+        ) :: map()
   def edit!(base_dir, archetype, target, content, author) do
     init!(base_dir)
     dir = identity_dir(base_dir)
     require_clean_main!(dir)
+    expected_prior = git_output!(dir, ["rev-parse", @live])
     path = edit_path(dir, archetype, target)
     previous = previous_target(path)
 
-    try do
-      apply_edit!(dir, path, target, content)
-      validate_edit!(dir, target, path)
-    rescue
-      error ->
-        restore_target!(path, previous)
-        reraise error, __STACKTRACE__
-    end
+    fingerprint =
+      try do
+        apply_edit!(dir, path, target, content)
+        validate_candidate_tree!(dir, expected_prior)
+      rescue
+        error ->
+          restore_target!(path, previous)
+          reraise error, __STACKTRACE__
+      end
 
     git!(dir, ["add", "-A"])
     git!(dir, ["commit", "-m", edit_message(archetype, target)], author)
-    publish_live!(dir)
+    candidate_result(dir, expected_prior, fingerprint)
   end
 
   @doc "Create a complete kungfu scaffold as one main commit and publish it."
-  @spec scaffold!(String.t(), String.t(), [{String.t(), binary()}], String.t()) ::
-          [String.t()]
+  @spec scaffold!(String.t(), String.t(), [{String.t(), binary()}], String.t()) :: map()
   def scaffold!(base_dir, name, entries, author) do
     manifest_relative = Path.join(["kungfu", name, "manifest.toml"])
     manifest = entries |> Map.new() |> Map.fetch!(manifest_relative)
@@ -340,6 +386,7 @@ defmodule Tightbeam.Identity do
     end
 
     require_clean_main!(dir)
+    expected_prior = git_output!(dir, ["rev-parse", @live])
 
     paths =
       Enum.map(entries, fn {relative, content} ->
@@ -349,18 +396,18 @@ defmodule Tightbeam.Identity do
         path
       end)
 
-    try do
-      validate_tree!(dir)
-    rescue
-      error ->
-        Enum.each(paths, &File.rm/1)
-        reraise error, __STACKTRACE__
-    end
+    fingerprint =
+      try do
+        validate_candidate_tree!(dir, expected_prior)
+      rescue
+        error ->
+          Enum.each(paths, &File.rm/1)
+          reraise error, __STACKTRACE__
+      end
 
     git!(dir, ["add", "-A", "--" | Enum.map(entries, &elem(&1, 0))])
     git!(dir, ["commit", "-m", "kungfu-scaffold: #{name}"], author)
-    _revision = publish_live!(dir)
-    paths
+    candidate_result(dir, expected_prior, fingerprint) |> Map.put(:paths, paths)
   end
 
   @doc "Learn one shipped kungfu bundle and publish it."
@@ -388,11 +435,13 @@ defmodule Tightbeam.Identity do
       :error ->
         refuse_seed_owned_bundle_paths!(name, bundle)
         require_clean_main!(dir)
+        expected_prior = git_output!(dir, ["rev-parse", @live])
+        upstream_prior = git_output!(dir, ["rev-parse", @upstream])
         learned = learned_bundle_names(dir)
         receipt = bundle_receipt(name, bundle)
         import_upstream!(dir, learned ++ [name], "learn: #{name}")
 
-        case merge_upstream(dir, "learn: #{name}", author, fn ->
+        case merge_upstream(dir, "learn: #{name}", author, expected_prior, upstream_prior, fn ->
                write_receipt!(dir, receipt)
              end) do
           {:ok, revision} -> {:ok, revision}
@@ -402,12 +451,13 @@ defmodule Tightbeam.Identity do
   end
 
   @doc "Remove one learned kungfu bundle by its committed receipt."
-  @spec unlearn!(String.t(), String.t(), String.t()) :: String.t()
+  @spec unlearn!(String.t(), String.t(), String.t()) :: map()
   def unlearn!(base_dir, name, author) do
     init!(base_dir)
     dir = identity_dir(base_dir)
     receipt = read_receipt!(dir, "main", name)
     require_clean_main!(dir)
+    expected_prior = git_output!(dir, ["rev-parse", @live])
 
     originals =
       receipt.paths
@@ -422,23 +472,24 @@ defmodule Tightbeam.Identity do
     receipt_bytes = File.read!(Path.join(dir, receipt_path))
     File.rm!(Path.join(dir, receipt_path))
 
-    try do
-      remove_empty_parent_dirs!(dir, [receipt_path | receipt.paths])
-      validate_tree!(dir)
-    rescue
-      error ->
-        Enum.each(Map.put(originals, receipt_path, receipt_bytes), fn {relative, bytes} ->
-          path = Path.join(dir, relative)
-          File.mkdir_p!(Path.dirname(path))
-          File.write!(path, bytes)
-        end)
+    fingerprint =
+      try do
+        remove_empty_parent_dirs!(dir, [receipt_path | receipt.paths])
+        validate_candidate_tree!(dir, expected_prior)
+      rescue
+        error ->
+          Enum.each(Map.put(originals, receipt_path, receipt_bytes), fn {relative, bytes} ->
+            path = Path.join(dir, relative)
+            File.mkdir_p!(Path.dirname(path))
+            File.write!(path, bytes)
+          end)
 
-        reraise error, __STACKTRACE__
-    end
+          reraise error, __STACKTRACE__
+      end
 
     git!(dir, ["add", "-A"])
     git!(dir, ["commit", "-m", "unlearn: #{name}"], author)
-    publish_live!(dir)
+    candidate_result(dir, expected_prior, fingerprint)
   end
 
   @doc "Bundle-owned archetype names recorded by a learned receipt."
@@ -529,11 +580,16 @@ defmodule Tightbeam.Identity do
     end
 
     require_clean_main!(dir)
+    expected_prior = git_output!(dir, ["rev-parse", @live])
+    upstream_prior = git_output!(dir, ["rev-parse", @upstream])
     learned = learned_bundle_names(dir)
     names = ["neutral-identity" | learned]
     message = "relearn: #{Enum.join(names, ", ")}"
     import_upstream!(dir, learned, message)
-    merge_upstream(dir, message, author, fn -> refresh_receipts!(dir, learned) end)
+
+    merge_upstream(dir, message, author, expected_prior, upstream_prior, fn ->
+      refresh_receipts!(dir, learned)
+    end)
   end
 
   @doc "Abort a conflicted re-learn without moving live."
@@ -546,7 +602,7 @@ defmodule Tightbeam.Identity do
   end
 
   @doc "Commit operator-resolved conflicts and publish live."
-  @spec resolve_relearn!(String.t(), String.t()) :: String.t()
+  @spec resolve_relearn!(String.t(), String.t()) :: map()
   def resolve_relearn!(base_dir, author) do
     dir = identity_dir(base_dir)
     require_conflict!(dir)
@@ -557,10 +613,12 @@ defmodule Tightbeam.Identity do
     end
 
     refresh_receipts_for_merge!(dir, merge_subject(dir))
+    expected_prior = git_output!(dir, ["rev-parse", @live])
+    fingerprint = validate_candidate_tree!(dir, expected_prior)
 
     git!(dir, ["add", "-A"])
     git!(dir, ["commit", "--no-edit"], author)
-    publish_live!(dir)
+    candidate_result(dir, expected_prior, fingerprint)
   end
 
   @doc "Report publication and conflict truth without mutation."
@@ -683,7 +741,7 @@ defmodule Tightbeam.Identity do
     end)
   end
 
-  defp merge_upstream(dir, message, author, before_commit) do
+  defp merge_upstream(dir, message, author, expected_prior, upstream_prior, before_commit) do
     case System.cmd(
            "git",
            ["merge", "--no-ff", "--no-commit", @upstream, "-m", message],
@@ -694,13 +752,24 @@ defmodule Tightbeam.Identity do
       {_output, 0} ->
         case run_pre_merge_hook(dir, author) do
           {_output, 0} ->
-            before_commit.()
+            fingerprint =
+              try do
+                before_commit.()
+                validate_candidate_tree!(dir, expected_prior)
+              rescue
+                error ->
+                  git!(dir, ["merge", "--abort"])
+                  git!(dir, ["update-ref", "refs/heads/#{@upstream}", upstream_prior])
+                  reraise error, __STACKTRACE__
+              end
+
             git!(dir, ["add", "-A"])
             git!(dir, ["commit", "-m", message], author)
-            {:ok, publish_live!(dir)}
+            {:ok, candidate_result(dir, expected_prior, fingerprint)}
 
           {output, _status} ->
             git!(dir, ["merge", "--abort"])
+            git!(dir, ["update-ref", "refs/heads/#{@upstream}", upstream_prior])
             {:error, String.trim(output)}
         end
 
@@ -874,7 +943,7 @@ defmodule Tightbeam.Identity do
         write_receipt!(dir, receipt)
         git!(dir, ["add", "-A", "--", receipt_path(receipt.name)])
         git!(dir, ["commit", "-m", "learn-receipt: agentic-engineering"], "tightbeam")
-        publish_live!(dir)
+        publish_live_unmarked!(dir)
       end
     end
   end
@@ -938,7 +1007,7 @@ defmodule Tightbeam.Identity do
     |> hd()
   end
 
-  defp revision_fragments!(dir, revision) do
+  defp revision_catalog!(dir, revision) do
     paths =
       git_output!(dir, [
         "ls-tree",
@@ -951,9 +1020,13 @@ defmodule Tightbeam.Identity do
       |> String.split("\n", trim: true)
       |> Enum.filter(&String.ends_with?(&1, ".md"))
 
-    Map.new(paths, fn path ->
-      {Path.basename(path), git_show!(dir, revision, path)}
-    end)
+    paths
+    |> Enum.map(&{&1, git_show_bytes!(dir, revision, &1)})
+    |> Renderer.catalog!()
+    |> Map.put_new("operating-manual.md", %{
+      path: "substrate:priv/guidance/operating-manual.md",
+      bytes: Archetypes.builtin_fragments()["operating-manual.md"]
+    })
   end
 
   defp maybe_exclude_materialized_skills(cwd, relative_skills) do
@@ -1045,19 +1118,45 @@ defmodule Tightbeam.Identity do
     end)
   end
 
-  defp validate_edit!(dir, :manifest, _path), do: validate_tree!(dir)
-  defp validate_edit!(dir, {:skill, _name, false}, _path), do: validate_tree!(dir)
-  defp validate_edit!(_dir, {:skill, _name, true}, _path), do: :ok
-  defp validate_edit!(_dir, :guidance, _path), do: :ok
+  defp validate_candidate_tree!(dir, expected_prior) do
+    fingerprint = tree_fingerprint!(dir)
+
+    try do
+      validate_tree!(dir)
+      fingerprint
+    rescue
+      error in Tightbeam.Identity.IncludeError ->
+        reraise Tightbeam.Identity.IncludeError.with_candidate(
+                  error,
+                  fingerprint,
+                  expected_prior
+                ),
+                __STACKTRACE__
+    end
+  end
 
   defp validate_tree!(dir) do
     refuse_reserved_substrate_skills!(dir)
 
-    fragments =
+    entries =
       dir
-      |> Path.join("guidance/*.md")
+      |> Path.join("guidance/**/*.md")
       |> Path.wildcard()
-      |> Map.new(&{Path.basename(&1), File.read!(&1)})
+      |> Enum.sort()
+      |> Enum.map(&{Path.relative_to(&1, dir), File.read!(&1)})
+
+    catalog =
+      entries
+      |> Renderer.catalog!()
+      |> Map.put_new("operating-manual.md", %{
+        path: "substrate:priv/guidance/operating-manual.md",
+        bytes: Archetypes.builtin_fragments()["operating-manual.md"]
+      })
+
+    Enum.each(@universal_roots, fn name ->
+      entry = required_catalog_entry!(catalog, name, "candidate-tree")
+      Renderer.render!(entry.bytes, entry.path, catalog, universal_root: name)
+    end)
 
     skills =
       dir
@@ -1072,7 +1171,7 @@ defmodule Tightbeam.Identity do
     |> Path.wildcard()
     |> Enum.each(fn path ->
       archetype = Archetypes.parse_manifest!(File.read!(path), Path.relative_to(path, dir))
-      _ = Archetypes.guidance(archetype, fragments)
+      _ = Archetypes.guidance_render(archetype, catalog)
       missing = Enum.reject(archetype.skills, &MapSet.member?(skills, &1))
 
       if missing != [] do
@@ -1080,6 +1179,40 @@ defmodule Tightbeam.Identity do
               "archetype #{archetype.name} elects unknown skills: #{Enum.join(missing, ", ")}"
       end
     end)
+  end
+
+  defp validate_revision_dir!(dir, revision) do
+    catalog = revision_catalog!(dir, revision)
+
+    Enum.each(@universal_roots, fn name ->
+      entry = required_catalog_entry!(catalog, name, revision)
+      Renderer.render!(entry.bytes, entry.path, catalog, universal_root: name)
+    end)
+
+    dir
+    |> git_output!(["ls-tree", "-r", "--name-only", revision, "--", "archetypes"])
+    |> String.split("\n", trim: true)
+    |> Enum.filter(&String.ends_with?(&1, ".toml"))
+    |> Enum.each(fn path ->
+      archetype = Archetypes.parse_manifest!(git_show!(dir, revision, path), path)
+      _ = Archetypes.guidance_render(archetype, catalog)
+
+      Enum.each(archetype.skills, fn skill ->
+        unless skill in Tightbeam.Homes.baseline_skill_names() or
+                 path_exists_at?(dir, revision, "skills/#{skill}/SKILL.md") do
+          raise ArgumentError, "archetype #{archetype.name} elects unknown skill: #{skill}"
+        end
+      end)
+    end)
+
+    Enum.each(Tightbeam.Homes.baseline_skill_names(), fn name ->
+      if path_exists_at?(dir, revision, "skills/#{name}/SKILL.md") do
+        raise ArgumentError,
+              "identity revision #{revision} contains reserved substrate skill #{name}"
+      end
+    end)
+
+    :ok
   end
 
   defp refuse_reserved_substrate_skills!(dir) do
@@ -1154,9 +1287,38 @@ defmodule Tightbeam.Identity do
     |> String.split("\n", trim: true)
   end
 
-  defp publish_live!(dir) do
+  @doc "Revalidate an exact candidate commit and advance live from its expected prior OID."
+  @spec publish_live!(String.t(), map()) :: {:ok, String.t()} | {:error, map()}
+  def publish_live!(base_dir, candidate) do
+    dir = identity_dir(base_dir)
+    revision = Map.fetch!(candidate, :candidate_revision)
+    expected = Map.fetch!(candidate, :expected_prior)
+    validate_revision_dir!(dir, revision)
+    actual = git_output!(dir, ["rev-parse", @live])
+
+    cond do
+      actual == revision ->
+        {:ok, revision}
+
+      actual != expected ->
+        {:error, %{code: "identity_publication_conflict", expected: expected, actual: actual}}
+
+      true ->
+        case System.cmd("git", ["merge-base", "--is-ancestor", expected, revision], cd: dir) do
+          {_output, 0} ->
+            git!(dir, ["update-ref", "refs/heads/#{@live}", revision, expected])
+            {:ok, revision}
+
+          _ ->
+            {:error, %{code: "identity_publication_non_fast_forward", expected: expected}}
+        end
+    end
+  end
+
+  defp publish_live_unmarked!(dir) do
     live = git_output!(dir, ["rev-parse", @live])
     main = git_output!(dir, ["rev-parse", "main"])
+    validate_revision_dir!(dir, main)
 
     case System.cmd("git", ["merge-base", "--is-ancestor", live, main], cd: dir) do
       {_output, 0} -> git!(dir, ["update-ref", "refs/heads/#{@live}", main, live])
@@ -1164,6 +1326,43 @@ defmodule Tightbeam.Identity do
     end
 
     main
+  end
+
+  defp candidate_result(dir, expected_prior, fingerprint) do
+    %{
+      candidate_revision: git_output!(dir, ["rev-parse", "main"]),
+      expected_prior: expected_prior,
+      tree_fingerprint: fingerprint
+    }
+  end
+
+  defp tree_fingerprint!(dir) do
+    dir
+    |> candidate_tree_entries("")
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Enum.reduce(:crypto.hash_init(:sha256), fn {path, bytes}, context ->
+      :crypto.hash_update(context, [path, <<0>>, bytes])
+    end)
+    |> :crypto.hash_final()
+    |> Base.encode16(case: :lower)
+  end
+
+  defp candidate_tree_entries(root, relative) do
+    root
+    |> Path.join(relative)
+    |> File.ls!()
+    |> Enum.reject(&(&1 == ".git" and relative == ""))
+    |> Enum.sort()
+    |> Enum.flat_map(fn entry ->
+      child_relative = if relative == "", do: entry, else: Path.join(relative, entry)
+      child = Path.join(root, child_relative)
+
+      if File.dir?(child) do
+        candidate_tree_entries(root, child_relative)
+      else
+        [{child_relative, File.read!(child)}]
+      end
+    end)
   end
 
   defp validate_name!(name) do
@@ -1213,4 +1412,6 @@ defmodule Tightbeam.Identity do
       {"GIT_COMMITTER_EMAIL", "#{local}@tightbeam.local"}
     ]
   end
+
+  defp sha256(bytes), do: :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
 end

@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "notice-batching-v1-019"
+  @shape "identity-universal-root-render-v1-019"
+  @identity_render_stamp_previous_shape "notice-batching-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
@@ -136,6 +137,22 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
+  end
+
+  test "the exact notice-batching predecessor gains nullable identity render stamps", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
+
+    assert {:ok, _rows} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               @identity_render_stamp_previous_shape
+             ])
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert "identityRenderContract" in table_columns(db, "sessions")
+    assert "identityGuidanceDigest" in table_columns(db, "sessions")
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
@@ -337,6 +354,8 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE decision_request_terminal_epoch;
       ALTER TABLE decision_requests DROP COLUMN ruledViaPrincipal;
       ALTER TABLE decision_requests DROP COLUMN ruledViaSessionState;
+      ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
+      ALTER TABLE sessions DROP COLUMN identityRenderContract;
       UPDATE schema_stamp SET shape = '#{@operator_decision_shape}', stampedAt = 1;
       """)
 
@@ -455,6 +474,8 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE decision_request_terminal_epoch;
       ALTER TABLE decision_requests DROP COLUMN ruledViaPrincipal;
       ALTER TABLE decision_requests DROP COLUMN ruledViaSessionState;
+      ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
+      ALTER TABLE sessions DROP COLUMN identityRenderContract;
       UPDATE schema_stamp SET shape = '#{@operator_decision_shape}', stampedAt = 1;
       """)
 
@@ -933,6 +954,8 @@ defmodule Tightbeam.SchemaShapeTest do
       CREATE UNIQUE INDEX messages_client_dedupe
         ON messages (sessionKey, deviceId, clientMessageId)
         WHERE clientMessageId IS NOT NULL AND deviceId IS NOT NULL;
+      ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
+      ALTER TABLE sessions DROP COLUMN identityRenderContract;
       UPDATE schema_stamp SET shape = '#{@model_identity_shape}', stampedAt = 1;
       """)
 
@@ -982,6 +1005,8 @@ defmodule Tightbeam.SchemaShapeTest do
         );
         CREATE INDEX wakes_due ON wakes (state, dueAt);
         CREATE INDEX wakes_condition ON wakes (state, conditionKind, conditionScope);
+        ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
+        ALTER TABLE sessions DROP COLUMN identityRenderContract;
         UPDATE schema_stamp SET shape = '#{@terminal_decision_shape}', stampedAt = 1;
         """)
     after

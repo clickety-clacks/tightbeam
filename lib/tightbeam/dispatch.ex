@@ -178,6 +178,13 @@ defmodule Tightbeam.Dispatch do
     do: RailRemedy.close(db, statute, subject, occurrence)
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
+    call =
+      if verb in ["identity-edit", "identity-relearn", "learn", "unlearn", "kungfu-scaffold"] do
+        Map.put_new(call, :invocation_id, "identity-" <> Tightbeam.Id.uuid4())
+      else
+        call
+      end
+
     case Map.fetch(handlers, verb) do
       :error ->
         error = %{code: "unknown_verb"}
