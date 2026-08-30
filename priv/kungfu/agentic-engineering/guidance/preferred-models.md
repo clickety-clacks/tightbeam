@@ -2,8 +2,11 @@
 
 Two parts: CAPSULES (the org's working set, the minds we actually use, characterized
 once each) and the SUBSTRATE'S OWN ACTIVITIES. Kungfu-owned activities live in each
-bundle's `kungfu/<name>/preferred-models.md`. The working set is deliberately small:
-a model not listed here is NOT IN USE, and adding one is an intake/release-ceremony act.
+bundle's `kungfu/<name>/preferred-models.md`. Derive a model selection only from the
+ordered activity table at `kungfu/agentic-engineering/preferred-models.md`; this
+guidance defines the working set and does not select a model. The working set is
+deliberately small: a model not listed here is NOT IN USE, and adding one is an
+intake/release-ceremony act.
 
 ## Working set (capsules)
 <!-- machine-read: mix tightbeam.catalog.diff parses each capsule id from the
@@ -33,31 +36,3 @@ activity tables use the parenthetical nickname + an effort bracket; expand to
 
 Effort brackets (claude-x[low..max], sol[low..xhigh]) tune depth within a capsule;
 `tightbeam list` shows the live legal forms.
-
-## How to read the activity tables
-
-ONE column of minds per activity, IN ORDER: use the first qualified candidate that
-the live catalog permits. A candidate is available only when its model and effort are
-selectable on an allowed host, its credential can run, and it has the capability the
-activity requires. If NONE is available, the work is BLOCKED. The end of the list IS
-the floor; nothing off-list may do the work. `any` = no floor: any available mind may
-do it.
-
-Decide at spawn AND again whenever a mind fails you mid-work. Try each candidate once:
-a refused spawn or a harness out of tokens advances you one place to the right, never
-back to the same candidate. If qualification is ambiguous, use the recorded model
-policy; do not guess. When no mind on the list is available, the list has produced a
-named capability block: record the attempted rungs and evidence on the affected
-assignment, keep separable work moving, and schedule a re-check. Do not report up
-merely because the list ended; Main is never a model fallback. A responsible owner
-surfaces a real credential need to the user only through the normal exception path.
-Never a silent stall, never a retry loop against a wall.
-
-## Substrate activities
-
-| Activity | Wants | Minds, in order (blocked if none) |
-|---|---|---|
-| General user conversation (default agent) | breadth, warmth, cheap to idle | sonnet[medium], opus[medium] |
-| Onboarding / discovery conversations | judgment about people, reframing | fable[high], opus[high], sol[low] |
-| Failure classification, log triage | fast pattern matching | luna[high], haiku, sonnet[low], any |
-| Guidance / law authoring | wisdom-grade writing | fable[high], opus[high], sol[xhigh] |

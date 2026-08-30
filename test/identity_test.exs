@@ -285,6 +285,90 @@ defmodule Tightbeam.IdentityTest do
     assert coder == Identity.snapshot_at!(base, revision, "coder", :codex).guidance
   end
 
+  test "guidance delegates model selection to the one engineering activity table", ctx do
+    shipped = Path.expand("priv/kungfu/agentic-engineering")
+    guidance_dir = Path.join(shipped, "guidance")
+    activity_table = File.read!(Path.join(shipped, "preferred-models.md"))
+
+    assert :crypto.hash(:sha256, activity_table) |> Base.encode16(case: :lower) ==
+             "20893a295d7166a3265062559544462884245b368cc73fe4cd1bff3b5a13c831"
+
+    refute File.exists?(Path.join(guidance_dir, "model-policy.md"))
+
+    assert File.read!(Path.join(guidance_dir, "preferred-models.md")) =~
+             "Derive a model selection only from the\nordered activity table at `kungfu/agentic-engineering/preferred-models.md`"
+
+    for path <- Path.wildcard(Path.join(guidance_dir, "*.md")) do
+      refute File.read!(path) =~ "| Task class |", "guidance selects models: #{path}"
+      refute File.read!(path) =~ "Minds, in order", "guidance selects models: #{path}"
+    end
+
+    for path <- Path.wildcard(Path.join(shipped, "archetypes/*.toml")) do
+      refute File.read!(path) =~ ~s(#include "model-policy.md"),
+             "archetype imports a competing policy: #{path}"
+    end
+
+    Application.put_env(:tightbeam, :identity_source_dir, shipped)
+    base = Path.join(ctx.root, "model-selection-source")
+    assert {:ok, revision} = learn!(base, "agentic-engineering", "operator")
+
+    for name <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
+      guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance
+      assert occurrence_count(guidance, activity_table) == 1
+      refute guidance =~ "# Model policy"
+      refute guidance =~ "| Task class |"
+    end
+
+    assert :noop = Identity.init!(base)
+    assert Identity.live_revision!(base) == revision
+  end
+
+  test "relearn and restart remove a legacy model-policy guidance copy", ctx do
+    shipped = Path.expand("priv/kungfu/agentic-engineering")
+    legacy = Path.join(ctx.root, "legacy-agentic-engineering")
+    File.cp_r!(shipped, legacy)
+
+    File.write!(Path.join(legacy, "guidance/model-policy.md"), """
+    # Model policy
+
+    | Task class | Model (effort) |
+    | --- | --- |
+    | Spec review | claude-fable-5 |
+    """)
+
+    for path <- Path.wildcard(Path.join(legacy, "archetypes/*.toml")) do
+      File.write!(
+        path,
+        String.replace(
+          File.read!(path),
+          ~s(#include "preferred-models.md"),
+          ~s(#include "preferred-models.md"\n\n#include "model-policy.md")
+        )
+      )
+    end
+
+    Application.put_env(:tightbeam, :identity_source_dir, legacy)
+    base = Path.join(ctx.root, "legacy-model-policy")
+    assert {:ok, _legacy_revision} = learn!(base, "agentic-engineering", "operator")
+    identity_dir = Path.join(base, "identity")
+    assert File.regular?(Path.join(identity_dir, "guidance/model-policy.md"))
+
+    Application.put_env(:tightbeam, :identity_source_dir, shipped)
+    assert {:ok, revision} = relearn!(base, "operator")
+
+    refute File.exists?(Path.join(identity_dir, "guidance/model-policy.md"))
+    refute git_path_exists?(identity_dir, revision, "guidance/model-policy.md")
+
+    for name <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
+      guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance
+      refute guidance =~ "# Model policy"
+      refute guidance =~ "| Task class |"
+    end
+
+    assert :noop = Identity.init!(base)
+    refute File.exists?(Path.join(identity_dir, "guidance/model-policy.md"))
+  end
+
   test "pinned snapshots compose manifests and activity tables from one revision", ctx do
     assert {:ok, revision_a} = learn!(ctx.base, "agentic-engineering", "operator")
     dir = Path.join(ctx.base, "identity")

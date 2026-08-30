@@ -19,7 +19,8 @@ A complete bundle ships:
 5. **`kungfu/<name>/preferred-models.md`** — the ACTIVITY table: each activity the
    bundle's roles perform -> what it demands -> capsule+effort from the org's working
    set -> ladder -> floor. Capsules themselves live in the substrate's
-   guidance/preferred-models.md; archetype preferences derive from these rows.
+   guidance/preferred-models.md. Keep every model selection and ring-down in this
+   activity table; archetype guidance may only point to it.
 6. **`kungfu/<name>/intake.md`** — the operational questions only the operator can
    answer, each naming where its answer lands (preferred-models rows, producer
    commands, workspace roots, stances). Learning the bundle = install + walking the
