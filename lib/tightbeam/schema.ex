@@ -78,9 +78,11 @@ defmodule Tightbeam.Schema do
   # its one exact predecessor, and historical rows remain null.
   # Terminal operator decisions advance v7 to v8. Nullable effective parent
   # then relaxes the stored parent constraint from that exact predecessor.
-  # Identity render stamps advance v9 to v10. The effort-request exit CHECK
-  # then advances that exact predecessor to v11.
-  @shape "coordination-fabric-v1-phase1-v11"
+  # Identity render stamps advance v9 to v10, and the effort-request exit CHECK
+  # advances v10 to v11. The session projection amendment then materializes
+  # mechanical status from its sole durable input and advances v11 to v12.
+  @shape "coordination-fabric-v1-phase1-v12"
+  @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
   @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
   @identity_render_stamp_previous_shape "coordination-fabric-v1-phase1-v9"
   @nullable_effective_parent_previous_shape "coordination-fabric-v1-phase1-v8"
@@ -1032,7 +1034,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @effort_request_exit_previous_shape,
-             @shape,
+             @session_mechanical_status_previous_shape,
              System.system_time(:millisecond)
            ])
 
@@ -1311,7 +1313,7 @@ defmodule Tightbeam.Schema do
              rows -> incompatible_cold_start!("orphan_identity_row", inspect(rows))
            end
 
-           case Tightbeam.ColdStart.classify_in_txn(txn) do
+           case Tightbeam.ColdStart.classify_legacy_in_txn(txn) do
              %{state: state} when state in ["open", "claimed"] -> :ok
              %{invariant: invariant} -> incompatible_cold_start!(invariant)
            end
@@ -1322,9 +1324,7 @@ defmodule Tightbeam.Schema do
       {:error, %ShapeError{} = error} ->
         raise error
 
-      {:error, error} ->
-        _ = error
-
+      {:error, _error} ->
         raise ShapeError,
           message:
             "incompatible_cold_start_v1: legacy_witness_missing; recovery: Recover an unusable fresh database"
@@ -1468,6 +1468,70 @@ defmodule Tightbeam.Schema do
          end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  @spec upgrade_session_mechanical_status_v1(DB.server()) :: :ok
+  def upgrade_session_mechanical_status_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@session_mechanical_status_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_session_mechanical_status_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE sessions ADD COLUMN mechanicalStatus TEXT NOT NULL " <>
+                 "DEFAULT 'idle' CHECK (mechanicalStatus IN ('idle','running'))"
+             )
+
+           Txn.q(
+             txn,
+             """
+             UPDATE sessions
+             SET mechanicalStatus = CASE WHEN EXISTS (
+                   SELECT 1 FROM turns
+                   WHERE turns.sessionKey = sessions.sessionKey
+                     AND turns.status IN ('queued','running')
+                 ) THEN 'running' ELSE 'idle' END,
+                 updatedAt = MAX(updatedAt + 1, ?1)
+             """,
+             [migration_time]
+           )
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @session_mechanical_status_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_session_mechanical_status_v1: stamp race"
+               )
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_session_mechanical_status_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -1706,30 +1770,38 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@session_mechanical_status_previous_shape]]} ->
+        upgrade_session_mechanical_status_v1(db)
+
       {:ok, [[@effort_request_exit_previous_shape]]} ->
-        upgrade_effort_request_exit_v1(db)
+        :ok = upgrade_effort_request_exit_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@identity_render_stamp_previous_shape]]} ->
         :ok = upgrade_identity_render_stamp_v1(db)
-        upgrade_effort_request_exit_v1(db)
+        :ok = upgrade_effort_request_exit_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@nullable_effective_parent_previous_shape]]} ->
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
-        upgrade_effort_request_exit_v1(db)
+        :ok = upgrade_effort_request_exit_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@terminal_decision_previous_shape]]} ->
         :ok = upgrade_terminal_operator_decision_v1(db)
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
-        upgrade_effort_request_exit_v1(db)
+        :ok = upgrade_effort_request_exit_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@message_type_previous_shape]]} ->
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
-        upgrade_effort_request_exit_v1(db)
+        :ok = upgrade_effort_request_exit_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
@@ -1737,7 +1809,8 @@ defmodule Tightbeam.Schema do
         :ok = upgrade_terminal_operator_decision_v1(db)
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
-        upgrade_effort_request_exit_v1(db)
+        :ok = upgrade_effort_request_exit_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
@@ -1746,7 +1819,8 @@ defmodule Tightbeam.Schema do
         :ok = upgrade_terminal_operator_decision_v1(db)
         :ok = upgrade_nullable_effective_parent_v1(db)
         :ok = upgrade_identity_render_stamp_v1(db)
-        upgrade_effort_request_exit_v1(db)
+        :ok = upgrade_effort_request_exit_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1766,8 +1840,9 @@ defmodule Tightbeam.Schema do
         are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
         #{@message_type_previous_shape}, #{@terminal_decision_previous_shape},
         #{@nullable_effective_parent_previous_shape},
-        #{@identity_render_stamp_previous_shape}, and
-        #{@effort_request_exit_previous_shape}.
+        #{@identity_render_stamp_previous_shape},
+        #{@effort_request_exit_previous_shape}, and
+        #{@session_mechanical_status_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
