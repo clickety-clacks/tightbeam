@@ -1704,6 +1704,19 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  @doc "EFFORT ONLY: the durable terminal request for an exact id, if present."
+  @spec effort_terminal_in_txn(Txn.t(), String.t()) :: map() | nil
+  def effort_terminal_in_txn(txn, request_id) do
+    case Txn.q(
+           txn,
+           "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'effort' AND id = ?1 AND status = 'ruled' AND decision IN ('continue', 'dismiss')",
+           [request_id]
+         ) do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
   defp request_in_txn(txn, id) do
     [row] = Txn.q(txn, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id])
     request_from_row(row)

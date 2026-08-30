@@ -40,7 +40,9 @@ defmodule Tightbeam.Schema do
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
   @shape "identity-universal-root-render-v1-019"
-  @identity_render_stamp_previous_shape "notice-batching-v1-019"
+  @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
+  @effort_request_exit_shape "effort-request-exit-v1-019"
+  @effort_request_exit_previous_shape "notice-batching-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
@@ -400,6 +402,13 @@ defmodule Tightbeam.Schema do
            dispositionKind IS NOT NULL AND dispositionId IS NOT NULL AND
            ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
              livenessTriggerId IS NOT NULL AND actionNeeded = 1)
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND
+             requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND
+             reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND
+             dispositionKind = 'decision_request_transition' AND
+             causalSourceId = dispositionId)
             OR
             (workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND
              livenessTriggerId IS NULL AND actionNeeded = 0)))
@@ -1073,6 +1082,104 @@ defmodule Tightbeam.Schema do
     raise ShapeError, message: "incompatible_supervision_liveness_v1: #{detail}"
   end
 
+  @doc false
+  @spec upgrade_effort_request_exit_v1(DB.server()) :: :ok
+  def upgrade_effort_request_exit_v1(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, &upgrade_effort_request_exit_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "incompatible_effort_request_exit_v1: migration failed: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp upgrade_effort_request_exit_v1_in_txn(%Txn{} = txn) do
+    case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+      [[@effort_request_exit_previous_shape]] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible_effort_request_exit_v1: predecessor stamp #{inspect(rows)}"
+    end
+
+    # The older terminal-decision chain predates the liveness activation. In
+    # that case there is no cancellation table to widen; ensure_all/1 creates
+    # the current table after the exact stamp chain completes.
+    if Txn.q(
+         txn,
+         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+       ) != [] do
+      for name <- [
+            "wakes_typed_cancellation_required",
+            "wake_cancellations_pending_insert"
+          ] do
+        :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{name}")
+      end
+
+      :ok =
+        Txn.exec(
+          txn,
+          "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_exit_v1"
+        )
+
+      table = Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
+      :ok = Txn.exec(txn, table.sql)
+
+      columns =
+        "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+          "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+          "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+          "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+      :ok =
+        Txn.exec(
+          txn,
+          "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_effort_exit_v1"
+        )
+
+      :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_effort_exit_v1")
+
+      for name <- [
+            "wake_cancellations_pending_insert",
+            "wakes_typed_cancellation_required"
+          ] do
+        object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+        :ok = Txn.exec(txn, object.sql)
+      end
+    end
+
+    Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+      @effort_request_exit_previous_shape,
+      @effort_request_exit_shape,
+      System.system_time(:millisecond)
+    ])
+
+    if Txn.changes(txn) != 1,
+      do: raise(ShapeError, message: "incompatible_effort_request_exit_v1: stamp race")
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible_effort_request_exit_v1: foreign key check #{inspect(rows)}"
+    end
+  end
+
   defp ensure_stamp_table(db) do
     DB.execute(db, """
     CREATE TABLE IF NOT EXISTS schema_stamp (
@@ -1090,18 +1197,25 @@ defmodule Tightbeam.Schema do
       {:ok, [[@identity_render_stamp_previous_shape]]} ->
         upgrade_identity_render_stamp_v1(db)
 
+      {:ok, [[@effort_request_exit_previous_shape]]} ->
+        :ok = upgrade_effort_request_exit_v1(db)
+        upgrade_identity_render_stamp_v1(db)
+
       {:ok, [[@terminal_decision_shape]]} ->
         :ok = migrate_notice_batching_v1_019(db)
+        :ok = upgrade_effort_request_exit_v1(db)
         upgrade_identity_render_stamp_v1(db)
 
       {:ok, [[@operator_decision_shape]]} ->
         :ok = migrate_operator_decision_v1(db)
         :ok = migrate_notice_batching_v1_019(db)
+        :ok = upgrade_effort_request_exit_v1(db)
         upgrade_identity_render_stamp_v1(db)
 
       {:ok, [[@model_identity_shape]]} ->
         :ok = migrate_model_identity_v1(db)
         :ok = migrate_notice_batching_v1_019(db)
+        :ok = upgrade_effort_request_exit_v1(db)
         upgrade_identity_render_stamp_v1(db)
 
       {:ok, []} ->
@@ -1120,7 +1234,8 @@ defmodule Tightbeam.Schema do
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_shape}, then #{@terminal_decision_shape} to
-        #{@identity_render_stamp_previous_shape}, then to #{@shape}.
+        #{@effort_request_exit_previous_shape}, then #{@effort_request_exit_shape},
+        then #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1396,7 +1511,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} failed and was rolled back: #{Exception.message(error)}"
+              "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
@@ -1440,7 +1555,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != wake_count do
       raise ShapeError,
         message:
-          "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} copied #{Txn.changes(txn)} of #{wake_count} wakes"
+          "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} copied #{Txn.changes(txn)} of #{wake_count} wakes"
     end
 
     [[^wake_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wakes_notice_batching_v1")
@@ -1460,7 +1575,7 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} classified legacy wakes: #{inspect(rows)}"
+            "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} classified legacy wakes: #{inspect(rows)}"
     end
 
     wake_bound_objects =
@@ -1520,7 +1635,7 @@ defmodule Tightbeam.Schema do
       if Txn.changes(txn) != cancellation_count do
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+            "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} copied #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
       end
 
       :ok =
@@ -1554,7 +1669,7 @@ defmodule Tightbeam.Schema do
       if Txn.changes(txn) != cancellation_count do
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} restored #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
+            "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} restored #{Txn.changes(txn)} of #{cancellation_count} wake cancellations"
       end
 
       :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_notice_batching_v1")
@@ -1569,14 +1684,14 @@ defmodule Tightbeam.Schema do
       rows ->
         raise ShapeError,
           message:
-            "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} left invalid foreign keys: #{inspect(rows)}"
+            "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} left invalid foreign keys: #{inspect(rows)}"
     end
 
     Txn.q(
       txn,
       "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
       [
-        @identity_render_stamp_previous_shape,
+        @effort_request_exit_previous_shape,
         System.system_time(:millisecond),
         @terminal_decision_shape
       ]
@@ -1585,7 +1700,7 @@ defmodule Tightbeam.Schema do
     if Txn.changes(txn) != 1 do
       raise ShapeError,
         message:
-          "migration #{@terminal_decision_shape} -> #{@identity_render_stamp_previous_shape} lost its exact stamp transition"
+          "migration #{@terminal_decision_shape} -> #{@effort_request_exit_previous_shape} lost its exact stamp transition"
     end
 
     :ok
