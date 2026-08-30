@@ -102,6 +102,13 @@ defmodule Tightbeam.WorkItemsTest do
              "priority"
            ]
 
+    assert {:ok, version_columns} = DB.query(db, "PRAGMA table_info(work_item_versions)")
+
+    assert Enum.map(version_columns, fn [_cid, name | _] -> name end) == [
+             "workItemId",
+             "rowVersion"
+           ]
+
     assert {:ok, assignment_priority_columns} =
              DB.query(db, "PRAGMA table_info(assignment_priorities)")
 
