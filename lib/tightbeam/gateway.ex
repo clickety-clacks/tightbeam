@@ -6429,11 +6429,19 @@ defmodule Tightbeam.Gateway do
             {:refused, :turn_in_progress}
 
           true ->
+            [[max_seq]] =
+              Txn.q(
+                txn,
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
+                [call.session_key]
+              )
+
             case Org.swap_model_in_txn(
                    txn,
                    call.session_key,
                    {fresh.model, fresh.harness},
-                   {model, harness, provider}
+                   {model, harness, provider},
+                   cleared_through: max_seq
                  ) do
               {:ok, _updated} ->
                 :ok
@@ -6449,15 +6457,6 @@ defmodule Tightbeam.Gateway do
                         "own serializing transaction — the fresh read above " <>
                         "did not describe the row this UPDATE just saw"
             end
-
-            [[max_seq]] =
-              Txn.q(
-                txn,
-                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE sessionKey = ?1",
-                [call.session_key]
-              )
-
-            Org.set_cleared_through_in_txn(txn, call.session_key, max_seq)
 
             # Probe seam (same idiom as `on_work_item_interlock`): lets a
             # test fail the transaction BETWEEN the two writes and prove the

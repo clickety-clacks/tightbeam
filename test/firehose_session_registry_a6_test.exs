@@ -1,7 +1,7 @@
 defmodule Tightbeam.Firehose.SessionRegistryA6Test do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, Model, Org, Schema, StateResources}
+  alias Tightbeam.{DB, Ledger, Model, Org, Projection, Schema, StateResources}
   alias Tightbeam.Firehose.Hub
 
   setup do
@@ -172,7 +172,50 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     assert idle == canonical_session(ctx.db, ctx.worker.session_key)
   end
 
-  test "v9 migration materializes status and advances only changed session versions" do
+  test "one compound harness-switch commit emits only its final canonical session", ctx do
+    for content <- ["before one", "before two"] do
+      {:appended, _message} =
+        Projection.append(ctx.db, %{
+          session_key: ctx.worker.session_key,
+          role: "user",
+          sender: "user:flynn",
+          content: content
+        })
+    end
+
+    before = Org.get(ctx.db, ctx.worker.session_key)
+
+    assert {:ok, {:ok, updated}} =
+             DB.transaction(ctx.db, fn txn ->
+               [[max_seq]] =
+                 Tightbeam.DB.Txn.q(
+                   txn,
+                   "SELECT MAX(seq) FROM messages WHERE sessionKey = ?1",
+                   [ctx.worker.session_key]
+                 )
+
+               Org.swap_model_in_txn(
+                 txn,
+                 ctx.worker.session_key,
+                 {before.model, before.harness},
+                 {Model.new("gpt-5.6-sol"), "codex", "openai"},
+                 cleared_through: max_seq
+               )
+             end)
+
+    notice = receive_notice()
+    assert notice["class"] == "session.updated"
+    assert notice["payload"] == StateResources.session(updated)
+    assert notice["payload"] == canonical_session(ctx.db, ctx.worker.session_key)
+    assert notice["payload"]["harness"] == "codex"
+    assert notice["payload"]["clearedThroughSeq"] == 2
+    assert notice["payload"]["rowVersion"] > before.updated_at
+
+    sync_hub()
+    refute_receive {:firehose_notice, _notice}, 50
+  end
+
+  test "v9 migration materializes status and advances every changed public item version" do
     db = :firehose_session_registry_a6_migration_db
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -193,7 +236,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
 
     assert {:ok,
             [
-              ["idle-session", "idle", 10],
+              ["idle-session", "idle", idle_version],
               ["running-session", "running", running_version]
             ]} =
              DB.query(
@@ -201,6 +244,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
                "SELECT sessionKey,mechanicalStatus,updatedAt FROM sessions ORDER BY sessionKey"
              )
 
+    assert idle_version > 10
     assert running_version > 20
 
     assert {:ok, [["coordination-fabric-v1-phase1-v10"]]} =

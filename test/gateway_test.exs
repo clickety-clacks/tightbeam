@@ -3765,6 +3765,18 @@ defmodule Tightbeam.GatewayTest do
       model: Model.new("before-model")
     })
 
+    for content <- ["before one", "before two"] do
+      Projection.append(ctx.db, %{
+        session_key: "dup",
+        role: "user",
+        sender: "user:flynn",
+        content: content
+      })
+    end
+
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
+
     start_lane!(ctx.db, "dup")
     parent = self()
 
@@ -3807,7 +3819,9 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.count(results, &match?(%{ok: true}, &1)) == 1
     assert Enum.count(results, &match?(%{ok: false, code: "same_harness"}, &1)) == 1
 
-    assert Org.get(ctx.db, "dup").harness == "fixture"
+    updated = Org.get(ctx.db, "dup")
+    assert updated.harness == "fixture"
+    assert updated.cleared_through_seq == 2
 
     tombstones =
       ctx.db
@@ -3816,6 +3830,11 @@ defmodule Tightbeam.GatewayTest do
 
     assert length(tombstones) == 1,
            "exactly one tombstone for exactly one swap, got #{inspect(tombstones)}"
+
+    observed = observed_state_classes()
+
+    assert observed == ["session.updated"],
+           "the one harness-switch commit must expose only its final session projection, got #{inspect(observed)}"
   end
 
   describe "the substrate never elects a model (F2, Sol xhigh review)" do

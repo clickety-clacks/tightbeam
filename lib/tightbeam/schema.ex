@@ -1351,13 +1351,12 @@ defmodule Tightbeam.Schema do
              txn,
              """
              UPDATE sessions
-             SET mechanicalStatus = 'running',
+             SET mechanicalStatus = CASE WHEN EXISTS (
+                   SELECT 1 FROM turns
+                   WHERE turns.sessionKey = sessions.sessionKey
+                     AND turns.status IN ('queued','running')
+                 ) THEN 'running' ELSE 'idle' END,
                  updatedAt = MAX(updatedAt + 1, ?1)
-             WHERE EXISTS (
-               SELECT 1 FROM turns
-               WHERE turns.sessionKey = sessions.sessionKey
-                 AND turns.status IN ('queued','running')
-             )
              """,
              [migration_time]
            )

@@ -785,9 +785,35 @@ defmodule Tightbeam.Org do
         {expected_model, expected_harness},
         {%Model{} = model, harness, provider}
       ) do
-    current = must_get(txn, session_key)
+    swap_model_in_txn(
+      txn,
+      session_key,
+      {expected_model, expected_harness},
+      {model, harness, provider},
+      []
+    )
+  end
 
-    if current.model == model and current.harness == harness do
+  @doc "Serialized model/harness change with optional same-commit session fields."
+  @spec swap_model_in_txn(
+          Txn.t(),
+          String.t(),
+          {Model.t() | nil, String.t()},
+          {Model.t(), String.t(), String.t()},
+          keyword()
+        ) :: {:ok, session()} | {:duplicate, session()} | :stale
+  def swap_model_in_txn(
+        %Txn{} = txn,
+        session_key,
+        {expected_model, expected_harness},
+        {%Model{} = model, harness, provider},
+        opts
+      ) do
+    current = must_get(txn, session_key)
+    cleared_through = Keyword.get(opts, :cleared_through, current.cleared_through_seq)
+
+    if current.model == model and current.harness == harness and
+         current.cleared_through_seq == cleared_through do
       {:duplicate, current}
     else
       expected = expected_model || %Model{family: nil}
@@ -797,7 +823,7 @@ defmodule Tightbeam.Org do
           txn,
           """
           UPDATE sessions SET model=?4, thinkingLevel=?7, modelContext=?8, harness=?5,
-            provider=?6
+            provider=?6, clearedThroughSeq=?11
           WHERE sessionKey=?1 AND model IS ?2 AND thinkingLevel IS ?9
             AND modelContext IS ?10 AND harness=?3
           """,
@@ -811,7 +837,8 @@ defmodule Tightbeam.Org do
             model.effort,
             model.context,
             expected.effort,
-            expected.context
+            expected.context,
+            cleared_through
           ]
         )
 
@@ -894,12 +921,6 @@ defmodule Tightbeam.Org do
   @spec set_cleared_through(db(), String.t(), integer()) :: session()
   def set_cleared_through(db \\ Tightbeam.DB, session_key, seq) do
     update(db, session_key, "clearedThroughSeq = ?2", [seq])
-  end
-
-  @doc false
-  @spec set_cleared_through_in_txn(Txn.t(), String.t(), integer()) :: session()
-  def set_cleared_through_in_txn(%Txn{} = txn, session_key, seq) do
-    update_in_txn(txn, session_key, "clearedThroughSeq = ?2", [seq])
   end
 
   @doc false
