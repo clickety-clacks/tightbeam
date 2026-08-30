@@ -7,8 +7,9 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
   @moduledoc """
   Firehose acceptance map: A5 slow-consumer 4008/reconnect/rebuild is automated
-  here. A5 remains partial for gateway-kill recovery until Card 4 promotes the
-  existing restart smoke into ExUnit.
+  here. `Tightbeam.FirehoseRestartSmokeTest` keeps that Card 1 journey in the
+  normal suite and adds automated A5 gateway-kill recovery and A7 external-client
+  restart proof on Linux and macOS CI.
   """
 
   test "external subscribe, query rebuild, live apply, and forced reconnect converge" do
