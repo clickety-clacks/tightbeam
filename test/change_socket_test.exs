@@ -212,7 +212,12 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
            end)
 
     assert Enum.all?(Registry.observational_classes(), &match?(:error, Registry.fetch(&1)))
-    assert Enum.sort(Map.keys(rows) ++ Registry.observational_classes()) == Registry.classes()
+
+    assert Enum.sort(
+             Map.keys(rows) ++
+               Map.keys(Registry.invalidation_rows()) ++ Registry.observational_classes()
+           ) == Registry.classes()
+
     assert Map.keys(handlers) |> Enum.sort() == Map.keys(handler_effects) |> Enum.sort()
     assert_registry_match!(handler_effects, rows)
 

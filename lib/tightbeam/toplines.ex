@@ -14,6 +14,13 @@ defmodule Tightbeam.Toplines do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
+
+  @firehose_sources %{
+    "topline_created" => "topline.created",
+    "work_linked" => "topline_work_membership.linked",
+    "work_unlinked" => "topline_work_membership.unlinked"
+  }
 
   @white_space [
     0x0009,
@@ -133,6 +140,10 @@ defmodule Tightbeam.Toplines do
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
   @doc false
+  @spec firehose_sources() :: %{String.t() => String.t()}
+  def firehose_sources, do: @firehose_sources
+
+  @doc false
   def __handle__(db, "topline-create", call), do: create(db, call)
   def __handle__(db, "topline-link-work", call), do: link_work(db, call)
   def __handle__(db, "topline-unlink-work", call), do: unlink_work(db, call)
@@ -181,9 +192,17 @@ defmodule Tightbeam.Toplines do
                 [topline_id, caller.user, title, caller.actor_kind, caller.actor_ref, now]
               )
 
-              append_event(txn, topline_id, "topline_created", nil, caller, nil, now, %{
-                title: title
-              })
+              append_event(
+                txn,
+                firehose_hub(call),
+                topline_id,
+                "topline_created",
+                nil,
+                caller,
+                nil,
+                now,
+                %{title: title}
+              )
 
               response = %{topline: summary_in_txn(txn, topline_id)}
               remember(txn, caller.user, operation, key, fingerprint, response)
@@ -265,6 +284,7 @@ defmodule Tightbeam.Toplines do
 
                   append_event(
                     txn,
+                    firehose_hub(call),
                     topline_id,
                     "work_linked",
                     membership_id,
@@ -334,6 +354,7 @@ defmodule Tightbeam.Toplines do
 
                 append_event(
                   txn,
+                  firehose_hub(call),
                   membership.topline_id,
                   "work_unlinked",
                   membership_id,
@@ -543,7 +564,17 @@ defmodule Tightbeam.Toplines do
     }
   end
 
-  defp append_event(txn, topline_id, kind, membership_id, caller, reason, at, detail) do
+  defp append_event(
+         txn,
+         hub,
+         topline_id,
+         kind,
+         membership_id,
+         caller,
+         reason,
+         at,
+         detail
+       ) do
     [[seq]] =
       Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) + 1 FROM topline_events WHERE toplineId = ?1", [
         topline_id
@@ -567,6 +598,28 @@ defmodule Tightbeam.Toplines do
         at,
         canonical_json(detail)
       ]
+    )
+
+    refs =
+      case kind do
+        "topline_created" ->
+          %{"toplineId" => topline_id}
+
+        kind when kind in ["work_linked", "work_unlinked"] ->
+          %{
+            "toplineId" => topline_id,
+            "membershipId" => membership_id,
+            "workItemId" => Map.fetch!(detail, :workItemId)
+          }
+      end
+
+    Publisher.source_invalidation_in_txn(
+      txn,
+      hub,
+      Map.fetch!(@firehose_sources, kind),
+      seq,
+      at,
+      refs
     )
   end
 
@@ -935,6 +988,7 @@ defmodule Tightbeam.Toplines do
 
   defp mutation_time(_call), do: System.system_time(:millisecond)
   defp id(prefix), do: prefix <> Tightbeam.Id.uuid4()
+  defp firehose_hub(call), do: Map.get(call, :firehose_hub, Tightbeam.Firehose.Hub)
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do

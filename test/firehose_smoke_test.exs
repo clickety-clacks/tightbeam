@@ -6,10 +6,13 @@ defmodule Tightbeam.FirehoseSmokeTest do
   alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
 
   @moduledoc """
-  Firehose acceptance map: A5 slow-consumer 4008/reconnect/rebuild is automated
-  here. `Tightbeam.FirehoseRestartSmokeTest` keeps that Card 1 journey in the
-  normal suite and adds automated A5 gateway-kill recovery and A7 external-client
-  restart proof on Linux and macOS CI.
+  Firehose acceptance map: A1 and A3 are automated by the closed inventories,
+  real source commits, filter matrix, and visibility-first probes in
+  `Tightbeam.Firehose.RegistryProofTest`, with this real WebSocket journey as
+  the representative public-boundary witness. A5 slow-consumer
+  4008/reconnect/rebuild is automated here. `Tightbeam.FirehoseRestartSmokeTest`
+  keeps that Card 1 journey in the normal suite and adds automated A5 gateway-kill
+  recovery and A7 external-client restart proof on Linux and macOS CI.
   """
 
   test "external subscribe, query rebuild, live apply, and forced reconnect converge" do
