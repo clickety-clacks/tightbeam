@@ -766,7 +766,9 @@ defmodule Tightbeam.PlacementTest do
     expected_digest =
       Rails.hook_settings()
       |> Tightbeam.Harness.CursorRails.compile(
-        path: Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+        path:
+          Tightbeam.Harness.Cursor.helper_path_dir() <>
+            ":" <> Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
       )
       |> JSON.encode!()
       |> then(&:crypto.hash(:sha256, &1))
@@ -806,51 +808,8 @@ defmodule Tightbeam.PlacementTest do
              Base.encode16(:crypto.hash(:sha256, "tampered-after-projection"), case: :lower)
   end
 
-  test "Cursor launch projects a group-readable GitHub CLI config and points GH_CONFIG_DIR at it",
-       %{base_dir: base_dir, db: db} do
-    try do
-      github_projection_case(base_dir, db)
-    catch
-      # Unprivileged test user with no secondary group: the positive path
-      # cannot be modelled; the negative test below still runs.
-      :skip_no_secondary_group -> :ok
-    end
-  end
-
-  defp github_projection_case(base_dir, db) do
-    # The banked dir is kept 0700 by `tightbeam onboard github`; the dedicated
-    # execution identity cannot traverse it, so Cursor reads a 0640 projection
-    # under its config dir instead. Other harnesses keep the banked dir.
-    execution_home = Path.join(base_dir, "cursor-execution-test-home")
-    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
-    banked = Tightbeam.GithubAuth.config_dir(base_dir)
-    File.mkdir_p!(banked)
-
-    # The projection is only written when the execution home and projection
-    # root share a provisioned group distinct from the gateway's primary group.
-    # Model that with any secondary group the test user holds; without one the
-    # positive path cannot be exercised unprivileged.
-    {primary, 0} = System.cmd("id", ["-g"])
-    {all, 0} = System.cmd("id", ["-G"])
-    primary = primary |> String.trim() |> String.to_integer()
-
-    secondary =
-      all |> String.split() |> Enum.map(&String.to_integer/1) |> Enum.find(&(&1 != primary))
-
-    if is_nil(secondary), do: throw(:skip_no_secondary_group)
-
-    File.mkdir_p!(execution_home)
-    :ok = :file.change_group(execution_home, secondary)
-    File.mkdir_p!(home)
-    :ok = :file.change_group(home, secondary)
-    File.chmod!(Path.join(base_dir, "auth"), 0o700)
-    File.chmod!(Path.join([base_dir, "auth", "github"]), 0o700)
-    File.chmod!(banked, 0o700)
-    File.write!(Path.join(banked, "hosts.yml"), "github.com:\n  oauth_token: fixture\n")
-    File.write!(Path.join(banked, "config.yml"), "git_protocol: https\n")
-    File.chmod!(Path.join(banked, "hosts.yml"), 0o600)
-
-    config = %{
+  defp cursor_config(base_dir, db, execution_home) do
+    %{
       base_dir: base_dir,
       db: db,
       cwd: "/work",
@@ -868,49 +827,103 @@ defmodule Tightbeam.PlacementTest do
         verify_adapter_shim: fn _shim, _launcher -> :ok end
       }
     }
+  end
+
+  test "Cursor launch keeps GH_CONFIG_DIR on the canonical bank and carries the root-owned helper dir first",
+       %{base_dir: base_dir, db: db} do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+    banked = Tightbeam.GithubAuth.config_dir(base_dir)
+    File.mkdir_p!(banked)
+    File.write!(Path.join(banked, "hosts.yml"), "github.com:\n  oauth_token: fixture\n")
+    File.chmod!(Path.join(base_dir, "auth"), 0o700)
+    File.chmod!(Path.join([base_dir, "auth", "github"]), 0o700)
+    File.chmod!(banked, 0o700)
 
     cursor_auth = Path.join([base_dir, "auth", "cursor"])
     File.mkdir_p!(cursor_auth)
     File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
 
-    opts = Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+    opts =
+      Placement.adapter_opts!(
+        cursor_config(base_dir, db, execution_home),
+        {:cursor, "shared", "testhost"}
+      )
 
-    projected = Tightbeam.Harness.Cursor.github_config_dir(home)
-    assert projected == Path.join(home, "gh")
-    assert {"GH_CONFIG_DIR", projected} in opts[:env]
-    refute {"GH_CONFIG_DIR", banked} in opts[:env]
+    # Path-only credential rule: no copy of the GitHub config anywhere in the projection.
+    assert {"GH_CONFIG_DIR", banked} in opts[:env]
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
+    refute File.exists?(Path.join(home, "gh"))
 
-    assert Bitwise.band(File.stat!(projected).mode, 0o7777) == 0o2750
-
-    for name <- ["hosts.yml", "config.yml"] do
-      file = Path.join(projected, name)
-      assert File.read!(file) == File.read!(Path.join(banked, name))
-      assert Bitwise.band(File.stat!(file).mode, 0o777) == 0o640
-      assert File.stat!(file).gid == secondary
-    end
-
-    assert File.stat!(projected).gid == secondary
-
-    # The banked dir itself is left exactly as onboarding keeps it.
+    # Unprovisioned test host (no tightbeam-workspace on the execution home): the
+    # bank is left exactly as onboarding keeps it.
     assert Bitwise.band(File.stat!(banked).mode, 0o777) == 0o700
+    assert Bitwise.band(File.stat!(Path.join(base_dir, "auth")).mode, 0o777) == 0o700
 
-    # The wrapped rails carry the harness PATH so `tightbeam` and `gh` resolve
-    # under the launcher's fixed PATH.
+    # The wrapped rails resolve `tightbeam` from the root-owned helper dir before
+    # anything under the operator's base, then the harness PATH for `gh`.
     hooks = JSON.decode!(File.read!(Path.join(execution_home, ".cursor/hooks.json")))
-    expected_path = Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+
+    expected_path =
+      Tightbeam.Harness.Cursor.helper_path_dir() <>
+        ":" <> Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
 
     for %{"command" => command} <- hooks["hooks"]["beforeShellExecution"] do
       assert String.starts_with?(command, "PATH='#{expected_path}':\"$PATH\"; export PATH; ")
     end
+  end
 
-    # Other harnesses keep the banked dir.
-    codex_opts =
-      Placement.adapter_opts!(
-        Map.delete(config, :cursor_execution_home),
-        {:codex, "shared", "testhost"}
-      )
+  test "Cursor projection never harvests the home-side cli-config back into the bank",
+       %{base_dir: base_dir, db: db} do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+    File.write!(Path.join(cursor_auth, "cli-config.json"), ~s({"version":1,"trusted":false}))
 
-    assert {"GH_CONFIG_DIR", banked} in codex_opts[:env]
+    config = cursor_config(base_dir, db, execution_home)
+    Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+
+    # An execution-controlled replacement of the projected copy (the projection
+    # root is group-writable by uid 503) must never reach the operator store.
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
+    projected = Path.join(home, "cli-config.json")
+    File.rm!(projected)
+    File.write!(projected, ~s({"version":1,"trusted":true,"planted":true}))
+
+    Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+
+    assert File.read!(Path.join(cursor_auth, "cli-config.json")) ==
+             ~s({"version":1,"trusted":false})
+
+    # ...and the projection is re-materialized from the bank, not the planted file.
+    assert File.read!(projected) == ~s({"version":1,"trusted":false})
+  end
+
+  test "Cursor cli-config projection does not write through a planted symlink",
+       %{base_dir: base_dir, db: db} do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+    File.write!(Path.join(cursor_auth, "cli-config.json"), ~s({"version":1}))
+
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
+    File.mkdir_p!(home)
+    external = Path.join(base_dir, "external-target")
+    File.write!(external, "untouched")
+    File.ln_s!(external, Path.join(home, "cli-config.json"))
+
+    Placement.adapter_opts!(
+      cursor_config(base_dir, db, execution_home),
+      {:cursor, "shared", "testhost"}
+    )
+
+    assert File.read!(external) == "untouched"
+    assert {:ok, %File.Stat{type: :regular}} = File.lstat(Path.join(home, "cli-config.json"))
+    assert File.read!(Path.join(home, "cli-config.json")) == ~s({"version":1})
   end
 
   test "Cursor home delivery with a gateway-shaped config (no :cli_bin) derives the helper PATH",
@@ -942,7 +955,10 @@ defmodule Tightbeam.PlacementTest do
     home = Placement.deliver_home(config, {:cursor, "shared", "testhost"})
 
     hooks = JSON.decode!(File.read!(Path.join(execution_home, ".cursor/hooks.json")))
-    expected_path = Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+
+    expected_path =
+      Tightbeam.Harness.Cursor.helper_path_dir() <>
+        ":" <> Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
 
     assert hooks["version"] == 1
 
@@ -952,47 +968,6 @@ defmodule Tightbeam.PlacementTest do
 
     assert File.read!(Path.join(home, ".cursor/hooks.json")) ==
              File.read!(Path.join(execution_home, ".cursor/hooks.json"))
-  end
-
-  test "Cursor launch never writes the GitHub token copy on an unprovisioned host",
-       %{base_dir: base_dir, db: db} do
-    execution_home = Path.join(base_dir, "cursor-execution-test-home")
-    File.mkdir_p!(execution_home)
-    banked = Tightbeam.GithubAuth.config_dir(base_dir)
-    File.mkdir_p!(banked)
-    File.write!(Path.join(banked, "hosts.yml"), "github.com:\n  oauth_token: fixture\n")
-
-    config = %{
-      base_dir: base_dir,
-      db: db,
-      cwd: "/work",
-      cli_bin: Path.join(base_dir, "bin"),
-      cursor_execution_home: execution_home,
-      credential_kind: :api_key,
-      harness_target_overrides: %{
-        find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
-        realpath: fn path -> {:ok, path} end,
-        sha256: fn path ->
-          if Path.basename(path) == "index.js",
-            do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
-            else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
-        end,
-        verify_adapter_shim: fn _shim, _launcher -> :ok end
-      }
-    }
-
-    cursor_auth = Path.join([base_dir, "auth", "cursor"])
-    File.mkdir_p!(cursor_auth)
-    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
-
-    # Execution home is in the gateway's primary group here => unprovisioned.
-    opts = Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
-
-    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
-    projected = Tightbeam.Harness.Cursor.github_config_dir(home)
-    refute File.exists?(projected)
-    # GH_CONFIG_DIR still points at the (absent) projection: probes as needs_onboarding.
-    assert {"GH_CONFIG_DIR", projected} in opts[:env]
   end
 
   test "remote Cursor adapter_opts refuses local-only before credential kind read", %{

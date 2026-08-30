@@ -17,8 +17,39 @@ pub fn running_as_launcher() -> bool {
     fs::canonicalize(LAUNCHER).is_ok_and(|launcher| actual == launcher)
 }
 
+/// Root-owned directory carrying a `tightbeam` symlink to the launcher, so the
+/// dedicated identity resolves the rail helper without traversing the operator's
+/// home. The projected rails put it first on PATH.
+pub const HELPER_PATH_DIR: &str = "/usr/local/libexec/tightbeam-cursor-path";
+
+/// Read-only rail guards the projected hooks invoke as `tightbeam <guard>`.
+const UNPRIVILEGED_GUARDS: [&str; 2] = ["github-auth-check", "tool-call-observed"];
+
+/// What the launcher binary agrees to run. `cursor-exec` always (that is the
+/// sudoers grant). The rail guards only when invoked WITHOUT a privilege change
+/// — real uid == effective uid and no `SUDO_UID` — i.e. by the execution
+/// identity itself from inside a Cursor session, never through the sudoers
+/// wildcard by another workspace member.
 pub fn launcher_command_allowed(args: &[String]) -> bool {
-    args.first().is_some_and(|arg| arg == "cursor-exec")
+    launcher_command_allowed_with(args, invoked_unprivileged())
+}
+
+fn launcher_command_allowed_with(args: &[String], unprivileged: bool) -> bool {
+    match args.first().map(String::as_str) {
+        Some("cursor-exec") => true,
+        Some(guard) if UNPRIVILEGED_GUARDS.contains(&guard) => unprivileged,
+        _ => false,
+    }
+}
+
+/// True only when this process was NOT entered through sudo: sudo always
+/// exports SUDO_UID into the target environment (the caller cannot strip it),
+/// and the launcher scrubs it from the Cursor session it execs, so its presence
+/// is exactly "a workspace member is using the sudoers wildcard right now".
+fn invoked_unprivileged() -> bool {
+    std::env::var_os("SUDO_UID").is_none()
+        && unsafe { libc::getuid() } == unsafe { libc::geteuid() }
+        && unsafe { libc::getgid() } == unsafe { libc::getegid() }
 }
 
 pub fn require_onboard_prerequisite(machine: &str) -> Result<(), String> {
@@ -33,6 +64,7 @@ pub fn require_onboard_prerequisite(machine: &str) -> Result<(), String> {
         let execution_base = account.home.join(".tightbeam");
         verify_dedicated_cursor_install(&account)?;
         verify_launcher_install(Path::new(LAUNCHER))?;
+        verify_helper_path_install(Path::new(HELPER_PATH_DIR))?;
         verify_account_policy()?;
         let output = Command::new("/usr/bin/sudo")
             .args([
@@ -110,6 +142,48 @@ fn verify_launcher_install(path: &Path) -> Result<(), String> {
     {
         return Err(format!(
             "Cursor execution launcher at {LAUNCHER} must be a root-owned, non-symlink file that is not group/world writable"
+        ));
+    }
+    Ok(())
+}
+
+/// The helper-path dir must be root-owned and not group/world-writable, and its
+/// `tightbeam` entry must be a symlink to the launcher (canonicalize equality).
+fn verify_helper_path_install(dir: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(dir).map_err(|error| {
+        format!(
+            "Cursor helper path dir is not installed at {}: {error}",
+            dir.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(format!(
+            "Cursor helper path dir {} must be a root-owned directory that is not group/world writable",
+            dir.display()
+        ));
+    }
+    let helper = dir.join("tightbeam");
+    let link = fs::symlink_metadata(&helper).map_err(|error| {
+        format!(
+            "Cursor helper symlink is not installed at {}: {error}",
+            helper.display()
+        )
+    })?;
+    if !link.file_type().is_symlink() || link.uid() != 0 {
+        return Err(format!(
+            "{} must be a root-owned symlink to {LAUNCHER}",
+            helper.display()
+        ));
+    }
+    let resolved = fs::canonicalize(&helper)
+        .map_err(|error| format!("could not resolve {}: {error}", helper.display()))?;
+    let launcher = fs::canonicalize(LAUNCHER)
+        .map_err(|error| format!("could not resolve {LAUNCHER}: {error}"))?;
+    if resolved != launcher {
+        return Err(format!(
+            "{} resolves to {} rather than {LAUNCHER}",
+            helper.display(),
+            resolved.display()
         ));
     }
     Ok(())
@@ -197,6 +271,8 @@ fn admin_instructions_for(
              test ! -e {operator_home}/.pi || sudo chmod 0700 {operator_home}/.pi\n\
              sudo mkdir -p /usr/local/libexec\n\
              sudo install -o root -g wheel -m 0755 {executable} {LAUNCHER}\n\
+             sudo install -d -o root -g wheel -m 0755 {HELPER_PATH_DIR}\n\
+             sudo ln -sfn {LAUNCHER} {HELPER_PATH_DIR}/tightbeam\n\
              printf 'Defaults!{LAUNCHER} env_keep += \"CURSOR_API_KEY AGENT_CLI_CREDENTIAL_STORE CURSOR_CONFIG_DIR TIGHTBEAM_HOME TIGHTBEAM_MACHINE TIGHTBEAM_LINEAGE GH_CONFIG_DIR\"\\n%tightbeam-workspace ALL=({ACCOUNT}) NOPASSWD: {LAUNCHER} *\\n' | sudo tee /etc/sudoers.d/tightbeam-cursor >/dev/null\n\
              sudo chmod 0440 /etc/sudoers.d/tightbeam-cursor\n\
              sudo visudo -cf /etc/sudoers.d/tightbeam-cursor",
@@ -238,6 +314,8 @@ fn admin_instructions_for(
              test ! -e {operator_home}/.pi || sudo chmod 0700 {operator_home}/.pi\n\
              sudo mkdir -p /usr/local/libexec\n\
              sudo install -o root -g root -m 0755 {executable} {LAUNCHER}\n\
+             sudo install -d -o root -g root -m 0755 {HELPER_PATH_DIR}\n\
+             sudo ln -sfn {LAUNCHER} {HELPER_PATH_DIR}/tightbeam\n\
              printf 'Defaults!{LAUNCHER} env_keep += \"CURSOR_API_KEY AGENT_CLI_CREDENTIAL_STORE CURSOR_CONFIG_DIR TIGHTBEAM_HOME TIGHTBEAM_MACHINE TIGHTBEAM_LINEAGE GH_CONFIG_DIR\"\\n%tightbeam-workspace ALL=({ACCOUNT}) NOPASSWD: {LAUNCHER} *\\n' | sudo tee /etc/sudoers.d/tightbeam-cursor >/dev/null\n\
              sudo chmod 0440 /etc/sudoers.d/tightbeam-cursor\n\
              sudo visudo -cf /etc/sudoers.d/tightbeam-cursor",
@@ -646,6 +724,10 @@ mod tests {
             assert!(instructions.contains("/homes/test-machine/cursor/acp-sessions"));
             assert!(instructions.contains("chmod 2770 /srv/tightbeam/homes/test-machine/cursor "));
             assert!(instructions.contains("chown -R root:tightbeam-workspace"));
+            assert!(instructions.contains(HELPER_PATH_DIR));
+            assert!(
+                instructions.contains(&format!("ln -sfn {LAUNCHER} {HELPER_PATH_DIR}/tightbeam"))
+            );
             assert!(!instructions.contains("GH_CONFIG_DIR PATH"));
             assert!(!instructions.contains("!secure_path"));
         }
@@ -657,5 +739,46 @@ mod tests {
         for command in ["harness-exec", "rail-exec", "command-exec", "doctor"] {
             assert!(!launcher_command_allowed(&[command.to_owned()]));
         }
+    }
+
+    #[test]
+    fn launcher_allows_cursor_exec_always_and_guards_only_unprivileged() {
+        let args = |cmd: &str| vec![cmd.to_owned()];
+        for unprivileged in [true, false] {
+            assert!(launcher_command_allowed_with(
+                &args("cursor-exec"),
+                unprivileged
+            ));
+            assert!(!launcher_command_allowed_with(
+                &args("rail-exec"),
+                unprivileged
+            ));
+            assert!(!launcher_command_allowed_with(
+                &args("harness-exec"),
+                unprivileged
+            ));
+            assert!(!launcher_command_allowed_with(
+                &args("command-exec"),
+                unprivileged
+            ));
+            assert!(!launcher_command_allowed_with(&[], unprivileged));
+        }
+        // Rail guards: admitted only without a privilege change.
+        assert!(launcher_command_allowed_with(
+            &args("github-auth-check"),
+            true
+        ));
+        assert!(launcher_command_allowed_with(
+            &args("tool-call-observed"),
+            true
+        ));
+        assert!(!launcher_command_allowed_with(
+            &args("github-auth-check"),
+            false
+        ));
+        assert!(!launcher_command_allowed_with(
+            &args("tool-call-observed"),
+            false
+        ));
     }
 }

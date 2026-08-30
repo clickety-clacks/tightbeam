@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -52,13 +53,31 @@ impl RealGh {
         let dir = gh_config_dir(base_dir);
         fs::create_dir_all(&dir)
             .map_err(|error| format!("could not create {}: {error}", dir.display()))?;
-        for restrict in [
-            base_dir.join("auth"),
-            base_dir.join("auth").join("github"),
-            dir.clone(),
-        ] {
-            fs::set_permissions(&restrict, fs::Permissions::from_mode(0o700)).map_err(|error| {
-                format!("could not set 0700 on {}: {error}", restrict.display())
+        // A provisioned Cursor execution identity reads this bank on its
+        // canonical path through a group grant (auth 0710, github 0710, gh 0750;
+        // Tightbeam.Harness.Cursor.grant_bank_access!). Detect that grant by the
+        // gh dir carrying a group other than this process's own, and preserve
+        // traversal for it; otherwise keep the operator-only 0700 layout.
+        let own_gid = unsafe { libc::getgid() };
+        let group_granted = fs::metadata(&dir)
+            .map(|m| m.gid() != own_gid)
+            .unwrap_or(false);
+        let modes: [(std::path::PathBuf, u32); 3] = if group_granted {
+            [
+                (base_dir.join("auth"), 0o710),
+                (base_dir.join("auth").join("github"), 0o710),
+                (dir.clone(), 0o750),
+            ]
+        } else {
+            [
+                (base_dir.join("auth"), 0o700),
+                (base_dir.join("auth").join("github"), 0o700),
+                (dir.clone(), 0o700),
+            ]
+        };
+        for (restrict, mode) in modes {
+            fs::set_permissions(&restrict, fs::Permissions::from_mode(mode)).map_err(|error| {
+                format!("could not set {mode:o} on {}: {error}", restrict.display())
             })?;
         }
         Ok(RealGh {

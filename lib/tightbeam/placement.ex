@@ -1213,7 +1213,7 @@ defmodule Tightbeam.Placement do
         {"TIGHTBEAM_MACHINE", host},
         {"PATH", path},
         {"TIGHTBEAM_LINEAGE", lineage}
-      ] ++ github_env(harness, config.base_dir, home) ++ overlay_env
+      ] ++ github_env(config.base_dir) ++ overlay_env
 
     remote_env =
       if host_config.ssh do
@@ -1356,13 +1356,6 @@ defmodule Tightbeam.Placement do
   # honest answer (needs_onboarding) where ambient fallback would let a store
   # agents cannot reach answer "live".
   defp github_env(base_dir), do: Tightbeam.GithubAuth.env(base_dir)
-
-  # The dedicated Cursor identity cannot traverse the 0700 banked dir; it reads
-  # the group-readable projection deliver_home wrote under its config dir.
-  defp github_env(:cursor, _base_dir, home),
-    do: [{"GH_CONFIG_DIR", Tightbeam.Harness.Cursor.github_config_dir(home)}]
-
-  defp github_env(_harness, base_dir, _home), do: github_env(base_dir)
 
   @doc """
   Capture same-tier adapter boot inputs in the higher-tier coordinator.
@@ -1616,7 +1609,9 @@ defmodule Tightbeam.Placement do
     # CursorRails) because the dedicated identity's launcher pins PATH.
     # Only Cursor carries it; other harnesses must not require `cli_bin` here
     # (deliver_home also runs for home-only projections with minimal configs).
-    rails_path = if harness == :cursor, do: adapter_path(config, host_config)
+    rails_path =
+      if harness == :cursor,
+        do: Tightbeam.Harness.Cursor.helper_path_dir() <> ":" <> adapter_path(config, host_config)
 
     result =
       module.reconcile_home(
@@ -1652,9 +1647,8 @@ defmodule Tightbeam.Placement do
       if harness == :cursor do
         Tightbeam.Harness.Cursor.prepare_projection_runtime!(Map.fetch!(result, :home_path))
 
-        Tightbeam.Harness.Cursor.project_github_config!(
-          Map.fetch!(result, :home_path),
-          Tightbeam.GithubAuth.config_dir(host_config.base_dir),
+        Tightbeam.Harness.Cursor.grant_bank_access!(
+          host_config.base_dir,
           Map.get(config, :cursor_execution_home)
         )
 
