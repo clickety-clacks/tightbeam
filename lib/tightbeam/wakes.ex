@@ -1198,24 +1198,12 @@ defmodule Tightbeam.Wakes do
   # stand in for liveness on any other wake: every identity and carrier field
   # is joined back to the terminal request row in this transaction.
   defp exact_terminal_effort_request?(
-         _txn,
-         %{
-           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-           reason_kind: "obligation_disposed",
-           causal_source: %{kind: "decision_request", id: request_id}
-         },
+         txn,
+         command,
          %{
            kind: "disposition",
            disposition_kind: "decision_request_transition",
-           disposition_id: request_id,
-           terminal_request: %{
-             id: request_id,
-             kind: "effort",
-             assignment_id: assignment_id,
-             deadline_wake_id: wake_id,
-             status: "ruled",
-             decision: decision
-           }
+           disposition_id: request_id
          },
          %{
            wake_id: wake_id,
@@ -1224,7 +1212,17 @@ defmodule Tightbeam.Wakes do
          },
          %{kind: "assignment", id: assignment_id, impact: "linked_work_open"}
        ) do
-    decision in ["continue", "dismiss"]
+    with %{
+           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+           reason_kind: "obligation_disposed",
+           causal_source: %{kind: "decision_request", id: ^request_id}
+         } <- command,
+         %{id: ^request_id, assignment_id: ^assignment_id, deadline_wake_id: ^wake_id} <-
+           Escalation.effort_terminal_in_txn(txn, request_id) do
+      true
+    else
+      _ -> false
+    end
   end
 
   defp exact_terminal_effort_request?(_txn, _command, _outcome, _wake, _primary), do: false
