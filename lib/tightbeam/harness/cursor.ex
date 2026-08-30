@@ -13,8 +13,17 @@ defmodule Tightbeam.Harness.Cursor do
   alias Tightbeam.Model
 
   @adapter_version "2026.08.11-e8db854"
+  # The `cursor-agent` launcher script is byte-identical across all four
+  # published platform archives; only `index.js` differs per platform. Both
+  # verified against the real archives (ops, 2026-08-30); the CLI's admin
+  # block pins the same values (parity test in cursor_registration_test.exs).
   @launcher_sha256 "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
-  @bundle_sha256 "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0"
+  @bundle_sha256_by_platform %{
+    {:darwin, :arm64} => "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+    {:darwin, :x64} => "2def6db128c49b95f33b8b6f9624a15e65616f074ae505c06ffccf35fe0feb7b",
+    {:linux, :x64} => "f6fd4e6bf3d6ecbf66cc2dcabcf708b8a7c37b400d10c82a58658b5e331c36d0",
+    {:linux, :arm64} => "468106299df5dcebf227e0d478172a7241a202d25c4b2b7060b6723ee19cabac"
+  }
   @credential_file "cli-config.json"
   @api_key_file "api-key"
   @rails_file ".cursor/hooks.json"
@@ -413,12 +422,47 @@ defmodule Tightbeam.Harness.Cursor do
          {:ok, canonical} <- canonical_path(target, launcher),
          true <- Path.basename(Path.dirname(canonical)) == @adapter_version,
          :ok <- verify_hash(target, canonical, @launcher_sha256),
+         {:ok, bundle_sha256} <- bundle_sha256_for_host(),
          :ok <-
-           verify_hash(target, Path.join(Path.dirname(canonical), "index.js"), @bundle_sha256) do
+           verify_hash(target, Path.join(Path.dirname(canonical), "index.js"), bundle_sha256) do
       {:ok, %{launcher: canonical, version: @adapter_version}}
     else
       nil -> integrity_refusal(:not_found)
+      {:error, :unsupported_platform} -> integrity_refusal(:unsupported_platform)
       _ -> integrity_refusal()
+    end
+  end
+
+  @doc false
+  def bundle_sha256_by_platform, do: @bundle_sha256_by_platform
+
+  @doc false
+  def bundle_sha256_for_host! do
+    {:ok, digest} = bundle_sha256_for_host()
+    digest
+  end
+
+  # Cursor placement is gateway-local only, so the platform whose pin applies
+  # is always this node's. An unmapped platform is a refusal, never a skipped
+  # check.
+  defp bundle_sha256_for_host do
+    os =
+      case :os.type() do
+        {:unix, :darwin} -> :darwin
+        {:unix, :linux} -> :linux
+        _ -> nil
+      end
+
+    arch =
+      case :erlang.system_info(:system_architecture) |> List.to_string() |> String.split("-") do
+        [a | _] when a in ["aarch64", "arm64"] -> :arm64
+        [a | _] when a in ["x86_64", "amd64"] -> :x64
+        _ -> nil
+      end
+
+    case Map.fetch(@bundle_sha256_by_platform, {os, arch}) do
+      {:ok, digest} -> {:ok, digest}
+      :error -> {:error, :unsupported_platform}
     end
   end
 

@@ -698,7 +698,7 @@ defmodule Tightbeam.PlacementTest do
         realpath: fn path -> {:ok, path} end,
         sha256: fn path ->
           if Path.basename(path) == "index.js",
-            do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+            do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
             else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
         end,
         verify_adapter_shim: fn _shim, _launcher -> :ok end
@@ -788,7 +788,7 @@ defmodule Tightbeam.PlacementTest do
           File.write!(hooks_path, "tampered-after-projection")
 
           if Path.basename(path) == "index.js",
-            do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+            do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
             else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
         end,
         verify_adapter_shim: fn _shim, _launcher -> :ok end
@@ -821,7 +821,7 @@ defmodule Tightbeam.PlacementTest do
         realpath: fn path -> {:ok, path} end,
         sha256: fn path ->
           if Path.basename(path) == "index.js",
-            do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+            do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
             else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
         end,
         verify_adapter_shim: fn _shim, _launcher -> :ok end
@@ -944,7 +944,7 @@ defmodule Tightbeam.PlacementTest do
         realpath: fn path -> {:ok, path} end,
         sha256: fn path ->
           if Path.basename(path) == "index.js",
-            do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+            do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
             else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
         end,
         verify_adapter_shim: fn _shim, _launcher -> :ok end

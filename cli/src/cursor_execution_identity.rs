@@ -12,16 +12,59 @@ const CURSOR_VERSION: &str = "2026.08.11-e8db854";
 
 /// The pinned Cursor operand is obtainable: Cursor publishes every agent-cli
 /// version at this URL shape (the same one its installer script downloads
-/// from), and the archive's `dist-package/` is byte-identical to the pinned
-/// bundle `Tightbeam.Harness.Cursor` verifies at every launch. The two digests
-/// mirror `@launcher_sha256` / `@bundle_sha256` there; `test/cursor_registration_test.exs`
-/// pins the parity.
+/// from), and each archive's `dist-package/` is byte-identical to the pinned
+/// bundle `Tightbeam.Harness.Cursor` verifies at every launch. The launcher
+/// script is byte-identical across all four platform archives; `index.js` is
+/// platform-specific, so its pin is a per-platform table. All five digests
+/// mirror the adapter's (`@launcher_sha256` / `@bundle_sha256_by_platform`);
+/// `test/cursor_registration_test.exs` pins the parity, and every digest was
+/// verified against the real downloaded archives (ops, 2026-08-30).
 const CURSOR_DOWNLOAD_URL: &str =
     "https://downloads.cursor.com/lab/{CURSOR_VERSION}/{OS}/{ARCH}/agent-cli-package.tar.gz";
 const CURSOR_LAUNCHER_SHA256: &str =
     "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831";
-const CURSOR_BUNDLE_SHA256: &str =
-    "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0";
+const CURSOR_BUNDLE_SHA256_BY_PLATFORM: [(&str, &str, &str); 4] = [
+    (
+        "darwin",
+        "arm64",
+        "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+    ),
+    (
+        "darwin",
+        "x64",
+        "2def6db128c49b95f33b8b6f9624a15e65616f074ae505c06ffccf35fe0feb7b",
+    ),
+    (
+        "linux",
+        "x64",
+        "f6fd4e6bf3d6ecbf66cc2dcabcf708b8a7c37b400d10c82a58658b5e331c36d0",
+    ),
+    (
+        "linux",
+        "arm64",
+        "468106299df5dcebf227e0d478172a7241a202d25c4b2b7060b6723ee19cabac",
+    ),
+];
+
+/// This host's CPU architecture in Cursor's download vocabulary. Provisioning
+/// instructions are printed by the CLI running ON the host being provisioned,
+/// so compile-time arch is the host arch. An arch outside the table falls
+/// through unmapped: the URL 404s and the digest lookup refuses — loudly,
+/// never silently.
+fn host_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    }
+}
+
+fn cursor_bundle_sha256(os: &str, arch: &str) -> Option<&'static str> {
+    CURSOR_BUNDLE_SHA256_BY_PLATFORM
+        .iter()
+        .find(|(o, a, _)| *o == os && *a == arch)
+        .map(|(_, _, digest)| *digest)
+}
 
 pub fn running_as_launcher() -> bool {
     let Ok(actual) = std::env::current_exe().and_then(fs::canonicalize) else {
@@ -237,17 +280,14 @@ fn admin_instructions(
     )
 }
 
-/// The pinned bundle's download URL for the platform the instructions target.
-/// The architecture is left to the host shell, mapped exactly as Cursor's own
-/// installer maps `uname -m`.
-fn cursor_download_url(macos: bool) -> String {
+/// The pinned bundle's download URL for one concrete platform. Fully resolved
+/// here — no shell substitution — so the digest printed next to it is the one
+/// that archive must hash to.
+fn cursor_download_url(os: &str, arch: &str) -> String {
     CURSOR_DOWNLOAD_URL
         .replace("{CURSOR_VERSION}", CURSOR_VERSION)
-        .replace("{OS}", if macos { "darwin" } else { "linux" })
-        .replace(
-            "{ARCH}",
-            "$(uname -m | sed -e s/x86_64/x64/ -e s/amd64/x64/ -e s/aarch64/arm64/)",
-        )
+        .replace("{OS}", os)
+        .replace("{ARCH}", arch)
 }
 
 fn admin_instructions_for(
@@ -257,7 +297,10 @@ fn admin_instructions_for(
     machine: &str,
     macos: bool,
 ) -> String {
-    let download_url = cursor_download_url(macos);
+    let os = if macos { "darwin" } else { "linux" };
+    let arch = host_arch();
+    let download_url = cursor_download_url(os, arch);
+    let bundle_sha256 = cursor_bundle_sha256(os, arch).unwrap_or("UNSUPPORTED-CPU-ARCHITECTURE");
     if macos {
         format!(
             "An administrator must provision the dedicated Cursor identity. Tightbeam never runs these commands itself:\n\n\
@@ -276,7 +319,7 @@ fn admin_instructions_for(
              TB_CURSOR=$(mktemp -d)\n\
              curl -fsSL {download_url} -o $TB_CURSOR/agent-cli-package.tar.gz\n\
              tar --strip-components=1 -xzf $TB_CURSOR/agent-cli-package.tar.gz -C $TB_CURSOR\n\
-             printf '%s  %s\\n' {CURSOR_LAUNCHER_SHA256} $TB_CURSOR/cursor-agent {CURSOR_BUNDLE_SHA256} $TB_CURSOR/index.js | shasum -a 256 -c - && sudo tar --strip-components=1 --no-same-owner --no-same-permissions -xzf $TB_CURSOR/agent-cli-package.tar.gz -C /Users/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
+             printf '%s  %s\\n' {CURSOR_LAUNCHER_SHA256} $TB_CURSOR/cursor-agent {bundle_sha256} $TB_CURSOR/index.js | shasum -a 256 -c - && sudo tar --strip-components=1 --no-same-owner --no-same-permissions -xzf $TB_CURSOR/agent-cli-package.tar.gz -C /Users/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
              rm -rf $TB_CURSOR\n\
              sudo chown -R {ACCOUNT}:tightbeam-workspace /Users/{ACCOUNT}/.local\n\
              sudo chmod -R go-w /Users/{ACCOUNT}/.local\n\
@@ -323,7 +366,7 @@ fn admin_instructions_for(
              TB_CURSOR=$(mktemp -d)\n\
              curl -fsSL {download_url} -o $TB_CURSOR/agent-cli-package.tar.gz\n\
              tar --strip-components=1 -xzf $TB_CURSOR/agent-cli-package.tar.gz -C $TB_CURSOR\n\
-             printf '%s  %s\\n' {CURSOR_LAUNCHER_SHA256} $TB_CURSOR/cursor-agent {CURSOR_BUNDLE_SHA256} $TB_CURSOR/index.js | sha256sum -c - && sudo tar --strip-components=1 --no-same-owner --no-same-permissions -xzf $TB_CURSOR/agent-cli-package.tar.gz -C /home/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
+             printf '%s  %s\\n' {CURSOR_LAUNCHER_SHA256} $TB_CURSOR/cursor-agent {bundle_sha256} $TB_CURSOR/index.js | sha256sum -c - && sudo tar --strip-components=1 --no-same-owner --no-same-permissions -xzf $TB_CURSOR/agent-cli-package.tar.gz -C /home/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
              rm -rf $TB_CURSOR\n\
              sudo chown -R {ACCOUNT}:tightbeam-workspace /home/{ACCOUNT}/.local\n\
              sudo chmod -R go-w /home/{ACCOUNT}/.local\n\
@@ -774,7 +817,12 @@ mod tests {
             )));
             assert!(instructions.contains("agent-cli-package.tar.gz"));
             assert!(instructions.contains(CURSOR_LAUNCHER_SHA256));
-            assert!(instructions.contains(CURSOR_BUNDLE_SHA256));
+            let os = if macos { "darwin" } else { "linux" };
+            assert!(instructions.contains(cursor_bundle_sha256(os, host_arch()).unwrap()));
+            assert!(instructions.contains(&format!(
+                "/{os}/{arch}/agent-cli-package.tar.gz",
+                arch = host_arch()
+            )));
             // Digests are checked on an unprivileged extraction FIRST, and the
             // root extraction is gated on that check passing; root never
             // preserves the archive's ownership or setuid bits.
@@ -795,16 +843,35 @@ mod tests {
     }
 
     #[test]
-    fn download_url_names_the_pinned_version_and_maps_arch_like_cursors_installer() {
-        let url = cursor_download_url(true);
-        assert!(url.starts_with(&format!(
-            "https://downloads.cursor.com/lab/{CURSOR_VERSION}/darwin/"
-        )));
-        assert!(url.ends_with("/agent-cli-package.tar.gz"));
-        assert!(url.contains("x86_64/x64"));
-        assert!(url.contains("aarch64/arm64"));
-        assert!(!url.contains('{'));
-        assert!(cursor_download_url(false).contains("/linux/"));
+    fn download_url_is_concrete_and_every_platform_pin_is_distinct() {
+        assert_eq!(
+            cursor_download_url("darwin", "arm64"),
+            format!(
+                "https://downloads.cursor.com/lab/{CURSOR_VERSION}/darwin/arm64/agent-cli-package.tar.gz"
+            )
+        );
+        assert!(!cursor_download_url("linux", "x64").contains('{'));
+
+        // Four platforms, four distinct index.js pins, no accidental reuse of
+        // the darwin/arm64 digest for the rest (the round-4 finding).
+        let mut digests: Vec<&str> = CURSOR_BUNDLE_SHA256_BY_PLATFORM
+            .iter()
+            .map(|(_, _, digest)| *digest)
+            .collect();
+        assert_eq!(digests.len(), 4);
+        digests.sort_unstable();
+        digests.dedup();
+        assert_eq!(digests.len(), 4, "per-platform digests must be distinct");
+        for (os, arch) in [
+            ("darwin", "arm64"),
+            ("darwin", "x64"),
+            ("linux", "x64"),
+            ("linux", "arm64"),
+        ] {
+            assert!(cursor_bundle_sha256(os, arch).is_some());
+        }
+        assert!(cursor_bundle_sha256("linux", "riscv64").is_none());
+        assert!(["arm64", "x64"].contains(&host_arch()));
     }
 
     #[test]
