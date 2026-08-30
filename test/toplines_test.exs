@@ -217,6 +217,115 @@ defmodule Tightbeam.ToplinesTest do
              )
   end
 
+  test "AC10 concurrent active-pair links commit once and append one event", ctx do
+    work_item!(ctx.db, "wi_race", "flynn")
+
+    topline =
+      Toplines.create(
+        ctx.db,
+        call({:user, "flynn"}, %{title: "Race", idempotency_key: "race-create"}, 10)
+      ).topline
+
+    calls =
+      for key <- ["race-link-a", "race-link-b"] do
+        call(
+          {:user, "flynn"},
+          %{
+            topline_id: topline.id,
+            work_item_id: "wi_race",
+            reason: "same pair",
+            idempotency_key: key
+          },
+          11
+        )
+      end
+
+    results = race(calls, &Toplines.link_work(ctx.db, &1))
+
+    assert 1 == Enum.count(results, &match?(%{membership: %{}}, &1))
+    assert 1 == Enum.count(results, &match?(%{code: "membership_exists"}, &1))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM topline_work_memberships WHERE unlinkedAt IS NULL"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM topline_events WHERE toplineId=?1 AND kind='work_linked'",
+               [topline.id]
+             )
+  end
+
+  test "AC59 concurrent active Concern-reference links commit once and append one event", ctx do
+    work_item!(ctx.db, "wi_reference_race", "flynn")
+
+    topline =
+      Toplines.create(
+        ctx.db,
+        call({:user, "flynn"}, %{title: "Reference race", idempotency_key: "race-create"}, 20)
+      ).topline
+
+    membership =
+      Toplines.link_work(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{
+            topline_id: topline.id,
+            work_item_id: "wi_reference_race",
+            reason: "member",
+            idempotency_key: "race-member"
+          },
+          21
+        )
+      ).membership
+
+    concern =
+      Toplines.create_concern(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{topline_id: topline.id, title: "Risk", idempotency_key: "race-concern"},
+          22
+        )
+      ).concern
+
+    calls =
+      for key <- ["race-reference-a", "race-reference-b"] do
+        call(
+          {:user, "flynn"},
+          %{
+            concern_id: concern.id,
+            membership_id: membership.id,
+            reason: "same reference",
+            idempotency_key: key
+          },
+          23
+        )
+      end
+
+    results = race(calls, &Toplines.link_concern_work(ctx.db, &1))
+
+    assert 1 == Enum.count(results, &match?(%{concernReference: %{}}, &1))
+    assert 1 == Enum.count(results, &match?(%{code: "concern_reference_exists"}, &1))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM topline_concern_refs WHERE unlinkedAt IS NULL"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM topline_events WHERE toplineId=?1 AND kind='concern_work_linked'",
+               [topline.id]
+             )
+  end
+
   test "lifecycle mutations preserve canonical titles, exact transitions, and event order", ctx do
     created =
       Toplines.create(
@@ -494,6 +603,52 @@ defmodule Tightbeam.ToplinesTest do
            ) == [open.id, closed.id]
   end
 
+  test "public dependency digest uses the exact ordered integer Work Item rowVersion vector",
+       ctx do
+    work_item!(ctx.db, "wi_dependency", "flynn")
+
+    topline =
+      Toplines.create(
+        ctx.db,
+        call({:user, "flynn"}, %{title: "Dependency", idempotency_key: "dependency-create"}, 40)
+      ).topline
+
+    membership =
+      Toplines.link_work(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{
+            topline_id: topline.id,
+            work_item_id: "wi_dependency",
+            reason: "dependency",
+            idempotency_key: "dependency-link"
+          },
+          41
+        )
+      ).membership
+
+    expected_vector =
+      [
+        ["toplines", topline.id, 2],
+        ["topline work memberships", membership.id, 2],
+        ["work items", "wi_dependency", 1]
+      ]
+      |> Enum.sort()
+
+    expected_digest =
+      expected_vector
+      |> JSON.encode!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    assert [%{topline: queried} = composed] =
+             Toplines.query_public(ctx.db, %{principal: {:user, "flynn"}, state: ["open"]})
+
+    assert queried.id == topline.id
+    assert Toplines.public_item(composed).dependencyVersion == expected_digest
+  end
+
   test "the frozen in-transaction placement seam stores one pending episode and resolution",
        ctx do
     work_item!(ctx.db, "wi_place", "flynn")
@@ -678,6 +833,26 @@ defmodule Tightbeam.ToplinesTest do
   end
 
   defp read_call(principal, params \\ %{}), do: call(principal, params)
+
+  defp race(inputs, operation) do
+    parent = self()
+
+    tasks =
+      Enum.map(inputs, fn input ->
+        Task.async(fn ->
+          send(parent, {:race_ready, self()})
+          receive do: (:race_go -> operation.(input))
+        end)
+      end)
+
+    Enum.each(tasks, fn task ->
+      pid = task.pid
+      assert_receive {:race_ready, ^pid}, 1_000
+    end)
+
+    Enum.each(tasks, &send(&1.pid, :race_go))
+    Enum.map(tasks, &Task.await(&1, 5_000))
+  end
 
   defp work_item!(db, id, owner) do
     {:ok, _} =

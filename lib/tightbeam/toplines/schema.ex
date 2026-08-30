@@ -69,8 +69,10 @@ defmodule Tightbeam.Toplines.Schema do
             (unlinkedAt IS NULL AND unlinkReason IS NULL AND
              unlinkedActorKind IS NULL AND unlinkedActorRef IS NULL) OR
             (typeof(unlinkedAt) = 'integer' AND unlinkedAt >= linkedAt AND
+             unlinkReason IS NOT NULL AND
              length(trim(unlinkReason)) BETWEEN 1 AND 4000 AND
-             unlinkedActorKind IN ('user','session') AND length(trim(unlinkedActorRef)) > 0)
+             unlinkedActorKind IS NOT NULL AND unlinkedActorKind IN ('user','session') AND
+             unlinkedActorRef IS NOT NULL AND length(trim(unlinkedActorRef)) > 0)
           )
         )
         """)
@@ -120,8 +122,10 @@ defmodule Tightbeam.Toplines.Schema do
           CHECK (
             (state = 'open' AND resolveReason IS NULL AND resolvedActorKind IS NULL AND
              resolvedActorRef IS NULL AND resolvedAt IS NULL) OR
-            (state = 'resolved' AND length(trim(resolveReason)) BETWEEN 1 AND 4000 AND
-             resolvedActorKind IN ('user','session') AND length(trim(resolvedActorRef)) > 0 AND
+            (state = 'resolved' AND resolveReason IS NOT NULL AND
+             length(trim(resolveReason)) BETWEEN 1 AND 4000 AND
+             resolvedActorKind IS NOT NULL AND resolvedActorKind IN ('user','session') AND
+             resolvedActorRef IS NOT NULL AND length(trim(resolvedActorRef)) > 0 AND
              typeof(resolvedAt) = 'integer' AND resolvedAt >= createdAt)
           )
         )
@@ -157,8 +161,10 @@ defmodule Tightbeam.Toplines.Schema do
             (unlinkedAt IS NULL AND unlinkReason IS NULL AND
              unlinkedActorKind IS NULL AND unlinkedActorRef IS NULL) OR
             (typeof(unlinkedAt) = 'integer' AND unlinkedAt >= linkedAt AND
+             unlinkReason IS NOT NULL AND
              length(trim(unlinkReason)) BETWEEN 1 AND 4000 AND
-             unlinkedActorKind IN ('user','session') AND length(trim(unlinkedActorRef)) > 0)
+             unlinkedActorKind IS NOT NULL AND unlinkedActorKind IN ('user','session') AND
+             unlinkedActorRef IS NOT NULL AND length(trim(unlinkedActorRef)) > 0)
           )
         )
         """)
@@ -216,10 +222,11 @@ defmodule Tightbeam.Toplines.Schema do
           CHECK (
             (kind IN ('topline_created','concern_created') AND reason IS NULL) OR
             (kind NOT IN ('topline_created','concern_created') AND
+             reason IS NOT NULL AND
              length(trim(reason)) BETWEEN 1 AND 4000)
           ),
           CHECK (
-            (kind IN ('topline_created','concern_created') AND
+            COALESCE((kind IN ('topline_created','concern_created') AND
              json_type(detail, '$.title') = 'text' AND json_remove(detail, '$.title') = '{}') OR
             (kind IN ('topline_renamed','concern_renamed') AND
              json_type(detail, '$.fromTitle') = 'text' AND
@@ -242,7 +249,7 @@ defmodule Tightbeam.Toplines.Schema do
              json_type(detail, '$.membershipId') = 'text' AND
              json_type(detail, '$.unlinkReason') = 'text' AND
              json_extract(detail, '$.cause') IN ('explicit','membership_unlinked') AND
-             json_remove(detail, '$.membershipId', '$.unlinkReason', '$.cause') = '{}')
+             json_remove(detail, '$.membershipId', '$.unlinkReason', '$.cause') = '{}'), 0)
           )
         )
         """)
@@ -335,8 +342,10 @@ defmodule Tightbeam.Toplines.Schema do
             (state = 'pending' AND resolutionActorKind IS NULL AND
              resolutionActorRef IS NULL AND resolutionReason IS NULL AND
              resolvedAt IS NULL AND resolutionCausalEventSeq IS NULL) OR
-            (state != 'pending' AND resolutionActorKind IN ('user','session','process') AND
-             length(trim(resolutionActorRef)) > 0 AND length(trim(resolutionReason)) > 0 AND
+            (state != 'pending' AND resolutionActorKind IS NOT NULL AND
+             resolutionActorKind IN ('user','session','process') AND
+             resolutionActorRef IS NOT NULL AND length(trim(resolutionActorRef)) > 0 AND
+             resolutionReason IS NOT NULL AND length(trim(resolutionReason)) > 0 AND
              typeof(resolvedAt) = 'integer' AND resolvedAt >= openedAt)
           ),
           CHECK (
