@@ -1,8 +1,34 @@
 # Preferred models — engineering kungfu
 
-The single model-selection and ring-down source for this engineering kungfu. Capsules
-live in `guidance/preferred-models.md`; derive every selection from an ordered row
-below.
+The single model catalog, selection, and ring-down source for this engineering kungfu.
+
+## Working set (capsules)
+<!-- machine-read: mix tightbeam.catalog.diff parses each capsule id from the
+     leading "- **<id>**" of these bullets; keep that shape when editing. -->
+
+- **claude-fable-5**: deepest judgment and breadth; load-bearing rulings, adversarial
+  whole-system review, wisdom-level authoring. Expensive; reserve for what needs it.
+- **claude-opus-4-8**: strong general reasoning and composition; coordination,
+  drafting under rulings, reviewing another model's code.
+- **claude-sonnet-5**: the everyday mind for conversation, general agency, and light
+  analysis; the org default. Not for adversarial depth.
+- **claude-haiku-4-5-20251001** (nickname: haiku): fast and cheap classification,
+  extraction, and mechanical transforms. Never judgment.
+- **gpt-5.6-sol**: the implementer. Focused greenfield goals with invariants stated
+  up front; adversarial spec review at high effort. Pauses on underspecification
+  (virtue). Never orchestrates; stalls on rework-in-place.
+- **gpt-5.3-codex-spark**: utility intelligence. Summarization and
+  deterministic-but-loose transforms that still need inference. Cheap, fast.
+- **gpt-5.6-luna** (nickname: luna): straightforward-task workhorse at high/xhigh
+  effort for classification, triage, and other non-load-bearing work that still
+  needs inference. Not for judgment that carries weight.
+
+Capsule names are the canonical catalog base ids (what `tightbeam list` shows).
+Activity rows use the parenthetical nickname plus an effort bracket; expand to the
+canonical catalog base plus effort when spawning. Effort brackets tune depth within a
+capsule; `tightbeam list` shows the live legal forms.
+
+## Activity table
 
 | Activity                                        | Wants                              | Minds, in order (blocked if none)                                                |
 | ----------------------------------------------- | ---------------------------------- | -------------------------------------------------------------------------------- |

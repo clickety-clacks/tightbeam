@@ -29,12 +29,13 @@ still names a model that exists.
    - UNCHARACTERIZED live refs → new minds to characterize (steps 2-4).
    - VANISHED characterized refs → retired minds to remove or re-point (step 5).
 
-2. **Characterize each new model.** Add an entry to `preferred-models.md` in the org's
-   guidance, in the established format: what the model is FOR; what it is NOT for; its cost
-   posture; when to PREFER or AVOID it relative to its neighbors. Base the judgment on the
-   model's real strengths, not marketing — where you are unsure, say so and pick a
-   conservative quality-floor placement. A characterization is a judgment on the record, so
-   the next agent adjudicates against it instead of guessing.
+2. **Characterize each new model.** Add an entry to the working-set section of
+   `kungfu/agentic-engineering/preferred-models.md`, in the established format: what the
+   model is FOR; what it is NOT for; its cost posture; when to PREFER or AVOID it relative
+   to its neighbors. Base the judgment on the model's real strengths, not marketing — where
+   you are unsure, say so and pick a conservative quality-floor placement. A
+   characterization is a judgment on the record, so the next agent adjudicates against it
+   instead of guessing.
 
 3. **Place it in the activity table.** Decide where the new mind sits relative to the
    existing ones for each affected job: which ordered rows it clears, and which it does

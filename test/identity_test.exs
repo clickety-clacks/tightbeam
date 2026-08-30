@@ -288,19 +288,40 @@ defmodule Tightbeam.IdentityTest do
   test "guidance delegates model selection to the one engineering activity table", ctx do
     shipped = Path.expand("priv/kungfu/agentic-engineering")
     guidance_dir = Path.join(shipped, "guidance")
+
+    guidance_paths =
+      [
+        Path.wildcard(Path.expand("priv/guidance/*.md")),
+        Path.wildcard(Path.expand("priv/kungfu/*/guidance/*.md"))
+      ]
+      |> List.flatten()
+      |> Enum.uniq()
+
     activity_table = File.read!(Path.join(shipped, "preferred-models.md"))
 
     assert :crypto.hash(:sha256, activity_table) |> Base.encode16(case: :lower) ==
-             "20893a295d7166a3265062559544462884245b368cc73fe4cd1bff3b5a13c831"
+             "7323c24049f66c00e5f5988ca0300befe23f64e9bbf1e926a22828cad83552d4"
 
     refute File.exists?(Path.join(guidance_dir, "model-policy.md"))
 
     assert File.read!(Path.join(guidance_dir, "preferred-models.md")) =~
-             "Derive a model selection only from the\nordered activity table at `kungfu/agentic-engineering/preferred-models.md`"
+             "Derive every model\nselection from the ordered activity table at\n`kungfu/agentic-engineering/preferred-models.md`"
 
-    for path <- Path.wildcard(Path.join(guidance_dir, "*.md")) do
-      refute File.read!(path) =~ "| Task class |", "guidance selects models: #{path}"
-      refute File.read!(path) =~ "Minds, in order", "guidance selects models: #{path}"
+    working_set =
+      Regex.scan(~r/^- \*\*([^*]+)\*\*/m, activity_table)
+      |> Enum.map(fn [_, model_id] -> model_id end)
+
+    assert working_set != []
+
+    for path <- guidance_paths do
+      guidance = File.read!(path)
+      refute guidance =~ "| Task class |", "guidance selects models: #{path}"
+      refute guidance =~ "Minds, in order", "guidance selects models: #{path}"
+      refute guidance =~ "## Working set (capsules)", "guidance carries capsules: #{path}"
+
+      for model_id <- working_set do
+        refute guidance =~ model_id, "guidance carries model metadata #{model_id}: #{path}"
+      end
     end
 
     for path <- Path.wildcard(Path.join(shipped, "archetypes/*.toml")) do
@@ -336,6 +357,14 @@ defmodule Tightbeam.IdentityTest do
     | Spec review | claude-fable-5 |
     """)
 
+    File.write!(Path.join(legacy, "guidance/preferred-models.md"), """
+    # Preferred models (substrate)
+
+    ## Working set (capsules)
+
+    - **claude-fable-5** — legacy capsule
+    """)
+
     for path <- Path.wildcard(Path.join(legacy, "archetypes/*.toml")) do
       File.write!(
         path,
@@ -358,6 +387,7 @@ defmodule Tightbeam.IdentityTest do
 
     refute File.exists?(Path.join(identity_dir, "guidance/model-policy.md"))
     refute git_path_exists?(identity_dir, revision, "guidance/model-policy.md")
+    refute File.read!(Path.join(identity_dir, "guidance/preferred-models.md")) =~ "claude-fable-5"
 
     for name <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
       guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance

@@ -147,14 +147,16 @@ being nibbled to death by mail before you add to the pile.
 ## Hire help: spawn and retire
 Start a new session:
 
-    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model gpt-5.6-sol --effort high
+    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness <harness> --model <catalog-model> --effort <level>
 
 `--display` is the human label; `--name` registers a role bound to the new session so you can
 address it. Add `--archetype <name>` to give the session that archetype's identity — its
 guidance, skills, and allowed hosts; add `--host <name>` to place it on a machine the
 archetype allows. End a session with `tightbeam retire --session <key>`; its history is kept.
 Pass `--key <idempotencyKey>` on a spawn, assign, or wake you may retry, so the retry does not
-create a duplicate.
+create a duplicate. Derive model and effort from the adopted kungfu's activity table before
+spawning; for agentic engineering, use
+`kungfu/agentic-engineering/preferred-models.md`.
 Name what you hire so a directory of fifty reads at a glance. `--display` is
 "<Role> — <specific purpose>" ("Helper — picker duplicate titles"), never a bare
 role noun; `--name` is "<function>:<work-slug>" ("helper:picker-titles") so wakes
