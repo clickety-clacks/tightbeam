@@ -4,7 +4,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
   alias Tightbeam.ClientE2E.{LegGateway, SimClient, WS}
   alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Router
-  alias Tightbeam.{CursorSigning, DB, Gateway, Rules}
+  alias Tightbeam.{CursorSigning, DB, Gateway, Harness, Placement, Rules}
 
   defstruct [
     :base_dir,
@@ -27,6 +27,13 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     id = System.unique_integer([:positive, :monotonic])
     base_dir = Path.join(System.tmp_dir!(), "tightbeam-firehose-acceptance-#{id}")
     File.mkdir_p!(base_dir)
+
+    model_catalog =
+      Keyword.get_lazy(opts, :model_catalog, fn ->
+        Map.new(Harness.all(), fn harness ->
+          {{Placement.local_host_name(), harness.wire_name()}, []}
+        end)
+      end)
 
     {:ok, supervisor} = Supervisor.start_link([], strategy: :one_for_one)
     Process.unlink(supervisor)
@@ -63,6 +70,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
           handlers: handlers,
           cli_token: cli_token,
           firehose_hub: hub,
+          model_catalog: model_catalog,
           firehose_delivery_barrier: Keyword.get(opts, :delivery_barrier),
           session_status: fn _ -> nil end
         )
