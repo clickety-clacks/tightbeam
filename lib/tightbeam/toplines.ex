@@ -1024,7 +1024,7 @@ defmodule Tightbeam.Toplines do
                (SELECT seq FROM topline_events e
                 WHERE e.toplineId = m.toplineId AND e.membershipId = m.id
                   AND e.kind = 'work_linked'),
-               wi.id, wi.title, wi.state
+               wi.id, wi.createdAt
         FROM topline_work_memberships m
         JOIN work_items wi ON wi.id = m.workItemId
         WHERE m.toplineId = ?1 AND m.unlinkedAt IS NULL
@@ -1034,14 +1034,14 @@ defmodule Tightbeam.Toplines do
       )
 
     membership_entries =
-      Enum.map(rows, fn [membership_id, version, _work_id, _title, _state] ->
+      Enum.map(rows, fn [membership_id, version, _work_id, _work_item_row_version] ->
         ["topline work memberships", membership_id, version]
       end)
 
     work_entries =
       rows
-      |> Enum.map(fn [_membership_id, _version, work_id, title, state] ->
-        ["work items", work_id, sha256(canonical_json(%{state: state, title: title}))]
+      |> Enum.map(fn [_membership_id, _version, work_id, work_item_row_version] ->
+        ["work items", work_id, work_item_row_version]
       end)
       |> Enum.uniq()
 
