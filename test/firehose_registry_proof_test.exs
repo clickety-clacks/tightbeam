@@ -5,7 +5,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
   alias Tightbeam.{DB, Gateway, Model, Org, StateVisibility, SubagentMarkers, Toplines}
 
   @r8_groups [
-    {~w(work_item.created work_item.updated work_item.iceboxed work_item.reopened work_item.closed work_item.failed),
+    {~w(work_item.created work_item.updated work_item.iceboxed work_item.reopened work_item.closed work_item.failed work_item.deprioritized work_item.boundary_declared),
      "work-items", "upsert", ["workItemId"], :work_item},
     {~w(assignment.opened assignment.reopened assignment.closed), "assignments", "upsert",
      ["assignmentId"], :assignment},
