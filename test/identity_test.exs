@@ -292,6 +292,7 @@ defmodule Tightbeam.IdentityTest do
     guidance_paths =
       [
         Path.wildcard(Path.expand("priv/guidance/*.md")),
+        Path.wildcard(Path.expand("priv/seed/guidance/*.md")),
         Path.wildcard(Path.expand("priv/kungfu/*/guidance/*.md"))
       ]
       |> List.flatten()
@@ -338,6 +339,19 @@ defmodule Tightbeam.IdentityTest do
       assert occurrence_count(guidance, activity_table) == 1
       refute guidance =~ "# Model policy"
       refute guidance =~ "| Task class |"
+    end
+
+    neutral_base = Path.join(ctx.root, "neutral-guidance-census")
+    assert :initialized = Identity.init!(neutral_base)
+    neutral_guidance = Identity.snapshot!(neutral_base, "default", :codex).guidance
+
+    refute neutral_guidance =~ "| Task class |"
+    refute neutral_guidance =~ "Minds, in order"
+    refute neutral_guidance =~ "## Working set (capsules)"
+
+    for model_id <- working_set do
+      refute neutral_guidance =~ model_id,
+             "neutral default guidance carries model metadata #{model_id}"
     end
 
     assert :noop = Identity.init!(base)
