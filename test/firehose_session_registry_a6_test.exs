@@ -58,6 +58,9 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     assert payload == canonical_session(ctx.db, ctx.worker.session_key)
     assert payload == StateResources.session(renamed)
     assert payload["rowVersion"] > before["rowVersion"]
+    assert payload["overrides"] == nil
+    assert is_boolean(payload["isBuiltIn"])
+    assert is_boolean(payload["adopted"])
     refute Map.has_key?(payload, "cliToken")
     refute inspect(payload) =~ "tbs_"
 

@@ -64,6 +64,25 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     end
   end
 
+  test "the shared public serializer preserves canonical JSON null and boolean types" do
+    session =
+      "sessions"
+      |> item(Map.fetch!(@field_order, "sessions"))
+      |> Map.put("overrides", nil)
+      |> Map.put("isBuiltIn", true)
+      |> Map.put("adopted", false)
+      |> Map.put("state", :active)
+      |> StateResources.session()
+
+    assert session["overrides"] == nil
+    assert session["isBuiltIn"] === true
+    assert session["adopted"] === false
+    assert session["state"] == "active"
+
+    bytes = StateResources.encode_item("sessions", session)
+    assert JSON.decode!(bytes) == session
+  end
+
   test "A17 randomizes map and set order 1,000 times without changing item bytes" do
     expected =
       Map.new(@field_order, fn {resource, fields} ->

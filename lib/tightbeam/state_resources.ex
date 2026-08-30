@@ -1721,6 +1721,8 @@ defmodule Tightbeam.StateResources do
   end
 
   defp public(rows) when is_list(rows), do: Enum.map(rows, &public/1)
+  defp public(nil), do: nil
+  defp public(value) when is_boolean(value), do: value
   defp public(value) when is_atom(value), do: Atom.to_string(value)
   defp public(value), do: value
 
