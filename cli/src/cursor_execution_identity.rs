@@ -10,6 +10,19 @@ pub const ACCOUNT: &str = "tightbeam-cursor";
 pub const LAUNCHER: &str = "/usr/local/libexec/tightbeam-cursor-launcher";
 const CURSOR_VERSION: &str = "2026.08.11-e8db854";
 
+/// The pinned Cursor operand is obtainable: Cursor publishes every agent-cli
+/// version at this URL shape (the same one its installer script downloads
+/// from), and the archive's `dist-package/` is byte-identical to the pinned
+/// bundle `Tightbeam.Harness.Cursor` verifies at every launch. The two digests
+/// mirror `@launcher_sha256` / `@bundle_sha256` there; `test/cursor_registration_test.exs`
+/// pins the parity.
+const CURSOR_DOWNLOAD_URL: &str =
+    "https://downloads.cursor.com/lab/{CURSOR_VERSION}/{OS}/{ARCH}/agent-cli-package.tar.gz";
+const CURSOR_LAUNCHER_SHA256: &str =
+    "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831";
+const CURSOR_BUNDLE_SHA256: &str =
+    "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0";
+
 pub fn running_as_launcher() -> bool {
     let Ok(actual) = std::env::current_exe().and_then(fs::canonicalize) else {
         return false;
@@ -224,6 +237,19 @@ fn admin_instructions(
     )
 }
 
+/// The pinned bundle's download URL for the platform the instructions target.
+/// The architecture is left to the host shell, mapped exactly as Cursor's own
+/// installer maps `uname -m`.
+fn cursor_download_url(macos: bool) -> String {
+    CURSOR_DOWNLOAD_URL
+        .replace("{CURSOR_VERSION}", CURSOR_VERSION)
+        .replace("{OS}", if macos { "darwin" } else { "linux" })
+        .replace(
+            "{ARCH}",
+            "$(uname -m | sed -e s/x86_64/x64/ -e s/amd64/x64/ -e s/aarch64/arm64/)",
+        )
+}
+
 fn admin_instructions_for(
     base: &Path,
     operator_home: &Path,
@@ -231,6 +257,7 @@ fn admin_instructions_for(
     machine: &str,
     macos: bool,
 ) -> String {
+    let download_url = cursor_download_url(macos);
     if macos {
         format!(
             "An administrator must provision the dedicated Cursor identity. Tightbeam never runs these commands itself:\n\n\
@@ -246,7 +273,11 @@ fn admin_instructions_for(
              sudo dseditgroup -o edit -a $USER -t user tightbeam-workspace\n\
              sudo dseditgroup -o edit -a {ACCOUNT} -t user tightbeam-workspace\n\
              sudo install -d -o {ACCOUNT} -g tightbeam-workspace -m 0750 /Users/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
-             sudo /usr/bin/ditto {operator_home}/.local/share/cursor-agent/versions/{CURSOR_VERSION} /Users/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
+             TB_CURSOR=$(mktemp -d)\n\
+             curl -fsSL {download_url} -o $TB_CURSOR/agent-cli-package.tar.gz\n\
+             tar --strip-components=1 -xzf $TB_CURSOR/agent-cli-package.tar.gz -C $TB_CURSOR\n\
+             printf '%s  %s\\n' {CURSOR_LAUNCHER_SHA256} $TB_CURSOR/cursor-agent {CURSOR_BUNDLE_SHA256} $TB_CURSOR/index.js | shasum -a 256 -c - && sudo tar --strip-components=1 --no-same-owner --no-same-permissions -xzf $TB_CURSOR/agent-cli-package.tar.gz -C /Users/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
+             rm -rf $TB_CURSOR\n\
              sudo chown -R {ACCOUNT}:tightbeam-workspace /Users/{ACCOUNT}/.local\n\
              sudo chmod -R go-w /Users/{ACCOUNT}/.local\n\
              sudo -u {ACCOUNT} -H /usr/bin/ssh-keygen -q -t ed25519 -N '' -C tightbeam-cursor -f /Users/{ACCOUNT}/.ssh/id_ed25519\n\
@@ -289,7 +320,11 @@ fn admin_instructions_for(
              sudo usermod --append --groups tightbeam-workspace $USER\n\
              sudo usermod --append --groups tightbeam-workspace {ACCOUNT}\n\
              sudo install -d -o {ACCOUNT} -g tightbeam-workspace -m 0750 /home/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
-             sudo cp -a {operator_home}/.local/share/cursor-agent/versions/{CURSOR_VERSION}/. /home/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}/\n\
+             TB_CURSOR=$(mktemp -d)\n\
+             curl -fsSL {download_url} -o $TB_CURSOR/agent-cli-package.tar.gz\n\
+             tar --strip-components=1 -xzf $TB_CURSOR/agent-cli-package.tar.gz -C $TB_CURSOR\n\
+             printf '%s  %s\\n' {CURSOR_LAUNCHER_SHA256} $TB_CURSOR/cursor-agent {CURSOR_BUNDLE_SHA256} $TB_CURSOR/index.js | sha256sum -c - && sudo tar --strip-components=1 --no-same-owner --no-same-permissions -xzf $TB_CURSOR/agent-cli-package.tar.gz -C /home/{ACCOUNT}/.local/share/cursor-agent/versions/{CURSOR_VERSION}\n\
+             rm -rf $TB_CURSOR\n\
              sudo chown -R {ACCOUNT}:tightbeam-workspace /home/{ACCOUNT}/.local\n\
              sudo chmod -R go-w /home/{ACCOUNT}/.local\n\
              sudo -u {ACCOUNT} -H /usr/bin/ssh-keygen -q -t ed25519 -N '' -C tightbeam-cursor -f /home/{ACCOUNT}/.ssh/id_ed25519\n\
@@ -730,7 +765,46 @@ mod tests {
             );
             assert!(!instructions.contains("GH_CONFIG_DIR PATH"));
             assert!(!instructions.contains("!secure_path"));
+            // The pinned operand is obtained from Cursor's published archive
+            // and verified against both pinned digests — never copied from
+            // the operator's home, which need not have it installed.
+            assert!(instructions.contains(&format!(
+                "https://downloads.cursor.com/lab/{CURSOR_VERSION}/{}/",
+                if macos { "darwin" } else { "linux" }
+            )));
+            assert!(instructions.contains("agent-cli-package.tar.gz"));
+            assert!(instructions.contains(CURSOR_LAUNCHER_SHA256));
+            assert!(instructions.contains(CURSOR_BUNDLE_SHA256));
+            // Digests are checked on an unprivileged extraction FIRST, and the
+            // root extraction is gated on that check passing; root never
+            // preserves the archive's ownership or setuid bits.
+            let check = if macos {
+                "shasum -a 256 -c -"
+            } else {
+                "sha256sum -c -"
+            };
+            assert!(instructions.contains(&format!(
+                "{check} && sudo tar --strip-components=1 --no-same-owner --no-same-permissions -xzf"
+            )));
+            assert!(!instructions.contains(if macos { "sha256sum" } else { "shasum" }));
+            assert!(instructions.contains("TB_CURSOR=$(mktemp -d)"));
+            assert!(!instructions.contains("| sudo tar"));
+            assert!(!instructions.contains("ditto"));
+            assert!(!instructions.contains(&format!("{operator_home}/.local/share/cursor-agent")));
         }
+    }
+
+    #[test]
+    fn download_url_names_the_pinned_version_and_maps_arch_like_cursors_installer() {
+        let url = cursor_download_url(true);
+        assert!(url.starts_with(&format!(
+            "https://downloads.cursor.com/lab/{CURSOR_VERSION}/darwin/"
+        )));
+        assert!(url.ends_with("/agent-cli-package.tar.gz"));
+        assert!(url.contains("x86_64/x64"));
+        assert!(url.contains("aarch64/arm64"));
+        assert!(!url.contains('{'));
+        assert!(cursor_download_url(false).contains("/linux/"));
     }
 
     #[test]
