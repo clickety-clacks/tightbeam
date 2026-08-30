@@ -156,7 +156,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
     loaded = Archetypes.load!(ctx.base_dir)
 
@@ -225,7 +225,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -256,7 +256,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
     revision = Identity.live_revision!(ctx.base_dir)
 
@@ -401,7 +401,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -434,7 +434,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -497,7 +497,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold rejects every invalid name class before identity mutation", ctx do
     for name <- ["", "-demo", "Demo", "demo_name", "demo--name", "demo-"] do
       assert_raise ArgumentError, ~r/invalid kungfu name/, fn ->
-        Archetypes.scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:flynn")
+        scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:flynn")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -507,7 +507,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold requires purpose before identity mutation", ctx do
     for purpose <- [nil, "", "  "] do
       assert_raise ArgumentError, "kungfu purpose is required", fn ->
-        Archetypes.scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:flynn")
+        scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:flynn")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -530,7 +530,7 @@ defmodule Tightbeam.ArchetypesTest do
       assert_raise ArgumentError,
                    "kungfu scaffold target already exists: identity/#{occupied_relative}",
                    fn ->
-                     Archetypes.scaffold_kungfu!(
+                     scaffold_kungfu!(
                        base_dir,
                        name,
                        "A useful capability.",
@@ -549,7 +549,7 @@ defmodule Tightbeam.ArchetypesTest do
 
   test "kungfu scaffold commits on main and publishes live through the identity seam", ctx do
     paths =
-      Archetypes.scaffold_kungfu!(
+      scaffold_kungfu!(
         ctx.base_dir,
         "demo",
         ~s(Help teams turn "ideas" into shipped work.\nKeep it accountable.),
@@ -702,7 +702,7 @@ defmodule Tightbeam.ArchetypesTest do
           {%{"skills_add" => ["missing"]}, "unknown override skill names: missing"},
           {%{"guidance_extra" => 42}, "must be a string"},
           {%{"guidance_extra" => ~s(#include "missing.md")},
-           "unknown guidance fragment \"missing.md\""}
+           "identity_include_invalid cause=missing_fragment"}
         ] do
       assert {:error, %{code: "invalid_overrides", message: detail}} =
                Archetypes.normalize_overrides(ctx.base_dir, archetype, raw)
@@ -799,7 +799,7 @@ defmodule Tightbeam.ArchetypesTest do
     text = '#include "nope.md"'
     """)
 
-    assert_raise ArgumentError, ~r/unknown guidance fragment "nope.md"/, fn ->
+    assert_raise Tightbeam.Identity.IncludeError, ~r/cause=missing_fragment.*nope.md/, fn ->
       Archetypes.load!(ctx.base_dir)
     end
 
@@ -812,12 +812,29 @@ defmodule Tightbeam.ArchetypesTest do
     text = '#include "a.md"'
     """)
 
-    assert_raise ArgumentError, ~r/include cycle: a.md -> b.md -> a.md/, fn ->
+    assert_raise Tightbeam.Identity.IncludeError, ~r/cause=cycle.*a.md -> b.md -> a.md/, fn ->
       Archetypes.load!(ctx.base_dir)
     end
   end
 
   defp manifests_dir!(base_dir), do: Path.join(identity_dir!(base_dir), "archetypes")
+
+  defp learn!(base, name, author) do
+    case Identity.learn!(base, name, author) do
+      {:ok, candidate} ->
+        assert {:ok, revision} = Identity.publish_live!(base, candidate)
+        {:ok, revision}
+
+      other ->
+        other
+    end
+  end
+
+  defp scaffold_kungfu!(base, name, purpose, author) do
+    candidate = Archetypes.scaffold_kungfu!(base, name, purpose, author)
+    assert {:ok, _revision} = Identity.publish_live!(base, candidate)
+    candidate.paths
+  end
 
   defp identity_dir!(base_dir) do
     Identity.init!(base_dir)
