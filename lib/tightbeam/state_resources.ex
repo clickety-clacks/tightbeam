@@ -1413,6 +1413,12 @@ defmodule Tightbeam.StateResources do
         ArgumentError ->
           raise ArgumentError, "#{resource}.harness is absent from the served harness catalog"
       end
+
+      unless Enum.any?(Map.keys(catalog), fn {_host, catalog_harness} ->
+               harness == catalog_harness
+             end) do
+        raise ArgumentError, "#{resource}.harness is absent from the served harness catalog"
+      end
     end
 
     keys =

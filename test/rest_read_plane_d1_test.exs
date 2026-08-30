@@ -100,6 +100,11 @@ defmodule Tightbeam.RestReadPlaneD1Test do
 
     harness = hd(Harness.all()).wire_name()
 
+    catalog = %{
+      {"alpha-host", harness} => [],
+      {"zeta-host", harness} => []
+    }
+
     for host <- ~w(alpha-host zeta-host), name <- ~w(ALPHA_ENV ZETA_ENV) do
       assert {:ok, _entry} =
                Placement.set_env_overlay(
@@ -128,6 +133,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
       handlers: %{"inspect" => inspect_handler},
       cli_token: "tbc_rest_d1",
       cursor_signing: cursor_signing!(base_dir),
+      model_catalog: catalog,
       session_status: fn _ -> nil end
     ]
 
@@ -141,7 +147,8 @@ defmodule Tightbeam.RestReadPlaneD1Test do
       admin_session: admin_session,
       operator_device: operator_device,
       operator_session: operator_session,
-      harness: harness
+      harness: harness,
+      catalog: catalog
     }
   end
 
@@ -168,7 +175,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
 
     for {route, resource, collection_path, detail_path, raw, serializer} <- cases do
       item = apply(StateResources, serializer, [raw])
-      item_bytes = StateResources.encode_item(resource, item)
+      item_bytes = StateResources.encode_item(resource, item, ctx.catalog)
       {200, headers, collection_bytes} = http_get(port, collection_path, ctx.admin_device.token)
       collection = JSON.decode!(collection_bytes)
 

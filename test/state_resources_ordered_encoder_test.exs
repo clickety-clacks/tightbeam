@@ -319,6 +319,45 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       end
     end
 
+    absent_harness = [
+      {"assignments", %{"holderHarness" => "codex", "holderProvider" => nil}},
+      {"attests", %{"byHarness" => "codex", "byProvider" => nil}},
+      {"turns",
+       %{
+         "harness" => "codex",
+         "model" => nil,
+         "thinkingLevel" => nil,
+         "modelContext" => nil
+       }},
+      {"sessions",
+       %{
+         "host" => nil,
+         "harness" => "codex",
+         "provider" => nil,
+         "model" => nil,
+         "thinkingLevel" => nil,
+         "modelContext" => nil
+       }},
+      {"transcript messages",
+       %{
+         "harness" => "codex",
+         "provider" => nil,
+         "model" => nil,
+         "effort" => nil,
+         "context" => nil
+       }},
+      {"host environment", %{"host" => "testhost", "harness" => "codex"}}
+    ]
+
+    for {resource, selections} <- absent_harness do
+      invalid = resource |> item(Map.fetch!(@field_order, resource)) |> Map.merge(selections)
+      refute StateResources.complete_item?(resource, invalid, @catalog)
+
+      assert_raise ArgumentError, ~r/absent from the served harness catalog/, fn ->
+        StateResources.encode_item(resource, invalid, @catalog)
+      end
+    end
+
     device =
       item("devices", Map.fetch!(@field_order, "devices")) |> Map.put("model", "physical-model")
 
@@ -361,6 +400,27 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
         "refs" => %{"key" => "default-priority"},
         "payload" => partial_secret
       })
+    end
+
+    complete_secret =
+      "decision requests"
+      |> item(Map.fetch!(@field_order, "decision requests"))
+      |> Map.put("context", %{"nested" => [%{"cliToken" => "tbc_secret"}]})
+
+    assert StateResources.item_shape_complete?("decision-requests", complete_secret)
+    assert StateResources.item_has_secret_fields?(complete_secret)
+
+    assert_raise ArgumentError, ~r/forbidden field/, fn ->
+      Publisher.encode_wire_notice(
+        %{
+          "class" => "decision_request.opened",
+          "op" => "upsert",
+          "occurredAt" => 1,
+          "refs" => %{"decisionRequestId" => complete_secret["id"]},
+          "payload" => complete_secret
+        },
+        @catalog
+      )
     end
   end
 

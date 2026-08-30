@@ -55,6 +55,7 @@ defmodule Tightbeam.Wire.Router do
     ColdStart,
     Devices,
     Dispatch,
+    ModelCatalog,
     Org,
     Roles,
     StateResources,
@@ -537,7 +538,7 @@ defmodule Tightbeam.Wire.Router do
          rows <- state_collection_rows(conn, spec, seam, request.filters, visible),
          {page_rows, page} <- state_page(rows, boundary, request, principal, spec, conn),
          items <- state_serialize_rows(page_rows, spec) do
-      state_send(conn, 200, state_collection_envelope(spec.resource, items, page))
+      state_send(conn, 200, state_collection_envelope(conn, spec.resource, items, page))
     else
       {:error, 404, "not_found", _message} ->
         state_not_found(conn, spec.resource, started_at)
@@ -587,7 +588,7 @@ defmodule Tightbeam.Wire.Router do
          row <- apply(StateResources, seam.query, [db(conn), id]),
          true <- not is_nil(row),
          item <- apply(StateResources, seam.serializer, [row]),
-         item_bytes <- StateResources.encode_item(spec.resource, item) do
+         item_bytes <- StateResources.encode_item(spec.resource, item, state_catalog(conn)) do
       state_send(conn, 200, state_detail_envelope(spec.resource, item_bytes))
     else
       false ->
@@ -648,7 +649,7 @@ defmodule Tightbeam.Wire.Router do
            ]) do
         {:ok, row} ->
           item = apply(StateResources, seam.serializer, [row])
-          {:ok, StateResources.encode_item(spec.resource, item)}
+          {:ok, StateResources.encode_item(spec.resource, item, state_catalog(conn))}
 
         :not_found ->
           :not_found
@@ -1103,8 +1104,9 @@ defmodule Tightbeam.Wire.Router do
     Enum.map(rows, &apply(StateResources, seam.serializer, [&1]))
   end
 
-  defp state_collection_envelope(resource, items, page) do
-    item_bytes = Enum.map_join(items, ",", &StateResources.encode_item(resource, &1))
+  defp state_collection_envelope(conn, resource, items, page) do
+    catalog = state_catalog(conn)
+    item_bytes = Enum.map_join(items, ",", &StateResources.encode_item(resource, &1, catalog))
 
     "{" <>
       ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"items":[#{item_bytes}],) <>
@@ -1154,6 +1156,13 @@ defmodule Tightbeam.Wire.Router do
   defp deps(conn), do: conn.private.tightbeam_deps
   defp db(conn), do: deps(conn)[:db] || Tightbeam.DB
   defp handlers(conn), do: Map.fetch!(deps(conn), :handlers)
+
+  defp state_catalog(conn) do
+    case deps(conn)[:model_catalog] || ModelCatalog do
+      catalog when is_map(catalog) -> catalog
+      server -> ModelCatalog.get(server)
+    end
+  end
 
   defp session_status(conn),
     do: deps(conn)[:session_status] || (&Tightbeam.Gateway.session_status/1)
