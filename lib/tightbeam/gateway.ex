@@ -1118,6 +1118,12 @@ defmodule Tightbeam.Gateway do
         work_item_disposition(db, "work-item-close", item_change),
       {"work-item-fail", ["work_item.failed"]} =>
         work_item_disposition(db, "work-item-fail", item_change),
+      {"work-item-deprioritize", ["work_item.deprioritized"]} => fn call ->
+        WorkItems.__handle__(db, "work-item-deprioritize", call)
+      end,
+      {"work-item-boundary", ["work_item.boundary_declared"]} => fn call ->
+        WorkItems.__handle__(db, "work-item-boundary", call)
+      end,
       {"assign", ["assignment.opened"]} => fn call ->
         call =
           call

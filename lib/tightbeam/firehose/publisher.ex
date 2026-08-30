@@ -12,6 +12,8 @@ defmodule Tightbeam.Firehose.Publisher do
     "work-item-reopen" => {"work_item.reopened", &StateResources.work_item/1},
     "work-item-close" => {"work_item.closed", &StateResources.work_item/1},
     "work-item-fail" => {"work_item.failed", &StateResources.work_item/1},
+    "work-item-deprioritize" => {"work_item.deprioritized", &StateResources.work_item/1},
+    "work-item-boundary" => {"work_item.boundary_declared", &StateResources.work_item/1},
     "assign" => {"assignment.opened", &StateResources.assignment/1},
     "dispatch" => {"assignment.opened", &StateResources.assignment/1},
     "reopen-assignment" => {"assignment.reopened", &StateResources.assignment/1},
@@ -43,7 +45,7 @@ defmodule Tightbeam.Firehose.Publisher do
   }
 
   @transactional_verbs MapSet.new(
-                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer return rule effort-rule operator-ask operator-rule operator-withdraw withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
+                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail work-item-deprioritize work-item-boundary assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer return rule effort-rule operator-ask operator-rule operator-withdraw withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
                        )
 
   @spec accepted(map(), term()) :: :ok

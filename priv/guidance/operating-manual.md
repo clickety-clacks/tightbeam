@@ -199,6 +199,14 @@ never paste credential bytes into a durable record.
 
     tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
 
+If you own a principal-sourced work item and must put it behind another open item,
+file the choice at that moment. Use one typed notice with the named item and a
+bounded pickup horizon, or one decision request that names both items and asks
+which wins. Triage is allowed. Quietly leaving the principal's ask behind other work is
+not. When you declare a goal boundary, give it a bounded horizon. Move the
+boundary before that horizon, or let its one-shot escalation make the stall
+visible; do not extend an unchanged boundary.
+
 Open the card against a role, never a bare session key. The card records the role it
 was opened against; opened against a session key alone it records none, and
 `assignments --role` — and every role-history question after it — cannot see it. A
