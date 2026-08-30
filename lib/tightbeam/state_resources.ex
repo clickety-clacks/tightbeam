@@ -556,8 +556,19 @@ defmodule Tightbeam.StateResources do
   def production(row), do: row |> public() |> correlate("eventId", "seq")
   def turn(row), do: row |> public() |> correlate("turnSeq", "seq")
 
-  def decision_request(%{kind: "operator", status: "ruled"} = row),
-    do: row |> Tightbeam.Escalation.terminal_operator_projection() |> public()
+  def decision_request(%{status: "ruled"} = row) do
+    unless complete_ruled_decision?(row) do
+      raise ArgumentError, "decision_request_integrity_invalid"
+    end
+
+    case row do
+      %{kind: "operator"} ->
+        row |> Tightbeam.Escalation.terminal_operator_projection() |> public()
+
+      _ ->
+        public(row)
+    end
+  end
 
   def decision_request(row), do: public(row)
   def session(row), do: public(row)
@@ -1195,6 +1206,13 @@ defmodule Tightbeam.StateResources do
 
   defp collection_item_matches?(item, filters) do
     Enum.all?(filters, fn {field, value} -> item[field] == value end)
+  end
+
+  defp complete_ruled_decision?(row) do
+    Enum.all?([value(row, :decision), value(row, :ruled_by)], fn
+      text when is_binary(text) -> String.trim(text) != ""
+      _ -> false
+    end) and is_integer(value(row, :ruled_at))
   end
 
   defp camel_key(field) do
