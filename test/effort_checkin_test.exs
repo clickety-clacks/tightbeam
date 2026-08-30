@@ -1508,6 +1508,42 @@ defmodule Tightbeam.EffortCheckinTest do
     assert Wakes.get(ctx.db, replacement.wake_id).state == "canceled"
   end
 
+  test "a forged terminal effort payload cannot cancel an open request deadline", ctx do
+    assignment = dispatch(ctx, {:session, "parent"}, "holder", "forged terminal payload")
+    request_id = open_effort_request(ctx, assignment, "parent")
+    deadline = request_deadline_wake(ctx.db, request_id)
+    drop_supervision_liveness(ctx.db, assignment.id)
+
+    command = %{
+      wake_id: deadline.wake_id,
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "obligation_disposed",
+      causal_source: %{kind: "decision_request", id: request_id},
+      outcome: %{
+        kind: "disposition",
+        disposition_kind: "decision_request_transition",
+        disposition_id: request_id,
+        terminal_request: %{
+          id: request_id,
+          kind: "effort",
+          assignment_id: assignment.id,
+          deadline_wake_id: deadline.wake_id,
+          status: "ruled",
+          decision: "continue"
+        }
+      }
+    }
+
+    assert {:ok, false} =
+             DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
+
+    assert Wakes.get(ctx.db, deadline.wake_id).state == "pending"
+
+    assert rows(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request_id]) == [
+             ["open"]
+           ]
+  end
+
   defp dispatch(ctx, principal, holder, subject) do
     assignment(ctx, "dispatch", principal, holder, %{subject: subject, brief: subject})
   end
