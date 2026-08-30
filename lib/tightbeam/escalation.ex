@@ -1606,7 +1606,10 @@ defmodule Tightbeam.Escalation do
 
       requests = Enum.map(rows, &request_from_row/1)
 
-      case Enum.find(requests, &(&1.status == "ruled" and not ruled_decision_complete?(&1))) do
+      case Enum.find(requests, fn request ->
+             request.kind != "operator" and request.status == "ruled" and
+               not ruled_decision_complete?(request)
+           end) do
         %{id: request_id} ->
           integrity_error(request_id)
 
@@ -1653,17 +1656,18 @@ defmodule Tightbeam.Escalation do
         [row] ->
           request = request_from_row(row)
 
-          if request.status == "ruled" and not ruled_decision_complete?(request) do
-            integrity_error(request.id)
-          else
-            if request.kind == "operator" and request.status in ["ruled", "consumed"] do
+          cond do
+            request.kind == "operator" and request.status in ["ruled", "consumed"] ->
               case validate_operator_terminal_in_txn(txn, request, "detail", observer) do
                 :ok -> terminal_operator_projection(request)
                 {:error, refusal} -> refusal
               end
-            else
+
+            request.status == "ruled" and not ruled_decision_complete?(request) ->
+              integrity_error(request.id)
+
+            true ->
               request
-            end
           end
 
         [] ->
@@ -1780,6 +1784,8 @@ defmodule Tightbeam.Escalation do
     request_in_txn: "any",
     request_in_txn_optional: "any",
     migrate_terminal_operator_decision_v1_in_txn: "any",
+    migrate_ruled_decision_integrity_v1_in_txn: "any",
+    preflight_ruled_decision_integrity_in_txn: "any",
     # DELEGATE: no SQL literal of its own — reaches one of the entries above
     # by a local call. `answer/2`/`return_request/2`/`ask/2`/`rule/3`/`waive/3`/`withdraw/2`/
     # `resolve/3`/`summon/4` are this module's PUBLIC VERB SURFACE, reached

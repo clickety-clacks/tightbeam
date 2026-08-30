@@ -361,6 +361,10 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
       )
     end
 
+    # Deliberately corrupt completed rows to prove the read invariant; the
+    # ruled-row CHECK correctly rejects these shapes during ordinary writes.
+    :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=ON")
+
     :ok =
       DB.execute(
         ctx.db,
@@ -372,6 +376,8 @@ defmodule Tightbeam.TerminalOperatorDecisionParityTest do
         ctx.db,
         "UPDATE decision_requests SET decision='' WHERE id='#{blank_decision.id}'"
       )
+
+    :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=OFF")
 
     for request <- [null_decision, blank_decision] do
       assert %{code: "decision_request_integrity_invalid"} =
