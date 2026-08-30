@@ -293,11 +293,17 @@ defmodule Tightbeam.Firehose.Publisher do
       {:ok, %{resource: resource}} when is_map(payload) ->
         # Some current-main producers still publish result-shaped partial maps. Only a closed
         # R7/R7a item is eligible for RawJSON; the shared encoder remains strict for REST parity.
-        if StateResources.item_shape_complete?(resource, payload) do
-          bytes = StateResources.encode_item(resource, payload)
-          JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
-        else
-          JSON.encode!(notice)
+        cond do
+          StateResources.item_shape_complete?(resource, payload) ->
+            bytes = StateResources.encode_item(resource, payload)
+            JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
+
+          StateResources.item_has_secret_fields?(payload) or
+              StateResources.item_shape_superset?(resource, payload) ->
+            raise ArgumentError, "#{resource} Publisher payload has a forbidden field"
+
+          true ->
+            JSON.encode!(notice)
         end
 
       _ ->

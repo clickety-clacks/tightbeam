@@ -219,6 +219,92 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     end
   end
 
+  test "session enums and catalog-backed values fail closed at the shared encoder" do
+    catalog = %{
+      {"testhost", "fixture"} => [
+        %{
+          family: "fixture-model",
+          context: "1m",
+          efforts: ["medium"],
+          provider: :fixture_provider
+        }
+      ]
+    }
+
+    valid =
+      "sessions"
+      |> item(Map.fetch!(@field_order, "sessions"))
+      |> Map.merge(%{
+        "harness" => "fixture",
+        "provider" => "fixture_provider",
+        "model" => "fixture-model",
+        "thinkingLevel" => "medium",
+        "modelContext" => "1m",
+        "host" => "testhost",
+        "mechanicalStatus" => "idle"
+      })
+
+    assert StateResources.complete_item?("sessions", valid, catalog)
+
+    assert StateResources.encode_item("sessions", valid, catalog) ==
+             expected_bytes("sessions", Map.fetch!(@field_order, "sessions"), valid)
+
+    for {field, value} <- [
+          {"mechanicalStatus", "wedged"},
+          {"harness", "not-a-served-harness"},
+          {"provider", "other-provider"},
+          {"model", "other-model"},
+          {"thinkingLevel", "extreme"},
+          {"modelContext", "2m"}
+        ] do
+      invalid = Map.put(valid, field, value)
+      refute StateResources.complete_item?("sessions", invalid, catalog)
+
+      assert_raise ArgumentError, fn ->
+        StateResources.encode_item("sessions", invalid, catalog)
+      end
+    end
+  end
+
+  test "Publisher rejects known item supersets and secret fields instead of using the raw fallback" do
+    canonical =
+      "config"
+      |> item(Map.fetch!(@field_order, "config"))
+
+    for payload <- [
+          Map.put(canonical, "unexpected", "storage-drift"),
+          Map.put(canonical, "cliToken", "tbc_should_never_cross_the_wire")
+        ] do
+      assert StateResources.item_shape_superset?("config", payload)
+
+      assert_raise ArgumentError, fn -> StateResources.encode_item("config", payload) end
+
+      assert_raise ArgumentError, fn ->
+        Publisher.encode_wire_notice(%{
+          "class" => "config.updated",
+          "op" => "upsert",
+          "occurredAt" => 1,
+          "refs" => %{"key" => "default-priority"},
+          "payload" => payload
+        })
+      end
+    end
+
+    partial_secret = %{"key" => "default-priority", "cliToken" => "tbc_secret"}
+    assert StateResources.item_has_secret_fields?(partial_secret)
+    refute StateResources.item_shape_superset?("config", partial_secret)
+
+    assert_raise ArgumentError, fn ->
+      Publisher.encode_wire_notice(%{
+        "class" => "config.updated",
+        "op" => "upsert",
+        "occurredAt" => 1,
+        "refs" => %{"key" => "default-priority"},
+        "payload" => partial_secret
+      })
+    end
+  end
+
   test "legacy partial notices retain their current wire path until their serializer is R7-complete" do
     notice = %{
       "class" => "work_item.created",
@@ -228,6 +314,10 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
     refute StateResources.complete_item?("work-items", notice["payload"])
     assert Publisher.encode_wire_notice(notice) == JSON.encode!(notice)
+
+    additive = put_in(notice, ["payload", "priority"], 4)
+    refute StateResources.item_shape_superset?("work-items", additive["payload"])
+    assert Publisher.encode_wire_notice(additive) == JSON.encode!(additive)
   end
 
   defp item(resource, fields) do
@@ -236,6 +326,8 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
   defp value("sessions", "overrides"),
     do: %{"guidanceExtra" => nil, "skillsAdd" => ["beta", "alpha"]}
+
+  defp value("sessions", "harness"), do: "fixture"
 
   defp value("assignments", "files"), do: ["second", "first"]
 
@@ -324,6 +416,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   defp invalid_value(:integer), do: "not-an-integer"
   defp invalid_value(:positive_integer), do: 0
   defp invalid_value(:boolean), do: "not-a-boolean"
+  defp invalid_value({:catalog, _field}), do: nil
   defp invalid_value({:enum, [value | _values]}) when is_integer(value), do: 99
   defp invalid_value({:enum, _values}), do: "outside-enum"
   defp invalid_value({:array, _type, _order}), do: %{}
