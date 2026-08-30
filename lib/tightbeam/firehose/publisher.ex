@@ -36,7 +36,6 @@ defmodule Tightbeam.Firehose.Publisher do
     "role-bind" => {"role.bound", &StateResources.role/1},
     "role-rm" => {"role.removed", &StateResources.role/1},
     "spawn" => {"session.spawned", &StateResources.session/1},
-    "retire" => {"session.retired", &StateResources.session/1},
     "add-user" => {"user.added", &StateResources.user/1},
     "read-marker-set" => {"read_marker.updated", &StateResources.read_marker/1},
     "read-marker-clear" => {"read_marker.updated", &StateResources.read_marker/1},
@@ -203,6 +202,21 @@ defmodule Tightbeam.Firehose.Publisher do
       "class" => class,
       "op" => "observe",
       "occurredAt" => System.system_time(:millisecond),
+      "refs" => refs,
+      "payload" => StateResources.observation(payload)
+    }
+
+    Txn.handoff(txn, Hub, {:publish, notice})
+  end
+
+  @doc "Queue one observational notice with the mutation's durable occurrence time."
+  @spec observation_in_txn(Txn.t(), String.t(), map(), map(), integer()) :: :ok
+  def observation_in_txn(%Txn{} = txn, class, payload, refs, occurred_at)
+      when is_integer(occurred_at) do
+    notice = %{
+      "class" => class,
+      "op" => "observe",
+      "occurredAt" => occurred_at,
       "refs" => refs,
       "payload" => StateResources.observation(payload)
     }

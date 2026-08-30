@@ -3606,8 +3606,14 @@ defmodule Tightbeam.GatewayTest do
 
     # The exit is the CALLER's: retry at the boundary. Nothing was applied,
     # nothing was queued on the caller's behalf, nothing was buried.
-    assert Org.get(ctx.db, "queued") == before
-    assert Org.get(ctx.db, "queued").cleared_through_seq == 0
+    after_refusal = Org.get(ctx.db, "queued")
+
+    assert Map.drop(after_refusal, [:mechanical_status, :updated_at]) ==
+             Map.drop(before, [:mechanical_status, :updated_at])
+
+    assert after_refusal.mechanical_status == "running"
+    assert after_refusal.updated_at > before.updated_at
+    assert after_refusal.cleared_through_seq == 0
 
     assert length(Projection.list_after(ctx.db, "queued", nil, 50, 0)) == 1,
            "a refused switch appends no tombstone"
@@ -3759,6 +3765,18 @@ defmodule Tightbeam.GatewayTest do
       model: Model.new("before-model")
     })
 
+    for content <- ["before one", "before two"] do
+      Projection.append(ctx.db, %{
+        session_key: "dup",
+        role: "user",
+        sender: "user:flynn",
+        content: content
+      })
+    end
+
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
+
     start_lane!(ctx.db, "dup")
     parent = self()
 
@@ -3801,7 +3819,9 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.count(results, &match?(%{ok: true}, &1)) == 1
     assert Enum.count(results, &match?(%{ok: false, code: "same_harness"}, &1)) == 1
 
-    assert Org.get(ctx.db, "dup").harness == "fixture"
+    updated = Org.get(ctx.db, "dup")
+    assert updated.harness == "fixture"
+    assert updated.cleared_through_seq == 2
 
     tombstones =
       ctx.db
@@ -3810,6 +3830,11 @@ defmodule Tightbeam.GatewayTest do
 
     assert length(tombstones) == 1,
            "exactly one tombstone for exactly one swap, got #{inspect(tombstones)}"
+
+    observed = observed_state_classes()
+
+    assert observed == ["session.updated"],
+           "the one harness-switch commit must expose only its final session projection, got #{inspect(observed)}"
   end
 
   describe "the substrate never elects a model (F2, Sol xhigh review)" do
@@ -7283,7 +7308,13 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "Try again once the current turn finishes"
-    assert Org.get(ctx.db, "k1") == before
+    after_refusal = Org.get(ctx.db, "k1")
+
+    assert Map.drop(after_refusal, [:mechanical_status, :updated_at]) ==
+             Map.drop(before, [:mechanical_status, :updated_at])
+
+    assert after_refusal.mechanical_status == "running"
+    assert after_refusal.updated_at > before.updated_at
     refute File.exists?(home)
     send(runner, :finish_set_harness_turn)
   end

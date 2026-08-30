@@ -246,6 +246,15 @@ defmodule Tightbeam.ColdStart do
 
   @doc false
   def classify_in_txn(%Txn{} = txn) do
+    classify_in_txn(txn, &Org.get_in_txn/2)
+  end
+
+  @doc false
+  def classify_legacy_in_txn(%Txn{} = txn) do
+    classify_in_txn(txn, &Org.get_legacy_in_txn/2)
+  end
+
+  defp classify_in_txn(txn, session_reader) do
     graph_counts = counts_in_txn(txn)
     receipts = receipt_rows(txn)
 
@@ -263,7 +272,7 @@ defmodule Tightbeam.ColdStart do
         %{state: "incomplete", counts: graph_counts, invariant: "receipt_phase_invalid"}
 
       true ->
-        classify_receipt(txn, hd(receipts), graph_counts)
+        classify_receipt(txn, hd(receipts), graph_counts, session_reader)
     end
   end
 
@@ -471,9 +480,9 @@ defmodule Tightbeam.ColdStart do
     )
   end
 
-  defp classify_receipt(txn, receipt, graph_counts) do
+  defp classify_receipt(txn, receipt, graph_counts, session_reader) do
     user = Devices.get_user_in_txn(txn, receipt.user_id)
-    root = Org.get_in_txn(txn, receipt.root_session_key)
+    root = session_reader.(txn, receipt.root_session_key)
     device = receipt.device_id && Devices.get_device_in_txn(txn, receipt.device_id)
 
     invariant =
