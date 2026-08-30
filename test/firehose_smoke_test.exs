@@ -5,7 +5,7 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
   alias Tightbeam.{ConditionFacts, Devices, Dispatch, Gateway, Harness, Org, Placement}
   alias Tightbeam.{Projection, ReadMarkers, StateResources, Wakes}
-  alias Tightbeam.Firehose.{Hub, Rebuild, Registry}
+  alias Tightbeam.Firehose.{Hub, Publisher, Rebuild, Registry}
   alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
 
   @moduledoc """
@@ -298,11 +298,53 @@ defmodule Tightbeam.FirehoseSmokeTest do
     assert "prod.fired" in Registry.observational_classes()
     assert Registry.fetch("prod.fired") == :error
 
+    condition_notice = notices["condition_fact.filed"]
+    assert condition_notice["refs"]["factId"] == condition_notice["payload"]["id"]
+    refute Map.has_key?(condition_notice["payload"], "factId")
+
+    catalog =
+      %{
+        {"testhost", "claude"} => [
+          %{provider: :anthropic, family: "fable", efforts: [], context: nil}
+        ]
+      }
+      |> Map.put_new(
+        {host, harness},
+        [
+          %{
+            provider: Harness.parse!(harness).credential_provider(),
+            family: "unused",
+            efforts: [],
+            context: nil
+          }
+        ]
+      )
+
+    shape_failures =
+      Enum.flat_map(notices, fn {class, notice} ->
+        {:ok, row} = Registry.fetch(class)
+
+        if StateResources.item_shape_complete?(row.resource, notice["payload"]) do
+          []
+        else
+          [{class, row.resource, Map.keys(notice["payload"]) |> Enum.sort()}]
+        end
+      end)
+
+    assert shape_failures == []
+
     for {class, notice} <- notices do
       assert {:ok, fresh} =
                Rebuild.fetch(fixture.db, class, notice["refs"], fixture.user_id, true)
 
       assert fresh == notice["payload"], class
+
+      {:ok, row} = Registry.fetch(class)
+      live_bytes = StateResources.encode_item(row.resource, notice["payload"], catalog)
+      rebuilt_bytes = StateResources.encode_item(row.resource, fresh, catalog)
+
+      assert rebuilt_bytes == live_bytes, class
+      assert Publisher.encode_wire_notice(notice, catalog) =~ "\"payload\":" <> live_bytes
     end
 
     older = notices["read_marker.updated"]["payload"]

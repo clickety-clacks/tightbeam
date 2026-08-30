@@ -847,13 +847,43 @@ defmodule Tightbeam.StateResources do
   end
 
   def decision_request(row), do: public(row)
-  def session(row), do: public(row)
+
+  def session(row) do
+    {model, thinking_level, model_context} = session_model_fields(row)
+
+    row =
+      row
+      |> public()
+      |> Map.drop(
+        ~w(effectiveParent effectiveParentSource identityGuidanceDigest identityRenderContract operationalParent)
+      )
+
+    row
+    |> Map.put("model", model)
+    |> Map.put("thinkingLevel", thinking_level)
+    |> Map.put("modelContext", model_context)
+  end
+
   def role(row), do: row |> public() |> correlate("role", "name")
   def artifact(row), do: public(row)
 
   def message(row) do
     stored_type = value(row, :message_type)
-    row = public(row)
+    at = value(row, :at) || value(row, :timestamp)
+
+    row =
+      row
+      |> public()
+      |> Map.delete("timestamp")
+      |> Map.put("at", at)
+      |> Map.put_new("turnSeq", nil)
+      |> Map.put_new("assignmentId", nil)
+      |> Map.put_new("jobRef", nil)
+      |> Map.put_new("harness", nil)
+      |> Map.put_new("provider", nil)
+      |> Map.put_new("model", nil)
+      |> Map.put_new("effort", nil)
+      |> Map.put_new("context", nil)
 
     case stored_type do
       nil -> Map.delete(row, "messageType")
@@ -867,12 +897,22 @@ defmodule Tightbeam.StateResources do
     fact_id = row["factId"] || row["id"]
 
     row
-    |> Map.put_new("factId", fact_id)
+    |> Map.delete("factId")
+    |> Map.put("id", fact_id)
     |> Map.put("rowVersion", fact_id)
   end
 
   def critical_state(row), do: public(row)
-  def device(row), do: row |> public() |> correlate("deviceId", "id")
+
+  def device(row) do
+    row = public(row)
+    device_id = row["deviceId"] || row["id"]
+
+    row
+    |> Map.drop(~w(id isAdmin))
+    |> Map.put("deviceId", device_id)
+  end
+
   @doc "Closed config serializer."
   def config(row) do
     reject_public_shape_drift!(row, "config")
@@ -1144,6 +1184,22 @@ defmodule Tightbeam.StateResources do
     case row[source] do
       nil -> row
       value -> Map.put_new(row, primary, value)
+    end
+  end
+
+  defp session_model_fields(row) do
+    case value(row, :model) do
+      %Tightbeam.Model{} = model ->
+        {model.family, model.effort, model.context}
+
+      %{} = model ->
+        {value(model, :family), value(model, :effort), value(model, :context)}
+
+      model when is_binary(model) ->
+        {model, value(row, :thinking_level), value(row, :model_context)}
+
+      nil ->
+        {nil, value(row, :thinking_level), value(row, :model_context)}
     end
   end
 
