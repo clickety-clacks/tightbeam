@@ -95,6 +95,13 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     env =
       [
         {~c"MIX_ENV", ~c"dev"},
+        # A leg is a real child BEAM, but it does not need the host's full
+        # scheduler count. Two parallel fixtures plus a restart can otherwise
+        # ask a busy test host for hundreds of scheduler and dirty-scheduler
+        # threads, making the replacement BEAM fail before /version binds.
+        # Bound only this test child; its gateway, sockets, persisted database,
+        # process death, and reconnect path remain real.
+        {~c"ERL_FLAGS", ~c"+S 4:4 +SDcpu 2 +SDio 2"},
         {~c"TIGHTBEAM_BASE_DIR", to_charlist(base_dir)},
         {~c"TIGHTBEAM_PORT", to_charlist(Integer.to_string(port))},
         {~c"TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS", ~c"2500"}

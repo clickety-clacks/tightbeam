@@ -9,7 +9,7 @@ defmodule Tightbeam.Firehose.Registry do
 
   @observational ~w(
     verb.accepted verb.denied rail.denied lifecycle.boot lifecycle.clean_shutdown
-    lifecycle.dirty_exit lifecycle.takeover
+    lifecycle.dirty_exit lifecycle.takeover prod.fired
   )
 
   @state_rows [
@@ -26,7 +26,6 @@ defmodule Tightbeam.Firehose.Registry do
     {"wake.scheduled", "wakes", "upsert", "wakeId"},
     {"wake.fired", "wakes", "upsert", "wakeId"},
     {"wake.canceled", "wakes", "upsert", "wakeId"},
-    {"prod.fired", "productions", "upsert", "eventId"},
     {"turn.started", "turns", "upsert", "turnSeq"},
     {"turn.ended", "turns", "upsert", "turnSeq"},
     {"decision_request.opened", "decision-requests", "upsert", "decisionRequestId"},
@@ -34,6 +33,7 @@ defmodule Tightbeam.Firehose.Registry do
     {"decision_request.returned", "decision-requests", "upsert", "decisionRequestId"},
     {"decision_request.withdrawn", "decision-requests", "upsert", "decisionRequestId"},
     {"session.spawned", "sessions", "upsert", "sessionKey"},
+    {"session.updated", "sessions", "upsert", "sessionKey"},
     {"session.retired", "sessions", "upsert", "sessionKey"},
     {"role.created", "roles", "upsert", "role"},
     {"role.bound", "roles", "upsert", "role"},
@@ -117,7 +117,6 @@ defmodule Tightbeam.Firehose.Registry do
     "assignments" => :assignment,
     "attests" => :attest,
     "wakes" => :wake,
-    "productions" => :production,
     "turns" => :turn,
     "decision-requests" => :decision_request,
     "sessions" => :session,
