@@ -706,7 +706,7 @@ defmodule Tightbeam.EffortCheckin do
             decision_disposition_command(
               txn,
               ruled,
-              liveness_trigger_in_txn!(txn, ruled.assignment_id)
+              decision_liveness_trigger_in_txn(txn, ruled.assignment_id)
             )
           )
 
@@ -1033,7 +1033,8 @@ defmodule Tightbeam.EffortCheckin do
     outcome = %{
       kind: "disposition",
       disposition_kind: "decision_request_transition",
-      disposition_id: request.id
+      disposition_id: request.id,
+      terminal_request: request
     }
 
     %{
@@ -1048,6 +1049,17 @@ defmodule Tightbeam.EffortCheckin do
     do: Map.put(outcome, :liveness_trigger, trigger)
 
   defp put_liveness_trigger(outcome, nil), do: outcome
+
+  defp decision_liveness_trigger_in_txn(txn, assignment_id) do
+    primary = decision_liveness_primary_in_txn(txn, assignment_id)
+
+    case primary && Supervision.liveness_trigger_in_txn(txn, primary) do
+      nil -> nil
+      {:ok, trigger} when is_map(trigger) -> trigger
+      :none -> nil
+      {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+    end
+  end
 
   defp liveness_trigger_in_txn!(txn, assignment_id) do
     primary = decision_liveness_primary_in_txn(txn, assignment_id)

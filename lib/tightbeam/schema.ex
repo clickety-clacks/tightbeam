@@ -39,7 +39,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "notice-batching-v1-019"
+  @shape "effort-request-exit-v1-019"
+  @effort_request_exit_previous_shape "notice-batching-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
@@ -399,6 +400,13 @@ defmodule Tightbeam.Schema do
            dispositionKind IS NOT NULL AND dispositionId IS NOT NULL AND
            ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
              livenessTriggerId IS NOT NULL AND actionNeeded = 1)
+            OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND
+             requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND
+             reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND
+             dispositionKind = 'decision_request_transition' AND
+             causalSourceId = dispositionId)
             OR
             (workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND
              livenessTriggerId IS NULL AND actionNeeded = 0)))
@@ -1072,6 +1080,96 @@ defmodule Tightbeam.Schema do
     raise ShapeError, message: "incompatible_supervision_liveness_v1: #{detail}"
   end
 
+  @doc false
+  @spec upgrade_effort_request_exit_v1(DB.server()) :: :ok
+  def upgrade_effort_request_exit_v1(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, &upgrade_effort_request_exit_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "incompatible_effort_request_exit_v1: migration failed: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp upgrade_effort_request_exit_v1_in_txn(%Txn{} = txn) do
+    case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+      [[@effort_request_exit_previous_shape]] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible_effort_request_exit_v1: predecessor stamp #{inspect(rows)}"
+    end
+
+    for name <- [
+          "wakes_typed_cancellation_required",
+          "wake_cancellations_pending_insert"
+        ] do
+      :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{name}")
+    end
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_exit_v1"
+      )
+
+    table = Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
+    :ok = Txn.exec(txn, table.sql)
+
+    columns =
+      "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+        "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+        "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+        "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_effort_exit_v1"
+      )
+
+    :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_effort_exit_v1")
+
+    for name <- [
+          "wake_cancellations_pending_insert",
+          "wakes_typed_cancellation_required"
+        ] do
+      object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+      :ok = Txn.exec(txn, object.sql)
+    end
+
+    Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+      @effort_request_exit_previous_shape,
+      @shape,
+      System.system_time(:millisecond)
+    ])
+
+    if Txn.changes(txn) != 1,
+      do: raise(ShapeError, message: "incompatible_effort_request_exit_v1: stamp race")
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible_effort_request_exit_v1: foreign key check #{inspect(rows)}"
+    end
+  end
+
   defp ensure_stamp_table(db) do
     DB.execute(db, """
     CREATE TABLE IF NOT EXISTS schema_stamp (
@@ -1085,6 +1183,9 @@ defmodule Tightbeam.Schema do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
         :ok
+
+      {:ok, [[@effort_request_exit_previous_shape]]} ->
+        upgrade_effort_request_exit_v1(db)
 
       {:ok, [[@terminal_decision_shape]]} ->
         migrate_notice_batching_v1_019(db)
@@ -1112,7 +1213,8 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
-        to #{@terminal_decision_shape}, then #{@terminal_decision_shape} to #{@shape}.
+        to #{@terminal_decision_shape}, then #{@terminal_decision_shape} to #{@shape};
+        it can also migrate #{@effort_request_exit_previous_shape} directly to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.

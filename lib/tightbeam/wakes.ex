@@ -25,7 +25,7 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Gateway, NoticeBatcher}
+  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway, NoticeBatcher}
   alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
@@ -924,7 +924,7 @@ defmodule Tightbeam.Wakes do
 
     with :ok <- compatible?(requester_id, reason_kind, source_kind, outcome_kind),
          {:ok, tagged} <-
-           validate_outcome(txn, outcome_kind, outcome, wake, primary, requester_id),
+           validate_outcome(txn, outcome_kind, outcome, wake, primary, requester_id, command),
          {:ok, durable_source_id, accepted_event_id} <-
            durable_source(txn, command, source_kind, source_id, wake, canceled_at) do
       {:ok,
@@ -1078,7 +1078,15 @@ defmodule Tightbeam.Wakes do
   defp validate_source(txn, "session_transition", source_id, _wake),
     do: row_exists(txn, "SELECT 1 FROM sessions WHERE sessionKey=?1", source_id)
 
-  defp validate_outcome(txn, "replacement", outcome, wake, primary, requester_id) do
+  defp validate_outcome(
+         txn,
+         "replacement",
+         outcome,
+         wake,
+         primary,
+         requester_id,
+         _command
+       ) do
     replacement_id = Map.get(outcome, :replacement_wake_id)
 
     with true <- primary.impact != "linked_work_not_open",
@@ -1102,14 +1110,22 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp validate_outcome(txn, "disposition", outcome, wake, primary, _requester_id) do
+  defp validate_outcome(
+         txn,
+         "disposition",
+         outcome,
+         wake,
+         primary,
+         _requester_id,
+         command
+       ) do
     disposition_kind = Map.get(outcome, :disposition_kind)
     disposition_id = Map.get(outcome, :disposition_id)
 
     with true <- disposition_kind in @disposition_kinds and is_binary(disposition_id),
          :ok <- validate_disposition(txn, disposition_kind, disposition_id),
          true <- is_nil(Map.get(outcome, :replacement_wake_id)),
-         {:ok, liveness} <- validate_required_liveness(txn, outcome, wake, primary) do
+         {:ok, liveness} <- validate_required_liveness(txn, outcome, wake, primary, command) do
       {:ok,
        Map.merge(liveness, %{
          outcome_kind: "disposition",
@@ -1122,11 +1138,19 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp validate_outcome(txn, "no_replacement", outcome, wake, primary, _requester_id) do
+  defp validate_outcome(
+         txn,
+         "no_replacement",
+         outcome,
+         wake,
+         primary,
+         _requester_id,
+         command
+       ) do
     with true <- is_nil(Map.get(outcome, :replacement_wake_id)),
          true <- is_nil(Map.get(outcome, :disposition_kind)),
          true <- is_nil(Map.get(outcome, :disposition_id)),
-         {:ok, liveness} <- validate_required_liveness(txn, outcome, wake, primary) do
+         {:ok, liveness} <- validate_required_liveness(txn, outcome, wake, primary, command) do
       {:ok,
        Map.merge(liveness, %{
          outcome_kind: "no_replacement",
@@ -1139,7 +1163,7 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp validate_required_liveness(_txn, outcome, _wake, %{impact: impact})
+  defp validate_required_liveness(_txn, outcome, _wake, %{impact: impact}, _command)
        when impact != "linked_work_open" do
     if is_nil(Map.get(outcome, :liveness_trigger)) do
       {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}}
@@ -1148,7 +1172,7 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp validate_required_liveness(txn, outcome, wake, primary) do
+  defp validate_required_liveness(txn, outcome, wake, primary, command) do
     case Map.get(outcome, :liveness_trigger) do
       %{kind: kind, id: id} when kind in @liveness_kinds and is_binary(id) ->
         case validate_liveness(txn, kind, id, wake, primary) do
@@ -1156,10 +1180,50 @@ defmodule Tightbeam.Wakes do
           :error -> :error
         end
 
+      nil ->
+        if exact_terminal_effort_request?(txn, command, outcome, wake, primary),
+          do: {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}},
+          else: :error
+
       _ ->
         :error
     end
   end
+
+  # An open effort request is itself the agent's exit. Once the current
+  # expecter transitions that exact request, the transition is sufficient
+  # typed proof to cancel only its own deadline controller. This does not
+  # stand in for liveness on any other wake: every identity and carrier field
+  # is joined back to the terminal request row in this transaction.
+  defp exact_terminal_effort_request?(
+         txn,
+         command,
+         %{
+           kind: "disposition",
+           disposition_kind: "decision_request_transition",
+           disposition_id: request_id
+         },
+         %{
+           wake_id: wake_id,
+           assignment_id: assignment_id,
+           consumer: "effort_deadline"
+         },
+         %{kind: "assignment", id: assignment_id, impact: "linked_work_open"}
+       ) do
+    with %{
+           requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+           reason_kind: "obligation_disposed",
+           causal_source: %{kind: "decision_request", id: ^request_id}
+         } <- command,
+         %{id: ^request_id, assignment_id: ^assignment_id, deadline_wake_id: ^wake_id} <-
+           Escalation.effort_terminal_in_txn(txn, request_id) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp exact_terminal_effort_request?(_txn, _command, _outcome, _wake, _primary), do: false
 
   # The plain 3-arity form is every OTHER caller of this check (today, only
   # `validate_liveness/5`'s `pending_wake` clause, which is not a batcher

@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "notice-batching-v1-019"
+  @shape "effort-request-exit-v1-019"
+  @effort_request_exit_previous_shape "notice-batching-v1-019"
   @terminal_decision_shape "terminal-operator-decision-parity-v1"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
@@ -788,6 +789,56 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the exact notice-batching predecessor widens effort cancellation and preserves the stamp",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    {:ok, [[current_ddl]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+      )
+
+    effort_arm =
+      ~r/\n\s+OR\n\s+\(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND\n\s+livenessTriggerId IS NULL AND actionNeeded = 0 AND\n\s+requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND\n\s+reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND\n\s+dispositionKind = 'decision_request_transition' AND\n\s+causalSourceId = dispositionId\)/
+
+    predecessor_ddl = Regex.replace(effort_arm, current_ddl, "", global: false)
+    refute predecessor_ddl == current_ddl
+
+    refute predecessor_ddl =~
+             "reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND\n" <>
+               "      dispositionKind = 'decision_request_transition' AND\n" <>
+               "      causalSourceId = dispositionId)"
+
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER wakes_typed_cancellation_required;
+      DROP TRIGGER wake_cancellations_pending_insert;
+      ALTER TABLE wake_cancellations RENAME TO wake_cancellations_current;
+      #{predecessor_ddl};
+      DROP TABLE wake_cancellations_current;
+      UPDATE schema_stamp
+        SET shape='#{@effort_request_exit_previous_shape}', stampedAt=1;
+      """)
+
+    assert {:ok, [[@effort_request_exit_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    {:ok, [[migrated_ddl]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+      )
+
+    assert migrated_ddl =~ "requesterId = 'tightbeam:effort-checkin'"
+
+    assert object_sql(db, "trigger", "wakes_typed_cancellation_required") =~
+             "pendingwakecancellationrequirestypedprovenance"
   end
 
   test "the real be61 decision-request shape is refused before it can be read", %{db: db} do
