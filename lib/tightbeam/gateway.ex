@@ -212,7 +212,12 @@ defmodule Tightbeam.Gateway do
     reload_law!(config, Map.keys(handler_table))
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
-    adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
+    adapter_config =
+      config
+      |> Map.put(:cli_bin, cli_bin)
+      |> Map.put(:db, db)
+      |> Map.put(:codex_usage, Tightbeam.CodexUsage)
+
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
 
     adapter_opts = fn key, context ->
@@ -327,11 +332,13 @@ defmodule Tightbeam.Gateway do
          sweep_ms: config.wake_tick_ms,
          name: Tightbeam.Supervision},
         {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
+        {Tightbeam.CodexUsage, name: Tightbeam.CodexUsage},
         {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
         {Tightbeam.AdapterCoordinator,
          adapter_sup: Tightbeam.AdapterSupervisor,
          adapter_context: adapter_context,
          adapter_opts: adapter_opts,
+         codex_usage: Tightbeam.CodexUsage,
          db: db,
          name: Tightbeam.AdapterCoordinator},
         {Tightbeam.Productions.BubbleSweeper, db: db},
@@ -2171,6 +2178,16 @@ defmodule Tightbeam.Gateway do
           end
 
         credential_kind = credential_kind(session)
+        auth_mode = auth_mode(credential_kind)
+
+        usage =
+          case credential_kind do
+            kind when kind in ["apiKey", "subscription", "none"] ->
+              usage_projection(adapter_key(session), kind)
+
+            _error ->
+              nil
+          end
 
         payload = %{
           # sessionKey is REQUIRED by the client's SessionStatus decoder — its
@@ -2194,7 +2211,7 @@ defmodule Tightbeam.Gateway do
             harness: session.harness,
             host: session.host,
             credentialKind: credential_kind,
-            authMode: nil,
+            authMode: auth_mode,
             reasoningLevel: session.model && session.model.effort,
             thinkingLevel: nil,
             fastMode: nil,
@@ -2257,6 +2274,8 @@ defmodule Tightbeam.Gateway do
               )
           }
         }
+
+        payload = Tightbeam.CodexUsage.merge_status(payload, usage)
 
         case credential_kind do
           {:error, reason} ->
@@ -2496,6 +2515,26 @@ defmodule Tightbeam.Gateway do
   defp wire_credential_kind(:api_key), do: "apiKey"
   defp wire_credential_kind(:subscription), do: "subscription"
   defp wire_credential_kind(:none), do: "none"
+
+  defp auth_mode("apiKey"), do: "api_key"
+  defp auth_mode("subscription"), do: "oauth"
+  defp auth_mode("none"), do: nil
+  defp auth_mode({:error, _reason}), do: nil
+
+  defp usage_projection({harness, _identity, _host} = key, wire_kind) do
+    if Harness.usage_capture?(harness) do
+      case Process.whereis(Tightbeam.CodexUsage) do
+        nil -> nil
+        _pid -> Tightbeam.CodexUsage.project(Tightbeam.CodexUsage, key, usage_kind(wire_kind))
+      end
+    else
+      nil
+    end
+  end
+
+  defp usage_kind("apiKey"), do: :api_key
+  defp usage_kind("subscription"), do: :subscription
+  defp usage_kind("none"), do: :none
 
   defp defaults(config, db) do
     module = Harness.module!(config.default_harness)
@@ -7254,6 +7293,8 @@ defmodule Tightbeam.Gateway do
   end
 
   defp start_provider_runtime(provider, kind, machine) do
+    Tightbeam.CodexUsage.binding_changed(Tightbeam.CodexUsage, provider, machine)
+
     {started, failed} =
       Enum.reduce(harnesses_for_provider(provider), {[], []}, fn module, {started, failed} ->
         key = {module.id(), "shared", machine}

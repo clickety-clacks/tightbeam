@@ -1332,6 +1332,58 @@ defmodule Tightbeam.Wire.RouterTest do
     refute conn.resp_body =~ "apiKey"
   end
 
+  test "session status serializes the OpenClaw-compatible Codex usage shape additively", ctx do
+    key = "codex-usage-status"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    status = %{
+      session_key: key,
+      metadata_context_generation: "mcg-7",
+      session_usage: %{input_tokens: 12},
+      display: %{
+        auth_mode: "oauth",
+        codex_usage: %{
+          freshness: "fresh",
+          fetched_at: 1_770_000_000_000,
+          windows: [
+            %{label: "5h", remaining_percent: 72, reset_at: 1_770_003_600_000},
+            %{label: "Week", remaining_percent: 41, reset_at: nil}
+          ]
+        }
+      }
+    }
+
+    opts = Keyword.put(ctx.opts, :session_status, fn ^key -> status end)
+
+    conn =
+      Plug.Test.conn(:get, "/api/session-status?sessionKey=#{key}")
+      |> Plug.Conn.put_req_header("authorization", "Bearer " <> ctx.device.token)
+      |> Router.call(Router.init(opts))
+
+    assert conn.status == 200
+
+    assert JSON.decode!(conn.resp_body) == %{
+             "sessionKey" => key,
+             "metadataContextGeneration" => "mcg-7",
+             "sessionUsage" => %{"inputTokens" => 12},
+             "display" => %{
+               "authMode" => "oauth",
+               "codexUsage" => %{
+                 "freshness" => "fresh",
+                 "fetchedAt" => 1_770_000_000_000,
+                 "windows" => [
+                   %{
+                     "label" => "5h",
+                     "remainingPercent" => 72,
+                     "resetAt" => 1_770_003_600_000
+                   },
+                   %{"label" => "Week", "remainingPercent" => 41, "resetAt" => nil}
+                 ]
+               }
+             }
+           }
+  end
+
   test "facts-read routes as a read verb and list sessions use createdAt on the wire", ctx do
     parent = self()
 

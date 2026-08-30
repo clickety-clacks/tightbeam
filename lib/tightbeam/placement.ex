@@ -1341,6 +1341,7 @@ defmodule Tightbeam.Placement do
       process_identity_dir: host_config.base_dir,
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
       on_auth_event: auth_event_handler(config, host, module),
+      on_usage_event: usage_event_handler(config, key),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
     ]
@@ -1488,6 +1489,14 @@ defmodule Tightbeam.Placement do
 
         :ok
       end
+    end
+  end
+
+  defp usage_event_handler(config, key) do
+    cache = Map.get(config, :codex_usage, Tightbeam.CodexUsage)
+
+    fn {:adapter_event, adapter, event} ->
+      Tightbeam.CodexUsage.adapter_event(cache, key, adapter, event)
     end
   end
 

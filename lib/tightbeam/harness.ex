@@ -92,10 +92,12 @@ defmodule Tightbeam.Harness do
               {:ok, %{bin: String.t(), version: String.t()}}
               | {:error, :not_found | {:exec_failed, String.t()}}
   @callback classify_auth_event(map()) :: :terminal | :transient | :unknown
+  @callback usage_snapshot(map()) :: map()
+  @callback usage_update(map()) :: map() | nil
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
-  @optional_callbacks warm_home: 2
+  @optional_callbacks warm_home: 2, usage_snapshot: 1, usage_update: 1
 
   @callback conformance_vectors() :: %{
               required(String.t()) => [
@@ -135,6 +137,14 @@ defmodule Tightbeam.Harness do
   def module!(id) when is_atom(id) do
     Enum.find(all(), &(&1.id() == id)) ||
       raise ArgumentError, "unknown harness: #{inspect(id)}"
+  end
+
+  @doc false
+  def usage_capture?(harness) do
+    module = module!(harness)
+
+    function_exported?(module, :usage_snapshot, 1) and
+      function_exported?(module, :usage_update, 1)
   end
 
   @doc "Parse a wire harness name, raising instead of selecting another harness."

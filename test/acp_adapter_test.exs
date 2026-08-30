@@ -196,6 +196,10 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "initialize":
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 75);
         return send({ id: m.id, result: { protocolVersion: 1 } });
+      case "_codex/account/rate_limits/read":
+        capture(m);
+        if (failMode === "usage-read-stall") return;
+        return send({ id: m.id, result: { rateLimits: { primary: { usedPercent: 28, windowDurationMins: 300, resetsAt: null }, secondary: null } } });
       case "session/new": {
         newCalls += 1;
         capture(m);
@@ -447,6 +451,12 @@ defmodule Tightbeam.Acp.AdapterTest do
         end
       end)
       |> then(fn adapter_opts ->
+        case Keyword.get(opts, :on_usage_event) do
+          nil -> adapter_opts
+          handler -> Keyword.put(adapter_opts, :on_usage_event, handler)
+        end
+      end)
+      |> then(fn adapter_opts ->
         case Keyword.get(opts, :on_subagent_event) do
           nil -> adapter_opts
           handler -> Keyword.put(adapter_opts, :on_subagent_event, handler)
@@ -574,6 +584,14 @@ defmodule Tightbeam.Acp.AdapterTest do
       captured? -> :ok
       attempts == 0 -> flunk("request #{config_id}=#{value} was not captured")
       true -> Process.sleep(10) && assert_request_captured(path, config_id, value, attempts - 1)
+    end
+  end
+
+  defp assert_method_captured(path, method, attempts \\ 500) do
+    cond do
+      Enum.any?(captured_requests(path), &(&1["method"] == method)) -> :ok
+      attempts == 0 -> flunk("request #{method} was not captured")
+      true -> Process.sleep(10) && assert_method_captured(path, method, attempts - 1)
     end
   end
 
@@ -1211,6 +1229,62 @@ defmodule Tightbeam.Acp.AdapterTest do
                         }
                       }
                     }}
+  end
+
+  test "Codex usage reads do not block adapter session work" do
+    owner = self()
+
+    {adapter, capture_path} =
+      start_adapter(
+        harness: :codex,
+        fail_mode: "usage-read-stall",
+        on_usage_event: &send(owner, &1)
+      )
+
+    claim = %{generation: "g", incarnation: make_ref(), refresh: make_ref()}
+    Adapter.request_codex_usage(adapter, claim)
+    assert_method_captured(capture_path, "_codex/account/rate_limits/read")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("gpt-5.6-sol"), "/tmp", [], "guidance")
+
+    refute_receive {:adapter_event, ^adapter, {:full, ^claim, _result}}
+  end
+
+  test "forwarded rate-limit updates are sanitized before the usage callback" do
+    owner = self()
+
+    {adapter, _capture_path} =
+      start_adapter(harness: :codex, on_usage_event: &send(owner, &1))
+
+    raw = %{
+      "rateLimits" => %{
+        "primary" => %{
+          "usedPercent" => 28,
+          "windowDurationMins" => 300,
+          "resetsAt" => nil,
+          "account" => "PRIVATE-ACCOUNT"
+        },
+        "credits" => "PRIVATE-CREDIT"
+      }
+    }
+
+    send(
+      adapter,
+      {:acp_notification, "session/update",
+       %{
+         "sessionId" => "sess-1",
+         "update" => %{
+           "sessionUpdate" => "session_info_update",
+           "_meta" => %{"codex" => %{"rateLimitsUpdated" => raw}}
+         }
+       }}
+    )
+
+    assert_receive {:adapter_event, ^adapter, {:sparse, sparse, fetched_at}}
+    assert is_integer(fetched_at)
+    assert sparse == %{primary: %{used_percent: 28, duration: 300}}
+    refute inspect(sparse) =~ "PRIVATE"
   end
 
   # FAIL-BEFORE: against the tree preceding #99 new returned the raw JSON-RPC
