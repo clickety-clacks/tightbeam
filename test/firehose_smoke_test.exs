@@ -8,11 +8,14 @@ defmodule Tightbeam.FirehoseSmokeTest do
   alias Tightbeam.Firehose.{Hub, Rebuild, Registry}
   alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
 
+  @a4_replay_seed {7_913, 10_007, 65_537}
+
   @moduledoc """
   Firehose acceptance map: A1 and A3 are automated by the closed inventories,
   real source commits, filter matrix, and visibility-first probes in
-  `Tightbeam.Firehose.RegistryProofTest`, with this real WebSocket journey as
-  the representative public-boundary witness. A5 slow-consumer
+  `Tightbeam.Firehose.RegistryProofTest`. A4 drives all rebuildable classes
+  through the real WebSocket and compares the incremental model with a fresh
+  authoritative rebuild after every delivery. A5 slow-consumer
   4008/reconnect/rebuild is automated here. `Tightbeam.FirehoseRestartSmokeTest`
   keeps that Card 1 journey in the normal suite and adds automated A5 gateway-kill
   recovery and A7 external-client restart proof on Linux and macOS CI.
@@ -20,6 +23,13 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
   test "authoritative production rebuild closes the current Registry both ways" do
     fixture = start_fixture!()
+
+    ws =
+      Fixture.connect(fixture,
+        subscription_id: "a4-authoritative",
+        filters: %{"classes" => Rebuild.classes()}
+      )
+
     :ok = Hub.register(fixture.hub, self())
     on_exit(fn -> Hub.unregister(fixture.hub, self()) end)
 
@@ -305,6 +315,11 @@ defmodule Tightbeam.FirehoseSmokeTest do
       assert fresh == notice["payload"], class
     end
 
+    :ok = Hub.unregister(fixture.hub, self())
+    ws = assert_a4_websocket_convergence(fixture, ws, notices)
+    :ok = WS.close(ws)
+    :ok = Hub.register(fixture.hub, self())
+
     older = notices["read_marker.updated"]["payload"]
 
     latest =
@@ -506,6 +521,81 @@ defmodule Tightbeam.FirehoseSmokeTest do
     fixture = Fixture.start!(opts)
     on_exit(fn -> assert :ok = Fixture.stop(fixture) end)
     fixture
+  end
+
+  # The frames begin as real committed production projections. The altered
+  # version is an adversarial transport replay: it must leave the client model
+  # at the same fresh authoritative state as the duplicate does.
+  defp assert_a4_websocket_convergence(fixture, ws, notices) do
+    {model, ws} =
+      Enum.reduce(1..map_size(notices), {%{}, ws}, fn _, {model, ws} ->
+        {notice, ws} = Fixture.recv_change(ws)
+        fresh = assert_a4_fresh!(fixture, notice)
+        model = apply_a4_notice(model, notice)
+        assert model[a4_key(notice)].payload == fresh
+        {model, ws}
+      end)
+
+    {model, ws} = replay_a4_orders(fixture, ws, model, notices)
+
+    assert map_size(model) == map_size(notices)
+    ws
+  end
+
+  defp assert_a4_fresh!(fixture, notice) do
+    assert {:ok, fresh} =
+             Rebuild.fetch(
+               fixture.db,
+               notice["class"],
+               notice["refs"],
+               fixture.user_id,
+               true
+             )
+
+    fresh
+  end
+
+  defp apply_a4_notice(model, notice) do
+    key = a4_key(notice)
+    version = notice["payload"]["rowVersion"]
+
+    case model do
+      %{^key => %{version: current}} when current >= version -> model
+      _ -> Map.put(model, key, %{version: version, payload: notice["payload"]})
+    end
+  end
+
+  defp a4_key(notice), do: {notice["class"], notice["refs"]}
+
+  defp canonical_notice(notice),
+    do: Map.take(notice, ["class", "occurredAt", "op", "payload", "refs", "resource"])
+
+  defp replay_a4_orders(fixture, ws, model, notices) do
+    random = :rand.seed_s(:exsplus, @a4_replay_seed)
+
+    {replays, _random} =
+      notices
+      |> Enum.sort_by(fn {class, _notice} -> class end)
+      |> Enum.map_reduce(random, fn {_class, notice}, random ->
+        {choice, random} = :rand.uniform_s(2, random)
+        order = if choice == 1, do: [:duplicate, :older], else: [:older, :duplicate]
+        {{notice, order}, random}
+      end)
+
+    Enum.reduce(replays, {model, ws}, fn {notice, order}, {model, ws} ->
+      older = put_in(notice, ["payload", "rowVersion"], notice["payload"]["rowVersion"] - 1)
+
+      Enum.reduce(order, {model, ws}, fn replay, {model, ws} ->
+        outbound = if replay == :duplicate, do: notice, else: older
+        :ok = Hub.publish(fixture.hub, outbound)
+        {received, ws} = Fixture.recv_change(ws)
+        assert canonical_notice(received) == outbound
+        fresh = assert_a4_fresh!(fixture, received)
+        model = apply_a4_notice(model, received)
+        assert model[a4_key(received)].payload == fresh
+        {model, ws}
+      end)
+    end)
   end
 
   defp firehose_call(verb, params) do
