@@ -52,6 +52,10 @@ defmodule Tightbeam.WorkItems do
     CHECK((specRefName IS NULL) = (specRefSha256 IS NULL)),
     CHECK((createdByUser IS NOT NULL) != (createdBySession IS NOT NULL))
   );
+  CREATE TABLE IF NOT EXISTS work_item_versions (
+    workItemId TEXT PRIMARY KEY REFERENCES work_items(id),
+    rowVersion INTEGER NOT NULL CHECK(rowVersion > 0)
+  );
   CREATE INDEX IF NOT EXISTS work_items_created_in_turn ON work_items (createdInTurnSeq)
   """
 
@@ -101,6 +105,7 @@ defmodule Tightbeam.WorkItems do
               id = "wi_" <> Tightbeam.Id.uuid4()
               created_in_turn_seq = running_turn_seq(txn, created_by_session)
               priority = call.params[:priority] || default_priority_in_txn(txn)
+              created_at = now()
 
               Txn.q(
                 txn,
@@ -121,11 +126,12 @@ defmodule Tightbeam.WorkItems do
                   created_by_user,
                   created_by_session,
                   created_in_turn_seq,
-                  now()
+                  created_at
                 ]
               )
 
               put_priority_in_txn(txn, id, priority)
+              stamp_version_in_txn(txn, id, created_at)
 
               routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
 
@@ -253,7 +259,10 @@ defmodule Tightbeam.WorkItems do
           end
 
           updated = fetch_in_txn(txn, item.id)
-          {:updated, updated, metadata(item) != metadata(updated)}
+          changed? = metadata(item) != metadata(updated)
+
+          if changed?, do: stamp_version_in_txn(txn, item.id, now())
+          {:updated, fetch_in_txn(txn, item.id), changed?}
         end
     end
   end
@@ -413,6 +422,7 @@ defmodule Tightbeam.WorkItems do
 
           true ->
             apply_disposition(txn, item, verb, target, reason)
+            stamp_version_in_txn(txn, id, now())
             disposed = fetch_in_txn(txn, id)
 
             # The item keeps its CURRENT state only, and reopen nulls failReason;
@@ -920,11 +930,26 @@ defmodule Tightbeam.WorkItems do
 
   defp now, do: System.system_time(:millisecond)
 
+  # A timestamp alone repeats when two writes share one millisecond. The
+  # sidecar makes the public version strict without changing product fields.
+  defp stamp_version_in_txn(txn, work_item_id, proposed) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO work_item_versions (workItemId, rowVersion) VALUES (?1, ?2)
+      ON CONFLICT(workItemId) DO UPDATE
+      SET rowVersion = MAX(excluded.rowVersion, work_item_versions.rowVersion + 1)
+      """,
+      [work_item_id, proposed]
+    )
+  end
+
   # The wake-id columns are INTERNAL substrate truth — never surfaced in a
   # response object (§Response shapes).
   defp columns do
     "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
       "routingWakeId, slateWakeId, createdByUser, createdBySession, createdAt, " <>
+      "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId = work_items.id), createdAt), " <>
       "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
       "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER))"
   end
@@ -943,6 +968,7 @@ defmodule Tightbeam.WorkItems do
          user,
          session,
          created_at,
+         row_version,
          priority
        ]) do
     %{
@@ -959,6 +985,7 @@ defmodule Tightbeam.WorkItems do
       createdByUser: user,
       createdBySession: session,
       createdAt: created_at,
+      rowVersion: row_version,
       priority: priority
     }
   end

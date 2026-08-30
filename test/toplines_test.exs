@@ -1,7 +1,7 @@
 defmodule Tightbeam.ToplinesTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, ExecutionMap, Model, Org, Toplines}
+  alias Tightbeam.{DB, ExecutionMap, Model, Org, Toplines, WorkItems}
 
   setup do
     db = :"durable_toplines_#{System.unique_integer([:positive])}"
@@ -649,6 +649,70 @@ defmodule Tightbeam.ToplinesTest do
     assert Toplines.public_item(composed).dependencyVersion == expected_digest
   end
 
+  test "Work Item mutation advances its rowVersion and the composed dependency digest", ctx do
+    work_item!(ctx.db, "wi_mutation", "flynn")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE work_item_versions SET rowVersion = 9000000000000000 WHERE workItemId = 'wi_mutation'"
+      )
+
+    topline =
+      Toplines.create(
+        ctx.db,
+        call({:user, "flynn"}, %{title: "Mutation", idempotency_key: "mutation-create"}, 42)
+      ).topline
+
+    Toplines.link_work(
+      ctx.db,
+      call(
+        {:user, "flynn"},
+        %{
+          topline_id: topline.id,
+          work_item_id: "wi_mutation",
+          reason: "mutation",
+          idempotency_key: "mutation-link"
+        },
+        43
+      )
+    )
+
+    [before] = Toplines.query_public(ctx.db, %{principal: {:user, "flynn"}, state: ["open"]})
+    before_item = Toplines.public_item(before)
+    assert [%{workItemTitle: "Work wi_mutation"}] = before_item.workMemberships
+
+    updated =
+      WorkItems.__handle__(
+        ctx.db,
+        "work-item-update",
+        call({:user, "flynn"}, %{work_item_id: "wi_mutation", title: "After"}, 44)
+      )
+
+    assert updated.rowVersion == 9_000_000_000_000_001
+
+    [after_update] =
+      Toplines.query_public(ctx.db, %{principal: {:user, "flynn"}, state: ["open"]})
+
+    after_item = Toplines.public_item(after_update)
+    assert [%{workItemTitle: "After"}] = after_item.workMemberships
+    refute after_item.dependencyVersion == before_item.dependencyVersion
+
+    unchanged =
+      WorkItems.__handle__(
+        ctx.db,
+        "work-item-update",
+        call({:user, "flynn"}, %{work_item_id: "wi_mutation", title: "After"}, 45)
+      )
+
+    assert unchanged.rowVersion == updated.rowVersion
+
+    [after_noop] =
+      Toplines.query_public(ctx.db, %{principal: {:user, "flynn"}, state: ["open"]})
+
+    assert Toplines.public_item(after_noop).dependencyVersion == after_item.dependencyVersion
+  end
+
   test "the frozen in-transaction placement seam stores one pending episode and resolution",
        ctx do
     work_item!(ctx.db, "wi_place", "flynn")
@@ -864,6 +928,13 @@ defmodule Tightbeam.ToplinesTest do
         VALUES (?1, ?2, ?3, 'open', ?3, 1, 1)
         """,
         [id, "Work #{id}", owner]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO work_item_versions (workItemId, rowVersion) VALUES (?1, 1)",
+        [id]
       )
 
     id
