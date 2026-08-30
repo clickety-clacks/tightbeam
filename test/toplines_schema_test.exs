@@ -156,10 +156,42 @@ defmodule Tightbeam.ToplinesSchemaTest do
     end
   end
 
+  test "an after-commit database crash restarts with the exact stamped shape and rows" do
+    unique = System.unique_integer([:positive])
+    db = :"toplines_schema_restart_#{unique}"
+    path = Path.join(System.tmp_dir!(), "toplines-schema-restart-#{unique}.db")
+
+    on_exit(fn ->
+      if pid = Process.whereis(db), do: GenServer.stop(pid)
+      Enum.each([path, path <> "-shm", path <> "-wal"], &File.rm/1)
+    end)
+
+    {:ok, first} = DB.start_link(path: path, name: db)
+    Process.unlink(first)
+    seed_base_schema!(db)
+    assert :ok = ToplinesSchema.activate(db, 123)
+    insert_topline!(db, "Durable")
+    before = snapshot(db)
+
+    monitor = Process.monitor(first)
+    Process.exit(first, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^first, :killed}, 1_000
+
+    {:ok, second} = DB.start_link(path: path, name: db)
+    Process.unlink(second)
+    assert :ok = ToplinesSchema.activate(db, 999)
+    assert snapshot(db) == before
+  end
+
   defp base_db! do
     db = :"toplines_schema_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db}, id: db)
 
+    seed_base_schema!(db)
+    db
+  end
+
+  defp seed_base_schema!(db) do
     :ok =
       DB.execute(
         db,
@@ -183,8 +215,6 @@ defmodule Tightbeam.ToplinesSchemaTest do
           VALUES ('wi_one', 'Work', 'mike', 'open');
         """
       )
-
-    db
   end
 
   defp activated_db! do
