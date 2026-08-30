@@ -361,7 +361,7 @@ defmodule Tightbeam.ColdStartTest do
              "action" => "choose pair-first or host-local bootstrap"
            }
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v12"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -460,6 +460,7 @@ defmodule Tightbeam.ColdStartTest do
       assert migration_snapshot(db) == before
 
       assert :ok = Schema.upgrade_cold_start_v1(db)
+      assert :ok = Schema.ensure_all(db)
       assert %{"state" => "claimed", "cause" => "v5_observed"} = ColdStart.state(db)
     end
   end

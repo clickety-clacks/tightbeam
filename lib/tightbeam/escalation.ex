@@ -1665,6 +1665,7 @@ defmodule Tightbeam.Escalation do
     answer_open: "agent",
     return_open: "agent",
     effort_open_by_deadline_wake_in_txn: "effort",
+    effort_terminal_in_txn: "effort",
     effort_insert_in_txn: "effort",
     effort_id_by_generation_in_txn: "effort",
     effort_supersede_open_in_txn: "effort",
@@ -1750,6 +1751,19 @@ defmodule Tightbeam.Escalation do
            txn,
            "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'effort' AND status = 'open' AND deadlineWakeId = ?1",
            [wake_id]
+         ) do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
+  @doc "EFFORT ONLY: the durable terminal request for an exact id, if present."
+  @spec effort_terminal_in_txn(Txn.t(), String.t()) :: map() | nil
+  def effort_terminal_in_txn(txn, request_id) do
+    case Txn.q(
+           txn,
+           "SELECT #{@request_columns} FROM decision_requests WHERE kind = 'effort' AND id = ?1 AND status = 'ruled' AND decision IN ('continue', 'dismiss')",
+           [request_id]
          ) do
       [row] -> request_from_row(row)
       [] -> nil

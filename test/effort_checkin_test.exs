@@ -1389,6 +1389,161 @@ defmodule Tightbeam.EffortCheckinTest do
     end
   end
 
+  test "an exact effort transition cancels its own deadline after supervision liveness disappears",
+       ctx do
+    for action <- ["continue", "dismiss"] do
+      assignment = dispatch(ctx, {:session, "parent"}, "holder", "stale #{action}")
+      request_id = open_effort_request(ctx, assignment, "parent")
+      deadline = request_deadline_wake(ctx.db, request_id)
+      drop_supervision_liveness(ctx.db, assignment.id)
+
+      assert %{code: "not_authorized", message: "current expecter required"} =
+               EffortCheckin.rule(
+                 ctx.db,
+                 ctx.config,
+                 %{
+                   verb: "effort-rule",
+                   origin: "user:h2",
+                   principal: {:user, "h2"},
+                   session_key: nil,
+                   params: %{request: request_id, action: action}
+                 }
+               )
+
+      actor = "session:parent"
+
+      assert %{
+               id: ^request_id,
+               kind: "effort",
+               assignment_id: assignment_id,
+               deadline_wake_id: deadline_wake_id,
+               status: "ruled",
+               decision: ^action,
+               ruled_by: ^actor
+             } =
+               EffortCheckin.rule(
+                 ctx.db,
+                 ctx.config,
+                 effort_rule_call("parent", request_id, action)
+               )
+
+      assert assignment_id == assignment.id
+      assert deadline_wake_id == deadline.wake_id
+      assert Wakes.get(ctx.db, deadline.wake_id).state == "canceled"
+
+      assert %{
+               requester: "tightbeam:effort-checkin",
+               reason: "obligation_disposed",
+               source_kind: "decision_request",
+               source_id: ^request_id,
+               outcome: "disposition",
+               disposition_kind: "decision_request_transition",
+               disposition_id: ^request_id,
+               liveness_kind: nil,
+               liveness_id: nil,
+               action_needed: 0
+             } = cancellation(ctx.db, deadline.wake_id)
+    end
+  end
+
+  test "the terminal effort exception rejects mismatched requests and follows a concurrent deadline",
+       ctx do
+    mismatched = dispatch(ctx, {:session, "parent"}, "holder", "mismatched deadline")
+    mismatched_request = open_effort_request(ctx, mismatched, "parent")
+    mismatched_deadline = request_deadline_wake(ctx.db, mismatched_request)
+    drop_supervision_liveness(ctx.db, mismatched.id)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET status='ruled',decision='continue',ruledBy='session:parent',ruledAt=1 WHERE id=?1",
+               [mismatched_request]
+             )
+
+    unrelated =
+      Wakes.schedule(ctx.db, %{
+        session_key: "parent",
+        origin: "process:tightbeam",
+        consumer: "effort_deadline",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: mismatched.id
+      })
+
+    command = %{
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "obligation_disposed",
+      causal_source: %{kind: "decision_request", id: mismatched_request},
+      outcome: %{
+        kind: "disposition",
+        disposition_kind: "decision_request_transition",
+        disposition_id: mismatched_request
+      }
+    }
+
+    assert {:ok, false} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, unrelated.wake_id))
+             end)
+
+    assert Wakes.get(ctx.db, unrelated.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, mismatched_deadline.wake_id).state == "pending"
+
+    raced = dispatch(ctx, {:session, "parent"}, "holder", "deadline advanced first")
+    raced_request = open_effort_request(ctx, raced, "parent")
+    first_deadline = request_deadline_wake(ctx.db, raced_request)
+    drop_supervision_liveness(ctx.db, raced.id)
+
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, first_deadline)
+    replacement = request_deadline_wake(ctx.db, raced_request)
+    refute replacement.wake_id == first_deadline.wake_id
+
+    assert %{id: ^raced_request, status: "ruled", decision: "continue"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call("parent", raced_request, "continue")
+             )
+
+    assert Wakes.get(ctx.db, first_deadline.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, replacement.wake_id).state == "canceled"
+  end
+
+  test "a forged terminal effort payload cannot cancel an open request deadline", ctx do
+    assignment = dispatch(ctx, {:session, "parent"}, "holder", "forged terminal payload")
+    request_id = open_effort_request(ctx, assignment, "parent")
+    deadline = request_deadline_wake(ctx.db, request_id)
+    drop_supervision_liveness(ctx.db, assignment.id)
+
+    command = %{
+      wake_id: deadline.wake_id,
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "obligation_disposed",
+      causal_source: %{kind: "decision_request", id: request_id},
+      outcome: %{
+        kind: "disposition",
+        disposition_kind: "decision_request_transition",
+        disposition_id: request_id,
+        terminal_request: %{
+          id: request_id,
+          kind: "effort",
+          assignment_id: assignment.id,
+          deadline_wake_id: deadline.wake_id,
+          status: "ruled",
+          decision: "continue"
+        }
+      }
+    }
+
+    assert {:ok, false} =
+             DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
+
+    assert Wakes.get(ctx.db, deadline.wake_id).state == "pending"
+
+    assert rows(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request_id]) == [
+             ["open"]
+           ]
+  end
+
   defp dispatch(ctx, principal, holder, subject) do
     assignment(ctx, "dispatch", principal, holder, %{subject: subject, brief: subject})
   end
@@ -1529,6 +1684,19 @@ defmodule Tightbeam.EffortCheckinTest do
 
   defp request_ruling(db, request_id) do
     rows(db, "SELECT status,decision,ruledBy FROM decision_requests WHERE id=?1", [request_id])
+  end
+
+  defp drop_supervision_liveness(db, assignment_id) do
+    assert {:ok, _} =
+             DB.query(db, "DELETE FROM supervision_entitlements WHERE assignmentId=?1", [
+               assignment_id
+             ])
+
+    assert rows(db, "SELECT COUNT(*) FROM supervision_entitlements WHERE assignmentId=?1", [
+             assignment_id
+           ]) == [[0]]
+
+    :ok
   end
 
   defp generation_count(db, assignment_id) do
