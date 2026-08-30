@@ -3606,8 +3606,14 @@ defmodule Tightbeam.GatewayTest do
 
     # The exit is the CALLER's: retry at the boundary. Nothing was applied,
     # nothing was queued on the caller's behalf, nothing was buried.
-    assert Org.get(ctx.db, "queued") == before
-    assert Org.get(ctx.db, "queued").cleared_through_seq == 0
+    after_refusal = Org.get(ctx.db, "queued")
+
+    assert Map.drop(after_refusal, [:mechanical_status, :updated_at]) ==
+             Map.drop(before, [:mechanical_status, :updated_at])
+
+    assert after_refusal.mechanical_status == "running"
+    assert after_refusal.updated_at > before.updated_at
+    assert after_refusal.cleared_through_seq == 0
 
     assert length(Projection.list_after(ctx.db, "queued", nil, 50, 0)) == 1,
            "a refused switch appends no tombstone"
@@ -7283,7 +7289,13 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "Try again once the current turn finishes"
-    assert Org.get(ctx.db, "k1") == before
+    after_refusal = Org.get(ctx.db, "k1")
+
+    assert Map.drop(after_refusal, [:mechanical_status, :updated_at]) ==
+             Map.drop(before, [:mechanical_status, :updated_at])
+
+    assert after_refusal.mechanical_status == "running"
+    assert after_refusal.updated_at > before.updated_at
     refute File.exists?(home)
     send(runner, :finish_set_harness_turn)
   end

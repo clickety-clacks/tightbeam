@@ -107,7 +107,7 @@ defmodule Tightbeam.Gateway do
   alias Tightbeam.Wire.Payloads
   require Logger
 
-  @direct_state_classes ~w(message.created wake.fired prod.fired turn.started turn.ended)
+  @direct_state_classes ~w(message.created wake.fired turn.started turn.ended)
 
   defmodule EffortRearmRace do
     @moduledoc false
@@ -643,7 +643,7 @@ defmodule Tightbeam.Gateway do
     item_change = fn work_item_id, kind -> emit_item_change(db, work_item_id, kind) end
 
     %{
-      {"post", ["message.created"]} => fn call ->
+      {"post", ["message.created", "session.updated"]} => fn call ->
         p = call.params
 
         if p[:invalid_reply_reference] == true do
@@ -672,89 +672,92 @@ defmodule Tightbeam.Gateway do
           end
         end
       end,
-      {"wake", ["wake.scheduled", "wake.canceled", "wake.fired", "message.created"]} => fn call ->
-        p = call.params
+      {"wake",
+       ["wake.scheduled", "wake.canceled", "wake.fired", "message.created", "session.updated"]} =>
+        fn call ->
+          p = call.params
 
-        cond do
-          is_binary(p[:cancel_wake_id]) ->
-            cancel_wake_result(db, call, p.cancel_wake_id)
+          cond do
+            is_binary(p[:cancel_wake_id]) ->
+              cancel_wake_result(db, call, p.cancel_wake_id)
 
-          not (is_binary(p[:prompt]) and p.prompt != "") ->
-            %{code: "invalid", message: "a wake must carry a prompt"}
+            not (is_binary(p[:prompt]) and p.prompt != "") ->
+              %{code: "invalid", message: "a wake must carry a prompt"}
 
-          # A class must be a NAME. Note what is deliberately NOT checked here:
-          # membership in the five seed classes. A kungfu extends the vocabulary
-          # freely (fabric §7), so refusing an unrecognized name would make an
-          # org's own extension a substrate error; an extension this build has
-          # no mapping for is delivered as `fyi` with a named skew row instead
-          # (§5 policy-skew rule) — never dropped, never promoted.
-          Map.has_key?(p, :class) and not (is_binary(p[:class]) and p[:class] != "") ->
-            %{code: "invalid", message: "--class requires a class name"}
+            # A class must be a NAME. Note what is deliberately NOT checked here:
+            # membership in the five seed classes. A kungfu extends the vocabulary
+            # freely (fabric §7), so refusing an unrecognized name would make an
+            # org's own extension a substrate error; an extension this build has
+            # no mapping for is delivered as `fyi` with a named skew row instead
+            # (§5 policy-skew rule) — never dropped, never promoted.
+            Map.has_key?(p, :class) and not (is_binary(p[:class]) and p[:class] != "") ->
+              %{code: "invalid", message: "--class requires a class name"}
 
-          not valid_reresolve?(p) ->
-            %{code: "invalid", message: "reresolve lineage requires seed and rung"}
+            not valid_reresolve?(p) ->
+              %{code: "invalid", message: "reresolve lineage requires seed and rung"}
 
-          is_binary(p[:condition_scope]) and not is_binary(p[:condition_kind]) ->
-            %{code: "invalid", message: "--when-scope requires --when-fact"}
+            is_binary(p[:condition_scope]) and not is_binary(p[:condition_kind]) ->
+              %{code: "invalid", message: "--when-scope requires --when-fact"}
 
-          is_binary(p[:condition_kind]) and is_nil(p[:after_ms]) and is_nil(p[:at]) ->
-            %{
-              code: "invalid",
-              message: "a condition wake requires a fallback (--fallback-after / --at)"
-            }
+            is_binary(p[:condition_kind]) and is_nil(p[:after_ms]) and is_nil(p[:at]) ->
+              %{
+                code: "invalid",
+                message: "a condition wake requires a fallback (--fallback-after / --at)"
+              }
 
-          not wake_principal_allowed?(db, call) ->
-            %{code: "unknown_caller"}
+            not wake_principal_allowed?(db, call) ->
+              %{code: "unknown_caller"}
 
-          true ->
-            wake_result(config, db, call)
-        end
-      end,
-      {"condition", ["condition_fact.filed", "wake.fired", "message.created"]} => fn call ->
-        p = call.params
+            true ->
+              wake_result(config, db, call)
+          end
+        end,
+      {"condition", ["condition_fact.filed", "wake.fired", "message.created", "session.updated"]} =>
+        fn call ->
+          p = call.params
 
-        cond do
-          not (is_binary(p[:kind]) and p.kind != "") ->
-            %{code: "invalid", message: "a condition fact requires a kind"}
+          cond do
+            not (is_binary(p[:kind]) and p.kind != "") ->
+              %{code: "invalid", message: "a condition fact requires a kind"}
 
-          # `work-blocked`/`work-unblocked` assert an authority's judgment
-          # over a session (spec production-machine-v1 §Standing facts): the
-          # scope must be a session, and the caller must sit ABOVE it in the
-          # operational-parent lineage, or be its owner (user or admin). ConditionFacts
-          # itself refuses the substrate; this seam refuses the unauthorized.
-          p.kind in ~w(work-blocked work-unblocked) and
-              not work_block_authority?(db, call, p[:scope]) ->
-            %{
-              code: "not_authorized",
-              message:
-                "#{p.kind} may only be asserted by the scope session's lineage " <>
-                  "above it or its owner, over an existing session scope"
-            }
+            # `work-blocked`/`work-unblocked` assert an authority's judgment
+            # over a session (spec production-machine-v1 §Standing facts): the
+            # scope must be a session, and the caller must sit ABOVE it in the
+            # operational-parent lineage, or be its owner (user or admin). ConditionFacts
+            # itself refuses the substrate; this seam refuses the unauthorized.
+            p.kind in ~w(work-blocked work-unblocked) and
+                not work_block_authority?(db, call, p[:scope]) ->
+              %{
+                code: "not_authorized",
+                message:
+                  "#{p.kind} may only be asserted by the scope session's lineage " <>
+                    "above it or its owner, over an existing session scope"
+              }
 
-          true ->
-            scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+            true ->
+              scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
 
-            case ConditionFacts.file_idempotent_with_effect(
-                   db,
-                   scheduler,
-                   %{
-                     kind: p.kind,
-                     scope: p[:scope],
-                     origin: call.origin,
-                     idempotency_key: p[:idempotency_key]
-                   },
-                   call
-                 ) do
-              {{:error, error}, _filed?} ->
-                error
+              case ConditionFacts.file_idempotent_with_effect(
+                     db,
+                     scheduler,
+                     %{
+                       kind: p.kind,
+                       scope: p[:scope],
+                       origin: call.origin,
+                       idempotency_key: p[:idempotency_key]
+                     },
+                     call
+                   ) do
+                {{:error, error}, _filed?} ->
+                  error
 
-              {fact, filed?} ->
-                if call[:firehose_effect_requested],
-                  do: {:firehose_effect, fact, filed?},
-                  else: fact
-            end
-        end
-      end,
+                {fact, filed?} ->
+                  if call[:firehose_effect_requested],
+                    do: {:firehose_effect, fact, filed?},
+                    else: fact
+              end
+          end
+        end,
       {"facts-read", []} => fn call -> facts_read_result(db, call) end,
       {"artifact-record", ["artifact.recorded"]} => fn call -> Artifacts.record(db, call) end,
       {"artifact-get", []} => fn call ->
@@ -1116,17 +1119,20 @@ defmodule Tightbeam.Gateway do
 
         Assignments.__handle__(db, "assign", call)
       end,
-      {"dispatch", ["assignment.opened", "message.created", "wake.scheduled"]} => fn call ->
-        call =
-          call
-          |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
-          |> Map.put(:on_assignment_change, assignment_change)
-          |> Map.put(:on_work_item_change, item_change)
-          |> Map.put(:effort_config, config)
-          |> Map.put(:on_dispatch_delivery, fn delivery, _ -> complete_delivery(db, delivery) end)
+      {"dispatch", ["assignment.opened", "message.created", "wake.scheduled", "session.updated"]} =>
+        fn call ->
+          call =
+            call
+            |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
+            |> Map.put(:on_assignment_change, assignment_change)
+            |> Map.put(:on_work_item_change, item_change)
+            |> Map.put(:effort_config, config)
+            |> Map.put(:on_dispatch_delivery, fn delivery, _ ->
+              complete_delivery(db, delivery)
+            end)
 
-        Assignments.__handle__(db, "dispatch", call)
-      end,
+          Assignments.__handle__(db, "dispatch", call)
+        end,
       {"attest", ["attest.filed", "assignment.closed"]} => fn call ->
         Assignments.__handle__(
           db,
@@ -1161,15 +1167,17 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:effort_config, config)
         )
       end,
-      {"repair-assignment", ["message.created"]} => fn call ->
+      {"repair-assignment", ["message.created", "session.updated"]} => fn call ->
         repair_assignment_result(config, db, call)
       end,
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
-      {"cancel", ["turn.ended"]} => fn call -> cancel_result(db, call) end,
+      {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,
       {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
       {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
-      {"tune", ["message.created"]} => fn call -> tune_result(config, db, call) end,
+      {"tune", ["message.created", "session.updated"]} => fn call ->
+        tune_result(config, db, call)
+      end,
       {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
         retire_result(config, db, call)
       end
@@ -7658,15 +7666,6 @@ defmodule Tightbeam.Gateway do
                     })
                   end
 
-                  Enum.each(result.retired, fn %{session: retired_session} ->
-                    Tightbeam.Firehose.Publisher.committed_in_txn(
-                      txn,
-                      "session.retired",
-                      retired_session,
-                      %{"sessionKey" => retired_session.session_key}
-                    )
-                  end)
-
                   result
                 end)
 
@@ -7881,12 +7880,13 @@ defmodule Tightbeam.Gateway do
          drain_reason
        ) do
     assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    session = Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
 
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason,
       cause: "session-retired",
       principal: TurnLifecycle.principal(principal)
     )
+
+    session = Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
 
     {assignments, session}
   end

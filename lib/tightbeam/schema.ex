@@ -78,7 +78,10 @@ defmodule Tightbeam.Schema do
   # its one exact predecessor, and historical rows remain null.
   # Terminal operator decisions advance v7 to v8. Nullable effective parent
   # then relaxes the stored parent constraint from that exact predecessor.
-  @shape "coordination-fabric-v1-phase1-v9"
+  # The session projection amendment materializes mechanical status from its
+  # sole durable input and advances v9 to v10.
+  @shape "coordination-fabric-v1-phase1-v10"
+  @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v9"
   @nullable_effective_parent_previous_shape "coordination-fabric-v1-phase1-v8"
   @terminal_decision_previous_shape "coordination-fabric-v1-phase1-v7"
   @message_type_previous_shape "coordination-fabric-v1-phase1-v6"
@@ -1202,7 +1205,7 @@ defmodule Tightbeam.Schema do
              rows -> incompatible_cold_start!("orphan_identity_row", inspect(rows))
            end
 
-           case Tightbeam.ColdStart.classify_in_txn(txn) do
+           case Tightbeam.ColdStart.classify_legacy_in_txn(txn) do
              %{state: state} when state in ["open", "claimed"] -> :ok
              %{invariant: invariant} -> incompatible_cold_start!(invariant)
            end
@@ -1213,9 +1216,7 @@ defmodule Tightbeam.Schema do
       {:error, %ShapeError{} = error} ->
         raise error
 
-      {:error, error} ->
-        _ = error
-
+      {:error, _error} ->
         raise ShapeError,
           message:
             "incompatible_cold_start_v1: legacy_witness_missing; recovery: Recover an unusable fresh database"
@@ -1290,7 +1291,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @nullable_effective_parent_previous_shape,
-             @shape,
+             @session_mechanical_status_previous_shape,
              System.system_time(:millisecond)
            ])
 
@@ -1320,6 +1321,71 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_nullable_effective_parent_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_session_mechanical_status_v1(DB.server()) :: :ok
+  def upgrade_session_mechanical_status_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@session_mechanical_status_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_session_mechanical_status_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE sessions ADD COLUMN mechanicalStatus TEXT NOT NULL " <>
+                 "DEFAULT 'idle' CHECK (mechanicalStatus IN ('idle','running'))"
+             )
+
+           Txn.q(
+             txn,
+             """
+             UPDATE sessions
+             SET mechanicalStatus = 'running',
+                 updatedAt = MAX(updatedAt + 1, ?1)
+             WHERE EXISTS (
+               SELECT 1 FROM turns
+               WHERE turns.sessionKey = sessions.sessionKey
+                 AND turns.status IN ('queued','running')
+             )
+             """,
+             [migration_time]
+           )
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @session_mechanical_status_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_session_mechanical_status_v1: stamp race"
+               )
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_session_mechanical_status_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -1558,30 +1624,38 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@session_mechanical_status_previous_shape]]} ->
+        upgrade_session_mechanical_status_v1(db)
+
       {:ok, [[@nullable_effective_parent_previous_shape]]} ->
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@terminal_decision_previous_shape]]} ->
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@message_type_previous_shape]]} ->
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@cold_start_previous_shape]]} ->
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@operational_parent_previous_shape]]} ->
         :ok = upgrade_operational_parent_v1(db)
         :ok = upgrade_cold_start_v1(db)
         :ok = upgrade_message_type_v1(db)
         :ok = upgrade_terminal_operator_decision_v1(db)
-        upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1600,7 +1674,8 @@ defmodule Tightbeam.Schema do
         There is no migration from #{found}. The only supported upgrade sources
         are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
         #{@message_type_previous_shape}, #{@terminal_decision_previous_shape}, and
-        #{@nullable_effective_parent_previous_shape}.
+        #{@nullable_effective_parent_previous_shape}, and
+        #{@session_mechanical_status_previous_shape}.
         Move this database aside and let it be recreated.
         """
 

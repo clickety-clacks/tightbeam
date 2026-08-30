@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v9"
+  @shape "coordination-fabric-v1-phase1-v10"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -45,13 +45,13 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v10"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v10"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -203,7 +203,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert :ok = Schema.ensure_all(db)
     assert "messageType" in table_columns(db, "messages")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v10"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     restored = Projection.get(db, historical.id)
@@ -392,7 +392,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v10"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -428,7 +428,7 @@ defmodule Tightbeam.SchemaShapeTest do
     refute "operationalParent" in table_columns(db, "sessions")
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v10"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -550,7 +550,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v10"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -648,6 +648,7 @@ defmodule Tightbeam.SchemaShapeTest do
       assert Enum.at(column, 3) == 1
       refute table?(db, "sessions_effective_parent_v1")
       assert :ok = Schema.upgrade_nullable_effective_parent_v1(db)
+      assert :ok = Schema.upgrade_session_mechanical_status_v1(db)
     end
   end
 
@@ -730,7 +731,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v9"
+    assert error.message =~ "coordination-fabric-v1-phase1-v10"
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -792,7 +793,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v9"
+    assert error.message =~ "coordination-fabric-v1-phase1-v10"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -912,7 +913,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v9"
+    assert error.message =~ "coordination-fabric-v1-phase1-v10"
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -983,7 +984,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v9"
+    assert error.message =~ "coordination-fabric-v1-phase1-v10"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -1096,7 +1097,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v9"
+    assert error.message =~ "coordination-fabric-v1-phase1-v10"
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
@@ -1135,7 +1136,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v9"
+    assert error.message =~ "coordination-fabric-v1-phase1-v10"
     assert error.message =~ "no migration"
 
     assert {:ok, [[ddl]]} =
@@ -1171,6 +1172,7 @@ defmodule Tightbeam.SchemaShapeTest do
     :ok = DB.execute(db, "DROP TABLE cold_start_receipts")
     :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN creationKind")
     :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN operationalParent")
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
     :ok = DB.execute(db, "ALTER TABLE messages DROP COLUMN messageType")
 
     {:ok, _} =
@@ -1187,6 +1189,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
     {:ok, :ok} =
       DB.foreign_key_rebuild(db, fn txn ->
+        :ok = DB.Txn.exec(txn, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
+
         DB.Txn.q(
           txn,
           "UPDATE sessions SET operationalParent='agent:main:clawline:' || ownerUserId || ':main' WHERE operationalParent IS NULL"

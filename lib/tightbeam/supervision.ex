@@ -2109,12 +2109,18 @@ defmodule Tightbeam.Supervision do
               detail: %{tier: pending.pendingK}
             }
 
-            Tightbeam.Firehose.Publisher.committed_in_txn(txn, "prod.fired", event, %{
-              "eventId" => seq,
-              "assignmentId" => pending.pendingAssignment,
-              "workItemId" => job_ref,
-              "sessionKey" => pending.sessionKey
-            })
+            Tightbeam.Firehose.Publisher.observation_in_txn(
+              txn,
+              "prod.fired",
+              event,
+              %{
+                "eventId" => seq,
+                "assignmentId" => pending.pendingAssignment,
+                "workItemId" => job_ref,
+                "sessionKey" => pending.sessionKey
+              },
+              at
+            )
 
             seq
           end
@@ -3980,6 +3986,9 @@ defmodule Tightbeam.Supervision do
       "UPDATE turns SET status='canceled', endedAt=?2 WHERE seq=?1 AND status='queued'",
       [transfer.turn_seq, retirement_epoch]
     )
+
+    if Txn.changes(txn) == 1,
+      do: Tightbeam.Org.sync_mechanical_status_in_txn(txn, transfer.session_key)
   end
 
   defp insert_retirement_controller_in_txn(
