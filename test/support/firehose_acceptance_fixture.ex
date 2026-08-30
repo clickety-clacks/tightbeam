@@ -114,7 +114,10 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     end
   end
 
-  def connect(%__MODULE__{} = fixture) do
+  def connect(%__MODULE__{} = fixture, opts \\ []) do
+    subscription_id = Keyword.get(opts, :subscription_id, "work-items")
+    filters = Keyword.get(opts, :filters, %{"classes" => ["work_item."]})
+
     {:ok, ws} = WS.connect("127.0.0.1", fixture.port, "/ws/changes?protocolVersion=1")
     :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => fixture.device.token}))
     {:ok, {:text, auth}, ws} = WS.recv(ws, 2_000)
@@ -126,8 +129,8 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
         JSON.encode!(%{
           "type" => "subscribe",
           "protocolVersion" => 1,
-          "subscriptionId" => "work-items",
-          "filters" => %{"classes" => ["work_item."]}
+          "subscriptionId" => subscription_id,
+          "filters" => filters
         })
       )
 
@@ -157,6 +160,13 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
   def create_item(%__MODULE__{} = fixture, title) do
     %{"result" => %{"id" => id}} =
       dispatch(fixture, "work-item-create", %{"title" => title})
+
+    id
+  end
+
+  def update_item(%__MODULE__{} = fixture, id, title) do
+    %{"result" => %{"id" => ^id}} =
+      dispatch(fixture, "work-item-update", %{"workItemId" => id, "title" => title})
 
     id
   end
