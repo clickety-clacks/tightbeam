@@ -1199,7 +1199,7 @@ defmodule Tightbeam.Schema do
         upgrade_identity_render_stamp_v1(db, @notice_batching_pre_liveness_shape)
 
       {:ok, [[@terminal_decision_shape]]} ->
-        :ok = migrate_notice_batching_v1_019(db, @terminal_decision_shape, false)
+        :ok = migrate_notice_batching_v1_019(db, @terminal_decision_shape, true)
         check_shape(db)
 
       {:ok, [[@terminal_decision_liveness_shape]]} ->
@@ -1230,8 +1230,8 @@ defmodule Tightbeam.Schema do
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
-        It can migrate #{@terminal_decision_shape} to
-        #{@notice_batching_pre_liveness_shape}, then #{@shape}. It can also migrate
+        It can migrate #{@terminal_decision_shape} through
+        #{@effort_request_exit_previous_shape} to #{@shape}. It can also migrate
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
         then #{@shape}.
 

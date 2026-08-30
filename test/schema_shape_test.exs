@@ -790,7 +790,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, []} = DB.query(db, "SELECT id FROM supervision_liveness_epoch")
   end
 
-  test "terminal-decision predecessor wakes migrate exactly without inferred carriers", %{db: db} do
+  test "terminal-decision stamp without the historical liveness carrier refuses before mutation",
+       %{
+         db: db
+       } do
     assert :ok = Schema.ensure_all(db)
     drop_liveness_activation(db)
     downgrade_wakes_to_terminal_decision(db)
@@ -808,27 +811,60 @@ defmodule Tightbeam.SchemaShapeTest do
     {:ok, before_rows} =
       DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
 
-    assert :ok = Schema.ensure_all(db)
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ "migration #{@terminal_decision_shape} failed and was rolled back"
+    assert error.message =~ "wake_cancellations"
 
     assert {:ok, ^before_rows} =
              DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
 
-    assert {:ok,
-            [
-              [nil, nil, nil, 0, 0],
-              [nil, nil, nil, 0, 0],
-              [nil, nil, nil, 0, 0]
-            ]} =
-             DB.query(
-               db,
-               "SELECT class, classElection, deliveryRule, digest, summon FROM wakes ORDER BY wakeId"
-             )
+    refute table?(db, "wake_cancellations")
+    refute table?(db, "notice_batches")
+    assert {:ok, [[@terminal_decision_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+  end
 
-    assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
-    assert {:ok, []} = DB.query(db, "SELECT batchId FROM notice_batches")
+  test "the exact d483 terminal-liveness database migrates and survives restart", %{db: _db} do
+    unique = System.unique_integer([:positive])
+    path = Path.join(System.tmp_dir!(), "d483-terminal-liveness-restart-#{unique}.sqlite3")
+    first = :"d483_terminal_liveness_before_#{unique}"
+    second = :"d483_terminal_liveness_after_#{unique}"
 
-    assert {:ok, [[@shape]]} =
-             DB.query(db, "SELECT shape FROM schema_stamp")
+    fixture =
+      __DIR__
+      |> Path.join("fixtures/d483a9c8_terminal_liveness.sqlite3.gz.b64")
+      |> File.read!()
+      |> String.replace(~r/\s+/u, "")
+      |> Base.decode64!()
+      |> :zlib.gunzip()
+
+    assert Base.encode16(:crypto.hash(:sha256, fixture), case: :lower) ==
+             "593308eb122ea1140a592b667afea41c501f99003949025ad29fea407d74eeb0"
+
+    File.write!(path, fixture)
+
+    on_exit(fn ->
+      File.rm(path)
+      File.rm("#{path}-shm")
+      File.rm("#{path}-wal")
+    end)
+
+    {:ok, first_pid} = DB.start_link(path: path, name: first)
+    assert {:ok, [[@terminal_decision_shape]]} = DB.query(first, "SELECT shape FROM schema_stamp")
+    assert table?(first, "wake_cancellations")
+    assert :ok = Schema.ensure_all(first)
+    assert {:ok, [[@shape]]} = DB.query(first, "SELECT shape FROM schema_stamp")
+    :ok = GenServer.stop(first_pid)
+
+    {:ok, second_pid} = DB.start_link(path: path, name: second)
+    assert :ok = Schema.ensure_all(second)
+    assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
+    assert "identityGuidanceDigest" in table_columns(second, "sessions")
+
+    assert object_sql(second, "trigger", "wakes_typed_cancellation_required") =~
+             "pendingwakecancellationrequirestypedprovenance"
+
+    :ok = GenServer.stop(second_pid)
   end
 
   test "the exact notice-batching predecessor widens effort cancellation and preserves the stamp",
