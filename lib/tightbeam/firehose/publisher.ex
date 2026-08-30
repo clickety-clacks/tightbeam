@@ -3,7 +3,26 @@ defmodule Tightbeam.Firehose.Publisher do
 
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Registry}
-  alias Tightbeam.StateResources
+  alias Tightbeam.{ModelCatalog, StateResources}
+
+  @work_item_public_shape MapSet.new(
+                            ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason createdByUser createdBySession createdAt priority rowVersion)
+                          )
+  @legacy_partial_shapes %{
+    "work_item.created" => [
+      MapSet.new(~w(id rowVersion)),
+      @work_item_public_shape
+    ],
+    "work_item.updated" => [
+      MapSet.new(~w(id ownerUserId rowVersion)),
+      MapSet.new(~w(id title ownerUserId updatedAt rowVersion)),
+      @work_item_public_shape
+    ],
+    "work_item.iceboxed" => [@work_item_public_shape],
+    "work_item.reopened" => [@work_item_public_shape],
+    "work_item.closed" => [@work_item_public_shape],
+    "work_item.failed" => [@work_item_public_shape]
+  }
 
   @state_verbs %{
     "work-item-create" => {"work_item.created", &StateResources.work_item/1},
@@ -285,19 +304,44 @@ defmodule Tightbeam.Firehose.Publisher do
   end
 
   @doc false
-  def encode_wire_notice(%{"class" => class, "payload" => payload} = notice) do
+  def encode_wire_notice(notice), do: encode_wire_notice(notice, ModelCatalog.get())
+
+  @doc false
+  def encode_wire_notice(%{"class" => class, "payload" => payload} = notice, catalog)
+      when is_map(catalog) do
     case Registry.fetch(class) do
+      {:ok, %{resource: "productions"}} ->
+        JSON.encode!(notice)
+
       {:ok, %{resource: resource}} when is_map(payload) ->
-        if StateResources.admin_resource?(resource) do
-          bytes = StateResources.encode_admin_item(resource, payload)
-          JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
-        else
-          JSON.encode!(notice)
+        # Some current-main producers still publish result-shaped partial maps. Only a closed
+        # R7/R7a item is eligible for RawJSON; the shared encoder remains strict for REST parity.
+        cond do
+          StateResources.item_has_secret_fields?(payload) ->
+            raise ArgumentError, "#{resource} Publisher payload has a forbidden field"
+
+          StateResources.item_shape_complete?(resource, payload) ->
+            bytes = StateResources.encode_item(resource, payload, catalog)
+            JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
+
+          permitted_legacy_payload?(class, payload) ->
+            JSON.encode!(notice)
+
+          true ->
+            raise ArgumentError,
+                  "#{resource} Publisher payload has no permitted legacy partial shape"
         end
 
       _ ->
         JSON.encode!(notice)
     end
+  end
+
+  def encode_wire_notice(notice, _catalog), do: JSON.encode!(notice)
+
+  defp permitted_legacy_payload?(class, payload) do
+    keys = MapSet.new(Map.keys(payload))
+    Enum.any?(Map.get(@legacy_partial_shapes, class, []), &MapSet.equal?(&1, keys))
   end
 
   @spec committed_notice(String.t(), map(), map()) :: map()
