@@ -150,6 +150,32 @@ defmodule Tightbeam.Harness.Cursor do
   # the digest of the bytes the projection wrote.
   defp rails_opts(opts), do: Keyword.take(opts, [:path])
 
+  # CUSTODY STUBS (dr_f273ca8d, spec-first): these symbols state the ruled
+  # ownership boundary and compile, but perform no account, root-filesystem, or
+  # bundle installation. Remove them only when a separately reviewed canonical
+  # provisioner lands for the root-owned launcher, dedicated execution account,
+  # and pinned Cursor bundle.
+  @custody_stub_root_launcher_dir "/usr/local/libexec/tightbeam-cursor-path"
+  @doc false
+  def custody_stub_root_launcher_dir, do: @custody_stub_root_launcher_dir
+
+  @doc false
+  def custody_stub_execution_account, do: "tightbeam-cursor"
+
+  @doc false
+  def custody_stub_pinned_bundle do
+    %{
+      version: @adapter_version,
+      launcher_sha256: @launcher_sha256,
+      bundle_sha256: @bundle_sha256
+    }
+  end
+
+  # The rails projection consumes the declared root-owned seam without claiming
+  # that Placement or the gateway provisions it.
+  @spec helper_path_dir() :: String.t()
+  def helper_path_dir, do: custody_stub_root_launcher_dir()
+
   @doc false
   def prepare_projection_runtime!(home) do
     # Cursor 2026.08.11 writes ACP session state beneath CURSOR_CONFIG_DIR.
@@ -221,7 +247,15 @@ defmodule Tightbeam.Harness.Cursor do
       |> CursorRails.compile(rails_opts(path: Map.get(desired, :rails_path)))
       |> JSON.encode!()
 
-    Tightbeam.Homes.reconcile(target, home, %{desired | rails: rails},
+    # harvest_auth: false — the projection root is group-writable by the
+    # execution identity, so a home-side cli-config.json can be replaced by
+    # uid 503; harvesting it back would let execution-controlled content land
+    # in the operator's credential store. Cursor's credential is env-delivered
+    # and cli-config.json is non-secret preferences: nothing needs harvesting.
+    Tightbeam.Homes.reconcile(
+      target,
+      home,
+      %{desired | rails: rails} |> Map.put(:harvest_auth, false),
       credential_names: [@credential_file],
       credential_projection: :copy_readable,
       rails_filename: @rails_file,

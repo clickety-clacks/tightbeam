@@ -765,7 +765,9 @@ defmodule Tightbeam.PlacementTest do
     expected_digest =
       Rails.hook_settings()
       |> Tightbeam.Harness.CursorRails.compile(
-        path: Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+        path:
+          Tightbeam.Harness.Cursor.helper_path_dir() <>
+            ":" <> Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
       )
       |> JSON.encode!()
       |> then(&:crypto.hash(:sha256, &1))
@@ -805,6 +807,80 @@ defmodule Tightbeam.PlacementTest do
              Base.encode16(:crypto.hash(:sha256, "tampered-after-projection"), case: :lower)
   end
 
+  defp cursor_config(base_dir, db, execution_home) do
+    %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      cursor_execution_home: execution_home,
+      credential_kind: :api_key,
+      harness_target_overrides: %{
+        find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: fn path ->
+          if Path.basename(path) == "index.js",
+            do: "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+            else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+        end,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
+      }
+    }
+  end
+
+  test "Cursor projection never harvests the home-side cli-config back into the bank",
+       %{base_dir: base_dir, db: db} do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+    File.write!(Path.join(cursor_auth, "cli-config.json"), ~s({"version":1,"trusted":false}))
+
+    config = cursor_config(base_dir, db, execution_home)
+    Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+
+    # An execution-controlled replacement of the projected copy (the projection
+    # root is group-writable by uid 503) must never reach the operator store.
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
+    projected = Path.join(home, "cli-config.json")
+    File.rm!(projected)
+    File.write!(projected, ~s({"version":1,"trusted":true,"planted":true}))
+
+    Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+
+    assert File.read!(Path.join(cursor_auth, "cli-config.json")) ==
+             ~s({"version":1,"trusted":false})
+
+    # ...and the projection is re-materialized from the bank, not the planted file.
+    assert File.read!(projected) == ~s({"version":1,"trusted":false})
+  end
+
+  test "Cursor cli-config projection does not write through a planted symlink",
+       %{base_dir: base_dir, db: db} do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+    File.write!(Path.join(cursor_auth, "cli-config.json"), ~s({"version":1}))
+
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
+    File.mkdir_p!(home)
+    external = Path.join(base_dir, "external-target")
+    File.write!(external, "untouched")
+    File.ln_s!(external, Path.join(home, "cli-config.json"))
+
+    Placement.adapter_opts!(
+      cursor_config(base_dir, db, execution_home),
+      {:cursor, "shared", "testhost"}
+    )
+
+    assert File.read!(external) == "untouched"
+    assert {:ok, %File.Stat{type: :regular}} = File.lstat(Path.join(home, "cli-config.json"))
+    assert File.read!(Path.join(home, "cli-config.json")) == ~s({"version":1})
+  end
+
   test "Cursor home delivery with a gateway-shaped config (no :cli_bin) derives the helper PATH",
        %{base_dir: base_dir, db: db} do
     # Turn-boundary / set_harness deliveries use the plain gateway config, which
@@ -834,7 +910,10 @@ defmodule Tightbeam.PlacementTest do
     home = Placement.deliver_home(config, {:cursor, "shared", "testhost"})
 
     hooks = JSON.decode!(File.read!(Path.join(execution_home, ".cursor/hooks.json")))
-    expected_path = Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+
+    expected_path =
+      Tightbeam.Harness.Cursor.helper_path_dir() <>
+        ":" <> Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
 
     assert hooks["version"] == 1
 

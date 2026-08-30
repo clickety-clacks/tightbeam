@@ -20,7 +20,9 @@ fn main() {
     if cursor_execution_identity::running_as_launcher()
         && !cursor_execution_identity::launcher_command_allowed(&args)
     {
-        eprintln!("Cursor execution launcher refused: only cursor-exec is permitted");
+        eprintln!(
+            "Cursor execution launcher refused: only cursor-exec is permitted (rail guards only when invoked unprivileged)"
+        );
         std::process::exit(1);
     }
 

@@ -130,7 +130,12 @@ defmodule Tightbeam.Spinup do
   # seam only asks each of them for its own.
   defp install_command(target, install_dir, locality) do
     packages =
-      Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
+      Harness.all()
+      # Cursor is not an npm adapter: its pinned bundle is installed by Cursor's
+      # own installer under the dedicated execution account and verified by
+      # Cursor.verify_installed_cli/1 (`cursor-agent@<version>` is not published).
+      |> Enum.reject(&(&1 == Tightbeam.Harness.Cursor))
+      |> Enum.map_join(" ", &"#{&1.install_package()}@#{&1.adapter_version()}")
 
     # `--no-save`, because npm records a CARET RANGE for a version it installed
     # exactly: `npm install pkg@1.1.4` writes `"^1.1.4"` into package.json, so the

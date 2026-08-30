@@ -83,14 +83,36 @@ fn session_exec_with_mode(
         .and_then(|_| identity.sync_all())
         .map_err(|error| format!("harness identity could not be written: {error}"))?;
 
-    let mut command = Command::new(&args[separator + 1]);
-    command.args(&args[separator + 2..]);
-    if let Some(path) = fixed_path {
-        command.env("PATH", path);
-    }
+    let mut command = child_command(&args[separator + 1], &args[separator + 2..], fixed_path);
     let error = command.exec();
 
     Err(format!("harness command could not be executed: {error}"))
+}
+
+/// Environment variables sudo exports into the target environment. The
+/// dedicated Cursor identity is entered through sudo; the launcher has already
+/// consumed SUDO_UID for its attestation, and the Cursor session plus its hook
+/// subprocesses must not inherit these, or the launcher's unprivileged-invocation
+/// test (rail guards) would misread a direct in-session call as a privilege
+/// change. A new sudo by anyone else sets them afresh, so the sudoers-wildcard
+/// confinement is unaffected.
+const SUDO_ENV: [&str; 4] = ["SUDO_UID", "SUDO_GID", "SUDO_USER", "SUDO_COMMAND"];
+
+/// The harness child: inherits the environment, except that a dedicated-identity
+/// launch (`fixed_path`) pins PATH and scrubs sudo's exports.
+fn child_command(program: &str, args: &[String], fixed_path: Option<&str>) -> Command {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(path) = fixed_path {
+        command.env("PATH", path);
+        // The execution account's login shell is /usr/bin/false; never let a
+        // SHELL inherited from sudo decide how Cursor runs its hooks.
+        command.env("SHELL", "/bin/sh");
+        for name in SUDO_ENV {
+            command.env_remove(name);
+        }
+    }
+    command
 }
 
 fn wait_for_session_child(child: libc::pid_t) -> Result<i32, String> {
@@ -378,5 +400,28 @@ mod tests {
         );
         fs::remove_file(identity).unwrap();
         fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn dedicated_identity_child_pins_path_and_scrubs_sudo_exports() {
+        use std::ffi::OsStr;
+        let command = child_command(
+            "/bin/sh",
+            &["-c".to_owned(), "true".to_owned()],
+            Some("/usr/bin:/bin"),
+        );
+        let envs: Vec<(&OsStr, Option<&OsStr>)> = command.get_envs().collect();
+        assert!(envs.contains(&(OsStr::new("PATH"), Some(OsStr::new("/usr/bin:/bin")))));
+        assert!(envs.contains(&(OsStr::new("SHELL"), Some(OsStr::new("/bin/sh")))));
+        for name in SUDO_ENV {
+            assert!(
+                envs.contains(&(OsStr::new(name), None)),
+                "{name} must be removed"
+            );
+        }
+
+        // Shared (operator-identity) harnesses inherit everything untouched.
+        let plain = child_command("/bin/sh", &[], None);
+        assert_eq!(plain.get_envs().count(), 0);
     }
 }

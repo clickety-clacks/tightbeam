@@ -1670,7 +1670,9 @@ defmodule Tightbeam.Placement do
     # CursorRails) because the dedicated identity's launcher pins PATH.
     # Only Cursor carries it; other harnesses must not require `cli_bin` here
     # (deliver_home also runs for home-only projections with minimal configs).
-    rails_path = if harness == :cursor, do: adapter_path(config, host_config)
+    rails_path =
+      if harness == :cursor,
+        do: Tightbeam.Harness.Cursor.helper_path_dir() <> ":" <> adapter_path(config, host_config)
 
     result =
       module.reconcile_home(

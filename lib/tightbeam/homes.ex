@@ -488,13 +488,27 @@ defmodule Tightbeam.Homes do
           end
 
         :copy_readable ->
+          # The target's directory may be writable by the execution identity, so
+          # never follow whatever is at `target`: remove it (a planted symlink
+          # goes with it) and create the copy exclusively, which fails rather
+          # than writes through anything re-planted in between.
           case File.rm(target) do
             :ok -> :ok
             {:error, :enoent} -> :ok
             {:error, reason} -> raise File.Error, reason: reason, action: "remove", path: target
           end
 
-          File.cp!(source, target)
+          bytes = File.read!(source)
+
+          case :file.open(target, [:write, :exclusive, :binary]) do
+            {:ok, io} ->
+              :ok = :file.write(io, bytes)
+              :ok = :file.close(io)
+
+            {:error, reason} ->
+              raise File.Error, reason: reason, action: "create exclusively", path: target
+          end
+
           File.chmod!(target, 0o640)
       end
 
