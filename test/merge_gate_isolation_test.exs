@@ -3,6 +3,51 @@ defmodule Tightbeam.MergeGateIsolationTest do
 
   @production_port 11_373
 
+  test "the authoritative wrapper refuses before tests when Cargo is unavailable" do
+    capture = capture_preflight_refusal!(omit: "cargo")
+
+    assert capture =~
+             ~s(tightbeam-gate-preflight: {"schema":"tightbeam-gate-preflight-refusal/v1","cause":"cargo-unavailable"})
+
+    refute capture =~ "TESTS_STARTED"
+    refute capture =~ "Authoritative Mix gate:"
+  end
+
+  test "the authoritative wrapper refuses before tests when the locale is not UTF-8" do
+    capture = capture_preflight_refusal!(charmap: "ANSI_X3.4-1968")
+
+    assert capture =~
+             ~s(tightbeam-gate-preflight: {"schema":"tightbeam-gate-preflight-refusal/v1","cause":"utf8-locale-unavailable"})
+
+    refute capture =~ "TESTS_STARTED"
+    refute capture =~ "Authoritative Mix gate:"
+  end
+
+  test "the authoritative wrapper refuses before tests when neither direct tools nor Mise provide the pinned BEAM" do
+    capture = capture_preflight_refusal!(erlang: "28.4", mise: :failing)
+
+    assert capture =~
+             ~s(tightbeam-gate-preflight: {"schema":"tightbeam-gate-preflight-refusal/v1","cause":"pinned-beam-unavailable"})
+
+    refute capture =~ "TESTS_STARTED"
+    refute capture =~ "Authoritative Mix gate:"
+  end
+
+  test "the authoritative wrapper uses Mise when only Mise provides the pinned BEAM" do
+    fake_bin = fake_toolchain_bin!(erlang: "28.4", mise: :pinned)
+    wrapper = Path.expand("../scripts/verify_mix.sh", __DIR__)
+
+    assert {capture, 0} =
+             System.cmd(wrapper, ["--trace"],
+               env: [{"PATH", fake_bin <> ":/usr/bin:/bin"}, {"LANG", "C.UTF-8"}],
+               stderr_to_stdout: true
+             )
+
+    assert capture =~ "MISE_TESTS_STARTED\n"
+    assert capture =~ "Authoritative Mix gate:"
+    assert capture =~ "ARG=--trace\n"
+  end
+
   test "the authoritative wrapper isolates two runs while production port 11373 stays occupied" do
     occupant = occupy_or_observe_production_port!()
 
@@ -24,7 +69,7 @@ defmodule Tightbeam.MergeGateIsolationTest do
     refute first_node == second_node
 
     for capture <- [first, second] do
-      assert capture =~ "Elixir 1.19.5 (OTP 28)\n"
+      assert capture =~ "Elixir 1.19.5 (compiled with Erlang/OTP 28)\n"
       assert capture =~ "TIGHTBEAM_PORT=0\n"
       assert capture =~ "TIGHTBEAM_AUTHORITATIVE_GATE=1\n"
       assert capture =~ "TIGHTBEAM_GATE_NODE=#{captured_node(capture)}\n"
@@ -70,30 +115,11 @@ defmodule Tightbeam.MergeGateIsolationTest do
   end
 
   defp capture_wrapper_invocation! do
-    fake_bin =
-      Path.join(System.tmp_dir!(), "merge-gate-bin-#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(fake_bin)
-    on_exit(fn -> File.rm_rf!(fake_bin) end)
-
-    fake_elixir = Path.join(fake_bin, "elixir")
-
-    File.write!(fake_elixir, """
-    #!/bin/sh
-    if [ "${1:-}" = "--version" ]; then
-      printf 'Elixir 1.19.5 (OTP 28)\\n'
-      exit 0
-    fi
-    env | sort
-    for arg in "$@"; do
-      printf 'ARG=%s\\n' "$arg"
-    done
-    """)
-
-    File.chmod!(fake_elixir, 0o755)
+    fake_bin = fake_toolchain_bin!()
 
     poisoned_env = [
       {"PATH", fake_bin <> ":" <> System.fetch_env!("PATH")},
+      {"LANG", "C.UTF-8"},
       {"TIGHTBEAM_BASE_DIR", "/production/org"},
       {"TIGHTBEAM_ADVERTISED_URL", "http://127.0.0.1:11373"},
       {"TIGHTBEAM_FUTURE_PRODUCTION_INPUT", "must-be-scrubbed"},
@@ -111,6 +137,79 @@ defmodule Tightbeam.MergeGateIsolationTest do
              System.cmd(wrapper, ["--trace"], env: poisoned_env, stderr_to_stdout: true)
 
     capture
+  end
+
+  defp capture_preflight_refusal!(options) do
+    fake_bin = fake_toolchain_bin!(options)
+    wrapper = Path.expand("../scripts/verify_mix.sh", __DIR__)
+
+    assert {capture, 78} =
+             System.cmd(wrapper, [],
+               env: [
+                 {"PATH", fake_bin <> ":/usr/bin:/bin"},
+                 {"LANG", "C.UTF-8"},
+                 {"LC_ALL", nil},
+                 {"LC_CTYPE", nil}
+               ],
+               stderr_to_stdout: true
+             )
+
+    capture
+  end
+
+  defp fake_toolchain_bin!(options \\ []) do
+    fake_bin =
+      Path.join(System.tmp_dir!(), "merge-gate-bin-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(fake_bin)
+    on_exit(fn -> File.rm_rf!(fake_bin) end)
+
+    unless options[:omit] == "cargo", do: write_tool!(fake_bin, "cargo", "exit 0")
+
+    write_tool!(fake_bin, "locale", "printf '#{options[:charmap] || "UTF-8"}\\n'")
+    write_tool!(fake_bin, "erl", "printf '#{options[:erlang] || "28.5"}\\n'")
+    write_tool!(fake_bin, "mix", "exit 0")
+
+    write_tool!(fake_bin, "elixir", """
+    if [ "${1:-}" = "--version" ]; then
+      printf 'Elixir 1.19.5 (compiled with Erlang/OTP 28)\\n'
+      exit 0
+    fi
+    printf 'TESTS_STARTED\\n'
+    env | sort
+    for arg in "$@"; do
+      printf 'ARG=%s\\n' "$arg"
+    done
+    """)
+
+    if options[:mise] == :failing, do: write_tool!(fake_bin, "mise", "exit 1")
+
+    if options[:mise] == :pinned do
+      write_tool!(fake_bin, "mise", """
+      shift 2
+      case "$1" in
+        erl) printf '28.5\\n' ;;
+        mix) exit 0 ;;
+        elixir)
+          shift
+          if [ "${1:-}" = "--version" ]; then
+            printf 'Elixir 1.19.5 (compiled with Erlang/OTP 28)\\n'
+            exit 0
+          fi
+          printf 'MISE_TESTS_STARTED\\n'
+          for arg in "$@"; do printf 'ARG=%s\\n' "$arg"; done
+          ;;
+      esac
+      """)
+    end
+
+    fake_bin
+  end
+
+  defp write_tool!(directory, name, body) do
+    path = Path.join(directory, name)
+    File.write!(path, "#!/bin/sh\n#{body}\n")
+    File.chmod!(path, 0o755)
   end
 
   defp captured_node(capture) do
