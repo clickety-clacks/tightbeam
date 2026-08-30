@@ -1198,13 +1198,18 @@ defmodule Tightbeam.AdminProjectionTest do
     handler =
       Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-edit"]
 
+    call =
+      firehose_call("identity-edit", %{
+        archetype: "default",
+        content: "# unpublished identity change\n"
+      })
+      |> Map.put(:invocation_id, "identity-non-fast-forward-replay")
+
     assert %{code: "identity_publication_non_fast_forward", expected: ^divergent} =
-             handler.(
-               firehose_call("identity-edit", %{
-                 archetype: "default",
-                 content: "# unpublished identity change\n"
-               })
-             )
+             denial =
+             handler.(call)
+
+    assert handler.(call) == denial
 
     assert hydrated_identity!(ctx.db, "served") == before
     refute_receive {:firehose_notice, _notice}
@@ -1325,16 +1330,29 @@ defmodule Tightbeam.AdminProjectionTest do
       firehose_call("identity-edit", %{archetype: "default", content: "ignored"})
       |> Map.put(:invocation_id, invocation)
 
-    assert %{code: "identity_publication_conflict", actual: ^divergent} = handler.(call)
+    expected = candidate.expected_prior
 
-    assert %{state: "denied", cause: "identity_publication_conflict"} =
+    assert %{
+             code: "identity_publication_conflict",
+             expected: ^expected,
+             actual: ^divergent
+           } = denial = handler.(call)
+
+    assert %{
+             state: "denied",
+             cause: "identity_publication_conflict",
+             denial_code: "identity_publication_conflict",
+             denial_message: nil,
+             denial_expected: ^expected,
+             denial_actual: ^divergent
+           } =
              AdminProjection.identity_publication_marker(
                ctx.db,
                invocation,
                candidate.expected_prior
              )
 
-    assert %{code: "identity_publication_conflict"} = handler.(call)
+    assert handler.(call) == denial
     assert git!(identity_dir, ["rev-parse", "tightbeam/live"]) == divergent
   end
 

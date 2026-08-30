@@ -52,6 +52,8 @@ defmodule Tightbeam.AdminProjection do
     cause             TEXT,
     denialCode        TEXT,
     denialMessage     TEXT,
+    denialExpected    TEXT,
+    denialActual      TEXT,
     state             TEXT NOT NULL CHECK (state IN ('pending', 'accepted', 'denied')),
     createdAt         INTEGER NOT NULL,
     updatedAt         INTEGER NOT NULL,
@@ -82,6 +84,7 @@ defmodule Tightbeam.AdminProjection do
            """
            SELECT invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
                   principal, validationResult, cause, denialCode, denialMessage,
+                  denialExpected, denialActual,
                   state, createdAt, updatedAt
            FROM identity_publication_markers
            WHERE invocationId = ?1 AND expectedPriorLive = ?2
@@ -99,6 +102,8 @@ defmodule Tightbeam.AdminProjection do
           cause,
           denial_code,
           denial_message,
+          denial_expected,
+          denial_actual,
           state,
           created,
           updated
@@ -114,6 +119,8 @@ defmodule Tightbeam.AdminProjection do
           cause: cause,
           denial_code: denial_code,
           denial_message: denial_message,
+          denial_expected: denial_expected,
+          denial_actual: denial_actual,
           state: state,
           created_at: created,
           updated_at: updated
@@ -161,8 +168,10 @@ defmodule Tightbeam.AdminProjection do
       INSERT OR IGNORE INTO identity_publication_markers
         (invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
          principal, validationResult, cause, denialCode, denialMessage,
+         denialExpected, denialActual,
          state, createdAt, updatedAt)
-      VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', NULL, NULL, NULL, 'pending', ?6, ?6)
+      VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', NULL, NULL, NULL, NULL, NULL,
+              'pending', ?6, ?6)
       """,
       [
         invocation_id,
@@ -189,13 +198,16 @@ defmodule Tightbeam.AdminProjection do
     validation_result = if state == "accepted", do: "accepted", else: "denied"
     denial_code = if denial, do: Map.get(denial, :code) || Map.get(denial, "code")
     denial_message = if denial, do: Map.get(denial, :message) || Map.get(denial, "message")
+    denial_expected = if denial, do: Map.get(denial, :expected) || Map.get(denial, "expected")
+    denial_actual = if denial, do: Map.get(denial, :actual) || Map.get(denial, "actual")
 
     Txn.q(
       txn,
       """
       UPDATE identity_publication_markers
       SET validationResult = ?3, cause = ?4, denialCode = ?5,
-          denialMessage = ?6, state = ?3, updatedAt = ?7
+          denialMessage = ?6, denialExpected = ?7, denialActual = ?8,
+          state = ?3, updatedAt = ?9
       WHERE invocationId = ?1 AND expectedPriorLive = ?2 AND state = 'pending'
       """,
       [
@@ -205,6 +217,8 @@ defmodule Tightbeam.AdminProjection do
         cause,
         denial_code,
         denial_message,
+        denial_expected,
+        denial_actual,
         System.system_time(:millisecond)
       ]
     )
@@ -231,8 +245,10 @@ defmodule Tightbeam.AdminProjection do
         INSERT OR IGNORE INTO identity_publication_markers
           (invocationId, expectedPriorLive, candidateRevision, treeFingerprint,
            principal, validationResult, cause, denialCode, denialMessage,
+           denialExpected, denialActual,
            state, createdAt, updatedAt)
-        VALUES (?1, ?2, NULL, ?3, ?4, 'denied', ?5, ?6, ?7, 'denied', ?8, ?8)
+        VALUES (?1, ?2, NULL, ?3, ?4, 'denied', ?5, ?6, ?7, NULL, NULL,
+                'denied', ?8, ?8)
         """,
         [
           invocation_id,

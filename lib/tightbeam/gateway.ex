@@ -4916,11 +4916,14 @@ defmodule Tightbeam.Gateway do
   end
 
   defp identity_denial_result(marker) do
-    %{
-      code: marker.denial_code || marker.cause || "identity_publication_denied",
-      message: marker.denial_message || "identity publication denied"
-    }
+    %{code: marker.denial_code || marker.cause || "identity_publication_denied"}
+    |> put_present(:message, marker.denial_message)
+    |> put_present(:expected, marker.denial_expected)
+    |> put_present(:actual, marker.denial_actual)
   end
+
+  defp put_present(result, _key, nil), do: result
+  defp put_present(result, key, value), do: Map.put(result, key, value)
 
   defp notify_session(config, db, session_key, prompt) do
     deliver_prompt(session_key, "process:tightbeam", prompt,
