@@ -33,7 +33,8 @@ defmodule Tightbeam.Schema do
     Tightbeam.WorkState,
     Tightbeam.Productions.BubbleSweeper,
     Tightbeam.HarnessProcess,
-    Tightbeam.HarnessHealth
+    Tightbeam.HarnessHealth,
+    Tightbeam.Toplines
   ]
 
   # The shape this build writes. Bump it when a production table changes in a

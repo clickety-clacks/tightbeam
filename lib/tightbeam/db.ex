@@ -108,6 +108,8 @@ defmodule Tightbeam.DB do
       :ok = Sqlite3.execute(conn, pragma)
     end
 
+    :ok = load_topline_unicode(conn)
+
     {:ok, %{conn: conn}}
   end
 
@@ -157,6 +159,21 @@ defmodule Tightbeam.DB do
       {:row, row} -> collect(conn, stmt, [row | acc])
       :done -> Enum.reverse(acc)
       {:error, reason} -> raise Error, message: to_string(reason)
+    end
+  end
+
+  defp load_topline_unicode(conn) do
+    extension = if match?({:unix, :darwin}, :os.type()), do: ".dylib", else: ".so"
+    path = Application.app_dir(:tightbeam, "priv/topline_unicode#{extension}")
+    :ok = Sqlite3.enable_load_extension(conn, true)
+
+    try do
+      [[nil]] =
+        run_query(conn, "SELECT load_extension(?1, 'sqlite3_topline_unicode_init')", [path])
+
+      :ok
+    after
+      :ok = Sqlite3.enable_load_extension(conn, false)
     end
   end
 end

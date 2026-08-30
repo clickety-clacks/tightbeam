@@ -23,8 +23,12 @@ defmodule Tightbeam.ToplinesTest do
 
     assert {:ok,
             [
+              ["topline_concern_refs"],
+              ["topline_concerns"],
               ["topline_events"],
               ["topline_idempotency"],
+              ["topline_placement_obligations"],
+              ["topline_schema_stamp"],
               ["topline_work_memberships"],
               ["toplines"]
             ]} =
@@ -209,6 +213,363 @@ defmodule Tightbeam.ToplinesTest do
                ctx.db,
                "SELECT COUNT(*) FROM topline_work_memberships WHERE unlinkedAt IS NULL"
              )
+  end
+
+  test "lifecycle mutations preserve canonical titles, exact transitions, and event order", ctx do
+    created =
+      Toplines.create(
+        ctx.db,
+        call({:user, "flynn"}, %{title: " Cafe\u0301 ", idempotency_key: "create"}, 10)
+      )
+
+    id = created.topline.id
+
+    assert %{code: "no_change", message: "no change"} =
+             Toplines.update(
+               ctx.db,
+               call(
+                 {:user, "flynn"},
+                 %{
+                   topline_id: id,
+                   title: "\u00a0Café\u3000",
+                   reason: "same",
+                   idempotency_key: "same"
+                 },
+                 11
+               )
+             )
+
+    updated =
+      Toplines.update(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{topline_id: id, title: "Ship", reason: "rename", idempotency_key: "rename"},
+          12
+        )
+      )
+
+    assert updated.topline.title == "Ship"
+    assert updated.topline.updatedAt == 12
+
+    closed =
+      Toplines.close(
+        ctx.db,
+        call({:user, "flynn"}, %{topline_id: id, reason: "done", idempotency_key: "close"}, 13)
+      )
+
+    assert closed.topline.state == "closed"
+    assert closed.topline.closedAt == 13
+
+    assert %{code: "no_change"} =
+             Toplines.update(
+               ctx.db,
+               call(
+                 {:user, "flynn"},
+                 %{topline_id: id, title: "Ship", reason: "same", idempotency_key: "closed-same"},
+                 14
+               )
+             )
+
+    assert %{code: "topline_closed"} =
+             Toplines.update(
+               ctx.db,
+               call(
+                 {:user, "flynn"},
+                 %{
+                   topline_id: id,
+                   title: "Other",
+                   reason: "different",
+                   idempotency_key: "closed-different"
+                 },
+                 15
+               )
+             )
+
+    reopened =
+      Toplines.reopen(
+        ctx.db,
+        call({:user, "flynn"}, %{topline_id: id, reason: "again", idempotency_key: "reopen"}, 16)
+      )
+
+    assert reopened.topline.state == "open"
+    assert reopened.topline.closedAt == nil
+
+    assert %{code: "invalid_transition", message: "invalid state transition"} =
+             Toplines.reopen(
+               ctx.db,
+               call(
+                 {:user, "flynn"},
+                 %{topline_id: id, reason: "again", idempotency_key: "reopen-twice"},
+                 17
+               )
+             )
+
+    assert %{topline: %{history: history}} =
+             Toplines.get(ctx.db, read_call({:user, "flynn"}, %{topline_id: id, history: true}))
+
+    assert Enum.map(history, &{&1.seq, &1.kind}) == [
+             {1, "topline_created"},
+             {2, "topline_renamed"},
+             {3, "topline_closed"},
+             {4, "topline_reopened"}
+           ]
+
+    assert Enum.at(history, 1).detail == %{fromTitle: "Café", toTitle: "Ship"}
+  end
+
+  test "concerns and references preserve current state and derived unlink history", ctx do
+    work_item!(ctx.db, "wi_concern", "flynn")
+
+    topline =
+      Toplines.create(
+        ctx.db,
+        call({:user, "flynn"}, %{title: "Intent", idempotency_key: "create"}, 20)
+      ).topline
+
+    membership =
+      Toplines.link_work(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{
+            topline_id: topline.id,
+            work_item_id: "wi_concern",
+            reason: "member",
+            idempotency_key: "link"
+          },
+          21
+        )
+      ).membership
+
+    concern =
+      Toplines.create_concern(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{topline_id: topline.id, title: " Risk ", idempotency_key: "concern"},
+          22
+        )
+      ).concern
+
+    reference =
+      Toplines.link_concern_work(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{
+            concern_id: concern.id,
+            membership_id: membership.id,
+            reason: "addresses",
+            idempotency_key: "reference"
+          },
+          23
+        )
+      ).concernReference
+
+    assert reference.toplineId == topline.id
+    assert reference.unlinkedAt == nil
+
+    resolved =
+      Toplines.resolve_concern(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{concern_id: concern.id, reason: "handled", idempotency_key: "resolve"},
+          24
+        )
+      ).concern
+
+    assert resolved.state == "resolved"
+    assert resolved.activeConcernReferenceIds == [reference.id]
+
+    reopened =
+      Toplines.reopen_concern(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{concern_id: concern.id, reason: "returned", idempotency_key: "reopen"},
+          25
+        )
+      ).concern
+
+    assert reopened.state == "open"
+    assert reopened.resolveReason == nil
+
+    renamed =
+      Toplines.update_concern(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{
+            concern_id: concern.id,
+            title: "New risk",
+            reason: "clearer",
+            idempotency_key: "rename"
+          },
+          26
+        )
+      ).concern
+
+    assert renamed.title == "New risk"
+
+    ended =
+      Toplines.unlink_work(
+        ctx.db,
+        call(
+          {:user, "flynn"},
+          %{membership_id: membership.id, reason: "split", idempotency_key: "unlink"},
+          27
+        )
+      )
+
+    assert ended.endedConcernReferenceIds == [reference.id]
+
+    assert %{topline: %{concerns: [%{activeConcernReferenceIds: []}], history: history}} =
+             Toplines.get(
+               ctx.db,
+               read_call({:user, "flynn"}, %{topline_id: topline.id, history: true})
+             )
+
+    assert Enum.take(Enum.map(history, & &1.kind), -2) == [
+             "work_unlinked",
+             "concern_work_unlinked"
+           ]
+
+    assert List.last(history).detail == %{
+             cause: "membership_unlinked",
+             membershipId: membership.id,
+             unlinkReason: "split"
+           }
+  end
+
+  test "public query applies visibility and state before the closed projection", ctx do
+    open =
+      Toplines.create(
+        ctx.db,
+        call({:user, "flynn"}, %{title: "Open", idempotency_key: "open"}, 30)
+      ).topline
+
+    closed =
+      Toplines.create(
+        ctx.db,
+        call({:user, "flynn"}, %{title: "Closed", idempotency_key: "closed"}, 31)
+      ).topline
+
+    Toplines.close(
+      ctx.db,
+      call(
+        {:user, "flynn"},
+        %{topline_id: closed.id, reason: "done", idempotency_key: "close"},
+        32
+      )
+    )
+
+    assert [] = Toplines.query_public(ctx.db, %{principal: {:user, "kay"}, state: nil})
+
+    assert [%{topline: %{id: id}} = queried] =
+             Toplines.query_public(ctx.db, %{principal: {:user, "flynn"}, state: ["open"]})
+
+    assert id == open.id
+    item = Toplines.public_item(queried)
+
+    assert Map.keys(item) |> MapSet.new() ==
+             MapSet.new(~w(
+               id ownerUserId title state createdActor createdAt updatedAt closedAt
+               activeWorkCount openConcernCount workMemberships concerns dependencyVersion
+             )a)
+
+    assert item.workMemberships == []
+    assert item.concerns == []
+    assert item.dependencyVersion =~ ~r/^[0-9a-f]{64}$/
+
+    assert Enum.map(
+             Toplines.query_public(ctx.db, %{
+               principal: {:user, "root"},
+               state: ["closed", "open"]
+             }),
+             & &1.topline.id
+           ) == [open.id, closed.id]
+  end
+
+  test "the frozen in-transaction placement seam stores one pending episode and resolution",
+       ctx do
+    work_item!(ctx.db, "wi_place", "flynn")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        INSERT INTO wakes
+          (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt)
+        VALUES ('w_place', 'agent:main:clawline:flynn:main', 'process:tightbeam',
+                'Choose placement', 'prompt', 40, 'pending', 40)
+        """
+      )
+
+    {:ok, opened} =
+      DB.transaction(ctx.db, fn txn ->
+        Toplines.open_placement_in_txn(txn, %{
+          id: "tlp_one",
+          work_item_id: "wi_place",
+          owner_user_id: "flynn",
+          cause: "created",
+          cause_ref: "wi_place",
+          source_causal_event_seq: nil,
+          actor_kind: "user",
+          actor_ref: "flynn",
+          at: 40,
+          prompt_wake_id: "w_place"
+        })
+      end)
+
+    assert opened == %{
+             cause: "created",
+             causeRef: "wi_place",
+             dueAt: 40,
+             id: "tlp_one",
+             openedActor: %{kind: "user", ref: "flynn"},
+             openedAt: 40,
+             ownerUserId: "flynn",
+             promptWake: %{id: "w_place", state: "pending"},
+             resolutionActor: nil,
+             resolutionReason: nil,
+             resolvedAt: nil,
+             state: "pending",
+             workItemId: "wi_place",
+             workItemTitle: "Work wi_place"
+           }
+
+    {:ok, resolved} =
+      DB.transaction(ctx.db, fn txn ->
+        Toplines.resolve_placement_in_txn(txn, %{
+          work_item_id: "wi_place",
+          state: "left_unlinked",
+          actor_kind: "user",
+          actor_ref: "flynn",
+          reason: "deliberate",
+          at: 41,
+          resolution_causal_event_seq: nil
+        })
+      end)
+
+    assert resolved.state == "left_unlinked"
+    assert resolved.resolutionActor == %{kind: "user", ref: "flynn"}
+    assert resolved.resolutionReason == "deliberate"
+    assert resolved.resolvedAt == 41
+
+    assert {:ok, nil} =
+             DB.transaction(ctx.db, fn txn ->
+               Toplines.resolve_placement_in_txn(txn, %{
+                 work_item_id: "wi_place",
+                 state: "left_unlinked",
+                 actor_kind: "user",
+                 actor_ref: "flynn",
+                 reason: "again",
+                 at: 42,
+                 resolution_causal_event_seq: nil
+               })
+             end)
   end
 
   test "invalid, invisible, cross-owner, duplicate, and process operations refuse without writes",
