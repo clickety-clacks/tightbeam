@@ -114,6 +114,72 @@ defmodule Tightbeam.StateResources do
 
   def query_artifact(db, id), do: Artifacts.get(db, id)
 
+  def query_attest(db, id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser,
+               producer, producerCommand, byHarness, byProvider, commitRefs, ts
+        FROM attests WHERE id = ?1
+        """,
+        [id]
+      )
+
+    case rows do
+      [
+        [
+          id,
+          assignment_id,
+          kind,
+          verdict_kind,
+          note,
+          by_session,
+          by_user,
+          producer,
+          producer_command,
+          by_harness,
+          by_provider,
+          commit_refs,
+          ts
+        ]
+      ] ->
+        %{
+          id: id,
+          assignment_id: assignment_id,
+          kind: kind,
+          verdict_kind: verdict_kind,
+          note: note,
+          by_session: by_session,
+          by_user: by_user,
+          producer: producer,
+          producer_command: producer_command,
+          by_harness: by_harness,
+          by_provider: by_provider,
+          commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
+          ts: ts
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  def query_condition_fact(db, id) do
+    {:ok, rows} =
+      DB.query(db, "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1", [id])
+
+    case rows do
+      [[fact_id, ts, kind, scope, origin]] ->
+        %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+
+      [] ->
+        nil
+    end
+  end
+
+  def query_message(db, id), do: Tightbeam.Projection.get(db, id)
+
   def query_device(db, id) do
     case Devices.by_id(db, id) do
       nil -> nil

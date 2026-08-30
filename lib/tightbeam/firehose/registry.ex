@@ -2,9 +2,9 @@ defmodule Tightbeam.Firehose.Registry do
   @moduledoc """
   The v1 class vocabulary and its state-resource mapping.
 
-  Observational classes intentionally have no resource mapping. Every state
-  row names the shared query, serializer, visibility, primary refs, and durable
-  version source used by rebuilds and notices.
+  Observational classes intentionally have no resource mapping. Rows marked
+  rebuildable name the shared query, serializer, visibility, primary refs, and
+  durable version source used by rebuilds and notices.
   """
 
   @observational ~w(
@@ -58,6 +58,7 @@ defmodule Tightbeam.Firehose.Registry do
       query: :query_config,
       serializer: :config,
       visibility: :config_visible?,
+      rebuild: true,
       version_source: "admin_projection_versions"
     },
     %{
@@ -68,6 +69,7 @@ defmodule Tightbeam.Firehose.Registry do
       query: :query_host_environment,
       serializer: :host_environment,
       visibility: :host_environment_visible?,
+      rebuild: true,
       version_source: "admin_projection_versions+host_environment_projection"
     },
     %{
@@ -78,6 +80,7 @@ defmodule Tightbeam.Firehose.Registry do
       query: :query_host,
       serializer: :host,
       visibility: :host_visible?,
+      rebuild: true,
       version_source: "admin_projection_versions"
     },
     %{
@@ -88,6 +91,7 @@ defmodule Tightbeam.Firehose.Registry do
       query: :query_user,
       serializer: :user,
       visibility: :user_visible?,
+      rebuild: true,
       version_source: "admin_projection_versions"
     },
     %{
@@ -98,6 +102,7 @@ defmodule Tightbeam.Firehose.Registry do
       query: :query_identity,
       serializer: :identity,
       visibility: :identity_visible?,
+      rebuild: true,
       version_source: "admin_projection_versions.publication_stamp"
     },
     %{
@@ -108,6 +113,7 @@ defmodule Tightbeam.Firehose.Registry do
       query: :query_kungfu,
       serializer: :kungfu,
       visibility: :kungfu_visible?,
+      rebuild: true,
       version_source: "admin_projection_versions.publication_stamp"
     }
   ]
@@ -152,11 +158,75 @@ defmodule Tightbeam.Firehose.Registry do
           Map.merge(row, %{
             query: :query_user,
             visibility: :user_visible?,
+            rebuild: true,
             version_source: "admin_projection_versions"
           })
         end)
+        |> Map.update!("attest.filed", fn row ->
+          Map.merge(row, %{
+            query: :query_attest,
+            visibility: :visible?,
+            rebuild: true,
+            version_source: "append_only"
+          })
+        end)
+        |> Map.update!("condition_fact.filed", fn row ->
+          Map.merge(row, %{
+            query: :query_condition_fact,
+            visibility: :visible?,
+            rebuild: true,
+            version_source: "append_only"
+          })
+        end)
         |> Map.update!("message.created", fn row ->
-          %{row | primary_refs: ["messageId", "sessionKey"]}
+          row
+          |> Map.merge(%{
+            query: :query_message,
+            visibility: :visible?,
+            rebuild: true,
+            version_source: "append_only"
+          })
+          |> Map.put(:primary_refs, ["messageId", "sessionKey"])
+        end)
+        |> Map.update!("prod.fired", fn row ->
+          Map.merge(row, %{
+            query: :query_production,
+            visibility: :visible?,
+            rebuild: true,
+            version_source: "append_only"
+          })
+        end)
+        |> Map.update!("critical_lease.updated", fn row ->
+          Map.merge(row, %{
+            query: :query_critical_state,
+            visibility: :visible?,
+            rebuild: true,
+            version_source: "critical_lease.updated_at"
+          })
+        end)
+        |> then(fn rows ->
+          Enum.reduce(
+            ~w(device.approved device.denied device.revoked),
+            rows,
+            fn class, rows ->
+              Map.update!(rows, class, fn row ->
+                Map.merge(row, %{
+                  query: :query_device,
+                  visibility: :visible?,
+                  rebuild: true,
+                  version_source: "device_versions"
+                })
+              end)
+            end
+          )
+        end)
+        |> Map.update!("read_marker.updated", fn row ->
+          Map.merge(row, %{
+            query: :query_read_marker,
+            visibility: :visible?,
+            rebuild: true,
+            version_source: "read_marker.updated_at"
+          })
         end)
         |> Map.merge(
           Map.new(@admin_rows, &{&1.class, Map.put(&1, :primary_ref, hd(&1.primary_refs))})

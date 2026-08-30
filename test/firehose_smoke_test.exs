@@ -2,8 +2,9 @@ defmodule Tightbeam.FirehoseSmokeTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.ClientE2E.WS
-  alias Tightbeam.{AdminProjection, Devices, Gateway, Harness, Placement}
-  alias Tightbeam.Firehose.{Hub, Publisher, Registry}
+  alias Tightbeam.{AdminProjection, CausalEvents, ConditionFacts, DB, Devices, Dispatch}
+  alias Tightbeam.{Gateway, Harness, Placement, Projection, ReadMarkers, Wakes}
+  alias Tightbeam.Firehose.{Hub, Publisher, Rebuild, Registry}
   alias Tightbeam.StateResources
   alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
 
@@ -343,6 +344,364 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
     assert buffered == fresh
     :ok = WS.close(ws)
+  end
+
+  test "A4 rebuild capability closes both ways over authoritative production mutations" do
+    fixture = start_fixture!()
+    :ok = Hub.register(fixture.hub, self())
+    on_exit(fn -> Hub.unregister(fixture.hub, self()) end)
+
+    {:ok, scheduler} =
+      Supervisor.start_child(
+        fixture.supervisor,
+        {Wakes, db: fixture.db, name: nil, tick_ms: 60_000, deliver: fn _wake -> :ok end}
+      )
+
+    main = Tightbeam.TestCase.ensure_main_session(fixture.db, fixture.user_id)
+
+    handlers =
+      Gateway.handlers(%{
+        db: fixture.db,
+        base_dir: fixture.base_dir,
+        wake_scheduler: scheduler,
+        wake_tick_ms: 1_000
+      })
+
+    call = fn verb, params -> production_call(fixture, verb, params) end
+
+    notices = %{}
+
+    notices =
+      capture_classes(fixture, notices, ["config.updated"], fn ->
+        handlers["config"].(
+          call.("config", %{action: "set", setting: "default-priority", value: 7})
+        )
+
+        Hub.committed(
+          fixture.hub,
+          "config.updated",
+          StateResources.query_config(fixture.db, "default-priority"),
+          %{"key" => "default-priority"}
+        )
+      end)
+
+    host = Placement.local_host_name()
+    harness = hd(Harness.all()).wire_name()
+
+    notices =
+      capture_classes(fixture, notices, ["host_env.updated"], fn ->
+        result =
+          Placement.set_env_overlay_with_firehose(
+            fixture.db,
+            host,
+            harness,
+            "A4_COMPLETE",
+            "private",
+            "user:#{fixture.user_id}",
+            call.("host-env-set", %{})
+          )
+
+        Hub.committed(
+          fixture.hub,
+          "host_env.updated",
+          StateResources.query_host_environment(fixture.db, host, harness, "A4_COMPLETE"),
+          %{}
+        )
+
+        result
+      end)
+
+    notices =
+      capture_classes(fixture, notices, ["host.registered"], fn ->
+        result =
+          Placement.register_host_with_firehose(
+            fixture.db,
+            "a4-complete-host",
+            %{ssh: nil, base_dir: "/a4/complete", cli_bin: nil, adapter_bin_dir: nil},
+            call.("register-host", %{})
+          )
+
+        Hub.committed(
+          fixture.hub,
+          "host.registered",
+          StateResources.query_host(fixture.db, "a4-complete-host"),
+          %{"host" => "a4-complete-host"}
+        )
+
+        result
+      end)
+
+    notices =
+      capture_classes(fixture, notices, ["user.added"], fn ->
+        user = Devices.add_user(fixture.db, "a4-complete-user", false)
+
+        Hub.committed(
+          fixture.hub,
+          "user.added",
+          StateResources.query_user(fixture.db, user.user_id),
+          %{"userId" => user.user_id}
+        )
+      end)
+
+    Devices.add_user(fixture.db, "a4-promoted-user", false)
+
+    notices =
+      capture_classes(fixture, notices, ["user.promoted"], fn ->
+        result =
+          Devices.promote_user_with_firehose(
+            fixture.db,
+            "a4-promoted-user",
+            call.("promote-user", %{user_id: "a4-promoted-user"})
+          )
+
+        Hub.committed(
+          fixture.hub,
+          "user.promoted",
+          StateResources.query_user(fixture.db, "a4-promoted-user"),
+          %{"userId" => "a4-promoted-user"}
+        )
+
+        result
+      end)
+
+    notices =
+      Enum.reduce(
+        [
+          {"device.approved", "approve-device", "a4-approved", &Devices.approve_with_firehose/4},
+          {"device.denied", "deny-device", "a4-denied", &Devices.deny_with_firehose/3},
+          {"device.revoked", "revoke-device", "a4-revoked", &Devices.revoke_with_firehose/3}
+        ],
+        notices,
+        fn {class, verb, device_id, mutation}, notices ->
+          assert {:pending, _device} =
+                   Devices.pair(fixture.db, %{
+                     device_id: device_id,
+                     claimed_name: device_id,
+                     platform: nil,
+                     model: nil
+                   })
+
+          capture_classes(fixture, notices, [class], fn ->
+            case class do
+              "device.approved" ->
+                mutation.(
+                  fixture.db,
+                  device_id,
+                  fixture.user_id,
+                  call.("approve-device", %{device_id: device_id})
+                )
+
+              _ ->
+                mutation.(
+                  fixture.db,
+                  device_id,
+                  call.(verb, %{device_id: device_id})
+                )
+            end
+          end)
+        end
+      )
+
+    notices =
+      capture_classes(fixture, notices, ["read_marker.updated"], fn ->
+        ReadMarkers.set(fixture.db, fixture.user_id, "a4-complete", "newer",
+          firehose_call: call.("read-marker-set", %{scope_key: "a4-complete"})
+        )
+      end)
+
+    notices =
+      capture_classes(fixture, notices, ["critical_lease.updated"], fn ->
+        Tightbeam.CriticalLeases.declare(
+          fixture.db,
+          main.session_key,
+          1_000,
+          "a4-complete",
+          5_000,
+          %{
+            call.("critical", %{for_ms: 1_000, reason: "a4-complete"})
+            | principal: {:session, main.session_key},
+              session_key: main.session_key
+          }
+        )
+      end)
+
+    notices =
+      capture_classes(fixture, notices, ["identity.updated", "kungfu.updated"], fn ->
+        result =
+          handlers["kungfu-scaffold"].(
+            call.("kungfu-scaffold", %{
+              name: "a4-complete",
+              purpose: "Prove authoritative rebuild completeness."
+            })
+          )
+
+        identity =
+          fixture.db
+          |> StateResources.query_identity(%{"name" => "served"})
+          |> List.first()
+
+        Hub.committed(fixture.hub, "identity.updated", identity, %{"name" => "served"})
+
+        Hub.committed(
+          fixture.hub,
+          "kungfu.updated",
+          StateResources.query_kungfu(fixture.db, "a4-complete"),
+          %{"name" => "a4-complete"}
+        )
+
+        result
+      end)
+
+    dispatch_call =
+      call.("dispatch", %{
+        subject: "A4 production rebuild",
+        brief: "Create real append-only rows."
+      })
+      |> Map.merge(%{session_key: main.session_key, target_role: nil, role_fallback: false})
+
+    {:ok, assignment} = Dispatch.dispatch(fixture.db, handlers, dispatch_call)
+
+    notices =
+      capture_classes(fixture, notices, ["message.created"], fn ->
+        {:appended, message} =
+          Projection.append(fixture.db, %{
+            session_key: main.session_key,
+            role: "assistant",
+            message_type: "substrate",
+            content: "authoritative A4 message",
+            sender: "process:tightbeam"
+          })
+
+        Hub.committed(fixture.hub, "message.created", message, %{
+          "messageId" => message.id,
+          "sessionKey" => main.session_key,
+          "ownerUserId" => fixture.user_id
+        })
+      end)
+
+    notices =
+      capture_classes(fixture, notices, ["attest.filed"], fn ->
+        {:ok, _result} =
+          Dispatch.dispatch(fixture.db, handlers, %{
+            call.("attest", %{
+              assignment_id: assignment.id,
+              kind: "progress",
+              note: "authoritative A4 append"
+            })
+            | principal: {:session, main.session_key},
+              origin: "agent:#{main.session_key}"
+          })
+      end)
+
+    notices =
+      capture_classes(fixture, notices, ["condition_fact.filed"], fn ->
+        assert {%{kind: "a4-authoritative"}, true} =
+                 ConditionFacts.file_idempotent_with_effect(
+                   fixture.db,
+                   scheduler,
+                   %{
+                     kind: "a4-authoritative",
+                     scope: "complete",
+                     origin: "user:#{fixture.user_id}",
+                     idempotency_key: "a4-authoritative"
+                   },
+                   call.("condition", %{kind: "a4-authoritative", scope: "complete"})
+                 )
+      end)
+
+    notices =
+      capture_classes(fixture, notices, ["prod.fired"], fn ->
+        {:ok, seq} =
+          DB.transaction(fixture.db, fn txn ->
+            :ok =
+              CausalEvents.append_in_txn(txn, %{
+                kind: "prod_fired",
+                job_ref: assignment.workItemId,
+                assignment_id: assignment.id,
+                session_key: main.session_key,
+                detail: %{"tier" => 1}
+              })
+
+            [[seq]] = DB.Txn.q(txn, "SELECT last_insert_rowid()")
+            seq
+          end)
+
+        event = StateResources.query_production(fixture.db, seq)
+        assert event.kind == "prod_fired"
+        Hub.committed(fixture.hub, "prod.fired", event, %{"eventId" => event.seq})
+      end)
+
+    assert Map.keys(notices) |> Enum.sort() == Rebuild.classes()
+    assert Rebuild.classes() == Enum.sort(Map.keys(@a4_versioned) ++ Map.keys(@a4_immutable))
+
+    for {class, notice} <- notices do
+      assert {:ok, fresh} =
+               Rebuild.fetch(
+                 fixture.db,
+                 class,
+                 notice["refs"],
+                 fixture.user_id,
+                 true
+               )
+
+      assert fresh == notice["payload"], class
+    end
+
+    older = notices["read_marker.updated"]["payload"]
+
+    latest =
+      capture_classes(fixture, %{}, ["read_marker.updated"], fn ->
+        ReadMarkers.set(fixture.db, fixture.user_id, "a4-complete", "latest",
+          firehose_call: call.("read-marker-set", %{scope_key: "a4-complete"})
+        )
+      end)["read_marker.updated"]
+
+    assert older["rowVersion"] < latest["payload"]["rowVersion"]
+
+    assert {:ok, latest["payload"]} ==
+             Rebuild.fetch(
+               fixture.db,
+               "read_marker.updated",
+               latest["refs"],
+               fixture.user_id,
+               true
+             )
+
+    assert :forbidden ==
+             Rebuild.fetch(
+               fixture.db,
+               "critical_lease.updated",
+               notices["critical_lease.updated"]["refs"],
+               fixture.user_id,
+               false
+             )
+
+    assert {:ok, notices["host.registered"]["payload"]} ==
+             Rebuild.fetch(
+               fixture.db,
+               "host.registered",
+               notices["host.registered"]["refs"],
+               fixture.user_id,
+               false
+             )
+
+    assert :forbidden ==
+             Rebuild.fetch(
+               fixture.db,
+               "user.promoted",
+               notices["user.promoted"]["refs"],
+               fixture.user_id,
+               false
+             )
+
+    assert :unsupported ==
+             Rebuild.fetch(
+               fixture.db,
+               "work_item.updated",
+               %{"workItemId" => assignment.workItemId},
+               fixture.user_id,
+               true
+             )
   end
 
   test "external subscribe, query rebuild, live apply, and forced reconnect converge" do
@@ -694,6 +1053,42 @@ defmodule Tightbeam.FirehoseSmokeTest do
       params: params,
       firehose_in_txn: true
     }
+  end
+
+  defp production_call(fixture, verb, params) do
+    firehose_call(verb, params)
+    |> Map.put(:firehose_hub, fixture.hub)
+  end
+
+  defp capture_classes(fixture, notices, classes, mutation) do
+    {notices, _result} = capture_classes_with_result(fixture, notices, classes, mutation)
+    notices
+  end
+
+  defp capture_classes_with_result(fixture, notices, classes, mutation) do
+    result = mutation.()
+    wanted = MapSet.new(classes)
+    {receive_classes(fixture.hub, notices, wanted), result}
+  end
+
+  defp receive_classes(hub, notices, wanted) do
+    if MapSet.size(wanted) == 0 do
+      notices
+    else
+      receive do
+        {:firehose_notice, %{"class" => class} = notice} ->
+          Hub.delivered(hub, self())
+
+          if MapSet.member?(wanted, class) do
+            receive_classes(hub, Map.put(notices, class, notice), MapSet.delete(wanted, class))
+          else
+            receive_classes(hub, notices, wanted)
+          end
+      after
+        2_000 ->
+          flunk("missing authoritative Firehose classes: #{inspect(MapSet.to_list(wanted))}")
+      end
+    end
   end
 
   defp authoritative_key(%{"resource" => "host environment", "refs" => refs}),
