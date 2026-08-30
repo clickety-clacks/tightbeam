@@ -549,11 +549,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::RevokeAssignment {
             identity,
             assignment_id,
+            reason,
         } => Ok(request(
             identity,
             "revoke-assignment",
             vec![],
-            vec![string_field("assignmentId", assignment_id)],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
         )),
         Command::ReopenAssignment {
             identity,
@@ -2544,8 +2548,15 @@ mod tests {
             r#"{"as":"parent","verb":"decision-request","params":{"request":"dr_12345678-1234-4234-9234-123456789abc"}}"#
         );
         assert_eq!(
-            body(&["revoke-assignment", "asg_1", "--as", "parent",]),
-            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
+            body(&[
+                "revoke-assignment",
+                "asg_1",
+                "--reason",
+                "superseded by a new assignment",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1","reason":"superseded by a new assignment"}}"#
         );
         assert_eq!(
             body(&[

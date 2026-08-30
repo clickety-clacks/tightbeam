@@ -451,7 +451,9 @@ defmodule Tightbeam.WorkItemsTest do
     Assignments.__handle__(ctx.db, "assign", assignment_call)
   end
 
-  defp revoke_call(id), do: call("revoke-assignment", {:user, "flynn"}, %{assignment_id: id})
+  defp revoke_call(id),
+    do:
+      call("revoke-assignment", {:user, "flynn"}, %{assignment_id: id, reason: "test revocation"})
 
   defp dispatch!(ctx, call) do
     assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)

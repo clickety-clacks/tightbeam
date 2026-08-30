@@ -4032,7 +4032,7 @@ defmodule Tightbeam.ConformanceSupport do
         origin: "user:owner",
         principal: {:user, "owner"},
         session_key: nil,
-        params: %{assignment_id: assignment_id}
+        params: %{assignment_id: assignment_id, reason: "test revocation"}
       })
 
     refute Map.has_key?(result, :code)

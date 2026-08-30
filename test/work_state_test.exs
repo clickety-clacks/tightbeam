@@ -496,7 +496,7 @@ defmodule Tightbeam.WorkStateTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{assignment_id: assignment_id},
+      params: %{assignment_id: assignment_id, reason: "test revocation"},
       on_assignment_change: ctx.assignment_change
     })
   end

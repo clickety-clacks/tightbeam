@@ -138,6 +138,42 @@ defmodule Tightbeam.Assignments do
   );
   """
 
+  # A revocation is a terminal fact, not an attest: the revoker is not the
+  # holder and does not owe a verdict. Keep its provenance in its own
+  # append-only row so reopening does not erase an earlier revocation.
+  @revocations_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_revocations (
+    id TEXT PRIMARY KEY,
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    revokedAt INTEGER NOT NULL,
+    revokedByUser TEXT NULL REFERENCES users(userId),
+    revokedBySession TEXT NULL REFERENCES sessions(sessionKey),
+    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000 AND length(trim(reason)) >= 1),
+    CHECK((revokedByUser IS NOT NULL) != (revokedBySession IS NOT NULL))
+  );
+  CREATE INDEX IF NOT EXISTS assignment_revocations_assignment
+    ON assignment_revocations (assignmentId, revokedAt, id);
+  """
+
+  # The assignments row remains the terminal-state authority. This trigger
+  # makes a revoked close impossible unless the same transaction first wrote a
+  # provenance row with the exact closer and timestamp it is about to publish.
+  @revocation_trigger_ddl """
+  CREATE TRIGGER IF NOT EXISTS assignments_revocation_reason_required
+  BEFORE UPDATE OF state, outcome, closedAt, closedByUser, closedBySession ON assignments
+  WHEN NEW.state = 'closed' AND NEW.outcome = 'revoked'
+    AND NOT EXISTS (
+      SELECT 1 FROM assignment_revocations r
+      WHERE r.assignmentId = NEW.id
+        AND r.revokedAt = NEW.closedAt
+        AND r.revokedByUser IS NEW.closedByUser
+        AND r.revokedBySession IS NEW.closedBySession
+    )
+  BEGIN
+    SELECT RAISE(ABORT, 'revoked assignment requires revocation provenance');
+  END;
+  """
+
   # The `reopen-assignment` papertrail. The assignments CHECK forces an OPEN row
   # to carry NULL outcome/closedAt/closer/closingAttest, so reopening necessarily
   # clears those columns — and a repair that CLEARS a recorded fact without
@@ -177,7 +213,28 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @assignment_priorities_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
     :ok = DB.execute(db, @reopenings_ddl)
+    :ok = DB.execute(db, @revocations_ddl)
+    :ok = DB.execute(db, @revocation_trigger_ddl)
+    migrate_legacy_revocations(db)
     Tightbeam.EffortCheckin.ensure_schema(db)
+  end
+
+  # Historical revoked rows predate a required reason. The explicit sentinel
+  # records that absence without manufacturing a motive, and INSERT OR IGNORE
+  # makes boot/replay idempotent.
+  defp migrate_legacy_revocations(db) do
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT OR IGNORE INTO assignment_revocations
+          (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+        SELECT 'legacy:' || id || ':' || closedAt, id, closedAt, closedByUser,
+          closedBySession, 'legacy_unknown'
+        FROM assignments
+        WHERE state = 'closed' AND outcome = 'revoked'
+        """
+      )
   end
 
   @doc "Close every open assignment held by a retiring session and record why."
@@ -205,6 +262,16 @@ defmodule Tightbeam.Assignments do
 
     Enum.each(assignments, fn %{assignment_id: assignment_id, work_item_id: work_item_id} ->
       ts = now()
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO assignment_revocations
+          (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+        VALUES (?1, ?2, ?3, ?4, NULL, 'holder session retired')
+        """,
+        [id("rev_"), assignment_id, ts, owner_user_id]
+      )
 
       Txn.q(
         txn,
@@ -954,8 +1021,9 @@ defmodule Tightbeam.Assignments do
                 error
             end
 
-          if is_map(result) and not Map.has_key?(result, :code),
-            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+          if is_map(result) and not Map.has_key?(result, :code) and
+               not Map.get(result, :revocation_replayed, false),
+             do: Publisher.maybe_accepted_in_txn(txn, call, result)
 
           result
         end)
@@ -1166,7 +1234,7 @@ defmodule Tightbeam.Assignments do
         best_effort(fn -> notify(call, :on_assignment_change, assignment_id, prior_state) end)
       end
 
-      result
+      Map.delete(result, :revocation_replayed)
     end
   rescue
     TransitionRace -> assignment_closed()
@@ -1472,6 +1540,25 @@ defmodule Tightbeam.Assignments do
 
   defp valid_reopen_reason(_),
     do: error("invalid_reason", "reason must be text")
+
+  defp valid_revocation_reason(reason) when is_binary(reason) do
+    # SQLite counts Unicode code points for this CHECK, so the application
+    # guard uses the same unit and always returns a named refusal first.
+    length_in_code_points = length(String.to_charlist(reason))
+
+    if length_in_code_points in 1..2000 and String.trim(reason) != "",
+      do: :ok,
+      else:
+        error(
+          "invalid_reason",
+          "reason must be 1..2000 non-blank characters naming the revocation"
+        )
+  end
+
+  defp valid_revocation_reason(nil),
+    do: error("missing_reason", "revocation requires a reason naming why this card is revoked")
+
+  defp valid_revocation_reason(_), do: error("invalid_reason", "reason must be text")
 
   defp assignments_result(db, call) do
     with :ok <- principal_allowed(call.principal, "assignments"),
@@ -1941,48 +2028,75 @@ defmodule Tightbeam.Assignments do
             error("not_authorized", "assignment revocation requires its opener or an admin")
 
           assignment.state != "open" ->
-            assignment_closed()
+            with :ok <- valid_revocation_reason(call.params[:reason]) do
+              if assignment.outcome == "revoked" and
+                   assignment.revocationReason == call.params[:reason] do
+                Map.put(assignment, :revocation_replayed, true)
+              else
+                assignment_closed()
+              end
+            end
 
           true ->
-            {closed_user, closed_session} = opener(call.principal)
+            with :ok <- valid_revocation_reason(call.params[:reason]) do
+              {closed_user, closed_session} = opener(call.principal)
+              closed_at = now()
 
-            Txn.q(
-              txn,
-              """
-              UPDATE assignments SET state = 'closed', outcome = 'revoked', closedAt = ?2,
-                closedByUser = ?3, closedBySession = ?4
-              WHERE id = ?1 AND state = 'open'
-              """,
-              [assignment_id, now(), closed_user, closed_session]
-            )
-
-            if Txn.changes(txn) != 1, do: raise(TransitionRace)
-            revoked_assignment = fetch_assignment!(txn, assignment_id)
-            Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
-
-            liveness_trigger =
-              disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
-
-            supervision_transition!(txn, :terminal_disposition, %{
-              kind: "terminal_disposition",
-              assignment_id: assignment_id,
-              cause: "terminal_disposition",
-              principal: principal_id(call.principal),
-              requester_id: "tightbeam:assignments"
-            })
-
-            EffortCheckin.cancel_in_txn(
-              txn,
-              assignment_id,
-              assignment_disposition_command(
-                assignment_id,
-                "tightbeam:assignments",
-                liveness_trigger
+              Txn.q(
+                txn,
+                """
+                INSERT INTO assignment_revocations
+                  (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                """,
+                [
+                  id("rev_"),
+                  assignment_id,
+                  closed_at,
+                  closed_user,
+                  closed_session,
+                  call.params[:reason]
+                ]
               )
-            )
 
-            append_assignment_marker(txn, revoked_assignment, :revoked)
-            revoked_assignment
+              Txn.q(
+                txn,
+                """
+                UPDATE assignments SET state = 'closed', outcome = 'revoked', closedAt = ?2,
+                  closedByUser = ?3, closedBySession = ?4
+                WHERE id = ?1 AND state = 'open'
+                """,
+                [assignment_id, closed_at, closed_user, closed_session]
+              )
+
+              if Txn.changes(txn) != 1, do: raise(TransitionRace)
+              revoked_assignment = fetch_assignment!(txn, assignment_id)
+              Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
+
+              liveness_trigger =
+                disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
+
+              supervision_transition!(txn, :terminal_disposition, %{
+                kind: "terminal_disposition",
+                assignment_id: assignment_id,
+                cause: "terminal_disposition",
+                principal: principal_id(call.principal),
+                requester_id: "tightbeam:assignments"
+              })
+
+              EffortCheckin.cancel_in_txn(
+                txn,
+                assignment_id,
+                assignment_disposition_command(
+                  assignment_id,
+                  "tightbeam:assignments",
+                  liveness_trigger
+                )
+              )
+
+              append_assignment_marker(txn, revoked_assignment, :revoked)
+              revoked_assignment
+            end
         end
     end
   end
@@ -2613,7 +2727,10 @@ defmodule Tightbeam.Assignments do
 
   defp columns do
     "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>
-      "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId" <>
+      "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId, " <>
+      "(SELECT reason FROM assignment_revocations r WHERE r.assignmentId = assignments.id " <>
+      "AND r.revokedAt IS assignments.closedAt AND r.revokedByUser IS assignments.closedByUser " <>
+      "AND r.revokedBySession IS assignments.closedBySession ORDER BY r.id DESC LIMIT 1)" <>
       ", workItemId, reviewsAssignmentId, holderHarness, holderProvider, " <>
       "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = assignments.id), " <>
       "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END), " <>
@@ -2637,6 +2754,7 @@ defmodule Tightbeam.Assignments do
          closed_by_user,
          closed_by_session,
          closing_attest_id,
+         revocation_reason,
          work_item_id,
          reviews_assignment_id,
          holder_harness,
@@ -2659,6 +2777,7 @@ defmodule Tightbeam.Assignments do
       closedByUser: closed_by_user,
       closedBySession: closed_by_session,
       closingAttestId: closing_attest_id,
+      revocationReason: revocation_reason,
       workItemId: work_item_id,
       reviewsAssignmentId: reviews_assignment_id,
       holderHarness: holder_harness,

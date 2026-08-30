@@ -432,7 +432,10 @@ defmodule Tightbeam.CheckTierTest do
     Assignments.__handle__(
       ctx.db,
       "revoke-assignment",
-      call("revoke-assignment", {:user, "flynn"}, %{assignment_id: assignment_id})
+      call("revoke-assignment", {:user, "flynn"}, %{
+        assignment_id: assignment_id,
+        reason: "test revocation"
+      })
     )
   end
 

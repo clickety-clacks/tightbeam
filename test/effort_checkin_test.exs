@@ -148,7 +148,8 @@ defmodule Tightbeam.EffortCheckinTest do
     revoked = dispatch(ctx, {:session, "parent"}, "holder", "revoked")
 
     assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
-      assignment_id: revoked.id
+      assignment_id: revoked.id,
+      reason: "test revocation"
     })
 
     assert bracket_state(ctx.db, revoked.id) == "canceled"
@@ -537,7 +538,11 @@ defmodule Tightbeam.EffortCheckinTest do
     assert bracket_state(ctx.db, item.id) == "probed"
     assert no_effort_requests?(ctx.db, item.id)
 
-    assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{assignment_id: item.id})
+    assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
+      assignment_id: item.id,
+      reason: "test revocation"
+    })
+
     assert bracket_state(ctx.db, item.id) == "canceled"
   end
 

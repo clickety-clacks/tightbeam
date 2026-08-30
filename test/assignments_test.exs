@@ -2133,6 +2133,129 @@ defmodule Tightbeam.AssignmentsTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
   end
 
+  test "revocation requires one durable bounded reason and projects its provenance", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reason required"))
+
+    for params <- [
+          %{assignment_id: assignment.id},
+          %{assignment_id: assignment.id, reason: "   "},
+          %{assignment_id: assignment.id, reason: String.duplicate("x", 2001)},
+          %{assignment_id: assignment.id, reason: 7}
+        ] do
+      assert %{code: code} =
+               handle(
+                 ctx,
+                 "revoke-assignment",
+                 call("revoke-assignment", {:user, "flynn"}, nil, params)
+               )
+
+      assert code in ["missing_reason", "invalid_reason"]
+    end
+
+    assert %{state: "open", revocationReason: nil} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId = ?1",
+               [
+                 assignment.id
+               ]
+             )
+
+    revoked =
+      handle(
+        ctx,
+        "revoke-assignment",
+        call("revoke-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: "the work moved to its replacement"
+        })
+      )
+
+    assert revoked.revocationReason == "the work moved to its replacement"
+    assert revoked.closedByUser == "flynn"
+
+    assert %{revocationReason: "the work moved to its replacement"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert %{
+             "class" => "assignment.closed",
+             "payload" => %{"revocationReason" => "the work moved to its replacement"}
+           } =
+             Tightbeam.Firehose.Publisher.state_notice(
+               ctx.db,
+               call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+               revoked
+             )
+
+    assert {:ok, [["flynn", nil, closed_at, "the work moved to its replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedByUser, revokedBySession, revokedAt, reason FROM assignment_revocations WHERE assignmentId = ?1",
+               [assignment.id]
+             )
+
+    assert closed_at == revoked.closedAt
+
+    replayed =
+      handle(
+        ctx,
+        "revoke-assignment",
+        call("revoke-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: "the work moved to its replacement"
+        })
+      )
+
+    assert replayed.id == assignment.id
+    assert replayed.revocationReason == "the work moved to its replacement"
+
+    assert %{code: "assignment_closed"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               call("revoke-assignment", {:user, "flynn"}, nil, %{
+                 assignment_id: assignment.id,
+                 reason: "a conflicting reason"
+               })
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId = ?1",
+               [
+                 assignment.id
+               ]
+             )
+  end
+
+  test "legacy revoked assignments migrate only to the explicit unknown sentinel", ctx do
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id, subject, holderKey, holderFallback, openedByUser, openedAt, state, outcome,
+                  closedAt, closedByUser)
+               VALUES ('asg_legacy_reason', 'legacy', 'holder', 0, 'flynn', 1, 'closed', 'revoked', 2, 'flynn')
+               """
+             )
+
+    :ok = Assignments.ensure_schema(ctx.db)
+
+    assert %{revocationReason: "legacy_unknown", closedByUser: "flynn", closedAt: 2} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:user, "flynn"}, "asg_legacy_reason")
+             )
+  end
+
   test "query filters, deterministic ordering, role-resolved holder input, and open_count", ctx do
     a = handle(ctx, "assign", assign_call({:user, "flynn"}, "a"))
     b = handle(ctx, "assign", assign_call({:user, "flynn"}, "b"))
@@ -2400,7 +2523,7 @@ defmodule Tightbeam.AssignmentsTest do
     do: call("assignment-get", principal, nil, %{assignment_id: id})
 
   defp revoke_call(principal, id),
-    do: call("revoke-assignment", principal, nil, %{assignment_id: id})
+    do: call("revoke-assignment", principal, nil, %{assignment_id: id, reason: "test revocation"})
 
   defp reopen_call(principal, id, reason),
     do:

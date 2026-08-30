@@ -760,7 +760,7 @@ defmodule Tightbeam.GatewayTest do
              handlers["revoke-assignment"].(
                Map.merge(common, %{
                  verb: "revoke-assignment",
-                 params: %{assignment_id: assign_id}
+                 params: %{assignment_id: assign_id, reason: "test revocation"}
                })
              )
 

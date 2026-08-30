@@ -363,7 +363,14 @@ defmodule Tightbeam.CliIntegrationTest do
     {revoked, 0} =
       System.cmd(
         ctx.binary,
-        ["revoke-assignment", assignment_id, "--as-user", "flynn"],
+        [
+          "revoke-assignment",
+          assignment_id,
+          "--reason",
+          "operator cleanup",
+          "--as-user",
+          "flynn"
+        ],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -494,7 +501,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {revoked, 0} =
-      System.cmd(ctx.binary, ["revoke-assignment", dispatch_id],
+      System.cmd(ctx.binary, ["revoke-assignment", dispatch_id, "--reason", "worker cleanup"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -502,7 +509,10 @@ defmodule Tightbeam.CliIntegrationTest do
     assert revoked =~ "revoked"
 
     assert_receive {:cli_call,
-                    %{verb: "revoke-assignment", params: %{assignment_id: ^dispatch_id}}}
+                    %{
+                      verb: "revoke-assignment",
+                      params: %{assignment_id: ^dispatch_id, reason: "worker cleanup"}
+                    }}
 
     {listed, 0} =
       System.cmd(ctx.binary, ["assignments", "--session", "cli-worker", "--state", "all"],

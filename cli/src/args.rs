@@ -225,6 +225,7 @@ pub enum Command {
     RevokeAssignment {
         identity: Identity,
         assignment_id: String,
+        reason: String,
     },
     ReopenAssignment {
         identity: Identity,
@@ -712,8 +713,8 @@ COMMANDS:
       information. The original row and reason remain in history, it leaves
       the open queue, and its asker must revise or replace it with a new request
       if an answer is still needed.
-  revoke-assignment <assignmentId>
-      Revoke when the assignment handler already authorizes your principal.
+  revoke-assignment <assignmentId> --reason "..."
+      Revoke with a durable reason when the assignment handler authorizes your principal.
   reopen-assignment <assignmentId> --reason "..."
       Move a CLOSED assignment back to open so its holder can file the verdict
       or lifecycle row the card still owes — the agent-reachable repair for a
@@ -1759,11 +1760,19 @@ fn parse_with_optional_catalog(
         }
         "revoke-assignment" => {
             if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam revoke-assignment <assignmentId>".to_owned());
+                return Err(
+                    "usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"".to_owned(),
+                );
             }
+            let Some(reason) = nonempty(flags, "reason") else {
+                return Err(
+                    "usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"".to_owned(),
+                );
+            };
             Ok(Command::RevokeAssignment {
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
+                reason,
             })
         }
         "reopen-assignment" => {

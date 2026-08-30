@@ -1943,7 +1943,11 @@ defmodule FeatureSmoke do
     request2 = arm_effort_request!(state, first_id, parent_key)
     request2_id = request2["id"]
 
-    revoked = ok!(parent_state, "revoke-assignment", %{"assignmentId" => first_id})
+    revoked =
+      ok!(parent_state, "revoke-assignment", %{
+        "assignmentId" => first_id,
+        "reason" => "smoke cleanup"
+      })
 
     assert(
       state,
@@ -1987,7 +1991,11 @@ defmodule FeatureSmoke do
       "replacement dispatch did not arm a fresh bracket: #{inspect(replacement_request)}"
     )
 
-    ok!(parent_state, "revoke-assignment", %{"assignmentId" => second_id})
+    ok!(parent_state, "revoke-assignment", %{
+      "assignmentId" => second_id,
+      "reason" => "smoke cleanup"
+    })
+
     retire(state, first_holder)
     retire(state, second_holder)
     retire(state, parent)
@@ -2299,7 +2307,10 @@ defmodule FeatureSmoke do
       got = ok!(state, "work-item-get", %{"workItemId" => item["id"]})
 
       for asg <- got["assignments"] || [], asg["state"] == "open" do
-        ok!(state, "revoke-assignment", %{"assignmentId" => asg["id"]})
+        ok!(state, "revoke-assignment", %{
+          "assignmentId" => asg["id"],
+          "reason" => "smoke cleanup"
+        })
       end
 
       ok!(state, "work-item-close", %{"workItemId" => item["id"]})
