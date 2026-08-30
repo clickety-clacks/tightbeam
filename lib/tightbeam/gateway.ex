@@ -2768,33 +2768,32 @@ defmodule Tightbeam.Gateway do
     archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
     invocation_id = Map.fetch!(call, :invocation_id)
 
-    case Org.release_archetypes(
-           db,
-           archetypes,
-           fn txn ->
-             candidate = Identity.unlearn!(config.base_dir, name, call.origin)
+    release_identity_unlearn(config, db, name, archetypes, fn txn ->
+      candidate = Identity.unlearn!(config.base_dir, name, call.origin)
 
-             marker =
-               AdminProjection.begin_identity_publication_in_txn(
-                 txn,
-                 invocation_id,
-                 candidate,
-                 call.origin
-               )
+      marker =
+        AdminProjection.begin_identity_publication_in_txn(
+          txn,
+          invocation_id,
+          candidate,
+          call.origin
+        )
 
-             {candidate, marker}
-           end,
-           fn {candidate, marker} ->
-             case Identity.publish_live!(config.base_dir, candidate) do
-               {:ok, revision} ->
-                 reload_law!(config)
-                 {:published, marker, revision}
+      {candidate, marker}
+    end)
+  end
 
-               {:error, error} ->
-                 {:denied, marker, error}
-             end
+  defp release_identity_unlearn(config, db, name, archetypes, prepare) do
+    case Org.release_archetypes(db, archetypes, prepare, fn {candidate, marker} ->
+           case Identity.publish_live!(config.base_dir, candidate) do
+             {:ok, revision} ->
+               reload_law!(config)
+               {:published, marker, revision}
+
+             {:error, error} ->
+               {:denied, marker, error}
            end
-         ) do
+         end) do
       {:referenced, references} ->
         unlearn_referenced_result(name, references)
 
@@ -3670,15 +3669,40 @@ defmodule Tightbeam.Gateway do
           identity_denial_result(marker)
 
         %{state: "pending"} = marker ->
-          candidate = %{
-            expected_prior: marker.expected_prior,
-            candidate_revision: marker.candidate_revision,
-            tree_fingerprint: marker.tree_fingerprint
-          }
-
-          publish_identity_candidate(config, db, call, candidate, %{state: "published"})
+          replay_identity_publication(config, db, call, marker)
       end
     end)
+  end
+
+  defp replay_identity_publication(config, db, %{verb: "unlearn"} = call, marker) do
+    name = call.params.name
+
+    archetypes =
+      Identity.bundle_archetype_names_at!(config.base_dir, marker.expected_prior, name)
+
+    candidate = identity_candidate_from_marker(marker)
+
+    release_identity_unlearn(config, db, name, archetypes, fn _txn ->
+      {candidate, marker}
+    end)
+  end
+
+  defp replay_identity_publication(config, db, call, marker) do
+    publish_identity_candidate(
+      config,
+      db,
+      call,
+      identity_candidate_from_marker(marker),
+      %{state: "published"}
+    )
+  end
+
+  defp identity_candidate_from_marker(marker) do
+    %{
+      expected_prior: marker.expected_prior,
+      candidate_revision: marker.candidate_revision,
+      tree_fingerprint: marker.tree_fingerprint
+    }
   end
 
   defp identity_denial_result(marker) do

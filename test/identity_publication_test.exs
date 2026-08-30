@@ -1,7 +1,18 @@
 defmodule Tightbeam.IdentityPublicationTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{AdminProjection, Archetypes, DB, Devices, Dispatch, Gateway, Identity, Schema}
+  alias Tightbeam.{
+    AdminProjection,
+    Archetypes,
+    DB,
+    Devices,
+    Dispatch,
+    Gateway,
+    Identity,
+    Model,
+    Org,
+    Schema
+  }
 
   setup do
     base_dir =
@@ -159,6 +170,66 @@ defmodule Tightbeam.IdentityPublicationTest do
 
     assert handler.(call) == denial
     assert git!(identity_dir, ["rev-parse", "tightbeam/live"]) == divergent
+  end
+
+  test "pending unlearn replay keeps a late durable reference behind the writer fence", ctx do
+    assert {:ok, learned} = Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+    assert {:ok, _revision} = Identity.publish_live!(ctx.base_dir, learned)
+    Archetypes.load!(ctx.base_dir)
+
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+    key = "unlearn-late-reference"
+    invocation = keyed_invocation("user:flynn", "unlearn", key)
+    candidate = Identity.unlearn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
+    assert {:ok, %{state: "pending"}} =
+             AdminProjection.begin_identity_publication(
+               ctx.db,
+               invocation,
+               candidate,
+               "user:flynn"
+             )
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:late-coder",
+        display_name: "Late coder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol")
+      })
+
+    call = %{
+      verb: "unlearn",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{name: "agentic-engineering", idempotency_key: key}
+    }
+
+    assert {:error,
+            %{
+              state: "referenced",
+              code: "kungfu_referenced",
+              sessions: [%{session_key: session_key}]
+            }} = Dispatch.dispatch(ctx.db, handlers, call)
+
+    assert session_key == session.session_key
+    assert Identity.live_revision!(ctx.base_dir) == candidate.expected_prior
+    assert Archetypes.get("coder").name == "coder"
+
+    assert %{state: "pending", candidate_revision: candidate_revision} =
+             AdminProjection.identity_publication_marker(
+               ctx.db,
+               invocation,
+               candidate.expected_prior
+             )
+
+    assert candidate_revision == candidate.candidate_revision
   end
 
   defp identity_call(params, invocation_id) do

@@ -495,10 +495,16 @@ defmodule Tightbeam.Identity do
   @doc "Bundle-owned archetype names recorded by a learned receipt."
   @spec bundle_archetype_names!(String.t(), String.t()) :: [String.t()]
   def bundle_archetype_names!(base_dir, name) do
+    bundle_archetype_names_at!(base_dir, "main", name)
+  end
+
+  @doc "Bundle-owned archetype names recorded by a learned receipt at `revision`."
+  @spec bundle_archetype_names_at!(String.t(), String.t(), String.t()) :: [String.t()]
+  def bundle_archetype_names_at!(base_dir, revision, name) do
     dir = identity_dir(base_dir)
 
     dir
-    |> read_receipt!("main", name)
+    |> read_receipt!(revision, name)
     |> Map.fetch!(:paths)
     |> Enum.filter(&(Path.dirname(&1) == "archetypes" and String.ends_with?(&1, ".toml")))
     |> Enum.map(&(&1 |> Path.basename() |> Path.rootname()))
