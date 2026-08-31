@@ -3,7 +3,44 @@ defmodule Tightbeam.Firehose.Publisher do
 
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Registry}
-  alias Tightbeam.StateResources
+  alias Tightbeam.{ModelCatalog, StateResources}
+
+  @work_item_public_shape MapSet.new(
+                            ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason createdByUser createdBySession createdAt priority rowVersion)
+                          )
+
+  # Preserve only the exact result-shaped payloads already emitted on current main.
+  # Any additive drift still refuses at the shared Publisher boundary.
+  @message_public_shape MapSet.new(
+                          ~w(id seq sessionKey role messageType content timestamp sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier rowVersion)
+                        )
+  @message_public_shape_without_type MapSet.delete(@message_public_shape, "messageType")
+  @session_public_shape MapSet.new(
+                          ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion effectiveParent effectiveParentSource identityGuidanceDigest identityRenderContract operationalParent)
+                        )
+  @role_public_shape MapSet.new(
+                       ~w(role name boundSessionKey ownerUserId createdAt updatedAt rowVersion)
+                     )
+  @role_removed_shape MapSet.new(~w(removed))
+  @legacy_partial_shapes %{
+    "work_item.created" => [
+      MapSet.new(~w(id rowVersion)),
+      @work_item_public_shape
+    ],
+    "work_item.updated" => [
+      MapSet.new(~w(id ownerUserId rowVersion)),
+      MapSet.new(~w(id title ownerUserId updatedAt rowVersion)),
+      @work_item_public_shape
+    ],
+    "work_item.iceboxed" => [@work_item_public_shape],
+    "work_item.reopened" => [@work_item_public_shape],
+    "work_item.closed" => [@work_item_public_shape],
+    "work_item.failed" => [@work_item_public_shape],
+    "message.created" => [@message_public_shape, @message_public_shape_without_type],
+    "session.updated" => [@session_public_shape],
+    "role.created" => [@role_public_shape],
+    "role.removed" => [@role_public_shape, @role_removed_shape]
+  }
 
   @state_verbs %{
     "work-item-create" => {"work_item.created", &StateResources.work_item/1},
@@ -119,7 +156,17 @@ defmodule Tightbeam.Firehose.Publisher do
     case {call.verb, result} do
       {"attest", %{assignment: %{state: "closed", outcome: outcome} = assignment}}
       when outcome in ~w(completed surrendered revoked) ->
-        primary ++ [build("assignment.closed", call, assignment, &StateResources.assignment/1)]
+        canonical_assignment = canonical_assignment_result(db, call, assignment)
+
+        primary ++
+          [
+            build(
+              "assignment.closed",
+              call,
+              canonical_assignment,
+              &StateResources.assignment/1
+            )
+          ]
 
       _ ->
         primary
@@ -285,19 +332,44 @@ defmodule Tightbeam.Firehose.Publisher do
   end
 
   @doc false
-  def encode_wire_notice(%{"class" => class, "payload" => payload} = notice) do
+  def encode_wire_notice(notice), do: encode_wire_notice(notice, ModelCatalog.get())
+
+  @doc false
+  def encode_wire_notice(%{"class" => class, "payload" => payload} = notice, catalog)
+      when is_map(catalog) do
     case Registry.fetch(class) do
+      {:ok, %{resource: "productions"}} ->
+        JSON.encode!(notice)
+
       {:ok, %{resource: resource}} when is_map(payload) ->
-        if StateResources.admin_resource?(resource) do
-          bytes = StateResources.encode_admin_item(resource, payload)
-          JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
-        else
-          JSON.encode!(notice)
+        # Some current-main producers still publish result-shaped partial maps. Only a closed
+        # R7/R7a item is eligible for RawJSON; the shared encoder remains strict for REST parity.
+        cond do
+          StateResources.item_has_secret_fields?(payload) ->
+            raise ArgumentError, "#{resource} Publisher payload has a forbidden field"
+
+          StateResources.item_shape_complete?(resource, payload) ->
+            bytes = StateResources.encode_item(resource, payload, catalog)
+            JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
+
+          permitted_legacy_payload?(class, payload) ->
+            JSON.encode!(notice)
+
+          true ->
+            raise ArgumentError,
+                  "#{resource} Publisher payload has no permitted legacy partial shape"
         end
 
       _ ->
         JSON.encode!(notice)
     end
+  end
+
+  def encode_wire_notice(notice, _catalog), do: JSON.encode!(notice)
+
+  defp permitted_legacy_payload?(class, payload) do
+    keys = MapSet.new(Map.keys(payload))
+    Enum.any?(Map.get(@legacy_partial_shapes, class, []), &MapSet.equal?(&1, keys))
   end
 
   @spec committed_notice(String.t(), map(), map()) :: map()
@@ -360,6 +432,12 @@ defmodule Tightbeam.Firehose.Publisher do
 
   defp canonical_result(db, %{verb: verb} = call, result)
        when verb in ~w(assign dispatch reopen-assignment revoke-assignment) do
+    canonical_assignment_result(db, call, result)
+  end
+
+  defp canonical_assignment_result(nil, _call, result), do: result
+
+  defp canonical_assignment_result(db, call, result) do
     id = result[:id] || result["id"] || result[:assignment_id] || call.params[:assignment_id]
     StateResources.query_assignment(db, id, call) || result
   end
