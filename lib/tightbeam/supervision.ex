@@ -89,7 +89,15 @@ defmodule Tightbeam.Supervision do
   @doc false
   @spec recover_liveness!(DB.server(), pos_integer()) :: :ok
   def recover_liveness!(db, interval) when is_integer(interval) and interval > 0 do
-    recover_liveness(%{db: db, sweep_ms: interval})
+    recover_liveness(%{db: db, sweep_ms: interval, clock: &now/0})
+  end
+
+  @doc false
+  @spec recover_liveness!(DB.server(), pos_integer(), non_neg_integer()) :: :ok
+  def recover_liveness!(db, interval, recovery_clock)
+      when is_integer(interval) and interval > 0 and is_integer(recovery_clock) and
+             recovery_clock >= 0 do
+    recover_liveness(%{db: db, sweep_ms: interval, clock: fn -> recovery_clock end})
   end
 
   @spec prod_state(DB.server(), String.t()) :: map() | nil
@@ -570,12 +578,17 @@ defmodule Tightbeam.Supervision do
     :terminal_disposition
   end
 
-  def transition_in_txn(%Txn{} = txn, %{
-        kind: "checkpoint_scheduled",
-        wake_id: wake_id,
-        creator_session_key: creator_session_key,
-        supervision_interval_ms: interval
-      }) do
+  def transition_in_txn(
+        %Txn{} = txn,
+        %{
+          kind: "checkpoint_scheduled",
+          wake_id: wake_id,
+          creator_session_key: creator_session_key,
+          supervision_interval_ms: interval
+        } = observation
+      ) do
+    checkpoint_clock = Map.get(observation, :clock, now())
+
     candidate =
       Txn.q(
         txn,
@@ -600,7 +613,7 @@ defmodule Tightbeam.Supervision do
 
     case candidate do
       [[assignment_id, turn_seq]] ->
-        materialize_default_pacing_in_txn(txn, assignment_id, interval, now())
+        materialize_default_pacing_in_txn(txn, assignment_id, interval, checkpoint_clock)
 
         case Txn.q(
                txn,
@@ -618,7 +631,7 @@ defmodule Tightbeam.Supervision do
             (wakeId, assignmentId, holderSessionKey, sourceTurnSeq, boundAt, principal)
           VALUES (?1, ?2, ?3, ?4, ?5, 'process:tightbeam')
           """,
-          [wake_id, assignment_id, creator_session_key, turn_seq, now()]
+          [wake_id, assignment_id, creator_session_key, turn_seq, checkpoint_clock]
         )
 
         :armed
@@ -1305,10 +1318,19 @@ defmodule Tightbeam.Supervision do
           | {:retry, :rail_escalate}
           | {:refused, String.t()}
   def evaluate(db, handlers, n, session_key, terminal_seq) do
-    evaluate_with_interval(db, handlers, n, session_key, terminal_seq, nil)
+    interval = Application.get_env(:tightbeam, :wake_tick_ms, 1_000)
+    evaluate_with_interval(db, handlers, n, session_key, terminal_seq, interval, now())
   end
 
-  defp evaluate_with_interval(db, handlers, n, session_key, terminal_seq, interval) do
+  defp evaluate_with_interval(
+         db,
+         handlers,
+         n,
+         session_key,
+         terminal_seq,
+         interval,
+         evaluation_clock
+       ) do
     case drain(db, handlers, session_key) do
       {:pending, result} ->
         result
@@ -1316,10 +1338,27 @@ defmodule Tightbeam.Supervision do
       {:cleared, :deferred} ->
         if harness_unavailable?(db, session_key),
           do: :harness_unavailable,
-          else: evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval)
+          else:
+            evaluate_terminal(
+              db,
+              handlers,
+              n,
+              session_key,
+              terminal_seq,
+              interval,
+              evaluation_clock
+            )
 
       {:cleared, _prior_result} ->
-        evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval)
+        evaluate_terminal(
+          db,
+          handlers,
+          n,
+          session_key,
+          terminal_seq,
+          interval,
+          evaluation_clock
+        )
     end
   end
 
@@ -1430,6 +1469,7 @@ defmodule Tightbeam.Supervision do
       handlers: Keyword.fetch!(opts, :handlers),
       n: Keyword.fetch!(opts, :prod_limit),
       sweep_ms: Keyword.get(opts, :sweep_ms),
+      clock: Keyword.get(opts, :clock, &now/0),
       delivery_opts: Keyword.take(opts, [:conn_registry, :lane_manager])
     }
 
@@ -1453,7 +1493,8 @@ defmodule Tightbeam.Supervision do
         state.n,
         session_key,
         terminal_seq,
-        state.sweep_ms
+        state.sweep_ms,
+        state.clock.()
       )
     end)
 
@@ -1485,7 +1526,15 @@ defmodule Tightbeam.Supervision do
   # Recognize, then act: the production's complete LHS is evaluated once, at
   # cycle start, and everything downstream — including the schedule's gates —
   # consults that verdict rather than re-reading working memory mid-cycle.
-  defp evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval) do
+  defp evaluate_terminal(
+         db,
+         handlers,
+         n,
+         session_key,
+         terminal_seq,
+         interval,
+         evaluation_clock
+       ) do
     case prod_production_matches?(db, session_key, terminal_seq) do
       {:no_match, :no_open_obligation} ->
         :idle
@@ -1512,7 +1561,16 @@ defmodule Tightbeam.Supervision do
         :stranded
 
       verdict ->
-        evaluate_live(db, handlers, n, session_key, terminal_seq, verdict, interval)
+        evaluate_live(
+          db,
+          handlers,
+          n,
+          session_key,
+          terminal_seq,
+          verdict,
+          interval,
+          evaluation_clock
+        )
     end
   end
 
@@ -1562,7 +1620,16 @@ defmodule Tightbeam.Supervision do
   @doc "The end-of-turn shift, in execution order. Pinned by test; amend both."
   def turn_end_schedule, do: @turn_end_schedule
 
-  defp evaluate_live(db, handlers, n, session_key, terminal_seq, verdict, interval) do
+  defp evaluate_live(
+         db,
+         handlers,
+         n,
+         session_key,
+         terminal_seq,
+         verdict,
+         interval,
+         evaluation_clock
+       ) do
     # Every verdict that reaches the schedule still carries the obligation:
     # the rail production outranks the prod ladder and needs it even when the
     # prod production did not match.
@@ -1580,7 +1647,8 @@ defmodule Tightbeam.Supervision do
       terminal_seq: terminal_seq,
       assignment: assignment,
       verdict: verdict,
-      supervision_interval_ms: interval
+      supervision_interval_ms: interval,
+      evaluation_clock: evaluation_clock
     }
 
     run_schedule(@turn_end_schedule, ctx)
@@ -1623,7 +1691,8 @@ defmodule Tightbeam.Supervision do
             ctx.session_key,
             ctx.terminal_seq,
             assignment,
-            ctx.supervision_interval_ms
+            ctx.supervision_interval_ms,
+            ctx.evaluation_clock
           )
 
         {:halt, result}
@@ -1808,70 +1877,94 @@ defmodule Tightbeam.Supervision do
          session_key,
          terminal_seq,
          assignment,
-         replacement_interval
+         replacement_interval,
+         evaluation_clock
        ) do
-    evaluation_clock = now()
-
     outcome =
       transaction!(db, fn txn ->
-        case Txn.q(
-               txn,
-               """
-               SELECT generation, dueAt, state, lastAttemptGeneration,
-                      supervisionIntervalMs, basisKind, basisId
-               FROM supervision_entitlements
-               WHERE assignmentId=?1
-               """,
-               [assignment.id]
-             ) do
-          [] ->
-            :unarmed
+        if is_nil(watched_assignment_in_txn(txn, assignment.id)) do
+          :unarmed
+        else
+          pacing_missing? =
+            Txn.q(
+              txn,
+              "SELECT 1 FROM supervision_entitlements WHERE assignmentId=?1",
+              [assignment.id]
+            ) == []
 
-          [[generation, due_at, state, last_attempt, stored_interval, basis_kind, basis_id]] ->
-            interval =
-              if is_integer(replacement_interval) and replacement_interval > 0,
-                do: replacement_interval,
-                else: stored_interval
+          materialize_default_pacing_in_txn(
+            txn,
+            assignment.id,
+            replacement_interval,
+            evaluation_clock
+          )
 
-            case absorb_liveness_receipts_in_txn(txn, assignment.id, interval) do
-              :rebased ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                :rebased
+          case Txn.q(
+                 txn,
+                 """
+                 SELECT generation, dueAt, state, lastAttemptGeneration,
+                        supervisionIntervalMs, basisKind, basisId
+                 FROM supervision_entitlements
+                 WHERE assignmentId=?1
+                 """,
+                 [assignment.id]
+               ) do
+            [] ->
+              :unarmed
 
-              :duplicate when state == "claimed" ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                :claimed
+            [[generation, due_at, state, last_attempt, stored_interval, basis_kind, basis_id]] ->
+              interval =
+                if is_integer(replacement_interval) and replacement_interval > 0,
+                  do: replacement_interval,
+                  else: stored_interval
 
-              :duplicate when state == "armed" and due_at > evaluation_clock ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                :not_due
+              case absorb_liveness_receipts_in_txn(
+                     txn,
+                     assignment.id,
+                     interval,
+                     evaluation_clock
+                   ) do
+                :rebased ->
+                  write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                  :rebased
 
-              :duplicate when state == "armed" ->
-                if due_gate?(txn, assignment.id, session_key) do
-                  :controlled
-                else
-                  case claim_entitlement_in_txn(
-                         txn,
-                         assignment,
-                         generation,
-                         due_at,
-                         last_attempt,
-                         basis_kind,
-                         basis_id,
-                         evaluation_clock,
-                         n,
-                         terminal_seq,
-                         "new_terminal"
-                       ) do
-                    :ok -> :claimed
-                    :stale -> :duplicate
+                :duplicate when state == "claimed" ->
+                  write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                  :claimed
+
+                :duplicate when state == "armed" and due_at > evaluation_clock ->
+                  unless pacing_missing?,
+                    do: write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+
+                  :not_due
+
+                :duplicate when state == "armed" ->
+                  if due_gate?(txn, assignment.id, session_key) do
+                    :controlled
+                  else
+                    case claim_entitlement_in_txn(
+                           txn,
+                           assignment,
+                           generation,
+                           due_at,
+                           last_attempt,
+                           basis_kind,
+                           basis_id,
+                           evaluation_clock,
+                           n,
+                           terminal_seq,
+                           "new_terminal"
+                         ) do
+                      :ok -> :claimed
+                      :stale -> :duplicate
+                    end
                   end
-                end
 
-              :duplicate ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
-                :duplicate
-            end
+                :duplicate ->
+                  write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                  :duplicate
+              end
+          end
         end
       end)
 
@@ -2583,9 +2676,9 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp recover_liveness(%{sweep_ms: interval} = state)
+  defp recover_liveness(%{sweep_ms: interval, clock: clock} = state)
        when is_integer(interval) and interval > 0 do
-    recovery_clock = now()
+    recovery_clock = clock.()
 
     transaction!(state.db, fn txn ->
       retired_holders =
@@ -2627,7 +2720,7 @@ defmodule Tightbeam.Supervision do
           "process:tightbeam"
         )
 
-        absorb_liveness_receipts_in_txn(txn, assignment_id, interval)
+        absorb_liveness_receipts_in_txn(txn, assignment_id, interval, recovery_clock)
       end)
     end)
   end
@@ -2739,9 +2832,9 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp liveness_cycle(%{sweep_ms: interval} = state, terminal_rebases)
+  defp liveness_cycle(%{sweep_ms: interval, clock: clock} = state, terminal_rebases)
        when is_integer(interval) and interval > 0 do
-    evaluation_clock = now()
+    evaluation_clock = clock.()
 
     outcome =
       transaction!(state.db, fn txn ->
@@ -2754,7 +2847,12 @@ defmodule Tightbeam.Supervision do
             if MapSet.member?(acc, assignment_id) do
               acc
             else
-              case absorb_liveness_receipts_in_txn(txn, assignment_id, interval) do
+              case absorb_liveness_receipts_in_txn(
+                     txn,
+                     assignment_id,
+                     interval,
+                     evaluation_clock
+                   ) do
                 :rebased -> MapSet.put(acc, assignment_id)
                 :duplicate -> acc
               end
@@ -2779,6 +2877,10 @@ defmodule Tightbeam.Supervision do
   defp liveness_cycle(_state, _terminal_rebases), do: :ok
 
   defp absorb_liveness_receipts_in_txn(txn, assignment_id, interval) do
+    absorb_liveness_receipts_in_txn(txn, assignment_id, interval, now())
+  end
+
+  defp absorb_liveness_receipts_in_txn(txn, assignment_id, interval, evaluation_clock) do
     ensure_liveness_receipt_state_in_txn(
       txn,
       assignment_id,
@@ -2805,15 +2907,25 @@ defmodule Tightbeam.Supervision do
       ) != []
 
     if state in ["armed", "claimed", "terminus"] and not pending_controller? do
-      absorb_receipt_candidates_in_txn(txn, assignment_id, generation, interval)
+      absorb_receipt_candidates_in_txn(
+        txn,
+        assignment_id,
+        generation,
+        interval,
+        evaluation_clock
+      )
     else
       :duplicate
     end
   end
 
-  defp absorb_receipt_candidates_in_txn(txn, assignment_id, generation, interval) do
-    evaluation_clock = now()
-
+  defp absorb_receipt_candidates_in_txn(
+         txn,
+         assignment_id,
+         generation,
+         interval,
+         evaluation_clock
+       ) do
     [[holder, work_item_id]] =
       Txn.q(
         txn,
@@ -3326,7 +3438,8 @@ defmodule Tightbeam.Supervision do
               state.n,
               session_key,
               terminal_seq,
-              state.sweep_ms
+              state.sweep_ms,
+              state.clock.()
             )
           end)
 

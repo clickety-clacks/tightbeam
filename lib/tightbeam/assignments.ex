@@ -1681,7 +1681,7 @@ defmodule Tightbeam.Assignments do
 
   defp apply_reopen(txn, call, assignment) do
     assignment_id = assignment.id
-    now = now()
+    now = Map.get(call, :clock, now())
     {reopened_user, reopened_session} = opener(call.principal)
 
     # The close is written down BEFORE it is cleared. Order matters: a crash
