@@ -1017,23 +1017,22 @@ defmodule Tightbeam.Toplines do
               error("idempotency_conflict", "idempotency key conflicts with a prior request")
 
             :new ->
-              placement =
-                resolve_placement_in_txn(txn, %{
-                  work_item_id: work_item_id,
-                  state: "resolved",
-                  actor_kind: caller.actor_kind,
-                  actor_ref: caller.actor_ref,
-                  reason: reason,
-                  at: mutation_time(call)
-                })
+              case resolve_placement_in_txn(txn, %{
+                     work_item_id: work_item_id,
+                     state: "left_unlinked",
+                     actor_kind: caller.actor_kind,
+                     actor_ref: caller.actor_ref,
+                     reason: reason,
+                     at: mutation_time(call)
+                   }) do
+                nil ->
+                  error("placement_not_pending", "placement is not pending")
 
-              if is_nil(placement),
-                do: error("placement_not_pending", "placement is not pending"),
-                else: :ok
-
-              response = %{placement: placement}
-              remember(txn, caller.user, operation, key, fingerprint, response)
-              response
+                placement ->
+                  response = %{placement: placement}
+                  remember(txn, caller.user, operation, key, fingerprint, response)
+                  response
+              end
           end
         end
       end)
@@ -1050,9 +1049,17 @@ defmodule Tightbeam.Toplines do
         {owner_sql, owner_params} = owner_filter(caller, "p")
 
         {state_sql, state_params} =
-          if state == "all",
-            do: {"", []},
-            else: {" AND p.state = ?#{length(owner_params) + 1}", [state]}
+          case state do
+            "all" ->
+              {"", []}
+
+            "pending" ->
+              {" AND p.state = ?#{length(owner_params) + 1}", ["pending"]}
+
+            "resolved" ->
+              {" AND p.state IN (?#{length(owner_params) + 1}, ?#{length(owner_params) + 2}, ?#{length(owner_params) + 3})",
+               ["linked", "left_unlinked", "work_terminal"]}
+          end
 
         ids =
           Txn.q(

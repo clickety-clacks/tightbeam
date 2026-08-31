@@ -791,6 +791,69 @@ defmodule Tightbeam.ToplinesTest do
              end)
   end
 
+  test "leave-unlinked resolves the caller's pending placement idempotently and lists resolved placements",
+       ctx do
+    work_item!(ctx.db, "wi_leave", "flynn")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        INSERT INTO wakes
+          (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt)
+        VALUES ('w_leave', 'agent:main:clawline:flynn:main', 'process:tightbeam',
+                'Choose placement', 'prompt', 40, 'pending', 40)
+        """
+      )
+
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        Toplines.open_placement_in_txn(txn, %{
+          id: "tlp_leave",
+          work_item_id: "wi_leave",
+          owner_user_id: "flynn",
+          cause: "created",
+          cause_ref: "wi_leave",
+          source_causal_event_seq: nil,
+          actor_kind: "user",
+          actor_ref: "flynn",
+          at: 40,
+          prompt_wake_id: "w_leave"
+        })
+      end)
+
+    request = %{work_item_id: "wi_leave", reason: "not now", idempotency_key: "leave-1"}
+
+    assert %{placement: %{id: "tlp_leave", state: "left_unlinked", resolutionReason: "not now"}} =
+             Toplines.leave_unlinked(ctx.db, call({:user, "flynn"}, request, 41))
+
+    assert %{placement: %{id: "tlp_leave", state: "left_unlinked"}} =
+             Toplines.leave_unlinked(ctx.db, call({:user, "flynn"}, request, 42))
+
+    assert %{code: "placement_not_pending"} =
+             Toplines.leave_unlinked(
+               ctx.db,
+               call({:user, "flynn"}, %{request | idempotency_key: "leave-2"}, 43)
+             )
+
+    assert %{placements: []} = Toplines.list_placements(ctx.db, read_call({:user, "flynn"}))
+
+    assert %{placements: [%{id: "tlp_leave", state: "left_unlinked"}]} =
+             Toplines.list_placements(
+               ctx.db,
+               read_call({:user, "flynn"}, %{state: "resolved"})
+             )
+
+    assert %{placements: []} =
+             Toplines.list_placements(ctx.db, read_call({:user, "kay"}, %{state: "all"}))
+
+    assert %{code: "process_denied"} =
+             Toplines.leave_unlinked(
+               ctx.db,
+               call({:process, "tightbeam"}, %{work_item_id: "wi_leave"}, 44)
+             )
+  end
+
   test "invalid, invisible, cross-owner, duplicate, and process operations refuse without writes",
        ctx do
     work_item!(ctx.db, "wi_mine", "flynn")
