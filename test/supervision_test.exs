@@ -525,7 +525,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, [["progress", "att_c532a60d"], ["progress", "att_99c4c115"]]} =
              DB.query(
                ctx.db,
-               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts ORDER BY receiptId"
+               "SELECT sourceKind,sourceId FROM supervision_liveness_progress_receipts ORDER BY receiptId"
              )
   end
 
