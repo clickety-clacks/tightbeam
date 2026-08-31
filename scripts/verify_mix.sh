@@ -25,6 +25,25 @@ pinned_elixir_spec=$(awk '$1 == "elixir" { print $2 }' "$tool_versions")
 pinned_elixir=${pinned_elixir_spec%%-otp-*}
 pinned_elixir_otp=${pinned_elixir_spec##*-otp-}
 
+# The pin names an OTP release line the way source installs stamp OTP_VERSION
+# (mise/asdf build 28.5 and stamp exactly "28.5"), while erlef/setup-beam on CI
+# installs Erlang/OTP's binary patch releases, whose OTP_VERSION reads
+# "28.5.0.5". Both are the pinned release. Nothing else is: the allowed
+# boundary is the exact pin, or the pin extended by dot-separated NUMERIC
+# components only — 28.4, 28.50, 28.5., 28.5.foo, 28.5..1, 28.5.1a all refuse.
+erlang_matches_pin() {
+  [ "$1" = "$pinned_erlang" ] && return 0
+  case "$1" in
+    "$pinned_erlang".*) ;;
+    *) return 1 ;;
+  esac
+  suffix=${1#"$pinned_erlang".}
+  case "$suffix" in
+    '' | *[!0-9.]* | .* | *. | *..*) return 1 ;;
+  esac
+  return 0
+}
+
 beam_matches() {
   erlang_version=$("$@" erl -noshell -eval \
     'Root = code:root_dir(), Release = erlang:system_info(otp_release), {ok, Version} = file:read_file(filename:join([Root, "releases", Release, "OTP_VERSION"])), io:format("~s", [Version]), halt().' \
@@ -35,7 +54,7 @@ beam_matches() {
   elixir_otp=$(printf '%s\n' "$elixir_output" |
     sed -n 's/^Elixir [^ ]* (compiled with Erlang\/OTP \([^)]*\)).*/\1/p')
   "$@" mix --version >/dev/null 2>&1 || return 1
-  [ "$erlang_version" = "$pinned_erlang" ] &&
+  erlang_matches_pin "$erlang_version" &&
     [ "$elixir_version" = "$pinned_elixir" ] &&
     [ "$elixir_otp" = "$pinned_elixir_otp" ]
 }

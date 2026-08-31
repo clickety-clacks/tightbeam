@@ -33,6 +33,46 @@ defmodule Tightbeam.MergeGateIsolationTest do
     refute capture =~ "Authoritative Mix gate:"
   end
 
+  test "the authoritative wrapper accepts a binary patch release of the pinned OTP line" do
+    # erlef/setup-beam installs OTP's binary patch releases: OTP_VERSION reads
+    # 28.5.0.5 for pin 28.5. That is the pinned release and must run directly,
+    # with no Mise fallback (CI runners have none).
+    fake_bin = fake_toolchain_bin!(erlang: "28.5.0.5", mise: :failing)
+    wrapper = Path.expand("../scripts/verify_mix.sh", __DIR__)
+
+    assert {capture, 0} =
+             System.cmd(wrapper, [],
+               env: [{"PATH", fake_bin <> ":/usr/bin:/bin"}, {"LANG", "C.UTF-8"}],
+               stderr_to_stdout: true
+             )
+
+    assert capture =~ "TESTS_STARTED\n"
+    assert capture =~ "Authoritative Mix gate:"
+  end
+
+  test "a different OTP line sharing the pin's digits is still refused" do
+    capture = capture_preflight_refusal!(erlang: "28.50", mise: :failing)
+
+    assert capture =~
+             ~s(tightbeam-gate-preflight: {"schema":"tightbeam-gate-preflight-refusal/v1","cause":"pinned-beam-unavailable"})
+
+    refute capture =~ "TESTS_STARTED"
+  end
+
+  test "a malformed suffix on the pinned line is refused, not accepted" do
+    # The boundary is dot-separated numeric components only: empty, trailing-dot,
+    # nonnumeric, repeated-dot, and mixed suffix components are all refusals.
+    for malformed <- ["28.5.", "28.5.foo", "28.5..1", "28.5.1a", "28.5.0.5a", "28.5.0..5"] do
+      capture = capture_preflight_refusal!(erlang: malformed, mise: :failing)
+
+      assert capture =~
+               ~s(tightbeam-gate-preflight: {"schema":"tightbeam-gate-preflight-refusal/v1","cause":"pinned-beam-unavailable"}),
+             "#{malformed} must refuse"
+
+      refute capture =~ "TESTS_STARTED", "#{malformed} must not start the gate"
+    end
+  end
+
   test "the authoritative wrapper uses Mise when only Mise provides the pinned BEAM" do
     fake_bin = fake_toolchain_bin!(erlang: "28.4", mise: :pinned)
     wrapper = Path.expand("../scripts/verify_mix.sh", __DIR__)
