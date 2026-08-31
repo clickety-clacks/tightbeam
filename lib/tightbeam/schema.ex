@@ -40,7 +40,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "identity-universal-root-render-v1-019"
+  @shape "liveness-progress-receipts-v1-019"
+  @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -602,7 +603,7 @@ defmodule Tightbeam.Schema do
         receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
         assignmentId TEXT NOT NULL REFERENCES assignments(id),
         sourceKind TEXT NOT NULL CHECK (sourceKind IN (
-          'artifact','work_item_update','verdict','checkpoint'
+          'artifact','work_item_update','verdict','progress','checkpoint'
         )),
         sourceId TEXT NOT NULL,
         sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
@@ -1189,6 +1190,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@liveness_progress_receipts_previous_shape]]} ->
+        upgrade_liveness_progress_receipts_v1(db)
+
       {:ok, [[@identity_render_stamp_previous_shape]]} ->
         upgrade_identity_render_stamp_v1(db)
 
@@ -1275,7 +1279,7 @@ defmodule Tightbeam.Schema do
            Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityGuidanceDigest TEXT")
 
            Txn.q(txn, "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3", [
-             @shape,
+             @liveness_progress_receipts_previous_shape,
              System.system_time(:millisecond),
              predecessor
            ])
@@ -1285,8 +1289,107 @@ defmodule Tightbeam.Schema do
 
            :ok
          end) do
-      {:ok, :ok} -> :ok
+      {:ok, :ok} -> upgrade_liveness_progress_receipts_v1(db)
       {:error, error} -> raise error
+    end
+  end
+
+  defp upgrade_liveness_progress_receipts_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, fn txn ->
+             case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+               [[@liveness_progress_receipts_previous_shape]] ->
+                 :ok
+
+               rows ->
+                 raise ShapeError,
+                   message:
+                     "incompatible_liveness_progress_receipts_v1: predecessor stamp #{inspect(rows)}"
+             end
+
+             if Txn.q(
+                  txn,
+                  "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervision_liveness_receipts'"
+                ) != [] do
+               :ok =
+                 Txn.exec(txn, "DROP INDEX IF EXISTS supervision_liveness_receipts_assignment")
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "ALTER TABLE supervision_liveness_receipts RENAME TO supervision_liveness_receipts_identity_root_v1"
+                 )
+
+               table =
+                 Enum.find(
+                   @supervision_liveness_enforcement_objects,
+                   &(&1.name == "supervision_liveness_receipts")
+                 )
+
+               :ok = Txn.exec(txn, table.sql)
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   """
+                   INSERT INTO supervision_liveness_receipts
+                     (receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
+                   SELECT receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt
+                   FROM supervision_liveness_receipts_identity_root_v1
+                   ORDER BY receiptId
+                   """
+                 )
+
+               :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_receipts_identity_root_v1")
+
+               index =
+                 Enum.find(
+                   @supervision_liveness_enforcement_objects,
+                   &(&1.name == "supervision_liveness_receipts_assignment")
+                 )
+
+               :ok = Txn.exec(txn, index.sql)
+             end
+
+             Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+               @liveness_progress_receipts_previous_shape,
+               @shape,
+               migration_time
+             ])
+
+             if Txn.changes(txn) != 1,
+               do:
+                 raise(ShapeError,
+                   message: "incompatible_liveness_progress_receipts_v1: stamp race"
+                 )
+
+             case Txn.q(txn, "PRAGMA foreign_key_check") do
+               [] ->
+                 :ok
+
+               rows ->
+                 raise ShapeError,
+                   message:
+                     "incompatible_liveness_progress_receipts_v1: foreign key check #{inspect(rows)}"
+             end
+           end) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "incompatible_liveness_progress_receipts_v1: upgrade failed: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
   end
 
