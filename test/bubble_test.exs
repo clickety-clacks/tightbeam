@@ -1,7 +1,17 @@
 defmodule Tightbeam.Productions.BubbleTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, HarnessHealth, Ledger, Model, Org}
+  alias Tightbeam.{
+    Assignments,
+    ConditionFacts,
+    ConnRegistry,
+    DB,
+    HarnessHealth,
+    Ledger,
+    Model,
+    Org
+  }
+
   alias Tightbeam.Productions.Bubble
 
   defmodule LaneDoorbell do
@@ -607,5 +617,52 @@ defmodule Tightbeam.Productions.BubbleTest do
       end)
 
     assert {:error, %{code: "reserved_kind"}} = refused
+  end
+
+  test "terminal lineage exhaustion transfers cannot-proceed disposition to the alerted user",
+       ctx do
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{ctx.main.session_key}",
+        principal: {:session, ctx.main.session_key},
+        session_key: "holder",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "terminal disposer transfer", idempotency_key: nil, work_item_id: nil}
+      })
+
+    blocked =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: nil,
+        params: %{
+          assignment_id: assignment.id,
+          kind: "cannot-proceed",
+          note: "the opener lineage is exhausted"
+        }
+      })
+
+    cause_seq = fail_assigned_turn!(ctx.db, ctx.main.session_key, assignment.id)
+    assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
+
+    assert {:ok, [["user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert %{outcome: "revoked"} =
+             Assignments.__handle__(ctx.db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{assignment_id: assignment.id, reason: "terminal disposition"}
+             })
   end
 end

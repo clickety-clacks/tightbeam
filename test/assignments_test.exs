@@ -2121,6 +2121,150 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
   end
 
+  test "holder retirement leaves a standing cannot-proceed assignment with its disposer", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "blocked at retirement"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the opener must decide")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "flynn",
+                 "user:flynn"
+               )
+             end)
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [
+               assignment.id
+             ])
+
+    assert {:ok, [["standing", "user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [
+               blocked.decisionRequest.id
+             ])
+
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "pending"
+  end
+
+  test "a release fact that wins an overlapping revoke leaves no revoke side effects", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "release race"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "wait for release")
+      |> put_in([:params, :release_fact_kind], "dependency-ready")
+      |> put_in([:params, :release_fact_scope], assignment.id)
+      |> put_in([:params, :release_fact_principal_ref], "user:flynn")
+      |> then(&handle(ctx, "attest", &1))
+
+    parent = self()
+
+    fact_task =
+      Task.async(fn ->
+        DB.transaction(ctx.db, fn txn ->
+          fact =
+            ConditionFacts.file_in_txn(txn, %{
+              kind: "dependency-ready",
+              scope: assignment.id,
+              origin: "user:flynn"
+            })
+
+          send(parent, {:fact_written_inside_transaction, self()})
+
+          receive do
+            :commit_fact -> fact
+          end
+        end)
+      end)
+
+    assert_receive {:fact_written_inside_transaction, transaction_pid}
+
+    revoke_task =
+      Task.async(fn ->
+        send(parent, :revoke_started_during_fact_transaction)
+        handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+      end)
+
+    assert_receive :revoke_started_during_fact_transaction
+    send(transaction_pid, :commit_fact)
+
+    assert {:ok, %{fact_id: fact_id}} = Task.await(fact_task)
+    assert %{code: "cannot_proceed_released"} = Task.await(revoke_task)
+
+    assert {:ok, [["settled", "release-fact", ^fact_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind,settlementFactId FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["open", nil, 0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT state,outcome,
+                 (SELECT count(*) FROM assignment_revocations WHERE assignmentId=assignments.id)
+               FROM assignments WHERE id=?1
+               """,
+               [assignment.id]
+             )
+
+    assert %{code: "cannot_proceed_released"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "later ordinary revocation")
+             )
+  end
+
+  test "the terminal user alert transfers a retired session opener to its owner", ctx do
+    assignment =
+      handle(ctx, "assign", assign_call({:session, "other-session"}, "dead opener alert"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the opener is gone")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert %{state: "retired"} = Org.retire(ctx.db, "other-session", "user:other", 1_000)
+
+    assert {:ok, %{kind: "user-alerted", scope: "other"}} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "user-alerted",
+                 scope: "other",
+                 origin: "process:tightbeam"
+               })
+             end)
+
+    assert {:ok, [["user:other"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "other"}, assignment.id))
+  end
+
   test "reopen-assignment repairs a revoked card (Sol xhigh review, finding 7)", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "revoke then repair"))
     revoked = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))

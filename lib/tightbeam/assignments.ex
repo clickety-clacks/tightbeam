@@ -115,6 +115,7 @@ defmodule Tightbeam.Assignments do
     decisionRequestId TEXT NOT NULL UNIQUE,
     decisionWakeId TEXT NOT NULL UNIQUE REFERENCES wakes(wakeId),
     openerRef TEXT NOT NULL,
+    disposerRef TEXT NOT NULL,
     reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 2000),
     releaseFactKind TEXT NULL,
     releaseFactScope TEXT NULL,
@@ -144,6 +145,15 @@ defmodule Tightbeam.Assignments do
   CREATE INDEX IF NOT EXISTS assignment_cannot_proceed_release
     ON assignment_cannot_proceed(releaseFactKind, releaseFactScope, releaseFactPrincipalRef)
     WHERE state='standing' AND releaseFactKind IS NOT NULL;
+  """
+
+  @cannot_proceed_release_observations_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_cannot_proceed_release_observations (
+    conditionId TEXT PRIMARY KEY REFERENCES assignment_cannot_proceed(id),
+    principal TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 2000),
+    observedAt INTEGER NOT NULL
+  );
   """
 
   @assignment_files_ddl """
@@ -378,6 +388,7 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
     :ok = DB.execute(db, @cannot_proceed_ddl)
+    :ok = DB.execute(db, @cannot_proceed_release_observations_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
     :ok = DB.execute(db, @assignment_priorities_ddl)
@@ -400,6 +411,7 @@ defmodule Tightbeam.Assignments do
     if Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='attests'") == [] do
       :ok = Txn.exec(txn, @attests_ddl)
       :ok = Txn.exec(txn, @cannot_proceed_ddl)
+      :ok = Txn.exec(txn, @cannot_proceed_release_observations_ddl)
       :ok
     else
       rebuild_attests_for_cannot_proceed_in_txn(txn)
@@ -436,12 +448,17 @@ defmodule Tightbeam.Assignments do
     :ok = Txn.exec(txn, "DROP TABLE attests")
     :ok = Txn.exec(txn, "ALTER TABLE attests_cannot_proceed_v1 RENAME TO attests")
     :ok = Txn.exec(txn, @cannot_proceed_ddl)
+    :ok = Txn.exec(txn, @cannot_proceed_release_observations_ddl)
     :ok
   end
 
   @doc false
   @spec ensure_cannot_proceed_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_cannot_proceed_schema(db), do: DB.execute(db, @cannot_proceed_ddl)
+  def ensure_cannot_proceed_schema(db) do
+    with :ok <- DB.execute(db, @cannot_proceed_ddl) do
+      DB.execute(db, @cannot_proceed_release_observations_ddl)
+    end
+  end
 
   defp migrate_revocation_reason_constraint(db) do
     case DB.foreign_key_rebuild(db, fn txn ->
@@ -613,6 +630,10 @@ defmodule Tightbeam.Assignments do
         SELECT a.id, EXISTS(SELECT 1 FROM attests f WHERE f.assignmentId=a.id), a.workItemId
         FROM assignments a
         WHERE a.holderKey=?1 AND a.state='open'
+          AND NOT EXISTS (
+            SELECT 1 FROM assignment_cannot_proceed cp
+            WHERE cp.assignmentId=a.id AND cp.state='standing'
+          )
         ORDER BY a.openedAt, a.id
         """,
         [session_key]
@@ -853,6 +874,79 @@ defmodule Tightbeam.Assignments do
           nil ->
             :ok
         end
+      end
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def transfer_cannot_proceed_disposer_to_user_in_txn(
+        %Txn{} = txn,
+        assignment_id,
+        user_id,
+        cause_seq
+      )
+      when is_binary(assignment_id) and is_binary(user_id) do
+    disposer_ref = "user:" <> user_id
+
+    Txn.q(
+      txn,
+      "UPDATE assignment_cannot_proceed SET disposerRef=?2 WHERE assignmentId=?1 AND state='standing' AND disposerRef != ?2",
+      [assignment_id, disposer_ref]
+    )
+
+    if Txn.changes(txn) == 1 do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "cannot_proceed_disposer_transferred",
+        assignment_id,
+        "disposer=#{disposer_ref} cause_seq=#{cause_seq}"
+      )
+    end
+
+    :ok
+  end
+
+  def transfer_cannot_proceed_disposer_to_user_in_txn(
+        %Txn{},
+        _assignment_id,
+        _user_id,
+        _cause_seq
+      ),
+      do: :ok
+
+  @doc false
+  def transfer_retired_cannot_proceed_disposers_to_user_in_txn(%Txn{} = txn, user_id)
+      when is_binary(user_id) do
+    assignment_ids =
+      Txn.q(
+        txn,
+        "SELECT assignmentId FROM assignment_cannot_proceed WHERE state='standing' ORDER BY createdAt, id"
+      )
+
+    Enum.each(assignment_ids, fn [assignment_id] ->
+      case cannot_proceed_disposer_ref_in_txn(txn, assignment_id) do
+        "session:" <> session_key ->
+          case Txn.q(
+                 txn,
+                 "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='retired'",
+                 [session_key, user_id]
+               ) do
+            [[1]] ->
+              transfer_cannot_proceed_disposer_to_user_in_txn(
+                txn,
+                assignment_id,
+                user_id,
+                "user-alerted"
+              )
+
+            [] ->
+              :ok
+          end
+
+        _other ->
+          :ok
       end
     end)
 
@@ -2563,9 +2657,10 @@ defmodule Tightbeam.Assignments do
             txn,
             """
             INSERT INTO assignment_cannot_proceed
-              (id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef, reason,
+              (id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+               disposerRef, reason,
                releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state, createdAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'standing', ?11)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, 'standing', ?11)
             """,
             [
               condition_id,
@@ -2623,7 +2718,8 @@ defmodule Tightbeam.Assignments do
     case Txn.q(
            txn,
            """
-           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef, reason,
+           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+                  disposerRef, reason,
                   releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state,
                   createdAt, settledAt, settlementKind, settlementFactId, settledBy
            FROM assignment_cannot_proceed
@@ -2642,7 +2738,8 @@ defmodule Tightbeam.Assignments do
     case Txn.q(
            txn,
            """
-           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef, reason,
+           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+                  disposerRef, reason,
                   releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state,
                   createdAt, settledAt, settlementKind, settlementFactId, settledBy
            FROM assignment_cannot_proceed
@@ -2661,7 +2758,8 @@ defmodule Tightbeam.Assignments do
       Txn.q(
         txn,
         """
-        SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef, reason,
+        SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+               disposerRef, reason,
                releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state,
                createdAt, settledAt, settlementKind, settlementFactId, settledBy
         FROM assignment_cannot_proceed WHERE id=?1
@@ -2680,6 +2778,7 @@ defmodule Tightbeam.Assignments do
       decision_request_id,
       decision_wake_id,
       opener_ref,
+      disposer_ref,
       reason,
       release_kind,
       release_scope,
@@ -2699,6 +2798,7 @@ defmodule Tightbeam.Assignments do
       decisionRequestId: decision_request_id,
       decisionWakeId: decision_wake_id,
       openerRef: opener_ref,
+      disposerRef: disposer_ref,
       reason: reason,
       releaseFactKind: release_kind,
       releaseFactScope: release_scope,
@@ -2783,85 +2883,148 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_revocation_reason(call.params[:reason]) do
-              {closed_user, closed_session} = opener(call.principal)
-              closed_at = now()
-              revocation_id = id("rev_")
-              reopening_id = current_reopening_id(txn, assignment_id)
+              case released_cannot_proceed(txn, assignment_id) do
+                %{settlementFactId: fact_id} = released ->
+                  case observe_release_before_disposition_in_txn(txn, released, call) do
+                    :new_intent ->
+                      revoke_open_assignment_in_txn(txn, call, assignment_id)
 
-              Txn.q(
-                txn,
-                """
-                INSERT INTO assignment_revocations
-                  (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                """,
-                [
-                  revocation_id,
-                  assignment_id,
-                  closed_at,
-                  closed_user,
-                  closed_session,
-                  call.params[:reason]
-                ]
-              )
+                    :release_won ->
+                      error(
+                        "cannot_proceed_released",
+                        "cannot-proceed was already released by condition fact #{fact_id}; a later ordinary revoke must state a new reason"
+                      )
+                  end
 
-              Txn.q(
-                txn,
-                """
-                INSERT INTO assignment_revocation_generations
-                  (revocationId, assignmentId, reopeningId)
-                VALUES (?1, ?2, ?3)
-                """,
-                [revocation_id, assignment_id, reopening_id]
-              )
-
-              Txn.q(
-                txn,
-                """
-                UPDATE assignments SET state = 'closed', outcome = 'revoked', closedAt = ?2,
-                  closedByUser = ?3, closedBySession = ?4
-                WHERE id = ?1 AND state = 'open'
-                """,
-                [assignment_id, closed_at, closed_user, closed_session]
-              )
-
-              if Txn.changes(txn) != 1, do: raise(TransitionRace)
-              revoked_assignment = fetch_assignment!(txn, assignment_id)
-              Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
-
-              liveness_trigger =
-                disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
-
-              settle_cannot_proceed_by_disposition_in_txn(
-                txn,
-                assignment_id,
-                principal_id(call.principal),
-                closed_at,
-                liveness_trigger
-              )
-
-              supervision_transition!(txn, :terminal_disposition, %{
-                kind: "terminal_disposition",
-                assignment_id: assignment_id,
-                cause: "terminal_disposition",
-                principal: principal_id(call.principal),
-                requester_id: "tightbeam:assignments"
-              })
-
-              EffortCheckin.cancel_in_txn(
-                txn,
-                assignment_id,
-                assignment_disposition_command(
-                  assignment_id,
-                  "tightbeam:assignments",
-                  liveness_trigger
-                )
-              )
-
-              append_assignment_marker(txn, revoked_assignment, :revoked)
-              revoked_assignment
+                nil ->
+                  revoke_open_assignment_in_txn(txn, call, assignment_id)
+              end
             end
         end
+    end
+  end
+
+  defp revoke_open_assignment_in_txn(txn, call, assignment_id) do
+    {closed_user, closed_session} = opener(call.principal)
+    closed_at = now()
+    revocation_id = id("rev_")
+    reopening_id = current_reopening_id(txn, assignment_id)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_revocations
+        (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      """,
+      [
+        revocation_id,
+        assignment_id,
+        closed_at,
+        closed_user,
+        closed_session,
+        call.params[:reason]
+      ]
+    )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_revocation_generations
+        (revocationId, assignmentId, reopeningId)
+      VALUES (?1, ?2, ?3)
+      """,
+      [revocation_id, assignment_id, reopening_id]
+    )
+
+    Txn.q(
+      txn,
+      """
+      UPDATE assignments SET state = 'closed', outcome = 'revoked', closedAt = ?2,
+        closedByUser = ?3, closedBySession = ?4
+      WHERE id = ?1 AND state = 'open'
+      """,
+      [assignment_id, closed_at, closed_user, closed_session]
+    )
+
+    if Txn.changes(txn) != 1, do: raise(TransitionRace)
+    revoked_assignment = fetch_assignment!(txn, assignment_id)
+    Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
+
+    liveness_trigger = disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
+
+    settle_cannot_proceed_by_disposition_in_txn(
+      txn,
+      assignment_id,
+      principal_id(call.principal),
+      closed_at,
+      liveness_trigger
+    )
+
+    supervision_transition!(txn, :terminal_disposition, %{
+      kind: "terminal_disposition",
+      assignment_id: assignment_id,
+      cause: "terminal_disposition",
+      principal: principal_id(call.principal),
+      requester_id: "tightbeam:assignments"
+    })
+
+    EffortCheckin.cancel_in_txn(
+      txn,
+      assignment_id,
+      assignment_disposition_command(
+        assignment_id,
+        "tightbeam:assignments",
+        liveness_trigger
+      )
+    )
+
+    append_assignment_marker(txn, revoked_assignment, :revoked)
+    revoked_assignment
+  end
+
+  defp released_cannot_proceed(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+                  disposerRef, reason, releaseFactKind, releaseFactScope,
+                  releaseFactPrincipalRef, state, createdAt, settledAt, settlementKind,
+                  settlementFactId, settledBy
+           FROM assignment_cannot_proceed
+           WHERE assignmentId=?1 AND state='settled' AND settlementKind='release-fact'
+           ORDER BY settledAt DESC, id DESC LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      [row] -> cannot_proceed(row)
+      [] -> nil
+    end
+  end
+
+  defp observe_release_before_disposition_in_txn(txn, released, call) do
+    principal = principal_id(call.principal)
+    reason = call.params[:reason]
+
+    case Txn.q(
+           txn,
+           "SELECT principal,reason FROM assignment_cannot_proceed_release_observations WHERE conditionId=?1",
+           [released.id]
+         ) do
+      [] ->
+        Txn.q(
+          txn,
+          "INSERT INTO assignment_cannot_proceed_release_observations (conditionId,principal,reason,observedAt) VALUES (?1,?2,?3,?4)",
+          [released.id, principal, reason, now()]
+        )
+
+        :release_won
+
+      [[^principal, ^reason]] ->
+        :release_won
+
+      [[_prior_principal, _prior_reason]] ->
+        :new_intent
     end
   end
 
@@ -3000,10 +3163,10 @@ defmodule Tightbeam.Assignments do
   defp cannot_proceed_disposer_ref_in_txn(txn, assignment_id) do
     case Txn.q(
            txn,
-           "SELECT openerRef, decisionWakeId FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing'",
+           "SELECT disposerRef, decisionWakeId FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing'",
            [assignment_id]
          ) do
-      [[opener_ref, wake_id]] ->
+      [[disposer_ref, wake_id]] ->
         case Txn.q(
                txn,
                """
@@ -3017,7 +3180,7 @@ defmodule Tightbeam.Assignments do
                [wake_id]
              ) do
           [[session_key]] -> "session:" <> session_key
-          [] -> opener_ref
+          [] -> disposer_ref
         end
 
       [] ->

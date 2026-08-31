@@ -104,6 +104,11 @@ defmodule Tightbeam.ConditionFacts do
     ts = System.system_time(:millisecond)
     scope = Map.get(input, :scope)
 
+    if kind == "user-alerted" and is_binary(scope) do
+      :ok =
+        Tightbeam.Assignments.transfer_retired_cannot_proceed_disposers_to_user_in_txn(txn, scope)
+    end
+
     Txn.q(
       txn,
       "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (?1, ?2, ?3, ?4)",
