@@ -533,7 +533,7 @@ COMMANDS:
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
-  toplines [--origin user|session|all] [--owner <userId>] [--state <state>]
+  execution-map [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
            [--session <key>] [--tree]
       The work telemetry the substrate already knows: every work item you can
@@ -544,14 +544,14 @@ COMMANDS:
       concurrency, not proven causality — every node states its own
       epistemic status (linked, from_turn, no_turn_observed, unrecorded).
       No percentages and no completion estimates: the rows do not support them.
-        tightbeam toplines --origin user --state open --as-user flynn
-        tightbeam toplines --quiet-over 2h --as-user flynn
-  topline (--under <workItemId> [roster filters] | --assignments <id,...>)
+        tightbeam execution-map --origin user --state open --as-user flynn
+        tightbeam execution-map --quiet-over 2h --as-user flynn
+  execution-map-select (--under <workItemId> [roster filters] | --assignments <id,...>)
       --under walks one item's causal subtree (the anchor plus its visible
       linked descendants). --assignments names an explicit assignment set and
       reports the items they resolve to; an assignment belonging to no item
       comes back in noItem rather than being silently dropped.
-        tightbeam topline --under wi_abc123 --as-user flynn
+        tightbeam execution-map-select --under wi_abc123 --as-user flynn
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -878,9 +878,9 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
     Ok(js_number_json(value * multiplier))
 }
 
-const TOPLINES_USAGE: &str = "usage: tightbeam toplines [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
+const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
 
-const TOPLINE_USAGE: &str = "usage: tightbeam topline (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+const TOPLINE_USAGE: &str = "usage: tightbeam execution-map-select (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
 
 /// Every roster-filter flag, in one place, so the assignment-mode refusal and the
 /// filter builder cannot drift apart.
@@ -1544,7 +1544,7 @@ fn parse_with_optional_catalog(
                     .map(|value| js_number_json(number_coercion(&value))),
             })
         }
-        "toplines" => {
+        "execution-map" => {
             if parsed.positional.len() != 1 {
                 return Err(TOPLINES_USAGE.to_owned());
             }
@@ -1554,7 +1554,7 @@ fn parse_with_optional_catalog(
                 tree: flags.contains_key("tree"),
             })
         }
-        "topline" => {
+        "execution-map-select" => {
             if parsed.positional.len() != 1 {
                 return Err(TOPLINE_USAGE.to_owned());
             }
@@ -1572,7 +1572,7 @@ fn parse_with_optional_catalog(
             let selection = match (under, assignments) {
                 (Some(_), Some(_)) | (None, None) => {
                     return Err(
-                        "topline requires exactly one of --under <workItemId> or --assignments <id,...>"
+                        "execution-map-select requires exactly one of --under <workItemId> or --assignments <id,...>"
                             .to_owned(),
                     )
                 }
@@ -1808,7 +1808,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2763,8 +2763,8 @@ mod tests {
                 "transcript",
                 "tune",
                 "unlearn",
-                "topline",
-                "toplines",
+                "execution-map",
+                "execution-map-select",
                 "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",
@@ -2888,7 +2888,7 @@ mod tests {
             ("session", "agent:coder:app"),
         ] {
             let error = parse(strings(&[
-                "topline",
+                "execution-map-select",
                 "--assignments",
                 "asg_x",
                 &format!("--{flag}"),
@@ -2911,7 +2911,7 @@ mod tests {
     #[test]
     fn assignment_selection_sends_only_the_id_list() {
         let command = parse(strings(&[
-            "topline",
+            "execution-map-select",
             "--assignments",
             "asg_a,asg_b",
             "--as-user",
@@ -2959,7 +2959,7 @@ mod tests {
     #[test]
     fn under_selection_still_carries_roster_filters() {
         let command = parse(strings(&[
-            "topline",
+            "execution-map-select",
             "--under",
             "wi_abc",
             "--state",
@@ -3310,7 +3310,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 
