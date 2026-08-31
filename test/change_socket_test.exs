@@ -123,6 +123,16 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     assert JSON.decode!(bytes) == %{"type" => "heartbeat", "seq" => 1}
   end
 
+  test "heartbeat closes a socket when its credential changed without a notice", ctx do
+    {:push, {:text, _auth}, state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    :ok = Tightbeam.Devices.revoke(ctx.db, ctx.device.device_id)
+
+    assert {:stop, :normal, 1008, ^state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+  end
+
   test "a retirement affecting the authenticated owner closes with policy code", ctx do
     {:push, {:text, _auth}, state} =
       inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)

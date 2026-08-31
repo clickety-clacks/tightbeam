@@ -12,6 +12,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defstruct phase: :unauthed,
             user_id: nil,
             device_id: nil,
+            credential_digest: nil,
             is_admin: false,
             subscriptions: %{},
             heartbeat_timer: nil,
@@ -45,8 +46,12 @@ defmodule Tightbeam.Wire.ChangeSocket do
   def handle_info({:firehose_notice, _notice}, state), do: {:ok, state}
 
   def handle_info(:firehose_heartbeat, %{phase: :live} = state) do
-    state = schedule_heartbeat(state)
-    push(%{"type" => "heartbeat", "seq" => Hub.sequence(hub(state), self())}, state)
+    if credential_current?(state) do
+      state = schedule_heartbeat(state)
+      push(%{"type" => "heartbeat", "seq" => Hub.sequence(hub(state), self())}, state)
+    else
+      {:stop, :normal, 1008, state}
+    end
   end
 
   def handle_info(:firehose_heartbeat, state), do: {:ok, state}
@@ -83,7 +88,9 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp route(_message, state), do: invalid("unsupported request", state)
 
   defp authenticate(message, state) do
-    case Devices.by_token(db(state), string(message["token"])) do
+    token = string(message["token"])
+
+    case Devices.by_token(db(state), token) do
       nil ->
         known = Devices.by_id(db(state), string(message["deviceId"]))
 
@@ -111,6 +118,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
           | phase: :live,
             user_id: device.user_id,
             device_id: device.device_id,
+            credential_digest: credential_digest(token),
             is_admin: device.is_admin
         }
 
@@ -219,6 +227,20 @@ defmodule Tightbeam.Wire.ChangeSocket do
   end
 
   defp heartbeat_ms(state), do: Map.get(state.deps, :firehose_heartbeat_ms, 15_000)
+
+  # The revocation notice is best-effort. Heartbeats also compare the exact
+  # credential generation so a lost notice cannot leave a revoked socket live.
+  defp credential_current?(state) do
+    case Devices.by_id(db(state), state.device_id) do
+      %{status: "allowlisted", token: token} when is_binary(token) ->
+        Plug.Crypto.secure_compare(credential_digest(token), state.credential_digest)
+
+      _other ->
+        false
+    end
+  end
+
+  defp credential_digest(token), do: :crypto.hash(:sha256, token)
 
   defp await_delivery_release(state, notice) do
     case Map.get(state.deps, :firehose_delivery_barrier) do
