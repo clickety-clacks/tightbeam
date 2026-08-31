@@ -4,6 +4,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   alias Tightbeam.{
     Assignments,
+    ConditionFacts,
     DB,
     Dispatch,
     Gateway,
@@ -1846,28 +1847,177 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "reopen-assignment repairs a surrendered card (Sol xhigh review, finding 7)", ctx do
-    assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "surrender then repair"))
+  test "new surrender writes are refused while a historical surrendered card remains readable",
+       ctx do
+    assignment =
+      handle(ctx, "assign", assign_call({:session, "holder"}, "legacy surrender repair"))
 
-    surrendered =
-      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "surrender"))
+    assert %{code: "invalid_kind"} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "surrender"))
 
-    assert surrendered.assignment.outcome == "surrendered"
-
-    reopened =
-      handle(
-        ctx,
-        "reopen-assignment",
-        reopen_call({:session, "holder"}, assignment.id, "the surrender was premature")
-      )
-
-    assert reopened.state == "open"
-
-    assert {:ok, [["surrendered"]]} =
+    assert {:ok, _} =
              DB.query(
                ctx.db,
-               "SELECT priorOutcome FROM assignment_reopenings WHERE assignmentId = ?1",
+               "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_legacy_surrender', ?1, 'surrender', 'historical', 'holder', 10)",
                [assignment.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed', outcome='surrendered', closedAt=10, closedBySession='holder', closingAttestId='att_legacy_surrender' WHERE id=?1",
+               [assignment.id]
+             )
+
+    historical =
+      handle(ctx, "assignment-get", assignment_get_call({:session, "holder"}, assignment.id))
+
+    assert historical.outcome == "surrendered"
+
+    assert [%{kind: "surrender", note: "historical"}] =
+             Assignments.list_attests(ctx.db, assignment.id)
+  end
+
+  test "cannot-proceed is holder-only, idempotent, pauses one card, and releases on its exact fact",
+       ctx do
+    first = handle(ctx, "assign", assign_call({:user, "flynn"}, "first blocked card"))
+    second = handle(ctx, "assign", assign_call({:session, "holder"}, "second runnable card"))
+
+    missing_reason = attest_call({:session, "holder"}, first.id, "cannot-proceed")
+    assert %{code: "missing_reason"} = handle(ctx, "attest", missing_reason)
+
+    wrong_holder =
+      attest_call({:session, "other-session"}, first.id, "cannot-proceed")
+      |> put_in([:params, :note], "not mine")
+
+    assert %{code: "not_holder"} = handle(ctx, "attest", wrong_holder)
+
+    filing =
+      attest_call({:session, "holder"}, first.id, "cannot-proceed")
+      |> put_in([:params, :note], "waiting for the exact release fact")
+      |> put_in([:params, :release_fact_kind], "dependency-ready")
+      |> put_in([:params, :release_fact_scope], first.id)
+      |> put_in([:params, :release_fact_principal_ref], "agent:holder")
+
+    filed = handle(ctx, "attest", filing)
+    replay = handle(ctx, "attest", filing)
+
+    assert filed.assignment.state == "open"
+    assert replay.replayed
+    assert replay.cannotProceed.id == filed.cannotProceed.id
+    assert Assignments.attest_count(ctx.db, first.id) == 1
+    assert filed.decisionRequest.assignment_id == first.id
+    assert filed.decisionRequest.expecter_session_key == Org.personal_session_key("flynn")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM decision_requests WHERE assignmentId=?1 AND status='open'",
+               [first.id]
+             )
+
+    assert Assignments.oldest_prod_eligible(ctx.db, "holder").id == second.id
+
+    assert {:ok, fact} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "dependency-ready",
+                 scope: first.id,
+                 origin: "agent:holder"
+               })
+             end)
+
+    assert is_integer(fact.fact_id)
+    assert Assignments.oldest_prod_eligible(ctx.db, "holder").id == first.id
+
+    assert {:ok, [["withdrawn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM decision_requests WHERE id=?1",
+               [filed.decisionRequest.id]
+             )
+
+    terminal = handle(ctx, "assign", assign_call({:session, "holder"}, "terminal race"))
+
+    terminal_block =
+      attest_call({:session, "holder"}, terminal.id, "cannot-proceed")
+      |> put_in([:params, :note], "may finish concurrently")
+      |> then(&handle(ctx, "attest", &1))
+
+    completed =
+      handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "completion"))
+
+    assert completed.assignment.outcome == "completed"
+    assert Wakes.get(ctx.db, terminal_block.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, [["settled", "disposed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind FROM assignment_cannot_proceed WHERE id=?1",
+               [terminal_block.cannotProceed.id]
+             )
+
+    disposed = handle(ctx, "assign", assign_call({:user, "flynn"}, "opener disposition"))
+
+    disposed_block =
+      attest_call({:session, "holder"}, disposed.id, "cannot-proceed")
+      |> put_in([:params, :note], "opener must dispose")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert %{code: "not_authorized"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "admin"}, disposed.id))
+
+    revoked =
+      handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, disposed.id))
+
+    assert revoked.outcome == "revoked"
+    assert Wakes.get(ctx.db, disposed_block.decisionWake.wake_id).state == "canceled"
+  end
+
+  test "cannot-proceed disposition follows an existing dead-opener fault bubble", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "bubbled disposition"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the opener is unavailable")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns
+                 (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
+               VALUES
+                 (?1,'cannot-proceed-cause',?2,'process:tightbeam','parent decision',?3,
+                  'failed',1,2)
+               """,
+               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
+             )
+
+    assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns
+                 (sessionKey,messageId,origin,prompt,assignmentId,status,requestRef,createdAt)
+               VALUES
+                 ('other-session','cannot-proceed-bubble','process:tightbeam','fault bubble',?1,
+                  'delivered',?2,3)
+               """,
+               [assignment.id, "bubble:#{cause_seq}"]
+             )
+
+    assert %{code: "not_authorized"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:session, "other-session"}, assignment.id)
              )
   end
 
@@ -2259,16 +2409,17 @@ defmodule Tightbeam.AssignmentsTest do
     assert count in [0, 1]
     assert (winner[:attest] && count == 1) || (!winner[:attest] && count == 0)
 
-    terminal = handle(ctx, "assign", assign_call({:session, "holder"}, "terminal"))
-    closed = handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "surrender"))
-    assert closed.assignment.outcome == "surrendered"
-    assert closed.assignment.closingAttestId == closed.attest.id
+    paused = handle(ctx, "assign", assign_call({:session, "holder"}, "paused"))
 
-    assert %{code: "assignment_closed"} =
-             handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "progress"))
+    cannot_proceed =
+      attest_call({:session, "holder"}, paused.id, "cannot-proceed")
+      |> put_in([:params, :note], "needs an opener decision")
+      |> then(&handle(ctx, "attest", &1))
 
-    assert %{code: "assignment_closed"} =
-             handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "verdict"))
+    assert cannot_proceed.assignment.state == "open"
+    assert cannot_proceed.attest.kind == "cannot-proceed"
+    assert cannot_proceed.cannotProceed.state == "standing"
+    assert cannot_proceed.decisionWake.assignment_id == paused.id
   end
 
   test "work lifecycle markers land in the actor transcript with exact event text", ctx do
@@ -2296,10 +2447,12 @@ defmodule Tightbeam.AssignmentsTest do
     completion =
       handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "completion"))
 
-    surrendered = handle(ctx, "assign", assign_call({:user, "flynn"}, "surrender markers"))
+    paused = handle(ctx, "assign", assign_call({:user, "flynn"}, "cannot-proceed markers"))
 
-    surrender =
-      handle(ctx, "attest", attest_call({:session, "holder"}, surrendered.id, "surrender"))
+    cannot_proceed =
+      attest_call({:session, "holder"}, paused.id, "cannot-proceed")
+      |> put_in([:params, :note], "needs input")
+      |> then(&handle(ctx, "attest", &1))
 
     revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "revoke markers"))
     revocation = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked.id))
@@ -2310,9 +2463,8 @@ defmodule Tightbeam.AssignmentsTest do
              "[verdict filed: reviewed-clean on #{completed.id}]",
              "[completion filed on #{completed.id}]",
              "[assignment closed: #{completed.id} — completed]",
-             "[assignment opened: #{surrendered.id}]",
-             "[surrendered #{surrendered.id} — needs user input]",
-             "[assignment closed: #{surrendered.id} — surrendered]",
+             "[assignment opened: #{paused.id}]",
+             "[cannot-proceed filed on #{paused.id}: needs input]",
              "[assignment opened: #{revoked.id}]",
              "[assignment revoked: #{revoked.id}]"
            ]
@@ -2322,8 +2474,7 @@ defmodule Tightbeam.AssignmentsTest do
     assert user_verdict.attest.byUser == "flynn"
     assert completion.assignment.outcome == "completed"
     assert completion.assignment.closingAttestId == completion.attest.id
-    assert surrender.assignment.outcome == "surrendered"
-    assert surrender.assignment.closingAttestId == surrender.attest.id
+    assert cannot_proceed.assignment.state == "open"
     assert revocation.outcome == "revoked"
     assert revocation.closingAttestId == nil
 

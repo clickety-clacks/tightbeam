@@ -135,7 +135,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
 
-    for kind <- ["completion", "surrender"] do
+    for kind <- ["completion"] do
       item = dispatch(ctx, {:session, "parent"}, "holder", kind)
       assignment(ctx, "attest", {:session, "holder"}, nil, %{assignment_id: item.id, kind: kind})
       assert bracket_state(ctx.db, item.id) == "canceled"
@@ -144,6 +144,16 @@ defmodule Tightbeam.EffortCheckinTest do
                item.id
              ]) == [[0]]
     end
+
+    blocked = dispatch(ctx, {:session, "parent"}, "holder", "cannot-proceed")
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: blocked.id,
+      kind: "cannot-proceed",
+      note: "needs the parent"
+    })
+
+    assert bracket_state(ctx.db, blocked.id) == "armed"
 
     revoked = dispatch(ctx, {:session, "parent"}, "holder", "revoked")
 

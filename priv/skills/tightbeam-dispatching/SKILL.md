@@ -43,8 +43,8 @@ normal lifecycle routing is the substrate's job.
 
 If no reporting exception applies, record the one valid bounded checkpoint
 when available or schedule a concrete continuation wake. Never manufacture
-a generic progress attest. Completion and surrender remain truthful terminal
-receipts. A qualifying progress row resets the prod countdown; scheduled
+a generic progress attest. Completion remains the holder's truthful terminal
+receipt. A qualifying progress row resets the prod countdown; scheduled
 wakes pause it; words do neither. If you stall, prods arrive from
 process:tightbeam and escalate up your spawner chain after N misses.
 

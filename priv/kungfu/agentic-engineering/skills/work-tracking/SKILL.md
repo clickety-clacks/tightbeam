@@ -18,7 +18,8 @@ work-items, assignments, attests; this is the policy for using them well.)
   (`--spec-ref <name> --spec-sha256 <hex>`) so the thread names the exact spec version
   it serves.
 - Every delegated obligation is an assignment on the work-item, held by one session.
-  The holder owes an outcome fact: a completion, a surrender, or a verdict. An
+  The holder owes an outcome fact: a completion or a verdict. A cannot-proceed filing
+  records why the still-open card cannot move. An
   assignment with none of these is open work, and the holder is accountable for it.
 - Record the ids the substrate returns — work-items, assignments, scheduled wakes. You
   sweep and address work by id (`tightbeam work-item-get <id>`,
@@ -26,7 +27,7 @@ work-items, assignments, attests; this is the policy for using them well.)
   an id that exists only in scrollback is lost to the next turn.
 - Attest facts as they happen, not at the end: progress when you learn or finish
   something the next reader needs; completion only with the evidence in the note;
-  surrender with the exact blocker in the note; a verdict when the obligation was a
+  cannot-proceed with the exact blocker in the note; a verdict when the obligation was a
   judgment.
 - Write every note for a reader with no context: state what an identifier means, cite
   the file and line, log line, or commit that supports each claim.

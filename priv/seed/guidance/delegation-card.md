@@ -62,7 +62,7 @@ ones take the org's law path (see the standing-directives vocabulary).
 
 ## Who files what on this card
 
-- **Lifecycle attests** — progress, completion, surrender — are HOLDER-ONLY: the
+- **Lifecycle attests** — progress, completion, cannot-proceed — are HOLDER-ONLY: the
   exec files its own, exactly as every holder does. Nobody files lifecycle rows on
   another session's card.
 - **Directive-kind attests** — standing directives and their cancellations — are

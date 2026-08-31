@@ -358,11 +358,11 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert is_binary(slate2)
     assert slate2 != slate
 
-    # Surrender path.
-    surrender_item = create(ctx, {:user, "flynn"}, %{title: "Surrendered"})
-    {:ok, sa} = disp_assign(ctx, {:user, "flynn"}, "holder", "sw", surrender_item.id)
-    surrender(ctx, "holder", sa.id)
-    assert is_binary(slate_wake_id(ctx.db, surrender_item.id))
+    # cannot-proceed keeps the assignment open, so it must not arm a slate wake.
+    blocked_item = create(ctx, {:user, "flynn"}, %{title: "Blocked"})
+    {:ok, blocked} = disp_assign(ctx, {:user, "flynn"}, "holder", "blocked", blocked_item.id)
+    cannot_proceed(ctx, "holder", blocked.id)
+    assert slate_wake_id(ctx.db, blocked_item.id) == nil
 
     # Revoke path.
     revoke_item = create(ctx, {:user, "flynn"}, %{title: "Revoked"})
@@ -869,7 +869,20 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   defp complete(ctx, holder, assignment_id), do: attest(ctx, holder, assignment_id, "completion")
-  defp surrender(ctx, holder, assignment_id), do: attest(ctx, holder, assignment_id, "surrender")
+
+  defp cannot_proceed(ctx, holder, assignment_id) do
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:#{holder}",
+      principal: {:session, holder},
+      session_key: nil,
+      params: %{
+        assignment_id: assignment_id,
+        kind: "cannot-proceed",
+        note: "needs its opener"
+      }
+    })
+  end
 
   defp attest(ctx, holder, assignment_id, kind) do
     Assignments.__handle__(ctx.db, "attest", %{

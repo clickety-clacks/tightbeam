@@ -1049,6 +1049,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             verdict,
             note,
             commit_refs,
+            release_fact_kind,
+            release_fact_scope,
+            release_fact_principal_ref,
         } => {
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
@@ -1065,6 +1068,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     "\"commitRefs\":{}",
                     serde_json::to_string(value).expect("commit refs are JSON serializable")
                 ));
+            }
+            if let Some(value) = release_fact_kind {
+                params.push(string_field("releaseFactKind", value));
+            }
+            if let Some(value) = release_fact_scope {
+                params.push(string_field("releaseFactScope", value));
+            }
+            if let Some(value) = release_fact_principal_ref {
+                params.push(string_field("releaseFactPrincipalRef", value));
             }
             Ok(request(identity, "attest", vec![], params))
         }
@@ -3294,6 +3306,26 @@ mod tests {
 
     #[test]
     fn builds_byte_exact_attest_bodies() {
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "cannot-proceed",
+                "--note",
+                "waiting",
+                "--release-fact-kind",
+                "dependency-ready",
+                "--release-fact-scope",
+                "asg_1",
+                "--release-fact-principal-ref",
+                "agent:holder",
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"cannot-proceed","note":"waiting","releaseFactKind":"dependency-ready","releaseFactScope":"asg_1","releaseFactPrincipalRef":"agent:holder"}}"#
+        );
+
         assert_eq!(
             body(&[
                 "attest",

@@ -703,7 +703,7 @@ defmodule Tightbeam.Wakes do
   defp retarget_delivery(source, _created_at), do: {source.delivery_rule, source.due_at}
 
   @requester_kinds ~w(user session process)
-  @reason_kinds ~w(requester_withdrew superseded obligation_disposed routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable)
+  @reason_kinds ~w(requester_withdrew superseded obligation_disposed cannot_proceed_released routing_bracket_satisfied target_retired production_unmatched consumer_unavailable target_unresolvable)
   @source_kinds ~w(verb_call wake progress_attest condition_fact assignment_transition work_item_transition decision_request monitor_generation routing_bracket session_transition scheduler_delivery)
   @disposition_kinds ~w(assignment_transition work_item_transition decision_request_transition monitor_generation_transition)
   @liveness_kinds ~w(supervision_entitlement supervision_transfer pending_wake routing_bracket)
@@ -712,7 +712,7 @@ defmodule Tightbeam.Wakes do
     "tightbeam:wake-scheduler" =>
       ~w(production_unmatched consumer_unavailable target_unresolvable),
     "tightbeam:work-items" => ~w(routing_bracket_satisfied),
-    "tightbeam:assignments" => ~w(obligation_disposed),
+    "tightbeam:assignments" => ~w(obligation_disposed cannot_proceed_released),
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
     "tightbeam:retirement" => ~w(target_retired obligation_disposed),
@@ -730,6 +730,7 @@ defmodule Tightbeam.Wakes do
     "obligation_disposed" =>
       {~w(assignment_transition work_item_transition decision_request monitor_generation),
        ~w(disposition)},
+    "cannot_proceed_released" => {~w(condition_fact), ~w(no_replacement)},
     "routing_bracket_satisfied" =>
       {~w(assignment_transition work_item_transition routing_bracket),
        ~w(replacement disposition)},

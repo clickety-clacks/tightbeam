@@ -162,7 +162,7 @@ The assignment's durable `effectKind` supplies the classification above. A linke
 review card is always `effectKind = review`, so its completion is exempt and cannot
 recursively require review. For unlinked evidence-only work, the holder files a
 `progress` attest recording
-delivered-not-withdrawn, then its opener revokes the card. Never surrender delivered
+delivered-not-withdrawn, then its opener revokes the card. Never mark delivered
 work as abandoned, and never revoke without the delivered row; both make the record
 lie.
 
@@ -173,5 +173,5 @@ on the board.
 
 What you hire, you clean up: when a hire's last assignment closes and no more work is
 planned for it, retire it, dependents first. Never retire a hire with an open assignment:
-the holder closes or surrenders it, or you explicitly dispose of it through the lawful
+the holder closes it, or you explicitly dispose of it through the lawful
 assignment path before the retirement.

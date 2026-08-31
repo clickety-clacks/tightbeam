@@ -85,7 +85,11 @@ defmodule Tightbeam.Schema do
   # mechanical status from its sole durable input and advances v11 to v12.
   # Ruled-decision integrity then rebuilds `decision_requests` from that exact
   # shape, so a ruled status cannot exist without its decision, ruler, and time.
-  @shape "coordination-fabric-v1-phase1-v13"
+  # Cannot-proceed then widens historical attests without deleting surrender
+  # rows, adds the standing per-assignment condition, and widens typed wake
+  # cancellation for release-fact settlement.
+  @shape "coordination-fabric-v1-phase1-v14"
+  @cannot_proceed_previous_shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
   @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
   @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
@@ -236,7 +240,7 @@ defmodule Tightbeam.Schema do
         requesterKind TEXT NOT NULL CHECK (requesterKind IN ('user','session','process')),
         requesterId TEXT NOT NULL,
         reasonKind TEXT NOT NULL CHECK (reasonKind IN (
-          'requester_withdrew','superseded','obligation_disposed',
+          'requester_withdrew','superseded','obligation_disposed','cannot_proceed_released',
           'routing_bracket_satisfied','target_retired','production_unmatched',
           'consumer_unavailable','target_unresolvable'
         )),
@@ -321,8 +325,11 @@ defmodule Tightbeam.Schema do
              outcomeKind IN ('replacement','disposition'))
             OR
             (requesterId = 'tightbeam:assignments' AND
-             reasonKind = 'obligation_disposed' AND causalSourceKind = 'assignment_transition' AND
-             outcomeKind = 'disposition')
+             ((reasonKind = 'obligation_disposed' AND
+               causalSourceKind = 'assignment_transition' AND outcomeKind = 'disposition')
+              OR
+              (reasonKind = 'cannot_proceed_released' AND
+               causalSourceKind = 'condition_fact' AND outcomeKind = 'no_replacement')))
             OR
             (requesterId = 'tightbeam:effort-checkin' AND
              ((reasonKind = 'superseded' AND
@@ -1560,13 +1567,97 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @ruled_decision_integrity_previous_shape,
-             @shape,
+             @cannot_proceed_previous_shape,
              migration_time
            ])
 
            if Txn.changes(txn) != 1,
              do:
                raise(ShapeError, message: "incompatible_ruled_decision_integrity_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        upgrade_cannot_proceed_v1(db)
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_ruled_decision_integrity_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_cannot_proceed_v1(DB.server()) :: :ok
+  def upgrade_cannot_proceed_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@cannot_proceed_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_cannot_proceed_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           if Txn.q(
+                txn,
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+              ) == [[1]] do
+             for name <- [
+                   "wakes_typed_cancellation_required",
+                   "wake_cancellations_pending_insert"
+                 ] do
+               :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{name}")
+             end
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_cannot_proceed_v1"
+               )
+
+             table = Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
+             :ok = Txn.exec(txn, table.sql)
+
+             columns =
+               "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+                 "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+                 "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+                 "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_cannot_proceed_v1"
+               )
+
+             :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_cannot_proceed_v1")
+
+             for name <- [
+                   "wake_cancellations_pending_insert",
+                   "wakes_typed_cancellation_required"
+                 ] do
+               object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+               :ok = Txn.exec(txn, object.sql)
+             end
+           end
+
+           :ok = Tightbeam.Assignments.migrate_cannot_proceed_v1_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @cannot_proceed_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_cannot_proceed_v1: stamp race")
 
            :ok
          end) do
@@ -1578,8 +1669,7 @@ defmodule Tightbeam.Schema do
 
       {:error, error} ->
         raise ShapeError,
-          message:
-            "incompatible_ruled_decision_integrity_v1: upgrade failed: #{Exception.message(error)}"
+          message: "incompatible_cannot_proceed_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -1818,6 +1908,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@cannot_proceed_previous_shape]]} ->
+        upgrade_cannot_proceed_v1(db)
+
       {:ok, [[@ruled_decision_integrity_previous_shape]]} ->
         upgrade_ruled_decision_integrity_v1(db)
 
@@ -1894,7 +1987,8 @@ defmodule Tightbeam.Schema do
         #{@identity_render_stamp_previous_shape},
         #{@effort_request_exit_previous_shape}, and
         #{@session_mechanical_status_previous_shape}, and
-        #{@ruled_decision_integrity_previous_shape}.
+        #{@ruled_decision_integrity_previous_shape}, and
+        #{@cannot_proceed_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
