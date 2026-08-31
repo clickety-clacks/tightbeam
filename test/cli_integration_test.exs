@@ -1626,7 +1626,7 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert upgrade =~ "workItems"
+    assert upgrade =~ "\"roots\""
 
     :ok = Supervisor.stop(candidate_bandit)
 
@@ -1646,7 +1646,7 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert restarted =~ "workItems"
+    assert restarted =~ "\"roots\""
 
     {new, 1} =
       System.cmd(ctx.binary, ["toplines", "--tree"],
