@@ -100,8 +100,11 @@ defmodule Tightbeam.ClientE2E.LegGateway do
         # ask a busy test host for hundreds of scheduler and dirty-scheduler
         # threads, making the replacement BEAM fail before /version binds.
         # Bound only this test child; its gateway, sockets, persisted database,
-        # process death, and reconnect path remain real.
-        {~c"ERL_FLAGS", ~c"+S 4:4 +SDcpu 2 +SDio 2"},
+        # process death, and reconnect path remain real. One scheduler and one
+        # dirty scheduler of each kind are sufficient for this single listener.
+        # The previous four-scheduler setting can still exhaust the hosted
+        # runner's thread budget before the child binds /version.
+        {~c"ERL_FLAGS", ~c"+S 1:1 +SDcpu 1 +SDio 1"},
         {~c"TIGHTBEAM_BASE_DIR", to_charlist(base_dir)},
         {~c"TIGHTBEAM_PORT", to_charlist(Integer.to_string(port))},
         {~c"TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS", ~c"2500"}
