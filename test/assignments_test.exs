@@ -2097,6 +2097,59 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "completion and surrender notices use the exact shared assignment bytes", ctx do
+    catalog = %{
+      {"eezo", "claude"} => [
+        %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    for {kind, derived_status} <- [{"completion", "claims-done"}, {"surrender", "abandoned"}] do
+      assignment =
+        handle(
+          ctx,
+          "assign",
+          assign_call({:user, "flynn"}, "#{kind} assignment projection")
+          |> put_in([:params, :files], [
+            "lib/tightbeam/firehose/publisher.ex",
+            "test/assignments_test.exs"
+          ])
+        )
+
+      attest_call = attest_call({:session, "holder"}, assignment.id, kind)
+      result = handle(ctx, "attest", attest_call)
+
+      notice =
+        ctx.db
+        |> Tightbeam.Firehose.Publisher.accepted_notices(attest_call, result)
+        |> Enum.find(&(&1["class"] == "assignment.closed"))
+
+      assert %{
+               "payload" => %{
+                 "derivedStatus" => ^derived_status,
+                 "files" => [
+                   "lib/tightbeam/firehose/publisher.ex",
+                   "test/assignments_test.exs"
+                 ]
+               }
+             } = notice
+
+      assert Map.keys(notice["payload"]) |> Enum.sort() ==
+               ~w(closedAt closedBySession closedByUser closingAttestId derivedStatus effectKind files holderFallback holderHarness holderKey holderProvider holderRole id openedAt openedBySession openedByUser outcome reviewsAssignmentId rowVersion state subject workItemId)
+
+      refute Map.has_key?(notice["payload"], "reopenings")
+      refute Map.has_key?(notice["payload"], "revocationReason")
+      refute Map.has_key?(notice["payload"], "priority")
+
+      item_bytes =
+        Tightbeam.StateResources.encode_item("assignments", notice["payload"], catalog)
+
+      wire = Tightbeam.Firehose.Publisher.encode_wire_notice(notice, catalog)
+      assert wire =~ ~s("payload":#{item_bytes})
+      assert JSON.decode!(wire) == notice
+    end
+  end
+
   test "generation upgrade replaces the predecessor tuple trigger before a reopened close", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade generation"))
 

@@ -156,7 +156,17 @@ defmodule Tightbeam.Firehose.Publisher do
     case {call.verb, result} do
       {"attest", %{assignment: %{state: "closed", outcome: outcome} = assignment}}
       when outcome in ~w(completed surrendered revoked) ->
-        primary ++ [build("assignment.closed", call, assignment, &StateResources.assignment/1)]
+        canonical_assignment = canonical_assignment_result(db, call, assignment)
+
+        primary ++
+          [
+            build(
+              "assignment.closed",
+              call,
+              canonical_assignment,
+              &StateResources.assignment/1
+            )
+          ]
 
       _ ->
         primary
@@ -422,6 +432,12 @@ defmodule Tightbeam.Firehose.Publisher do
 
   defp canonical_result(db, %{verb: verb} = call, result)
        when verb in ~w(assign dispatch reopen-assignment revoke-assignment) do
+    canonical_assignment_result(db, call, result)
+  end
+
+  defp canonical_assignment_result(nil, _call, result), do: result
+
+  defp canonical_assignment_result(db, call, result) do
     id = result[:id] || result["id"] || result[:assignment_id] || call.params[:assignment_id]
     StateResources.query_assignment(db, id, call) || result
   end
