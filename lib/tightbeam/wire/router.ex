@@ -729,9 +729,6 @@ defmodule Tightbeam.Wire.Router do
       [] ->
         {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
 
-      [""] ->
-        {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
-
       [as_user] ->
         with {:ok, principal} <- resolve_cli_as_user({:session, session}, as_user) do
           {:ok, state_principal_view(principal, conn)}
@@ -1345,7 +1342,7 @@ defmodule Tightbeam.Wire.Router do
              "role #{role} is not held by this session; held roles: #{held}"}
         end
 
-      is_binary(body["asUser"]) and body["asUser"] != "" ->
+      is_binary(body["asUser"]) ->
         case resolve_cli_as_user({:session, session}, body["asUser"]) do
           {:ok, principal} -> {:ok, "user:#{session.owner_user_id}", principal}
           error -> error

@@ -289,6 +289,8 @@ defmodule Tightbeam.RestReadPlaneD1Test do
        "invalid_as_user"},
       {"session absent asUser stays a session", "/api/hosts", ctx.admin_session.cli_token, 200,
        nil},
+      {"session empty asUser", "/api/hosts?asUser=", ctx.admin_session.cli_token, 403,
+       "identity_not_yours"},
       {"session matching asUser becomes the owner user", "/api/config?asUser=flynn",
        ctx.admin_session.cli_token, 200, nil},
       {"session mismatching asUser", "/api/config?asUser=operator", ctx.admin_session.cli_token,
@@ -312,6 +314,11 @@ defmodule Tightbeam.RestReadPlaneD1Test do
 
     assert mismatch.resp_body ==
              ~s({"schemaVersion":1,"resource":"config","error":{"code":"identity_not_yours","message":"this session belongs to flynn"}})
+
+    empty = get(ctx, "/api/hosts?asUser=", ctx.admin_session.cli_token)
+
+    assert empty.resp_body ==
+             ~s({"schemaVersion":1,"resource":"hosts","error":{"code":"identity_not_yours","message":"this session belongs to flynn"}})
 
     malformed = get(ctx, "/api/config?asUser=flynn%zz", "tbc_rest_d1")
     assert malformed.status == 400
@@ -338,6 +345,8 @@ defmodule Tightbeam.RestReadPlaneD1Test do
        "invalid_message"},
       {"org missing", "/api/hosts", "tbc_rest_d1", %{}, 400, "invalid_message"},
       {"session absent", "/api/hosts", ctx.admin_session.cli_token, %{}, 200, nil},
+      {"session empty", "/api/hosts?asUser=", ctx.admin_session.cli_token, %{"asUser" => ""}, 403,
+       "identity_not_yours"},
       {"session matching", "/api/hosts?asUser=flynn", ctx.admin_session.cli_token,
        %{"asUser" => "flynn"}, 200, nil},
       {"session mismatching", "/api/hosts?asUser=operator", ctx.admin_session.cli_token,
@@ -356,6 +365,14 @@ defmodule Tightbeam.RestReadPlaneD1Test do
         assert JSON.decode!(dispatch.resp_body)["error"]["code"] == code, label
       end
     end
+
+    empty_dispatch =
+      dispatch(ctx, ctx.admin_session.cli_token, %{"verb" => "inspect", "asUser" => ""})
+
+    assert JSON.decode!(empty_dispatch.resp_body)["error"] == %{
+             "code" => "identity_not_yours",
+             "message" => "this session belongs to flynn"
+           }
   end
 
   test "allowlisted filters compose OR within a field and AND across fields", ctx do
