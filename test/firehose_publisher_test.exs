@@ -966,8 +966,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
   test "condition and critical projections carry stable ids and last-version-wins" do
     older_fact = Tightbeam.StateResources.condition_fact(%{fact_id: 4, ts: 100, kind: "ready"})
     newer_fact = Tightbeam.StateResources.condition_fact(%{fact_id: 5, ts: 90, kind: "ready"})
-    assert older_fact["factId"] == older_fact["rowVersion"]
-    assert newer_fact["factId"] == newer_fact["rowVersion"]
+    assert older_fact["id"] == older_fact["rowVersion"]
+    assert newer_fact["id"] == newer_fact["rowVersion"]
     assert lww(older_fact, newer_fact) == newer_fact
     assert lww(newer_fact, older_fact) == newer_fact
     assert lww(newer_fact, newer_fact) == newer_fact

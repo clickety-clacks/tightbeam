@@ -5,7 +5,7 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
   alias Tightbeam.{ConditionFacts, Devices, Dispatch, Gateway, Harness, Org, Placement}
   alias Tightbeam.{Projection, ReadMarkers, StateResources, SubagentMarkers, Toplines, Wakes}
-  alias Tightbeam.Firehose.{Hub, Rebuild, Registry}
+  alias Tightbeam.Firehose.{Hub, Publisher, Rebuild, Registry}
   alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
 
   @a4_replay_seed {7_913, 10_007, 65_537}
@@ -311,6 +311,23 @@ defmodule Tightbeam.FirehoseSmokeTest do
     assert "prod.fired" in Registry.observational_classes()
     assert Registry.fetch("prod.fired") == :error
 
+    device_notice = notices["device.approved"]
+
+    assert MapSet.new(Map.keys(device_notice["payload"])) ==
+             MapSet.new(
+               ~w(deviceId userId claimedName status platform model createdAt rowVersion)
+             )
+
+    refute Map.has_key?(device_notice["payload"], "isAdmin")
+    assert StateResources.item_shape_complete?("devices", device_notice["payload"])
+
+    condition_notice = notices["condition_fact.filed"]
+    assert condition_notice["refs"]["factId"] == condition_notice["payload"]["id"]
+    refute Map.has_key?(condition_notice["payload"], "factId")
+
+    assert JSON.decode!(Publisher.encode_wire_notice(condition_notice, %{})) ==
+             condition_notice
+
     for {class, notice} <- notices do
       assert {:ok, fresh} =
                Rebuild.fetch(fixture.db, class, notice["refs"], fixture.user_id, true)
@@ -611,17 +628,28 @@ defmodule Tightbeam.FirehoseSmokeTest do
     {replays, _random} =
       notices
       |> Enum.sort_by(fn {class, _notice} -> class end)
-      |> Enum.map_reduce(random, fn {_class, notice}, random ->
+      |> Enum.map_reduce(random, fn {class, notice}, random ->
         {choice, random} = :rand.uniform_s(2, random)
-        order = if choice == 1, do: [:duplicate, :older], else: [:older, :duplicate]
+
+        # A fact's version is its immutable id, and version 1 has no positive predecessor.
+        order =
+          cond do
+            class == "condition_fact.filed" -> [:duplicate]
+            notice["payload"]["rowVersion"] == 1 -> [:duplicate]
+            choice == 1 -> [:duplicate, :older]
+            true -> [:older, :duplicate]
+          end
+
         {{notice, order}, random}
       end)
 
     Enum.reduce(replays, {model, ws}, fn {notice, order}, {model, ws} ->
-      older = put_in(notice, ["payload", "rowVersion"], notice["payload"]["rowVersion"] - 1)
-
       Enum.reduce(order, {model, ws}, fn replay, {model, ws} ->
-        outbound = if replay == :duplicate, do: notice, else: older
+        outbound =
+          if replay == :duplicate,
+            do: notice,
+            else: put_in(notice, ["payload", "rowVersion"], notice["payload"]["rowVersion"] - 1)
+
         :ok = Hub.publish(fixture.hub, outbound)
         {received, ws} = Fixture.recv_change(ws)
         assert canonical_notice(received) == outbound
