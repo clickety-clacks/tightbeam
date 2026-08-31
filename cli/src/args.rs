@@ -247,6 +247,15 @@ pub enum Command {
         verb: String,
         params: Vec<(String, String)>,
     },
+    DurableToplines {
+        identity: Identity,
+        state: Option<String>,
+    },
+    DurableTopline {
+        identity: Identity,
+        topline_id: String,
+        history: bool,
+    },
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
@@ -568,6 +577,22 @@ COMMANDS:
       reports the items they resolve to; an assignment belonging to no item
       comes back in noItem rather than being silently dropped.
         tightbeam execution-map-select --under wi_abc123 --as-user flynn
+  toplines [--state open|closed|all]
+      List your visible durable Toplines.
+  topline <toplineId> [--history]
+      Read one visible durable Topline; --history includes its event history.
+  topline-create --title <text> --key <idempotencyKey>
+  topline-update <toplineId> --title <text> --reason <text> --key <idempotencyKey>
+  topline-close <toplineId> --reason <text> --key <idempotencyKey>
+  topline-reopen <toplineId> --reason <text> --key <idempotencyKey>
+  topline-link-work <toplineId> <workItemId> --reason <text> --key <idempotencyKey>
+  topline-unlink-work <membershipId> --reason <text> --key <idempotencyKey>
+  topline-concern-create <toplineId> --title <text> --key <idempotencyKey>
+  topline-concern-update <concernId> --title <text> --reason <text> --key <idempotencyKey>
+  topline-concern-resolve <concernId> --reason <text> --key <idempotencyKey>
+  topline-concern-reopen <concernId> --reason <text> --key <idempotencyKey>
+  topline-concern-link-work <concernId> <membershipId> --reason <text> --key <idempotencyKey>
+  topline-concern-unlink-work <concernRefId> --reason <text> --key <idempotencyKey>
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -900,6 +925,8 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
 const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
 
 const TOPLINE_USAGE: &str = "usage: tightbeam execution-map-select (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+const DURABLE_TOPLINES_USAGE: &str = "usage: tightbeam toplines [--state open|closed|all]";
+const DURABLE_TOPLINE_USAGE: &str = "usage: tightbeam topline <toplineId> [--history]";
 
 /// Every roster-filter flag, in one place, so the assignment-mode refusal and the
 /// filter builder cannot drift apart.
@@ -1763,6 +1790,31 @@ fn parse_with_optional_catalog(
             Ok(Command::Topline {
                 identity: identity(flags)?,
                 selection,
+            })
+        }
+        "toplines" => {
+            if parsed.positional.len() != 1 {
+                return Err(DURABLE_TOPLINES_USAGE.to_owned());
+            }
+            let state = nonempty(flags, "state");
+            if let Some(value) = &state {
+                if !matches!(value.as_str(), "open" | "closed" | "all") {
+                    return Err(DURABLE_TOPLINES_USAGE.to_owned());
+                }
+            }
+            Ok(Command::DurableToplines {
+                identity: identity(flags)?,
+                state,
+            })
+        }
+        "topline" => {
+            if parsed.positional.len() != 2 {
+                return Err(DURABLE_TOPLINE_USAGE.to_owned());
+            }
+            Ok(Command::DurableTopline {
+                identity: identity(flags)?,
+                topline_id: parsed.positional[1].clone(),
+                history: flags.contains_key("history"),
             })
         }
         verb @ ("topline-create"
@@ -2934,6 +2986,20 @@ mod tests {
                 "unlearn",
                 "execution-map",
                 "execution-map-select",
+                "toplines",
+                "topline",
+                "topline-create",
+                "topline-update",
+                "topline-close",
+                "topline-reopen",
+                "topline-link-work",
+                "topline-unlink-work",
+                "topline-concern-create",
+                "topline-concern-update",
+                "topline-concern-resolve",
+                "topline-concern-reopen",
+                "topline-concern-link-work",
+                "topline-concern-unlink-work",
                 "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",

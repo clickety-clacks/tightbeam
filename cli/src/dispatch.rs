@@ -679,6 +679,24 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 .map(|(name, value)| string_field(name, value))
                 .collect(),
         )),
+        Command::DurableToplines { identity, state } => {
+            let params = state
+                .as_ref()
+                .map(|value| vec![string_field("state", value)])
+                .unwrap_or_default();
+            Ok(request(identity, "toplines", vec![], params))
+        }
+        Command::DurableTopline {
+            identity,
+            topline_id,
+            history,
+        } => {
+            let mut params = vec![string_field("toplineId", topline_id)];
+            if *history {
+                params.push("\"history\":true".to_owned());
+            }
+            Ok(request(identity, "topline", vec![], params))
+        }
         Command::WorkItemIcebox {
             identity,
             work_item_id,
@@ -1605,6 +1623,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
         | Command::ToplineMutation { identity, .. }
+        | Command::DurableToplines { identity, .. }
+        | Command::DurableTopline { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
