@@ -1759,7 +1759,7 @@ fn parse_with_optional_catalog(
             })
         }
         "revoke-assignment" => {
-            if parsed.positional.len() != 2 {
+            if parsed.positional.len() != 2 || parsed.duplicates.contains("reason") {
                 return Err(
                     "usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"".to_owned(),
                 );
@@ -3686,6 +3686,23 @@ mod tests {
                 ..
             } if assignment_id == "asg_1" && reason == "stale verdict"
         ));
+    }
+
+    #[test]
+    fn revoke_assignment_requires_exactly_one_reason() {
+        assert_eq!(
+            parse(strings(&[
+                "revoke-assignment",
+                "asg_1",
+                "--reason",
+                "first",
+                "--reason",
+                "second",
+                "--as-user",
+                "flynn",
+            ])),
+            Err("usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"".to_owned())
+        );
     }
 
     #[test]
