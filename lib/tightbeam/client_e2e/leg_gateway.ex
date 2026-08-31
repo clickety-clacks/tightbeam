@@ -91,10 +91,13 @@ defmodule Tightbeam.ClientE2E.LegGateway do
   def boot(base_dir, port, opts \\ []) do
     log_path = Path.join(base_dir, "gateway.log")
     repo_root = Keyword.get(opts, :repo_root, File.cwd!())
+    # Production journeys keep the dev build. Acceptance fixtures may select
+    # their compiled test registry without changing the caller's own Mix VM.
+    mix_env = Keyword.get(opts, :mix_env, "dev")
 
     env =
       [
-        {~c"MIX_ENV", ~c"dev"},
+        {~c"MIX_ENV", to_charlist(mix_env)},
         # A leg is a real child BEAM, but it does not need the host's full
         # scheduler count. Two parallel fixtures plus a restart can otherwise
         # ask a busy test host for hundreds of scheduler and dirty-scheduler

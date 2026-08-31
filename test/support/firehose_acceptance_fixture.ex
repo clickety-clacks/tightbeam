@@ -113,7 +113,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
       CursorSigning.provision!(base_dir)
 
       gateway =
-        case LegGateway.boot(base_dir, port, repo_root: repo_root) do
+        case boot_subprocess(base_dir, port, repo_root) do
           {:ok, gateway} ->
             gateway
 
@@ -206,7 +206,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     end
 
     restarted =
-      case LegGateway.boot(fixture.base_dir, fixture.port, repo_root: fixture.repo_root) do
+      case boot_subprocess(fixture.base_dir, fixture.port, fixture.repo_root) do
         {:ok, gateway} ->
           gateway
 
@@ -434,6 +434,20 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     {:ok, {_address, port}} = :inet.sockname(socket)
     :ok = :gen_tcp.close(socket)
     port
+  end
+
+  defp boot_subprocess(base_dir, port, repo_root) do
+    # CI installs only the test registry's Fixture CLI. A dev child excludes
+    # that harness and exits at preflight before /version can bind. Keep the
+    # child test VM's own scratch root inside base_dir so exact teardown owns it.
+    LegGateway.boot(base_dir, port,
+      repo_root: repo_root,
+      mix_env: "test",
+      env: [
+        {"TMPDIR", base_dir},
+        {"TIGHTBEAM_FIREHOSE_ACCEPTANCE_GATEWAY", "1"}
+      ]
+    )
   end
 
   defp gateway_token!(base_dir) do
