@@ -17,14 +17,18 @@ item pins a spec-ref, the sha256 names the exact spec text your goal owes confor
 to. Build from the ruling text at the canonical path, never a copy in the dispatch
 note or your memory of it.
 
-## Build exactly the spec
-The spec defines the whole of the work; anything beyond it is a defect, whatever its
-quality. No extra validation, guard, fallback, retry, config option, or compatibility
-path the spec does not require. "Safer," "defensive," "future-proof," and "while I was
-in there" do not create a spec clause. An unrequested addition adds untested surface,
-obscures the change, and widens the review beyond what the spec can prove. Code the
-spec's behavior genuinely cannot function without is in scope even when unnamed; the
-test is necessity for a specified clause, not usefulness.
+## Build exactly the ask
+The ask defines the whole of the work; anything beyond it fails review, whatever its
+quality. Under heavy posture the ask is the pinned spec. Under light posture the work
+item's input IS the spec (the orchestrator ruled it sufficient to build an MVP; read
+the posture verdict on the work item), and a gap in it is a question to your
+orchestrator, not a spec defect to route to a spec-writer. No extra validation, guard,
+fallback, retry, config option, or compatibility path the ask does not require, and no
+fix of a bug the ask did not name. "Safer," "defensive," "future-proof," "while I was
+in there," and "it was right there" do not make it the ask. An incidental fix is its
+own card; report it, do not fold it in. Code the ask's behavior genuinely cannot
+function without is in scope even when unnamed; the test is necessity for the ask, not
+usefulness.
 
 ## Change only what your goal requires
 Beyond no-additions (above): no MODIFICATIONS of working behavior without live
@@ -138,6 +142,11 @@ their change first hand reviewers dramatically fewer defects, because the annota
 is where the author catches them. That ready-for-review attest, like your completion,
 names the repo as `host:absolute-path` and the commit id. "It shipped" without an
 address sends your verifier hunting the wrong repo.
+
+A review may come back `changes-requested` on a finding you believe the ask ships
+without. You may contest it on exactly that ground, to your orchestrator, with the
+facet named; the orchestrator adjudicates, not the reviewer and not you. Never argue a
+behavioral finding you have not reproduced yourself.
 
 File completion ONLY after the review verdict is in, the verification papertrail is
 recorded, and integration is proven. Completion closes your assignment, and the

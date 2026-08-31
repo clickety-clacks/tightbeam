@@ -85,6 +85,45 @@ deny_when = [
   { fact = "work_item.verdict_kinds", op = "not_in", value = ["spirit-approved"] },
 ]
 
+# Posture gate (Mike, 2026-08-31). Every piece of implementation work runs under
+# one of two postures, ruled by its orchestrator on receiving the slice: HEAVY (a
+# new feature, an architectural change, new infrastructure: full spec cycle) or
+# LIGHT (an adjudicated fix, a straightforward bug, an augmentation within the
+# architecture: the input is the spec, one coder, one review at the light bar).
+# The orchestrator files the ruling as a verdict on a card on the SAME work item
+# the coder card will use, normally the slice card it holds open for the life of
+# the slice: `--verdict posture-light` or `--verdict posture-heavy`, reasoning in
+# the note. These two rails refuse to open a coder card until that verdict exists.
+# Deny, not remedy, for the spirit rule's reason: the missing paper is a judgment,
+# and the orchestrator is the mind that supplies it (`external_producer`: no
+# remedy mints this verdict). The rail checks that a posture was ruled, never
+# whether it was ruled well. `target.archetype` names the session about to hold
+# the card; the assignment facts describe the reviewed or prior card, never the
+# one being opened.
+[[rule]]
+name = "implementation-requires-posture"
+verb = "assign"
+text = "implementation needs a posture ruling first: file posture-light or posture-heavy as a verdict on a card on this work item, with the reasoning, then assign"
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "eq", value = "coder" },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["posture-light", "posture-heavy"] },
+]
+
+[[rule]]
+name = "implementation-dispatch-requires-posture"
+verb = "dispatch"
+text = "implementation needs a posture ruling first: file posture-light or posture-heavy as a verdict on a card on this work item, with the reasoning, then dispatch"
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "eq", value = "coder" },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["posture-light", "posture-heavy"] },
+]
+
 # The review-rounds doorbell. Product goal:
 # at round four (recent norm is 1-2; the old process ran 4-10; grace built
 # in), SHINE LIGHT on a review that may be spinning by summoning the product

@@ -24,7 +24,10 @@ missing.
    - **Wrong assumption** — the agent believes something false about the code, the
      spec, or the environment. Correct it with evidence and wake the agent.
    - **Unneeded gate** — the agent waits for permission or input the work does not
-     require. Name the authority it already holds and wake it.
+     require. Name the authority it already holds and wake it. A review holding work
+     for a facet the ask ships without is this class: file `review-overreach` on the
+     review card and have the reviewer re-file (orchestrator kernel, "Verifying without
+     redoing").
    - **Refused workaround** — a viable path that breaks no rule exists and the agent
      has not taken it. State the path and wake the agent to take it.
    - **Real block** — the work cannot proceed without a decision that belongs to the

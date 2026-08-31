@@ -19,6 +19,13 @@ them keep that two-step form.
 Keep only a handful of goals truly in-flight at once (see the kernel); this loop is
 per-feature, but your attention across features is the scarce resource.
 
+0. **Posture.** Before anything is staffed, rule the slice heavy or light (the
+   orchestrator kernel defines both) and file it as a verdict on your slice card on
+   this work item: `--verdict posture-heavy` or `--verdict posture-light`, grounds in
+   the note. The substrate refuses a coder card on an unpostured work item. HEAVY runs
+   steps 1 through 10. LIGHT skips steps 1 through 3: the work item's input is the
+   spec, one coder is assigned it as the goal (step 4), and its review (step 5) runs
+   at the light bar. Every other step applies to both.
 1. **Spec.** Spawn a spec-writer and assign it the spec:
    `tightbeam assign --subject "spec: <feature>" --role spec-writer --work-item <id>`.
    The spec states invariants first, a testable acceptance contract, open questions,
@@ -34,8 +41,11 @@ per-feature, but your attention across features is the scarce resource.
    Spawn the selected reviewer as a fresh session. Link the review to the work it
    reviews so the substrate can witness the independence:
    `tightbeam assign --subject "review of spec <id>" --role reviewer:<slug> --work-item <id> --reviews <specAssignmentId>`.
-   The reviewer works per `reviewing-specs`. On `changes-requested`, wake the
-   spec-writer to revise; repeat until `reviewed-clean`. The spec-writer then pins (or
+   The reviewer works per `reviewing-specs`. On `changes-requested`, read each
+   blocking finding against the ask first: a finding the MVP ships without gets
+   `review-overreach` on the review card (orchestrator kernel, "Verifying without
+   redoing") and the reviewer re-files. Then wake the spec-writer to revise the rest;
+   repeat until `reviewed-clean`. The spec-writer then pins (or
    re-pins) the reviewed spec's hash on the work item (spec-handoff skill), so builders
    build from the cleared text.
 3. **Decompose.** Break the spec into focused, independently verifiable coding goals —
@@ -72,9 +82,17 @@ per-feature, but your attention across features is the scarce resource.
    The `--reviews` link and the verdict by that card's different-session holder are
    what let the substrate compute independence. Harness and provider differences stay
    observable selection evidence; they do not gate completion. A verdict filed
-   without the link is a claim the rows cannot confirm. On `changes-requested`, wake
-   the producer to iterate and have the same reviewer re-file on the same review card
-   until `reviewed-clean`; do not multiply review cards for review rounds.
+   without the link is a claim the rows cannot confirm. On `changes-requested`, read
+   each blocking finding against the ask before you wake anyone: a finding the MVP
+   ships without gets `review-overreach` on the review card and the reviewer re-files
+   with it moved to post-mvp. Then wake the producer to iterate on what remains and
+   have the same reviewer re-file on the same review card until `reviewed-clean`; do
+   not multiply review cards for review rounds. Under light posture the reviewer's bar
+   is "nothing egregiously wrong," and the same overreach check applies. Four rounds
+   ring the review-rounds doorbell; an overreach re-file counts as a round.
+   The product owner's spirit review (step 6) asks a different question, whether the
+   built thing is the product; the reviewer asks whether it is the ask. Nobody gates
+   the same question twice.
 6. **Spirit review (substantial changes).** A goal is substantial when it produces
    product behavior with no product-owner-gated spec authority behind it —
    behavior an agent or user experiences, an authority moved between homes, or a
