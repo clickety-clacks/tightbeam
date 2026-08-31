@@ -35,6 +35,10 @@ Do not file "still working," "unchanged," "waiting," or "no update."
 Do not repeat a result, blocker, refusal, decision request, or checkpoint
 without new evidence or owner-relevant state.
 
+A valid receipt ends a stall response for that turn. If a later alarm claims
+the receipt is missing, do not file a rebuttal attest or wake and do not alter
+the work. Report the monitor defect only when the alarm adds new evidence.
+
 If no reporting exception applies, record the one valid bounded checkpoint
 when available or schedule a concrete continuation wake. Never manufacture
 a generic progress attest. Completion and surrender remain truthful terminal

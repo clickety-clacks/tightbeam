@@ -25,6 +25,9 @@ questions the product owner ruled non-blocking. Build around a marked hole. An
 UNMARKED hole on a load-bearing concept is a spec defect — send it to the spec-writer;
 do not fill it with your own guess.
 
+When an alleged mismatch is between unchanged source copies, hash their exact bytes.
+Matching hashes end that verification; do not reopen it because metadata disagrees.
+
 ## Group coupled work before fan-out
 When the product owner gives you related work items, keep each item's durable record
 and slate, but plan the set together before staffing it. Treat items as one coordinated
@@ -50,12 +53,10 @@ a concrete definition of done is dumping, not delegating — the holder stalls o
 and the result bounces back to you. The brief carries all three. Pick each worker's model
 per preferred-models, from the live catalog.
 
-Before your FIRST fan-out on a work-item, digest the whole spec against its spirit —
-the substrate enforces this once per work-item (your first dispatch detours you into a
-rumination turn if you haven't). After that it's your judgment: a bug fix or a local
-modification rarely re-touches the spirit, but a feature addition or removal — a
-change to what the thing IS — does; re-ruminate then, on your own, before fanning out
-again. The substrate will never classify that for you.
+Before your FIRST fan-out on a work item, digest the whole spec against its spirit.
+The substrate enforces this once per work item. Do not repeat spirit review because
+you split the item into goals or slices. If the item's product intent changes, revise
+the same work-item spirit review; never open another for a slice.
 
 Decompose by the seam, not just for parallelism: defects cluster where two agents'
 work meets, so cut along interfaces that minimize what crosses between goals — one
@@ -79,7 +80,10 @@ not to track harder.
 ## Every sweep: advance or kill
 Each time you wake to your board, every active goal gets fed or shot — advanced toward
 done, or ended. A goal that has sat since your last sweep with no new fact and no
-answer to a wake is a stall; run the unblocking skill on it. Read each dispatch's
+answer to a wake is a stall. First read its liveness receipts. A valid receipt ends
+the stall response even when a later alarm claims it is missing; do not rebut the alarm
+with an attest or wake and do not re-staff the work. Otherwise run the unblocking skill.
+Read each dispatch's
 FIRST progress attest critically: a wrong direction costs little at the first commit
 and everything at the last. Nothing is allowed to linger half-alive: an item you will
 not advance, you retire, and you say why.
@@ -138,15 +142,22 @@ repository's prose defines verification, records the results as a report artifac
 and files the `verified` verdict — green tests and a clean review are not that proof,
 and the substrate blocks a completion that lacks the papertrail.
 
+Keep that one linked review card open across every `changes-requested` revision. The
+same holder reviews each new candidate on it and completes it only after `reviewed-clean`.
+
 ## Closing the loop: the completion rail
 `completion-requires-review` backstops the evidence shape; it never chooses a model.
 A review-required card completes only when
 `assignment.qualifying_review_verdict_kinds` contains `reviewed-clean`: the latest
 card linked by `--reviews` has a clean latest holder-filed verdict, and that holder is
 a different session from the work's author. Closing or revoking that fulfilled review
-card preserves its verdict; an older round cannot override it, and a newer round
-becomes authoritative. Who opened the review card and which harness or provider ran
+card preserves its verdict; an older verdict cannot override the latest verdict on that
+same card. Who opened the review card and which harness or provider ran
 it do not change that fact.
+
+When a lane pins an authorized target tip, hold that exact tip until the reviewed
+candidate lands. Unrelated target movement is a hold violation to report. Do not
+reconcile or rebuild on the moved target unless the owner explicitly changes the pin.
 
 The assignment's durable `effectKind` supplies the classification above. A linked
 review card is always `effectKind = review`, so its completion is exempt and cannot

@@ -63,16 +63,18 @@ per-feature, but your attention across features is the scarce resource.
    the same candidate. Send ambiguous qualification to your parent. If the row is
    exhausted, the parent records `work-blocked` or surfaces the credential need. Spawn
    the selected reviewer as a fresh session with the capability the effect requires.
-   Same model, provider, or harness remains eligible. Link the single review card to
-   the reviewed work:
+   Same model, provider, or harness remains eligible. Open exactly one linked review
+   card for the change and keep that card through all revisions:
    `tightbeam assign --subject "review of <goal>" --role reviewer:<slug> --work-item <id> --reviews <coderAssignmentId>`.
    The `--reviews` link and the verdict by that card's different-session holder are
    what let the substrate compute independence. Harness and provider differences stay
    observable selection evidence; they do not gate completion. A verdict filed
-   without the link is a claim the rows cannot confirm. On `changes-requested`, wake
-   the producer to iterate and have the same reviewer re-file on the same review card
-   until `reviewed-clean`; do not multiply review cards for review rounds.
-6. **Spirit review (substantial changes).** A goal is substantial when it produces
+   without the link is a claim the rows cannot confirm. On `changes-requested`, leave
+   the review card open, wake the producer to iterate, and have the same reviewer
+   re-file on that card until `reviewed-clean`. Complete the review card only after its
+   clean verdict; never multiply or close-and-reopen cards for review rounds.
+6. **Spirit review (substantial work items).** Spirit review happens once per work
+   item, never once per goal or slice. A work item is substantial when it produces
    product behavior with no product-owner-gated spec authority behind it —
    behavior an agent or user experiences, an authority moved between homes, or a
    change to what a fresh install boots as, that no owner-gated spec states. A
@@ -85,25 +87,30 @@ per-feature, but your attention across features is the scarce resource.
    Cross-model spec review is quality control, not spirit — a spec cleared only by
    cross-model review makes nothing routine.
 
-   A substantial goal does not integrate until the product owner has answered its
-   spirit summary. Wake the owner with what changed in product terms, which Spirit
-   clauses it serves, and what it forecloses:
-   `tightbeam wake --session <productOwner> --prompt "spirit review of <goalAssignmentId>: <summary>"`.
-   The answer is an attest on the goal's assignment in the owner-verdict shape:
-   `tightbeam attest <goalAssignmentId> --kind verdict --verdict spirit-accepted --note "<basis>"`,
-   or `--verdict changes-requested` with what the spirit refuses. An unanswered
+   If the work item already carries the product owner's spirit verdict for its current
+   intent, every implementation slice inherits it; do not ask again as the work is
+   decomposed. Otherwise, the work item does not integrate until the product owner has
+   answered one spirit summary. Wake the owner with what changed in product terms,
+   which Spirit clauses it serves, and what it forecloses. Keep revisions on that same
+   spirit-review assignment. The answer is `spirit-accepted`, or `changes-requested`
+   with what the spirit refuses. An unanswered
    gate queues the merge indefinitely — that wait is the accepted cost; chase it
    up the existing wake rungs, never around the gate. An answer from before
-   integration is stale where integration changed the product-visible semantics,
-   exactly as a code review is. When you cannot tell which side a goal falls on,
+   integration is stale where integration changed the product-visible semantics; revise
+   the same work-item spirit review instead of opening one per slice. When you cannot
+   tell which side a work item falls on,
    that question goes to the product owner too — the ask costs one wake; a wrong
    guess merges a change the spirit never accepted.
-7. **Integrate.** The coder reconciles the change with main
-   (committing-and-pushing skill); the review that clears the work covers the
-   post-reconciliation result — a review from before integration is stale where
-   integration changed semantics.
-8. **Verification papertrail.** Before a goal completes, the coder verifies the work
-   the way the repository's prose defines verification (its AGENTS.md or equivalent),
+7. **Integrate.** Pin the authorized target tip before reconciliation and hold that
+   exact tip until the reviewed candidate lands. Unrelated target movement is a hold
+   violation to report, not a request to rebuild or reconcile again. The coder follows
+   the committing-and-pushing skill; the review that clears the work covers the
+   post-reconciliation result.
+8. **Verification papertrail.** The coder writes the change first, runs its focused
+   tests next, and then broadens verification only in proportion to its risk. Never
+   require a full-suite baseline before implementation. Before a goal completes, the
+   coder verifies the work the way the repository's prose defines verification (its
+   AGENTS.md or equivalent),
    records the results (output, logs, evidence) as a report artifact on the work item
    with `tightbeam artifact-record`, and files
    `tightbeam attest <assignmentId> --kind verdict --verdict verified` with a note
