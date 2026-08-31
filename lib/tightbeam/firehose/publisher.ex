@@ -11,9 +11,6 @@ defmodule Tightbeam.Firehose.Publisher do
 
   # Preserve only the exact result-shaped payloads already emitted on current main.
   # Any additive drift still refuses at the shared Publisher boundary.
-  @device_public_shape MapSet.new(
-                         ~w(deviceId userId claimedName status isAdmin platform model createdAt rowVersion)
-                       )
   @message_public_shape MapSet.new(
                           ~w(id seq sessionKey role messageType content timestamp sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier rowVersion)
                         )
@@ -39,9 +36,6 @@ defmodule Tightbeam.Firehose.Publisher do
     "work_item.reopened" => [@work_item_public_shape],
     "work_item.closed" => [@work_item_public_shape],
     "work_item.failed" => [@work_item_public_shape],
-    "device.approved" => [@device_public_shape],
-    "device.denied" => [@device_public_shape],
-    "device.revoked" => [@device_public_shape],
     "message.created" => [@message_public_shape, @message_public_shape_without_type],
     "session.updated" => [@session_public_shape],
     "role.created" => [@role_public_shape],

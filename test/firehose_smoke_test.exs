@@ -311,6 +311,16 @@ defmodule Tightbeam.FirehoseSmokeTest do
     assert "prod.fired" in Registry.observational_classes()
     assert Registry.fetch("prod.fired") == :error
 
+    device_notice = notices["device.approved"]
+
+    assert MapSet.new(Map.keys(device_notice["payload"])) ==
+             MapSet.new(
+               ~w(deviceId userId claimedName status platform model createdAt rowVersion)
+             )
+
+    refute Map.has_key?(device_notice["payload"], "isAdmin")
+    assert StateResources.item_shape_complete?("devices", device_notice["payload"])
+
     condition_notice = notices["condition_fact.filed"]
     assert condition_notice["refs"]["factId"] == condition_notice["payload"]["id"]
     refute Map.has_key?(condition_notice["payload"], "factId")

@@ -873,7 +873,10 @@ defmodule Tightbeam.StateResources do
   end
 
   def critical_state(row), do: public(row)
-  def device(row), do: row |> public() |> correlate("deviceId", "id")
+
+  # Admin authority belongs to the owning user and is not part of the R7 device item.
+  def device(row), do: row |> public() |> Map.delete("isAdmin") |> correlate("deviceId", "id")
+
   @doc "Closed config serializer."
   def config(row) do
     reject_public_shape_drift!(row, "config")

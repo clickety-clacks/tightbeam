@@ -364,6 +364,42 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     assert StateResources.complete_item?("devices", device, %{})
   end
 
+  test "device projection omits derived admin state and Publisher refuses it as wire drift" do
+    projection =
+      StateResources.device(%{
+        device_id: "device-canonical",
+        user_id: "flynn",
+        claimed_name: "Canonical device",
+        status: "allowlisted",
+        is_admin: true,
+        token: "tbt_storage_secret",
+        platform: nil,
+        model: nil,
+        created_at: 1,
+        row_version: 2
+      })
+
+    assert MapSet.new(Map.keys(projection)) ==
+             MapSet.new(Map.fetch!(@field_order, "devices"))
+
+    refute Map.has_key?(projection, "isAdmin")
+    refute Map.has_key?(projection, "token")
+
+    notice = %{
+      "class" => "device.approved",
+      "op" => "upsert",
+      "occurredAt" => 1,
+      "refs" => %{"deviceId" => projection["deviceId"]},
+      "payload" => projection
+    }
+
+    assert JSON.decode!(Publisher.encode_wire_notice(notice, %{})) == notice
+
+    assert_raise ArgumentError, ~r/no permitted legacy partial shape/, fn ->
+      Publisher.encode_wire_notice(put_in(notice, ["payload", "isAdmin"], true), %{})
+    end
+  end
+
   test "Publisher rejects known item supersets and secret fields instead of using the raw fallback" do
     canonical =
       "config"
