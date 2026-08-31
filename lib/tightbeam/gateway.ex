@@ -1013,6 +1013,12 @@ defmodule Tightbeam.Gateway do
       "topline-concern-unlink-work" => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-concern-unlink-work", call)
       end,
+      "topline-work-leave-unlinked" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-work-leave-unlinked", call)
+      end,
+      "topline-placement-list" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-placement-list", call)
+      end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
