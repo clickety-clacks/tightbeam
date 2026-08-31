@@ -1926,7 +1926,17 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "reopened same-millisecond revocations bind reads and replay to the exact generation",
        ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "generation identity"))
+    assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "generation identity")
+        |> put_in([:params, :files], [
+          "lib/tightbeam/state_resources.ex",
+          "test/assignments_test.exs"
+        ])
+      )
+
     assignment_id = assignment.id
 
     assert %{outcome: "revoked"} =
@@ -2016,15 +2026,43 @@ defmodule Tightbeam.AssignmentsTest do
     assert %{assignment: %{revocationReason: "second reason"}} =
              WorkState.detail(ctx.db, assignment.id)
 
+    notice =
+      Tightbeam.Firehose.Publisher.state_notice(
+        ctx.db,
+        call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+        current
+      )
+
     assert %{
              "class" => "assignment.closed",
-             "payload" => %{"revocationReason" => "second reason"}
-           } =
-             Tightbeam.Firehose.Publisher.state_notice(
-               ctx.db,
-               call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
-               current
-             )
+             "payload" => %{
+               "files" => [
+                 "lib/tightbeam/state_resources.ex",
+                 "test/assignments_test.exs"
+               ],
+               "derivedStatus" => "abandoned"
+             }
+           } = notice
+
+    assert Map.keys(notice["payload"]) |> Enum.sort() ==
+             ~w(closedAt closedBySession closedByUser closingAttestId derivedStatus effectKind files holderFallback holderHarness holderKey holderProvider holderRole id openedAt openedBySession openedByUser outcome reviewsAssignmentId rowVersion state subject workItemId)
+
+    refute Map.has_key?(notice["payload"], "reopenings")
+    refute Map.has_key?(notice["payload"], "revocationReason")
+    refute Map.has_key?(notice["payload"], "priority")
+
+    catalog = %{
+      {"eezo", "claude"} => [
+        %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    item_bytes =
+      Tightbeam.StateResources.encode_item("assignments", notice["payload"], catalog)
+
+    wire = Tightbeam.Firehose.Publisher.encode_wire_notice(notice, catalog)
+    assert wire =~ ~s("payload":#{item_bytes})
+    assert JSON.decode!(wire) == notice
 
     assert %{id: ^assignment_id, revocationReason: "second reason"} =
              handle(
@@ -2436,13 +2474,17 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{
              "class" => "assignment.closed",
-             "payload" => %{"revocationReason" => "the work moved to its replacement"}
+             "payload" => %{"closedByUser" => "flynn", "outcome" => "revoked"} = payload
            } =
              Tightbeam.Firehose.Publisher.state_notice(
                ctx.db,
                call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
                revoked
              )
+
+    refute Map.has_key?(payload, "reopenings")
+    refute Map.has_key?(payload, "revocationReason")
+    refute Map.has_key?(payload, "priority")
 
     assert {:ok, [["flynn", nil, closed_at, "the work moved to its replacement"]]} =
              DB.query(
