@@ -1030,6 +1030,34 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
     }
 }
 
+/// Durable Topline commands are a closed public surface.  In particular, the
+/// retired Execution Map flags must fail at parsing rather than be silently
+/// dropped before dispatch.
+fn closed_topline_flags(
+    verb: &str,
+    flags: &HashMap<String, String>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut rejected = flags
+        .keys()
+        .filter(|flag| {
+            !matches!(flag.as_str(), "as" | "as-user" | "as-process")
+                && !allowed.contains(&flag.as_str())
+        })
+        .map(|flag| format!("--{flag}"))
+        .collect::<Vec<_>>();
+    rejected.sort();
+
+    if rejected.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "usage: tightbeam {verb} does not accept {}",
+            rejected.join(", ")
+        ))
+    }
+}
+
 pub fn parse_after(text: &str) -> Result<String, String> {
     parse_duration("after", text)
 }
@@ -1147,6 +1175,21 @@ fn topline_mutation(
     positional: &[String],
     flags: &HashMap<String, String>,
 ) -> Result<Command, String> {
+    let allowed = match verb {
+        "topline-create" => &["title", "key"][..],
+        "topline-update" => &["title", "reason", "key"][..],
+        "topline-close" | "topline-reopen" => &["reason", "key"][..],
+        "topline-link-work" => &["reason", "key"][..],
+        "topline-unlink-work" => &["reason", "key"][..],
+        "topline-concern-create" => &["title", "key"][..],
+        "topline-concern-update" => &["title", "reason", "key"][..],
+        "topline-concern-resolve" | "topline-concern-reopen" => &["reason", "key"][..],
+        "topline-concern-link-work" => &["reason", "key"][..],
+        "topline-concern-unlink-work" => &["reason", "key"][..],
+        "topline-work-leave-unlinked" => &["reason", "key"][..],
+        _ => return Err(format!("unknown Topline operation: {verb}")),
+    };
+    closed_topline_flags(verb, flags, allowed)?;
     let required = |name| nonempty(flags, name).ok_or_else(|| format!("{verb} requires --{name}"));
     let exact = |count| {
         if positional.len() == count {
@@ -1250,7 +1293,7 @@ fn topline_mutation(
                 key()?,
             ]
         }
-        _ => return Err(format!("unknown Topline operation: {verb}")),
+        _ => unreachable!("closed above"),
     };
 
     Ok(Command::ToplineMutation {
@@ -2153,6 +2196,7 @@ fn parse_with_optional_catalog(
             })
         }
         "toplines" => {
+            closed_topline_flags("toplines", flags, &["state"])?;
             if parsed.positional.len() != 1 {
                 return Err(DURABLE_TOPLINES_USAGE.to_owned());
             }
@@ -2168,6 +2212,7 @@ fn parse_with_optional_catalog(
             })
         }
         "topline" => {
+            closed_topline_flags("topline", flags, &["history"])?;
             if parsed.positional.len() != 2 {
                 return Err(DURABLE_TOPLINE_USAGE.to_owned());
             }
@@ -2191,6 +2236,7 @@ fn parse_with_optional_catalog(
         | "topline-concern-unlink-work"
         | "topline-work-leave-unlinked") => topline_mutation(verb, &parsed.positional, flags),
         "topline-placement-list" => {
+            closed_topline_flags("topline-placement-list", flags, &["state"])?;
             if parsed.positional.len() != 1 {
                 return Err(
                     "usage: tightbeam topline-placement-list [--state pending|resolved|all]"
@@ -4460,5 +4506,34 @@ mod tests {
             command,
             Command::IdentityEdit { content: Some(content), .. } if content == "a\u{fffd}b"
         ));
+    }
+
+    #[test]
+    fn durable_topline_commands_refuse_closed_or_retired_flags_before_dispatch() {
+        for args in [
+            strings(&[
+                "topline-create",
+                "--title",
+                "Ship",
+                "--key",
+                "k",
+                "--bogus",
+                "ignored",
+                "--as-user",
+                "flynn",
+            ]),
+            strings(&["toplines", "--tree", "--as-user", "flynn"]),
+            strings(&[
+                "topline",
+                "tl_probe",
+                "--under",
+                "wi_probe",
+                "--as-user",
+                "flynn",
+            ]),
+            strings(&["topline-placement-list", "--history", "--as-user", "flynn"]),
+        ] {
+            assert!(parse(args).unwrap_err().contains("does not accept"));
+        }
     }
 }
