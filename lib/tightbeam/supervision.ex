@@ -2271,12 +2271,7 @@ defmodule Tightbeam.Supervision do
         )
 
       Enum.each(retired_holders, fn [session_key, owner_user_id] ->
-        Assignments.interrupt_for_retire_in_txn(
-          txn,
-          session_key,
-          owner_user_id,
-          "process:tightbeam"
-        )
+        recover_retired_holder_in_txn(txn, session_key, owner_user_id)
       end)
 
       Txn.q(
@@ -2369,6 +2364,28 @@ defmodule Tightbeam.Supervision do
   end
 
   defp recover_liveness(_state), do: :ok
+
+  # Recovery is not an authorized user or session principal. The revocation
+  # provenance contract admits only a real user or session, so retain the
+  # stranded assignment and report the refusal rather than inventing its
+  # holder's owner as the revoker.
+  defp recover_retired_holder_in_txn(txn, session_key, owner_user_id) do
+    Assignments.interrupt_for_retire_in_txn(
+      txn,
+      session_key,
+      owner_user_id,
+      "process:tightbeam"
+    )
+  rescue
+    error in ArgumentError ->
+      if String.starts_with?(error.message, "retirement interruption requires a representable") do
+        Logger.error(
+          "retired-holder recovery refused for #{session_key}: #{Exception.message(error)}"
+        )
+      else
+        reraise error, __STACKTRACE__
+      end
+  end
 
   defp baseline_progress_in_txn(txn, assignment_id) do
     rows =

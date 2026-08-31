@@ -7811,7 +7811,8 @@ defmodule Tightbeam.Gateway do
     # `resolve_caller/2` handles all three origin classes and yields a nil owner
     # for a process, which cannot match a NOT NULL ownerUserId, so unknown and
     # process callers keep getting `not_found`.
-    owner = resolve_caller(db, call.origin)[:owner_user_id]
+    caller = principal_caller(db, call)
+    owner = caller[:owner_user_id]
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do
@@ -7846,6 +7847,7 @@ defmodule Tightbeam.Gateway do
                       session.session_key,
                       owner,
                       call.origin,
+                      retirement_provenance_principal(call, caller),
                       Map.fetch!(config, :wake_tick_ms),
                       "retired: session retired before execution"
                     )
@@ -7981,6 +7983,7 @@ defmodule Tightbeam.Gateway do
          root_key,
          owner,
          principal,
+         revocation_principal,
          supervision_interval_ms,
          drain_reason
        ) do
@@ -8007,6 +8010,7 @@ defmodule Tightbeam.Gateway do
               member.session_key,
               owner,
               principal,
+              revocation_principal,
               supervision_interval_ms,
               drain_reason
             )
@@ -8069,10 +8073,12 @@ defmodule Tightbeam.Gateway do
          session_key,
          owner,
          principal,
+         revocation_principal,
          supervision_interval_ms,
          drain_reason
        ) do
-    assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
+    assignments =
+      Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, revocation_principal)
 
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason,
       cause: "session-retired",
@@ -8083,6 +8089,20 @@ defmodule Tightbeam.Gateway do
 
     {assignments, session}
   end
+
+  # The router's immutable principal identifies the actual revoker. Origin is
+  # retained for the unrelated ledger and session-retirement records, where an
+  # agent role origin is part of their existing audit vocabulary.
+  defp retirement_provenance_principal(%{principal: {:user, user_id}}, _caller),
+    do: "user:" <> user_id
+
+  defp retirement_provenance_principal(%{principal: {:session, session_key}}, _caller),
+    do: "session:" <> session_key
+
+  defp retirement_provenance_principal(_call, %{caller_session: %{session_key: session_key}}),
+    do: "session:" <> session_key
+
+  defp retirement_provenance_principal(_call, %{owner_user_id: user_id}), do: "user:" <> user_id
 
   # Retire durability owns the ordering: every DB transition commits before
   # this seam touches a harness. Adapters are shared by key, so each retired

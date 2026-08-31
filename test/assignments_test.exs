@@ -1891,6 +1891,34 @@ defmodule Tightbeam.AssignmentsTest do
                "SELECT priorOutcome FROM assignment_reopenings WHERE assignmentId = ?1",
                [assignment.id]
              )
+
+    assert {:ok, [[1, "test revocation"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*), min(reason)
+               FROM assignment_revocations WHERE assignmentId = ?1
+               """,
+               [assignment.id]
+             )
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "second revocation")
+             )
+
+    assert {:ok, [[2, "second revocation", "test revocation"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*), min(reason), max(reason)
+               FROM assignment_revocations WHERE assignmentId = ?1
+               """,
+               [assignment.id]
+             )
   end
 
   test "a failure after the history insert rolls back the whole reopen (Sol xhigh review, finding 7)",
@@ -2353,6 +2381,65 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "revocation provenance cannot be rewritten or deleted", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "immutable provenance"))
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert {:error, %DB.Error{message: update_error}} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_revocations SET reason='rewritten reason' WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert update_error =~ "revocation provenance is immutable"
+
+    assert {:error, %DB.Error{message: delete_error}} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert delete_error =~ "revocation provenance is immutable"
+
+    assert {:ok, [["test revocation"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reason FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  test "process retirement refuses rather than attributing the holder owner", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "recovery provenance"))
+
+    assert {:error, %ArgumentError{message: message}} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "flynn",
+                 "process:tightbeam"
+               )
+             end)
+
+    assert message =~ "requires a representable user or session principal"
+
+    assert {:ok, [["open", 0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT state,
+                 (SELECT count(*) FROM assignment_revocations WHERE assignmentId=assignments.id)
+               FROM assignments WHERE id=?1
+               """,
+               [assignment.id]
+             )
+  end
+
   test "upgrade rebuilds revocation provenance with the Unicode whitespace constraint", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade reason"))
 
@@ -2400,6 +2487,14 @@ defmodule Tightbeam.AssignmentsTest do
                WHERE id='revocation-pre-upgrade'
                """
              )
+
+    assert {:error, %DB.Error{message: immutable_error}} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_revocations SET reason='rewritten' WHERE id='revocation-pre-upgrade'"
+             )
+
+    assert immutable_error =~ "revocation provenance is immutable"
 
     assert {:error, %DB.Error{message: trigger_error}} =
              DB.query(

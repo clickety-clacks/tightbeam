@@ -936,7 +936,7 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
-  test "startup recovery revokes an open assignment whose holder is already retired", ctx do
+  test "startup recovery refuses an unrepresentable process revoker", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 4, due_at: 9_000_000_000_000)
 
     {:ok, _} =
@@ -947,16 +947,16 @@ defmodule Tightbeam.SupervisionTest do
 
     _name = start_liveness!(ctx, sweep_ms: 60_000)
 
-    assert {:ok, [["closed", "revoked"]]} =
+    assert {:ok, [["open", nil]]} =
              DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id='asg_1'")
 
-    assert {:ok, [["interrupted-by-retire"]]} =
+    assert {:ok, []} =
              DB.query(
                ctx.db,
                "SELECT reason FROM assignment_interruptions WHERE assignmentId='asg_1'"
              )
 
-    assert {:ok, []} =
+    assert {:ok, [["asg_1"]]} =
              DB.query(
                ctx.db,
                "SELECT assignmentId FROM supervision_entitlements WHERE assignmentId='asg_1'"

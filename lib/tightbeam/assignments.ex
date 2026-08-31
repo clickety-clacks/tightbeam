@@ -219,6 +219,18 @@ defmodule Tightbeam.Assignments do
   BEGIN
     SELECT RAISE(ABORT, 'revoked assignment requires revocation provenance');
   END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocations_immutable_update
+  BEFORE UPDATE ON assignment_revocations
+  BEGIN
+    SELECT RAISE(ABORT, 'revocation provenance is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocations_immutable_delete
+  BEFORE DELETE ON assignment_revocations
+  BEGIN
+    SELECT RAISE(ABORT, 'revocation provenance is immutable');
+  END;
   """
 
   # The `reopen-assignment` papertrail. The assignments CHECK forces an OPEN row
@@ -445,8 +457,8 @@ defmodule Tightbeam.Assignments do
   # Retirement receives the caller's durable origin string from Gateway. A
   # session origin is its actual sessions primary key (often `agent:...`), so
   # preserve it instead of replacing it with the holder's owner. Process-owned
-  # recovery has no representable user-or-session actor in this schema and
-  # retains the established owner fallback.
+  # recovery has no representable user-or-session actor in this schema, so it
+  # refuses before recording a false user principal.
   defp retirement_provenance_actor(_txn, "user:" <> user_id, _owner_user_id),
     do: {user_id, nil}
 
@@ -456,10 +468,14 @@ defmodule Tightbeam.Assignments do
   defp retirement_provenance_actor(txn, principal, owner_user_id),
     do: retirement_session_or_owner(txn, principal, owner_user_id)
 
-  defp retirement_session_or_owner(txn, session_key, owner_user_id) do
+  defp retirement_session_or_owner(txn, session_key, _owner_user_id) do
     case Txn.q(txn, "SELECT sessionKey FROM sessions WHERE sessionKey=?1", [session_key]) do
-      [[^session_key]] -> {nil, session_key}
-      [] -> {owner_user_id, nil}
+      [[^session_key]] ->
+        {nil, session_key}
+
+      [] ->
+        raise ArgumentError,
+              "retirement interruption requires a representable user or session principal; got #{inspect(session_key)}"
     end
   end
 
