@@ -767,7 +767,7 @@ fn opens_entry(line: &str, command: &str) -> bool {
 
 const BOOLEAN_FLAGS: &[&str] = &[
     "abort", "admin", "all", "api-key", "dry-run", "help", "json", "manifest", "resolve", "rm",
-    "tree",
+    "tree", "history",
 ];
 
 #[derive(Debug)]
