@@ -1726,9 +1726,27 @@ defmodule Tightbeam.CliIntegrationTest do
     provision_i68_adapter_stubs!(rollback_base)
     old_cli = Path.join(previous, "tightbeam/bin/tightbeam")
     old_gateway = Path.join(previous, "tightbeam/bin/tightbeam-gateway")
+    bootstrap_port = unused_port!()
+    bootstrap_node = "lane2_i68_bootstrap_#{bootstrap_port}"
+
+    bootstrap_gateway_port =
+      start_previous_gateway!(old_gateway, rollback_base, bootstrap_port, bootstrap_node)
+
+    assert %{"version" => "0.1.8"} =
+             get_json!("http://127.0.0.1:#{bootstrap_port}/version")
+
+    stop_previous_gateway(
+      old_gateway,
+      rollback_base,
+      bootstrap_port,
+      bootstrap_node,
+      bootstrap_gateway_port
+    )
+
+    seed_i68_authenticated_legacy_session!(rollback_base)
+
     old_port = unused_port!()
     old_node = "lane2_i68_#{old_port}"
-
     old_gateway_port = start_previous_gateway!(old_gateway, rollback_base, old_port, old_node)
 
     on_exit(fn ->
@@ -1739,18 +1757,41 @@ defmodule Tightbeam.CliIntegrationTest do
 
     old_env = [
       {"TIGHTBEAM_URL", "http://127.0.0.1:#{old_port}"},
-      {"TIGHTBEAM_TOKEN", "i68-untrusted-token"}
+      {"TIGHTBEAM_TOKEN", "i68-valid-token"}
     ]
 
-    {old, old_status} =
-      System.cmd(old_cli, ["toplines", "--tree"],
+    {created, 0} =
+      System.cmd(
+        old_cli,
+        [
+          "work-item-create",
+          "--title",
+          "I68 legacy telemetry",
+          "--key",
+          "i68-legacy",
+          "--as",
+          "i68-holder"
+        ],
         cd: ctx.outside,
         env: old_env,
         stderr_to_stdout: true
       )
 
-    assert old_status != 0
-    refute old =~ "unknown command"
+    old_work_item_id = JSON.decode!(created)["id"]
+
+    {old, 0} =
+      System.cmd(old_cli, ["toplines", "--as", "i68-holder"],
+        cd: ctx.outside,
+        env: old_env,
+        stderr_to_stdout: true
+      )
+
+    assert %{"items" => old_items} = JSON.decode!(old)
+
+    assert Enum.any?(
+             old_items,
+             &(&1["id"] == old_work_item_id and &1["title"] == "I68 legacy telemetry")
+           )
 
     stop_previous_gateway(old_gateway, rollback_base, old_port, old_node, old_gateway_port)
 
@@ -1762,16 +1803,10 @@ defmodule Tightbeam.CliIntegrationTest do
 
     :ok = Tightbeam.Schema.ensure_all(candidate_db)
 
-    {:ok, _} =
-      DB.query(
-        candidate_db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('i68-flynn', 1, 1)"
-      )
-
     candidate_session =
       Org.create(candidate_db, %{
-        session_key: "i68-holder",
-        display_name: "I68 Holder",
+        session_key: "candidate-holder",
+        display_name: "Candidate Holder",
         owner_user_id: "i68-flynn",
         origin: "user:i68-flynn",
         archetype: "default",
@@ -1781,7 +1816,7 @@ defmodule Tightbeam.CliIntegrationTest do
         model: Model.new("fable")
       })
 
-    Roles.create!(candidate_db, "i68-holder", "i68-flynn", candidate_session.session_key)
+    Roles.create!(candidate_db, "candidate-holder", "i68-flynn", candidate_session.session_key)
 
     candidate_handlers =
       Gateway.handlers(%{db: candidate_db, base_dir: rollback_base, cwd: rollback_base})
@@ -1883,6 +1918,62 @@ defmodule Tightbeam.CliIntegrationTest do
       File.write!(path, "#!/bin/sh\nexit 0\n")
       File.chmod!(path, 0o755)
     end
+  end
+
+  defp seed_i68_authenticated_legacy_session!(base_dir) do
+    db = :"cli_i68_legacy_seed_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: Path.join(base_dir, "state.db"), name: db}, id: db)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('i68-flynn', 1, 1)"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO devices (deviceId, userId, claimedName, status, token, createdAt)
+               VALUES ('i68-device', 'i68-flynn', 'I68 device', 'allowlisted',
+                       'i68-device-token', 1)
+               """
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO sessions
+                 (sessionKey, displayName, ownerUserId, origin, archetype, cliToken,
+                  harness, provider, model, createdAt, updatedAt)
+               VALUES ('i68-holder', 'I68 Holder', 'i68-flynn', 'user:i68-flynn', 'default',
+                       'i68-valid-token', 'claude', 'anthropic', 'fable', 1, 1)
+               """
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO sessions
+                 (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin, archetype,
+                  harness, provider, model, createdAt, updatedAt)
+               VALUES ('agent:main:clawline:i68-flynn:main', 'Main', 'main', 1, 'i68-flynn',
+                       'user:i68-flynn', 'default', 'claude', 'anthropic', 'fable', 1, 1)
+               """
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO roles (name, boundSessionKey, ownerUserId, createdAt, updatedAt)
+               VALUES ('i68-holder', 'i68-holder', 'i68-flynn', 1, 1)
+               """
+             )
+
+    :ok = Supervisor.stop(db)
   end
 
   defp unused_port! do
