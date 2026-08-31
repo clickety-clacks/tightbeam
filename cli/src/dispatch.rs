@@ -989,7 +989,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = limit {
                 params.push(format!("\"limit\":{value}"));
             }
-            Ok(request(identity, "toplines", vec![], params))
+            Ok(request(identity, "execution-map", vec![], params))
         }
         // Every selector travels as an ordinary body PARAM: both verbs are declared
         // non-target at the router, and --session is a COHORT FILTER over creator
@@ -1008,7 +1008,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         } => {
             let mut params = filter_params(filters);
             params.push(string_field("under", work_item_id));
-            Ok(request(identity, "topline", vec![], params))
+            Ok(request(identity, "execution-map-select", vec![], params))
         }
         Command::Topline {
             identity,
@@ -1021,7 +1021,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
 
             Ok(request(
                 identity,
-                "topline",
+                "execution-map-select",
                 vec![],
                 vec![format!(
                     "\"assignments\":{}",
@@ -3031,7 +3031,7 @@ mod tests {
         );
         assert_eq!(
             body(&[
-                "toplines",
+                "execution-map",
                 "--after",
                 "wi_1",
                 "--limit",
@@ -3039,16 +3039,23 @@ mod tests {
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"toplines","params":{"after":"wi_1","limit":25}}"#
+            r#"{"asUser":"flynn","verb":"execution-map","params":{"after":"wi_1","limit":25}}"#
         );
         // A forest has no lawful page boundary, and the CLI says so before the
         // round trip rather than after it.
         assert_eq!(
             args::parse(
-                ["toplines", "--tree", "--limit", "5", "--as-user", "flynn"]
-                    .iter()
-                    .map(|v| (*v).to_owned())
-                    .collect()
+                [
+                    "execution-map",
+                    "--tree",
+                    "--limit",
+                    "5",
+                    "--as-user",
+                    "flynn"
+                ]
+                .iter()
+                .map(|v| (*v).to_owned())
+                .collect()
             )
             .unwrap_err(),
             "--after/--limit page the flat roster; --tree returns a forest"
@@ -3058,7 +3065,7 @@ mod tests {
             &["attests", "as_1", "--limit", "-1"][..],
             &["attests", "as_1", "--limit", "abc"][..],
             &["attests", "as_1", "--after", ""][..],
-            &["toplines", "--after", ""][..],
+            &["execution-map", "--after", ""][..],
         ] {
             let mut argv = bad.to_vec();
             argv.extend_from_slice(&["--as-user", "flynn"]);
