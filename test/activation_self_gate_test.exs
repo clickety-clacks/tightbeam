@@ -68,56 +68,70 @@ defmodule Tightbeam.ActivationSelfGateTest do
 
   test "the implementation's emitted activation vocabulary is the canonical manifest" do
     root = Path.expand("..", __DIR__)
-    source = File.read!(Path.join(root, "lib/tightbeam/activations.ex"))
+    activation_source = File.read!(Path.join(root, "lib/tightbeam/activations.ex"))
+    router_source = File.read!(Path.join(root, "lib/tightbeam/wire/router.ex"))
 
-    for name <-
-          @manifest.tables ++
-            @manifest.columns ++
-            @manifest.event_kinds ++
-            @manifest.payload_names ++
-            @manifest.derived_states ++
-            @manifest.error_codes do
-      assert source =~ name, "activation implementation does not emit manifest name #{name}"
-    end
-
-    attributes = Tightbeam.Wire.Router.__info__(:attributes)
-    router_verbs = Keyword.fetch!(attributes, :agent_verbs)
-
-    for verb <- @manifest.verbs do
-      assert verb in router_verbs
-    end
-
-    gateway = File.read!(Path.join(root, "lib/tightbeam/gateway.ex"))
-    router = File.read!(Path.join(root, "lib/tightbeam/wire/router.ex"))
-    assert gateway <> router =~ hd(@manifest.capabilities)
-    assert router =~ hd(@manifest.wire_fields)
-    assert machine_vocabulary_gate(@manifest) == :ok
+    assert implementation_gate(activation_source, router_source) == :ok
   end
 
-  test "A-34 named vocabulary, sibling-table, policy, and fixture-byte mutants fail" do
+  test "A-34 production-source vocabulary, sibling-table, policy, and fixture-byte mutants fail" do
+    root = Path.expand("..", __DIR__)
+    activation_source = File.read!(Path.join(root, "lib/tightbeam/activations.ex"))
+    router_source = File.read!(Path.join(root, "lib/tightbeam/wire/router.ex"))
+
     assert {:error, {:forbidden_token, "production"}} =
-             @manifest
-             |> put_in([:payload_names], @manifest.payload_names ++ ["productionTarget"])
-             |> machine_vocabulary_gate()
+             activation_source
+             |> String.replace(
+               "\"target\" => target,",
+               "\"target\" => target,\n        \"productionTarget\" => target,",
+               global: false
+             )
+             |> implementation_gate(router_source)
 
     assert {:error, {:forbidden_token, "campaign"}} =
-             @manifest
-             |> put_in([:event_kinds], @manifest.event_kinds ++ ["campaign-launched"])
-             |> machine_vocabulary_gate()
+             activation_source
+             |> String.replace(
+               ~S|defp kind_for_verb("activation-authority"), do: "authority-attached"|,
+               ~S|defp kind_for_verb("activation-authority"), do: "campaign-launched"|,
+               global: false
+             )
+             |> implementation_gate(router_source)
 
     assert {:error, {:forbidden_token, "bioscience"}} =
-             @manifest
-             |> put_in([:verbs], @manifest.verbs ++ ["bioscience-experiment"])
-             |> machine_vocabulary_gate()
+             implementation_gate(
+               activation_source,
+               String.replace(
+                 router_source,
+                 "activation-status activations spawn",
+                 "activation-status activations bioscience-experiment spawn",
+                 global: false
+               )
+             )
 
     assert {:error, :sibling_activation_table} =
-             sibling_gate(@manifest.tables ++ ["production_deploy_facts"])
+             activation_source
+             |> String.replace(
+               "  CREATE INDEX IF NOT EXISTS activation_events_stream",
+               "  CREATE TABLE production_deploy_facts (id TEXT);\n  CREATE INDEX IF NOT EXISTS activation_events_stream",
+               global: false
+             )
+             |> implementation_gate(router_source)
 
     assert {:error, :policy_interpretation} =
-             policy_gate(@manifest.derived_states, ["example:approved"])
+             activation_source
+             |> Kernel.<>(
+               "\n# source mutant\ndefp domain_policy(decision), do: decision[\"code\"] == \"approved\"\n"
+             )
+             |> implementation_gate(router_source)
 
     assert {:error, :closed_state_changed} =
-             policy_gate(@manifest.derived_states ++ ["authorized"], [])
+             activation_source
+             |> String.replace(
+               "      true ->\n        \"declared\"",
+               "      true ->\n        \"authorized\"",
+               global: false
+             )
+             |> implementation_gate(router_source)
 
     Enum.each(@pins, fn {name, expected_sha} ->
       bytes = File.read!(Path.join(@fixture_dir, name))
@@ -167,6 +181,153 @@ defmodule Tightbeam.ActivationSelfGateTest do
         biosciences: :pending_implementation
       }
     })
+  end
+
+  defp implementation_gate(activation_source, router_source) do
+    manifest = implementation_manifest(activation_source, router_source)
+
+    with :ok <- sibling_gate(manifest.tables),
+         :ok <- source_policy_gate(activation_source, manifest.derived_states),
+         :ok <- machine_vocabulary_gate(manifest),
+         true <-
+           normalized_manifest(manifest) == normalized_manifest(@manifest) or
+             {:error, :machine_manifest_changed} do
+      :ok
+    end
+  end
+
+  defp implementation_manifest(activation_source, router_source) do
+    table_body =
+      activation_source
+      |> then(
+        &Regex.run(~r/CREATE TABLE IF NOT EXISTS activation_events \((.*?)\n  \);/s, &1,
+          capture: :all_but_first
+        )
+      )
+      |> List.first()
+
+    columns =
+      Regex.scan(~r/^\s+([A-Za-z][A-Za-z0-9]*)\s+(?:INTEGER|TEXT)\b/m, table_body,
+        capture: :all_but_first
+      )
+      |> List.flatten()
+
+    payload_keys =
+      Regex.scan(~r/payload = %\{(.*?)\}/s, activation_source, capture: :all_but_first)
+      |> List.flatten()
+      |> Enum.flat_map(fn body ->
+        Regex.scan(~r/"([A-Za-z][A-Za-z0-9]*)"\s*=>/, body, capture: :all_but_first)
+        |> List.flatten()
+      end)
+
+    nested_payload_keys =
+      [
+        function_body(activation_source, "domain_identity"),
+        function_body(activation_source, "domain_code"),
+        function_body(activation_source, "resource_ref"),
+        function_group_body(activation_source, "prior", "nullable_ms")
+      ]
+      |> Enum.flat_map(&map_keys/1)
+
+    relations = sigil_words_attribute(activation_source, "relations")
+
+    certainties =
+      Regex.scan(~r/p\.certainty in ~w\(([^)]*)\)/, activation_source, capture: :all_but_first)
+      |> List.flatten()
+      |> Enum.flat_map(&String.split/1)
+
+    event_kinds =
+      Regex.scan(
+        ~r/defp kind_for_verb\("[^"]+"\), do: "([^"]+)"/,
+        activation_source,
+        capture: :all_but_first
+      )
+      |> List.flatten()
+
+    derived_states =
+      activation_source
+      |> function_body("derive_state")
+      |> then(fn body ->
+        Regex.scan(~r/(?:->|do:|else:)\s*"([^"]+)"/, body, capture: :all_but_first)
+      end)
+      |> List.flatten()
+
+    router_activation_span =
+      router_source
+      |> then(
+        &Regex.run(~r/@agent_verbs ~w\([^)]* artifacts (.*?) spawn /s, &1,
+          capture: :all_but_first
+        )
+      )
+      |> List.first()
+
+    capabilities =
+      router_source
+      |> then(&Regex.run(~r/"features"\s*=>\s*\[([^]]*)\]/, &1, capture: :all_but_first))
+      |> List.first()
+      |> then(&Regex.scan(~r/"([^"]+)"/, &1, capture: :all_but_first))
+      |> List.flatten()
+
+    %{
+      tables:
+        Regex.scan(
+          ~r/CREATE TABLE(?: IF NOT EXISTS)?\s+([A-Za-z][A-Za-z0-9_]*)/,
+          activation_source,
+          capture: :all_but_first
+        )
+        |> List.flatten(),
+      columns: columns,
+      event_kinds: event_kinds,
+      payload_names:
+        (payload_keys ++ nested_payload_keys ++ relations ++ certainties)
+        |> Enum.reject(&(&1 in columns))
+        |> Enum.uniq(),
+      wire_fields: if(capabilities == [], do: [], else: ["features"]),
+      derived_states: Enum.uniq(derived_states),
+      capabilities: capabilities,
+      verbs: String.split(router_activation_span),
+      error_codes: sigil_words_attribute(activation_source, "error_codes")
+    }
+  end
+
+  defp function_body(source, name) do
+    source
+    |> then(&Regex.run(~r/  defp #{name}\b(.*?)(?=\n  defp )/s, &1, capture: :all_but_first))
+    |> List.first()
+  end
+
+  defp function_group_body(source, name, next_name) do
+    source
+    |> then(
+      &Regex.run(~r/  defp #{name}\b(.*?)(?=\n  defp #{next_name}\b)/s, &1,
+        capture: :all_but_first
+      )
+    )
+    |> List.first()
+  end
+
+  defp map_keys(source) do
+    Regex.scan(~r/"([A-Za-z][A-Za-z0-9]*)"\s*=>/, source, capture: :all_but_first)
+    |> List.flatten()
+  end
+
+  defp sigil_words_attribute(source, name) do
+    source
+    |> then(&Regex.run(~r/@#{name} ~w\(([^)]*)\)/, &1, capture: :all_but_first))
+    |> List.first()
+    |> String.split()
+  end
+
+  defp normalized_manifest(manifest) do
+    Map.new(manifest, fn {category, names} -> {category, Enum.sort(names)} end)
+  end
+
+  defp source_policy_gate(source, states) do
+    interpreted_code? =
+      Regex.match?(~r/\["code"\]\s*(?:==|!=|in\b)/, source) or
+        Regex.match?(~r/%\{"code"\s*=>\s*"[^"]+"\}/, source)
+
+    policy_gate(states, if(interpreted_code?, do: ["interpreted"], else: []))
   end
 
   defp fixture_gate(bytes, expected_sha) do
@@ -334,7 +495,7 @@ defmodule Tightbeam.ActivationSelfGateTest do
 
   defp policy_gate(states, interpreted_domain_codes) do
     cond do
-      states != @manifest.derived_states -> {:error, :closed_state_changed}
+      Enum.sort(states) != Enum.sort(@manifest.derived_states) -> {:error, :closed_state_changed}
       interpreted_domain_codes != [] -> {:error, :policy_interpretation}
       true -> :ok
     end

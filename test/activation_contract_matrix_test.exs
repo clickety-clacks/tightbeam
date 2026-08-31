@@ -109,8 +109,20 @@ defmodule Tightbeam.ActivationContractMatrixTest do
         {:ok, _} =
           DB.query(
             db,
-            "UPDATE assignments SET state='closed',outcome='revoked',closedAt=8,closedByUser='work_owner' WHERE id='asg_matrix'"
+            "INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES ('att_a07_completed','asg_matrix','completion','holder',8)"
           )
+
+        {:ok, _} =
+          DB.query(
+            db,
+            "UPDATE assignments SET state='closed',outcome='completed',closedAt=8,closedBySession='holder',closingAttestId='att_a07_completed' WHERE id='asg_matrix'"
+          )
+
+        assert {:ok, [["closed", "completed", 8, nil, "holder", "att_a07_completed"]]} =
+                 DB.query(
+                   db,
+                   "SELECT state,outcome,closedAt,closedByUser,closedBySession,closingAttestId FROM assignments WHERE id='asg_matrix'"
+                 )
 
         result =
           apply(db, "activation-declare", {:session, "holder"}, declare("closed-assignment"))
@@ -118,8 +130,11 @@ defmodule Tightbeam.ActivationContractMatrixTest do
         {:ok, _} =
           DB.query(
             db,
-            "UPDATE assignments SET state='open',outcome=NULL,closedAt=NULL,closedByUser=NULL WHERE id='asg_matrix'"
+            "UPDATE assignments SET state='open',outcome=NULL,closedAt=NULL,closedByUser=NULL,closedBySession=NULL,closingAttestId=NULL WHERE id='asg_matrix'"
           )
+
+        {:ok, _} =
+          DB.query(db, "DELETE FROM attests WHERE id='att_a07_completed'")
 
         result
       end,

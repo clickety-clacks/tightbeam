@@ -1,10 +1,12 @@
 defmodule Tightbeam.ActivationsTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Activations, DB, Dispatch, Gateway, Model, Org, Rules}
+  alias Tightbeam.{Activations, ColdStart, DB, Dispatch, Gateway, Model, Org, Rules}
+  alias Tightbeam.ClientE2E.LegGateway
 
   @sha String.duplicate("a", 64)
   @sha2 String.duplicate("b", 64)
+  @legacy_base "6e852693a4ba9f6bedbc9a77ed24675abdbd4fea"
 
   setup do
     db = :activations_db
@@ -697,14 +699,16 @@ defmodule Tightbeam.ActivationsTest do
     assert length(indexes) == 12
   end
 
-  test "an older reader opens a database containing activation rows without adopting them" do
+  @tag timeout: 240_000
+  test "the exact older gateway opens activation rows and current CLI refuses before dispatch" do
     root =
       Path.join(
         System.tmp_dir!(),
-        "activation-downgrade-#{System.unique_integer([:positive])}"
+        "activation-downgrade-client-e2e-#{System.unique_integer([:positive])}"
       )
 
     File.mkdir_p!(root)
+    Tightbeam.CursorSigning.provision!(root)
     path = Path.join(root, "state.db")
     writer = :activation_downgrade_writer
     reader = :activation_downgrade_reader
@@ -713,13 +717,14 @@ defmodule Tightbeam.ActivationsTest do
     {:ok, writer_pid} = DB.start_link(path: path, name: writer)
     :ok = Tightbeam.Schema.ensure_all(writer)
 
-    {:ok, _} =
-      DB.query(
-        writer,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('legacy',0,'admin_add',1)"
-      )
+    assert {:ok, %{phase: "reserved"}} =
+             ColdStart.add_first_user(writer, "legacy", %{
+               host: "testhost",
+               harness: :claude,
+               provider: :anthropic,
+               model: Model.new("fable")
+             })
 
-    personal(writer, "legacy")
     session(writer, "legacy-holder", "legacy")
 
     {:ok, _} =
@@ -746,6 +751,63 @@ defmodule Tightbeam.ActivationsTest do
       })
 
     GenServer.stop(writer_pid)
+    legacy_checkout = exact_legacy_checkout!()
+    port = free_port()
+
+    gateway =
+      case LegGateway.boot(root, port,
+             repo_root: legacy_checkout,
+             boot_timeout_ms: 180_000,
+             env: [
+               {"PATH", System.fetch_env!("PATH")},
+               {"ELIXIR_ERL_OPTIONS", "+fnu"},
+               {"MIX_BUILD_PATH", Path.join(Path.expand("..", __DIR__), "_build/legacy-base")}
+             ]
+           ) do
+        {:ok, gateway} ->
+          gateway
+
+        {:error, reason, gateway} ->
+          log = if File.exists?(gateway.log_path), do: File.read!(gateway.log_path), else: ""
+          LegGateway.teardown(gateway, remove: false)
+          flunk("exact legacy gateway failed to boot: #{inspect(reason)}\n#{log}")
+      end
+
+    on_exit(fn -> assert :ok = LegGateway.teardown(gateway, remove: false) end)
+
+    assert %{"protocolVersion" => 1} = version = gateway_version!(port)
+    refute Map.has_key?(version, "features")
+
+    cli = Path.expand("../cli/target/release/tightbeam", __DIR__)
+    assert File.exists?(cli), "build cli/target/release/tightbeam before running this gate"
+
+    cli_env = [{"TIGHTBEAM_BASE_DIR", root}]
+
+    assert {legacy_journey, 0} =
+             System.cmd(cli, ["work-item-get", "wi_legacy", "--as-user", "legacy"],
+               cd: root,
+               env: cli_env,
+               stderr_to_stdout: true
+             )
+
+    assert legacy_journey =~ "wi_legacy"
+    assert legacy_journey =~ "legacy-readable"
+
+    assert {"capability_missing: activation-events-v1\n", 1} =
+             System.cmd(
+               cli,
+               [
+                 "activation-status",
+                 "--activation",
+                 current.event.activation_id,
+                 "--as-user",
+                 "legacy"
+               ],
+               cd: root,
+               env: cli_env,
+               stderr_to_stdout: true
+             )
+
     {:ok, reader_pid} = DB.start_link(path: path, name: reader)
     on_exit(fn -> if Process.alive?(reader_pid), do: GenServer.stop(reader_pid) end)
 
@@ -755,8 +817,8 @@ defmodule Tightbeam.ActivationsTest do
     assert {:ok, [[current.event.activation_id]]} ==
              DB.query(reader, "SELECT activationId FROM activation_events")
 
-    legacy_version = %{"protocolVersion" => 1}
-    refute Map.has_key?(legacy_version, "features")
+    assert {:ok, [[0]]} =
+             DB.query(reader, "SELECT COUNT(*) FROM events WHERE verb='activation-status'")
   end
 
   test "dispatch and work trace expose activation metadata without protected payload objects", %{
@@ -892,6 +954,52 @@ defmodule Tightbeam.ActivationsTest do
   defp resource(id, sha), do: %{"namespace" => "example", "id" => id, "sha256" => sha}
   defp origin({:session, session}), do: "agent:" <> session
   defp origin({:user, user}), do: "user:" <> user
+
+  defp exact_legacy_checkout! do
+    repo = Path.expand("..", __DIR__)
+    checkout = Path.join(repo, "_build/legacy-checkout-#{@legacy_base}")
+
+    unless File.dir?(Path.join(checkout, ".git")) do
+      assert {_output, 0} =
+               System.cmd("git", ["clone", "--shared", "--no-checkout", repo, checkout],
+                 stderr_to_stdout: true
+               )
+
+      assert {_output, 0} =
+               System.cmd("git", ["checkout", "--detach", @legacy_base],
+                 cd: checkout,
+                 stderr_to_stdout: true
+               )
+
+      File.ln_s!(Path.join(repo, "deps"), Path.join(checkout, "deps"))
+      File.ln_s!(Path.join(repo, "cli/target"), Path.join(checkout, "cli/target"))
+    end
+
+    assert {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: checkout)
+    assert String.trim(commit) == @legacy_base
+    checkout
+  end
+
+  defp free_port do
+    {:ok, socket} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
+    {:ok, {_address, port}} = :inet.sockname(socket)
+    :ok = :gen_tcp.close(socket)
+    port
+  end
+
+  defp gateway_version!(port) do
+    {:ok, _} = Application.ensure_all_started(:inets)
+
+    {:ok, {{_http, 200, _reason}, _headers, body}} =
+      :httpc.request(
+        :get,
+        {~c"http://127.0.0.1:#{port}/version", []},
+        [],
+        body_format: :binary
+      )
+
+    JSON.decode!(body)
+  end
 
   defp personal(db, owner), do: session(db, Org.personal_session_key(owner), owner)
 
