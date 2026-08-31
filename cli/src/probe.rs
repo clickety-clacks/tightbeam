@@ -275,6 +275,13 @@ struct BaseDir {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialHealth {
+    kind: &'static str,
+    status: &'static str,
+    corrupt_fields: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Candidate {
     pid: u32,
     ppid: Option<u32>,
@@ -323,6 +330,7 @@ struct Report {
     collection_ms: u64,
     host: Host,
     base_dir: BaseDir,
+    credential_health: BTreeMap<String, CredentialHealth>,
     marked_candidates: Vec<Candidate>,
     identity_candidates: BTreeMap<String, Vec<u32>>,
     adapter_candidates: Vec<AdapterCandidate>,
@@ -764,21 +772,23 @@ fn note_identity_failure(notes: &mut Vec<String>, pid: u32) {
     notes.push(format!("sysctl identity failed for pid {pid}"));
 }
 
+fn darwin_enumeration_error(failure: CommandFailure) -> &'static str {
+    match failure {
+        CommandFailure::Timeout => "probe: ps enumeration timed out",
+        CommandFailure::Failed => "probe: ps enumeration failed",
+    }
+}
+
 fn collect_darwin(
     io: &impl ProbeIo,
     own_pid: u32,
     catalog: Option<&crate::harnesses::HarnessCatalog>,
-) -> Result<RawFacts, String> {
-    let pass1 = io
-        .command(
-            "ps",
-            &["-axEww".into(), "-o".into(), "pid=,command=".into()],
-            Duration::from_millis(1500),
-        )
-        .map_err(|failure| match failure {
-            CommandFailure::Timeout => "probe: ps enumeration timed out".to_owned(),
-            CommandFailure::Failed => "probe: ps enumeration failed".to_owned(),
-        })?;
+) -> Result<RawFacts, CommandFailure> {
+    let pass1 = io.command(
+        "ps",
+        &["-axEww".into(), "-o".into(), "pid=,command=".into()],
+        Duration::from_millis(1500),
+    )?;
     let pids_scanned = pass1
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.iter().all(|byte| byte.is_ascii_whitespace()))
@@ -970,6 +980,90 @@ fn inspect_base_dir(io: &impl ProbeIo, path: &Path, notes: &mut Vec<String>) -> 
     }
 }
 
+fn inspect_credential_health(base_dir: &Path) -> BTreeMap<String, CredentialHealth> {
+    BTreeMap::from([("anthropic".to_owned(), inspect_anthropic_oauth(base_dir))])
+}
+
+fn inspect_anthropic_oauth(base_dir: &Path) -> CredentialHealth {
+    let metadata_path = base_dir
+        .join("auth")
+        .join("claude")
+        .join(".tightbeam")
+        .join("credential.json");
+    let metadata = match fs::read(&metadata_path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(metadata)) => metadata,
+            _ => return credential_health("unverifiable", Vec::new()),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return credential_health("not_banked", Vec::new());
+        }
+        Err(_) => return credential_health("unverifiable", Vec::new()),
+    };
+
+    if metadata.get("onboarded") != Some(&Value::Bool(true)) {
+        return credential_health("not_banked", Vec::new());
+    }
+    // The recorded kind is authoritative. Metadata predating the kind field is a
+    // subscription by construction, matching Credentials.kind_at/2; an API key is a bare
+    // secret in this same file and must never be parsed as OAuth by shape.
+    if metadata.get("kind").and_then(Value::as_str) == Some("api_key") {
+        return credential_health("not_oauth", Vec::new());
+    }
+
+    let credential_path = base_dir
+        .join("auth")
+        .join("claude")
+        .join(".credentials.json");
+    let credential = match fs::read(&credential_path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(Value::Object(credential)) => credential,
+            _ => return credential_health("unverifiable", Vec::new()),
+        },
+        Err(_) => return credential_health("unverifiable", Vec::new()),
+    };
+    let Some(Value::Object(oauth)) = credential.get("claudeAiOauth") else {
+        return credential_health("unverifiable", Vec::new());
+    };
+
+    // Mechanical projection of the authoritative Elixir refuse_hollow! rule. Only field
+    // names survive this function; token bytes never enter the report or an error string.
+    let mut fields = Vec::new();
+    if blank_oauth_token(oauth.get("accessToken")) {
+        fields.push("claudeAiOauth.accessToken");
+    }
+    if oauth.contains_key("refreshToken") && blank_oauth_token(oauth.get("refreshToken")) {
+        fields.push("claudeAiOauth.refreshToken");
+    }
+    if oauth
+        .get("expiresAt")
+        .and_then(Value::as_i64)
+        .is_some_and(|expires_at| expires_at <= 0)
+    {
+        fields.push("claudeAiOauth.expiresAt");
+    }
+
+    if fields.is_empty() {
+        credential_health("healthy", fields)
+    } else {
+        credential_health("corrupt", fields)
+    }
+}
+
+fn blank_oauth_token(value: Option<&Value>) -> bool {
+    value
+        .and_then(Value::as_str)
+        .is_none_or(|token| token.trim().is_empty())
+}
+
+fn credential_health(status: &'static str, corrupt_fields: Vec<&'static str>) -> CredentialHealth {
+    CredentialHealth {
+        kind: "oauth",
+        status,
+        corrupt_fields,
+    }
+}
+
 fn platform_limits(platform: &str) -> Vec<&'static str> {
     if platform == "linux" {
         vec![
@@ -1065,6 +1159,7 @@ fn assemble(
             probe_version: env!("CARGO_PKG_VERSION"),
         },
         base_dir,
+        credential_health: BTreeMap::new(),
         marked_candidates,
         identity_candidates,
         adapter_candidates,
@@ -1105,6 +1200,20 @@ fn human(report: &Report) -> String {
             Some(action) => format!("cold start: {state} — {action}"),
             None => format!("cold start: {state}"),
         });
+    }
+    for (provider, health) in &report.credential_health {
+        if health.status == "corrupt" {
+            lines.push(format!(
+                "credential {provider} {}: CORRUPT ({})",
+                health.kind,
+                health.corrupt_fields.join(", ")
+            ));
+        } else {
+            lines.push(format!(
+                "credential {provider} {}: {}",
+                health.kind, health.status
+            ));
+        }
     }
     if report.marked_candidates.is_empty() {
         lines.push("no marked candidates".to_owned());
@@ -1236,6 +1345,33 @@ fn entries_value(entries: &Entries) -> Value {
     ])
 }
 
+fn credential_health_value(entries: &BTreeMap<String, CredentialHealth>) -> Value {
+    Value::Object(
+        entries
+            .iter()
+            .map(|(provider, health)| {
+                (
+                    provider.clone(),
+                    object([
+                        ("kind", Value::from(health.kind)),
+                        ("status", Value::from(health.status)),
+                        (
+                            "corrupt_fields",
+                            Value::Array(
+                                health
+                                    .corrupt_fields
+                                    .iter()
+                                    .map(|field| Value::from(*field))
+                                    .collect(),
+                            ),
+                        ),
+                    ]),
+                )
+            })
+            .collect(),
+    )
+}
+
 fn report_value(report: &Report) -> Value {
     let entries = &report.base_dir.entries;
     let identity_candidates = report
@@ -1278,6 +1414,10 @@ fn report_value(report: &Report) -> Value {
                         .map_or(Value::Null, |count| Value::from(count as u64)),
                 ),
             ]),
+        ),
+        (
+            "credential_health",
+            credential_health_value(&report.credential_health),
         ),
         (
             "marked_candidates",
@@ -1372,9 +1512,28 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let io = SystemIo;
     let resolved_base_dir = resolve_base_dir(base_dir);
     let (harness_catalog, harness_notes) = doctor_harness_catalog(&resolved_base_dir);
-    let mut raw = match std::env::consts::OS {
-        "linux" => collect_linux(&io, std::process::id(), harness_catalog.as_ref())?,
-        "macos" => collect_darwin(&io, std::process::id(), harness_catalog.as_ref())?,
+    let (mut raw, collection_failure) = match std::env::consts::OS {
+        "linux" => (
+            collect_linux(&io, std::process::id(), harness_catalog.as_ref())?,
+            None,
+        ),
+        "macos" => match collect_darwin(&io, std::process::id(), harness_catalog.as_ref()) {
+            Ok(raw) => (raw, None),
+            Err(CommandFailure::Failed) => {
+                let failure = darwin_enumeration_error(CommandFailure::Failed).to_owned();
+                (
+                    RawFacts {
+                        platform: "macos",
+                        pids_scanned: 0,
+                        pids_env_unreadable: None,
+                        processes: Vec::new(),
+                        notes: vec![failure.clone()],
+                    },
+                    Some(failure),
+                )
+            }
+            Err(failure) => return Err(darwin_enumeration_error(failure).to_owned()),
+        },
         _ => return Err("probe: unsupported platform".to_owned()),
     };
     raw.notes.extend(harness_notes);
@@ -1383,13 +1542,34 @@ pub fn run(json: bool, base_dir: Option<String>) -> Result<(), String> {
     let base_dir = inspect_base_dir(&io, &resolved_base_dir, &mut raw.notes);
     let mut report = assemble(raw, probed_at_ms, 0, hostname, base_dir);
     report.cold_start = crate::dispatch::cold_start_for_doctor(&resolved_base_dir).ok();
+    report.credential_health = inspect_credential_health(&resolved_base_dir);
     report.collection_ms = u64::try_from(monotonic.elapsed().as_millis()).unwrap_or(u64::MAX);
     if json {
         println!("{}", report_json(&report));
     } else {
         println!("{}", human(&report));
     }
-    require_runnable_harness_cli(harness_catalog.as_ref())
+    require_runnable_harness_cli(harness_catalog.as_ref())?;
+    require_credential_integrity(&report.credential_health)?;
+    match collection_failure {
+        Some(failure) => Err(failure),
+        None => Ok(()),
+    }
+}
+
+fn require_credential_integrity(
+    credential_health: &BTreeMap<String, CredentialHealth>,
+) -> Result<(), String> {
+    let Some((provider, health)) = credential_health
+        .iter()
+        .find(|(_provider, health)| health.status == "corrupt")
+    else {
+        return Ok(());
+    };
+    Err(format!(
+        "doctor: banked OAuth credential for {provider} is CORRUPT ({}); run tightbeam onboard {provider} --as-user <userId>",
+        health.corrupt_fields.join(", ")
+    ))
 }
 
 fn require_runnable_harness_cli(
@@ -1466,6 +1646,35 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    fn doctor_credential_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tightbeam-doctor-credential-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn bank_anthropic(root: &Path, kind: Option<&str>, oauth: Value) {
+        let store = root.join("auth").join("claude");
+        fs::create_dir_all(store.join(".tightbeam")).unwrap();
+        let mut metadata = serde_json::json!({"onboarded": true});
+        if let Some(kind) = kind {
+            metadata["kind"] = Value::from(kind);
+        }
+        fs::write(
+            store.join(".tightbeam").join("credential.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            store.join(".credentials.json"),
+            serde_json::to_vec(&serde_json::json!({"claudeAiOauth": oauth})).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn stat(ppid: u32, pgid: u32, start: u64) -> Vec<u8> {
         let mut fields = vec!["S".to_owned(), ppid.to_string(), pgid.to_string()];
         fields.extend((6..=21).map(|_| "0".to_owned()));
@@ -1534,6 +1743,140 @@ mod tests {
             "doctor: could not check harnesses; cannot establish that a harness can run"
         );
         assert!(!error.contains("no registered harness CLI is available"));
+    }
+
+    #[test]
+    fn banked_oauth_hollow_fields_are_structured_corrupt_and_fail_doctor() {
+        let root = doctor_credential_root();
+        let cases = [
+            (
+                serde_json::json!({
+                    "accessToken": "",
+                    "refreshToken": "refresh-ok",
+                    "expiresAt": 4_102_444_800_000_i64
+                }),
+                "claudeAiOauth.accessToken",
+            ),
+            (
+                serde_json::json!({
+                    "accessToken": "access-ok",
+                    "refreshToken": "",
+                    "expiresAt": 4_102_444_800_000_i64
+                }),
+                "claudeAiOauth.refreshToken",
+            ),
+            (
+                serde_json::json!({
+                    "accessToken": "access-ok",
+                    "refreshToken": "refresh-ok",
+                    "expiresAt": 0
+                }),
+                "claudeAiOauth.expiresAt",
+            ),
+        ];
+
+        for (oauth, expected_field) in cases {
+            bank_anthropic(&root, Some("subscription"), oauth);
+            let health = inspect_credential_health(&root);
+            let anthropic = &health["anthropic"];
+            assert_eq!(anthropic.status, "corrupt");
+            assert_eq!(anthropic.corrupt_fields, vec![expected_field]);
+            assert!(require_credential_integrity(&health).is_err());
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn omitted_refresh_and_recorded_api_key_are_not_corrupt_oauth() {
+        let root = doctor_credential_root();
+        bank_anthropic(
+            &root,
+            Some("subscription"),
+            serde_json::json!({
+                "accessToken": "setup-token",
+                "expiresAt": 4_102_444_800_000_i64
+            }),
+        );
+        let health = inspect_credential_health(&root);
+        assert_eq!(health["anthropic"].status, "healthy");
+        assert!(health["anthropic"].corrupt_fields.is_empty());
+        assert!(require_credential_integrity(&health).is_ok());
+
+        bank_anthropic(
+            &root,
+            Some("api_key"),
+            serde_json::json!({"accessToken": "", "refreshToken": "", "expiresAt": 0}),
+        );
+        let health = inspect_credential_health(&root);
+        assert_eq!(health["anthropic"].status, "not_oauth");
+        assert!(require_credential_integrity(&health).is_ok());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn credential_health_status_precedence_is_deterministic_for_malformed_fixtures() {
+        let root = doctor_credential_root();
+        let store = root.join("auth").join("claude");
+        let metadata_path = store.join(".tightbeam").join("credential.json");
+        let credential_path = store.join(".credentials.json");
+
+        let health = inspect_credential_health(&root);
+        assert_eq!(
+            health["anthropic"],
+            credential_health("not_banked", Vec::new())
+        );
+
+        fs::create_dir_all(store.join(".tightbeam")).unwrap();
+        fs::write(&metadata_path, b"{").unwrap();
+        let health = inspect_credential_health(&root);
+        assert_eq!(
+            health["anthropic"],
+            credential_health("unverifiable", Vec::new())
+        );
+
+        fs::write(&metadata_path, br#"{"onboarded":false}"#).unwrap();
+        fs::write(&credential_path, b"{").unwrap();
+        let health = inspect_credential_health(&root);
+        assert_eq!(
+            health["anthropic"],
+            credential_health("not_banked", Vec::new())
+        );
+
+        fs::write(&metadata_path, br#"{"onboarded":true,"kind":"api_key"}"#).unwrap();
+        let health = inspect_credential_health(&root);
+        assert_eq!(health["anthropic"].status, "not_oauth");
+
+        fs::write(
+            &metadata_path,
+            br#"{"onboarded":true,"kind":"subscription"}"#,
+        )
+        .unwrap();
+        let health = inspect_credential_health(&root);
+        assert_eq!(
+            health["anthropic"],
+            credential_health("unverifiable", Vec::new())
+        );
+
+        fs::write(
+            &credential_path,
+            br#"{"claudeAiOauth":{"accessToken":7,"refreshToken":false,"expiresAt":-1}}"#,
+        )
+        .unwrap();
+        let first = inspect_credential_health(&root);
+        let second = inspect_credential_health(&root);
+        assert_eq!(first, second);
+        assert_eq!(
+            first["anthropic"].corrupt_fields,
+            vec![
+                "claudeAiOauth.accessToken",
+                "claudeAiOauth.refreshToken",
+                "claudeAiOauth.expiresAt"
+            ]
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[derive(Default)]
@@ -1984,8 +2327,9 @@ mod tests {
             };
             assert_eq!(
                 collect_darwin(&io, 999, Some(&crate::harnesses::catalog().unwrap())).unwrap_err(),
-                expected
+                failure
             );
+            assert_eq!(darwin_enumeration_error(failure), expected);
         }
     }
 
@@ -2188,6 +2532,7 @@ mod tests {
     },
     "adapter_stderr_log_count": null
   },
+  "credential_health": {},
   "marked_candidates": [],
   "identity_candidates": {},
   "adapter_candidates": [],
@@ -2289,6 +2634,7 @@ mod tests {
     },
     "adapter_stderr_log_count": 2
   },
+  "credential_health": {},
   "marked_candidates": [
     {
       "pid": 4,
