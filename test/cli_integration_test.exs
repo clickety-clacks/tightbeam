@@ -151,10 +151,12 @@ defmodule Tightbeam.CliIntegrationTest do
 
     %{
       base_dir: base_dir,
+      bandit: bandit,
       binary: binary,
       db: db,
       handlers: handlers,
       port: port,
+      router_opts: router_opts,
       session: session,
       worker: worker,
       workdir: workdir,
@@ -1650,5 +1652,57 @@ defmodule Tightbeam.CliIntegrationTest do
       assert output =~ "does not accept"
       refute_receive {:cli_call, _call}
     end
+  end
+
+  test "real CLI survives router restart while the immutable previous package keeps only telemetry names",
+       ctx do
+    {first, 0} = System.cmd(ctx.binary, ["toplines"], cd: ctx.workdir, stderr_to_stdout: true)
+    assert first =~ "toplines"
+    assert_receive {:cli_call, %{verb: "toplines"}}
+
+    :ok = Supervisor.stop(ctx.bandit)
+
+    bandit =
+      start_supervised!(
+        {Bandit, plug: {Router, ctx.router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+      )
+
+    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+
+    File.write!(
+      Path.join(ctx.base_dir, "work/session/.tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{port}",
+        token: ctx.session.cli_token,
+        sessionKey: ctx.session.session_key
+      })
+    )
+
+    {second, 0} = System.cmd(ctx.binary, ["toplines"], cd: ctx.workdir, stderr_to_stdout: true)
+    assert second =~ "toplines"
+    assert_receive {:cli_call, %{verb: "toplines"}}
+
+    archive =
+      "/home/mike/.tightbeam/work/f8899f5cc784/toplines-i68-019-fixture/tightbeam-0.1.8-linux-x86_64-2ff4ed2.tgz"
+
+    previous = Path.join(ctx.base_dir, "previous")
+    File.mkdir_p!(previous)
+    {_, 0} = System.cmd("tar", ["-xzf", archive, "-C", previous], stderr_to_stdout: true)
+    old_cli = Path.join(previous, "tightbeam/bin/tightbeam")
+    env = [{"TIGHTBEAM_URL", "http://127.0.0.1:9"}, {"TIGHTBEAM_TOKEN", "synthetic"}]
+
+    {old, old_status} =
+      System.cmd(old_cli, ["toplines", "--tree", "--as-user", "flynn"],
+        env: env,
+        stderr_to_stdout: true
+      )
+
+    assert old_status != 0
+    refute old =~ "unknown command"
+
+    {new, 1} =
+      System.cmd(ctx.binary, ["toplines", "--tree"], cd: ctx.workdir, stderr_to_stdout: true)
+
+    assert new =~ "does not accept --tree"
   end
 end
