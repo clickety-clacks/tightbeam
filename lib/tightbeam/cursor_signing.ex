@@ -1415,7 +1415,7 @@ defmodule Tightbeam.CursorSigning do
   defp uid_from_id do
     executable = Enum.find(["/usr/bin/id", "/bin/id"], &File.regular?/1)
 
-    case executable && System.cmd(executable, ["-u"], stderr_to_stdout: true) do
+    case executable && System.cmd(executable, ["-u"], uid_command_options()) do
       {output, 0} ->
         case parse_uid(String.trim(output)) do
           nil -> error(:service_identity_unavailable)
@@ -1424,6 +1424,15 @@ defmodule Tightbeam.CursorSigning do
 
       _other ->
         error(:service_identity_unavailable)
+    end
+  end
+
+  # Cursor fault probes load into external BEAMs on Darwin. Do not carry that
+  # test-only dynamic-library injection into the OS identity utility itself.
+  defp uid_command_options do
+    case :os.type() do
+      {:unix, :darwin} -> [stderr_to_stdout: true, env: [{"DYLD_INSERT_LIBRARIES", ""}]]
+      _other -> [stderr_to_stdout: true]
     end
   end
 
