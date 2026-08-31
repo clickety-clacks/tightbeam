@@ -156,6 +156,7 @@ pub enum Command {
         reviews: Option<String>,
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
+        report_to: Option<String>,
     },
     Dispatch {
         identity: Identity,
@@ -166,6 +167,7 @@ pub enum Command {
         workdir_root: Option<String>,
         brief: String,
         idempotency_key: Option<String>,
+        report_to: Option<String>,
     },
     EffortRule {
         identity: Identity,
@@ -296,6 +298,16 @@ pub enum Command {
         identity: Identity,
         target: Option<Target>,
         state: Option<String>,
+    },
+    CompletionNotices {
+        identity: Identity,
+        status: String,
+        session_key: Option<String>,
+    },
+    CompletionDisposition {
+        identity: Identity,
+        completion_id: String,
+        decision: String,
     },
     CancelWake {
         identity: Identity,
@@ -621,13 +633,18 @@ COMMANDS:
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
-         [--files '["lib/a.ex","test/a_test.exs"]']
+         [--files '["lib/a.ex","test/a_test.exs"]'] [--report-to <sessionKey>]
       Open an obligation held by a session; a work item is the durable thread
       across assignments.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
+           [--report-to <sessionKey>]
       Atomically open an assignment and wake its holder with the card id.
+  completion-notices --status open|all [--session <childSessionKey>]
+      List visible completion notices, optionally for one exact child session.
+  completion-disposition <completionId> --decision retain|park|retire
+      Apply one authorized lifecycle disposition to an open completion request.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in routed to your principal.
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
@@ -1151,6 +1168,13 @@ fn parse_with_optional_catalog(
     }
 
     let flags = &parsed.flags;
+    if flags.contains_key("report-to") && !matches!(command, Some("assign" | "dispatch")) {
+        return Err("--report-to is valid only with assign or dispatch".to_owned());
+    }
+    if matches!(flags.get("report-to"), Some(value) if value.is_empty()) {
+        return Err("--report-to requires a non-empty session key".to_owned());
+    }
+
     match command.expect("checked above") {
         "doctor" => {
             let base_dir = nonempty(flags, "base-dir");
@@ -1484,6 +1508,7 @@ fn parse_with_optional_catalog(
                 reviews: nonempty(flags, "reviews"),
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
+                report_to: nonempty(flags, "report-to"),
             })
         }
         "dispatch" => {
@@ -1506,6 +1531,7 @@ fn parse_with_optional_catalog(
                 workdir_root: nonempty(flags, "workdir-root"),
                 brief,
                 idempotency_key: nonempty(flags, "key"),
+                report_to: nonempty(flags, "report-to"),
             })
         }
         "effort-rule" => {
@@ -1907,6 +1933,38 @@ fn parse_with_optional_catalog(
                 state: nonempty(flags, "state"),
             })
         }
+        "completion-notices" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam completion-notices --status open|all [--session <childSessionKey>]".to_owned());
+            }
+            let status = nonempty(flags, "status").ok_or_else(|| {
+                "usage: tightbeam completion-notices --status open|all [--session <childSessionKey>]".to_owned()
+            })?;
+            if !matches!(status.as_str(), "open" | "all") {
+                return Err("--status must be open or all".to_owned());
+            }
+            Ok(Command::CompletionNotices {
+                identity: identity(flags)?,
+                status,
+                session_key: nonempty(flags, "session"),
+            })
+        }
+        "completion-disposition" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam completion-disposition <completionId> --decision retain|park|retire".to_owned());
+            }
+            let decision = nonempty(flags, "decision").ok_or_else(|| {
+                "usage: tightbeam completion-disposition <completionId> --decision retain|park|retire".to_owned()
+            })?;
+            if !matches!(decision.as_str(), "retain" | "park" | "retire") {
+                return Err("--decision must be retain, park, or retire".to_owned());
+            }
+            Ok(Command::CompletionDisposition {
+                identity: identity(flags)?,
+                completion_id: parsed.positional[1].clone(),
+                decision,
+            })
+        }
         "cancel-wake" => {
             let wake_id = parsed
                 .positional
@@ -2004,7 +2062,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2212,6 +2270,102 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn completion_commands_and_report_to_parse_exactly() {
+        assert_eq!(
+            parse(strings(&[
+                "completion-notices",
+                "--status",
+                "open",
+                "--session",
+                "child",
+                "--as",
+                "parent",
+            ])),
+            Ok(Command::CompletionNotices {
+                identity: Identity::Role("parent".to_owned()),
+                status: "open".to_owned(),
+                session_key: Some("child".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "completion-disposition",
+                "cn_1",
+                "--decision",
+                "retain",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::CompletionDisposition {
+                identity: Identity::User("flynn".to_owned()),
+                completion_id: "cn_1".to_owned(),
+                decision: "retain".to_owned(),
+            })
+        );
+        assert!(matches!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "work",
+                "--session",
+                "child",
+                "--report-to",
+                "report",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::Assign {
+                report_to: Some(value),
+                ..
+            }) if value == "report"
+        ));
+        assert_eq!(
+            parse(strings(&[
+                "completion-notices",
+                "--status",
+                "closed",
+                "--as-user",
+                "flynn",
+            ])),
+            Err("--status must be open or all".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "completion",
+                "--report-to",
+                "report"
+            ])),
+            Err("--report-to is valid only with assign or dispatch".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "work",
+                "--session",
+                "child",
+                "--report-to",
+                "",
+            ])),
+            Err("--report-to requires a non-empty session key".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "completion-disposition",
+                "cn_1",
+                "--decision",
+                "delete",
+                "--as-user",
+                "flynn",
+            ])),
+            Err("--decision must be retain, park, or retire".to_owned())
+        );
     }
 
     #[test]
@@ -2806,6 +2960,8 @@ mod tests {
                 "add-user",
                 "cancel-wake",
                 "condition",
+                "completion-disposition",
+                "completion-notices",
                 "config",
                 "coordination-share",
                 "decision-requests",
@@ -3416,7 +3572,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 
