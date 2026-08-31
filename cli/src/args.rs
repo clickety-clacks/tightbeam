@@ -1070,6 +1070,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "clear-spec-ref",
     "dry-run",
     "help",
+    "history",
     "json",
     "manifest",
     "resolve",
