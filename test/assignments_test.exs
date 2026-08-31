@@ -2537,6 +2537,34 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "schema restart preserves one recorded revocation reason without a legacy sentinel", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "restart provenance"))
+
+    assert %{outcome: "revoked", revocationReason: "recorded reason"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "recorded reason")
+             )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:ok, [[1, "recorded reason"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*), min(reason)
+               FROM assignment_revocations WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert %{revocationReason: "recorded reason"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+  end
+
   test "revocation replay emits no second state callback or accepted handoff", ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "replay notices"))
 

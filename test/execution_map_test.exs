@@ -1126,6 +1126,8 @@ defmodule Tightbeam.ExecutionMapTest do
 
   defp close!(db, id, outcome, closing_attest_id) do
     if outcome == "revoked" do
+      revocation_id = "revocation:#{id}"
+
       {:ok, _} =
         DB.query(
           db,
@@ -1134,7 +1136,18 @@ defmodule Tightbeam.ExecutionMapTest do
             (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
           VALUES (?1, ?2, ?3, 'flynn', NULL, 'execution-map test revocation')
           """,
-          ["revocation:#{id}", id, @default_created + 1]
+          [revocation_id, id, @default_created + 1]
+        )
+
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO assignment_revocation_generations
+            (revocationId, assignmentId, reopeningId)
+          VALUES (?1, ?2, NULL)
+          """,
+          [revocation_id, id]
         )
     end
 

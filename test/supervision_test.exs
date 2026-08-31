@@ -3767,6 +3767,8 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   defp revoke_assignment!(db, assignment_id, revoked_at) do
+    revocation_id = "revocation:#{assignment_id}:#{revoked_at}"
+
     {:ok, _} =
       DB.query(
         db,
@@ -3775,7 +3777,18 @@ defmodule Tightbeam.SupervisionTest do
           (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
         VALUES (?1, ?2, ?3, 'flynn', NULL, 'supervision test revocation')
         """,
-        ["revocation:#{assignment_id}:#{revoked_at}", assignment_id, revoked_at]
+        [revocation_id, assignment_id, revoked_at]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO assignment_revocation_generations
+          (revocationId, assignmentId, reopeningId)
+        VALUES (?1, ?2, NULL)
+        """,
+        [revocation_id, assignment_id]
       )
 
     {:ok, _} =

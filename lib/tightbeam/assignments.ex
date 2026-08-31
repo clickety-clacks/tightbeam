@@ -428,8 +428,9 @@ defmodule Tightbeam.Assignments do
   end
 
   # Historical revoked rows predate a required reason. The explicit sentinel
-  # records that absence without manufacturing a motive, and INSERT OR IGNORE
-  # makes boot/replay idempotent.
+  # records that absence without manufacturing a motive. A matching durable
+  # provenance row is already the reason for this close, so restart must never
+  # add a second synthetic legacy fact beside it.
   defp migrate_legacy_revocations(db) do
     :ok =
       DB.execute(
@@ -441,6 +442,13 @@ defmodule Tightbeam.Assignments do
           closedBySession, 'legacy_unknown'
         FROM assignments
         WHERE state = 'closed' AND outcome = 'revoked'
+          AND NOT EXISTS (
+            SELECT 1 FROM assignment_revocations r
+            WHERE r.assignmentId = assignments.id
+              AND r.revokedAt IS assignments.closedAt
+              AND r.revokedByUser IS assignments.closedByUser
+              AND r.revokedBySession IS assignments.closedBySession
+          )
         """
       )
   end
