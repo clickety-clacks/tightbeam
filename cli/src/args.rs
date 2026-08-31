@@ -4,11 +4,12 @@
 //! omission lets the gateway derive the principal from the discovered session
 //! credential.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::harnesses::HarnessCatalog;
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
@@ -23,6 +24,96 @@ pub enum Target {
     Session(String),
     Role(String),
     User(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivationCommand {
+    Declare {
+        assignment: String,
+        owner: String,
+        domain: String,
+        correlation: String,
+        input: Value,
+        target: Value,
+        prior: Option<String>,
+        relation: Option<String>,
+        key: String,
+    },
+    Authority {
+        activation: String,
+        after: String,
+        assignment: Option<String>,
+        authorizer: Value,
+        basis: Value,
+        decision: Value,
+        key: String,
+    },
+    Attempt {
+        activation: String,
+        after: String,
+        assignment: String,
+        authority_events: Vec<String>,
+        executor: Value,
+        external_attempt: Value,
+        target_state_before: Value,
+        key: String,
+    },
+    Observe {
+        activation: String,
+        after: String,
+        assignment: Option<String>,
+        attempt: String,
+        certainty: String,
+        result: Value,
+        target_state_after: Value,
+        outputs: Value,
+        evidence: Value,
+        external_occurred_at: Value,
+        key: String,
+    },
+    Reconcile {
+        activation: String,
+        after: String,
+        assignment: Option<String>,
+        observation: String,
+        certainty: String,
+        result: Value,
+        target_state_after: Value,
+        outputs: Value,
+        evidence: Value,
+        external_occurred_at: Value,
+        key: String,
+    },
+    Withdraw {
+        activation: String,
+        after: String,
+        assignment: Option<String>,
+        reason: Value,
+        basis: Value,
+        key: String,
+    },
+    Renotify {
+        activation: String,
+        after: String,
+        noticed_event: String,
+        replaces_wake: String,
+        key: String,
+    },
+    Ack {
+        activation: String,
+        after: String,
+        noticed_event: String,
+        wake: String,
+        key: String,
+    },
+    Status {
+        activation: String,
+    },
+    List {
+        assignment: Option<String>,
+        work_item: Option<String>,
+        correlation: Option<String>,
+    },
 }
 
 /// The ONE runtime control a `tune` call changes.
@@ -70,6 +161,8 @@ pub enum Command {
     /// assimilate`. Printing the whole manual in answer to a question about one
     /// command buries the answer it was asked for.
     CommandHelp(String),
+    /// Print only the nearest session credential's session key.
+    IdentityCurrent,
     Doctor {
         json: bool,
         base_dir: Option<String>,
@@ -108,6 +201,10 @@ pub enum Command {
         identity: Identity,
         work_item_id: Option<String>,
         session_key: Option<String>,
+    },
+    Activation {
+        identity: Identity,
+        command: ActivationCommand,
     },
     /// Substrate-reserved: the PreToolUse hook reporting that this session is
     /// about to run `artifact-record`. Carries no identity flag because the
@@ -174,9 +271,34 @@ pub enum Command {
         request_id: String,
         action: String,
     },
+    OperatorAsk {
+        identity: Identity,
+        question: String,
+        note: Option<String>,
+        options: Option<Vec<String>>,
+        assignment_id: Option<String>,
+        deadline_ms: Option<String>,
+        supersedes: Option<String>,
+    },
+    OperatorRule {
+        identity: Identity,
+        request_id: String,
+        decision: Option<String>,
+        response: Option<String>,
+        rationale: Option<String>,
+    },
+    OperatorWithdraw {
+        identity: Identity,
+        request_id: String,
+        reason: String,
+    },
     DecisionRequests {
         identity: Identity,
         status: Option<String>,
+    },
+    DecisionRequest {
+        identity: Identity,
+        request_id: String,
     },
     /// File one question at a named principal (coordination-fabric-v1 §7
     /// `input-needed` carrier). The row is data its asker chooses to honor:
@@ -200,18 +322,36 @@ pub enum Command {
     RevokeAssignment {
         identity: Identity,
         assignment_id: String,
+        reason: String,
     },
     ReopenAssignment {
         identity: Identity,
         assignment_id: String,
         reason: String,
     },
+    RepairAssignment {
+        identity: Identity,
+        assignment_id: String,
+        action: String,
+        model: Option<String>,
+        effort: Option<String>,
+        context: Option<String>,
+        outcome: Option<String>,
+        turn_seq: Option<String>,
+        idempotency_key: String,
+    },
     WorkItemCreate {
         identity: Identity,
         title: String,
         spec_ref_name: Option<String>,
         spec_ref_sha256: Option<String>,
+        priority: Option<String>,
         idempotency_key: Option<String>,
+    },
+    WorkItemUpdate {
+        identity: Identity,
+        work_item_id: String,
+        priority: String,
     },
     WorkItemGet {
         identity: Identity,
@@ -508,6 +648,30 @@ COMMANDS:
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
 
+  activation-declare --assignment A --owner U --domain N --correlation C
+      --input RESOURCE_JSON --target RESOURCE_JSON
+      [--prior ACT --relation retry-of|compensates|supersedes] --key K
+  activation-authority --activation ACT --after EVENT [--assignment A]
+      --authorizer IDENTITY_JSON --basis RESOURCE_JSON --decision CODE_JSON --key K
+  activation-attempt --activation ACT --after EVENT --assignment A
+      --authority-events ID[,ID...] --executor IDENTITY_JSON
+      --external-attempt RESOURCE_JSON --target-state-before RESOURCE_JSON|null --key K
+  activation-observe --activation ACT --after EVENT [--assignment A]
+      --attempt EVENT --certainty determinate|indeterminate --result CODE_JSON
+      --target-state-after RESOURCE_JSON|null --outputs RESOURCE_JSON_ARRAY
+      --evidence RESOURCE_JSON --external-occurred-at MS|null --key K
+  activation-reconcile --activation ACT --after EVENT [--assignment A]
+      --observation EVENT --certainty determinate|irrecoverable --result CODE_JSON
+      --target-state-after RESOURCE_JSON|null --outputs RESOURCE_JSON_ARRAY
+      --evidence RESOURCE_JSON --external-occurred-at MS|null --key K
+  activation-withdraw --activation ACT --after EVENT [--assignment A]
+      --reason CODE_JSON --basis RESOURCE_JSON --key K
+  activation-renotify --activation ACT --after EVENT --noticed-event EVENT
+      --replaces-wake W --key K
+  activation-ack --activation ACT --after EVENT --noticed-event EVENT --wake W --key K
+  activation-status --activation ACT
+  activations [--assignment A | --work-item WI | --correlation C]
+
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
         [--context <variant>] [--host <host>] [--key <idempotencyKey>]
@@ -561,10 +725,12 @@ COMMANDS:
       End a session deliberately.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
-                   [--key <idempotencyKey>]
+                   [--priority <0..8>] [--key <idempotencyKey>]
       File a work item. Unrouted, it becomes YOUR problem on a deadline: file
       it, then route it (assign/dispatch) or icebox it. --key makes create
       idempotent (same key returns the same item).
+  work-item-update <workItemId> --priority <0..8>
+      Raise or lower the work item's priority. Open cards inherit the change.
   work-item-get <workItemId>
   work-item-trace <workItemId>
   attend [--high]
@@ -646,9 +812,24 @@ COMMANDS:
   completion-disposition <completionId> --decision retain|park|retire
       Apply one authorized lifecycle disposition to an open completion request.
   effort-rule --request <decisionRequestId> --action continue|dismiss
-      Rule an effort-without-effect check-in routed to your principal.
+      Rule an effort-without-effect check-in whose complete id you hold. The
+      current expecter is the preferred responder, not an authorization gate.
+  operator-ask --question <q> [--note <t>] [--options a,b,c]
+               [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]
+      File an owner-scoped operator decision request.
+  operator-rule <dr_id> (--decision <label> | --response <text>)
+                [--rationale <text>]
+      Record the operator's resolution. A session that presented the request runs it
+      only on the operator's explicit delegation, quoted in --rationale.
+  operator-withdraw <dr_id> --reason <text>
+      Withdraw an operator decision request as its owner or original asker.
   decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
       List decision requests visible to your principal.
+  decision-request --request <decisionRequestId>
+      Read one agent question or effort request by its complete id. For an
+      agent session, the id is a reference: the request's expecter is the
+      preferred responder, not an authorization gate. Reading a request is
+      not an instruction to respond.
   ask (--session <key> | --role <name> | --user <id>) --question "<text>"
       [--about <assignmentId>]
       Put one question to another principal and get back its id. THE QUESTION
@@ -660,21 +841,25 @@ COMMANDS:
       at their next turn boundary, or within 30 minutes, whichever is first.
         tightbeam ask --role owner --question "ship behind a flag or block?" --as coder
   answer --request <decisionRequestId> --answer "<text>"
-      Answer a question that was put to you. It is an answer, not a ruling: it
-      authorizes nothing and unblocks nothing on its own. Only the principal
-      the question was asked of can answer it.
+      Answer a question whose complete id you hold. It is an answer, not a
+      ruling: it authorizes nothing and unblocks nothing on its own. The named
+      expecter is the preferred responder, not an authorization gate.
   return --request <decisionRequestId> --reason "<text>"
-      Return an open question for insufficient information. The original row
-      and reason remain in history, it leaves the open queue, and its asker
-      must revise or replace it with a new request if an answer is still needed.
-  revoke-assignment <assignmentId>
-      Revoke when the assignment handler already authorizes your principal.
+      Return an open question whose complete id you hold for insufficient
+      information. The original row and reason remain in history, it leaves
+      the open queue, and its asker must revise or replace it with a new request
+      if an answer is still needed.
+  revoke-assignment <assignmentId> --reason "..."
+      Revoke with a durable reason when the assignment handler authorizes your principal.
   reopen-assignment <assignmentId> --reason "..."
       Move a CLOSED assignment back to open so its holder can file the verdict
       or lifecycle row the card still owes — the agent-reachable repair for a
       card that closed carrying the wrong judgment. The prior close is kept on
       the record. Refuses by name when the card is already open, its holder is
       retired, its work item is not open, or its files collide.
+  repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
+      Repair a failed or never-launched holder without revoking its work.
+      tune also requires --model; rerun requires --outcome not-completed.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
@@ -697,6 +882,9 @@ COMMANDS:
   kungfu list
       List the kungfu bundles shipped with this Tightbeam build and each
       bundle's declared root archetype.
+
+  identity current
+      Print this session's key without printing its bearer credential.
 
   ADMIN (require --as-user of an admin, or an admin-owned agent handle):
   identity edit <archetype> [--manifest | --skill <name> [--rm]]
@@ -729,8 +917,9 @@ COMMANDS:
       Add a user, optionally as an admin. An existing admin may run this over
       the ordinary gateway path. On an empty local org, the first user is
       created directly and becomes admin by the existing cold-start rule.
-  config get default-archetype                   read the default spawn archetype
+  config get default-archetype|default-priority  read an organization default
   config set default-archetype <name>            set the default spawn archetype
+  config set default-priority <0..8>              set the default card priority
   host-env-set --host <host> --harness <harness> NAME=VALUE
       Set one host- and harness-scoped environment overlay. The result states
       when the adapter will observe the new value.
@@ -830,20 +1019,26 @@ const BOOLEAN_FLAGS: &[&str] = &[
 struct Flags {
     positional: Vec<String>,
     flags: HashMap<String, String>,
+    duplicates: HashSet<String>,
 }
 
 fn split_args(args: Vec<String>) -> Flags {
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
+    let mut duplicates = HashSet::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
         if let Some(name) = arg.strip_prefix("--") {
             if BOOLEAN_FLAGS.contains(&name) {
-                flags.insert(name.to_owned(), String::new());
+                if flags.insert(name.to_owned(), String::new()).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
             } else {
                 let value = args.get(index + 1).cloned().unwrap_or_default();
-                flags.insert(name.to_owned(), value);
+                if flags.insert(name.to_owned(), value).is_some() {
+                    duplicates.insert(name.to_owned());
+                }
                 index += 1;
             }
         } else {
@@ -851,11 +1046,34 @@ fn split_args(args: Vec<String>) -> Flags {
         }
         index += 1;
     }
-    Flags { positional, flags }
+    Flags {
+        positional,
+        flags,
+        duplicates,
+    }
 }
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
+}
+
+fn complete_decision_request_id(value: &str) -> bool {
+    let Some(uuid) = value.strip_prefix("dr_") else {
+        return false;
+    };
+    let bytes = uuid.as_bytes();
+
+    bytes.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| bytes[index] == b'-')
+        && bytes[14] == b'4'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 8 | 13 | 18 | 23)
+                || byte.is_ascii_digit()
+                || matches!(byte, b'a'..=b'f')
+        })
 }
 
 const TUNE_USAGE: &str = "usage: tightbeam tune --session <key> (--harness <harness> --model <model> | --model <model> | --effort <level>) [--effort <level>] [--context <variant>]";
@@ -1134,6 +1352,266 @@ fn generated_key() -> String {
     format!("cli_{millis}_{}", String::from_utf8_lossy(&suffix))
 }
 
+fn activation_json(flags: &HashMap<String, String>, name: &str) -> Result<Value, String> {
+    let encoded = nonempty(flags, name).ok_or_else(|| format!("--{name} is required"))?;
+    serde_json::from_str(&encoded).map_err(|_| format!("--{name} requires JSON"))
+}
+
+fn activation_required(flags: &HashMap<String, String>, name: &str) -> Result<String, String> {
+    nonempty(flags, name).ok_or_else(|| format!("--{name} is required"))
+}
+
+fn parse_activation(
+    name: &str,
+    parsed: &Flags,
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    if parsed.positional.len() != 1 {
+        return Err(format!("usage: tightbeam {name} [flags]"));
+    }
+
+    let command_flags: &[&str] = match name {
+        "activation-declare" => &[
+            "assignment",
+            "owner",
+            "domain",
+            "correlation",
+            "input",
+            "target",
+            "prior",
+            "relation",
+            "key",
+        ],
+        "activation-authority" => &[
+            "activation",
+            "after",
+            "assignment",
+            "authorizer",
+            "basis",
+            "decision",
+            "key",
+        ],
+        "activation-attempt" => &[
+            "activation",
+            "after",
+            "assignment",
+            "authority-events",
+            "executor",
+            "external-attempt",
+            "target-state-before",
+            "key",
+        ],
+        "activation-observe" => &[
+            "activation",
+            "after",
+            "assignment",
+            "attempt",
+            "certainty",
+            "result",
+            "target-state-after",
+            "outputs",
+            "evidence",
+            "external-occurred-at",
+            "key",
+        ],
+        "activation-reconcile" => &[
+            "activation",
+            "after",
+            "assignment",
+            "observation",
+            "certainty",
+            "result",
+            "target-state-after",
+            "outputs",
+            "evidence",
+            "external-occurred-at",
+            "key",
+        ],
+        "activation-withdraw" => &[
+            "activation",
+            "after",
+            "assignment",
+            "reason",
+            "basis",
+            "key",
+        ],
+        "activation-renotify" => &[
+            "activation",
+            "after",
+            "noticed-event",
+            "replaces-wake",
+            "key",
+        ],
+        "activation-ack" => &["activation", "after", "noticed-event", "wake", "key"],
+        "activation-status" => &["activation"],
+        "activations" => &["assignment", "work-item", "correlation"],
+        _ => unreachable!("closed activation command set"),
+    };
+    if flags.keys().any(|flag| {
+        !command_flags.contains(&flag.as_str())
+            && !matches!(flag.as_str(), "as" | "as-user" | "as-process")
+    }) {
+        return Err(format!("usage: tightbeam {name} [flags]"));
+    }
+
+    let identity = identity(flags)?;
+    let command = match name {
+        "activation-declare" => {
+            let prior = nonempty(flags, "prior");
+            let relation = nonempty(flags, "relation");
+            if prior.is_some() != relation.is_some()
+                || relation.as_deref().is_some_and(|value| {
+                    !matches!(value, "retry-of" | "compensates" | "supersedes")
+                })
+            {
+                return Err("--prior and --relation must be supplied together; relation is retry-of, compensates, or supersedes".to_owned());
+            }
+            ActivationCommand::Declare {
+                assignment: activation_required(flags, "assignment")?,
+                owner: activation_required(flags, "owner")?,
+                domain: activation_required(flags, "domain")?,
+                correlation: activation_required(flags, "correlation")?,
+                input: activation_json(flags, "input")?,
+                target: activation_json(flags, "target")?,
+                prior,
+                relation,
+                key: activation_required(flags, "key")?,
+            }
+        }
+        "activation-authority" => ActivationCommand::Authority {
+            activation: activation_required(flags, "activation")?,
+            after: activation_required(flags, "after")?,
+            assignment: nonempty(flags, "assignment"),
+            authorizer: activation_json(flags, "authorizer")?,
+            basis: activation_json(flags, "basis")?,
+            decision: activation_json(flags, "decision")?,
+            key: activation_required(flags, "key")?,
+        },
+        "activation-attempt" => {
+            let authority_events = activation_required(flags, "authority-events")?
+                .split(',')
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if authority_events.iter().any(String::is_empty) {
+                return Err(
+                    "--authority-events requires a non-empty comma-separated list".to_owned(),
+                );
+            }
+            ActivationCommand::Attempt {
+                activation: activation_required(flags, "activation")?,
+                after: activation_required(flags, "after")?,
+                assignment: activation_required(flags, "assignment")?,
+                authority_events,
+                executor: activation_json(flags, "executor")?,
+                external_attempt: activation_json(flags, "external-attempt")?,
+                target_state_before: activation_json(flags, "target-state-before")?,
+                key: activation_required(flags, "key")?,
+            }
+        }
+        "activation-observe" | "activation-reconcile" => {
+            let certainty = activation_required(flags, "certainty")?;
+            let external_occurred_at = activation_json(flags, "external-occurred-at")?;
+            if !external_occurred_at.is_null()
+                && external_occurred_at
+                    .as_u64()
+                    .is_none_or(|value| value > i64::MAX as u64)
+            {
+                return Err("--external-occurred-at requires an integer from 0 through 9223372036854775807 or null".to_owned());
+            }
+            let common = (
+                activation_required(flags, "activation")?,
+                activation_required(flags, "after")?,
+                nonempty(flags, "assignment"),
+                certainty,
+                activation_json(flags, "result")?,
+                activation_json(flags, "target-state-after")?,
+                activation_json(flags, "outputs")?,
+                activation_json(flags, "evidence")?,
+                external_occurred_at,
+                activation_required(flags, "key")?,
+            );
+            if name == "activation-observe" {
+                ActivationCommand::Observe {
+                    activation: common.0,
+                    after: common.1,
+                    assignment: common.2,
+                    attempt: activation_required(flags, "attempt")?,
+                    certainty: common.3,
+                    result: common.4,
+                    target_state_after: common.5,
+                    outputs: common.6,
+                    evidence: common.7,
+                    external_occurred_at: common.8,
+                    key: common.9,
+                }
+            } else {
+                ActivationCommand::Reconcile {
+                    activation: common.0,
+                    after: common.1,
+                    assignment: common.2,
+                    observation: activation_required(flags, "observation")?,
+                    certainty: common.3,
+                    result: common.4,
+                    target_state_after: common.5,
+                    outputs: common.6,
+                    evidence: common.7,
+                    external_occurred_at: common.8,
+                    key: common.9,
+                }
+            }
+        }
+        "activation-withdraw" => ActivationCommand::Withdraw {
+            activation: activation_required(flags, "activation")?,
+            after: activation_required(flags, "after")?,
+            assignment: nonempty(flags, "assignment"),
+            reason: activation_json(flags, "reason")?,
+            basis: activation_json(flags, "basis")?,
+            key: activation_required(flags, "key")?,
+        },
+        "activation-renotify" => ActivationCommand::Renotify {
+            activation: activation_required(flags, "activation")?,
+            after: activation_required(flags, "after")?,
+            noticed_event: activation_required(flags, "noticed-event")?,
+            replaces_wake: activation_required(flags, "replaces-wake")?,
+            key: activation_required(flags, "key")?,
+        },
+        "activation-ack" => ActivationCommand::Ack {
+            activation: activation_required(flags, "activation")?,
+            after: activation_required(flags, "after")?,
+            noticed_event: activation_required(flags, "noticed-event")?,
+            wake: activation_required(flags, "wake")?,
+            key: activation_required(flags, "key")?,
+        },
+        "activation-status" => ActivationCommand::Status {
+            activation: activation_required(flags, "activation")?,
+        },
+        "activations" => {
+            let assignment = nonempty(flags, "assignment");
+            let work_item = nonempty(flags, "work-item");
+            let correlation = nonempty(flags, "correlation");
+            if [
+                assignment.as_ref(),
+                work_item.as_ref(),
+                correlation.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .count()
+                > 1
+            {
+                return Err("activations accepts at most one filter".to_owned());
+            }
+            ActivationCommand::List {
+                assignment,
+                work_item,
+                correlation,
+            }
+        }
+        _ => unreachable!("closed activation command set"),
+    };
+    Ok(Command::Activation { identity, command })
+}
+
 pub fn parse(args: Vec<String>) -> Result<Command, String> {
     parse_with_optional_catalog(args, None)
 }
@@ -1176,6 +1654,16 @@ fn parse_with_optional_catalog(
     }
 
     match command.expect("checked above") {
+        name @ ("activation-declare"
+        | "activation-authority"
+        | "activation-attempt"
+        | "activation-observe"
+        | "activation-reconcile"
+        | "activation-withdraw"
+        | "activation-renotify"
+        | "activation-ack"
+        | "activation-status"
+        | "activations") => parse_activation(name, &parsed, flags),
         "doctor" => {
             let base_dir = nonempty(flags, "base-dir");
             if parsed.positional.len() != 1
@@ -1553,6 +2041,59 @@ fn parse_with_optional_catalog(
                 action,
             })
         }
+        "operator-ask" => {
+            if parsed.positional.len() != 1 {
+                return Err("usage: tightbeam operator-ask --question <q> [--note <t>] [--options a,b,c] [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]".to_owned());
+            }
+            let question =
+                nonempty(flags, "question").ok_or_else(|| "--question is required".to_owned())?;
+            let options = flags
+                .get("options")
+                .map(|value| value.split(',').map(str::to_owned).collect::<Vec<_>>());
+            let deadline_ms = flags
+                .get("deadline")
+                .map(|value| parse_duration("deadline", value))
+                .transpose()?;
+            Ok(Command::OperatorAsk {
+                identity: identity(flags)?,
+                question,
+                note: nonempty(flags, "note"),
+                options,
+                assignment_id: nonempty(flags, "assignment"),
+                deadline_ms,
+                supersedes: nonempty(flags, "supersedes"),
+            })
+        }
+        "operator-rule" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-rule <dr_id> (--decision <label> | --response <text>) [--rationale <text>]".to_owned());
+            }
+            let decision = flags.get("decision").cloned();
+            let response = flags.get("response").cloned();
+            if decision.is_some() == response.is_some() {
+                return Err(
+                    "operator-rule requires exactly one of --decision or --response".to_owned(),
+                );
+            }
+            Ok(Command::OperatorRule {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                decision,
+                response,
+                rationale: nonempty(flags, "rationale"),
+            })
+        }
+        "operator-withdraw" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam operator-withdraw <dr_id> --reason <text>".to_owned());
+            }
+            Ok(Command::OperatorWithdraw {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+            })
+        }
         "decision-requests" => {
             if parsed.positional.len() != 1 {
                 return Err(
@@ -1562,6 +2103,27 @@ fn parse_with_optional_catalog(
             Ok(Command::DecisionRequests {
                 identity: identity(flags)?,
                 status: nonempty(flags, "status"),
+            })
+        }
+        "decision-request" => {
+            const ALLOWED: &[&str] = &["request", "as", "as-user", "as-process"];
+            let request_id = nonempty(flags, "request");
+
+            if parsed.positional.len() != 1
+                || !request_id
+                    .as_deref()
+                    .is_some_and(complete_decision_request_id)
+                || parsed.duplicates.contains("request")
+                || flags.keys().any(|flag| !ALLOWED.contains(&flag.as_str()))
+            {
+                return Err(
+                    "usage: tightbeam decision-request --request <decisionRequestId>".to_owned(),
+                );
+            }
+
+            Ok(Command::DecisionRequest {
+                identity: identity(flags)?,
+                request_id: request_id.expect("checked above"),
             })
         }
         "ask" => {
@@ -1612,12 +2174,20 @@ fn parse_with_optional_catalog(
             })
         }
         "revoke-assignment" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam revoke-assignment <assignmentId>".to_owned());
+            if parsed.positional.len() != 2 || parsed.duplicates.contains("reason") {
+                return Err(
+                    "usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"".to_owned(),
+                );
             }
+            let Some(reason) = nonempty(flags, "reason") else {
+                return Err(
+                    "usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"".to_owned(),
+                );
+            };
             Ok(Command::RevokeAssignment {
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
+                reason,
             })
         }
         "reopen-assignment" => {
@@ -1635,6 +2205,35 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
                 reason,
+            })
+        }
+        "repair-assignment" => {
+            let usage = "usage: tightbeam repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key> [--model <model> --effort <tier> --context <window>] [--outcome not-completed] [--turn <seq>]";
+            let action = nonempty(flags, "action");
+            let key = nonempty(flags, "key");
+            let allowed = ["tune", "restart", "rerun", "resume", "relaunch"];
+            if parsed.positional.len() != 2
+                || action
+                    .as_ref()
+                    .is_none_or(|value| !allowed.contains(&value.as_str()))
+                || key.is_none()
+            {
+                return Err(usage.to_owned());
+            }
+            if nonempty(flags, "outcome").is_some_and(|value| value != "not-completed") {
+                return Err("--outcome must be not-completed".to_owned());
+            }
+            Ok(Command::RepairAssignment {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                action: action.expect("checked above"),
+                model: nonempty(flags, "model"),
+                effort: nonempty(flags, "effort"),
+                context: nonempty(flags, "context"),
+                outcome: nonempty(flags, "outcome"),
+                turn_seq: nonempty(flags, "turn")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                idempotency_key: key.expect("checked above"),
             })
         }
         "work-item-create" => {
@@ -1657,7 +2256,21 @@ fn parse_with_optional_catalog(
                 title: nonempty(flags, "title").ok_or_else(|| "--title is required".to_owned())?,
                 spec_ref_name,
                 spec_ref_sha256,
+                priority: priority_flag(flags)?,
                 idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "work-item-update" => {
+            if parsed.positional.len() != 2 {
+                return Err(
+                    "usage: tightbeam work-item-update <workItemId> --priority <0..8>".to_owned(),
+                );
+            }
+            Ok(Command::WorkItemUpdate {
+                identity: identity(flags)?,
+                work_item_id: parsed.positional[1].clone(),
+                priority: priority_flag(flags)?
+                    .ok_or_else(|| "--priority is required".to_owned())?,
             })
         }
         "work-item-get" => {
@@ -2062,7 +2675,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2134,6 +2747,19 @@ fn parse_harness_process(
     }
 }
 
+fn priority_flag(flags: &HashMap<String, String>) -> Result<Option<String>, String> {
+    nonempty(flags, "priority")
+        .map(|value| {
+            let priority = value.parse::<u8>().ok();
+            if priority.is_some_and(|priority| priority <= 8) {
+                Ok(value)
+            } else {
+                Err("priority must be an integer from 0 through 8".to_owned())
+            }
+        })
+        .transpose()
+}
+
 fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     match (
         parsed.positional.get(1).map(String::as_str),
@@ -2141,17 +2767,28 @@ fn parse_config(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comma
         parsed.positional.get(3),
         parsed.positional.get(4),
     ) {
-        (Some("get"), Some("default-archetype"), None, None) => Ok(Command::ConfigGet {
+        (Some("get"), Some(setting @ ("default-archetype" | "default-priority")), None, None) => Ok(Command::ConfigGet {
             identity: identity(flags)?,
-            setting: "default-archetype".to_owned(),
+            setting: setting.to_owned(),
         }),
         (Some("set"), Some("default-archetype"), Some(value), None) => Ok(Command::ConfigSet {
             identity: identity(flags)?,
             setting: "default-archetype".to_owned(),
             value: value.clone(),
         }),
+        (Some("set"), Some("default-priority"), Some(value), None) => {
+            let priority = value.parse::<u8>().ok();
+            if priority.is_none_or(|priority| priority > 8) {
+                return Err("default-priority must be an integer from 0 through 8".to_owned());
+            }
+            Ok(Command::ConfigSet {
+                identity: identity(flags)?,
+                setting: "default-priority".to_owned(),
+                value: value.clone(),
+            })
+        }
         _ => Err(
-            "usage: tightbeam config get default-archetype | config set default-archetype <name>"
+            "usage: tightbeam config get default-archetype|default-priority | config set default-archetype <name> | config set default-priority <0..8>"
                 .to_owned(),
         ),
     }
@@ -2162,6 +2799,9 @@ fn parse_identity_command(
     flags: &HashMap<String, String>,
 ) -> Result<Command, String> {
     match parsed.positional.get(1).map(String::as_str) {
+        Some("current") if parsed.positional.len() == 2 && flags.is_empty() => {
+            Ok(Command::IdentityCurrent)
+        }
         Some("edit") => {
             let archetype = parsed.positional.get(2).cloned().ok_or_else(|| {
                 "usage: tightbeam identity edit <archetype> [--manifest | --skill <name> [--rm]] [--file <path>]".to_owned()
@@ -2241,7 +2881,9 @@ fn parse_identity_command(
                 all,
             })
         }
-        _ => Err("usage: tightbeam identity edit|status|relearn|repoint|apply ...".to_owned()),
+        _ => Err(
+            "usage: tightbeam identity current|edit|status|relearn|repoint|apply ...".to_owned(),
+        ),
     }
 }
 
@@ -2378,6 +3020,68 @@ mod tests {
         ] {
             assert_eq!(parse(args), Ok(Command::Help));
         }
+    }
+
+    #[test]
+    fn activation_commands_parse_closed_json_and_relation_shapes() {
+        assert!(matches!(
+            parse(strings(&[
+                "activation-declare",
+                "--assignment", "asg_1",
+                "--owner", "owner",
+                "--domain", "example",
+                "--correlation", "c1",
+                "--input", r#"{"namespace":"x","id":"i","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                "--target", r#"{"namespace":"x","id":"t","sha256":null}"#,
+                "--key", "k1",
+                "--as", "coder"
+            ])),
+            Ok(Command::Activation {
+                identity: Identity::Role(role),
+                command: ActivationCommand::Declare { assignment, domain, .. }
+            }) if role == "coder" && assignment == "asg_1" && domain == "example"
+        ));
+
+        assert!(
+            parse(strings(&[
+                "activation-declare",
+                "--assignment",
+                "a",
+                "--owner",
+                "u",
+                "--domain",
+                "d",
+                "--correlation",
+                "c",
+                "--input",
+                "not-json",
+                "--target",
+                "null",
+                "--key",
+                "k"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "activation-status",
+                "--activation",
+                "act_1",
+                "--event-id",
+                "forged"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(strings(&[
+                "activations",
+                "--assignment",
+                "a",
+                "--work-item",
+                "wi"
+            ]))
+            .is_err()
+        );
     }
 
     #[test]
@@ -2949,6 +3653,16 @@ mod tests {
             headings,
             [
                 "answer",
+                "activation-ack",
+                "activation-attempt",
+                "activation-authority",
+                "activation-declare",
+                "activation-observe",
+                "activation-reconcile",
+                "activation-renotify",
+                "activation-status",
+                "activation-withdraw",
+                "activations",
                 "ask",
                 "assimilate",
                 "assign",
@@ -2964,6 +3678,7 @@ mod tests {
                 "completion-notices",
                 "config",
                 "coordination-share",
+                "decision-request",
                 "decision-requests",
                 "digest-members",
                 "dispatch",
@@ -2978,9 +3693,13 @@ mod tests {
                 "learn",
                 "list",
                 "onboard",
+                "operator-ask",
+                "operator-rule",
+                "operator-withdraw",
                 "retire",
                 "return",
                 "reopen-assignment",
+                "repair-assignment",
                 "revoke-assignment",
                 "spawn",
                 "tune",
@@ -2989,6 +3708,7 @@ mod tests {
                 "work-item-create",
                 "work-item-fail",
                 "work-item-get",
+                "work-item-update",
                 "attend",
                 "transcript",
                 "turn-trace",
@@ -3003,6 +3723,7 @@ mod tests {
             .collect()
         );
         for syntax in [
+            "identity current",
             "identity edit <archetype>",
             "identity relearn [--abort | --resolve]",
             "identity repoint <retired-session> <archetype>",
@@ -3010,8 +3731,9 @@ mod tests {
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
             "add-user <userId> [--admin]",
-            "config get default-archetype",
+            "config get default-archetype|default-priority",
             "config set default-archetype <name>",
+            "config set default-priority <0..8>",
             "host-env-set --host <host> --harness <harness> NAME=VALUE",
             "host-env-list [--host <host>] [--harness <harness>]",
             "host-env-unset --host <host> --harness <harness> NAME",
@@ -3504,6 +4226,21 @@ mod tests {
     }
 
     #[test]
+    fn identity_current_is_local_and_takes_no_identity_override() {
+        assert_eq!(
+            parse(strings(&["identity", "current"])),
+            Ok(Command::IdentityCurrent)
+        );
+        assert_eq!(
+            parse(strings(&["identity", "current", "--as", "coder"])),
+            Err(
+                "usage: tightbeam identity current|edit|status|relearn|repoint|apply ..."
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn requires_exactly_one_wake_target_and_session_only_retire() {
         for args in [
             strings(&["wake", "--prompt", "hello", "--as-user", "flynn"]),
@@ -3569,11 +4306,145 @@ mod tests {
     }
 
     #[test]
+    fn revoke_assignment_requires_exactly_one_reason() {
+        assert_eq!(
+            parse(strings(&[
+                "revoke-assignment",
+                "asg_1",
+                "--reason",
+                "first",
+                "--reason",
+                "second",
+                "--as-user",
+                "flynn",
+            ])),
+            Err("usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"".to_owned())
+        );
+    }
+
+    #[test]
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, decision-requests, ask, answer, return, revoke-assignment, reopen-assignment, work-item-create, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
+    }
+
+    #[test]
+    fn operator_decision_commands_parse_the_exact_surface() {
+        assert_eq!(
+            parse(strings(&[
+                "operator-ask",
+                "--question",
+                "ship window?",
+                "--note",
+                "release train",
+                "--options",
+                "accept,wait",
+                "--assignment",
+                "asg_1",
+                "--deadline",
+                "2h",
+                "--supersedes",
+                "dr_old",
+                "--as",
+                "coder:release",
+            ])),
+            Ok(Command::OperatorAsk {
+                identity: Identity::Role("coder:release".to_owned()),
+                question: "ship window?".to_owned(),
+                note: Some("release train".to_owned()),
+                options: Some(vec!["accept".to_owned(), "wait".to_owned()]),
+                assignment_id: Some("asg_1".to_owned()),
+                deadline_ms: Some("7200000".to_owned()),
+                supersedes: Some("dr_old".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "operator-rule",
+                "dr_1",
+                "--response",
+                "ship after 013",
+                "--rationale",
+                "dependency first",
+                "--as-user",
+                "mike",
+            ])),
+            Ok(Command::OperatorRule {
+                identity: Identity::User("mike".to_owned()),
+                request_id: "dr_1".to_owned(),
+                decision: None,
+                response: Some("ship after 013".to_owned()),
+                rationale: Some("dependency first".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn operator_rule_requires_one_answer_form() {
+        for args in [
+            strings(&["operator-rule", "dr_1"]),
+            strings(&[
+                "operator-rule",
+                "dr_1",
+                "--decision",
+                "accept",
+                "--response",
+                "yes",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("operator-rule requires exactly one of --decision or --response".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn decision_request_requires_one_exact_request_flag_and_closed_identity_flags() {
+        let request_id = "dr_12345678-1234-4234-9234-123456789abc";
+
+        assert_eq!(
+            parse(strings(&[
+                "decision-request",
+                "--request",
+                request_id,
+                "--as",
+                "reviewer",
+            ])),
+            Ok(Command::DecisionRequest {
+                identity: Identity::Role("reviewer".to_owned()),
+                request_id: request_id.to_owned(),
+            })
+        );
+
+        for args in [
+            strings(&["decision-request"]),
+            strings(&["decision-request", request_id]),
+            strings(&["decision-request", "--request", ""]),
+            strings(&["decision-request", "--request", "dr_12345678"]),
+            strings(&[
+                "decision-request",
+                "--request",
+                request_id,
+                "--request",
+                "dr_87654321-4321-4321-8321-cba987654321",
+            ]),
+            strings(&[
+                "decision-request",
+                "--request",
+                request_id,
+                "--target",
+                "main",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam decision-request --request <decisionRequestId>".to_owned())
+            );
+        }
     }
 
     #[test]
@@ -3618,9 +4489,7 @@ mod tests {
             "waive",
             "revoke-waiver",
             "withdraw",
-            "decision-request",
             "critical",
-            "work-item-update",
             "work-item-list",
             "assignment-get",
             "init",
@@ -3862,6 +4731,7 @@ mod tests {
                     base_dir: Some("/tmp/tightbeam".to_owned()),
                 },
             ),
+            (strings(&["identity", "current"]), Command::IdentityCurrent),
             (
                 strings(&["identity", "status", "coder", "--as-user", "flynn"]),
                 Command::IdentityStatus {

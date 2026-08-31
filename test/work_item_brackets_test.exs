@@ -887,7 +887,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{assignment_id: assignment_id}
+      params: %{assignment_id: assignment_id, reason: "test revocation"}
     })
   end
 

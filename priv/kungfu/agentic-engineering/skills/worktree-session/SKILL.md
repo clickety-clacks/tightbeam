@@ -41,6 +41,16 @@ boundary.
 7. Reconcile main into your branch before building on it: merge main in, resolve
    conflicts on your branch, and prove the combined result builds and passes tests
    there. Do not build new work on a branch that has diverged from main.
-8. After your branch merges, delete your clone. A finished assignment leaves no
+8. **Preserve local-only work before retirement.** Before you run `tightbeam retire
+   --session <key>` for a hire that touched a repository, inspect the complete
+   workspace, including local commits and tracked, untracked, and ignored files.
+   Prove that every commit that must survive is pushed and that no remaining
+   local-only change exists only in the retiring workspace. If local-only work
+   remains, package the complete repository into a recovery archive in your own
+   workdir and record that archive on the work item with `tightbeam artifact-record`
+   before retirement. A closed assignment, a clean assignment ledger, or a path in
+   an attest does not prove byte custody. If you cannot inspect or preserve the
+   workspace, do not retire the session.
+9. After your branch merges, delete your clone. A finished assignment leaves no
    checkout behind; attest the cleanup as part of completion. Deleting your own clone
    is safe precisely because it is yours and its commits are already on the remote.

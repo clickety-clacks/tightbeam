@@ -24,6 +24,9 @@ defmodule Tightbeam.Firehose.Publisher do
     "answer" => {"decision_request.ruled", &StateResources.decision_request/1},
     "rule" => {"decision_request.ruled", &StateResources.decision_request/1},
     "effort-rule" => {"decision_request.ruled", &StateResources.decision_request/1},
+    "operator-ask" => {"decision_request.opened", &StateResources.decision_request/1},
+    "operator-rule" => {"decision_request.ruled", &StateResources.decision_request/1},
+    "operator-withdraw" => {"decision_request.withdrawn", &StateResources.decision_request/1},
     "return" => {"decision_request.returned", &StateResources.decision_request/1},
     "withdraw" => {"decision_request.withdrawn", &StateResources.decision_request/1},
     "approve-device" => {"device.approved", &StateResources.device/1},
@@ -33,7 +36,6 @@ defmodule Tightbeam.Firehose.Publisher do
     "role-bind" => {"role.bound", &StateResources.role/1},
     "role-rm" => {"role.removed", &StateResources.role/1},
     "spawn" => {"session.spawned", &StateResources.session/1},
-    "retire" => {"session.retired", &StateResources.session/1},
     "add-user" => {"user.added", &StateResources.user/1},
     "read-marker-set" => {"read_marker.updated", &StateResources.read_marker/1},
     "read-marker-clear" => {"read_marker.updated", &StateResources.read_marker/1},
@@ -41,14 +43,14 @@ defmodule Tightbeam.Firehose.Publisher do
   }
 
   @transactional_verbs MapSet.new(
-                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer return rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
+                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer return rule effort-rule operator-ask operator-rule operator-withdraw withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
                        )
 
   @spec accepted(map(), term()) :: :ok
-  def accepted(call, result), do: Hub.accepted(nil, call, result)
+  def accepted(call, result), do: Hub.accepted(hub(call), nil, call, result)
 
   @spec accepted(GenServer.server(), map(), term()) :: :ok
-  def accepted(db, call, result), do: Hub.accepted(db, call, result)
+  def accepted(db, call, result), do: Hub.accepted(hub(call), db, call, result)
 
   @spec transactional_verb?(String.t()) :: boolean()
   def transactional_verb?(verb), do: MapSet.member?(@transactional_verbs, verb)
@@ -63,7 +65,7 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
-    Txn.handoff(txn, Hub, {:accepted, nil, call, result})
+    Txn.handoff(txn, hub(call), {:accepted, nil, call, result})
   end
 
   @spec maybe_accepted_in_txn(Txn.t(), map(), term()) :: :ok
@@ -74,7 +76,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec observed_accepted_in_txn(Txn.t(), map()) :: :ok
   def observed_accepted_in_txn(%Txn{} = txn, call) do
-    Txn.handoff(txn, Hub, {:publish, observation_notice("verb.accepted", call)})
+    Txn.handoff(txn, hub(call), {:publish, observation_notice("verb.accepted", call)})
   end
 
   @spec maybe_observed_accepted_in_txn(Txn.t(), map()) :: :ok
@@ -95,15 +97,16 @@ defmodule Tightbeam.Firehose.Publisher do
   def capture_before(_db, call), do: call
 
   @spec denied(map(), map()) :: :ok
-  def denied(call, error), do: Hub.denied(call, error)
+  def denied(call, error), do: Hub.denied(hub(call), call, error)
 
   @spec denied_in_txn(Txn.t(), map(), map()) :: :ok
   def denied_in_txn(%Txn{} = txn, call, error) do
-    Txn.handoff(txn, Hub, {:denied, call, error})
+    Txn.handoff(txn, hub(call), {:denied, call, error})
   end
 
   @spec observed_accepted(map()) :: :ok
-  def observed_accepted(call), do: Hub.publish(observation_notice("verb.accepted", call))
+  def observed_accepted(call),
+    do: Hub.publish(hub(call), observation_notice("verb.accepted", call))
 
   @spec accepted_notices(GenServer.server() | nil, map(), term()) :: [map()]
   def accepted_notices(db, call, result) do
@@ -141,6 +144,66 @@ defmodule Tightbeam.Firehose.Publisher do
   @spec committed_in_txn(Txn.t(), String.t(), map(), map()) :: :ok
   def committed_in_txn(%Txn{} = txn, class, payload, refs \\ %{}) do
     Txn.handoff(txn, Hub, {:committed, class, payload, refs})
+  end
+
+  @doc "Queue one exact source-invalidation notice on its committing transaction."
+  @spec source_invalidation_in_txn(
+          Txn.t(),
+          GenServer.server(),
+          String.t(),
+          pos_integer(),
+          integer(),
+          map()
+        ) :: :ok
+  def source_invalidation_in_txn(
+        %Txn{} = txn,
+        hub,
+        class,
+        source_version,
+        occurred_at,
+        refs
+      ) do
+    Txn.handoff(
+      txn,
+      hub,
+      {:publish, source_invalidation_notice(class, source_version, occurred_at, refs)}
+    )
+  end
+
+  @doc false
+  @spec source_invalidation_notice(String.t(), pos_integer(), integer(), map()) :: map()
+  def source_invalidation_notice(class, source_version, occurred_at, refs)
+      when is_binary(class) and is_integer(source_version) and source_version > 0 and
+             is_integer(occurred_at) and is_map(refs) do
+    row =
+      case Registry.fetch_invalidation(class) do
+        {:ok, row} -> row
+        :error -> raise ArgumentError, "unregistered firehose source invalidation: #{class}"
+      end
+
+    actual_ref_set = refs |> Map.keys() |> Enum.sort()
+
+    unless actual_ref_set in row.ref_sets and
+             Enum.all?(refs, fn {_key, value} -> is_binary(value) and value != "" end) do
+      raise ArgumentError,
+            "firehose #{class} invalidation refs do not match the registry: " <>
+              "got=#{inspect(actual_ref_set)} allowed=#{inspect(row.ref_sets)}"
+    end
+
+    %{
+      "class" => class,
+      "op" => row.op,
+      "occurredAt" => occurred_at,
+      "refs" => refs,
+      "payload" => %{"sourceVersion" => source_version}
+    }
+  end
+
+  def source_invalidation_notice(class, source_version, occurred_at, refs) do
+    raise ArgumentError,
+          "invalid firehose source invalidation: class=#{inspect(class)} " <>
+            "sourceVersion=#{inspect(source_version)} occurredAt=#{inspect(occurred_at)} " <>
+            "refs=#{inspect(refs)}"
   end
 
   @doc "Queue the existing message-created notice on the transaction that appended it."
@@ -199,6 +262,21 @@ defmodule Tightbeam.Firehose.Publisher do
       "class" => class,
       "op" => "observe",
       "occurredAt" => System.system_time(:millisecond),
+      "refs" => refs,
+      "payload" => StateResources.observation(payload)
+    }
+
+    Txn.handoff(txn, Hub, {:publish, notice})
+  end
+
+  @doc "Queue one observational notice with the mutation's durable occurrence time."
+  @spec observation_in_txn(Txn.t(), String.t(), map(), map(), integer()) :: :ok
+  def observation_in_txn(%Txn{} = txn, class, payload, refs, occurred_at)
+      when is_integer(occurred_at) do
+    notice = %{
+      "class" => class,
+      "op" => "observe",
+      "occurredAt" => occurred_at,
       "refs" => refs,
       "payload" => StateResources.observation(payload)
     }
@@ -449,6 +527,8 @@ defmodule Tightbeam.Firehose.Publisher do
   defp principal({kind, value}) when is_binary(value), do: "#{kind}:#{value}"
   defp principal(value) when is_binary(value), do: value
   defp principal(_value), do: nil
+
+  defp hub(call), do: Map.get(call, :firehose_hub, Hub)
 
   defp require_primary_refs!(class, primary_refs, refs) do
     missing = Enum.reject(primary_refs, &(is_binary(refs[&1]) or is_integer(refs[&1])))

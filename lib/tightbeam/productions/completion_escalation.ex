@@ -21,8 +21,11 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     causeBySession TEXT NOT NULL REFERENCES sessions(sessionKey),
     ownerUserId TEXT NOT NULL REFERENCES users(userId),
     rootMainHolder INTEGER NOT NULL CHECK (rootMainHolder IN (0,1)),
-    immediateParentSessionKey TEXT NULL,
-    parentSessionKey TEXT NULL,
+    immediateParentSessionKey TEXT NOT NULL,
+    parentSessionKey TEXT NOT NULL,
+    parentResolutionSource TEXT NOT NULL CHECK (
+      parentResolutionSource IN ('explicit','owner_main')
+    ),
     parentRouteStatus TEXT NOT NULL CHECK (
       parentRouteStatus IN ('scheduled','unavailable','root-self')
     ),
@@ -52,7 +55,6 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     CHECK (dedupeKey = 'completion:' || closingAttestId),
     CHECK (
       (parentRouteStatus = 'scheduled' AND rootMainHolder = 0
-        AND parentSessionKey IS NOT NULL
         AND parentSessionKey IS immediateParentSessionKey
         AND currentParentNoticeWakeId IS NOT NULL)
       OR
@@ -61,6 +63,8 @@ defmodule Tightbeam.Productions.CompletionEscalation do
         AND currentParentNoticeWakeId IS NULL)
       OR
       (parentRouteStatus = 'root-self' AND rootMainHolder = 1
+        AND parentResolutionSource = 'owner_main'
+        AND immediateParentSessionKey = childSessionKey
         AND parentSessionKey = childSessionKey
         AND currentParentNoticeWakeId IS NOT NULL)
     ),
@@ -140,12 +144,11 @@ defmodule Tightbeam.Productions.CompletionEscalation do
   def open_in_txn(%Txn{} = txn, assignment, attest) do
     child = assignment.holderKey
 
-    [[owner, spawned_by, built_in]] =
-      Txn.q(
-        txn,
-        "SELECT ownerUserId, spawnedBy, isBuiltIn FROM sessions WHERE sessionKey=?1",
-        [child]
-      )
+    [[built_in]] =
+      Txn.q(txn, "SELECT isBuiltIn FROM sessions WHERE sessionKey=?1", [child])
+
+    resolution = Org.effective_parent_in_txn(txn, child)
+    owner = resolution.owner_user_id
 
     [[remaining]] =
       Txn.q(txn, "SELECT count(*) FROM assignments WHERE holderKey=?1 AND state='open'", [
@@ -153,7 +156,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
       ])
 
     root_main = built_in == 1 and child == Org.personal_session_key(owner)
-    parent = parent_route(txn, child, owner, spawned_by, root_main)
+    parent = parent_route(txn, resolution, root_main)
     report_to_key = assignment.reportToSessionKey
     report_to = report_to_route(txn, report_to_key, owner, parent)
     completion_id = "cn_" <> Tightbeam.Id.uuid4()
@@ -175,7 +178,8 @@ defmodule Tightbeam.Productions.CompletionEscalation do
             completion_id,
             assignment,
             attest,
-            spawned_by,
+            resolution.session_key,
+            resolution.source,
             parent,
             report_to_key,
             remaining,
@@ -199,7 +203,8 @@ defmodule Tightbeam.Productions.CompletionEscalation do
             completion_id,
             assignment,
             attest,
-            spawned_by,
+            resolution.session_key,
+            resolution.source,
             parent,
             report_to_key,
             remaining
@@ -224,11 +229,12 @@ defmodule Tightbeam.Productions.CompletionEscalation do
         (id, dedupeKey, assignmentId, workItemId, childSessionKey,
          remainingOpenAssignments, closingAttestId, outcome, causeBySession,
          ownerUserId, rootMainHolder, immediateParentSessionKey, parentSessionKey,
-         parentRouteStatus, reportToSessionKey, reportToRouteStatus, generation,
+         parentResolutionSource, parentRouteStatus, reportToSessionKey,
+         reportToRouteStatus, generation,
          currentParentNoticeWakeId, reportToNoticeWakeId, deadlineWakeId,
          actionDeadlineAt, status, createdAt)
       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'completed', ?8, ?9, ?10, ?11, ?12,
-              ?13, ?14, ?15, 0, ?16, ?17, ?18, ?19, ?20, ?21)
+              ?13, ?14, ?15, ?16, 0, ?17, ?18, ?19, ?20, ?21, ?22)
       """,
       [
         completion_id,
@@ -241,8 +247,9 @@ defmodule Tightbeam.Productions.CompletionEscalation do
         child,
         owner,
         bool_int(root_main),
-        if(root_main, do: nil, else: spawned_by),
+        resolution.session_key,
         parent.session_key,
+        Atom.to_string(resolution.source),
         parent.route_status,
         report_to_key,
         report_to.route_status,
@@ -591,6 +598,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
           assignment,
           attest,
           row.immediate_parent_session_key,
+          row.parent_resolution_source,
           parent,
           row.report_to_session_key,
           0,
@@ -696,38 +704,43 @@ defmodule Tightbeam.Productions.CompletionEscalation do
       active_owner_session?(txn, target, row.owner_user_id)
   end
 
-  defp parent_route(_txn, child, _owner, _spawned_by, true),
+  defp parent_route(_txn, %{session_key: child, source: :owner_main}, true),
     do: %{session_key: child, route_status: "root-self", failure_reason: nil, foreign: false}
 
-  defp parent_route(txn, _child, owner, spawned_by, false) do
-    cond do
-      is_nil(spawned_by) ->
-        unavailable_parent(nil, "parent-missing")
-
-      true ->
-        case Txn.q(
-               txn,
-               "SELECT ownerUserId, state FROM sessions WHERE sessionKey=?1",
-               [spawned_by]
-             ) do
-          [] -> unavailable_parent(spawned_by, "parent-missing")
-          [[^owner, "active"]] -> scheduled_parent(spawned_by)
-          [[^owner, _state]] -> unavailable_parent(spawned_by, "parent-inactive")
-          [[_foreign, _state]] -> unavailable_parent(spawned_by, "parent-owner-mismatch", true)
-        end
+  defp parent_route(txn, %{session_key: selected, owner_user_id: owner}, false) do
+    case Txn.q(
+           txn,
+           "SELECT ownerUserId, state FROM sessions WHERE sessionKey=?1",
+           [selected]
+         ) do
+      [] -> unavailable_parent(selected, "parent-missing")
+      [[^owner, "active"]] -> scheduled_parent(selected)
+      [[^owner, _state]] -> unavailable_parent(selected, "parent-inactive")
+      [[_foreign, _state]] -> unavailable_parent(selected, "parent-owner-mismatch", true)
     end
   end
 
   defp current_parent_route(txn, %{root_main_holder: true} = row),
-    do: parent_route(txn, row.child_session_key, row.owner_user_id, nil, true)
+    do:
+      parent_route(
+        txn,
+        %{
+          session_key: row.parent_session_key,
+          source: String.to_existing_atom(row.parent_resolution_source),
+          owner_user_id: row.owner_user_id
+        },
+        true
+      )
 
   defp current_parent_route(txn, row),
     do:
       parent_route(
         txn,
-        row.child_session_key,
-        row.owner_user_id,
-        row.parent_session_key,
+        %{
+          session_key: row.parent_session_key,
+          source: String.to_existing_atom(row.parent_resolution_source),
+          owner_user_id: row.owner_user_id
+        },
         false
       )
 
@@ -908,7 +921,17 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     :ok
   end
 
-  defp parent_prompt(id, assignment, attest, immediate_parent, parent, report_to, remaining, root) do
+  defp parent_prompt(
+         id,
+         assignment,
+         attest,
+         immediate_parent,
+         resolution_source,
+         parent,
+         report_to,
+         remaining,
+         root
+       ) do
     action_needed = remaining == 0
 
     body =
@@ -921,7 +944,8 @@ defmodule Tightbeam.Productions.CompletionEscalation do
       closingAttestId=#{attest.id}
       outcome=completed
       causePrincipal=session:#{assignment.holderKey}
-      immediateParentSessionKey=#{immediate_parent || "none"}
+      immediateParentSessionKey=#{immediate_parent}
+      parentResolutionSource=#{resolution_source}
       parentRoute=#{parent_route_label(parent.route_status)}
       reportToSessionKey=#{report_to || "none"}
       remainingOpenAssignments=#{remaining}
@@ -943,7 +967,16 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     end
   end
 
-  defp report_to_prompt(id, assignment, attest, immediate_parent, parent, report_to, remaining) do
+  defp report_to_prompt(
+         id,
+         assignment,
+         attest,
+         immediate_parent,
+         resolution_source,
+         parent,
+         report_to,
+         remaining
+       ) do
     """
     Child completion copied by explicit report-to.
     completionId=#{id}
@@ -953,7 +986,8 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     closingAttestId=#{attest.id}
     outcome=completed
     causePrincipal=session:#{assignment.holderKey}
-    immediateParentSessionKey=#{immediate_parent || "none"}
+    immediateParentSessionKey=#{immediate_parent}
+    parentResolutionSource=#{resolution_source}
     parentRoute=#{parent_route_label(parent.route_status)}
     reportToSessionKey=#{report_to}
     remainingOpenAssignments=#{remaining}
@@ -963,7 +997,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     |> String.trim_trailing()
   end
 
-  defp parent_route_label("scheduled"), do: "spawnedBy"
+  defp parent_route_label("scheduled"), do: "effective-parent"
   defp parent_route_label("unavailable"), do: "parent-unavailable"
   defp parent_route_label("root-self"), do: "root-self"
 
@@ -1012,7 +1046,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
            [wake_id]
          ) do
       [raw] ->
-        {completion_raw, [wake_generation, kind, wake_state, id]} = Enum.split(raw, 30)
+        {completion_raw, [wake_generation, kind, wake_state, id]} = Enum.split(raw, 31)
 
         completion_raw
         |> row()
@@ -1118,6 +1152,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
       routing: %{
         parent: %{
           sessionKey: row.parent_session_key,
+          resolutionSource: row.parent_resolution_source,
           routeStatus: row.parent_route_status,
           receipt: parent_receipt
         },
@@ -1246,7 +1281,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
 
     ~w(id dedupeKey assignmentId workItemId childSessionKey remainingOpenAssignments
        closingAttestId outcome causeBySession ownerUserId rootMainHolder
-       immediateParentSessionKey parentSessionKey parentRouteStatus reportToSessionKey
+       immediateParentSessionKey parentSessionKey parentResolutionSource parentRouteStatus reportToSessionKey
        reportToRouteStatus generation currentParentNoticeWakeId reportToNoticeWakeId
        deadlineWakeId actionDeadlineAt status decision actedBySession actedByUser actedAt
        supersededReason supersededByAssignmentId supersededAt createdAt)
@@ -1267,6 +1302,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
          root_main_holder,
          immediate_parent_session_key,
          parent_session_key,
+         parent_resolution_source,
          parent_route_status,
          report_to_session_key,
          report_to_route_status,
@@ -1298,6 +1334,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
       root_main_holder: root_main_holder == 1,
       immediate_parent_session_key: immediate_parent_session_key,
       parent_session_key: parent_session_key,
+      parent_resolution_source: parent_resolution_source,
       parent_route_status: parent_route_status,
       report_to_session_key: report_to_session_key,
       report_to_route_status: report_to_route_status,

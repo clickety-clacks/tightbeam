@@ -1,15 +1,15 @@
 name = "recon"
-skills = ["recon-first-investigation", "recon-lifecycle", "bug-provenance", "human-communication"]
+skills = ["worktree-session", "recon-first-investigation", "recon-lifecycle", "bug-provenance", "human-communication"]
 
 [guidance]
 text = """
+#include "golden-rule.md"
+
 #include "wisdom-core.md"
 
 #include "engineering-tenets.md"
 
 #include "preferred-models.md"
-
-#include "model-policy.md"
 
 #include "recon.md"
 """

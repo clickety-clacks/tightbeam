@@ -192,6 +192,13 @@ defmodule Tightbeam.Dispatch do
     do: RailRemedy.notice(db, handlers, statute, subject, call)
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
+    call =
+      if verb in ["identity-edit", "identity-relearn", "learn", "unlearn", "kungfu-scaffold"] do
+        Map.put_new(call, :invocation_id, "identity-" <> Tightbeam.Id.uuid4())
+      else
+        call
+      end
+
     publisher_call = Publisher.capture_before(db, call)
 
     case Map.fetch(handlers, verb) do
@@ -334,6 +341,7 @@ defmodule Tightbeam.Dispatch do
   # summed, and one returning none would report 0 — so a second member either
   # accepts that meaning of N or brings its own counter.
   @result_elided ~w(transcript)
+  @activation_write_verbs ~w(activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack)
 
   # The CALL is audited with its params — that IS the access trail — and the
   # RESULT is replaced by a count. Denials are NOT elided: an error map is useful
@@ -352,6 +360,30 @@ defmodule Tightbeam.Dispatch do
   # behavior change no spec here authorizes. Elision governs the audit row only.
   defp outcome_payload("onboard", _call, {:returned, result}) when is_map(result),
     do: Map.delete(result, :lease_id)
+
+  defp outcome_payload(verb, _call, {:returned, %{event: event, state: state}})
+       when verb in @activation_write_verbs do
+    %{
+      activation_id: event.activation_id,
+      event_kind: event.kind,
+      event_id: event.event_id,
+      state: state
+    }
+  end
+
+  defp outcome_payload("activation-status", _call, {:returned, result}) do
+    %{
+      activation_id: result.activation_id,
+      state: result.state,
+      event_count: length(result.events)
+    }
+  end
+
+  defp outcome_payload("activations", _call, {:returned, result}), do: %{count: result.count}
+
+  defp outcome_payload(verb, _call, {:raised, _exception})
+       when verb in @activation_write_verbs or verb in ["activation-status", "activations"],
+       do: %{code: "server_error", crash: true}
 
   defp outcome_payload(verb, call, outcome) do
     if verb in @result_elided do

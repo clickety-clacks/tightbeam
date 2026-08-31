@@ -59,20 +59,51 @@ defmodule Tightbeam.Application do
   end
 
   defp start_tree(config) do
+    # The server-held cursor signer is composed before the listener. An absent
+    # canonical path selects the explicit bootstrap state: the base tree may run,
+    # but no gateway child or listener is admitted until local provisioning
+    # reaches the durable healthy transition. Normal startup never provisions or
+    # substitutes material.
+    cursor_signing = Tightbeam.CursorSigning.load!(config.base_dir)
+
+    config = Map.put(config, :cursor_signing, cursor_signing)
+
     with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
-      Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
-        {:ok, _pid} = Supervisor.start_child(supervisor, child)
-      end)
+      case Tightbeam.CursorSigning.lifecycle(cursor_signing) do
+        :healthy ->
+          :ok = admit_gateway(supervisor, config)
+          {:ok, supervisor}
 
-      # LAST, deliberately: Bandit's "Running ... (http)" has already been
-      # logged by now, and that line reads as a verdict. On an org that cannot
-      # run a single turn it was the wrong one, so the real verdict goes after
-      # it. Assembled from what boot already knows; it starts nothing and
-      # cannot fail the boot.
-      report_readiness(config)
+        :unprovisioned ->
+          {:ok, _bootstrap} =
+            Supervisor.start_child(
+              supervisor,
+              {Tightbeam.CursorSigning.Bootstrap,
+               supervisor: supervisor, config: config, provider: cursor_signing}
+            )
 
-      {:ok, supervisor}
+          {:ok, supervisor}
+
+        _refusal ->
+          Supervisor.stop(supervisor)
+          raise Tightbeam.CursorSigning.Error, reason: :unavailable
+      end
     end
+  end
+
+  @doc false
+  def admit_gateway(supervisor, config) do
+    Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
+      {:ok, _pid} = Supervisor.start_child(supervisor, child)
+    end)
+
+    # LAST, deliberately: Bandit's "Running ... (http)" has already been
+    # logged by now, and that line reads as a verdict. On an org that cannot
+    # run a single turn it was the wrong one, so the real verdict goes after
+    # it. Assembled from what boot already knows; it starts nothing and cannot
+    # fail the boot.
+    report_readiness(config)
+    :ok
   end
 
   # AN EXPECTED REFUSAL IS NOT A CRASH.
@@ -260,7 +291,7 @@ defmodule Tightbeam.Application do
       escalation_decision_deadline_ms:
         Application.get_env(:tightbeam, :escalation_decision_deadline_ms, 86_400_000),
       effort_checkin_horizon_ms:
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000),
+        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 14_400_000),
       critical_lease_hard_cap_ms:
         Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000),
       onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000)

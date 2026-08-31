@@ -32,7 +32,9 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Model, Org, Schema}
+  alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
+
+  @shape "coordination-fabric-v1-phase1-v14"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -43,7 +45,7 @@ defmodule Tightbeam.SchemaShapeTest do
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert "completionReportToSessionKey" in table_columns(db, "assignments")
@@ -66,8 +68,233 @@ defmodule Tightbeam.SchemaShapeTest do
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
 
+    assert {:ok, [[@shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the exact v9 predecessor gains nullable identity render stamps", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
+
+    assert {:ok, _rows} =
+             DB.query(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v9'")
+
+    assert :ok = Schema.upgrade_identity_render_stamp_v1(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v10"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, columns} = DB.query(db, "PRAGMA table_info(sessions)")
+    names = Enum.map(columns, &Enum.at(&1, 1))
+    assert "identityRenderContract" in names
+    assert "identityGuidanceDigest" in names
+  end
+
+  test "the exact v10 predecessor widens effort cancellation after identity render stamps",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
+
+    {:ok, [[current_ddl]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+      )
+
+    effort_arm =
+      ~r/\n\s+OR\n\s+\(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND\n\s+livenessTriggerId IS NULL AND actionNeeded = 0 AND\n\s+requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND\n\s+reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND\n\s+dispositionKind = 'decision_request_transition' AND\n\s+causalSourceId = dispositionId\)/
+
+    predecessor_ddl = Regex.replace(effort_arm, current_ddl, "", global: false)
+    refute predecessor_ddl == current_ddl
+
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER wakes_typed_cancellation_required;
+      DROP TRIGGER wake_cancellations_pending_insert;
+      ALTER TABLE wake_cancellations RENAME TO wake_cancellations_current;
+      #{predecessor_ddl};
+      DROP TABLE wake_cancellations_current;
+      UPDATE schema_stamp
+        SET shape='coordination-fabric-v1-phase1-v10', stampedAt=1;
+      """)
+
+    assert "identityRenderContract" in table_columns(db, "sessions")
+    assert "identityGuidanceDigest" in table_columns(db, "sessions")
+    assert :ok = Schema.upgrade_effort_request_exit_v1(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v11"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert "identityRenderContract" in table_columns(db, "sessions")
+    assert "identityGuidanceDigest" in table_columns(db, "sessions")
+
+    assert {:ok, [[migrated_ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+             )
+
+    assert Regex.match?(effort_arm, migrated_ddl)
+  end
+
+  test "the exact v7 predecessor activates terminal decision parity once and preserves history",
+       %{
+         db: db
+       } do
+    assert :ok = Schema.ensure_all(db)
+    downgrade_to_v8(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO decision_requests (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,question,context,status) VALUES ('dr_pre_terminal','statute','session:legacy','flynn',1,2,'gate','legacy','legacy question','{}','open')"
+      )
+
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER IF EXISTS decision_request_operator_terminal_insert;
+      DROP TRIGGER IF EXISTS decision_request_operator_terminal_update;
+      INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES
+        (11,11,'escalation-ruled','dr_00000000-0000-4000-8000-000000000004','process:tightbeam'),
+        (12,12,'escalation-ruled','dr_00000000-0000-4000-8000-000000000002','process:tightbeam'),
+        (13,13,'escalation-ruled','dr_00000000-0000-4000-8000-000000000001','process:tightbeam');
+      INSERT INTO lifecycle_events (ts,kind,subject,detail) VALUES
+        (11,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000004','legacy'),
+        (12,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000002','legacy'),
+        (13,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000001','legacy'),
+        (14,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000003','legacy');
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
+         actionKey,question,options,context,status,decision,ruledBy,ruledAt,
+         rulingFactId,consumedAt)
+      VALUES
+        ('dr_00000000-0000-4000-8000-000000000004','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+         'legacy-complete','legacy complete','[{"label":"accept"}]','{}','ruled','accept',
+         'user:flynn',11,11,NULL),
+        ('dr_00000000-0000-4000-8000-000000000002','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+         'legacy-missing-fact-id','legacy missing fact id','[{"label":"accept"}]','{}','ruled','accept',
+         'user:flynn',12,NULL,NULL),
+        ('dr_00000000-0000-4000-8000-000000000003','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+         'legacy-missing-fact','legacy missing fact','[{"label":"accept"}]','{}','ruled','accept',
+         'user:flynn',14,999,NULL),
+        ('dr_00000000-0000-4000-8000-000000000001','operator','agent:raiser','agent:raiser:legacy','flynn',1,2,
+         'legacy-consumed','legacy consumed','[{"label":"accept"}]','{}','consumed','accept',
+         'user:flynn',13,13,13);
+      DROP TABLE IF EXISTS decision_request_integrity_evidence;
+      DROP TABLE IF EXISTS decision_request_terminal_epoch;
+      UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v7', stampedAt=1;
+      """)
+
+    assert :ok = Schema.upgrade_terminal_operator_decision_v1(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["dr_pre_terminal", "statute", "open", "legacy question"]]} =
+             DB.query(
+               db,
+               "SELECT id,kind,status,question FROM decision_requests WHERE id='dr_pre_terminal'"
+             )
+
+    assert "ruledViaPrincipal" in table_columns(db, "decision_requests")
+    assert "ruledViaSessionState" in table_columns(db, "decision_requests")
+
+    assert {:ok,
+            [
+              [
+                0,
+                "terminal-operator-decision-parity-v1",
+                13,
+                "terminal-operator-decision-parity-v1",
+                "process:tightbeam"
+              ]
+            ]} =
+             DB.query(
+               db,
+               "SELECT id,schemaVersion,legacyRulingFactMaxId,cause,principal FROM decision_request_terminal_epoch"
+             )
+
+    assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+
+    assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert {:ok, [[1, 3]]} =
+             DB.query(
+               db,
+               "SELECT (SELECT COUNT(*) FROM decision_request_terminal_epoch), (SELECT COUNT(*) FROM decision_request_integrity_evidence)"
+             )
+
+    assert {:ok,
+            [
+              ["dr_00000000-0000-4000-8000-000000000001", "[\"lifecycleConsumption\"]"],
+              ["dr_00000000-0000-4000-8000-000000000002", "[\"rulingFactId\"]"],
+              ["dr_00000000-0000-4000-8000-000000000003", failing_fact_fields]
+            ]} =
+             DB.query(
+               db,
+               "SELECT requestId,failingFields FROM decision_request_integrity_evidence WHERE firstSurface='migration-preflight' AND observerPrincipal='process:tightbeam' ORDER BY requestId"
+             )
+
+    assert "rulingFactId" in JSON.decode!(failing_fact_fields)
+  end
+
+  test "the harness health foundation is additive and exact", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert table_columns(db, "harness_health_observations") ==
+             ~w(id correlationId harness host failureClass evidenceKind sessionKey assignmentId observedAt cause principal incidentId)
+
+    assert table_columns(db, "harness_health_incidents") ==
+             ~w(id harness host failureClass state openedAt openObservationId openedFactId resolvedAt resolutionObservationId resolvedFactId)
+
+    assert table_columns(db, "harness_health_members") == ~w(incidentId sessionKey)
+
+    assert table_columns(db, "harness_health_assignments") ==
+             ~w(incidentId assignmentId sessionKey)
+
+    assert table_columns(db, "turn_repair_attempts") ==
+             ~w(id repairKey sourceSeq attemptSeq assignmentId principal createdAt)
+
+    assert table_columns(db, "assignment_repair_attempts") ==
+             ~w(id assignmentId repairKey requestFingerprint action principal state resultJson createdAt completedAt)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harness_health_incidents")
+  end
+
+  test "the exact v6 predecessor gains a nullable stored message discriminator", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    {:appended, historical} =
+      Projection.append(db, %{
+        session_key: "historical",
+        role: "assistant",
+        content: "stored before the discriminator"
+      })
+
+    :ok = DB.execute(db, "ALTER TABLE messages DROP COLUMN messageType")
+    remove_controller_root_link(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v6', stampedAt=1"
+      )
+
+    assert :ok = Schema.upgrade_message_type_v1(db)
+    assert "messageType" in table_columns(db, "messages")
+
     assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+
+    restored = Projection.get(db, historical.id)
+    assert restored.message_type == nil
+    assert restored.role == historical.role
+    assert restored.content == historical.content
   end
 
   test "the shared liveness activation creates one exact additive shape", %{db: db} do
@@ -80,7 +307,8 @@ defmodule Tightbeam.SchemaShapeTest do
              ~w(attestId assignmentId attestTs generation recoveryBaseline cause principal)
 
     assert table_columns(db, "supervision_liveness_sidecar") ==
-             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded)
+             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded) ++
+               ["rootTurnSeq"]
 
     assert table_columns(db, "wake_cancellations") ==
              ~w(wakeId wakeState canceledAt requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind replacementWakeId dispositionKind dispositionId primaryWorkKind primaryWorkId workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)
@@ -249,22 +477,22 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
     assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
+    assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
-  test "the exact v6 predecessor is refused before v7 DDL", %{db: db} do
+  test "the exact v13 predecessor is refused before v14 DDL", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v6'")
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v13'")
     before = table_columns(db, "assignments")
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-    assert error.message =~ "stamped: coordination-fabric-v1-phase1-v6"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v7"
+    assert error.message =~ "stamped: coordination-fabric-v1-phase1-v13"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v14"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v13"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
@@ -298,7 +526,6 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     refute "operationalParent" in table_columns(db, "sessions")
-
     assert :ok = Schema.upgrade_operational_parent_v1(db)
 
     assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
@@ -364,11 +591,172 @@ defmodule Tightbeam.SchemaShapeTest do
 
     refute "operationalParent" in table_columns(db, "sessions")
     refute table?(db, "sessions_operational_parent_v1")
-
     assert :ok = Schema.upgrade_operational_parent_v1(db)
 
     assert {:ok, [[^main_key]]} =
              DB.query(db, "SELECT operationalParent FROM sessions WHERE kind='main'")
+  end
+
+  test "the exact v8 predecessor preserves explicit parents and becomes nullable", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    main = Org.get(db, Org.personal_session_key("flynn"))
+    root = session(db, "root", "flynn")
+    child = session(db, "child", "flynn", spawned_by: root.session_key)
+
+    %{operational_parent: main_parent} =
+      Org.set_operational_parent(db, root.session_key, main.session_key)
+
+    assert main_parent == main.session_key
+
+    %{operational_parent: child_parent} =
+      Org.set_operational_parent(db, child.session_key, root.session_key)
+
+    assert child_parent == root.session_key
+    downgrade_to_v8(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    parent_column =
+      Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+        name == "operationalParent"
+      end)
+
+    assert Enum.at(parent_column, 3) == 1
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO assignments
+          (id,subject,holderKey,openedByUser,openedAt)
+        VALUES ('asg_historical_root','historical controller','child','flynn',1);
+        INSERT INTO wakes
+          (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,assignmentId)
+        VALUES
+          ('w_historical_root','root','process:tightbeam','historical','prompt',0,'pending',1,
+           'asg_historical_root');
+        INSERT INTO supervision_liveness_sidecar
+          (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,chargedGeneration)
+        VALUES
+          ('w_historical_root','asg_historical_root','scheduled','prod','pending',1);
+        """
+      )
+
+    assert {:ok, [historical_before]} =
+             DB.query(
+               db,
+               "SELECT * FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+             )
+
+    assert :ok = Schema.upgrade_nullable_effective_parent_v1(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok,
+            [
+              [main_key, nil, main_parent],
+              [child_key, root_key, child_parent],
+              [root_key, nil, root_parent]
+            ]} =
+             DB.query(
+               db,
+               "SELECT sessionKey,spawnedBy,operationalParent FROM sessions ORDER BY sessionKey"
+             )
+
+    assert main_key == main.session_key
+    assert main_parent == main.session_key
+    assert child_key == child.session_key
+    assert child_parent == root.session_key
+    assert root_key == root.session_key
+    assert root_parent == main.session_key
+
+    nullable_column =
+      Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+        name == "operationalParent"
+      end)
+
+    assert Enum.at(nullable_column, 3) == 0
+
+    assert {:ok, [historical_after]} =
+             DB.query(
+               db,
+               "SELECT * FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+             )
+
+    assert Enum.take(historical_after, length(historical_before)) == historical_before
+    assert List.last(historical_after) == nil
+
+    assert {:ok, :historical_unknown} =
+             DB.transaction(db, fn txn ->
+               Supervision.controller_coverage_in_txn(txn, "asg_historical_root", 1)
+             end)
+
+    for _ <- 1..10 do
+      assert {:ok, [[nil]]} =
+               DB.query(
+                 db,
+                 "SELECT rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
+               )
+    end
+  end
+
+  test "each interrupted nullable-parent upgrade rolls back and retries exactly", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    for point <- [
+          :after_root_copy,
+          :after_root_drop,
+          :after_root_restore,
+          :after_root_link,
+          :after_copy,
+          :after_drop,
+          :after_rename,
+          :after_migration,
+          :after_stamp
+        ] do
+      downgrade_to_v8(db)
+
+      error =
+        assert_raise Schema.ShapeError, fn ->
+          Schema.upgrade_nullable_effective_parent_v1(db, fail_at: point)
+        end
+
+      assert error.message =~ "forced nullable-effective-parent migration interruption"
+
+      assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+
+      column =
+        Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
+          name == "operationalParent"
+        end)
+
+      assert Enum.at(column, 3) == 1
+      refute table?(db, "sessions_effective_parent_v1")
+      assert :ok = Schema.upgrade_nullable_effective_parent_v1(db)
+      assert :ok = Schema.upgrade_identity_render_stamp_v1(db)
+      assert :ok = Schema.upgrade_effort_request_exit_v1(db)
+      assert :ok = Schema.upgrade_session_mechanical_status_v1(db)
+    end
   end
 
   # The defect this refuses: `CREATE TABLE IF NOT EXISTS` is SILENT about a
@@ -450,7 +838,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "some-later-shape"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ @shape
   end
 
   # Sol xhigh review round 2, finding 2 (wave 1): `classElection`'s CHECK
@@ -512,7 +900,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ @shape
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or widen the constraint in place.
@@ -632,7 +1020,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ @shape
     assert error.message =~ "no migration"
 
     # It REFUSED — it did not repair or relax the constraint in place.
@@ -703,7 +1091,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-classes-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ @shape
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's decision_requests columns were never
@@ -816,7 +1204,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v2"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ @shape
     assert error.message =~ "no migration"
 
     # It REFUSED — the merged build's wakes class/delivery columns were never
@@ -855,7 +1243,7 @@ defmodule Tightbeam.SchemaShapeTest do
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert error.message =~ "coordination-fabric-v1-phase1-v3"
-    assert error.message =~ "coordination-fabric-v1-phase1-v7"
+    assert error.message =~ @shape
     assert error.message =~ "no migration"
 
     assert {:ok, [[ddl]]} =
@@ -886,16 +1274,95 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_previous_shape(db) do
+    remove_controller_root_link(db)
     :ok = DB.execute(db, "DROP TRIGGER users_gateway_owned_insert")
     :ok = DB.execute(db, "DROP TABLE cold_start_receipts")
     :ok = DB.execute(db, "ALTER TABLE users DROP COLUMN creationKind")
     :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN operationalParent")
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
+    :ok = DB.execute(db, "ALTER TABLE messages DROP COLUMN messageType")
 
     {:ok, _} =
       DB.query(
         db,
         "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v4', stampedAt=1"
       )
+
+    :ok
+  end
+
+  defp downgrade_to_v8(db) do
+    remove_controller_root_link(db)
+
+    {:ok, :ok} =
+      DB.foreign_key_rebuild(db, fn txn ->
+        :ok = DB.Txn.exec(txn, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
+
+        DB.Txn.q(
+          txn,
+          "UPDATE sessions SET operationalParent='agent:main:clawline:' || ownerUserId || ':main' WHERE operationalParent IS NULL"
+        )
+
+        [[ddl]] =
+          DB.Txn.q(
+            txn,
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='sessions'"
+          )
+
+        predecessor_ddl =
+          ~r/CREATE TABLE(?: IF NOT EXISTS)? "?sessions"?/
+          |> Regex.replace(ddl, "CREATE TABLE sessions_v8")
+          |> then(
+            &Regex.replace(
+              ~r/operationalParent\s+TEXT\s+REFERENCES/,
+              &1,
+              "operationalParent TEXT NOT NULL REFERENCES"
+            )
+          )
+
+        :ok = DB.Txn.exec(txn, predecessor_ddl)
+
+        DB.Txn.q(
+          txn,
+          """
+          INSERT INTO sessions_v8
+          SELECT * FROM sessions ORDER BY createdAt,sessionKey
+          """
+        )
+
+        :ok = DB.Txn.exec(txn, "DROP TABLE sessions")
+        :ok = DB.Txn.exec(txn, "ALTER TABLE sessions_v8 RENAME TO sessions")
+
+        DB.Txn.q(
+          txn,
+          "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v8', stampedAt=1"
+        )
+
+        :ok
+      end)
+
+    :ok
+  end
+
+  defp remove_controller_root_link(db) do
+    {:ok, :ok} =
+      DB.foreign_key_rebuild(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "SELECT type, name FROM sqlite_master WHERE type IN ('index','trigger') AND sql LIKE '%rootTurnSeq%'"
+        )
+        |> Enum.each(fn [type, name] ->
+          :ok = DB.Txn.exec(txn, "DROP #{String.upcase(type)} IF EXISTS #{name}")
+        end)
+
+        :ok =
+          DB.Txn.exec(
+            txn,
+            "ALTER TABLE supervision_liveness_sidecar DROP COLUMN rootTurnSeq"
+          )
+
+        :ok
+      end)
 
     :ok
   end

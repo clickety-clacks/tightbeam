@@ -65,8 +65,19 @@ defmodule Tightbeam.AssignmentsTest do
 
     Enum.each(invalid, fn values ->
       assert {:error, %DB.Error{message: message}} = DB.query(db, base <> values)
-      assert message =~ "CHECK constraint"
+
+      assert message =~ "CHECK constraint" or
+               message =~ "revoked assignment requires revocation provenance"
     end)
+
+    assert {:error, %DB.Error{message: trigger_error}} =
+             DB.query(
+               db,
+               base <>
+                 "('a10','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,'flynn',NULL,NULL)"
+             )
+
+    assert trigger_error =~ "revoked assignment requires revocation provenance"
 
     assert {:error, %DB.Error{}} =
              DB.query(
@@ -1880,6 +1891,233 @@ defmodule Tightbeam.AssignmentsTest do
                "SELECT priorOutcome FROM assignment_reopenings WHERE assignmentId = ?1",
                [assignment.id]
              )
+
+    assert {:ok, [[1, "test revocation"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*), min(reason)
+               FROM assignment_revocations WHERE assignmentId = ?1
+               """,
+               [assignment.id]
+             )
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "second revocation")
+             )
+
+    assert %{revocationReason: "second revocation"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[2, "second revocation", "test revocation"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*), min(reason), max(reason)
+               FROM assignment_revocations WHERE assignmentId = ?1
+               """,
+               [assignment.id]
+             )
+  end
+
+  test "reopened same-millisecond revocations bind reads and replay to the exact generation",
+       ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "generation identity"))
+    assignment_id = assignment.id
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "first reason")
+             )
+
+    assert {:ok, [[first_id, closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id, revokedAt FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "the first close was mistaken")
+             )
+
+    # The first immutable row has the same actor and timestamp as the target
+    # close below, but belongs to the initial generation. It cannot satisfy the
+    # post-reopen close trigger.
+    assert {:error, %DB.Error{message: old_generation_error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id, closed_at]
+             )
+
+    assert old_generation_error =~ "revoked assignment requires revocation provenance"
+
+    assert {:ok, [[reopening_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM assignment_reopenings WHERE assignmentId=?1 ORDER BY id DESC LIMIT 1",
+               [assignment.id]
+             )
+
+    second_id = "revocation-second-generation"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_revocations
+                 (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+               VALUES (?1, ?2, ?3, 'flynn', NULL, 'second reason')
+               """,
+               [second_id, assignment.id, closed_at]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_revocation_generations
+                 (revocationId, assignmentId, reopeningId)
+               VALUES (?1, ?2, ?3)
+               """,
+               [second_id, assignment.id, reopening_id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id, closed_at]
+             )
+
+    assert %{revocationReason: "second reason"} =
+             current =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert %{assignment: %{revocationReason: "second reason"}} =
+             WorkState.detail(ctx.db, assignment.id)
+
+    assert %{
+             "class" => "assignment.closed",
+             "payload" => %{"revocationReason" => "second reason"}
+           } =
+             Tightbeam.Firehose.Publisher.state_notice(
+               ctx.db,
+               call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+               current
+             )
+
+    assert %{id: ^assignment_id, revocationReason: "second reason"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               call("revoke-assignment", {:user, "flynn"}, nil, %{
+                 assignment_id: assignment.id,
+                 reason: "second reason"
+               })
+             )
+
+    assert {:ok, [[^second_id, ^reopening_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revocationId, reopeningId
+               FROM assignment_revocation_generations
+               WHERE assignmentId=?1 AND reopeningId IS NOT NULL
+               """,
+               [assignment.id]
+             )
+
+    assert {:ok, [[^first_id, nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revocationId, reopeningId
+               FROM assignment_revocation_generations
+               WHERE assignmentId=?1 AND reopeningId IS NULL
+               """,
+               [assignment.id]
+             )
+  end
+
+  test "generation upgrade replaces the predecessor tuple trigger before a reopened close", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade generation"))
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedAt FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "upgrade needs a new generation")
+             )
+
+    # Simulate the exact predecessor: no generation table and the former
+    # timestamp/actor trigger body under its stable trigger name.
+    :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocation_generations")
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TRIGGER assignments_revocation_reason_required
+        BEFORE UPDATE OF state, outcome, closedAt, closedByUser, closedBySession ON assignments
+        WHEN NEW.state = 'closed' AND NEW.outcome = 'revoked'
+          AND NOT EXISTS (
+            SELECT 1 FROM assignment_revocations r
+            WHERE r.assignmentId = NEW.id
+              AND r.revokedAt = NEW.closedAt
+              AND r.revokedByUser IS NEW.closedByUser
+              AND r.revokedBySession IS NEW.closedBySession
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'revoked assignment requires revocation provenance');
+        END
+        """
+      )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:error, %DB.Error{message: error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id, closed_at]
+             )
+
+    assert error =~ "revoked assignment requires revocation provenance"
   end
 
   test "a failure after the history insert rolls back the whole reopen (Sol xhigh review, finding 7)",
@@ -2090,7 +2328,8 @@ defmodule Tightbeam.AssignmentsTest do
     assert revocation.closingAttestId == nil
 
     assert Enum.all?(Projection.list_after(ctx.db, "holder", nil, 100), fn marker ->
-             marker.role == "assistant" and marker.sender == "process:tightbeam"
+             marker.role == "assistant" and marker.sender == "process:tightbeam" and
+               marker.message_type == "substrate"
            end)
   end
 
@@ -2130,6 +2369,473 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "revoke-assignment", revoke_call(nil, assignment.id))
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
+  end
+
+  test "revocation requires one durable bounded reason and projects its provenance", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reason required"))
+
+    for params <- [
+          %{assignment_id: assignment.id},
+          %{assignment_id: assignment.id, reason: "   "},
+          %{assignment_id: assignment.id, reason: "\t"},
+          %{assignment_id: assignment.id, reason: "\u00A0"},
+          %{assignment_id: assignment.id, reason: "\u3000"},
+          %{assignment_id: assignment.id, reason: String.duplicate("x", 2001)},
+          %{assignment_id: assignment.id, reason: 7}
+        ] do
+      assert %{code: code} =
+               handle(
+                 ctx,
+                 "revoke-assignment",
+                 call("revoke-assignment", {:user, "flynn"}, nil, params)
+               )
+
+      assert code in ["missing_reason", "invalid_reason"]
+    end
+
+    assert %{state: "open", revocationReason: nil} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId = ?1",
+               [
+                 assignment.id
+               ]
+             )
+
+    for {reason, suffix} <- [{"\t", "tab"}, {"\u00A0", "nbsp"}, {"\u3000", "ideographic"}] do
+      assert {:error, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                 VALUES (?1, ?2, 1, 'flynn', NULL, ?3)
+                 """,
+                 ["revocation-whitespace-#{suffix}", assignment.id, reason]
+               )
+    end
+
+    revoked =
+      handle(
+        ctx,
+        "revoke-assignment",
+        call("revoke-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: "the work moved to its replacement"
+        })
+      )
+
+    assert revoked.revocationReason == "the work moved to its replacement"
+    assert revoked.closedByUser == "flynn"
+
+    assert %{revocationReason: "the work moved to its replacement"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert %{
+             "class" => "assignment.closed",
+             "payload" => %{"revocationReason" => "the work moved to its replacement"}
+           } =
+             Tightbeam.Firehose.Publisher.state_notice(
+               ctx.db,
+               call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+               revoked
+             )
+
+    assert {:ok, [["flynn", nil, closed_at, "the work moved to its replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedByUser, revokedBySession, revokedAt, reason FROM assignment_revocations WHERE assignmentId = ?1",
+               [assignment.id]
+             )
+
+    assert closed_at == revoked.closedAt
+
+    replayed =
+      handle(
+        ctx,
+        "revoke-assignment",
+        call("revoke-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: "the work moved to its replacement"
+        })
+      )
+
+    assert replayed.id == assignment.id
+    assert replayed.revocationReason == "the work moved to its replacement"
+
+    admin_revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "admin revocation"))
+
+    assert %{closedByUser: "admin"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "admin"}, admin_revoked.id)
+             )
+
+    assert %{code: "assignment_closed"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, admin_revoked.id)
+             )
+
+    assert %{code: "assignment_closed"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               call("revoke-assignment", {:user, "flynn"}, nil, %{
+                 assignment_id: assignment.id,
+                 reason: "a conflicting reason"
+               })
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId = ?1",
+               [
+                 assignment.id
+               ]
+             )
+  end
+
+  test "legacy revoked assignments migrate only to the explicit unknown sentinel", ctx do
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required_insert")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id, subject, holderKey, holderFallback, openedByUser, openedAt, state, outcome,
+                  closedAt, closedByUser)
+               VALUES ('asg_legacy_reason', 'legacy', 'holder', 0, 'flynn', 1, 'closed', 'revoked', 2, 'flynn')
+               """
+             )
+
+    :ok = Assignments.ensure_schema(ctx.db)
+
+    assert %{revocationReason: "legacy_unknown", closedByUser: "flynn", closedAt: 2} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:user, "flynn"}, "asg_legacy_reason")
+             )
+
+    assert {:ok, [["legacy:asg_legacy_reason:2", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revocationId, reopeningId
+               FROM assignment_revocation_generations
+               WHERE assignmentId='asg_legacy_reason'
+               """
+             )
+  end
+
+  test "schema restart preserves one recorded revocation reason without a legacy sentinel", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "restart provenance"))
+
+    assert %{outcome: "revoked", revocationReason: "recorded reason"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "recorded reason")
+             )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:ok, [[1, "recorded reason"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*), min(reason)
+               FROM assignment_revocations WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert %{revocationReason: "recorded reason"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+  end
+
+  test "revocation replay emits no second state callback or accepted handoff", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "replay notices"))
+
+    call =
+      revoke_call({:user, "flynn"}, assignment.id)
+      |> Map.merge(%{
+        firehose_in_txn: true,
+        firehose_hub: self(),
+        on_assignment_change: fn _, _ -> send(self(), :assignment_changed) end
+      })
+
+    assert %{id: assignment_id} = handle(ctx, "revoke-assignment", call)
+    assert assignment_id == assignment.id
+    assert_receive {:"$gen_cast", {:accepted, nil, %{verb: "revoke-assignment"}, _}}
+    assert_receive :assignment_changed
+
+    assert %{id: ^assignment_id} = handle(ctx, "revoke-assignment", call)
+    refute_received {:"$gen_cast", {:accepted, nil, %{verb: "revoke-assignment"}, _}}
+    refute_received :assignment_changed
+  end
+
+  test "retirement attributes revocation provenance to the acting session", ctx do
+    caller = session(ctx.db, "agent:retirement-caller", "flynn")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "retirement actor"))
+
+    assert {:ok, [_]} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "flynn",
+                 caller.session_key
+               )
+             end)
+
+    assert {:ok, [[nil, "agent:retirement-caller", "holder session retired"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revokedByUser, revokedBySession, reason
+               FROM assignment_revocations WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert {:ok, [[nil, "agent:retirement-caller"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT closedByUser, closedBySession FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+  end
+
+  test "revocation provenance cannot be rewritten or deleted", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "immutable provenance"))
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert {:error, %DB.Error{message: update_error}} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_revocations SET reason='rewritten reason' WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert update_error =~ "revocation provenance is immutable"
+
+    assert {:error, %DB.Error{message: delete_error}} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert delete_error =~ "revocation provenance is immutable"
+
+    assert {:error, %DB.Error{message: generation_update_error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignment_revocation_generations
+               SET reopeningId=1 WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert generation_update_error =~ "revocation generation is immutable"
+
+    assert {:error, %DB.Error{message: generation_delete_error}} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_revocation_generations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert generation_delete_error =~ "revocation generation is immutable"
+
+    assert {:ok, [["test revocation"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reason FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  test "process retirement refuses rather than attributing the holder owner", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "recovery provenance"))
+
+    assert {:error, %ArgumentError{message: message}} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "flynn",
+                 "process:tightbeam"
+               )
+             end)
+
+    assert message =~ "requires a representable user or session principal"
+
+    assert {:ok, [["open", 0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT state,
+                 (SELECT count(*) FROM assignment_revocations WHERE assignmentId=assignments.id)
+               FROM assignments WHERE id=?1
+               """,
+               [assignment.id]
+             )
+  end
+
+  test "upgrade rebuilds revocation provenance with the Unicode whitespace constraint", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade reason"))
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+    :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocation_generations")
+    :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocations")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TABLE assignment_revocations (
+          id TEXT PRIMARY KEY,
+          assignmentId TEXT NOT NULL REFERENCES assignments(id),
+          revokedAt INTEGER NOT NULL,
+          revokedByUser TEXT NULL REFERENCES users(userId),
+          revokedBySession TEXT NULL REFERENCES sessions(sessionKey),
+          reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000 AND length(trim(reason)) >= 1),
+          CHECK((revokedByUser IS NOT NULL) != (revokedBySession IS NOT NULL))
+        );
+        CREATE INDEX assignment_revocations_assignment
+          ON assignment_revocations (assignmentId, revokedAt, id);
+        DELETE FROM assignment_revocation_migrations;
+        """
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_revocations
+                 (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+               VALUES ('revocation-pre-upgrade', ?1, 42, 'flynn', NULL, 'superseded')
+               """,
+               [assignment.id]
+             )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:ok, [["superseded", 42, "flynn", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT reason, revokedAt, revokedByUser, revokedBySession
+               FROM assignment_revocations
+               WHERE id='revocation-pre-upgrade'
+               """
+             )
+
+    assert {:error, %DB.Error{message: immutable_error}} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_revocations SET reason='rewritten' WHERE id='revocation-pre-upgrade'"
+             )
+
+    assert immutable_error =~ "revocation provenance is immutable"
+
+    assert {:error, %DB.Error{message: trigger_error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=43, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id]
+             )
+
+    assert trigger_error =~ "revoked assignment requires revocation provenance"
+
+    for code_point <- [
+          9,
+          10,
+          11,
+          12,
+          13,
+          32,
+          133,
+          160,
+          5760,
+          8192,
+          8193,
+          8194,
+          8195,
+          8196,
+          8197,
+          8198,
+          8199,
+          8200,
+          8201,
+          8202,
+          8232,
+          8233,
+          8239,
+          8287,
+          12288
+        ] do
+      assert {:error, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                 VALUES (?1, ?2, 43, 'flynn', NULL, ?3)
+                 """,
+                 [
+                   "revocation-upgrade-whitespace-#{code_point}",
+                   assignment.id,
+                   <<code_point::utf8>>
+                 ]
+               )
+    end
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT count(*) FROM assignment_revocation_migrations
+                  WHERE migrationId='0.2.0/revocation-reason-unicode-whitespace-v1'),
+                 (SELECT count(*) FROM assignment_revocations
+                  WHERE id='revocation-pre-upgrade')
+               """
+             )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT count(*) FROM assignment_revocation_migrations
+                  WHERE migrationId='0.2.0/revocation-reason-unicode-whitespace-v1'),
+                 (SELECT count(*) FROM assignment_revocations
+                  WHERE id='revocation-pre-upgrade')
+               """
+             )
   end
 
   test "query filters, deterministic ordering, role-resolved holder input, and open_count", ctx do
@@ -2399,7 +3105,7 @@ defmodule Tightbeam.AssignmentsTest do
     do: call("assignment-get", principal, nil, %{assignment_id: id})
 
   defp revoke_call(principal, id),
-    do: call("revoke-assignment", principal, nil, %{assignment_id: id})
+    do: call("revoke-assignment", principal, nil, %{assignment_id: id, reason: "test revocation"})
 
   defp reopen_call(principal, id, reason),
     do:

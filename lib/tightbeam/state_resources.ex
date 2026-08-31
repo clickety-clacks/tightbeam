@@ -114,6 +114,72 @@ defmodule Tightbeam.StateResources do
 
   def query_artifact(db, id), do: Artifacts.get(db, id)
 
+  def query_attest(db, id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser,
+               producer, producerCommand, byHarness, byProvider, commitRefs, ts
+        FROM attests WHERE id = ?1
+        """,
+        [id]
+      )
+
+    case rows do
+      [
+        [
+          id,
+          assignment_id,
+          kind,
+          verdict_kind,
+          note,
+          by_session,
+          by_user,
+          producer,
+          producer_command,
+          by_harness,
+          by_provider,
+          commit_refs,
+          ts
+        ]
+      ] ->
+        %{
+          id: id,
+          assignment_id: assignment_id,
+          kind: kind,
+          verdict_kind: verdict_kind,
+          note: note,
+          by_session: by_session,
+          by_user: by_user,
+          producer: producer,
+          producer_command: producer_command,
+          by_harness: by_harness,
+          by_provider: by_provider,
+          commit_refs: if(is_binary(commit_refs), do: JSON.decode!(commit_refs), else: nil),
+          ts: ts
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  def query_condition_fact(db, id) do
+    {:ok, rows} =
+      DB.query(db, "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1", [id])
+
+    case rows do
+      [[fact_id, ts, kind, scope, origin]] ->
+        %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+
+      [] ->
+        nil
+    end
+  end
+
+  def query_message(db, id), do: Tightbeam.Projection.get(db, id)
+
   def query_device(db, id) do
     case Devices.by_id(db, id) do
       nil -> nil
@@ -489,11 +555,36 @@ defmodule Tightbeam.StateResources do
   def wake(row), do: public(row)
   def production(row), do: row |> public() |> correlate("eventId", "seq")
   def turn(row), do: row |> public() |> correlate("turnSeq", "seq")
+
+  def decision_request(%{status: "ruled"} = row) do
+    unless complete_ruled_decision?(row) do
+      raise ArgumentError, "decision_request_integrity_invalid"
+    end
+
+    case row do
+      %{kind: "operator"} ->
+        row |> Tightbeam.Escalation.terminal_operator_projection() |> public()
+
+      _ ->
+        public(row)
+    end
+  end
+
   def decision_request(row), do: public(row)
   def session(row), do: public(row)
   def role(row), do: row |> public() |> correlate("role", "name")
   def artifact(row), do: public(row)
-  def message(row), do: public(row)
+
+  def message(row) do
+    stored_type = value(row, :message_type)
+    row = public(row)
+
+    case stored_type do
+      nil -> Map.delete(row, "messageType")
+      type when is_binary(type) -> Map.put(row, "messageType", type)
+      _other -> raise ArgumentError, "messageType must be a string when present"
+    end
+  end
 
   def condition_fact(row) do
     row = public(row)
@@ -1040,7 +1131,7 @@ defmodule Tightbeam.StateResources do
   defp config_row([key, value, updated_at, row_version]) do
     %{
       key: key,
-      value: if(key == "default-archetype", do: value, else: nil),
+      value: if(key in ["default-archetype", "default-priority"], do: value, else: nil),
       updated_at: updated_at,
       row_version: row_version
     }
@@ -1115,6 +1206,13 @@ defmodule Tightbeam.StateResources do
 
   defp collection_item_matches?(item, filters) do
     Enum.all?(filters, fn {field, value} -> item[field] == value end)
+  end
+
+  defp complete_ruled_decision?(row) do
+    Enum.all?([value(row, :decision), value(row, :ruled_by)], fn
+      text when is_binary(text) -> String.trim(text) != ""
+      _ -> false
+    end) and is_integer(value(row, :ruled_at))
   end
 
   defp camel_key(field) do

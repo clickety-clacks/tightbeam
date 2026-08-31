@@ -7,12 +7,18 @@
 # The directory Mix downloads your dependencies sources to.
 /deps/
 
+# Native cursor-signing lock primitive built by elixir_make.
+/priv/cursor_signing_native.so
+
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/
 
 # Temporary files, for example, from tests.
 /tmp/
 /scratch/
+/native/topline_unicode/target/
+/priv/topline_unicode.so
+/priv/topline_unicode.dylib
 
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump

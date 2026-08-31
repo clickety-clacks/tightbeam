@@ -74,6 +74,7 @@ defmodule Tightbeam.Placement do
     Archetypes,
     DB,
     Harness,
+    HarnessHealth,
     Homes,
     Identity,
     Org,
@@ -1339,7 +1340,7 @@ defmodule Tightbeam.Placement do
       process_ssh: host_config.ssh,
       process_identity_dir: host_config.base_dir,
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
-      on_auth_event: auth_event_handler(host, module),
+      on_auth_event: auth_event_handler(config, host, module),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
     ]
@@ -1445,15 +1446,36 @@ defmodule Tightbeam.Placement do
     })
   end
 
-  defp auth_event_handler(host, module) do
+  defp auth_event_handler(config, host, module) do
+    db = Map.get(config, :db, DB)
+
     fn classification, event ->
       if classification == :terminal do
         Task.Supervisor.start_child(Tightbeam.TurnTaskSupervisor, fn ->
-          case Tightbeam.Credentials.mark_terminal(
-                 module.credential_provider(),
-                 event,
-                 Tightbeam.Credentials.server(host)
-               ) do
+          try do
+            HarnessHealth.observe_provider_invalidation(db, module.id(), host, event,
+              principal: "process:tightbeam/provider:#{module.credential_provider()}"
+            )
+          rescue
+            error ->
+              Logger.error(
+                "harness auth incident record failed for #{module.id()} on #{host}: " <>
+                  Exception.format(:error, error, __STACKTRACE__)
+              )
+          end
+
+          mark_result =
+            try do
+              Tightbeam.Credentials.mark_terminal(
+                module.credential_provider(),
+                event,
+                Tightbeam.Credentials.server(host)
+              )
+            catch
+              :exit, reason -> {:error, {:credential_owner_exit, reason}}
+            end
+
+          case mark_result do
             :ok ->
               :ok
 

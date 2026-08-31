@@ -904,9 +904,18 @@ defmodule Tightbeam.ExecutionMapTest do
     session!(ctx.db, "s_real", "flynn")
     item!(ctx.db, "wi_routed")
 
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-toplines-router-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
     opts = [
       db: ctx.db,
-      base_dir: System.tmp_dir!(),
+      base_dir: base_dir,
+      cursor_signing: cursor_signing!(base_dir),
       handlers: %{
         "toplines" => fn call -> ExecutionMap.roster(ctx.db, call) end,
         "topline" => fn call -> ExecutionMap.topline(ctx.db, call) end
@@ -1116,6 +1125,32 @@ defmodule Tightbeam.ExecutionMapTest do
   end
 
   defp close!(db, id, outcome, closing_attest_id) do
+    if outcome == "revoked" do
+      revocation_id = "revocation:#{id}"
+
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO assignment_revocations
+            (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+          VALUES (?1, ?2, ?3, 'flynn', NULL, 'execution-map test revocation')
+          """,
+          [revocation_id, id, @default_created + 1]
+        )
+
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO assignment_revocation_generations
+            (revocationId, assignmentId, reopeningId)
+          VALUES (?1, ?2, NULL)
+          """,
+          [revocation_id, id]
+        )
+    end
+
     {:ok, _} =
       DB.query(
         db,

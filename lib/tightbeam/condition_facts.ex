@@ -17,13 +17,46 @@ defmodule Tightbeam.ConditionFacts do
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
-  @reserved_kinds ~w(quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present)
+  @reserved_kinds ~w(
+    quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present
+    harness-auth-dead harness-auth-restored
+    harness-rate-limit-dead harness-rate-limit-restored
+    harness-adapter-unavailable harness-adapter-restored
+    harness-model-unavailable harness-model-restored
+    harness-task-crash harness-task-restored
+    harness-interrupted-outcome-unknown harness-interrupted-outcome-reconciled
+  )
   @agent_only_kinds ~w(work-blocked work-unblocked)
 
   @standing_pairs %{
     "work-blocked" => "work-unblocked",
-    "user-alerted" => "user-alert-cleared"
+    "user-alerted" => "user-alert-cleared",
+    "harness-auth-dead" => "harness-auth-restored",
+    "harness-rate-limit-dead" => "harness-rate-limit-restored",
+    "harness-adapter-unavailable" => "harness-adapter-restored",
+    "harness-model-unavailable" => "harness-model-restored",
+    "harness-task-crash" => "harness-task-restored",
+    "harness-interrupted-outcome-unknown" => "harness-interrupted-outcome-reconciled"
   }
+
+  @harness_health_kinds %{
+    {"auth-dead", :assert} => "harness-auth-dead",
+    {"auth-dead", :retract} => "harness-auth-restored",
+    {"rate-limit-dead", :assert} => "harness-rate-limit-dead",
+    {"rate-limit-dead", :retract} => "harness-rate-limit-restored",
+    {"adapter_unavailable", :assert} => "harness-adapter-unavailable",
+    {"adapter_unavailable", :retract} => "harness-adapter-restored",
+    {"model_unavailable", :assert} => "harness-model-unavailable",
+    {"model_unavailable", :retract} => "harness-model-restored",
+    {"task_crash", :assert} => "harness-task-crash",
+    {"task_crash", :retract} => "harness-task-restored",
+    {"interrupted-outcome-unknown", :assert} => "harness-interrupted-outcome-unknown",
+    {"interrupted-outcome-unknown", :retract} => "harness-interrupted-outcome-reconciled"
+  }
+  @harness_failure_classes ~w(
+    auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
+    interrupted-outcome-unknown
+  )
 
   @ddl """
   CREATE TABLE IF NOT EXISTS condition_facts (
@@ -209,6 +242,62 @@ defmodule Tightbeam.ConditionFacts do
       )
 
     match?([[^assert_kind]], rows)
+  end
+
+  @doc "The literal condition scope for one shared harness process."
+  @spec harness_scope(String.t(), String.t()) :: String.t()
+  def harness_scope(harness, host)
+      when is_binary(harness) and harness != "" and is_binary(host) and host != "" do
+    JSON.encode!([harness, host])
+  end
+
+  @doc "Whether one failure class currently stands for a shared harness process."
+  @spec harness_failure_standing?(DB.server(), String.t(), String.t(), String.t()) :: boolean()
+  def harness_failure_standing?(db, harness, host, failure_class) do
+    standing?(
+      db,
+      Map.fetch!(@harness_health_kinds, {failure_class, :assert}),
+      harness_scope(harness, host)
+    )
+  end
+
+  @doc "Whether either distinct harness failure class currently stands."
+  @spec harness_unavailable?(DB.server(), String.t(), String.t()) :: boolean()
+  def harness_unavailable?(db, harness, host) do
+    Enum.any?(
+      @harness_failure_classes,
+      fn failure_class ->
+        harness_failure_standing?(db, harness, host, failure_class)
+      end
+    )
+  end
+
+  @doc "The transaction-owned form of the all-class harness availability gate."
+  @spec harness_unavailable_in_txn?(Txn.t(), String.t(), String.t()) :: boolean()
+  def harness_unavailable_in_txn?(%Txn{} = txn, harness, host) do
+    scope = harness_scope(harness, host)
+
+    Enum.any?(@harness_failure_classes, fn failure_class ->
+      assert_kind = Map.fetch!(@harness_health_kinds, {failure_class, :assert})
+      standing_in_txn?(txn, assert_kind, scope)
+    end)
+  end
+
+  @doc "File one harness-health assertion or retraction inside its incident transaction."
+  @spec file_harness_health_in_txn(
+          Txn.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          :assert | :retract
+        ) :: map()
+  def file_harness_health_in_txn(%Txn{} = txn, harness, host, failure_class, transition)
+      when transition in [:assert, :retract] do
+    file_in_txn(txn, %{
+      kind: Map.fetch!(@harness_health_kinds, {failure_class, transition}),
+      scope: harness_scope(harness, host),
+      origin: "process:tightbeam"
+    })
   end
 
   @doc """

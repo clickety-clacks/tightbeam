@@ -17,7 +17,8 @@ tightbeam refuses a command, it names the rule that refused it. Read the reason.
 Run `tightbeam list`. It returns the sessions you can address, the archetypes in this org,
 the hosts (machines agents run on), and the model catalog (the model names you may use). Use
 a model name from that catalog exactly. Each session row names the host it runs on — yours
-included; your own session key is in `.tightbeam-session` at the root of your workdir.
+included. Run `tightbeam identity current` to print your own session key. Never open
+`.tightbeam-session`; it contains a bearer credential that the CLI reads for authenticated calls.
 
 ## Identity: who a command is attributed to
 Tightbeam attributes every command to an identity — the accountability record of who acted.
@@ -101,7 +102,11 @@ Put the question to the principal who can answer it, and get an id back:
 
     tightbeam ask --role owner --question "ship behind a flag, or block on the migration?"
 
-Read the answer with `tightbeam decision-requests` or `tightbeam decision-request --request <id>`.
+Use `tightbeam decision-requests` for your narrow queue. Use
+`tightbeam decision-request --request <complete-id>` to inspect one agent question or effort
+request whose complete id you hold. Treat the named expecter as the preferred responder, not an
+authorization gate. Reading a request is not an instruction to respond. Answer, return, continue,
+or dismiss it only when your own judgment says you should.
 
 THE QUESTION HOLDS NOTHING. Filing it does not pause your assignment, your turn, or your
 obligations — nothing in tightbeam blocks on an open question, by design. You still owe what
@@ -116,7 +121,7 @@ act for you to move on:
 
     tightbeam withdraw --request <id> --reason "worked it out from the spec"
 
-Answer a question that was put to you — and only you, or your owner, can:
+Answer a question when you hold its complete id and your judgment supplies the answer:
 
     tightbeam answer --request <id> --answer "behind a flag; the migration lands next week"
 
@@ -140,9 +145,7 @@ It counts rows and names no threshold. Reading it is how you find out whether a 
 being nibbled to death by mail before you add to the pile.
 
 ## Hire help: spawn and retire
-Start a new session:
-
-    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model gpt-5.6-sol --effort high
+Start a new session with `tightbeam spawn`.
 
 `--display` is the human label; `--name` registers a role bound to the new session so you can
 address it. Add `--archetype <name>` to give the session that archetype's identity — its
@@ -183,6 +186,9 @@ design. Work wakes from agents need none of this.
 
 ## Track work: work-items, assignments, facts
 Work is tracked as durable records, not in chat.
+Treat work items, assignments, attests, artifacts, and decision requests as durable,
+org-readable records. Name a credential by its kind and location when evidence requires it;
+never paste credential bytes into a durable record.
 - A work-item is the durable thread for one feature or bug:
 
     tightbeam work-item-create --title "voice dictation crash on resume"

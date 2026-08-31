@@ -1,7 +1,18 @@
 defmodule Tightbeam.CompletionEscalationTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, ConnRegistry, DB, Gateway, Model, Org, Wakes, WorkItems}
+  alias Tightbeam.{
+    Assignments,
+    ConnRegistry,
+    DB,
+    Gateway,
+    Model,
+    Org,
+    Placement,
+    Wakes,
+    WorkItems
+  }
+
   alias Tightbeam.Productions.CompletionEscalation
 
   setup do
@@ -9,6 +20,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     start_supervised!({DB, path: ":memory:", name: db})
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     :ok = Tightbeam.Schema.ensure_all(db)
+    assert {:ok, _} = Placement.register_host(db, "gibson", %{ssh: "gibson", base_dir: "/tmp"})
 
     {:ok, _} =
       DB.query(
@@ -81,7 +93,8 @@ defmodule Tightbeam.CompletionEscalationTest do
       outcome=completed
       causePrincipal=session:#{ctx.child.session_key}
       immediateParentSessionKey=#{ctx.parent.session_key}
-      parentRoute=spawnedBy
+      parentResolutionSource=explicit
+      parentRoute=effective-parent
       reportToSessionKey=#{ctx.report.session_key}
       remainingOpenAssignments=0
       actionNeeded=true
@@ -102,7 +115,8 @@ defmodule Tightbeam.CompletionEscalationTest do
       outcome=completed
       causePrincipal=session:#{ctx.child.session_key}
       immediateParentSessionKey=#{ctx.parent.session_key}
-      parentRoute=spawnedBy
+      parentResolutionSource=explicit
+      parentRoute=effective-parent
       reportToSessionKey=#{ctx.report.session_key}
       remainingOpenAssignments=0
       actionNeeded=true
@@ -390,6 +404,7 @@ defmodule Tightbeam.CompletionEscalationTest do
 
     assert record.routing.parent == %{
              sessionKey: ctx.main.session_key,
+             resolutionSource: "owner_main",
              routeStatus: "root-self",
              receipt: %{state: "pending", turnSeq: nil}
            }
@@ -566,7 +581,7 @@ defmodule Tightbeam.CompletionEscalationTest do
 
   test "cross-owner spawnedBy fails closed and remains diagnostic", ctx do
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+      DB.query(ctx.db, "UPDATE sessions SET operationalParent=?2 WHERE sessionKey=?1", [
         ctx.child.session_key,
         ctx.foreign.session_key
       ])
@@ -833,6 +848,7 @@ defmodule Tightbeam.CompletionEscalationTest do
       owner_user_id: owner,
       origin: "user:#{owner}",
       spawned_by: spawned_by,
+      operational_parent: spawned_by,
       archetype: "default",
       harness: "claude",
       provider: "anthropic",

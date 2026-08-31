@@ -11,6 +11,7 @@ defmodule Tightbeam.Archetypes do
   """
 
   @persist_key __MODULE__
+  alias Tightbeam.Identity.Renderer
 
   @typedoc "A validated archetype."
   @type t :: %{
@@ -76,17 +77,7 @@ defmodule Tightbeam.Archetypes do
         Map.put(loaded, archetype.name, archetype)
       end)
 
-    fragments =
-      base_dir
-      |> Path.join("identity/guidance/*.md")
-      |> Path.wildcard()
-      |> Enum.sort()
-      |> Enum.reduce(builtin_fragments(), fn path, acc ->
-        case Path.basename(path) do
-          "operating-manual.md" -> acc
-          name -> Map.put(acc, name, File.read!(path))
-        end
-      end)
+    fragments = load_fragments!(base_dir)
 
     # Validate ALL law at load: every archetype's guidance must compose
     # (missing fragments and include cycles fail the boot, not a turn), and
@@ -171,7 +162,47 @@ defmodule Tightbeam.Archetypes do
 
   @doc "Resolve includes against an explicit immutable fragment set."
   @spec resolve_guidance!(String.t(), %{optional(String.t()) => String.t()}) :: String.t()
-  def resolve_guidance!(text, fragments), do: resolve_includes(text, fragments, [])
+  def resolve_guidance!(text, fragments) do
+    Renderer.render!(text, "archetype-guidance", fragments).bytes
+  end
+
+  @doc "Compose one archetype while retaining include-graph metadata."
+  @spec guidance_render(t(), map()) :: map()
+  def guidance_render(archetype, fragments) do
+    preamble = "# Tightbeam · #{archetype.name}"
+
+    materials =
+      case archetype.references do
+        [] ->
+          nil
+
+        references ->
+          lines =
+            Enum.flat_map(references, fn reference ->
+              ["- #{reference.name}: #{reference.location}"] ++
+                if(reference.access, do: ["  access: #{reference.access}"], else: [])
+            end)
+
+          Enum.join(["## Your materials" | lines], "\n")
+      end
+
+    with_materials = if materials, do: preamble <> "\n\n" <> materials, else: preamble
+
+    rendered =
+      if archetype.guidance do
+        origin = (archetype.source && archetype.source.file) || "archetype:#{archetype.name}"
+        Renderer.render!(archetype.guidance, origin, fragments)
+      else
+        %{bytes: "", provenance: [], reachable_roots: MapSet.new(), root_occurrences: %{}}
+      end
+
+    bytes =
+      if rendered.bytes == "",
+        do: with_materials,
+        else: with_materials <> "\n\n" <> rendered.bytes
+
+    %{rendered | bytes: bytes}
+  end
 
   @doc "Validate and normalize spawn-time session overrides."
   @spec normalize_overrides(String.t(), t(), term()) ::
@@ -254,72 +285,7 @@ defmodule Tightbeam.Archetypes do
   def guidance(archetype), do: guidance_with(archetype, fragments())
 
   defp guidance_with(archetype, fragments) do
-    preamble =
-      [
-        "# Tightbeam · #{archetype.name}"
-      ]
-      |> Enum.join("\n")
-
-    materials =
-      case archetype.references do
-        [] ->
-          nil
-
-        references ->
-          lines =
-            Enum.flat_map(references, fn reference ->
-              ["- #{reference.name}: #{reference.location}"] ++
-                if(reference.access, do: ["  access: #{reference.access}"], else: [])
-            end)
-
-          Enum.join(["## Your materials" | lines], "\n")
-      end
-
-    with_materials = if materials, do: preamble <> "\n\n" <> materials, else: preamble
-
-    if archetype.guidance do
-      with_materials <> "\n\n" <> resolve_includes(archetype.guidance, fragments, [])
-    else
-      with_materials
-    end
-  end
-
-  # Include resolution: a line of exactly `#include "name.md"` is replaced by
-  # the named fragment, itself resolved (stack detects cycles; depth-capped).
-  # No other line is touched — includes only, never logic.
-  defp resolve_includes(text, fragments, stack) do
-    text
-    |> String.split("\n")
-    |> Enum.map(fn line ->
-      case Regex.run(~r/^#include "([^"]+)"\s*$/, line) do
-        [_, name] ->
-          cond do
-            name in stack ->
-              raise ArgumentError,
-                    "guidance include cycle: #{Enum.join(Enum.reverse([name | stack]), " -> ")}"
-
-            length(stack) >= 10 ->
-              raise ArgumentError, "guidance include depth exceeded at #{name}"
-
-            true ->
-              case Map.fetch(fragments, name) do
-                {:ok, content} ->
-                  content
-                  |> String.trim_trailing("\n")
-                  |> resolve_includes(fragments, [name | stack])
-
-                :error ->
-                  raise ArgumentError,
-                        "unknown guidance fragment #{inspect(name)}; available: " <>
-                          (fragments |> Map.keys() |> Enum.sort() |> Enum.join(", "))
-              end
-          end
-
-        nil ->
-          line
-      end
-    end)
-    |> Enum.join("\n")
+    guidance_render(archetype, fragments).bytes
   end
 
   defp override_object(raw) when is_map(raw), do: :ok
@@ -403,10 +369,10 @@ defmodule Tightbeam.Archetypes do
           {:ok, nil}
         else
           try do
-            resolve_includes(guidance, fragments(), [])
+            Renderer.render!(guidance, "session-override", fragments())
             {:ok, guidance}
           rescue
-            error in ArgumentError ->
+            error in [ArgumentError, Tightbeam.Identity.IncludeError] ->
               {:error,
                %{
                  code: "invalid_overrides",
@@ -436,8 +402,8 @@ defmodule Tightbeam.Archetypes do
       text
       |> String.split("\n")
       |> Enum.map_reduce([], fn line, discrepancies ->
-        case Regex.run(~r/^#include "([^"]+)"\s*$/, line) do
-          [_, name] ->
+        case Renderer.directive(line) do
+          {:include, name} ->
             cond do
               name in stack ->
                 {"",
@@ -462,7 +428,10 @@ defmodule Tightbeam.Archetypes do
                 end
             end
 
-          nil ->
+          :invalid ->
+            {"", discrepancies ++ ["invalid guidance include directive"]}
+
+          :none ->
             {line, discrepancies}
         end
       end)
@@ -495,6 +464,25 @@ defmodule Tightbeam.Archetypes do
     # The operating manual is shipped content (priv/guidance/operating-manual.md),
     # the single source of truth — not a hardcoded literal that can drift from it.
     %{"operating-manual.md" => shipped_guidance!("guidance/operating-manual.md")}
+  end
+
+  defp load_fragments!(base_dir) do
+    entries =
+      base_dir
+      |> Path.join("identity/guidance/**/*.md")
+      |> Path.wildcard()
+      |> Enum.sort()
+      |> Enum.map(&{Path.relative_to(&1, Path.join(base_dir, "identity")), File.read!(&1)})
+
+    catalog = Renderer.catalog!(entries)
+
+    catalog =
+      Map.put_new(catalog, "operating-manual.md", %{
+        path: "substrate:priv/guidance/operating-manual.md",
+        bytes: builtin_fragments()["operating-manual.md"]
+      })
+
+    Map.new(catalog, fn {name, entry} -> {name, entry.bytes} end)
   end
 
   @kungfu_template_paths [

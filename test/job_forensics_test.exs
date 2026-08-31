@@ -193,7 +193,7 @@ defmodule Tightbeam.JobForensicsTest do
     assert_keys(
       fetch_item(db, "wi_disp").workItem,
       ~w(createdAt createdBySession createdByUser failReason id isBug ownerUserId
-         specRefName specRefSha256 state title)a
+         priority rowVersion specRefName specRefSha256 state title)a
     )
   end
 
@@ -904,7 +904,13 @@ defmodule Tightbeam.JobForensicsTest do
     insert_entitlement!(db, "asg_prod")
     handlers = Gateway.handlers(%{db: db, base_dir: System.tmp_dir!(), default_harness: :claude})
 
-    seq = turn(db, "holder", status: "delivered")
+    seq =
+      turn(db, "holder",
+        assignment_id: "asg_prod",
+        job_ref: "wi_prod",
+        status: "delivered"
+      )
+
     assert {:prodded, 1} = Supervision.evaluate(db, handlers, 3, "holder", seq)
 
     assert [%{kind: "prod_fired"} = fired] = CausalEvents.for_job(db, "wi_prod", [])
@@ -1197,7 +1203,20 @@ defmodule Tightbeam.JobForensicsTest do
     {:ok, _} =
       DB.query(db, "UPDATE wakes SET state = 'fired', firedAt = 1 WHERE state = 'pending'")
 
-    seq = turn(db, session_key, status: "delivered")
+    {:ok, [[assignment_id, job_ref]]} =
+      DB.query(
+        db,
+        "SELECT id, workItemId FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id LIMIT 1",
+        [session_key]
+      )
+
+    seq =
+      turn(db, session_key,
+        assignment_id: assignment_id,
+        job_ref: job_ref,
+        status: "delivered"
+      )
+
     Supervision.evaluate(db, handlers, 3, session_key, seq)
   end
 

@@ -3,6 +3,8 @@ skills = ["worktree-session", "feature-cycle", "work-tracking", "unblocking", "t
 
 [guidance]
 text = """
+#include "golden-rule.md"
+
 #include "wisdom-core.md"
 
 #include "wisdom-meta.md"
@@ -10,8 +12,6 @@ text = """
 #include "engineering-tenets.md"
 
 #include "preferred-models.md"
-
-#include "model-policy.md"
 
 #include "orchestrator.md"
 

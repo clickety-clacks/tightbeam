@@ -3,6 +3,8 @@ skills = ["worktree-session", "reviewing-code", "reviewing-specs", "spec-conform
 
 [guidance]
 text = """
+#include "golden-rule.md"
+
 #include "wisdom-core.md"
 
 #include "wisdom-meta.md"
@@ -12,8 +14,6 @@ text = """
 #include "subtraction.md"
 
 #include "preferred-models.md"
-
-#include "model-policy.md"
 
 #include "reviewer.md"
 """

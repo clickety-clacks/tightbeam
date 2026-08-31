@@ -433,7 +433,7 @@ defmodule Tightbeam.RecurrenceSuppression do
     )
 
     if Txn.changes(txn) == 1 do
-      case main_fallback_target(txn, occurrence.target_session) do
+      case effective_parent_target(txn, occurrence.target_session) do
         nil ->
           audit(
             txn,
@@ -471,21 +471,11 @@ defmodule Tightbeam.RecurrenceSuppression do
     end
   end
 
-  # This base has no durable operational-parent resolver. Creation provenance
-  # (`spawnedBy`) is deliberately not authority; the declared fallback is Main.
-  defp main_fallback_target(txn, target) do
-    case Txn.q(
-           txn,
-           "SELECT ownerUserId FROM sessions WHERE sessionKey=?1",
-           [target]
-         ) do
-      [[owner]] ->
-        main = Org.personal_session_key(owner)
-        if active_distinct?(txn, main, target), do: main
-
-      _ ->
-        nil
-    end
+  defp effective_parent_target(txn, target) do
+    parent = Org.effective_parent_in_txn(txn, target).session_key
+    if active_distinct?(txn, parent, target), do: parent
+  rescue
+    ArgumentError -> nil
   end
 
   defp active_distinct?(_txn, candidate, target) when candidate == target, do: false

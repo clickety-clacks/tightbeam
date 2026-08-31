@@ -1502,10 +1502,12 @@ defmodule Tightbeam.CredentialsTest do
       db = :"credentials_boot_#{System.unique_integer([:positive])}"
       start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
       :ok = Tightbeam.Schema.ensure_all(db)
+      :ok = Tightbeam.CursorSigning.provision(ctx.base)
 
       config = %{
         db: db,
         base_dir: ctx.base,
+        cursor_signing: Tightbeam.CursorSigning.load!(ctx.base),
         port: 4_321,
         cwd: ctx.base,
         default_harness: :claude,

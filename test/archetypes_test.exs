@@ -3,12 +3,15 @@ defmodule Tightbeam.ArchetypesTest do
 
   alias Tightbeam.{Archetypes, Identity, Rails, Rules}
 
+  @golden_rule ~S("Pushing the product forwards is the goal of this kung-fu. No rule shall trump this rule. If there is a clear way forward, and that way forward is safe, then no rule, statute, or rail shall block it. If a rule, statute, or rail blocks this, it is necessarily wrong, and should be reported with a decision-request, but this DOES NOT BLOCK WORK. Get it done, and apologize later.")
+
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-archetypes-#{System.unique_integer([:positive])}")
 
     on_exit(fn ->
       File.rm_rf!(base_dir)
       :persistent_term.erase(Tightbeam.Archetypes)
+      :persistent_term.erase(Tightbeam.Rails)
     end)
 
     %{base_dir: base_dir}
@@ -153,7 +156,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
     loaded = Archetypes.load!(ctx.base_dir)
 
@@ -167,7 +170,7 @@ defmodule Tightbeam.ArchetypesTest do
              "human-communication"
            ]
 
-    for role <- ~w(coder orchestrator product-owner reviewer) do
+    for role <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
       assert "worktree-session" in loaded[role].skills
     end
 
@@ -218,6 +221,167 @@ defmodule Tightbeam.ArchetypesTest do
            )
   end
 
+  test "every engineering archetype serves the shared golden rule first", ctx do
+    Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
+    revision = Identity.live_revision!(ctx.base_dir)
+
+    archetype_paths =
+      Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/archetypes/*.toml")
+      |> Path.wildcard()
+      |> Enum.sort()
+
+    assert archetype_paths != []
+
+    for path <- archetype_paths do
+      archetype = Archetypes.parse_manifest!(File.read!(path), path)
+
+      assert String.starts_with?(
+               String.trim_leading(archetype.guidance),
+               ~s(#include "golden-rule.md")
+             )
+
+      served =
+        Identity.snapshot_at!(ctx.base_dir, revision, archetype.name, :codex).guidance
+
+      assert served =~ "# Tightbeam · #{archetype.name}\n\n#{@golden_rule}"
+      refute served =~ ~s(#include ")
+    end
+  end
+
+  test "the worktree skill preserves dirty repository work before retirement", ctx do
+    Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
+    revision = Identity.live_revision!(ctx.base_dir)
+
+    for role <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
+      worktree_skill =
+        Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).skills["worktree-session"]
+
+      assert worktree_skill =~ "Preserve local-only work before retirement"
+      assert worktree_skill =~ "tracked, untracked, and ignored files"
+      assert worktree_skill =~ "every commit that must survive is pushed"
+      assert worktree_skill =~ "package the complete repository into a recovery archive"
+      assert worktree_skill =~ "tightbeam artifact-record"
+      assert worktree_skill =~ "does not prove byte custody"
+      assert worktree_skill =~ "do not retire the session"
+    end
+
+    assert retirement_gate =
+             Enum.find(Rails.load!(ctx.base_dir), fn statute ->
+               statute.name == "preserve-repository-work-before-retire"
+             end)
+
+    assert retirement_gate.pattern ==
+             "tool_input[^:]*:[^:]*command[^:]*:[^[:alnum:]_./-]*(((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=([^[:space:];&|(){}'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$)|([^'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*([;&|(){}]|\\\\n)[[:space:]]*((then|do|else|elif)[[:space:]]+)?([[:alpha:]_][[:alnum:]_]*=([^[:space:];&|(){}'\"\\\\]|'[^']*'|\\\\\"[^\"]*\\\\\"|\\\\\\\\.)*[[:space:]]+)*([[:alnum:]_.-]+/)*tightbeam[[:space:]]+retire([[:space:]]|$))"
+
+    %{"hooks" => %{"PreToolUse" => entries}} = Rails.hook_settings()
+
+    retirement_entry =
+      Enum.find(entries, fn entry ->
+        [%{"command" => command}] = entry["hooks"]
+        command =~ "[gate: preserve-repository-work-before-retire]"
+      end)
+
+    assert retirement_entry
+    [%{"command" => command}] = retirement_entry["hooks"]
+
+    direct_call =
+      ~s({"tool_name":"Bash","tool_input":{"command":"tightbeam retire --session child"}})
+
+    {denial, 2} =
+      System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+        env: [{"TB_RETIRE_GATE_INPUT", direct_call}],
+        stderr_to_stdout: true
+      )
+
+    assert denial =~ "[gate: preserve-repository-work-before-retire]"
+    assert denial =~ "repository bytes have durable custody"
+
+    for relative_command <- [
+          "./tightbeam retire --session child",
+          "bin/tightbeam retire --session child",
+          "tightbeam list\\ntightbeam retire --session child",
+          "if true; then tightbeam retire --session child; fi",
+          "case x in x) tightbeam retire --session child;; esac",
+          "f() { tightbeam retire --session child; }; f",
+          "TB_MODE=review tightbeam retire --session child"
+        ] do
+      relative_call =
+        ~s({"tool_name":"Bash","tool_input":{"command":"#{relative_command}"}})
+
+      assert {_denial, 2} =
+               System.cmd(
+                 "sh",
+                 ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+                 env: [{"TB_RETIRE_GATE_INPUT", relative_call}],
+                 stderr_to_stdout: true
+               )
+    end
+
+    quoted_assignment_call =
+      JSON.encode!(%{
+        "tool_name" => "Bash",
+        "tool_input" => %{"command" => ~s(TB_NOTE="a b" tightbeam retire --session child)}
+      })
+
+    assert {_denial, 2} =
+             System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+               env: [{"TB_RETIRE_GATE_INPUT", quoted_assignment_call}],
+               stderr_to_stdout: true
+             )
+
+    mention_call =
+      ~s({"tool_name":"Bash","tool_input":{"command":"echo tightbeam retire --session child"}})
+
+    assert {"", 0} =
+             System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+               env: [{"TB_RETIRE_GATE_INPUT", mention_call}],
+               stderr_to_stdout: true
+             )
+
+    quoted_multiline_call =
+      ~s({"tool_name":"Bash","tool_input":{"command":"printf 'safe\\ntightbeam retire --session child'"}})
+
+    assert {"", 0} =
+             System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+               env: [{"TB_RETIRE_GATE_INPUT", quoted_multiline_call}],
+               stderr_to_stdout: true
+             )
+
+    for data_command <- [
+          ~s(printf "safe\ntightbeam retire --session child"),
+          ~s(printf "safe; tightbeam retire --session child"),
+          ~S(echo safe\; tightbeam retire --session child)
+        ] do
+      data_call =
+        JSON.encode!(%{"tool_name" => "Bash", "tool_input" => %{"command" => data_command}})
+
+      assert {"", 0} =
+               System.cmd(
+                 "sh",
+                 ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+                 env: [{"TB_RETIRE_GATE_INPUT", data_call}],
+                 stderr_to_stdout: true
+               )
+    end
+
+    proved_call =
+      ~s({"tool_name":"Bash","tool_input":{"command":"/opt/tightbeam/bin/tightbeam retire --session child"}})
+
+    assert {"", 0} =
+             System.cmd("sh", ["-c", ~s(printf '%s' "$TB_RETIRE_GATE_INPUT" | ) <> command],
+               env: [{"TB_RETIRE_GATE_INPUT", proved_call}],
+               stderr_to_stdout: true
+             )
+  end
+
   # Every archetype x both harnesses, and each `snapshot_at!` is a chain of
   # SEQUENTIAL git forks (rev-parse for the required refs, ls-tree for the
   # guidance set, then a `git show` per fragment, manifest and skill). A single
@@ -237,7 +401,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -270,7 +434,7 @@ defmodule Tightbeam.ArchetypesTest do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
-             Identity.learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
     loaded = Archetypes.load!(ctx.base_dir)
     revision = Identity.live_revision!(ctx.base_dir)
@@ -333,7 +497,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold rejects every invalid name class before identity mutation", ctx do
     for name <- ["", "-demo", "Demo", "demo_name", "demo--name", "demo-"] do
       assert_raise ArgumentError, ~r/invalid kungfu name/, fn ->
-        Archetypes.scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:flynn")
+        scaffold_kungfu!(ctx.base_dir, name, "A useful capability.", "user:flynn")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -343,7 +507,7 @@ defmodule Tightbeam.ArchetypesTest do
   test "kungfu scaffold requires purpose before identity mutation", ctx do
     for purpose <- [nil, "", "  "] do
       assert_raise ArgumentError, "kungfu purpose is required", fn ->
-        Archetypes.scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:flynn")
+        scaffold_kungfu!(ctx.base_dir, "demo", purpose, "user:flynn")
       end
 
       refute File.exists?(Path.join(ctx.base_dir, "identity/.git"))
@@ -366,7 +530,7 @@ defmodule Tightbeam.ArchetypesTest do
       assert_raise ArgumentError,
                    "kungfu scaffold target already exists: identity/#{occupied_relative}",
                    fn ->
-                     Archetypes.scaffold_kungfu!(
+                     scaffold_kungfu!(
                        base_dir,
                        name,
                        "A useful capability.",
@@ -385,7 +549,7 @@ defmodule Tightbeam.ArchetypesTest do
 
   test "kungfu scaffold commits on main and publishes live through the identity seam", ctx do
     paths =
-      Archetypes.scaffold_kungfu!(
+      scaffold_kungfu!(
         ctx.base_dir,
         "demo",
         ~s(Help teams turn "ideas" into shipped work.\nKeep it accountable.),
@@ -538,7 +702,7 @@ defmodule Tightbeam.ArchetypesTest do
           {%{"skills_add" => ["missing"]}, "unknown override skill names: missing"},
           {%{"guidance_extra" => 42}, "must be a string"},
           {%{"guidance_extra" => ~s(#include "missing.md")},
-           "unknown guidance fragment \"missing.md\""}
+           "identity_include_invalid cause=missing_fragment"}
         ] do
       assert {:error, %{code: "invalid_overrides", message: detail}} =
                Archetypes.normalize_overrides(ctx.base_dir, archetype, raw)
@@ -635,7 +799,7 @@ defmodule Tightbeam.ArchetypesTest do
     text = '#include "nope.md"'
     """)
 
-    assert_raise ArgumentError, ~r/unknown guidance fragment "nope.md"/, fn ->
+    assert_raise Tightbeam.Identity.IncludeError, ~r/cause=missing_fragment.*nope.md/, fn ->
       Archetypes.load!(ctx.base_dir)
     end
 
@@ -648,12 +812,29 @@ defmodule Tightbeam.ArchetypesTest do
     text = '#include "a.md"'
     """)
 
-    assert_raise ArgumentError, ~r/include cycle: a.md -> b.md -> a.md/, fn ->
+    assert_raise Tightbeam.Identity.IncludeError, ~r/cause=cycle.*a.md -> b.md -> a.md/, fn ->
       Archetypes.load!(ctx.base_dir)
     end
   end
 
   defp manifests_dir!(base_dir), do: Path.join(identity_dir!(base_dir), "archetypes")
+
+  defp learn!(base, name, author) do
+    case Identity.learn!(base, name, author) do
+      {:ok, candidate} ->
+        assert {:ok, revision} = Identity.publish_live!(base, candidate)
+        {:ok, revision}
+
+      other ->
+        other
+    end
+  end
+
+  defp scaffold_kungfu!(base, name, purpose, author) do
+    candidate = Archetypes.scaffold_kungfu!(base, name, purpose, author)
+    assert {:ok, _revision} = Identity.publish_live!(base, candidate)
+    candidate.paths
+  end
 
   defp identity_dir!(base_dir) do
     Identity.init!(base_dir)

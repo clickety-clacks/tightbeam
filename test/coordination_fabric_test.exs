@@ -146,7 +146,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     # firing mechanics govern it, and the delivery-policy row must not claim
     # the batcher held it either.
     conditioned =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:po",
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -248,7 +248,7 @@ defmodule Tightbeam.CoordinationFabricTest do
   test "a turn that ended BEFORE the message arrived is not that message's boundary",
        %{db: db} do
     session = "agent:po"
-    base = System.system_time(:millisecond)
+    base = 1_000
 
     seq = turn(db, session, status: "running", created_at: base - 1_000)
     end_turn(db, seq, base - 500)
@@ -271,19 +271,19 @@ defmodule Tightbeam.CoordinationFabricTest do
     early =
       schedule(db, session: session, class: "fyi", prompt: "early, released by the boundary")
 
-    seq = turn(db, session, status: "running", created_at: early.created_at)
-    ended_at = early.created_at + 10
+    seq = turn(db, session, status: "running", created_at: early.created_at - 5)
+    ended_at = early.created_at - 1
+
+    # Move the open timestamp behind the injected boundary before publishing
+    # the later source. Admission itself now observes the durable boundary and
+    # seals the prior prefix; changing a source timestamp after admission would
+    # test an impossible ordering.
+    assert {:ok, _} =
+             DB.query(db, "UPDATE notice_batches SET openedAt=?1", [early.created_at - 10])
+
     end_turn(db, seq, ended_at)
 
     late = schedule(db, session: session, class: "fyi", prompt: "late, arrived after the trigger")
-
-    # Deterministically AFTER the boundary that released `early` — pinned by
-    # direct injection, never raced against the real clock (Sol xhigh review
-    # round 2, finding 1): `Wakes.schedule` always stamps `createdAt` from its
-    # own clock, so there is no public way to make this ordering exact except
-    # to set it directly, the same way `turn`/`end_turn` already inject their
-    # own timestamps below.
-    stamp_created_at!(db, late, ended_at + 10)
 
     assert [digest_id] = Wakes.materialize_digests(db, ended_at + 20)
 
@@ -325,19 +325,17 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [edge.wake_id]
   end
 
-  test "classes are digested apart, so a 30-minute ceiling is not stretched to four hours",
+  test "input-needed keeps its existing class path and never joins an fyi batch",
        %{db: db} do
     schedule(db, session: "agent:po", class: "fyi", prompt: "fyi one")
     decision = schedule(db, session: "agent:po", class: "input-needed", prompt: "pick a or b")
 
     assert decision.due_at - decision.created_at == 1_800_000
 
-    assert [digest_id] = Wakes.materialize_digests(db, decision.due_at)
-    digest = Wakes.get(db, digest_id)
-
-    assert digest.class == "input-needed"
-    assert digest.prompt =~ "pick a or b"
-    refute digest.prompt =~ "fyi one"
+    assert [legacy_carrier_id] = Wakes.materialize_digests(db, decision.due_at)
+    assert decision.delivery_rule != Wakes.digest_rule()
+    assert Wakes.get(db, legacy_carrier_id).class == "input-needed"
+    assert Tightbeam.NoticeBatcher.source_refs(db, decision.wake_id) == []
   end
 
   test "LAW 2: a carried member keeps its row and points at the digest that carries it",
@@ -349,27 +347,20 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     carried = Wakes.get(db, member.wake_id)
 
-    # Consumed, but NOT as delivered — `fired` is this substrate's word for
-    # delivered and the member was never individually delivered.
-    assert carried.state == "canceled"
+    # The source row remains authoritative and pending; membership is a
+    # separate durable edge.
+    assert carried.state == "pending"
     assert carried.prompt == "the whole payload, verbatim"
     assert carried.class == "fyi"
     assert carried.class_election == "sender"
 
-    assert {:ok, [[reason, outcome, replacement, requester]]} =
-             DB.query(
-               db,
-               """
-               SELECT reasonKind, outcomeKind, replacementWakeId, requesterId
-               FROM wake_cancellations WHERE wakeId = ?1
-               """,
-               [member.wake_id]
-             )
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1", [
+               member.wake_id
+             ])
 
-    assert reason == "superseded"
-    assert outcome == "replacement"
-    assert replacement == digest_id
-    assert requester == "tightbeam:batcher"
+    assert [%{delivery_wake_id: ^digest_id}] =
+             Tightbeam.NoticeBatcher.source_refs(db, member.wake_id)
 
     assert [%{prompt: "the whole payload, verbatim"}] = Wakes.digest_members(db, digest_id)
   end
@@ -426,9 +417,9 @@ defmodule Tightbeam.CoordinationFabricTest do
     sender_elected = schedule(db, session: session, class: "fyi", prompt: "sender said fyi")
 
     classifier_elected =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
-        origin: "agent:sender",
+        origin: "process:tightbeam",
         creator_session_key: "agent:sender",
         prompt: "unclassed, the classifier stamped it",
         due_at: sender_elected.due_at,
@@ -468,7 +459,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [member.wake_id]
 
     unrelated =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:other",
         prompt: "unrelated traffic, not carried by anything",
@@ -498,7 +489,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "role-x", "flynn", "s1")
 
     a =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         target_role: "role-x",
         origin: "agent:sender",
@@ -509,7 +500,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     b =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         target_role: "role-x",
         origin: "agent:sender",
@@ -561,7 +552,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     })
 
     held =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         target_role: "role-x",
         origin: "agent:sender",
@@ -576,6 +567,20 @@ defmodule Tightbeam.CoordinationFabricTest do
     # not when.
     {:ok, _} =
       DB.query(db, "UPDATE wakes SET createdAt=1, dueAt=1 WHERE wakeId=?1", [held.wake_id])
+
+    {:ok, _} =
+      DB.query(db, "UPDATE notice_delivery_policies SET deadlineAt=1 WHERE sourceWakeId=?1", [
+        held.wake_id
+      ])
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE notice_batches SET dueAt=1 WHERE batchId=(SELECT batchId FROM notice_batch_members WHERE sourceWakeId=?1)",
+        [
+          held.wake_id
+        ]
+      )
 
     # The role rebinds to a DIFFERENT session BEFORE materialization ever
     # runs (the scheduler materializes with its own real clock, inside
@@ -593,7 +598,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "role-y", "flynn", "s1")
 
     role_member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         target_role: "role-y",
         origin: "agent:sender",
@@ -604,7 +609,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     session_member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "s1",
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -665,7 +670,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       )
 
     a =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -676,7 +681,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     b =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -720,7 +725,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       )
 
     a =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -731,7 +736,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     b =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -778,7 +783,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       )
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "agent:sender",
         creator_session_key: "agent:sender",
@@ -789,7 +794,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       })
 
     carrier =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
         origin: "process:tightbeam",
         prompt: "digest carrier",
@@ -829,7 +834,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert Wakes.get(db, member.wake_id).state == "canceled"
   end
 
-  test "O4: a forced member-cancellation failure rolls back its own group and does not crash the sweep",
+  test "O4: closed linked work does not poison source-preserving batches",
        %{db: db} do
     session = "agent:po"
     healthy_session = "agent:po2"
@@ -857,9 +862,9 @@ defmodule Tightbeam.CoordinationFabricTest do
     ok_member = schedule(db, session: session, class: "fyi", prompt: "fine")
 
     broken_member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: session,
-        origin: "agent:sender",
+        origin: "process:tightbeam",
         creator_session_key: "agent:sender",
         prompt: "linked to closed work",
         due_at: base,
@@ -867,71 +872,30 @@ defmodule Tightbeam.CoordinationFabricTest do
         work_item_id: "wi_broken"
       })
 
-    # A second, entirely healthy group — a DIFFERENT session, so a different
-    # (session, class) group under the same materialization sweep.
+    # A second lane proves one linked-work shape cannot affect another lane.
     healthy_member = schedule(db, session: healthy_session, class: "fyi", prompt: "unrelated")
 
-    # `broken_member`'s own linked work is not open, so the batcher's typed
-    # cancellation for it will be refused by `validate_outcome/4` — the ONE
-    # failure the all-or-nothing rule exists to catch.
-    at = broken_member.created_at + Wakes.delivery_policy("fyi").ceiling_ms
+    at = Enum.max([ok_member.due_at, broken_member.due_at, healthy_member.due_at])
 
-    # PER-GROUP ISOLATION (O4): the poisoned group's raise is caught before
-    # it reaches the caller — decimating one group must not decimate the
-    # sweep. The healthy group still materializes in the SAME call.
-    assert [digest_id] = Wakes.materialize_digests(db, at)
-    assert Wakes.get(db, digest_id).session_key == healthy_session
-    assert Enum.map(Wakes.digest_members(db, digest_id), & &1.wake_id) == [healthy_member.wake_id]
+    assert carrier_ids = Wakes.materialize_digests(db, at)
+    assert length(carrier_ids) == 2
 
-    # THE POISONED GROUP'S OWN TRANSACTION STILL ROLLS BACK IN FULL: neither
-    # of its members was touched and no carrier exists for it.
+    members =
+      carrier_ids
+      |> Enum.flat_map(&Wakes.digest_members(db, &1))
+      |> Enum.map(& &1.wake_id)
+      |> MapSet.new()
+
+    assert members ==
+             MapSet.new([ok_member.wake_id, broken_member.wake_id, healthy_member.wake_id])
+
+    # Membership never tries to cancel or reinterpret a source row, so a
+    # closed linked work item cannot poison admission.
     assert Wakes.get(db, ok_member.wake_id).state == "pending"
     assert Wakes.get(db, broken_member.wake_id).state == "pending"
-
-    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM wake_cancellations")
-    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest = 1")
-
-    assert {:ok, [[1]]} =
-             DB.query(
-               db,
-               "SELECT count(*) FROM lifecycle_events WHERE kind = 'wake_digest_materialized'"
-             )
-
-    # THE NAMED ROW IS THE AGENT-REACHABLE REPAIR SURFACE (philosophy gate
-    # Q3): the poisoned group is visible and identifiable, not merely absent.
-    assert {:ok, [[detail]]} =
-             DB.query(
-               db,
-               "SELECT detail FROM lifecycle_events WHERE kind = 'wake_digest_materialization_failed'"
-             )
-
-    assert detail =~ "incompatible_delivery_policy_v1"
-    assert detail =~ "#{session}/fyi"
-
-    # SIGNED LIKE THE SUCCESS PATH (Sol xhigh review, finding 3; §8
-    # legibility): the rule name and revision that was attempting this
-    # materialization travels on the failure row too, not just on
-    # `wake_digest_materialized`.
-    assert detail =~ "rule=#{Wakes.digest_rule()}"
-
-    # THE POISONED GROUP RETRIES NEXT TICK (still visible, still bounded) —
-    # calling materialize_digests again reproduces the exact same failure
-    # rather than silently giving up on it.
     assert Wakes.materialize_digests(db, at) == []
-
-    assert {:ok, [[2]]} =
-             DB.query(
-               db,
-               "SELECT count(*) FROM lifecycle_events WHERE kind = 'wake_digest_materialization_failed'"
-             )
-
-    # The healthy group's own carrier is untouched by the retry — still
-    # exactly the one materialization from before.
-    assert {:ok, [[1]]} =
-             DB.query(
-               db,
-               "SELECT count(*) FROM lifecycle_events WHERE kind = 'wake_digest_materialized'"
-             )
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM wake_cancellations")
+    assert {:ok, [[2]]} = DB.query(db, "SELECT count(*) FROM wakes WHERE digest = 1")
   end
 
   test "the scheduler materializes AND delivers its own turn for an idle session", %{db: db} do
@@ -962,7 +926,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert_receive {:delivered, %{digest: true, class: "fyi"} = delivered}, 1_000
     assert delivered.prompt =~ "the build finished"
     assert Wakes.get(db, delivered.wake_id).state == "fired"
-    assert Wakes.get(db, held.wake_id).state == "canceled"
+    assert Wakes.get(db, held.wake_id).state == "pending"
   end
 
   ## Seam ① — the acceptance-№1 read (§12 Q5)
@@ -1109,7 +1073,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     # recipient would, and drive `digest-members` from THAT id, not the
     # internal one, to prove the whole discovery path an agent actually has.
     delivered_prompt = Wakes.get(db, materialized_id).prompt
-    [digest_id] = Regex.run(~r/wake (w_[0-9a-f-]+)/, delivered_prompt, capture: :all_but_first)
+    [digest_id] = Regex.run(~r/wake (w_[a-z0-9_-]+)/, delivered_prompt, capture: :all_but_first)
     assert digest_id == materialized_id
 
     assert {:ok, %{digest_members: members}} =
@@ -1167,7 +1131,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "orphan-role", "roleowner", nil)
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:filer",
         target_role: "orphan-role",
         origin: "agent:sender",
@@ -1209,7 +1173,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "rm-role", "roleowner3", nil)
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:filer3",
         target_role: "rm-role",
         origin: "agent:sender",
@@ -1255,7 +1219,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "reused-role", "original-owner", nil)
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:filer4",
         target_role: "reused-role",
         origin: "agent:sender",
@@ -1295,7 +1259,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "resolved-role", "sessionowner5", "agent:holder5")
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:holder5",
         target_role: "resolved-role",
         origin: "agent:sender",
@@ -1347,7 +1311,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     Roles.create!(db, "collision-role", "alice bob", nil)
 
     member =
-      Wakes.schedule(db, %{
+      schedule_wake(db, %{
         session_key: "agent:filer6",
         target_role: "collision-role",
         origin: "agent:sender",
@@ -1411,16 +1375,17 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert request.deadline_at == nil
 
     # The transactional outbox: one wake, at the asked session, elected
-    # `input-needed` by the asker — so seam ②'s policy batches it to the target's
-    # next turn boundary or the 30-minute floor, whichever comes first.
+    # `input-needed` by the asker. V1 preserves that source path and does not
+    # create an fyi batch member for it.
     assert [notice] = wakes_for(db, "agent:po")
     assert notice.class == "input-needed"
     assert notice.class_election == "sender"
-    assert notice.delivery_rule == Wakes.digest_rule()
+    assert notice.delivery_rule != Wakes.digest_rule()
     assert notice.target_gate == 0
     assert notice.prompt =~ request.id
     assert notice.prompt =~ "ship behind a flag or block?"
     assert notice.due_at - notice.created_at == Wakes.delivery_policy("input-needed").ceiling_ms
+    assert Tightbeam.NoticeBatcher.source_refs(db, notice.wake_id) == []
   end
 
   test "THE TRIPWIRE: an open question gates nothing (fabric §10)", %{db: db} do
@@ -1502,10 +1467,16 @@ defmodule Tightbeam.CoordinationFabricTest do
       answer_open: "agent",
       return_open: "agent",
       effort_open_by_deadline_wake_in_txn: "effort",
+      effort_terminal_in_txn: "effort",
       effort_insert_in_txn: "effort",
       effort_id_by_generation_in_txn: "effort",
       effort_supersede_open_in_txn: "effort",
       effort_update_generation_in_txn: "effort",
+      insert_operator_request_in_txn: "operator",
+      operator_open_in_txn: "operator",
+      preflight_terminal_operator_rows_in_txn: "operator",
+      rule_operator_request_in_txn: "operator",
+      operator_withdraw_in_txn: "operator",
       open_counts_by_assignment: "statute,effort",
       consume: "any",
       withdraw_for_retired: "any",
@@ -1523,9 +1494,19 @@ defmodule Tightbeam.CoordinationFabricTest do
       withdraw_open: "any",
       get_raw: "any",
       request_in_txn: "any",
+      request_in_txn_optional: "any",
+      migrate_terminal_operator_decision_v1_in_txn: "any",
+      migrate_ruled_decision_integrity_v1_in_txn: "any",
+      preflight_ruled_decision_integrity_in_txn: "any",
       answer: "agent",
       return_request: "agent",
       ask: "agent",
+      operator_ask: "operator",
+      operator_ask_in_txn: "operator",
+      operator_rule: "operator",
+      operator_rule_in_txn: "operator",
+      operator_withdraw: "operator",
+      superseded_request_in_txn: "operator",
       raw_by_id: "any",
       raw_by_id_in_txn!: "any",
       resolve: "statute",
@@ -1552,10 +1533,16 @@ defmodule Tightbeam.CoordinationFabricTest do
       answer_open: 4,
       return_open: 4,
       effort_open_by_deadline_wake_in_txn: 2,
+      effort_terminal_in_txn: 2,
       effort_insert_in_txn: 2,
       effort_id_by_generation_in_txn: 3,
       effort_supersede_open_in_txn: 2,
       effort_update_generation_in_txn: 4,
+      insert_operator_request_in_txn: 6,
+      operator_open_in_txn: 4,
+      preflight_terminal_operator_rows_in_txn: 2,
+      rule_operator_request_in_txn: 6,
+      operator_withdraw_in_txn: 4,
       open_counts_by_assignment: 1,
       consume: 2,
       withdraw_for_retired: 2,
@@ -1573,9 +1560,19 @@ defmodule Tightbeam.CoordinationFabricTest do
       withdraw_open: 4,
       get_raw: 2,
       request_in_txn: 2,
+      request_in_txn_optional: 2,
+      migrate_terminal_operator_decision_v1_in_txn: 1,
+      migrate_ruled_decision_integrity_v1_in_txn: 1,
+      preflight_ruled_decision_integrity_in_txn: 1,
       answer: 2,
       return_request: 2,
       ask: 2,
+      operator_ask: 2,
+      operator_ask_in_txn: 5,
+      operator_rule: 3,
+      operator_rule_in_txn: 5,
+      operator_withdraw: 2,
+      superseded_request_in_txn: 4,
       raw_by_id: 2,
       raw_by_id_in_txn!: 2,
       resolve: 3,
@@ -1675,7 +1672,10 @@ defmodule Tightbeam.CoordinationFabricTest do
       withdraw_episodes: [{"lib/tightbeam/rail_episodes.ex", "handle_call/3"}],
       recover_retired: [{"lib/tightbeam/boot.ex", "start_link/1"}],
       list: [{"lib/tightbeam/gateway.ex", "handler_specs/1"}],
-      get: [{"lib/tightbeam/gateway.ex", "handler_specs/1"}],
+      get: [
+        {"lib/tightbeam/effort_checkin.ex", "visible_request?/3"},
+        {"lib/tightbeam/gateway.ex", "handler_specs/1"}
+      ],
       effort_rule_in_txn: [{"lib/tightbeam/effort_checkin.ex", "rule_in_txn/7"}],
       claim_park_wake_in_txn: [{"lib/tightbeam/supervision.ex", "park_escalation/3"}],
       decision_trace_rows: [{"lib/tightbeam/job_trace.ex", "decision_entries/2"}],
@@ -1685,8 +1685,17 @@ defmodule Tightbeam.CoordinationFabricTest do
         {"lib/tightbeam/wakes.ex", "validate_disposition/3"}
       ],
       statute_name_for_ruling: [{"lib/tightbeam/dispatch.ex", "ruling_statute/2"}],
-      raw_by_id: [{"lib/tightbeam/effort_checkin.ex", "request_row/2"}],
-      raw_by_id_in_txn!: [{"lib/tightbeam/effort_checkin.ex", "request_for_id/2"}]
+      raw_by_id: [
+        {"lib/tightbeam/effort_checkin.ex", "request_row/2"},
+        {"lib/tightbeam/gateway.ex", "handler_specs/1"}
+      ],
+      raw_by_id_in_txn!: [{"lib/tightbeam/effort_checkin.ex", "request_for_id/2"}],
+      migrate_terminal_operator_decision_v1_in_txn: [
+        {"lib/tightbeam/schema.ex", "upgrade_terminal_operator_decision_v1/1"}
+      ],
+      migrate_ruled_decision_integrity_v1_in_txn: [
+        {"lib/tightbeam/schema.ex", "upgrade_ruled_decision_integrity_v1/1"}
+      ]
     }
 
     verb_surface =
@@ -3319,22 +3328,12 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert snapshot.() == before
   end
 
-  test "the asker's exits are its own, and only the asked principal answers", %{db: db} do
+  test "the expecter is preferred while an exact-id agent session may answer", %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
     seed_session(db, "agent:stranger", "outsider")
 
     assert {:ok, %{decision_request: request}} = ask(db, "agent:coder", "agent:po", "which way?")
-
-    # Not the asker, not a bystander, not an admin: the principal that was
-    # asked. Refused as `not_found` rather than a kind-revealing `not_asked`
-    # (Sol xhigh review, finding 4) — an unauthorized caller learns nothing an
-    # unauthorized caller probing a fake id would not also learn.
-    assert {:error, %{code: "not_found"}} =
-             answer(db, {:session, "agent:coder"}, request.id, "myself")
-
-    assert {:error, %{code: "not_found"}} =
-             answer(db, {:session, "agent:stranger"}, request.id, "not mine to answer")
 
     # `rule` and `waive` refuse BY NAME rather than quietly doing something.
     assert {:error, %{code: "invalid", message: ruled}} =
@@ -3352,11 +3351,11 @@ defmodule Tightbeam.CoordinationFabricTest do
     before_facts = fact_count(db)
 
     assert {:ok, %{decision_request: answered}} =
-             answer(db, {:session, "agent:po"}, request.id, "behind a flag")
+             answer(db, {:session, "agent:stranger"}, request.id, "behind a flag")
 
     assert answered.status == "answered"
     assert answered.answer == "behind a flag"
-    assert answered.answered_by == "session:agent:po"
+    assert answered.answered_by == "session:agent:stranger"
     assert answered.decision == nil
     assert answered.consumed_at == nil
     assert fact_count(db) == before_facts
@@ -3365,12 +3364,29 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert reply.prompt =~ "behind a flag"
     assert reply.class == nil, "the substrate does not elect a class on a mind's behalf"
 
-    # Answered once is answered: a second answer is refused, not overwritten.
+    # An exact retry by the same canonical principal and payload is idempotent:
+    # no second lifecycle event or wake is emitted.
+    assert {:ok, %{decision_request: ^answered}} =
+             answer(db, {:session, "agent:stranger"}, request.id, "  behind a flag  ")
+
+    assert [_one_reply] = wakes_for(db, "agent:coder")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_answered' AND subject = ?1",
+               [request.id]
+             )
+
+    # A changed payload or a different authenticated session loses the CAS.
     assert {:error, %{code: "not_open"}} =
-             answer(db, {:session, "agent:po"}, request.id, "changed my mind")
+             answer(db, {:session, "agent:stranger"}, request.id, "changed my mind")
+
+    assert {:error, %{code: "not_open"}} =
+             answer(db, {:session, "agent:po"}, request.id, "behind a flag")
   end
 
-  test "answer and rule refuse a fake id, an agent question, and a non-agent request identically to an unauthorized caller",
+  test "answer hides fake and non-agent ids while an exact agent id grants session standing",
        %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     seed_session(db, "agent:po", "flynn")
@@ -3391,15 +3407,13 @@ defmodule Tightbeam.CoordinationFabricTest do
         [statute_id]
       )
 
-    # `answer`: a caller that was never asked cannot tell a fake id, someone
-    # else's question, and a non-agent request apart — ONE refusal for all
-    # three (Sol xhigh review, finding 4). Authority is checked before
-    # existence or kind is revealed.
     assert {:error, %{code: "not_found"}} =
              answer(db, {:session, "agent:outsider"}, "dr_nonexistent", "guess")
 
-    assert {:error, %{code: "not_found"}} =
-             answer(db, {:session, "agent:outsider"}, agent_request.id, "not mine")
+    assert {:ok, %{decision_request: answered}} =
+             answer(db, {:session, "agent:outsider"}, agent_request.id, "exact id is standing")
+
+    assert answered.answered_by == "session:agent:outsider"
 
     assert {:error, %{code: "not_found"}} =
              answer(db, {:session, "agent:outsider"}, statute_id, "not agent-kind")
@@ -3429,9 +3443,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert fake == agent_kind
     assert agent_kind == statute_kind
 
-    # An AUTHORIZED admin still gets the specific, kind-naming refusal for the
-    # agent row — that message is only a leak when the caller has no standing
-    # to be told anything at all.
+    # Rule remains the wrong operation for an agent question.
     assert {:error, %{code: "invalid", message: authorized_agent}} =
              admin_call(db, "rule", %{request: agent_request.id, decision: "allow"})
 
@@ -3471,11 +3483,6 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:error, %{code: "invalid"}} =
              return_request(db, {:session, "agent:po"}, request.id, "  ")
 
-    # The same privacy wall as answer: neither an outsider nor a non-agent id
-    # becomes an existence/kind oracle through the new verb.
-    assert {:error, %{code: "not_found"}} =
-             return_request(db, {:session, "agent:stranger"}, request.id, "unclear")
-
     assert {:error, %{code: "not_found"}} =
              return_request(db, {:session, "agent:po"}, "dr_missing", "unclear")
 
@@ -3484,7 +3491,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:ok, %{decision_request: returned}} =
              return_request(
                db,
-               {:session, "agent:po"},
+               {:session, "agent:stranger"},
                request.id,
                "  name the migration and rollback boundary  "
              )
@@ -3496,7 +3503,7 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert returned.raiser_session_key == request.raiser_session_key
     assert returned.expecter_session_key == request.expecter_session_key
     assert returned.return_reason == "name the migration and rollback boundary"
-    assert returned.returned_by == "session:agent:po"
+    assert returned.returned_by == "session:agent:stranger"
     assert is_integer(returned.returned_at)
     assert returned.answer == nil
     assert fact_count(db) == before_facts
@@ -3522,9 +3529,17 @@ defmodule Tightbeam.CoordinationFabricTest do
                [request.id]
              )
 
-    # An exact retry is idempotent: it returns the same row and emits neither a
-    # second event nor a second wake. A changed reason is not an edit of history.
-    assert {:ok, %{decision_request: exact_retry}} =
+    assert {:ok, %{decision_request: ^returned}} =
+             return_request(
+               db,
+               {:session, "agent:stranger"},
+               request.id,
+               "name the migration and rollback boundary"
+             )
+
+    assert [_one_notice] = wakes_for(db, "agent:coder")
+
+    assert {:error, %{code: "not_open"}} =
              return_request(
                db,
                {:session, "agent:po"},
@@ -3532,18 +3547,8 @@ defmodule Tightbeam.CoordinationFabricTest do
                "name the migration and rollback boundary"
              )
 
-    assert exact_retry.returned_at == returned.returned_at
-    assert [_one_notice] = wakes_for(db, "agent:coder")
-
-    assert {:ok, [[1]]} =
-             DB.query(
-               db,
-               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_returned' AND subject = ?1",
-               [request.id]
-             )
-
     assert {:error, %{code: "not_open"}} =
-             return_request(db, {:session, "agent:po"}, request.id, "different reason")
+             return_request(db, {:session, "agent:stranger"}, request.id, "different reason")
 
     assert {:error, %{code: "not_open"}} =
              answer(db, {:session, "agent:po"}, request.id, "too late")
@@ -3592,6 +3597,59 @@ defmodule Tightbeam.CoordinationFabricTest do
              DB.query(db, "SELECT status FROM decision_requests WHERE id = ?1", [request.id])
 
     assert status in ~w(answered withdrawn returned)
+  end
+
+  test "concurrent exact answer retries converge on one terminal write", %{db: db} do
+    seed_session(db, "agent:coder", "flynn")
+    seed_session(db, "agent:po", "flynn")
+    seed_session(db, "agent:reviewer", "outsider")
+
+    assert {:ok, %{decision_request: request}} =
+             ask(db, "agent:coder", "agent:po", "ship now?")
+
+    barrier = :atomics.new(1, [])
+
+    answer_once = fn ->
+      Task.async(fn ->
+        :atomics.add(barrier, 1, 1)
+        until = System.monotonic_time(:millisecond) + 2_000
+
+        wait = fn wait ->
+          if :atomics.get(barrier, 1) < 2 and System.monotonic_time(:millisecond) < until,
+            do: wait.(wait),
+            else: :ok
+        end
+
+        wait.(wait)
+        answer(db, {:session, "agent:reviewer"}, request.id, "ship behind the flag")
+      end)
+    end
+
+    outcomes = [answer_once.(), answer_once.()] |> Task.await_many(5_000)
+
+    assert Enum.all?(outcomes, fn
+             {:ok,
+              %{
+                decision_request: %{
+                  status: "answered",
+                  answer: "ship behind the flag",
+                  answered_by: "session:agent:reviewer"
+                }
+              }} ->
+               true
+
+             _ ->
+               false
+           end)
+
+    assert [_one_notice] = wakes_for(db, "agent:coder")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT count(*) FROM lifecycle_events WHERE kind = 'decision_request_answered' AND subject = ?1",
+               [request.id]
+             )
   end
 
   test "the schema refuses every shape the agent arm forbids", %{db: db} do
@@ -3713,6 +3771,71 @@ defmodule Tightbeam.CoordinationFabricTest do
 
     assert Escalation.list(db, reviewer_call, "open", owner_user_id: "flynn") == []
     assert Escalation.get(db, reviewer_call, request.id, owner_user_id: "flynn") == nil
+
+    assert {:ok, %{decision_request: exact}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: request.id})
+
+    assert exact.id == request.id
+    assert exact.question == request.question
+    assert exact.context == request.context
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{
+               request: String.slice(request.id, 0, 12)
+             })
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:user, "outsider"}, "decision-request", %{request: request.id})
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:process, "ci"}, "decision-request", %{request: request.id})
+
+    assert {:error, %{code: "not_found"}} =
+             answer(db, {:user, "flynn"}, request.id, "user boundaries stay narrow")
+
+    assert {:error, %{code: "not_found"}} =
+             answer(db, {:process, "ci"}, request.id, "processes gain no standing")
+
+    assert {:error, %{code: "invalid"}} =
+             verb(db, {:session, "agent:reviewer"}, "effort-rule", %{
+               request: request.id,
+               action: "continue"
+             })
+
+    statute_id = "dr_exact_hidden_statute"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO decision_requests (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName, actionKey, question, context, status) VALUES (?1, 'statute', 'session:agent:bob-app', 'bob', 1, 999999999999, 'deploy-gate', 'exact-hidden', 'q', '{}', 'open')",
+        [statute_id]
+      )
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: statute_id})
+
+    assert {:error, %{code: "not_found"}} =
+             verb(db, {:session, "agent:reviewer"}, "effort-rule", %{
+               request: statute_id,
+               action: "continue"
+             })
+
+    effort_id = "dr_exact_effort"
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO decision_requests (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey, lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt, question, options, context, status) VALUES (?1, 'effort', 'process:tightbeam', 'bob', 'asg_exact_effort', 'agent:bob-app', 1, 1, 'wake_exact_effort', 1, 999999999999, 'Continue or dismiss?', '[\"continue\",\"dismiss\"]', '{\"actions\":[\"continue\",\"dismiss\"]}', 'open')",
+        [effort_id]
+      )
+
+    assert {:ok, %{decision_request: effort}} =
+             verb(db, {:session, "agent:reviewer"}, "decision-request", %{request: effort_id})
+
+    assert effort.id == effort_id
+    assert effort.kind == "effort"
+    assert effort.options == ["continue", "dismiss"]
+    assert Escalation.list(db, reviewer_call, "open", owner_user_id: "flynn") == []
 
     # The owner acting AS itself — a user principal, not merely a session
     # resolving to the same owner — is the one the `ownerUserId` branch exists
@@ -3887,6 +4010,7 @@ defmodule Tightbeam.CoordinationFabricTest do
 
   defp principal_origin({:user, id}), do: "user:#{id}"
   defp principal_origin({:session, key}), do: "agent:#{key}"
+  defp principal_origin({:process, id}), do: "process:#{id}"
 
   # Every seam ③/④ call goes through `Dispatch.dispatch/3` — the chokepoint the
   # wire router uses — so `Rules.decide` sees these verbs exactly as it sees
@@ -4042,9 +4166,9 @@ defmodule Tightbeam.CoordinationFabricTest do
   end
 
   defp schedule(db, opts) do
-    Wakes.schedule(db, %{
+    schedule_wake(db, %{
       session_key: Keyword.fetch!(opts, :session),
-      origin: Keyword.get(opts, :origin, "agent:sender"),
+      origin: Keyword.get(opts, :origin, "process:tightbeam"),
       creator_session_key: Keyword.get(opts, :creator, "agent:sender"),
       prompt: Keyword.get(opts, :prompt, "go"),
       due_at: Keyword.get_lazy(opts, :due_at, fn -> System.system_time(:millisecond) end),
@@ -4054,18 +4178,25 @@ defmodule Tightbeam.CoordinationFabricTest do
     })
   end
 
-  # Injects an exact `createdAt`, deterministically — `Wakes.schedule` always
-  # stamps it from its own clock, so this is the only way to pin a wake's
-  # filing time relative to another event without racing the real clock
-  # (Sol xhigh review round 2, finding 1).
-  defp stamp_created_at!(db, wake, created_at) do
-    {:ok, _} =
-      DB.query(db, "UPDATE wakes SET createdAt = ?1 WHERE wakeId = ?2", [
-        created_at,
-        wake.wake_id
-      ])
+  defp schedule_wake(db, input) do
+    if input[:class] == "fyi" and input[:digest] != true do
+      seq = System.unique_integer([:positive, :monotonic])
 
-    :ok
+      {:ok, _policy} =
+        DB.transaction(db, fn txn ->
+          Tightbeam.Org.apply_notice_batching_lane_policy_in_txn(
+            txn,
+            input,
+            true,
+            "notice-batching-test-policy:coordination:#{seq}",
+            "agent:test-policy",
+            "coordination-fixture",
+            seq
+          )
+        end)
+    end
+
+    Wakes.schedule(db, input)
   end
 
   defp turn(db, session_key, opts) do

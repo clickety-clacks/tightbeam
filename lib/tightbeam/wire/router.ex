@@ -42,9 +42,9 @@ defmodule Tightbeam.Wire.Router do
     any asset.
 
   Elixir shape: `use Plug.Router`; deps (handlers table, db, cli_token,
-  session_status fun) arrive via `init_opts` from the composition root and
-  ride `conn.private`. Handlers run in the request process — fine, because
-  every verb is bounded (long work goes through the Ledger).
+  cursor_signing provider, session_status fun) arrive via `init_opts` from the
+  composition root and ride `conn.private`. Handlers run in the request process
+  — fine, because every verb is bounded (long work goes through the Ledger).
   """
 
   use Plug.Router
@@ -54,7 +54,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user read-marker-set read-marker-clear config register-host host-env-set host-env-list host-env-unset update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw ask answer return decision-requests decision-request transcript turn-trace attend toplines topline coordination-share digest-members harness-processes)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack activation-status activations spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user read-marker-set read-marker-clear config register-host host-env-set host-env-list host-env-unset update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment assignments completion-notices completion-disposition work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw ask answer return operator-ask operator-rule operator-withdraw decision-requests decision-request transcript turn-trace attend toplines topline coordination-share digest-members harness-processes)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -62,10 +62,26 @@ defmodule Tightbeam.Wire.Router do
                   )
 
   @impl Plug
+  def init(opts) do
+    deps = Map.new(opts)
+    _provider = deps |> Map.get(:cursor_signing) |> Tightbeam.CursorSigning.validate!()
+    deps
+  end
+
+  @impl Plug
   def call(conn, opts) do
-    conn
-    |> Plug.Conn.put_private(:tightbeam_deps, Map.new(opts))
-    |> super(opts)
+    deps = Map.new(opts)
+    conn = Plug.Conn.put_private(conn, :tightbeam_deps, deps)
+
+    case Tightbeam.CursorSigning.admit_request(deps.cursor_signing) do
+      :ok ->
+        super(conn, deps)
+
+      {:error, _reason} ->
+        conn
+        |> Plug.Conn.put_resp_header("cache-control", "no-store")
+        |> error(500, "projection_invalid")
+    end
   end
 
   plug(:match)
@@ -118,6 +134,7 @@ defmodule Tightbeam.Wire.Router do
       "version" => Tightbeam.CliCompatibility.required_version(),
       "build" => Tightbeam.BuildStamp.build(),
       "sha" => Tightbeam.BuildStamp.sha(),
+      "features" => ["activation-events-v1"],
       "adapters" => health
     })
   end
@@ -462,11 +479,13 @@ defmodule Tightbeam.Wire.Router do
     json(conn, 200, %{"result" => ColdStart.state(db(conn))})
   end
 
-  defp dispatch_agent_request(conn, :org, "bootstrap-user", body) do
+  defp dispatch_agent_request(conn, :org, "add-user", body)
+       when not is_map_key(body, "as") and not is_map_key(body, "asUser") and
+              not is_map_key(body, "asProcess") and not is_map_key(body, "asSession") do
     with :ok <- loopback_bootstrap(conn),
          {:ok, user_id} <- required_string(get_in(body, ["params", "userId"])),
          {:ok, result} <-
-           ColdStart.bootstrap_user(db(conn), user_id, Map.fetch!(deps(conn), :defaults)) do
+           ColdStart.add_first_user(db(conn), user_id, Map.fetch!(deps(conn), :defaults)) do
       json(conn, 200, %{"result" => result})
     else
       {:error, "bootstrap_closed"} ->
@@ -483,10 +502,6 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  defp dispatch_agent_request(conn, _auth, "bootstrap-user", _body) do
-    error(conn, 403, "forbidden", "local bootstrap required")
-  end
-
   defp dispatch_agent_request(conn, auth, verb, body) do
     with :ok <- allowed_agent_verb(verb),
          {:ok, origin, principal} <- agent_identity(body, auth, conn),
@@ -496,6 +511,7 @@ defmodule Tightbeam.Wire.Router do
         verb: verb,
         origin: origin,
         principal: principal,
+        firehose_hub: deps(conn)[:firehose_hub] || Tightbeam.Firehose.Hub,
         session_key: artifact_caller_session(verb, session_key, principal),
         target_role: target_meta.role,
         role_fallback: target_meta.fallback,
@@ -678,7 +694,7 @@ defmodule Tightbeam.Wire.Router do
   # owner-or-admin check (mirroring `coordination-share`'s) is the read's
   # actual gate, and a volunteered `--session` alongside `--wake-id` must not
   # get answered by the router first.
-  @non_target_verbs ~w(transcript turn-trace toplines topline coordination-share digest-members answer return)
+  @non_target_verbs ~w(activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack activation-status activations completion-notices completion-disposition transcript turn-trace toplines topline coordination-share digest-members answer return operator-ask operator-rule operator-withdraw decision-request decision-requests)
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
   # number, a boolean or an object — is still a caller volunteering a typed target
@@ -953,6 +969,28 @@ defmodule Tightbeam.Wire.Router do
       {:ok, result} ->
         json(conn, success_status, shape.(result))
 
+      {:error,
+       %{
+         code: "decision_request_integrity_invalid",
+         message: message,
+         request_id: request_id
+       }} ->
+        json(conn, 500, %{
+          "error" => %{
+            "code" => "decision_request_integrity_invalid",
+            "message" => message,
+            "requestId" => request_id
+          }
+        })
+
+      {:error, %{code: "activation_head_changed", current_head: current_head}} ->
+        json(conn, 409, %{
+          "error" => %{
+            "code" => "activation_head_changed",
+            "currentHead" => current_head
+          }
+        })
+
       {:error, result} ->
         error(conn, error_status(result[:code]), result[:code], result[:message])
 
@@ -1043,6 +1081,9 @@ defmodule Tightbeam.Wire.Router do
   defp error_status("unknown_assignment"), do: 404
   defp error_status("unknown_work_item"), do: 404
   defp error_status("server_error"), do: 500
+  defp error_status("decision_request_integrity_invalid"), do: 500
+  defp error_status("decision_request_integrity_evidence_conflict"), do: 500
+  defp error_status("decision_request_integrity_evidence_unavailable"), do: 500
   defp error_status(_), do: 400
 
   defp read_json(conn) do
@@ -1086,6 +1127,7 @@ defmodule Tightbeam.Wire.Router do
   # carrier it is written about, not to the parameter name everywhere.
   @substrate_only_params %{
     "wake" => ~w(assignment_id)a,
+    "operator-rule" => ~w(ruled_via_session_key ruled_via_principal ruled_via_session_state)a,
     "work-item-create" => ~w(created_in_turn_seq created_context_known)a,
     # The artifact's turn edge and the class of evidence behind it are the
     # substrate's own observation, resolved in `Artifacts.record/2` from the hook

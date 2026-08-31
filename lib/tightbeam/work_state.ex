@@ -34,6 +34,13 @@ defmodule Tightbeam.WorkState do
   a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
   a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
   a.closedAt, a.closedByUser, a.closedBySession, a.closingAttestId,
+  (SELECT r.reason FROM assignment_revocation_generations g
+    JOIN assignment_revocations r ON r.id = g.revocationId
+    WHERE g.assignmentId = a.id AND g.reopeningId IS (
+      SELECT reopening.id FROM assignment_reopenings reopening
+      WHERE reopening.assignmentId = a.id
+      ORDER BY reopening.id DESC LIMIT 1
+    )),
   a.workItemId, s.state,
   CASE
     WHEN a.state = 'closed' AND a.outcome IN ('surrendered', 'revoked') THEN 'abandoned'
@@ -47,7 +54,12 @@ defmodule Tightbeam.WorkState do
       SELECT 1 FROM attests f WHERE f.assignmentId = a.id
     ) THEN 'open'
     ELSE 'active'
-  END
+  END,
+  COALESCE(
+    (SELECT priority FROM assignment_priorities WHERE assignmentId=a.id),
+    (SELECT priority FROM work_item_priorities WHERE workItemId=a.workItemId),
+    CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+  )
   """
 
   @doc "Create both observability doorbell tables."
@@ -326,7 +338,10 @@ defmodule Tightbeam.WorkState do
   defp item_columns,
     do:
       "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
-        "createdByUser, createdBySession, createdAt"
+        "createdByUser, createdBySession, createdAt, " <>
+        "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
+        "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)), " <>
+        "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId=work_items.id), createdAt)"
 
   defp assignment([
          id,
@@ -343,9 +358,11 @@ defmodule Tightbeam.WorkState do
          closed_by_user,
          closed_by_session,
          closing_attest_id,
+         revocation_reason,
          work_item_id,
          holder_state,
-         status
+         status,
+         priority
        ]) do
     %{
       id: id,
@@ -362,9 +379,11 @@ defmodule Tightbeam.WorkState do
       closedByUser: closed_by_user,
       closedBySession: closed_by_session,
       closingAttestId: closing_attest_id,
+      revocationReason: revocation_reason,
       workItemId: work_item_id,
       holderState: holder_state,
-      status: status
+      status: status,
+      priority: priority
     }
   end
 
@@ -379,7 +398,9 @@ defmodule Tightbeam.WorkState do
          fail_reason,
          user,
          session,
-         created_at
+         created_at,
+         priority,
+         row_version
        ]) do
     %{
       id: id,
@@ -392,7 +413,9 @@ defmodule Tightbeam.WorkState do
       failReason: fail_reason,
       createdByUser: user,
       createdBySession: session,
-      createdAt: created_at
+      createdAt: created_at,
+      priority: priority,
+      rowVersion: row_version
     }
   end
 

@@ -60,8 +60,9 @@ Working the org:
   `orchestrator` for a ready product slice; that orchestrator staffs a `spec-writer`
   for buildable technical specification, a `coder` for implementation, a fresh
   `reviewer` for adversarial spec or code review, and a `recon` for uncertain facts
-  or repeat-failure diagnosis. Use the activity row in `preferred-models.md` to pick
-  each session's model. Do not directly staff implementation around the orchestrator.
+  or repeat-failure diagnosis. Derive each session's model from the applicable activity
+  row in `kungfu/agentic-engineering/preferred-models.md`. Do not directly staff
+  implementation around the orchestrator.
 - When you receive a work item to advance, inspect the visible idle work items for a
   small set that serves the same outcome or touches the same product/system seam.
   Suggest only materially related items, and explicitly file the suggestion for the

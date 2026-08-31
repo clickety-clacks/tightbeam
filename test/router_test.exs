@@ -101,6 +101,18 @@ defmodule Tightbeam.Wire.RouterTest do
         send(parent, {:call, call})
         %{artifacts: []}
       end,
+      "activation-status" => fn call ->
+        send(parent, {:call, call})
+        %{activation_id: call.params.activation_id, state: "declared", events: []}
+      end,
+      "activation-renotify" => fn call ->
+        send(parent, {:call, call})
+        %{event: %{kind: "notice-requeued"}}
+      end,
+      "activation-ack" => fn call ->
+        send(parent, {:call, call})
+        %{event: %{kind: "acknowledged"}}
+      end,
       "identity-status" => fn call ->
         send(parent, {:call, call})
         %{live: "abc123", conflict: false}
@@ -132,6 +144,7 @@ defmodule Tightbeam.Wire.RouterTest do
       opts: [
         db: db,
         base_dir: base_dir,
+        cursor_signing: cursor_signing!(base_dir),
         handlers: handlers,
         cli_token: "tbc_test",
         defaults: %{
@@ -212,12 +225,41 @@ defmodule Tightbeam.Wire.RouterTest do
     assert Devices.user(db, "first") == nil
   end
 
-  test "loopback bootstrap-user reserves the first user and Main through the gateway", ctx do
+  test "an empty org cannot use role or process identity to claim the first user", ctx do
+    {db, opts} = empty_router(ctx, "identity_bootstrap")
+
+    cases = [
+      {%{as: "unbound"}, 400,
+       %{"code" => "invalid_message", "message" => "unknown or unbound role: unbound"}},
+      {%{asProcess: "tightbeam"}, 403,
+       %{
+         "code" => "reserved_origin",
+         "message" => "process:tightbeam is reserved to the substrate"
+       }},
+      {%{asProcess: "installer"}, 403, %{"code" => "forbidden", "message" => "admin required"}}
+    ]
+
+    for {identity, status, error} <- cases do
+      response =
+        dispatch_cli(
+          %{ctx | opts: opts},
+          "tbc_test",
+          Map.merge(identity, %{verb: "add-user", params: %{userId: "first", isAdmin: true}})
+        )
+
+      assert response.status == status
+      assert JSON.decode!(response.resp_body) == %{"error" => error}
+      assert Devices.user(db, "first") == nil
+      assert Org.get(db, Org.personal_session_key("first")) == nil
+    end
+  end
+
+  test "loopback add-user reserves the first user and Main through the gateway", ctx do
     {db, opts} = empty_router(ctx, "loopback_bootstrap")
 
     response =
       dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
-        verb: "bootstrap-user",
+        verb: "add-user",
         params: %{userId: "alice"}
       })
 
@@ -236,14 +278,14 @@ defmodule Tightbeam.Wire.RouterTest do
     assert Devices.user(db, "alice").creation_kind == "gateway_local_bootstrap"
   end
 
-  test "non-loopback bootstrap-user refuses before any database write", ctx do
+  test "non-loopback add-user refuses before any database write", ctx do
     {db, opts} = empty_router(ctx, "remote_bootstrap")
 
     response =
       conn(
         :post,
         "/agent/dispatch",
-        JSON.encode!(%{verb: "bootstrap-user", params: %{userId: "alice"}})
+        JSON.encode!(%{verb: "add-user", params: %{userId: "alice"}})
       )
       |> Map.put(:remote_ip, {10, 0, 0, 8})
       |> put_req_header("authorization", "Bearer tbc_test")
@@ -290,6 +332,127 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_integer(body["build"]) and body["build"] > 0
     assert body["build"] == Tightbeam.BuildStamp.build()
     assert body["sha"] == Tightbeam.BuildStamp.sha()
+    assert body["protocolVersion"] == 1
+    assert body["features"] == ["activation-events-v1"]
+  end
+
+  test "activation wire verbs are non-target calls with camel-case params", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-status",
+        asUser: "flynn",
+        params: %{activationId: "act_example"}
+      })
+
+    assert response.status == 200
+    assert_receive {:call, call}
+    assert call.verb == "activation-status"
+    assert call.principal == {:user, "flynn"}
+    assert call.params == %{activation_id: "act_example"}
+
+    refused =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-status",
+        asUser: "flynn",
+        sessionKey: Org.personal_session_key("flynn"),
+        params: %{activationId: "act_example"}
+      })
+
+    assert refused.status == 400
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "invalid_message"
+  end
+
+  test "activation wire rejects substrate-owned fields and accepts the two wake references",
+       ctx do
+    actual_status =
+      Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+      |> Map.take(["activation-status"])
+
+    actual_ctx = %{
+      ctx
+      | opts:
+          Keyword.update!(ctx.opts, :handlers, fn handlers ->
+            Map.merge(handlers, actual_status)
+          end)
+    }
+
+    owned_fields = [
+      %{eventId: "aev_forged"},
+      %{bySession: "forged-session"},
+      %{byUser: "forged-user"},
+      %{principal: "user:forged"},
+      %{workItemId: "wi_forged"},
+      %{requestSha256: String.duplicate("a", 64)},
+      %{noticeWakeId: "w_forged"},
+      %{seq: 7},
+      %{ts: 8}
+    ]
+
+    Enum.each(owned_fields, fn supplied ->
+      response =
+        dispatch_cli(actual_ctx, "tbc_test", %{
+          verb: "activation-status",
+          asUser: "flynn",
+          params: Map.merge(%{activationId: "act_example"}, supplied)
+        })
+
+      assert response.status == 400
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_activation_payload"
+    end)
+
+    renotify =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-renotify",
+        asUser: "flynn",
+        params: %{
+          activationId: "act_example",
+          predecessorEventId: "aev_head",
+          noticedEventId: "aev_noticed",
+          replacesWakeId: "w_canceled",
+          idempotencyKey: "renotify-key"
+        }
+      })
+
+    assert renotify.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "activation-renotify",
+                      params: %{
+                        activation_id: "act_example",
+                        predecessor_event_id: "aev_head",
+                        noticed_event_id: "aev_noticed",
+                        replaces_wake_id: "w_canceled",
+                        idempotency_key: "renotify-key"
+                      }
+                    }}
+
+    acknowledged =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-ack",
+        asUser: "flynn",
+        params: %{
+          activationId: "act_example",
+          predecessorEventId: "aev_requeued",
+          noticedEventId: "aev_noticed",
+          acknowledgedWakeId: "w_fired",
+          idempotencyKey: "ack-key"
+        }
+      })
+
+    assert acknowledged.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "activation-ack",
+                      params: %{
+                        activation_id: "act_example",
+                        predecessor_event_id: "aev_requeued",
+                        noticed_event_id: "aev_noticed",
+                        acknowledged_wake_id: "w_fired",
+                        idempotency_key: "ack-key"
+                      }
+                    }}
   end
 
   test "the change socket requires protocolVersion 1 at upgrade", ctx do

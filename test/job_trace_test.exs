@@ -93,10 +93,10 @@ defmodule Tightbeam.JobTraceTest do
 
       INSERT INTO decision_requests
         (id, kind, raiserId, ownerUserId, assignmentId, raisedAt, deadlineAt,
-         statuteName, actionKey, question, context, status, decision)
+         statuteName, actionKey, question, context, status, decision, ruledBy, ruledAt)
       VALUES
         ('dr_trace', 'statute', 'user:owner', 'owner', 'asg_direct', 100, 500,
-         'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow');
+         'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow', 'user:owner', 100);
       """)
 
     %{db: db}

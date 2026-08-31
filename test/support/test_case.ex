@@ -54,6 +54,7 @@ defmodule Tightbeam.TestCase do
           catalog_reply: 2,
           catalog_probe_harness: 1,
           claim_org: 2,
+          cursor_signing!: 1,
           ensure_all_schemas: 1,
           ensure_main_session: 2
         ]
@@ -84,6 +85,42 @@ defmodule Tightbeam.TestCase do
   @doc "Create the complete production schema for a unit-test database."
   def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
 
+  @doc "Provision or load the real durable cursor-signing provider for a test base dir."
+  def cursor_signing!(base_dir) do
+    base_dir = cursor_signing_base_dir(base_dir)
+
+    case Tightbeam.CursorSigning.load(base_dir) do
+      {:ok, provider} ->
+        case Tightbeam.CursorSigning.validate(provider) do
+          :ok ->
+            provider
+
+          {:error, :cursor_signing_unprovisioned} ->
+            :ok = Tightbeam.CursorSigning.provision(base_dir)
+            Tightbeam.CursorSigning.load!(base_dir)
+
+          {:error, reason} ->
+            raise Tightbeam.CursorSigning.Error, reason: reason
+        end
+
+      {:error, %Tightbeam.CursorSigning.Error{reason: reason}}
+      when reason in [:missing_directory, :missing_material] ->
+        :ok = Tightbeam.CursorSigning.provision(base_dir)
+        Tightbeam.CursorSigning.load!(base_dir)
+
+      {:error, reason} ->
+        raise reason
+    end
+  end
+
+  defp cursor_signing_base_dir(base_dir) do
+    if Path.expand(base_dir) == Path.expand("/tmp") do
+      Path.join(System.tmp_dir!(), "tightbeam-cursor-signing-fixture")
+    else
+      base_dir
+    end
+  end
+
   @doc "Claim a fresh test org through the production cold-start coordinator."
   def claim_org(db, input) do
     Tightbeam.ColdStart.pair(db, input, %{
@@ -94,7 +131,7 @@ defmodule Tightbeam.TestCase do
     })
   end
 
-  @doc "Create the canonical self-parented Main fixture for an owner when absent."
+  @doc "Create the canonical nullable-parent Main fixture for an owner when absent."
   def ensure_main_session(db, owner) do
     key = Tightbeam.Org.personal_session_key(owner)
 
@@ -114,7 +151,12 @@ defmodule Tightbeam.TestCase do
           host: "testhost"
         })
 
-      %{kind: "main", operational_parent: ^key} = session ->
+      %{
+        kind: "main",
+        operational_parent: nil,
+        effective_parent: ^key,
+        effective_parent_source: :owner_main
+      } = session ->
         session
 
       session ->

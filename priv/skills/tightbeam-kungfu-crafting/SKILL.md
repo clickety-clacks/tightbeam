@@ -16,10 +16,10 @@ A complete bundle ships:
 4. **`kungfu/<name>/capabilities.md`** — the capability matrix: what adopting this
    bundle gives an org + conversation watch-fors per capability (readable without
    election; the general agent offers capabilities from it).
-5. **`kungfu/<name>/preferred-models.md`** — the ACTIVITY table: each activity the
-   bundle's roles perform -> what it demands -> capsule+effort from the org's working
-   set -> ladder -> floor. Capsules themselves live in the substrate's
-   guidance/preferred-models.md; archetype preferences derive from these rows.
+5. **`kungfu/<name>/preferred-models.md`** — the model catalog and ACTIVITY table:
+   each capsule's characterization plus each activity the bundle's roles perform -> what
+   it demands -> capsule+effort -> ladder -> floor. Keep every model selection and
+   ring-down in this document; archetype guidance may only point to it.
 6. **`kungfu/<name>/intake.md`** — the operational questions only the operator can
    answer, each naming where its answer lands (preferred-models rows, producer
    commands, workspace roots, stances). Learning the bundle = install + walking the

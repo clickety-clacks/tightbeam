@@ -18,6 +18,8 @@ defmodule Tightbeam.EffortCheckinTest do
     WorkItems
   }
 
+  alias Tightbeam.ConditionFacts
+
   defmodule LaneDoorbell do
     @moduledoc false
     use GenServer
@@ -68,6 +70,7 @@ defmodule Tightbeam.EffortCheckinTest do
     config = %{
       db: db,
       base_dir: base_dir,
+      cursor_signing: cursor_signing!(base_dir),
       port: 4_321,
       effort_checkin_horizon_ms: 10,
       cwd: base_dir,
@@ -94,13 +97,18 @@ defmodule Tightbeam.EffortCheckinTest do
     }
   end
 
-  test "proof 1: dispatch arms one bracket; bare assign does not; roots validate; all closes cancel",
+  test "proof 1: assign and dispatch each arm one bracket; roots validate; all closes cancel",
        ctx do
     bare = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "bare"})
 
-    assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
-             bare.id
-           ]) == [[0]]
+    assert [[1, "armed", bare_wake_id]] =
+             rows(
+               ctx.db,
+               "SELECT generation,state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1",
+               [bare.id]
+             )
+
+    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, bare_wake_id)
 
     for bad <- ["/absolute", "../escape", "a/../escape"] do
       assert %{code: "invalid_workdir_root"} =
@@ -140,7 +148,8 @@ defmodule Tightbeam.EffortCheckinTest do
     revoked = dispatch(ctx, {:session, "parent"}, "holder", "revoked")
 
     assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
-      assignment_id: revoked.id
+      assignment_id: revoked.id,
+      reason: "test revocation"
     })
 
     assert bracket_state(ctx.db, revoked.id) == "canceled"
@@ -168,59 +177,184 @@ defmodule Tightbeam.EffortCheckinTest do
     assert bracket_state(ctx.db, retired.id) == "canceled"
   end
 
-  test "acceptance 4 and 5: writes are detected with no git anywhere; a stall is not effect",
+  test "priority inherits from the work item, scales the four-hour window, and reprioritizes live probes",
        ctx do
-    # Acceptance 4: this workspace has no repository under it at all. Every case
-    # below is a WRITE, and none of them produces `unobservable` or a nag.
-    refute File.exists?(Path.join(ctx.root, ".git"))
+    config = Map.put(ctx.config, :effort_checkin_horizon_ms, 14_400_000)
+    ctx = %{ctx | config: config}
 
-    modified = dispatch(ctx, {:session, "parent"}, "holder", "modified file")
-    File.write!(Path.join(ctx.root, "src/tracked.txt"), "changed\n")
-    assert nil == fire_probe(ctx, modified.id)
-    assert silent_rearm(ctx.db, modified.id)
+    horizons =
+      for {priority, expected} <- [{3, 28_800_000}, {4, 14_400_000}, {5, 7_200_000}],
+          into: %{} do
+        item =
+          WorkItems.__handle__(ctx.db, "work-item-create", %{
+            verb: "work-item-create",
+            origin: "user:h1",
+            principal: {:user, "h1"},
+            session_key: nil,
+            params: %{title: "priority #{priority}", priority: priority}
+          })
+
+        assignment =
+          dispatch_for_item(ctx, {:session, "parent"}, "holder", "priority #{priority}", item.id)
+
+        assert assignment.priority == priority
+
+        assert [[^priority]] =
+                 rows(
+                   ctx.db,
+                   "SELECT priority FROM assignment_priorities WHERE assignmentId=?1",
+                   [
+                     assignment.id
+                   ]
+                 )
+
+        assert [[^expected, ^expected]] =
+                 rows(
+                   ctx.db,
+                   """
+                   SELECT g.baseHorizonMs,w.dueAt-g.armedAt
+                   FROM effort_checkin_generations AS g
+                   JOIN wakes AS w ON w.wakeId=g.wakeId
+                   WHERE g.assignmentId=?1 AND g.state='armed'
+                   """,
+                   [assignment.id]
+                 )
+
+        {priority, {item, assignment}}
+      end
+
+    {item, assignment} = horizons[4]
+
+    updated =
+      Gateway.handlers(ctx.config)["work-item-update"].(%{
+        verb: "work-item-update",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: "holder",
+        params: %{work_item_id: item.id, priority: 6}
+      })
+
+    assert updated.priority == 6
+
+    assert [[6, 3_600_000, 3_600_000]] =
+             rows(
+               ctx.db,
+               """
+               SELECT ap.priority,g.baseHorizonMs,w.dueAt-g.armedAt
+               FROM assignment_priorities AS ap
+               JOIN effort_checkin_generations AS g ON g.assignmentId=ap.assignmentId
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE ap.assignmentId=?1 AND g.state='armed'
+               """,
+               [assignment.id]
+             )
+
+    closed_item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:h1",
+        principal: {:user, "h1"},
+        session_key: nil,
+        params: %{title: "closed priority", priority: 4}
+      })
+
+    closed =
+      dispatch_for_item(
+        ctx,
+        {:session, "parent"},
+        "holder",
+        "closed priority",
+        closed_item.id
+      )
+
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: closed.id,
+      kind: "completion"
+    })
+
+    assert bracket_state(ctx.db, closed.id) == "canceled"
+
+    assert %{priority: 6} =
+             Gateway.handlers(ctx.config)["work-item-update"].(%{
+               verb: "work-item-update",
+               origin: "agent:holder",
+               principal: {:session, "holder"},
+               session_key: "holder",
+               params: %{work_item_id: closed_item.id, priority: 6}
+             })
+
+    assert [[6]] =
+             rows(
+               ctx.db,
+               "SELECT priority FROM assignment_priorities WHERE assignmentId=?1",
+               [closed.id]
+             )
+
+    reopened =
+      assignment(ctx, "reopen-assignment", {:session, "parent"}, nil, %{
+        assignment_id: closed.id,
+        reason: "the card carries work again"
+      })
+
+    assert reopened.state == "open"
+
+    assert [[2, "armed", 3_600_000, 3_600_000]] =
+             rows(
+               ctx.db,
+               """
+               SELECT g.generation,g.state,g.baseHorizonMs,w.dueAt-g.armedAt
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE g.assignmentId=?1
+               ORDER BY g.generation DESC LIMIT 1
+               """,
+               [closed.id]
+             )
+  end
+
+  test "a standing work-blocked fact suppresses the check and an ineligible icebox cancels it",
+       ctx do
+    blocked = dispatch(ctx, {:session, "parent"}, "holder", "blocked")
+
+    {:ok, %{kind: "work-blocked"}} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "work-blocked",
+          scope: "holder",
+          origin: "agent:holder"
+        })
+      end)
+
+    assert nil == fire_probe(ctx, blocked.id)
+    assert silent_rearm(ctx.db, blocked.id)
     assert prods(ctx.db, "holder") == []
 
-    created = dispatch(ctx, {:session, "parent"}, "holder", "created file")
-    File.write!(Path.join(ctx.root, "created.tmp"), "effect")
-    assert nil == fire_probe(ctx, created.id)
-    assert silent_rearm(ctx.db, created.id)
+    item = work_item!(ctx.db, "legacy icebox")
+    legacy = dispatch_for_item(ctx, {:session, "parent"}, "holder", "legacy icebox", item.id)
+    :ok = DB.execute(ctx.db, "UPDATE work_items SET state='iceboxed' WHERE id='#{item.id}'")
+    wake = current_wake(ctx.db, legacy.id)
 
-    deleted = dispatch(ctx, {:session, "parent"}, "holder", "deleted file")
-    File.rm!(Path.join(ctx.root, "created.tmp"))
-    assert nil == fire_probe(ctx, deleted.id)
-    assert silent_rearm(ctx.db, deleted.id)
+    assert nil == fire_probe(ctx, legacy.id)
+    assert bracket_state(ctx.db, legacy.id) == "canceled"
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert prods(ctx.db, "holder") == []
+  end
 
-    nested = dispatch(ctx, {:session, "parent"}, "holder", "nested write")
-    File.mkdir_p!(Path.join(ctx.root, "deep/deeper"))
-    File.write!(Path.join(ctx.root, "deep/deeper/note.md"), "nested")
-    assert nil == fire_probe(ctx, nested.id)
-    assert silent_rearm(ctx.db, nested.id)
+  test "acceptance 4 and 5: workspace writes are not activity; a stall is not effect",
+       ctx do
+    # Filesystem activity is not one of the four authorized card activities.
+    # A write therefore cannot hide an otherwise inactive card.
+    modified = dispatch(ctx, {:session, "parent"}, "holder", "workspace-only activity")
+    File.write!(Path.join(ctx.root, "src/tracked.txt"), "changed\n")
+    assert nil == fire_probe(ctx, modified.id)
+    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == modified.id))
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
+    refute prod.prompt =~ "writes"
+    refute prod.prompt =~ "workspace"
 
-    # A repository under the root is neither required nor special: git motion is
-    # only ever visible here as the writes git makes.
-    git_root = Path.join(ctx.root, "repo")
-    init_repo(git_root)
-    committed = dispatch(ctx, {:session, "parent"}, "holder", "commit")
-    File.write!(Path.join(git_root, "tracked.txt"), "committed\n")
-    git!(git_root, ["add", "tracked.txt"])
-    git!(git_root, ["commit", "-m", "effect"])
-    assert nil == fire_probe(ctx, committed.id)
-    assert silent_rearm(ctx.db, committed.id)
-
-    # ACCEPTED MISS-CASE (documented, not fixed): an mtime-preserving copy of a
-    # file that is already listed writes bytes the probe cannot see. It fails
-    # SAFE — one prod, answered by an attest. A copy to a NEW path is caught by
-    # the listing, so the miss needs an existing destination.
-    File.write!(Path.join(ctx.root, "src/dest.txt"), "old")
-    File.write!(Path.join(ctx.root, "src/source.txt"), "new bytes")
-    File.touch!(Path.join(ctx.root, "src/source.txt"), 1_700_000_000)
-    File.touch!(Path.join(ctx.root, "src/dest.txt"), 1_700_000_000)
-    preserved = dispatch(ctx, {:session, "parent"}, "holder", "mtime-preserving copy")
-    {_out, 0} = System.cmd("cp", ["-p", src(ctx, "src/source.txt"), src(ctx, "src/dest.txt")])
-    assert File.read!(src(ctx, "src/dest.txt")) == "new bytes"
-    assert nil == fire_probe(ctx, preserved.id)
-    assert [prod] = prods(ctx.db, "holder")
-    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+    File.write!(Path.join(ctx.root, "created.tmp"), "more workspace activity")
+    assert nil == fire_probe(ctx, modified.id)
+    assert [%{session_key: "parent"}] = escalation_wakes(ctx.db, modified.id)
 
     # A stall is turns without effect: turns are reported, never counted.
     stalled = dispatch(ctx, {:session, "parent"}, "holder", "stall")
@@ -239,7 +373,7 @@ defmodule Tightbeam.EffortCheckinTest do
     fire_probe(ctx, stalled.id)
     assert [parent_escalation] = escalation_wakes(ctx.db, stalled.id)
     assert parent_escalation.session_key == "parent"
-    assert parent_escalation.prompt =~ "no writes, artifacts, attests, or work-item updates"
+    assert parent_escalation.prompt =~ "no artifacts, attests, or work-item updates"
 
     # A replayed probe of an already-probed generation is inert.
     assert :ok = EffortCheckin.probe(ctx.db, ctx.config, wake)
@@ -247,14 +381,6 @@ defmodule Tightbeam.EffortCheckinTest do
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
              stalled.id
            ]) == [[0]]
-
-    # An absent workspace is stated as a fact on the channel it belongs to, not
-    # raised as its own alarm.
-    missing = dispatch(ctx, {:session, "parent"}, "holder", "missing")
-    File.rm_rf!(ctx.root)
-    parent_escalation = escalate(ctx, missing.id)
-    assert parent_escalation.session_key == "parent"
-    assert parent_escalation.prompt =~ "workspace #{ctx.root}: unobservable"
   end
 
   test "proof 4: internal wakes create no turn and stay out of pending/inspection", ctx do
@@ -357,7 +483,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert :counters.get(calls, 1) == 1
   end
 
-  test "proof 8: a busy org editing across multiple horizons emits zero visible artifacts", ctx do
+  test "proof 8: holder-wide workspace activity cannot suppress card inactivity", ctx do
     assignments =
       for index <- 1..3 do
         dispatch(ctx, {:session, "parent"}, "holder", "busy #{index}")
@@ -374,9 +500,8 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert rows(ctx.db, "SELECT COUNT(*) FROM condition_facts", []) == [[0]]
 
-    # A working agent is not prodded either: the prod is a rung of the alarm,
-    # not a heartbeat.
-    assert prods(ctx.db, "holder") == []
+    assert Enum.sort(Enum.map(prods(ctx.db, "holder"), & &1.assignment_id)) ==
+             Enum.sort(Enum.map(assignments, & &1.id))
   end
 
   test "proofs 5 and 8b: effect resets the parent rung and Main terminates escalation", ctx do
@@ -391,8 +516,13 @@ defmodule Tightbeam.EffortCheckinTest do
                [item.id]
              )
 
-    # Any real effect resets the streak, including its parent-ladder position.
-    File.write!(Path.join(ctx.root, "src/tracked.txt"), "reset\n")
+    # An assignment-local attest resets the streak, including its parent-ladder position.
+    assignment(ctx, "attest", {:session, "holder"}, nil, %{
+      assignment_id: item.id,
+      kind: "progress",
+      note: "material assignment progress"
+    })
+
     assert nil == fire_probe(ctx, item.id)
     assert silent_rearm(ctx.db, item.id, 4)
 
@@ -408,7 +538,11 @@ defmodule Tightbeam.EffortCheckinTest do
     assert bracket_state(ctx.db, item.id) == "probed"
     assert no_effort_requests?(ctx.db, item.id)
 
-    assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{assignment_id: item.id})
+    assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
+      assignment_id: item.id,
+      reason: "test revocation"
+    })
+
     assert bracket_state(ctx.db, item.id) == "canceled"
   end
 
@@ -570,7 +704,8 @@ defmodule Tightbeam.EffortCheckinTest do
       })
 
     assert nil == fire_probe(%{ctx | config: changing_remote}, item.id)
-    assert silent_rearm(ctx.db, item.id)
+    assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == item.id))
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
 
     failed_config = Map.put(ctx.config, :sh, fn _ -> {"ssh unavailable", 255} end)
 
@@ -582,7 +717,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     escalation = escalate(%{ctx | config: failed_config}, failed.id)
     assert escalation.session_key == "parent"
-    assert escalation.prompt =~ "unobservable"
+    assert escalation.prompt =~ "no artifacts, attests, or work-item updates"
     assert no_effort_requests?(ctx.db, failed.id)
   end
 
@@ -600,7 +735,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.session_key == "holder"
     assert prod.assignment_id == silent.id
     assert prod.state == "pending"
-    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
     assert prod.prompt =~ "artifact-record"
     assert prod.prompt =~ "2 turns taken"
     assert prod.prompt =~ "new material result or evidence"
@@ -628,6 +763,34 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(ctx, recorded.id)
     assert silent_rearm(ctx.db, recorded.id)
     assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == recorded.id)) == []
+  end
+
+  test "artifacts count only for the card's work item and unthreaded cards have none", ctx do
+    item = work_item!(ctx.db, "artifact scope")
+    other_item = work_item!(ctx.db, "unrelated artifact scope")
+
+    scoped = dispatch_for_item(ctx, {:session, "parent"}, "holder", "scoped", item.id)
+    artifact!(ctx.db, "holder", other_item.id, "other-card.md")
+
+    assert nil == fire_probe(ctx, scoped.id)
+
+    assert [_prod] =
+             Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == scoped.id))
+
+    matching = dispatch_for_item(ctx, {:session, "parent"}, "holder", "matching", item.id)
+    artifact!(ctx.db, "holder", item.id, "this-card.md")
+
+    assert nil == fire_probe(ctx, matching.id)
+    assert silent_rearm(ctx.db, matching.id)
+    assert Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == matching.id)) == []
+
+    unthreaded = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "unthreaded"})
+    artifact!(ctx.db, "holder", item.id, "still-threaded.md")
+
+    assert nil == fire_probe(ctx, unthreaded.id)
+
+    assert [_prod] =
+             Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == unthreaded.id))
   end
 
   test "acceptance 1 on the PRODUCTION path: the dispatch's own doorbell is not the holder's work",
@@ -667,7 +830,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert nil == fire_probe(ctx, assignment.id)
 
     assert [prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == assignment.id))
-    assert prod.prompt =~ "no writes, artifacts, attests, or work-item updates"
+    assert prod.prompt =~ "no artifacts, attests, or work-item updates"
 
     # And a real work-item UPDATE by the holder still counts, on the same path.
     silent = dispatch_for_item(ctx, {:session, "parent"}, "holder", "second bracket", item.id)
@@ -740,8 +903,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert [escalation] = escalation_wakes(ctx.db, silent.id)
     assert escalation.session_key == "parent"
     assert escalation.prompt =~ "Child session holder remains inactive"
-    assert escalation.prompt =~ "no writes, artifacts, attests, or work-item updates"
-    assert escalation.prompt =~ "workspace #{ctx.root}: none"
+    assert escalation.prompt =~ "no artifacts, attests, or work-item updates"
     assert no_effort_requests?(ctx.db, silent.id)
 
     # One prod per silent streak, not one per bracket.
@@ -1051,9 +1213,12 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert replacement_wake_id == replacement_wake.wake_id
 
-    assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
-             bare.id
-           ]) == [[0]]
+    assert [[2, "satellite"]] =
+             rows(
+               ctx.db,
+               "SELECT generation,host FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [bare.id]
+             )
 
     assert [[host, root]] =
              rows(
@@ -1111,9 +1276,277 @@ defmodule Tightbeam.EffortCheckinTest do
                [item.id]
              )
 
-    assert rows(ctx.db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
-             bare.id
-           ]) == [[0]]
+    assert [[3, ^replacement_key]] =
+             rows(
+               ctx.db,
+               "SELECT generation,holderKey FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+               [bare.id]
+             )
+  end
+
+  test "A-05: a dismiss snapshot change refuses stale and a fresh retry rules once", ctx do
+    observer = session(ctx.db, "dismiss-observer", "h1", Placement.local_host_name())
+    target = dispatch(ctx, {:session, "parent"}, "holder", "dismiss target")
+    moving = dispatch(ctx, {:session, "parent"}, "holder", "concurrent holder motion")
+    request_id = open_effort_request(ctx, target, "parent")
+    raced = :atomics.new(1, [])
+
+    race_config =
+      Map.put(ctx.config, :sh, fn invocation ->
+        if :atomics.compare_exchange(raced, 1, 0, 1) == :ok do
+          prepared =
+            EffortCheckin.prepare_transferred_rearms(
+              ctx.db,
+              ctx.config,
+              ctx.holder,
+              [moving.id]
+            )
+
+          assert {:ok, :ok} =
+                   DB.transaction(ctx.db, fn txn ->
+                     EffortCheckin.apply_prepared_rearms_in_txn(
+                       txn,
+                       ctx.config,
+                       ctx.holder.session_key,
+                       prepared
+                     )
+                   end)
+        end
+
+        System.cmd(hd(invocation), tl(invocation), stderr_to_stdout: true)
+      end)
+
+    call = effort_rule_call(observer.session_key, request_id, "dismiss")
+
+    assert %{code: "stale_effort_snapshot"} = EffortCheckin.rule(ctx.db, race_config, call)
+    assert [["open", nil, nil]] = request_ruling(ctx.db, request_id)
+
+    assert %{status: "ruled", decision: "dismiss", ruled_by: ruled_by} =
+             EffortCheckin.rule(ctx.db, ctx.config, call)
+
+    assert ruled_by == "session:#{observer.session_key}"
+    assert [["ruled", "dismiss", ^ruled_by]] = request_ruling(ctx.db, request_id)
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
+             [request_id]
+           ) == [[0]]
+  end
+
+  test "A-10: deadline and distinct-session rulings preserve one winner in both orders", ctx do
+    continuing = session(ctx.db, "continue-observer", "h1", Placement.local_host_name())
+    dismissing = session(ctx.db, "dismiss-observer-two", "h1", Placement.local_host_name())
+
+    ruling_first = dispatch(ctx, {:session, "parent"}, "holder", "ruling wins first")
+    continue_id = open_effort_request(ctx, ruling_first, "parent")
+    continue_deadline = request_deadline_wake(ctx.db, continue_id)
+    before_continue = generation_count(ctx.db, ruling_first.id)
+
+    assert %{status: "ruled", decision: "continue", ruled_by: continue_actor} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call(continuing.session_key, continue_id, "continue")
+             )
+
+    assert continue_actor == "session:#{continuing.session_key}"
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, continue_deadline)
+    assert generation_count(ctx.db, ruling_first.id) == before_continue + 1
+    assert [["ruled", "continue", ^continue_actor]] = request_ruling(ctx.db, continue_id)
+    assert Wakes.get(ctx.db, continue_deadline.wake_id).state == "canceled"
+
+    deadline_first = dispatch(ctx, {:session, "parent"}, "holder", "deadline wins first")
+    dismiss_id = open_effort_request(ctx, deadline_first, "parent")
+    first_deadline = request_deadline_wake(ctx.db, dismiss_id)
+    before_dismiss = generation_count(ctx.db, deadline_first.id)
+
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, first_deadline)
+
+    assert [["open", nil, nil, replacement_wake_id]] =
+             rows(
+               ctx.db,
+               "SELECT status,decision,ruledBy,deadlineWakeId FROM decision_requests WHERE id=?1",
+               [dismiss_id]
+             )
+
+    refute replacement_wake_id == first_deadline.wake_id
+    assert Wakes.get(ctx.db, first_deadline.wake_id).state == "fired"
+
+    assert %{status: "ruled", decision: "dismiss", ruled_by: dismiss_actor} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call(dismissing.session_key, dismiss_id, "dismiss")
+             )
+
+    assert dismiss_actor == "session:#{dismissing.session_key}"
+    assert generation_count(ctx.db, deadline_first.id) == before_dismiss + 1
+    assert [["ruled", "dismiss", ^dismiss_actor]] = request_ruling(ctx.db, dismiss_id)
+    assert Wakes.get(ctx.db, replacement_wake_id).state == "canceled"
+
+    for request_id <- [continue_id, dismiss_id] do
+      assert rows(
+               ctx.db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
+               [request_id]
+             ) == [[0]]
+    end
+  end
+
+  test "an exact effort transition cancels its own deadline after supervision liveness disappears",
+       ctx do
+    for action <- ["continue", "dismiss"] do
+      assignment = dispatch(ctx, {:session, "parent"}, "holder", "stale #{action}")
+      request_id = open_effort_request(ctx, assignment, "parent")
+      deadline = request_deadline_wake(ctx.db, request_id)
+      drop_supervision_liveness(ctx.db, assignment.id)
+
+      assert %{code: "not_authorized", message: "current expecter required"} =
+               EffortCheckin.rule(
+                 ctx.db,
+                 ctx.config,
+                 %{
+                   verb: "effort-rule",
+                   origin: "user:h2",
+                   principal: {:user, "h2"},
+                   session_key: nil,
+                   params: %{request: request_id, action: action}
+                 }
+               )
+
+      actor = "session:parent"
+
+      assert %{
+               id: ^request_id,
+               kind: "effort",
+               assignment_id: assignment_id,
+               deadline_wake_id: deadline_wake_id,
+               status: "ruled",
+               decision: ^action,
+               ruled_by: ^actor
+             } =
+               EffortCheckin.rule(
+                 ctx.db,
+                 ctx.config,
+                 effort_rule_call("parent", request_id, action)
+               )
+
+      assert assignment_id == assignment.id
+      assert deadline_wake_id == deadline.wake_id
+      assert Wakes.get(ctx.db, deadline.wake_id).state == "canceled"
+
+      assert %{
+               requester: "tightbeam:effort-checkin",
+               reason: "obligation_disposed",
+               source_kind: "decision_request",
+               source_id: ^request_id,
+               outcome: "disposition",
+               disposition_kind: "decision_request_transition",
+               disposition_id: ^request_id,
+               liveness_kind: nil,
+               liveness_id: nil,
+               action_needed: 0
+             } = cancellation(ctx.db, deadline.wake_id)
+    end
+  end
+
+  test "the terminal effort exception rejects mismatched requests and follows a concurrent deadline",
+       ctx do
+    mismatched = dispatch(ctx, {:session, "parent"}, "holder", "mismatched deadline")
+    mismatched_request = open_effort_request(ctx, mismatched, "parent")
+    mismatched_deadline = request_deadline_wake(ctx.db, mismatched_request)
+    drop_supervision_liveness(ctx.db, mismatched.id)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET status='ruled',decision='continue',ruledBy='session:parent',ruledAt=1 WHERE id=?1",
+               [mismatched_request]
+             )
+
+    unrelated =
+      Wakes.schedule(ctx.db, %{
+        session_key: "parent",
+        origin: "process:tightbeam",
+        consumer: "effort_deadline",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: mismatched.id
+      })
+
+    command = %{
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "obligation_disposed",
+      causal_source: %{kind: "decision_request", id: mismatched_request},
+      outcome: %{
+        kind: "disposition",
+        disposition_kind: "decision_request_transition",
+        disposition_id: mismatched_request
+      }
+    }
+
+    assert {:ok, false} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, unrelated.wake_id))
+             end)
+
+    assert Wakes.get(ctx.db, unrelated.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, mismatched_deadline.wake_id).state == "pending"
+
+    raced = dispatch(ctx, {:session, "parent"}, "holder", "deadline advanced first")
+    raced_request = open_effort_request(ctx, raced, "parent")
+    first_deadline = request_deadline_wake(ctx.db, raced_request)
+    drop_supervision_liveness(ctx.db, raced.id)
+
+    assert :ok = EffortCheckin.deadline(ctx.db, ctx.config, first_deadline)
+    replacement = request_deadline_wake(ctx.db, raced_request)
+    refute replacement.wake_id == first_deadline.wake_id
+
+    assert %{id: ^raced_request, status: "ruled", decision: "continue"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call("parent", raced_request, "continue")
+             )
+
+    assert Wakes.get(ctx.db, first_deadline.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, replacement.wake_id).state == "canceled"
+  end
+
+  test "a forged terminal effort payload cannot cancel an open request deadline", ctx do
+    assignment = dispatch(ctx, {:session, "parent"}, "holder", "forged terminal payload")
+    request_id = open_effort_request(ctx, assignment, "parent")
+    deadline = request_deadline_wake(ctx.db, request_id)
+    drop_supervision_liveness(ctx.db, assignment.id)
+
+    command = %{
+      wake_id: deadline.wake_id,
+      requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+      reason_kind: "obligation_disposed",
+      causal_source: %{kind: "decision_request", id: request_id},
+      outcome: %{
+        kind: "disposition",
+        disposition_kind: "decision_request_transition",
+        disposition_id: request_id,
+        terminal_request: %{
+          id: request_id,
+          kind: "effort",
+          assignment_id: assignment.id,
+          deadline_wake_id: deadline.wake_id,
+          status: "ruled",
+          decision: "continue"
+        }
+      }
+    }
+
+    assert {:ok, false} =
+             DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
+
+    assert Wakes.get(ctx.db, deadline.wake_id).state == "pending"
+
+    assert rows(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [request_id]) == [
+             ["open"]
+           ]
   end
 
   defp dispatch(ctx, principal, holder, subject) do
@@ -1191,6 +1624,94 @@ defmodule Tightbeam.EffortCheckinTest do
     do:
       rows(db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [assignment_id]) ==
         [[0]]
+
+  defp open_effort_request(ctx, assignment, expecter_session_key) do
+    [[generation]] =
+      rows(
+        ctx.db,
+        "SELECT MAX(generation) FROM effort_checkin_generations WHERE assignmentId=?1",
+        [assignment.id]
+      )
+
+    deadline =
+      Wakes.schedule(ctx.db, %{
+        session_key: expecter_session_key,
+        origin: "process:tightbeam",
+        consumer: "effort_deadline",
+        due_at: System.system_time(:millisecond) + 60_000,
+        assignment_id: assignment.id
+      })
+
+    request_id = "dr_effort_#{System.unique_integer([:positive])}"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
+                  effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
+               VALUES (?1,'effort','process:tightbeam','h1',?2,?3,1,?4,?5,?6,?7,
+                       'Continue or dismiss?','["continue","dismiss"]',
+                       '{"actions":["continue","dismiss"]}','open')
+               """,
+               [
+                 request_id,
+                 assignment.id,
+                 expecter_session_key,
+                 generation,
+                 deadline.wake_id,
+                 now,
+                 now + 60_000
+               ]
+             )
+
+    request_id
+  end
+
+  defp effort_rule_call(session_key, request_id, action) do
+    %{
+      verb: "effort-rule",
+      origin: "agent:caller-supplied-alias",
+      principal: {:session, session_key},
+      session_key: nil,
+      params: %{request: request_id, action: action}
+    }
+  end
+
+  defp request_deadline_wake(db, request_id) do
+    [[wake_id]] =
+      rows(db, "SELECT deadlineWakeId FROM decision_requests WHERE id=?1", [request_id])
+
+    Wakes.get(db, wake_id)
+  end
+
+  defp request_ruling(db, request_id) do
+    rows(db, "SELECT status,decision,ruledBy FROM decision_requests WHERE id=?1", [request_id])
+  end
+
+  defp drop_supervision_liveness(db, assignment_id) do
+    assert {:ok, _} =
+             DB.query(db, "DELETE FROM supervision_entitlements WHERE assignmentId=?1", [
+               assignment_id
+             ])
+
+    assert rows(db, "SELECT COUNT(*) FROM supervision_entitlements WHERE assignmentId=?1", [
+             assignment_id
+           ]) == [[0]]
+
+    :ok
+  end
+
+  defp generation_count(db, assignment_id) do
+    [[count]] =
+      rows(db, "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1", [
+        assignment_id
+      ])
+
+    count
+  end
 
   defp current_wake(db, assignment_id) do
     [[wake_id]] =
@@ -1298,6 +1819,11 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   defp session(db, key, owner, host, overrides \\ %{}) do
+    overrides =
+      if Map.has_key?(overrides, :spawned_by) and not Map.has_key?(overrides, :operational_parent),
+        do: Map.put(overrides, :operational_parent, overrides.spawned_by),
+        else: overrides
+
     Org.create(
       db,
       Map.merge(
@@ -1333,21 +1859,6 @@ defmodule Tightbeam.EffortCheckinTest do
       )
 
     JSON.decode!(baseline)["observation"]["stamp"]
-  end
-
-  defp init_repo(path) do
-    File.mkdir_p!(path)
-    git!(path, ["init"])
-    git!(path, ["config", "user.email", "test@example.invalid"])
-    git!(path, ["config", "user.name", "Test"])
-    File.write!(Path.join(path, "tracked.txt"), "baseline\n")
-    git!(path, ["add", "tracked.txt"])
-    git!(path, ["commit", "-m", "baseline"])
-  end
-
-  defp git!(path, args) do
-    {_output, 0} = System.cmd("git", ["-C", path | args], stderr_to_stdout: true)
-    :ok
   end
 
   # The prod is a wake to the HOLDER; the owner request's notification is a wake

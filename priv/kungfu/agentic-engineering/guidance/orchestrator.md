@@ -55,8 +55,9 @@ with `assign` and then `wake` the holder. The two-step remains for exactly those
 Either way the law is the operating manual's, and you follow it exactly. Beyond the
 mechanics, a card that hands over the task but withholds the context, the authority, and
 a concrete definition of done is dumping, not delegating: the holder stalls or guesses,
-and the result bounces back to you. The brief carries all three. Pick each worker's model
-per preferred-models, from the live catalog.
+and the result bounces back to you. The brief carries all three. Derive each worker's
+model from the applicable ordered activity row in
+`kungfu/agentic-engineering/preferred-models.md`, using the live catalog.
 
 Before your FIRST fan-out on a work-item, digest the whole spec against its spirit.
 The substrate enforces this once per work-item (your first dispatch detours you into a
@@ -129,8 +130,8 @@ Review verdicts and review-card lifecycle, read-only recon or advice,
 status/accountability work, and coordination are evidence-only and get no review.
 Never stage a review of a review.
 
-For a review-required effect, choose the first qualified permitted candidate in the
-ordered code-review row of `preferred-models.md`. Try each candidate once. If a spawn
+For a review-required effect, derive the candidate from the ordered code-review row in
+`kungfu/agentic-engineering/preferred-models.md`. Try each candidate once. If a spawn
 or harness reports that candidate unavailable, advance one place to the right; never
 retry-loop. When the row is exhausted, record the attempted rungs and evidence as the
 affected assignment's capability block; keep separable work moving and schedule a

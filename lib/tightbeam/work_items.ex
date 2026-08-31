@@ -16,7 +16,7 @@ defmodule Tightbeam.WorkItems do
   fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
   """
 
-  alias Tightbeam.{CausalEvents, DB, IdPrefix, Org, Wakes}
+  alias Tightbeam.{CausalEvents, DB, EffortCheckin, IdPrefix, Org, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -52,12 +52,25 @@ defmodule Tightbeam.WorkItems do
     CHECK((specRefName IS NULL) = (specRefSha256 IS NULL)),
     CHECK((createdByUser IS NOT NULL) != (createdBySession IS NOT NULL))
   );
+  CREATE TABLE IF NOT EXISTS work_item_versions (
+    workItemId TEXT PRIMARY KEY REFERENCES work_items(id),
+    rowVersion INTEGER NOT NULL CHECK(rowVersion > 0)
+  );
   CREATE INDEX IF NOT EXISTS work_items_created_in_turn ON work_items (createdInTurnSeq)
+  """
+
+  @priority_ddl """
+  CREATE TABLE IF NOT EXISTS work_item_priorities (
+    workItemId TEXT PRIMARY KEY REFERENCES work_items(id),
+    priority INTEGER NOT NULL
+  )
   """
 
   @doc "Create the work-item schema."
   @spec ensure_schema(DB.server()) :: :ok
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    with :ok <- DB.execute(db, @ddl), do: DB.execute(db, @priority_ddl)
+  end
 
   @doc false
   def __handle__(db, "work-item-create", call), do: create_result(db, call)
@@ -80,6 +93,7 @@ defmodule Tightbeam.WorkItems do
          :ok <- valid_title(call.params[:title]),
          :ok <- valid_spec_ref(call.params[:spec_ref_name], call.params[:spec_ref_sha256]),
          :ok <- valid_is_bug(is_bug),
+         :ok <- valid_priority(call.params[:priority]),
          :ok <- valid_idempotency_key(key),
          {:ok, owner} <- resolve_owner(db, call.principal) do
       {created_by_user, created_by_session} = creator(call.principal)
@@ -90,6 +104,8 @@ defmodule Tightbeam.WorkItems do
             nil ->
               id = "wi_" <> Tightbeam.Id.uuid4()
               created_in_turn_seq = running_turn_seq(txn, created_by_session)
+              priority = call.params[:priority] || default_priority_in_txn(txn)
+              created_at = now()
 
               Txn.q(
                 txn,
@@ -110,9 +126,12 @@ defmodule Tightbeam.WorkItems do
                   created_by_user,
                   created_by_session,
                   created_in_turn_seq,
-                  now()
+                  created_at
                 ]
               )
+
+              put_priority_in_txn(txn, id, priority)
+              stamp_version_in_txn(txn, id, created_at)
 
               routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
 
@@ -181,7 +200,11 @@ defmodule Tightbeam.WorkItems do
     with :ok <- principal_allowed(call.principal) do
       result =
         transaction(db, fn txn ->
-          result = update_in_txn(txn, call.params)
+          result =
+            update_in_txn(
+              txn,
+              Map.put(call.params, :effort_config, Map.get(call, :effort_config, %{}))
+            )
 
           case result do
             {:updated, item, _changed?} ->
@@ -218,10 +241,28 @@ defmodule Tightbeam.WorkItems do
 
         with :ok <- valid_title(title),
              :ok <- valid_spec_ref(spec_ref_name, spec_ref_sha256),
-             :ok <- valid_is_bug(is_bug) do
+             :ok <- valid_is_bug(is_bug),
+             :ok <- valid_priority(params[:priority]) do
+          priority = if Map.has_key?(params, :priority), do: params.priority, else: item.priority
           updates = patch_updates(params, title, spec_ref_name, spec_ref_sha256, is_bug)
-          updated = apply_updates(txn, item, updates)
-          {:updated, updated, metadata(item) != metadata(updated)}
+          apply_updates(txn, item, updates)
+
+          if priority != item.priority do
+            put_priority_in_txn(txn, item.id, priority)
+
+            EffortCheckin.reprioritize_work_item_in_txn(
+              txn,
+              Map.get(params, :effort_config, %{}),
+              item.id,
+              priority
+            )
+          end
+
+          updated = fetch_in_txn(txn, item.id)
+          changed? = metadata(item) != metadata(updated)
+
+          if changed?, do: stamp_version_in_txn(txn, item.id, now())
+          {:updated, fetch_in_txn(txn, item.id), changed?}
         end
     end
   end
@@ -381,6 +422,7 @@ defmodule Tightbeam.WorkItems do
 
           true ->
             apply_disposition(txn, item, verb, target, reason)
+            stamp_version_in_txn(txn, id, now())
             disposed = fetch_in_txn(txn, id)
 
             # The item keeps its CURRENT state only, and reopen nulls failReason;
@@ -789,6 +831,12 @@ defmodule Tightbeam.WorkItems do
   defp valid_is_bug(value) when is_boolean(value), do: :ok
   defp valid_is_bug(_), do: error("invalid_is_bug", "isBug must be a boolean")
 
+  defp valid_priority(nil), do: :ok
+  defp valid_priority(value) when is_integer(value) and value in 0..8, do: :ok
+
+  defp valid_priority(_),
+    do: error("invalid_priority", "priority must be an integer from 0 through 8")
+
   defp valid_idempotency_key(nil), do: :ok
 
   defp valid_idempotency_key(key) when is_binary(key) do
@@ -837,7 +885,23 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  defp metadata(item), do: {item.title, item.specRefName, item.specRefSha256, item.isBug}
+  defp metadata(item),
+    do: {item.title, item.specRefName, item.specRefSha256, item.isBug, item.priority}
+
+  defp put_priority_in_txn(txn, work_item_id, priority) do
+    Txn.q(
+      txn,
+      "INSERT INTO work_item_priorities (workItemId, priority) VALUES (?1, ?2) ON CONFLICT(workItemId) DO UPDATE SET priority=excluded.priority",
+      [work_item_id, priority]
+    )
+  end
+
+  defp default_priority_in_txn(txn) do
+    case Txn.q(txn, "SELECT value FROM org_settings WHERE key='default-priority'") do
+      [[value]] -> String.to_integer(value)
+      [] -> 4
+    end
+  end
 
   defp on_change(call), do: Map.get(call, :on_work_item_change, fn _, _ -> :ok end)
 
@@ -866,11 +930,28 @@ defmodule Tightbeam.WorkItems do
 
   defp now, do: System.system_time(:millisecond)
 
+  # A timestamp alone repeats when two writes share one millisecond. The
+  # sidecar makes the public version strict without changing product fields.
+  defp stamp_version_in_txn(txn, work_item_id, proposed) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO work_item_versions (workItemId, rowVersion) VALUES (?1, ?2)
+      ON CONFLICT(workItemId) DO UPDATE
+      SET rowVersion = MAX(excluded.rowVersion, work_item_versions.rowVersion + 1)
+      """,
+      [work_item_id, proposed]
+    )
+  end
+
   # The wake-id columns are INTERNAL substrate truth — never surfaced in a
   # response object (§Response shapes).
   defp columns do
     "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
-      "routingWakeId, slateWakeId, createdByUser, createdBySession, createdAt"
+      "routingWakeId, slateWakeId, createdByUser, createdBySession, createdAt, " <>
+      "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId = work_items.id), createdAt), " <>
+      "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
+      "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER))"
   end
 
   defp work_item([
@@ -886,7 +967,9 @@ defmodule Tightbeam.WorkItems do
          slate_wake_id,
          user,
          session,
-         created_at
+         created_at,
+         row_version,
+         priority
        ]) do
     %{
       id: id,
@@ -901,7 +984,9 @@ defmodule Tightbeam.WorkItems do
       slateWakeId: slate_wake_id,
       createdByUser: user,
       createdBySession: session,
-      createdAt: created_at
+      createdAt: created_at,
+      rowVersion: row_version,
+      priority: priority
     }
   end
 
