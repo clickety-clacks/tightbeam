@@ -2746,7 +2746,10 @@ defmodule Tightbeam.Gateway do
                 not is_nil(safe_failure) and not credential_refused? ->
                   safe_failure.message
 
-                match?(%{code: code, message: message} when is_binary(code) and is_binary(message), reason) ->
+                match?(
+                  %{code: code, message: message} when is_binary(code) and is_binary(message),
+                  reason
+                ) ->
                   reason
 
                 true ->

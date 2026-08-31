@@ -1320,6 +1320,7 @@ defmodule Tightbeam.Acp.AdapterTest do
              &(&1["method"] == "session/set_config_option" and &1["configId"] == "effort")
            )
   end
+
   test "Cursor resolves a bare ref to the closed wire enum through the option name" do
     {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
 
@@ -1387,6 +1388,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     # wire candidate exists and no invented decoration is guessed at.
     assert model_writes == ["composer-2.5-fast"]
   end
+
   test "strict apply does not retry an invalid-params model refusal" do
     {adapter, capture_path} =
       start_adapter(harness: :codex, fail_mode: "model-invalid-params")

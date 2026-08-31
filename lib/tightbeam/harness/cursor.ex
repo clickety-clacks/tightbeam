@@ -176,7 +176,7 @@ defmodule Tightbeam.Harness.Cursor do
     %{
       version: @adapter_version,
       launcher_sha256: @launcher_sha256,
-      bundle_sha256: @bundle_sha256
+      bundle_sha256_by_platform: @bundle_sha256_by_platform
     }
   end
 

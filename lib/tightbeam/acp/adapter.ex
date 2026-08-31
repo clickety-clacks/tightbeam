@@ -618,8 +618,8 @@ defmodule Tightbeam.Acp.Adapter do
              mcpServers: mcp_servers,
              _meta: Harness.module!(state.harness).session_config(%{}, guidance).meta
            },
-            timeout: request_timeout
-          ) do
+           timeout: request_timeout
+         ) do
       {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
         # The apply below resolves wire-by-name candidates from the cached
         # option list, so the session/new options must be remembered first.

@@ -87,8 +87,7 @@ defmodule Tightbeam.Schema do
   # shape, so a ruled status cannot exist without its decision, ruler, and time.
   # Cursor provider support widens the two persisted harness/provider CHECKs
   # from the exact v13 predecessor without changing any main-owned column.
-  @shape "coordination-fabric-v1-phase1-v14"
-  @cursor_provider_previous_shape "coordination-fabric-v1-phase1-v13"
+  @shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
   @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
   @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
@@ -1831,10 +1830,7 @@ defmodule Tightbeam.Schema do
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
-        :ok
-
-      {:ok, [[@cursor_provider_previous_shape]]} ->
-        migrate_cursor_provider_v1_020(db)
+        ensure_cursor_provider_v1_020(db)
 
       {:ok, [[@ruled_decision_integrity_previous_shape]]} ->
         :ok = upgrade_ruled_decision_integrity_v1(db)
@@ -1921,8 +1917,7 @@ defmodule Tightbeam.Schema do
         #{@identity_render_stamp_previous_shape},
         #{@effort_request_exit_previous_shape}, and
         #{@session_mechanical_status_previous_shape}, and
-        #{@ruled_decision_integrity_previous_shape}, and
-        #{@cursor_provider_previous_shape}.
+        #{@ruled_decision_integrity_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
@@ -1942,7 +1937,26 @@ defmodule Tightbeam.Schema do
     end
   end
 
-  defp migrate_cursor_provider_v1_020(db) do
+  defp ensure_cursor_provider_v1_020(db) do
+    case DB.query(
+           db,
+           "SELECT name,sql FROM sqlite_master WHERE type='table' AND name IN ('sessions','subagent_markers') ORDER BY name"
+         ) do
+      {:ok, []} ->
+        # Fresh bootstrap stamps before creating tables; current Org and
+        # SubagentMarkers DDL will create the widened constraints.
+        :ok
+
+      {:ok, rows} ->
+        if length(rows) == 2 and
+             Enum.all?(rows, fn [_name, sql] -> String.contains?(sql, "'cursor'") end),
+           do: :ok,
+           else: migrate_cursor_provider_v1_020(db)
+    end
+  end
+
+  @doc false
+  def migrate_cursor_provider_v1_020(db) do
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
@@ -1956,7 +1970,7 @@ defmodule Tightbeam.Schema do
         {:error, error} ->
           raise ShapeError,
             message:
-              "migration #{@cursor_provider_previous_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+              "in-place Cursor provider migration for #{@shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
@@ -1965,6 +1979,12 @@ defmodule Tightbeam.Schema do
 
   defp migrate_cursor_provider_v1_020_in_txn(%Txn{} = txn) do
     harnesses = Enum.map_join(Tightbeam.Harness.known(), ",", &"'#{&1.wire_name()}'")
+
+    model_column =
+      case Txn.q(txn, "SELECT COUNT(*) FROM sessions WHERE model IS NULL") do
+        [[0]] -> "model TEXT NOT NULL"
+        [[_]] -> "model TEXT"
+      end
 
     :ok =
       Txn.exec(
@@ -1980,7 +2000,7 @@ defmodule Tightbeam.Schema do
           identityRevision TEXT, identityRenderContract TEXT, identityGuidanceDigest TEXT,
           cliToken TEXT, harness TEXT NOT NULL CHECK (harness IN (#{harnesses})),
           provider TEXT NOT NULL CHECK (provider IN (#{@cursor_provider_values})),
-          model TEXT NOT NULL, thinkingLevel TEXT, modelContext TEXT,
+          #{model_column}, thinkingLevel TEXT, modelContext TEXT,
           host TEXT NOT NULL DEFAULT 'local', clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
           state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
           mechanicalStatus TEXT NOT NULL DEFAULT 'idle'
@@ -2063,14 +2083,10 @@ defmodule Tightbeam.Schema do
       rows -> incompatible_cursor_provider!("left invalid foreign keys: #{inspect(rows)}")
     end
 
-    Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
-      @shape,
-      System.system_time(:millisecond),
-      @cursor_provider_previous_shape
-    ])
-
-    if Txn.changes(txn) != 1,
-      do: incompatible_cursor_provider!("lost its exact stamp transition")
+    case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+      [[@shape]] -> :ok
+      rows -> incompatible_cursor_provider!("changed the main schema stamp: #{inspect(rows)}")
+    end
 
     :ok
   end

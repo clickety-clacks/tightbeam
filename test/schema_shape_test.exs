@@ -34,8 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v14"
-  @cursor_provider_previous_shape "coordination-fabric-v1-phase1-v13"
+  @shape "coordination-fabric-v1-phase1-v13"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -57,7 +56,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok =
              DB.execute(db, """
-             INSERT INTO users (userId, isAdmin, createdAt) VALUES ('george', 1, 1);
+             INSERT INTO users (userId, isAdmin, creationKind, createdAt)
+             VALUES ('george', 1, 'admin_add', 1);
              INSERT INTO sessions
                (sessionKey, displayName, ownerUserId, origin, archetype, harness,
                 provider, model, createdAt, updatedAt)
@@ -76,7 +76,6 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok =
              DB.execute(db, """
-             INSERT INTO users (userId, isAdmin, createdAt) VALUES ('mike', 1, 1);
              INSERT INTO sessions
                (sessionKey, displayName, ownerUserId, origin, archetype, harness,
                 provider, model, createdAt, updatedAt)
@@ -91,10 +90,10 @@ defmodule Tightbeam.SchemaShapeTest do
              VALUES (100, 'subagent_start', 'existing', 'sub-deleted', 'event-deleted',
                      'codex', 3);
              DELETE FROM subagent_markers WHERE id = 100;
-             UPDATE schema_stamp SET shape='#{@cursor_provider_previous_shape}', stampedAt=1;
+             UPDATE schema_stamp SET shape='#{@shape}', stampedAt=1;
              """)
 
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.migrate_cursor_provider_v1_020(db)
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["existing", "codex", "openai", "idle"]]} =
