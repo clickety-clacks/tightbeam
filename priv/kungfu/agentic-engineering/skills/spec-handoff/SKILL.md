@@ -16,7 +16,9 @@ description: How a spec moves to implementation and stays authoritative while it
    concept goes to the user
    (`tightbeam wake --user <id> --prompt "<the question>"`) and holds back the affected
    scope; separable scope hands off.
-3. Non-goals are named, so implementation cannot drift into them.
+3. Non-goals are named, so implementation cannot drift into them. The eight-section
+   skeleton (spec-homing) is yours to fill; the reviewer blocks on a load-bearing hole
+   in it, not on its shape.
 4. The handoff names the spec by identity, not just topic: the canonical path plus the
    content the work-item is bound to (`--spec-ref`/`--spec-sha256`, see spec-homing),
    the in-scope goals, and the work-item id. Bind (or re-bind) the hash AFTER the
