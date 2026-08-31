@@ -292,6 +292,11 @@ pub enum Command {
         identity: Identity,
         selection: ToplineSelection,
     },
+    ToplineMutation {
+        identity: Identity,
+        verb: String,
+        params: Vec<(String, String)>,
+    },
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
@@ -1105,6 +1110,116 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
         spec: nonempty(flags, "spec"),
         spec_sha: nonempty(flags, "spec-sha"),
         session: nonempty(flags, "session"),
+    })
+}
+
+fn topline_mutation(
+    verb: &str,
+    positional: &[String],
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    let required = |name| nonempty(flags, name).ok_or_else(|| format!("{verb} requires --{name}"));
+    let exact = |count| {
+        if positional.len() == count {
+            Ok(())
+        } else {
+            Err(format!(
+                "usage: tightbeam {verb} has an invalid argument count"
+            ))
+        }
+    };
+    let key = || required("key").map(|value| ("idempotencyKey".to_owned(), value));
+    let reason = || required("reason").map(|value| ("reason".to_owned(), value));
+    let title = || required("title").map(|value| ("title".to_owned(), value));
+
+    let params = match verb {
+        "topline-create" => {
+            exact(1)?;
+            vec![title()?, key()?]
+        }
+        "topline-update" => {
+            exact(2)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                title()?,
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-close" | "topline-reopen" => {
+            exact(2)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-link-work" => {
+            exact(3)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                ("workItemId".to_owned(), positional[2].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-unlink-work" => {
+            exact(2)?;
+            vec![
+                ("membershipId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-concern-create" => {
+            exact(2)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                title()?,
+                key()?,
+            ]
+        }
+        "topline-concern-update" => {
+            exact(2)?;
+            vec![
+                ("concernId".to_owned(), positional[1].clone()),
+                title()?,
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-concern-resolve" | "topline-concern-reopen" => {
+            exact(2)?;
+            vec![
+                ("concernId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-concern-link-work" => {
+            exact(3)?;
+            vec![
+                ("concernId".to_owned(), positional[1].clone()),
+                ("membershipId".to_owned(), positional[2].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-concern-unlink-work" => {
+            exact(2)?;
+            vec![
+                ("concernRefId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        _ => return Err(format!("unknown Topline operation: {verb}")),
+    };
+
+    Ok(Command::ToplineMutation {
+        identity: identity(flags)?,
+        verb: verb.to_owned(),
+        params,
     })
 }
 
@@ -2000,6 +2115,18 @@ fn parse_with_optional_catalog(
                 selection,
             })
         }
+        verb @ ("topline-create"
+        | "topline-update"
+        | "topline-close"
+        | "topline-reopen"
+        | "topline-link-work"
+        | "topline-unlink-work"
+        | "topline-concern-create"
+        | "topline-concern-update"
+        | "topline-concern-resolve"
+        | "topline-concern-reopen"
+        | "topline-concern-link-work"
+        | "topline-concern-unlink-work") => topline_mutation(verb, &parsed.positional, flags),
         "work-item-icebox" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam work-item-icebox <workItemId>".to_owned());

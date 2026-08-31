@@ -762,6 +762,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 )],
             ))
         }
+        Command::ToplineMutation {
+            identity,
+            verb,
+            params,
+        } => Ok(request(
+            identity,
+            verb,
+            vec![],
+            params
+                .iter()
+                .map(|(name, value)| string_field(name, value))
+                .collect(),
+        )),
         Command::WorkItemIcebox {
             identity,
             work_item_id,
@@ -1680,6 +1693,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::TurnTrace { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
+        | Command::ToplineMutation { identity, .. }
         | Command::CoordinationShare { identity, .. }
         | Command::DigestMembers { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
