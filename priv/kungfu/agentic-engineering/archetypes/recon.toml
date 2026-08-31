@@ -11,7 +11,5 @@ text = """
 
 #include "preferred-models.md"
 
-#include "model-policy.md"
-
 #include "recon.md"
 """
