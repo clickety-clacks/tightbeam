@@ -2330,7 +2330,7 @@ defmodule Tightbeam.Supervision do
         artifact_cursor,
         artifact_max
       ) ++
-        attest_receipts_in_txn(txn, assignment_id, attest_cursor, attest_max) ++
+        attest_receipts_in_txn(txn, assignment_id, generation, attest_cursor, attest_max) ++
         work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max)
 
     checkpoint =
@@ -2490,16 +2490,35 @@ defmodule Tightbeam.Supervision do
     |> Enum.map(fn [id, at] -> %{kind: "artifact", id: id, at: at, expires_at: nil} end)
   end
 
-  defp attest_receipts_in_txn(txn, assignment_id, cursor, maximum) do
+  defp attest_receipts_in_txn(txn, assignment_id, generation, cursor, maximum) do
     Txn.q(
       txn,
       """
       SELECT id, kind, ts
       FROM attests
-      WHERE rowid > ?1 AND rowid <= ?2 AND assignmentId=?3 AND kind IN ('progress','verdict')
+      WHERE rowid > ?1 AND rowid <= ?2 AND assignmentId=?3
+        AND (
+          kind='verdict'
+          OR (
+            kind='progress'
+            AND NOT EXISTS (
+              SELECT 1
+              FROM wake_cancellations
+              WHERE livenessTriggerKind='supervision_entitlement'
+                AND livenessTriggerId=?4
+                AND reasonKind='requester_withdrew'
+                AND causalSourceKind='verb_call'
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM supervision_liveness_sidecar
+                  WHERE wakeId=wake_cancellations.wakeId
+                )
+            )
+          )
+        )
       ORDER BY rowid
       """,
-      [cursor, maximum, assignment_id]
+      [cursor, maximum, assignment_id, "#{assignment_id}##{generation}"]
     )
     |> Enum.map(fn [id, kind, at] -> %{kind: kind, id: id, at: at, expires_at: nil} end)
   end
