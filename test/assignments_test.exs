@@ -1910,6 +1910,9 @@ defmodule Tightbeam.AssignmentsTest do
                |> put_in([:params, :reason], "second revocation")
              )
 
+    assert %{revocationReason: "second revocation"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
     assert {:ok, [[2, "second revocation", "test revocation"]]} =
              DB.query(
                ctx.db,
@@ -1919,6 +1922,202 @@ defmodule Tightbeam.AssignmentsTest do
                """,
                [assignment.id]
              )
+  end
+
+  test "reopened same-millisecond revocations bind reads and replay to the exact generation",
+       ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "generation identity"))
+    assignment_id = assignment.id
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "first reason")
+             )
+
+    assert {:ok, [[first_id, closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id, revokedAt FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "the first close was mistaken")
+             )
+
+    # The first immutable row has the same actor and timestamp as the target
+    # close below, but belongs to the initial generation. It cannot satisfy the
+    # post-reopen close trigger.
+    assert {:error, %DB.Error{message: old_generation_error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id, closed_at]
+             )
+
+    assert old_generation_error =~ "revoked assignment requires revocation provenance"
+
+    assert {:ok, [[reopening_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM assignment_reopenings WHERE assignmentId=?1 ORDER BY id DESC LIMIT 1",
+               [assignment.id]
+             )
+
+    second_id = "revocation-second-generation"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_revocations
+                 (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+               VALUES (?1, ?2, ?3, 'flynn', NULL, 'second reason')
+               """,
+               [second_id, assignment.id, closed_at]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_revocation_generations
+                 (revocationId, assignmentId, reopeningId)
+               VALUES (?1, ?2, ?3)
+               """,
+               [second_id, assignment.id, reopening_id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id, closed_at]
+             )
+
+    assert %{revocationReason: "second reason"} =
+             current =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert %{assignment: %{revocationReason: "second reason"}} =
+             WorkState.detail(ctx.db, assignment.id)
+
+    assert %{
+             "class" => "assignment.closed",
+             "payload" => %{"revocationReason" => "second reason"}
+           } =
+             Tightbeam.Firehose.Publisher.state_notice(
+               ctx.db,
+               call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+               current
+             )
+
+    assert %{id: ^assignment_id, revocationReason: "second reason"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               call("revoke-assignment", {:user, "flynn"}, nil, %{
+                 assignment_id: assignment.id,
+                 reason: "second reason"
+               })
+             )
+
+    assert {:ok, [[^second_id, ^reopening_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revocationId, reopeningId
+               FROM assignment_revocation_generations
+               WHERE assignmentId=?1 AND reopeningId IS NOT NULL
+               """,
+               [assignment.id]
+             )
+
+    assert {:ok, [[^first_id, nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revocationId, reopeningId
+               FROM assignment_revocation_generations
+               WHERE assignmentId=?1 AND reopeningId IS NULL
+               """,
+               [assignment.id]
+             )
+  end
+
+  test "generation upgrade replaces the predecessor tuple trigger before a reopened close", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade generation"))
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedAt FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "upgrade needs a new generation")
+             )
+
+    # Simulate the exact predecessor: no generation table and the former
+    # timestamp/actor trigger body under its stable trigger name.
+    :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocation_generations")
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TRIGGER assignments_revocation_reason_required
+        BEFORE UPDATE OF state, outcome, closedAt, closedByUser, closedBySession ON assignments
+        WHEN NEW.state = 'closed' AND NEW.outcome = 'revoked'
+          AND NOT EXISTS (
+            SELECT 1 FROM assignment_revocations r
+            WHERE r.assignmentId = NEW.id
+              AND r.revokedAt = NEW.closedAt
+              AND r.revokedByUser IS NEW.closedByUser
+              AND r.revokedBySession IS NEW.closedBySession
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'revoked assignment requires revocation provenance');
+        END
+        """
+      )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:error, %DB.Error{message: error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id, closed_at]
+             )
+
+    assert error =~ "revoked assignment requires revocation provenance"
   end
 
   test "a failure after the history insert rolls back the whole reopen (Sol xhigh review, finding 7)",
@@ -2326,6 +2525,16 @@ defmodule Tightbeam.AssignmentsTest do
                "assignment-get",
                assignment_get_call({:user, "flynn"}, "asg_legacy_reason")
              )
+
+    assert {:ok, [["legacy:asg_legacy_reason:2", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revocationId, reopeningId
+               FROM assignment_revocation_generations
+               WHERE assignmentId='asg_legacy_reason'
+               """
+             )
   end
 
   test "revocation replay emits no second state callback or accepted handoff", ctx do
@@ -2405,6 +2614,27 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert delete_error =~ "revocation provenance is immutable"
 
+    assert {:error, %DB.Error{message: generation_update_error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignment_revocation_generations
+               SET reopeningId=1 WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert generation_update_error =~ "revocation generation is immutable"
+
+    assert {:error, %DB.Error{message: generation_delete_error}} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_revocation_generations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert generation_delete_error =~ "revocation generation is immutable"
+
     assert {:ok, [["test revocation"]]} =
              DB.query(
                ctx.db,
@@ -2444,6 +2674,7 @@ defmodule Tightbeam.AssignmentsTest do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade reason"))
 
     :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+    :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocation_generations")
     :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocations")
 
     :ok =
