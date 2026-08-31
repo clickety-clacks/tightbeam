@@ -579,7 +579,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if *tree {
                 params.push("\"tree\":true".to_owned());
             }
-            Ok(request(identity, "toplines", vec![], params))
+            Ok(request(identity, "execution-map", vec![], params))
         }
         // Every selector travels as an ordinary body PARAM: both verbs are declared
         // non-target at the router, and --session is a COHORT FILTER over creator
@@ -598,7 +598,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         } => {
             let mut params = filter_params(filters);
             params.push(string_field("under", work_item_id));
-            Ok(request(identity, "topline", vec![], params))
+            Ok(request(identity, "execution-map-select", vec![], params))
         }
         Command::Topline {
             identity,
@@ -611,7 +611,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
 
             Ok(request(
                 identity,
-                "topline",
+                "execution-map-select",
                 vec![],
                 vec![format!(
                     "\"assignments\":{}",
