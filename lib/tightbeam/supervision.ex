@@ -94,9 +94,36 @@ defmodule Tightbeam.Supervision do
 
   @spec prod_state(DB.server(), String.t()) :: map() | nil
   def prod_state(db, assignment_id) do
-    {:ok, prod_rows} =
-      DB.query(
-        db,
+    transaction!(db, fn txn -> prod_state_in_txn(txn, assignment_id) end)
+  end
+
+  @doc false
+  @spec rollback_precheck(DB.server()) :: :ok | {:error, [map()]}
+  def rollback_precheck(db) do
+    transaction!(db, fn txn ->
+      rows =
+        watched_assignments_in_txn(txn)
+        |> Enum.filter(fn assignment ->
+          query(txn, "SELECT 1 FROM supervision_entitlements WHERE assignmentId=?1", [
+            assignment.id
+          ]) == []
+        end)
+        |> Enum.map(fn assignment ->
+          %{
+            assignmentId: assignment.id,
+            holderKey: assignment.holderKey,
+            openedAt: assignment.openedAt
+          }
+        end)
+
+      if rows == [], do: :ok, else: {:error, rows}
+    end)
+  end
+
+  defp prod_state_in_txn(txn, assignment_id) do
+    prod_rows =
+      Txn.q(
+        txn,
         "SELECT assignmentId, attemptCount, prodCount, deniedStreak, attestCount, lastProdAt, stalledAt, strandedAt FROM assignment_prods WHERE assignmentId = ?1",
         [assignment_id]
       )
@@ -119,9 +146,9 @@ defmodule Tightbeam.Supervision do
           nil
       end
 
-    {:ok, entitlement_rows} =
-      DB.query(
-        db,
+    entitlement_rows =
+      Txn.q(
+        txn,
         """
         SELECT generation, dueAt, state, basisKind, basisId, terminusAt, cause,
                principal, supervisionIntervalMs
@@ -131,7 +158,9 @@ defmodule Tightbeam.Supervision do
         [assignment_id]
       )
 
-    supervision =
+    watched = watched_assignment_in_txn(txn, assignment_id)
+
+    pacing =
       case entitlement_rows do
         [
           [
@@ -161,17 +190,49 @@ defmodule Tightbeam.Supervision do
             supervisionRetirementEpoch: nil,
             supervisionRetirementOutcomeKind: nil,
             supervisionRetirementOutcomeId: nil,
-            supervisionActionNeeded: nil
+            supervisionActionNeeded: nil,
+            supervisionPacingSource: "stored"
           }
 
         [] ->
-          transfer_projection(db, assignment_id)
+          if watched do
+            default_pacing_projection_in_txn(txn, assignment_id)
+          else
+            transfer_projection(txn, assignment_id)
+          end
       end
+
+    transfer = transfer_projection(txn, assignment_id, not is_nil(pacing))
+
+    pacing =
+      case {pacing, transfer} do
+        {nil, projection} ->
+          projection
+
+        {projection, nil} ->
+          projection
+
+        {projection, transfer_projection} ->
+          Map.merge(
+            projection,
+            Map.take(transfer_projection, [
+              :supervisionTransferWakeId,
+              :supervisionTransferSessionKey,
+              :supervisionRetirementEpoch,
+              :supervisionRetirementOutcomeKind,
+              :supervisionRetirementOutcomeId,
+              :supervisionActionNeeded
+            ])
+          )
+      end
+
+    supervision =
+      if pacing, do: Map.put(pacing, :supervisionWatched, not is_nil(watched)), else: nil
 
     case {counters, supervision} do
       {nil, nil} -> nil
       {nil, projection} -> Map.merge(zero_state(assignment_id), projection)
-      {state, nil} -> state
+      {state, nil} -> Map.put(state, :supervisionWatched, false)
       {state, projection} -> Map.merge(state, projection)
     end
   end
@@ -181,6 +242,223 @@ defmodule Tightbeam.Supervision do
 
   defp logical_basis_id("progress", "receipt:" <> receipt_id), do: receipt_id
   defp logical_basis_id(_kind, basis_id), do: basis_id
+
+  defp watched_assignments_in_txn(txn) do
+    Txn.q(
+      txn,
+      """
+      SELECT a.id, a.holderKey, a.openedAt, a.workItemId, a.subject
+      FROM assignments AS a
+      JOIN sessions AS s ON s.sessionKey = a.holderKey
+      WHERE a.state = 'open' AND s.state = 'active'
+      ORDER BY a.openedAt, a.id
+      """
+    )
+    |> Enum.map(fn [id, holder, opened_at, work_item_id, subject] ->
+      %{
+        id: id,
+        holderKey: holder,
+        openedAt: opened_at,
+        workItemId: work_item_id,
+        subject: subject
+      }
+    end)
+  end
+
+  defp watched_assignment_in_txn(txn, assignment_id) do
+    watched_assignments_in_txn(txn)
+    |> Enum.find(&(&1.id == assignment_id))
+  end
+
+  defp default_pacing_projection_in_txn(txn, assignment_id) do
+    pacing = derived_default_pacing_in_txn(txn, assignment_id)
+
+    %{
+      supervisionState: "default",
+      supervisionGeneration: pacing.generation,
+      supervisionDueAt: nil,
+      supervisionIntervalMs: nil,
+      supervisionBasisKind: logical_basis_kind(pacing.basis_kind, pacing.basis_id),
+      supervisionBasisId: logical_basis_id(pacing.basis_kind, pacing.basis_id),
+      supervisionCause: logical_basis_kind(pacing.cause, pacing.basis_id),
+      supervisionPrincipal: pacing.principal,
+      supervisionTerminusAt: nil,
+      supervisionTransferWakeId: pacing.transfer_wake_id,
+      supervisionTransferSessionKey: pacing.transfer_session_key,
+      supervisionRetirementEpoch: pacing.retirement_epoch,
+      supervisionRetirementOutcomeKind: pacing.retirement_outcome_kind,
+      supervisionRetirementOutcomeId: pacing.retirement_outcome_id,
+      supervisionActionNeeded: pacing.action_needed,
+      supervisionPacingSource: "default"
+    }
+  end
+
+  defp derived_default_pacing_in_txn(txn, assignment_id) do
+    [[generation]] =
+      Txn.q(
+        txn,
+        """
+        SELECT MAX(generation) FROM (
+          SELECT generation FROM supervision_liveness_receipts WHERE assignmentId=?1
+          UNION ALL
+          SELECT generation FROM supervision_progress_absorptions WHERE assignmentId=?1
+          UNION ALL
+          SELECT chargedGeneration AS generation FROM supervision_liveness_sidecar
+            WHERE assignmentId=?1 AND chargedGeneration IS NOT NULL
+        )
+        """,
+        [assignment_id]
+      )
+
+    generation = max(generation || 1, 1)
+
+    case accepted_transfer(txn, assignment_id, nil) do
+      {:ok, %{generation: transfer_generation} = transfer}
+      when is_nil(transfer_generation) or transfer_generation == generation ->
+        %{
+          generation: max(transfer.generation || generation, generation),
+          basis_kind: "escalation_scheduled",
+          basis_id: transfer.wake_id,
+          cause: "parent_elevated",
+          principal: transfer.principal,
+          transfer_wake_id: transfer.wake_id,
+          transfer_session_key: transfer.session_key,
+          retirement_epoch: transfer.retirement_epoch,
+          retirement_outcome_kind: transfer.retirement_outcome_kind,
+          retirement_outcome_id: transfer.retirement_outcome_id,
+          action_needed: transfer.action_needed
+        }
+
+      {:ok, _older_transfer} ->
+        receipt_default_pacing_in_txn(txn, assignment_id, generation)
+
+      :none ->
+        receipt_default_pacing_in_txn(txn, assignment_id, generation)
+
+      {:error, reason} ->
+        raise "incompatible_supervision_liveness_v1: #{reason}"
+    end
+  end
+
+  defp receipt_default_pacing_in_txn(txn, assignment_id, generation) do
+    case Txn.q(
+           txn,
+           """
+           SELECT receiptId FROM supervision_liveness_receipts
+           WHERE assignmentId=?1 AND generation=?2
+           ORDER BY receiptId DESC LIMIT 1
+           """,
+           [assignment_id, generation]
+         ) do
+      [[receipt_id]] ->
+        default_pacing(generation, "progress", "receipt:#{receipt_id}", "progress")
+
+      [] ->
+        default_pacing(generation, "recovery_backfill", assignment_id, "recovery_backfill")
+    end
+  end
+
+  defp default_pacing(generation, basis_kind, basis_id, cause) do
+    %{
+      generation: generation,
+      basis_kind: basis_kind,
+      basis_id: basis_id,
+      cause: cause,
+      principal: "process:tightbeam",
+      transfer_wake_id: nil,
+      transfer_session_key: nil,
+      retirement_epoch: nil,
+      retirement_outcome_kind: nil,
+      retirement_outcome_id: nil,
+      action_needed: nil
+    }
+  end
+
+  defp materialize_default_pacing_in_txn(txn, assignment_id, interval, materialization_clock)
+       when is_integer(interval) and interval > 0 and is_integer(materialization_clock) and
+              materialization_clock >= 0 do
+    case Txn.q(
+           txn,
+           "SELECT generation, dueAt, state FROM supervision_entitlements WHERE assignmentId=?1",
+           [assignment_id]
+         ) do
+      [[generation, due_at, state]] ->
+        %{generation: generation, due_at: due_at, state: state}
+
+      [] ->
+        do_materialize_default_pacing_in_txn(
+          txn,
+          assignment_id,
+          interval,
+          materialization_clock
+        )
+    end
+  end
+
+  defp do_materialize_default_pacing_in_txn(
+         txn,
+         assignment_id,
+         interval,
+         materialization_clock
+       ) do
+    if is_nil(watched_assignment_in_txn(txn, assignment_id)),
+      do:
+        raise(
+          "incompatible_supervision_liveness_v1: materialization requires a watched assignment"
+        )
+
+    baseline_progress_in_txn(txn, assignment_id)
+
+    ensure_liveness_receipt_state_in_txn(
+      txn,
+      assignment_id,
+      "recovery_backfill",
+      "process:tightbeam"
+    )
+
+    pacing = derived_default_pacing_in_txn(txn, assignment_id)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_entitlements
+        (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
+         basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
+      VALUES (?1, ?2, ?3, 'armed', NULL, NULL, ?4, ?5, NULL, ?6, ?7, ?8)
+      ON CONFLICT(assignmentId) DO NOTHING
+      """,
+      [
+        assignment_id,
+        pacing.generation,
+        materialization_clock + interval,
+        pacing.basis_kind,
+        pacing.basis_id,
+        pacing.cause,
+        pacing.principal,
+        interval
+      ]
+    )
+
+    inserted? = Txn.changes(txn) == 1
+
+    if inserted? do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "supervision_entitlement_materialized",
+        assignment_id,
+        "generation=#{pacing.generation} basis=#{pacing.basis_kind}:#{pacing.basis_id} dueAt=#{materialization_clock + interval} interval=#{interval} cause=#{pacing.cause} principal=#{pacing.principal}"
+      )
+    end
+
+    case Txn.q(
+           txn,
+           "SELECT generation, dueAt, state FROM supervision_entitlements WHERE assignmentId=?1",
+           [assignment_id]
+         ) do
+      [[generation, due_at, state]] -> %{generation: generation, due_at: due_at, state: state}
+      [] -> raise "incompatible_supervision_liveness_v1: missing materialized pacing row"
+    end
+  end
 
   @doc """
   Validate an existing accepted parent-transfer reference without creating
@@ -240,6 +518,47 @@ defmodule Tightbeam.Supervision do
   end
 
   def transition_in_txn(%Txn{} = txn, %{
+        kind: "assignment_reopen",
+        assignment_id: assignment_id,
+        opened_at: opened_at,
+        principal: principal,
+        supervision_interval_ms: interval
+      })
+      when is_integer(opened_at) and opened_at >= 0 and is_integer(interval) and interval > 0 do
+    cancel_assignment_controllers_in_txn(txn, assignment_id, "tightbeam:assignments")
+
+    Txn.q(
+      txn,
+      """
+      UPDATE supervision_watermarks
+      SET pendingBranch=NULL, pendingAssignment=NULL, pendingK=NULL, pendingN=NULL
+      WHERE pendingAssignment=?1
+      """,
+      [assignment_id]
+    )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_entitlements
+        (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
+         basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
+      VALUES (?1, 1, ?2, 'armed', NULL, NULL, 'assignment_open', ?1, NULL,
+              'assignment_open', ?3, ?4)
+      ON CONFLICT(assignmentId) DO UPDATE SET
+        generation=1, dueAt=excluded.dueAt, state='armed', lastAttemptGeneration=NULL,
+        claimClock=NULL, basisKind='assignment_open', basisId=excluded.basisId,
+        terminusAt=NULL, cause='assignment_open', principal=excluded.principal,
+        supervisionIntervalMs=excluded.supervisionIntervalMs
+      """,
+      [assignment_id, opened_at + interval, principal, interval]
+    )
+
+    ensure_liveness_receipt_state_in_txn(txn, assignment_id, "assignment_open", principal)
+    :armed
+  end
+
+  def transition_in_txn(%Txn{} = txn, %{
         kind: "terminal_disposition",
         assignment_id: assignment_id,
         cause: cause,
@@ -254,29 +573,44 @@ defmodule Tightbeam.Supervision do
   def transition_in_txn(%Txn{} = txn, %{
         kind: "checkpoint_scheduled",
         wake_id: wake_id,
-        creator_session_key: creator_session_key
+        creator_session_key: creator_session_key,
+        supervision_interval_ms: interval
       }) do
-    case Txn.q(
-           txn,
-           """
-           SELECT a.id, t.seq
-           FROM wakes w
-           JOIN turns t ON t.sessionKey=w.sessionKey
-           JOIN assignments a ON a.id=t.assignmentId
-           JOIN supervision_entitlements e ON e.assignmentId=a.id
-           WHERE w.wakeId=?1
-             AND w.sessionKey=?2 AND w.creatorSessionKey=?2
-             AND w.consumer='prompt' AND w.state='pending'
-             AND w.dueAt > w.createdAt
-             AND t.status='running'
-             AND a.holderKey=?2 AND a.state='open'
-             AND e.state IN ('armed','claimed')
-           ORDER BY t.seq DESC
-           LIMIT 1
-           """,
-           [wake_id, creator_session_key]
-         ) do
+    candidate =
+      Txn.q(
+        txn,
+        """
+        SELECT a.id, t.seq
+        FROM wakes w
+        JOIN turns t ON t.sessionKey=w.sessionKey
+        JOIN assignments a ON a.id=t.assignmentId
+        JOIN sessions s ON s.sessionKey=a.holderKey
+        WHERE w.wakeId=?1
+          AND w.sessionKey=?2 AND w.creatorSessionKey=?2
+          AND w.consumer='prompt' AND w.state='pending'
+          AND w.dueAt > w.createdAt
+          AND t.status='running'
+          AND a.holderKey=?2 AND a.state='open'
+          AND s.state='active'
+        ORDER BY t.seq DESC
+        LIMIT 1
+        """,
+        [wake_id, creator_session_key]
+      )
+
+    case candidate do
       [[assignment_id, turn_seq]] ->
+        materialize_default_pacing_in_txn(txn, assignment_id, interval, now())
+
+        case Txn.q(
+               txn,
+               "SELECT state FROM supervision_entitlements WHERE assignmentId=?1",
+               [assignment_id]
+             ) do
+          [[state]] when state in ["armed", "claimed"] -> :ok
+          _ -> raise "incompatible_supervision_liveness_v1: checkpoint pacing is not active"
+        end
+
         Txn.q(
           txn,
           """
@@ -406,8 +740,6 @@ defmodule Tightbeam.Supervision do
       """,
       [wake_id, assignment_id]
     )
-
-    clear_entitlement_in_txn(txn, assignment_id, "parent_elevated")
 
     EventLog.lifecycle_in_txn(
       txn,
@@ -852,8 +1184,17 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp clear_entitlement_in_txn(txn, assignment_id, cause, principal \\ "process:tightbeam") do
-    Txn.q(txn, "DELETE FROM supervision_entitlements WHERE assignmentId=?1", [assignment_id])
+  defp clear_entitlement_in_txn(txn, assignment_id, cause, principal) do
+    Txn.q(
+      txn,
+      """
+      DELETE FROM supervision_entitlements
+      WHERE assignmentId=?1
+        AND EXISTS (SELECT 1 FROM assignments WHERE id=?1 AND state='closed')
+      """,
+      [assignment_id]
+    )
+
     changed? = Txn.changes(txn) == 1
 
     Txn.q(
@@ -1042,21 +1383,10 @@ defmodule Tightbeam.Supervision do
   end
 
   defp oldest_supervised_assignment(db, session_key) do
-    case query(
-           db,
-           """
-           SELECT a.id, a.subject, a.holderKey
-           FROM assignments a
-           JOIN supervision_entitlements e ON e.assignmentId=a.id
-           WHERE a.holderKey=?1 AND a.state='open' AND e.state IN ('armed','claimed')
-           ORDER BY a.openedAt, a.id
-           LIMIT 1
-           """,
-           [session_key]
-         ) do
-      [[id, subject, holder]] -> %{id: id, subject: subject, holderKey: holder}
-      [] -> nil
-    end
+    transaction!(db, fn txn ->
+      watched_assignments_in_txn(txn)
+      |> Enum.find(&(&1.holderKey == session_key))
+    end)
   end
 
   defp turn_gate(db, session_key),
@@ -2285,20 +2615,11 @@ defmodule Tightbeam.Supervision do
       normalize_legacy_lineage_markers_in_txn(txn)
       migrate_legacy_parent_retirements_in_txn(txn)
 
-      existing =
-        Txn.q(
-          txn,
-          """
-          SELECT e.assignmentId
-          FROM supervision_entitlements e
-          JOIN assignments a ON a.id=e.assignmentId
-          JOIN sessions s ON s.sessionKey=a.holderKey
-          WHERE e.state IN ('armed','claimed') AND a.state='open' AND s.state='active'
-          ORDER BY a.openedAt, a.id
-          """
-        )
+      watched = watched_assignments_in_txn(txn)
 
-      Enum.each(existing, fn [assignment_id] ->
+      Enum.each(watched, fn %{id: assignment_id} ->
+        materialize_default_pacing_in_txn(txn, assignment_id, interval, recovery_clock)
+
         ensure_liveness_receipt_state_in_txn(
           txn,
           assignment_id,
@@ -2307,58 +2628,6 @@ defmodule Tightbeam.Supervision do
         )
 
         absorb_liveness_receipts_in_txn(txn, assignment_id, interval)
-      end)
-
-      missing =
-        Txn.q(
-          txn,
-          """
-          SELECT a.id
-          FROM assignments a
-          JOIN sessions s ON s.sessionKey=a.holderKey
-          LEFT JOIN supervision_entitlements e ON e.assignmentId=a.id
-          WHERE a.state='open' AND s.state='active' AND e.assignmentId IS NULL
-          ORDER BY a.openedAt, a.id
-          """
-        )
-
-      Enum.each(missing, fn [assignment_id] ->
-        case accepted_transfer(txn, assignment_id, nil) do
-          {:ok, _projection} ->
-            :ok
-
-          :none ->
-            baseline_progress_in_txn(txn, assignment_id)
-
-            ensure_liveness_receipt_state_in_txn(
-              txn,
-              assignment_id,
-              "recovery_backfill",
-              "process:tightbeam"
-            )
-
-            Txn.q(
-              txn,
-              """
-              INSERT INTO supervision_entitlements
-                (assignmentId, generation, dueAt, state, lastAttemptGeneration, claimClock,
-                 basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
-              VALUES (?1, 1, ?2, 'armed', NULL, NULL, 'recovery_backfill', ?1, NULL,
-                      'recovery_backfill', 'process:tightbeam', ?3)
-              """,
-              [assignment_id, recovery_clock + interval, interval]
-            )
-
-            EventLog.lifecycle_in_txn(
-              txn,
-              "supervision_entitlement_armed",
-              assignment_id,
-              "generation=1 basis=recovery_backfill:#{assignment_id} cause=recovery_backfill principal=process:tightbeam"
-            )
-
-          {:error, reason} ->
-            raise "incompatible_supervision_liveness_v1: #{reason}"
-        end
       end)
     end)
   end
@@ -2476,21 +2745,12 @@ defmodule Tightbeam.Supervision do
 
     outcome =
       transaction!(state.db, fn txn ->
-        assignments =
-          Txn.q(
-            txn,
-            """
-            SELECT e.assignmentId
-            FROM supervision_entitlements e
-            JOIN assignments a ON a.id=e.assignmentId
-            JOIN sessions s ON s.sessionKey=a.holderKey
-            WHERE e.state IN ('armed','claimed') AND a.state='open' AND s.state='active'
-            ORDER BY a.openedAt, a.id
-            """
-          )
+        assignments = watched_assignments_in_txn(txn)
 
         rebased =
-          Enum.reduce(assignments, terminal_rebases, fn [assignment_id], acc ->
+          Enum.reduce(assignments, terminal_rebases, fn %{id: assignment_id}, acc ->
+            materialize_default_pacing_in_txn(txn, assignment_id, interval, evaluation_clock)
+
             if MapSet.member?(acc, assignment_id) do
               acc
             else
@@ -2544,7 +2804,7 @@ defmodule Tightbeam.Supervision do
         [assignment_id]
       ) != []
 
-    if state in ["armed", "claimed"] and not pending_controller? do
+    if state in ["armed", "claimed", "terminus"] and not pending_controller? do
       absorb_receipt_candidates_in_txn(txn, assignment_id, generation, interval)
     else
       :duplicate
@@ -2663,7 +2923,7 @@ defmodule Tightbeam.Supervision do
               claimClock=NULL, basisKind='progress', basisId=?4, terminusAt=NULL,
               cause='progress', principal='process:tightbeam',
               supervisionIntervalMs=?5
-          WHERE assignmentId=?1 AND generation=?6 AND state IN ('armed','claimed')
+          WHERE assignmentId=?1 AND generation=?6 AND state IN ('armed','claimed','terminus')
           """,
           [
             assignment_id,
@@ -3220,7 +3480,7 @@ defmodule Tightbeam.Supervision do
 
   defp assignment_belongs_to_work?(_db_or_txn, _assignment_id, _primary), do: false
 
-  defp transfer_projection(db_or_txn, assignment_id) do
+  defp transfer_projection(db_or_txn, assignment_id, pacing_present? \\ false) do
     case accepted_transfer(db_or_txn, assignment_id, nil) do
       {:ok, transfer} ->
         %{
@@ -3242,6 +3502,11 @@ defmodule Tightbeam.Supervision do
         }
 
       :none ->
+        nil
+
+      # Stored pacing is the current generation. A candidate that no longer
+      # validates beside it is historical evidence, not an accepted transfer.
+      {:error, _reason} when pacing_present? ->
         nil
 
       {:error, reason} ->
@@ -3411,8 +3676,8 @@ defmodule Tightbeam.Supervision do
         """
         SELECT a.id
         FROM assignments a
-        LEFT JOIN supervision_entitlements e ON e.assignmentId=a.id
-        WHERE a.state='open' AND e.assignmentId IS NULL
+        JOIN sessions s ON s.sessionKey=a.holderKey
+        WHERE a.state='open' AND s.state='active'
         ORDER BY a.openedAt, a.id
         """
       )
@@ -3840,18 +4105,8 @@ defmodule Tightbeam.Supervision do
   end
 
   defp transferred_assignments_in_txn(txn, target_session_key) do
-    query(
-      txn,
-      """
-      SELECT a.id
-      FROM assignments a
-      LEFT JOIN supervision_entitlements e ON e.assignmentId=a.id
-      WHERE a.state='open' AND e.assignmentId IS NULL
-      ORDER BY a.openedAt, a.id
-      """,
-      []
-    )
-    |> Enum.reduce([], fn [assignment_id], acc ->
+    watched_assignments_in_txn(txn)
+    |> Enum.reduce([], fn %{id: assignment_id}, acc ->
       case accepted_transfer(txn, assignment_id, nil) do
         {:ok, %{session_key: ^target_session_key} = transfer} ->
           [{assignment_id, transfer} | acc]
@@ -3896,6 +4151,12 @@ defmodule Tightbeam.Supervision do
            basisKind, basisId, terminusAt, cause, principal, supervisionIntervalMs)
         VALUES (?1, ?2, ?3, 'armed', NULL, NULL, 'parent_retirement', ?4, NULL,
                 'parent_target_retired', ?5, ?6)
+        ON CONFLICT(assignmentId) DO UPDATE SET
+          generation=excluded.generation, dueAt=excluded.dueAt, state='armed',
+          lastAttemptGeneration=NULL, claimClock=NULL,
+          basisKind='parent_retirement', basisId=excluded.basisId, terminusAt=NULL,
+          cause='parent_target_retired', principal=excluded.principal,
+          supervisionIntervalMs=excluded.supervisionIntervalMs
         """,
         [
           assignment_id,

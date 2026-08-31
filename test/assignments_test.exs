@@ -2120,22 +2120,13 @@ defmodule Tightbeam.AssignmentsTest do
     assert error =~ "revoked assignment requires revocation provenance"
   end
 
-  test "a failure after the history insert rolls back the whole reopen (Sol xhigh review, finding 7)",
+  test "reopen replaces stale pacing in the same transaction",
        ctx do
     assignment =
       handle(ctx, "assign", assign_call({:session, "holder"}, "post-insert failure"))
 
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
 
-    # `terminal_disposition` DELETEs the supervision_entitlements row on close,
-    # so there is normally none left to conflict with by the time a card
-    # reopens. Forcing one back makes `apply_reopen`'s later
-    # `supervision_transition!(:armed, ...)` observe `:duplicate` (the INSERT's
-    # `ON CONFLICT(assignmentId) DO NOTHING` fires) instead of `:armed` — an
-    # uncaught raise landing AFTER the INSERT into `assignment_reopenings` and
-    # the UPDATE to the `assignments` row, proving the whole transaction —
-    # history row included — rolls back together rather than leaving an
-    # orphaned papertrail row behind a card the code never actually reopened.
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -2143,22 +2134,26 @@ defmodule Tightbeam.AssignmentsTest do
         INSERT INTO supervision_entitlements
           (assignmentId, generation, dueAt, state, basisKind, basisId, cause, principal,
            supervisionIntervalMs)
-        VALUES (?1, 1, 0, 'armed', 'assignment_open', ?1, 'assignment_open', 'process:test', 1000)
+        VALUES (?1, 9, NULL, 'terminus', 'assignment_open', ?1, 'terminus', 'process:test', NULL)
         """,
         [assignment.id]
       )
 
-    before = reopen_mutation_snapshot(ctx.db, assignment.id)
+    assignment_id = assignment.id
 
-    assert_raise RuntimeError, ~r/invalid supervision transition result/, fn ->
-      handle(
-        ctx,
-        "reopen-assignment",
-        reopen_call({:session, "holder"}, assignment.id, "racing supervision state")
-      )
-    end
+    assert %{id: ^assignment_id, state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "holder"}, assignment.id, "replace stale pacing")
+             )
 
-    assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
+    assert {:ok, [[1, "armed", nil, nil, nil, "assignment_open", "assignment_open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,state,lastAttemptGeneration,claimClock,terminusAt,basisKind,cause FROM supervision_entitlements WHERE assignmentId=?1",
+               [assignment.id]
+             )
   end
 
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
