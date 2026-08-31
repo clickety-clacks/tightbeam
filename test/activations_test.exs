@@ -960,8 +960,16 @@ defmodule Tightbeam.ActivationsTest do
     checkout = Path.join(repo, "_build/legacy-checkout-#{@legacy_base}")
 
     unless File.dir?(Path.join(checkout, ".git")) do
+      assert {origin, 0} = System.cmd("git", ["remote", "get-url", "origin"], cd: repo)
+
       assert {_output, 0} =
                System.cmd("git", ["clone", "--shared", "--no-checkout", repo, checkout],
+                 stderr_to_stdout: true
+               )
+
+      assert {_output, 0} =
+               System.cmd("git", ["fetch", "--depth=1", String.trim(origin), @legacy_base],
+                 cd: checkout,
                  stderr_to_stdout: true
                )
 
