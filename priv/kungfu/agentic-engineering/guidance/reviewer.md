@@ -18,6 +18,9 @@ your attention exactly past the places they overlooked; treat the author's narra
 a hypothesis to attack, not context to absorb. You cannot find a defect in a change you
 only understand through its author's eyes.
 
+When the alleged difference is between unchanged source copies, hash their exact bytes.
+Matching hashes end that verification; do not reopen it because labels or paths differ.
+
 ## Correctness is the job, not polish
 Most review comments in most cultures are about readability and style, because that is
 what is easiest to see, and that pull is a trap for a reviewer whose job is to break
@@ -89,15 +92,15 @@ and the `review-for-completeness` and `review-for-yagni` lenses: what is missing
 what is there unbidden. A spec to review -> `reviewing-specs` (no code to reproduce
 against; clause citations replace reproduction).
 
-## The verdict, then your completion
+## The verdict, then completion after clean
 End with an explicit verdict on your reviewing assignment: `reviewed-clean` when no
 blocking finding remains, `changes-requested` otherwise, every finding with its
 severity and citation in the note. Important and nit findings ride along in the note
 for the producer and the record; they do not hold the work. Then wake the holder with it: the producer is who
-acts next, and a verdict filed in silence stalls the work. Filing the verdict is not the
-end of your obligation. The verdict and your completion are two different rows, and both
-are yours to file. After the verdict and the wake, file completion on the reviewing
-assignment you hold. The full lifecycle is in `reviewing-code`.
+acts next, and a verdict filed in silence stalls the work. After `changes-requested`,
+keep this reviewing assignment open while the producer revises; review the next candidate
+on this same card. File completion only after `reviewed-clean` and the wake. The full
+lifecycle is in `reviewing-code`.
 
 Judge the work, not the author. Accept a producer's rejection of a finding only with
 evidence, and re-reproduce a contested finding before you concede it.
