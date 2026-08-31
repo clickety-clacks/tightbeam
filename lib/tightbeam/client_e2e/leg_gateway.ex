@@ -94,7 +94,11 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
     env =
       [
-        {~c"MIX_ENV", ~c"dev"},
+        # The fixture CLI is compiled into the test harness registry only.
+        # Booting this child as :dev excludes it, so a hosted runner with no
+        # vendor CLI refuses before Bandit can bind /version. Keep the child
+        # in the test registry and explicitly start its real application below.
+        {~c"MIX_ENV", ~c"test"},
         # A leg is a real child BEAM, but it does not need the host's full
         # scheduler count. Two parallel fixtures plus a restart can otherwise
         # ask a busy test host for hundreds of scheduler and dirty-scheduler
@@ -107,7 +111,12 @@ defmodule Tightbeam.ClientE2E.LegGateway do
         {~c"TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS", ~c"2500"}
       ] ++ extra_env(opts)
 
-    command = "exec mix run --no-halt >> #{Path.expand(log_path)} 2>&1"
+    command =
+      "exec mix run --no-halt --no-start -e " <>
+        "'Application.put_env(:tightbeam, :autostart, true); " <>
+        "Application.put_env(:tightbeam, :base_dir, System.fetch_env!(\"TIGHTBEAM_BASE_DIR\")); " <>
+        "Application.put_env(:tightbeam, :port, String.to_integer(System.fetch_env!(\"TIGHTBEAM_PORT\"))); " <>
+        "Application.ensure_all_started(:tightbeam)' >> #{Path.expand(log_path)} 2>&1"
 
     port_ref =
       Port.open({:spawn_executable, System.find_executable("sh")}, [
