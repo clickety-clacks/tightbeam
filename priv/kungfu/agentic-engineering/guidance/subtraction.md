@@ -6,6 +6,11 @@ adjudication engine whose own first paragraph forbade it; every round was
 adversarial, every closure was earnest, and the whole thing was garbage
 accreted around a correct intent. These rules exist so that cannot recur.
 
+"This should not exist" is the product owner's verdict to give over mechanism
+and scope. A reviewer or coder who believes it raises it to the product owner
+with `ask --user` and keeps reviewing or building the work on its merits; it is
+not a hold they may place themselves.
+
 Three answers to every found hole, and adding is NOT the default:
 1. ADD the mechanism that closes it.
 2. DELETE the surface that has the hole: no surface, no hole.

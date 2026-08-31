@@ -301,7 +301,7 @@ defmodule Tightbeam.IdentityTest do
     activity_table = File.read!(Path.join(shipped, "preferred-models.md"))
 
     assert :crypto.hash(:sha256, activity_table) |> Base.encode16(case: :lower) ==
-             "7323c24049f66c00e5f5988ca0300befe23f64e9bbf1e926a22828cad83552d4"
+             "e2a517e6b8f33cd3cde1056ccf42fb16c12b3f1893cdb140cbde133bffbec219"
 
     refute File.exists?(Path.join(guidance_dir, "model-policy.md"))
 
