@@ -1120,10 +1120,24 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp state_not_found(conn, resource, started_at) do
-    elapsed = System.monotonic_time(:microsecond) - started_at
-    remaining = @state_not_found_floor_us - elapsed
-    if remaining > 0, do: Process.sleep(div(remaining + 999, 1_000))
+    wait_for_state_not_found_floor(started_at + @state_not_found_floor_us)
     state_error(conn, resource, 404, "not_found", nil)
+  end
+
+  defp wait_for_state_not_found_floor(deadline) do
+    remaining = deadline - System.monotonic_time(:microsecond)
+
+    cond do
+      remaining > 2_000 ->
+        Process.sleep(div(remaining, 1_000) - 1)
+        wait_for_state_not_found_floor(deadline)
+
+      remaining > 0 ->
+        wait_for_state_not_found_floor(deadline)
+
+      true ->
+        :ok
+    end
   end
 
   defp state_error(conn, resource, status, "identity_not_yours" = code, message) do
