@@ -247,7 +247,7 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
   end
 
-  test "progress prose does not reset delivered or attempted counters", ctx do
+  test "the August 31 progress and dependency filings rebase liveness", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
@@ -257,7 +257,12 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_1','asg_1','progress','holder',2)"
+        """
+        INSERT INTO attests (id, assignmentId, kind, bySession, ts)
+        VALUES
+          ('att_c532a60d','asg_1','progress','holder',2),
+          ('att_99c4c115','asg_1','progress','holder',3)
+        """
       )
 
     {:ok, _} =
@@ -267,13 +272,16 @@ defmodule Tightbeam.SupervisionTest do
       )
 
     seq2 = terminal!(ctx.db, "holder")
-    assert {:prodded, 2} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
 
-    assert %{attemptCount: 2, prodCount: 2, attestCount: 1, stalledAt: nil} =
+    assert %{attemptCount: 0, prodCount: 0, attestCount: 2, stalledAt: nil} =
              Supervision.prod_state(ctx.db, "asg_1")
 
-    assert {:ok, []} =
-             DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
+    assert {:ok, [["progress", "att_c532a60d"], ["progress", "att_99c4c115"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts ORDER BY receiptId"
+             )
   end
 
   # Immutable authority: art_201ab36d, SHA-256
@@ -429,7 +437,7 @@ defmodule Tightbeam.SupervisionTest do
     refute second.wake_id in [first_id, third_id]
   end
 
-  test "vague progress and unbound, unrelated, or expired wakes are not receipts", ctx do
+  test "unrelated progress and unbound, unrelated, or expired wakes are not receipts", ctx do
     assignment(ctx.db, "asg_other", "holder", "other work", 2)
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     now = System.system_time(:millisecond)
@@ -455,7 +463,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_vague','asg_1','progress','blocked, no state change','holder',?1)",
+        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_unrelated','asg_other','progress','other work','holder',?1)",
         [now]
       )
 
