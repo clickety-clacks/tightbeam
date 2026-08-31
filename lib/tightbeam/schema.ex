@@ -34,7 +34,8 @@ defmodule Tightbeam.Schema do
     Tightbeam.Productions.BubbleSweeper,
     Tightbeam.HarnessProcess,
     Tightbeam.AdminProjection,
-    Tightbeam.HarnessHealth
+    Tightbeam.HarnessHealth,
+    Tightbeam.Toplines
   ]
 
   # The shape this build writes. Bump it when a production table changes in a
@@ -81,7 +82,10 @@ defmodule Tightbeam.Schema do
   # Identity render stamps advance v9 to v10, and the effort-request exit CHECK
   # advances v10 to v11. The session projection amendment then materializes
   # mechanical status from its sole durable input and advances v11 to v12.
-  @shape "coordination-fabric-v1-phase1-v12"
+  # Ruled-decision integrity then rebuilds `decision_requests` from that exact
+  # shape, so a ruled status cannot exist without its decision, ruler, and time.
+  @shape "coordination-fabric-v1-phase1-v13"
+  @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
   @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
   @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
   @identity_render_stamp_previous_shape "coordination-fabric-v1-phase1-v9"
@@ -1510,7 +1514,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @session_mechanical_status_previous_shape,
-             @shape,
+             @ruled_decision_integrity_previous_shape,
              migration_time
            ])
 
@@ -1523,7 +1527,7 @@ defmodule Tightbeam.Schema do
            :ok
          end) do
       {:ok, :ok} ->
-        :ok
+        upgrade_ruled_decision_integrity_v1(db)
 
       {:error, %ShapeError{} = error} ->
         raise error
@@ -1532,6 +1536,49 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_session_mechanical_status_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_ruled_decision_integrity_v1(DB.server()) :: :ok
+  def upgrade_ruled_decision_integrity_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@ruled_decision_integrity_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_ruled_decision_integrity_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Escalation.migrate_ruled_decision_integrity_v1_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @ruled_decision_integrity_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError, message: "incompatible_ruled_decision_integrity_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_ruled_decision_integrity_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -1770,6 +1817,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@ruled_decision_integrity_previous_shape]]} ->
+        upgrade_ruled_decision_integrity_v1(db)
+
       {:ok, [[@session_mechanical_status_previous_shape]]} ->
         upgrade_session_mechanical_status_v1(db)
 
@@ -1842,7 +1892,8 @@ defmodule Tightbeam.Schema do
         #{@nullable_effective_parent_previous_shape},
         #{@identity_render_stamp_previous_shape},
         #{@effort_request_exit_previous_shape}, and
-        #{@session_mechanical_status_previous_shape}.
+        #{@session_mechanical_status_previous_shape}, and
+        #{@ruled_decision_integrity_previous_shape}.
         Move this database aside and let it be recreated.
         """
 

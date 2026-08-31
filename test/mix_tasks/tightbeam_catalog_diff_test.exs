@@ -109,7 +109,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     end
   end
 
-  test "a learned org reads the working set from installed guidance" do
+  test "a learned org reads the working set from the installed engineering table" do
     base_dir =
       Path.join(
         System.tmp_dir!(),
@@ -121,7 +121,16 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     assert {:ok, _revision} = Tightbeam.Identity.learn!(base_dir, "agentic-engineering", "test")
 
     path = Diff.working_set_path(base_dir)
-    assert path == Path.join([base_dir, "identity", "guidance", "preferred-models.md"])
+
+    assert path ==
+             Path.join([
+               base_dir,
+               "identity",
+               "kungfu",
+               "agentic-engineering",
+               "preferred-models.md"
+             ])
+
     {_status, diff} = Diff.evaluate(%{"claude" => [], "codex" => []}, path)
     assert diff.working_set != []
   end

@@ -340,7 +340,8 @@ defmodule Tightbeam.WorkState do
       "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
         "createdByUser, createdBySession, createdAt, " <>
         "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
-        "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER))"
+        "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)), " <>
+        "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId=work_items.id), createdAt)"
 
   defp assignment([
          id,
@@ -398,7 +399,8 @@ defmodule Tightbeam.WorkState do
          user,
          session,
          created_at,
-         priority
+         priority,
+         row_version
        ]) do
     %{
       id: id,
@@ -412,7 +414,8 @@ defmodule Tightbeam.WorkState do
       createdByUser: user,
       createdBySession: session,
       createdAt: created_at,
-      priority: priority
+      priority: priority,
+      rowVersion: row_version
     }
   end
 

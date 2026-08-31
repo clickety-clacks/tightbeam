@@ -1496,6 +1496,8 @@ defmodule Tightbeam.CoordinationFabricTest do
       request_in_txn: "any",
       request_in_txn_optional: "any",
       migrate_terminal_operator_decision_v1_in_txn: "any",
+      migrate_ruled_decision_integrity_v1_in_txn: "any",
+      preflight_ruled_decision_integrity_in_txn: "any",
       answer: "agent",
       return_request: "agent",
       ask: "agent",
@@ -1560,6 +1562,8 @@ defmodule Tightbeam.CoordinationFabricTest do
       request_in_txn: 2,
       request_in_txn_optional: 2,
       migrate_terminal_operator_decision_v1_in_txn: 1,
+      migrate_ruled_decision_integrity_v1_in_txn: 1,
+      preflight_ruled_decision_integrity_in_txn: 1,
       answer: 2,
       return_request: 2,
       ask: 2,
@@ -1688,6 +1692,9 @@ defmodule Tightbeam.CoordinationFabricTest do
       raw_by_id_in_txn!: [{"lib/tightbeam/effort_checkin.ex", "request_for_id/2"}],
       migrate_terminal_operator_decision_v1_in_txn: [
         {"lib/tightbeam/schema.ex", "upgrade_terminal_operator_decision_v1/1"}
+      ],
+      migrate_ruled_decision_integrity_v1_in_txn: [
+        {"lib/tightbeam/schema.ex", "upgrade_ruled_decision_integrity_v1/1"}
       ]
     }
 

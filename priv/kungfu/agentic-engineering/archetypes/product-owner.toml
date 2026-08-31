@@ -13,8 +13,6 @@ text = """
 
 #include "preferred-models.md"
 
-#include "model-policy.md"
-
 #include "product-owner.md"
 
 #include "inception.md"

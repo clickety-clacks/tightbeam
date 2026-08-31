@@ -1,7 +1,7 @@
 defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConnRegistry, DB, Escalation, Model, Org, Wakes}
+  alias Tightbeam.{ConnRegistry, DB, Escalation, Model, Org, Schema, StateResources, Wakes}
 
   defmodule LaneDoorbell do
     use GenServer
@@ -124,6 +124,141 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
                "SELECT COUNT(*),MIN(failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
                [corrupt_id]
              )
+  end
+
+  test "a ruled decision requires its decision, ruler, and time at write, migration, and read",
+       ctx do
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_call(ctx.raiser, %{question: "is one ruling complete?"})
+      )
+
+    ruled =
+      Escalation.operator_rule(
+        ctx.db,
+        owner_operator_rule(request.id, %{decision: "accept"}),
+        scheduler: ctx.scheduler
+      )
+
+    assert %{status: "ruled", decision: "accept", ruled_by: "user:flynn", ruled_at: ruled_at} =
+             ruled
+
+    assert is_integer(ruled_at)
+
+    for {column, value} <- [
+          {"decision", nil},
+          {"decision", "   "},
+          {"ruledBy", nil},
+          {"ruledBy", "\n"},
+          {"ruledAt", nil}
+        ] do
+      assert {:error, %DB.Error{}} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE decision_requests SET #{column}=?2 WHERE id=?1",
+                 [request.id, value]
+               )
+    end
+
+    oversized = String.duplicate("x", 65_536)
+
+    oversized_request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_call(ctx.raiser, %{question: "does large ruling text retain compatibility?"})
+      )
+
+    assert %{decision: ^oversized} =
+             Escalation.operator_rule(
+               ctx.db,
+               owner_operator_rule(oversized_request.id, %{response: oversized}),
+               scheduler: ctx.scheduler
+             )
+
+    # A damaged file can bypass SQLite's write-time CHECK. The read path must
+    # still refuse it, and the stamped migration must name the repair rather
+    # than invent a result or ruler.
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA ignore_check_constraints = ON")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET decision='   ' WHERE id=?1",
+               [request.id]
+             )
+
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA ignore_check_constraints = OFF")
+
+    assert {:error, %DB.Error{message: message}} =
+             DB.foreign_key_rebuild(
+               ctx.db,
+               &Escalation.migrate_ruled_decision_integrity_v1_in_txn/1
+             )
+
+    assert message =~ "incompatible_ruled_decision_integrity_v1"
+    assert message =~ request.id
+
+    assert_raise ArgumentError, "decision_request_integrity_invalid", fn ->
+      StateResources.decision_request(%{
+        kind: "operator",
+        status: "ruled",
+        decision: "   ",
+        ruled_by: "user:flynn",
+        ruled_at: ruled_at
+      })
+    end
+
+    for refusal <- [
+          Escalation.get(ctx.db, owner_operator_rule(request.id, %{}), request.id),
+          Escalation.list(ctx.db, owner_operator_rule(request.id, %{}), "ruled",
+            owner_user_id: "flynn"
+          ),
+          Escalation.operator_rule(
+            ctx.db,
+            owner_operator_rule(request.id, %{decision: "accept"}),
+            scheduler: ctx.scheduler
+          )
+        ] do
+      assert %{code: "decision_request_integrity_invalid", request_id: request_id} = refusal
+      assert request_id == request.id
+      refute Map.has_key?(refusal, :decision)
+      refute Map.has_key?(refusal, :ruled_by)
+      refute Map.has_key?(refusal, :ruled_at)
+    end
+  end
+
+  test "a complete legacy ruling rebuilds and preserves its original raise time", ctx do
+    request =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_call(ctx.raiser, %{question: "does a complete ruling migrate?"})
+      )
+
+    assert %{status: "ruled"} =
+             Escalation.operator_rule(
+               ctx.db,
+               owner_operator_rule(request.id, %{decision: "accept"}),
+               scheduler: ctx.scheduler
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v12'"
+             )
+
+    assert :ok = Schema.upgrade_ruled_decision_integrity_v1(ctx.db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v13"]]} =
+             DB.query(ctx.db, "SELECT shape FROM schema_stamp")
+
+    request_id = request.id
+
+    assert %{id: ^request_id, status: "ruled", raised_at: raised_at} =
+             Escalation.get(ctx.db, owner_operator_rule(request_id, %{}), request_id)
+
+    assert raised_at == request.raised_at
   end
 
   defp session(db, name, owner) do

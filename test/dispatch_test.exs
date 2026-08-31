@@ -151,9 +151,9 @@ defmodule Tightbeam.DispatchTest do
         """
         INSERT INTO decision_requests
           (id, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName, actionKey,
-           question, context, status, decision)
+           question, context, status, decision, ruledBy, ruledAt)
         VALUES ('dr_cas', 'user:flynn', 'flynn', 1, 2, 'cas-rule', ?1,
-                'owner approval required', '{}', 'ruled', 'allow')
+                'owner approval required', '{}', 'ruled', 'allow', 'user:flynn', 2)
         """,
         [action_key]
       )

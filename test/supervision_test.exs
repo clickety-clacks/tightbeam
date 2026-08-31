@@ -90,7 +90,7 @@ defmodule Tightbeam.SupervisionTest do
       {:ok, _} =
         DB.query(
           db,
-          "UPDATE decision_requests SET status = 'ruled', decision = 'allow', ruledAt = 1 WHERE id = ?1 AND status = 'open'",
+          "UPDATE decision_requests SET status = 'ruled', decision = 'allow', ruledBy = 'process:tightbeam', ruledAt = 1 WHERE id = ?1 AND status = 'open'",
           [id]
         )
     end

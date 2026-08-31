@@ -27,7 +27,7 @@ per-feature, but your attention across features is the scarce resource.
    an implementation-detail question does not.
 2. **Adversarial spec review.** A spec is authoritative policy, so it requires review.
    Select the first qualified permitted candidate from the ordered spec-review row in
-   `preferred-models.md`. Try each candidate once; on an unavailable candidate, step
+   `kungfu/agentic-engineering/preferred-models.md`. Try each candidate once; on an unavailable candidate, step
    right once. When the row is exhausted, record the attempted rungs and evidence as
    the assignment's capability block, keep separable work moving, and schedule a
    re-check. Do not use Main as a model fallback.
@@ -60,7 +60,7 @@ per-feature, but your attention across features is the scarce resource.
    status/accountability work, and coordination are evidence-only and get no review.
 
    For a review-required effect, select the first qualified permitted candidate from
-   the ordered code-review row in `preferred-models.md`. Try each candidate once. An
+   the ordered code-review row in `kungfu/agentic-engineering/preferred-models.md`. Try each candidate once. An
    unavailable candidate advances the selection one place to the right; never retry
    the same candidate. If the row is exhausted, record the attempted rungs and evidence
    as the assignment's capability block, keep separable work moving, and schedule a

@@ -145,9 +145,7 @@ It counts rows and names no threshold. Reading it is how you find out whether a 
 being nibbled to death by mail before you add to the pile.
 
 ## Hire help: spawn and retire
-Start a new session:
-
-    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model gpt-5.6-sol --effort high
+Start a new session with `tightbeam spawn`.
 
 `--display` is the human label; `--name` registers a role bound to the new session so you can
 address it. Add `--archetype <name>` to give the session that archetype's identity — its

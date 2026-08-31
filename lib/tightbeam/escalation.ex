@@ -182,7 +182,20 @@ defmodule Tightbeam.Escalation do
                               answeredBy IS NULL AND answeredAt IS NULL AND
                               returnedBy IS NULL AND returnReason IS NULL AND
                               returnedAt IS NULL AND
-                              status NOT IN ('answered','returned')))
+                              status NOT IN ('answered','returned'))),
+    -- A ruled row IS the durable ruling. Do not let a partial transition turn
+    -- a visible status into an assertion whose decision, ruler, or time is
+    -- absent. The CAS writers set these three columns with `status` in their
+    -- one UPDATE; a legacy row that cannot meet this shape is refused by the
+    -- stamped rebuild below rather than repaired with invented history.
+    CHECK (
+      status <> 'ruled' OR
+        (typeof(decision) = 'text' AND
+           length(trim(decision, char(9) || char(10) || char(13) || ' ')) > 0
+         AND typeof(ruledBy) = 'text' AND
+           length(trim(ruledBy, char(9) || char(10) || char(13) || ' ')) > 0
+         AND typeof(ruledAt) = 'integer')
+    )
   );
   """
 
@@ -291,6 +304,13 @@ defmodule Tightbeam.Escalation do
                           global: false
                         )
 
+  @ruled_decision_integrity_request_ddl String.replace(
+                                          @decision_request_ddl,
+                                          "decision_requests",
+                                          "decision_requests_ruled_integrity_v1",
+                                          global: false
+                                        )
+
   @terminal_metadata_ddl """
   CREATE TABLE IF NOT EXISTS decision_request_terminal_epoch (
     id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -352,6 +372,32 @@ defmodule Tightbeam.Escalation do
     :ok
   end
 
+  @doc false
+  @spec migrate_ruled_decision_integrity_v1_in_txn(Txn.t()) :: :ok
+  def migrate_ruled_decision_integrity_v1_in_txn(txn) do
+    :ok = preflight_ruled_decision_integrity_in_txn(txn)
+    :ok = Txn.exec(txn, @ruled_decision_integrity_request_ddl)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO decision_requests_ruled_integrity_v1 (#{@request_columns})
+      SELECT #{@request_columns} FROM decision_requests
+      """
+    )
+
+    :ok = Txn.exec(txn, "DROP TABLE decision_requests")
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE decision_requests_ruled_integrity_v1 RENAME TO decision_requests"
+      )
+
+    :ok = Txn.exec(txn, @ddl)
+    :ok
+  end
+
   defp preflight_terminal_operator_rows_in_txn(txn, legacy_fact_max_id) do
     txn
     |> Txn.q("SELECT #{@legacy_request_columns} FROM decision_requests WHERE kind = 'operator'")
@@ -369,6 +415,22 @@ defmodule Tightbeam.Escalation do
           :ok -> :ok
           {:error, %{code: "decision_request_integrity_invalid"}} -> :ok
         end
+      end
+    end)
+
+    :ok
+  end
+
+  defp preflight_ruled_decision_integrity_in_txn(txn) do
+    txn
+    |> Txn.q("SELECT #{@request_columns} FROM decision_requests WHERE status = 'ruled'")
+    |> Enum.each(fn row ->
+      request = request_from_row(row)
+
+      unless ruled_decision_complete?(request) do
+        raise DB.Error,
+          message:
+            "incompatible_ruled_decision_integrity_v1: repair ruled request #{inspect(request.id)} with nonblank decision, ruledBy, and integer ruledAt before upgrade"
       end
     end)
 
@@ -406,11 +468,23 @@ defmodule Tightbeam.Escalation do
       :allow
     else
       case current_request(db, raiser_id, statute_name, digest(call)) do
-        %{status: "ruled", decision: "allow", id: id} -> {:allow, id}
-        %{status: "ruled", decision: "deny"} -> {:deny, deny_error(statute)}
-        %{status: "ruled", decision: "waived"} -> {:needs_request, nil}
-        %{status: "open", id: id} -> {:needs_request, id}
-        _ -> {:needs_request, nil}
+        %{status: "ruled"} = request ->
+          if ruled_decision_complete?(request) do
+            case request.decision do
+              "allow" -> {:allow, request.id}
+              "deny" -> {:deny, deny_error(statute)}
+              "waived" -> {:needs_request, nil}
+              _ -> {:needs_request, nil}
+            end
+          else
+            {:deny, integrity_error(request.id)}
+          end
+
+        %{status: "open", id: id} ->
+          {:needs_request, id}
+
+        _ ->
+          {:needs_request, nil}
       end
     end
   end
@@ -1532,19 +1606,28 @@ defmodule Tightbeam.Escalation do
 
       requests = Enum.map(rows, &request_from_row/1)
 
-      invalid_ids =
-        requests
-        |> Enum.filter(&(&1.kind == "operator" and &1.status in ["ruled", "consumed"]))
-        |> Enum.flat_map(fn request ->
-          case validate_operator_terminal_in_txn(txn, request, "list", observer) do
-            :ok -> []
-            {:error, _refusal} -> [request.id]
-          end
-        end)
+      case Enum.find(requests, fn request ->
+             request.kind != "operator" and request.status == "ruled" and
+               not ruled_decision_complete?(request)
+           end) do
+        %{id: request_id} ->
+          integrity_error(request_id)
 
-      case Enum.sort(invalid_ids) do
-        [request_id | _] -> integrity_error(request_id)
-        [] -> Enum.map(requests, &list_projection/1)
+        nil ->
+          invalid_ids =
+            requests
+            |> Enum.filter(&(&1.kind == "operator" and &1.status in ["ruled", "consumed"]))
+            |> Enum.flat_map(fn request ->
+              case validate_operator_terminal_in_txn(txn, request, "list", observer) do
+                :ok -> []
+                {:error, _refusal} -> [request.id]
+              end
+            end)
+
+          case Enum.sort(invalid_ids) do
+            [request_id | _] -> integrity_error(request_id)
+            [] -> Enum.map(requests, &list_projection/1)
+          end
       end
     end)
     |> unwrap_integrity_transaction()
@@ -1573,13 +1656,18 @@ defmodule Tightbeam.Escalation do
         [row] ->
           request = request_from_row(row)
 
-          if request.kind == "operator" and request.status in ["ruled", "consumed"] do
-            case validate_operator_terminal_in_txn(txn, request, "detail", observer) do
-              :ok -> terminal_operator_projection(request)
-              {:error, refusal} -> refusal
-            end
-          else
-            request
+          cond do
+            request.kind == "operator" and request.status in ["ruled", "consumed"] ->
+              case validate_operator_terminal_in_txn(txn, request, "detail", observer) do
+                :ok -> terminal_operator_projection(request)
+                {:error, refusal} -> refusal
+              end
+
+            request.status == "ruled" and not ruled_decision_complete?(request) ->
+              integrity_error(request.id)
+
+            true ->
+              request
           end
 
         [] ->
@@ -1696,6 +1784,8 @@ defmodule Tightbeam.Escalation do
     request_in_txn: "any",
     request_in_txn_optional: "any",
     migrate_terminal_operator_decision_v1_in_txn: "any",
+    migrate_ruled_decision_integrity_v1_in_txn: "any",
+    preflight_ruled_decision_integrity_in_txn: "any",
     # DELEGATE: no SQL literal of its own — reaches one of the entries above
     # by a local call. `answer/2`/`return_request/2`/`ask/2`/`rule/3`/`waive/3`/`withdraw/2`/
     # `resolve/3`/`summon/4` are this module's PUBLIC VERB SURFACE, reached
@@ -3105,6 +3195,13 @@ defmodule Tightbeam.Escalation do
 
   defp nonblank?(value) when is_binary(value), do: String.trim(value) != ""
   defp nonblank?(_value), do: false
+
+  # Every read that treats `ruled` as a fact uses this same base invariant.
+  # Operator rulings additionally pass through their attribution/fact audit.
+  defp ruled_decision_complete?(request),
+    do:
+      normalized_text?(request.decision) and normalized_text?(request.ruled_by) and
+        is_integer(request.ruled_at)
 
   defp normalized_text?(value) when is_binary(value),
     do: value != "" and String.trim(value) == value

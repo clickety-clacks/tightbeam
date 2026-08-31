@@ -2682,7 +2682,7 @@ defmodule Tightbeam.Gateway do
             # The substrate owes three things here and owes nothing else: the
             # truth (a `failed` turn row), the named reason (`turns.error` and
             # the `[turn failed]` marker in chat), and the record (the lifecycle
-            # event). An agent reading model-policy guidance decides what to do
+            # event). An agent reading the applicable activity table decides what to do
             # about it — retry elsewhere, spawn something else, or refuse.
             #
             # What this replaced was not merely excess: the hold healed into

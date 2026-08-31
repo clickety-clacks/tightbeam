@@ -1,7 +1,7 @@
 defmodule Tightbeam.Firehose.SessionRegistryA6Test do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, Model, Org, Projection, Schema, StateResources}
+  alias Tightbeam.{DB, Escalation, Ledger, Model, Org, Projection, Schema, StateResources}
   alias Tightbeam.Firehose.Hub
 
   setup do
@@ -232,6 +232,11 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
         """
       )
 
+    # v11's full schema includes decision requests. The mechanical-status
+    # migration now continues through the ruled-decision rebuild, so this
+    # isolated fixture must carry that predecessor table as well.
+    :ok = Escalation.ensure_schema(db)
+
     :ok = Schema.upgrade_session_mechanical_status_v1(db)
 
     assert {:ok,
@@ -247,7 +252,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
     assert idle_version > 10
     assert running_version > 20
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v12"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v13"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
