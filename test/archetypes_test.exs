@@ -252,6 +252,33 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "reviewer guidance serves the verdict-note artifact remedy", ctx do
+    Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
+    reviewer =
+      Identity.snapshot_at!(
+        ctx.base_dir,
+        Identity.live_revision!(ctx.base_dir),
+        "reviewer",
+        :codex
+      )
+
+    assert reviewer.guidance =~ "The verdict note has a 2,000-character cap"
+    assert reviewer.guidance =~ "one immutable report artifact"
+    assert reviewer.guidance =~ "artifact's id and SHA-256"
+    assert reviewer.guidance =~ "do not truncate the table"
+    assert reviewer.guidance =~ "or request a cap increase"
+
+    conformance = reviewer.skills["spec-conformance"]
+    assert conformance =~ "tightbeam artifact-record --kind report"
+    assert conformance =~ "--sha256 <hex>"
+    assert conformance =~ "invalid_note"
+    assert conformance =~ "clause-table artifact id; sha256"
+  end
+
   test "the worktree skill preserves dirty repository work before retirement", ctx do
     Identity.init!(ctx.base_dir)
 

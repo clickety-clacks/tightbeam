@@ -83,6 +83,13 @@ unlabeled nit drowns the one blocking defect and the reader cannot tell them apa
 unless you do. The clause table is the trace that
 proves the review happened.
 
+The verdict note has a 2,000-character cap. Keep the full clause table in the note
+when it fits. When it does not fit, put the full table in one immutable report artifact
+and cite that artifact's id and SHA-256 in the concise verdict note. Use the
+`spec-conformance` artifact procedure; do not truncate the table, split it across
+verdicts, or request a cap increase. An `invalid_note` refusal is the signal to use
+that procedure, not a reason to hold the review.
+
 ## Which ceremony
 Code to review -> `reviewing-code`, with `spec-conformance` building the clause table
 and the `review-for-completeness` and `review-for-yagni` lenses: what is missing, and
