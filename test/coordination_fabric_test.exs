@@ -3920,20 +3920,20 @@ defmodule Tightbeam.CoordinationFabricTest do
     assert {:error, %{code: "invalid"}} = attests(db, mine.id, %{limit: 0})
   end
 
-  test "the toplines cursor pages the flat roster on a stable order key", %{db: db} do
+  test "the execution-map cursor pages the flat roster on a stable order key", %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     ids = for n <- 1..4, do: work_item_row(db, "wi_#{n}", 1_000 + n)
 
-    assert {:ok, all} = toplines(db, %{})
+    assert {:ok, all} = execution_map(db, %{})
     assert Enum.map(all.items, & &1.id) == ids
     refute Map.has_key?(all, :next_after), "an unpaged roster answers exactly as it did"
 
-    assert {:ok, first} = toplines(db, %{limit: 2})
+    assert {:ok, first} = execution_map(db, %{limit: 2})
     assert Enum.map(first.items, & &1.id) == Enum.take(ids, 2)
     assert first.next_after == Enum.at(ids, 1)
     assert first.has_more_after
 
-    assert {:ok, second} = toplines(db, %{limit: 2, after: first.next_after})
+    assert {:ok, second} = execution_map(db, %{limit: 2, after: first.next_after})
     assert Enum.map(second.items, & &1.id) == Enum.drop(ids, 2)
     assert second.has_more_after == false
 
@@ -3947,11 +3947,11 @@ defmodule Tightbeam.CoordinationFabricTest do
     # cannot be found at all.
     close_work_item_row(db, Enum.at(ids, 0))
 
-    assert {:ok, filtered} = toplines(db, %{after: Enum.at(ids, 0), state: "open"})
+    assert {:ok, filtered} = execution_map(db, %{after: Enum.at(ids, 0), state: "open"})
     assert Enum.map(filtered.items, & &1.id) == Enum.drop(ids, 1)
   end
 
-  test "an exhausted toplines page hands back a null cursor, never a boolean", %{db: db} do
+  test "an exhausted execution-map page hands back a null cursor, never a boolean", %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     ids = for n <- 1..2, do: work_item_row(db, "wi_#{n}", 1_000 + n)
 
@@ -3960,17 +3960,19 @@ defmodule Tightbeam.CoordinationFabricTest do
     # evaluates to `false` for an empty page — not the `nil` an ID-or-null
     # cursor contract promises, and not something a client could round-trip
     # back in as `--after`.
-    assert {:ok, exhausted} = toplines(db, %{after: List.last(ids)})
+    assert {:ok, exhausted} = execution_map(db, %{after: List.last(ids)})
     assert exhausted.items == []
     assert exhausted.next_after == nil
     assert exhausted.has_more_after == false
   end
 
-  test "toplines refuses a forest page and an unresolvable cursor by name", %{db: db} do
+  test "execution-map refuses a forest page and an unresolvable cursor by name", %{db: db} do
     seed_session(db, "agent:coder", "flynn")
     work_item_row(db, "wi_1", 1_000)
 
-    assert {:error, %{code: "invalid", message: forest}} = toplines(db, %{tree: true, limit: 2})
+    assert {:error, %{code: "invalid", message: forest}} =
+             execution_map(db, %{tree: true, limit: 2})
+
     assert forest =~ "--tree returns a forest"
 
     # An unknown id and an id this caller cannot see are ONE answer — the
@@ -3979,17 +3981,17 @@ defmodule Tightbeam.CoordinationFabricTest do
     # with `attests`/`transcript`'s cursor refusals, what keeps the cursor
     # from being an oracle.
     assert {:error, %{code: "cursor_not_found", message: unknown}} =
-             toplines(db, %{after: "wi_ghost"})
+             execution_map(db, %{after: "wi_ghost"})
 
     assert unknown =~ "work item not found"
 
-    assert {:error, %{code: "invalid"}} = toplines(db, %{limit: -1})
-    assert {:error, %{code: "invalid"}} = toplines(db, %{after: ""})
+    assert {:error, %{code: "invalid"}} = execution_map(db, %{limit: -1})
+    assert {:error, %{code: "invalid"}} = execution_map(db, %{after: ""})
 
-    # `topline` bounds its own selection, so a cursor there is refused rather
-    # than accepted and ignored.
+    # `execution-map-select` bounds its own selection, so a cursor there is
+    # refused rather than accepted and ignored.
     assert {:error, %{code: "invalid", message: bounded}} =
-             topline(db, %{under: "wi_1", limit: 2})
+             execution_map_select(db, %{under: "wi_1", limit: 2})
 
     assert bounded =~ "selection the caller bounded"
   end
@@ -4053,8 +4055,10 @@ defmodule Tightbeam.CoordinationFabricTest do
   defp attests(db, assignment_id, params),
     do: verb(db, {:user, "flynn"}, "attests", Map.put(params, :assignment_id, assignment_id))
 
-  defp toplines(db, params), do: verb(db, {:user, "flynn"}, "toplines", params)
-  defp topline(db, params), do: verb(db, {:user, "flynn"}, "topline", params)
+  defp execution_map(db, params), do: verb(db, {:user, "flynn"}, "execution-map", params)
+
+  defp execution_map_select(db, params),
+    do: verb(db, {:user, "flynn"}, "execution-map-select", params)
 
   defp list_requests(db, principal) do
     case verb(db, principal, "decision-requests", %{status: "open"}) do
