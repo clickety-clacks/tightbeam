@@ -29,11 +29,18 @@ is a rubber stamp.
    verification verdict) or return the work.
 4. Check the exclusions: behavior inside a named non-goal is an unrequested addition
    and a finding.
-5. Include the full clause table in the verdict note, so the next reader sees which
-   clause carried which evidence. When every clause is satisfied or out-of-scope:
-   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<table>"`;
-   when any clause is unsatisfied or unproven:
-   `tightbeam attest <assignmentId> --kind verdict --verdict changes-requested --note "<table>"`.
+5. The full clause table is REQUIRED in the review document, where it has room to carry
+   the evidence each clause rested on. Calculate the document's SHA-256 and record the
+   exact bytes first:
+   `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId> --sha256 <hex>`.
+   Then file the verdict as an executive summary that names the artifact's id and
+   SHA-256, so the next reader can follow it to the table:
+   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<summary + art_id + sha256>"`
+   when every clause is satisfied or out-of-scope and no blocking or important finding
+   remains. Outstanding nits stay in the document and do not hold the MVP. File
+   `--verdict changes-requested` when any clause is unsatisfied or unproven. Do not paste
+   the table into the note, truncate it, split it across verdicts, or request a cap
+   increase.
 6. When a clause is too vague to classify, the spec has a hole. Wake the spec-writer
    (`tightbeam wake --role spec-writer --prompt "<the exact vague clause>"`); the
    clause is unproven until the spec rules.

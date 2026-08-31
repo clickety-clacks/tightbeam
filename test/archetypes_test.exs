@@ -252,6 +252,62 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "document-producing roles serve the canonical document and summary verdict contract",
+       ctx do
+    Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
+    revision = Identity.live_revision!(ctx.base_dir)
+    reviewer = Identity.snapshot_at!(ctx.base_dir, revision, "reviewer", :codex)
+    recon = Identity.snapshot_at!(ctx.base_dir, revision, "recon", :codex)
+    spec_writer = Identity.snapshot_at!(ctx.base_dir, revision, "spec-writer", :codex)
+    flat = fn text -> String.replace(text, "\n", " ") end
+    reviewer_guidance = flat.(reviewer.guidance)
+    recon_guidance = flat.(recon.guidance)
+    spec_writer_guidance = flat.(spec_writer.guidance)
+
+    assert reviewer_guidance =~ "Your deliverable is the review document"
+    assert reviewer_guidance =~ "Your verdict is that document's executive summary"
+    assert reviewer_guidance =~ "only outstanding items are nits PASSES"
+    assert reviewer_guidance =~ "artifact, verdict, wake, and your completion"
+    refute reviewer_guidance =~ "Your deliverable is a verdict"
+    refute reviewer_guidance =~ "every finding with its severity and citation in the note"
+
+    reviewing_code = flat.(reviewer.skills["reviewing-code"])
+    assert reviewing_code =~ "document is your canonical deliverable"
+    assert reviewing_code =~ "--sha256 <hex>"
+    assert reviewing_code =~ "Outstanding nits do not hold an MVP"
+    assert reviewing_code =~ "four different rows"
+    refute reviewing_code =~ "The verdict is the deliverable"
+
+    reviewing_specs = flat.(reviewer.skills["reviewing-specs"])
+    assert reviewing_specs =~ "document is the canonical deliverable"
+    assert reviewing_specs =~ "artifact-record --kind report"
+    assert reviewing_specs =~ "concise executive summary"
+    assert reviewing_specs =~ "four different rows"
+
+    conformance = flat.(reviewer.skills["spec-conformance"])
+    assert conformance =~ "full clause table is REQUIRED in the review document"
+    assert conformance =~ "--sha256 <hex>"
+    assert conformance =~ "Outstanding nits stay in the document"
+    assert conformance =~ "Do not paste"
+    refute conformance =~ "full clause table in the verdict note"
+
+    assert recon_guidance =~ "canonical deliverable is the recon document"
+    assert recon_guidance =~ "report artifact, verdict, wake, and completion"
+
+    recon_lifecycle = flat.(recon.skills["recon-lifecycle"])
+    assert recon_lifecycle =~ "document's concise executive summary"
+    assert recon_lifecycle =~ "Report artifact, verdict, wake, completion"
+    refute recon_lifecycle =~ "The verdict is the deliverable"
+
+    assert spec_writer_guidance =~ "Record the canonical spec before handoff or completion"
+    assert spec_writer_guidance =~ "artifact-record --kind spec"
+    assert spec_writer_guidance =~ "These are distinct rows"
+  end
+
   test "the worktree skill preserves dirty repository work before retirement", ctx do
     Identity.init!(ctx.base_dir)
 

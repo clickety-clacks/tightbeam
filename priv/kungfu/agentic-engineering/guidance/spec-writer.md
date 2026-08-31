@@ -14,6 +14,13 @@ most expensive kind to fix, because it is injected earliest and caught latest; t
 cheapest defect removal you will ever do is a hard read of your own draft before
 anyone builds from it.
 
+Record the canonical spec before handoff or completion. Calculate its SHA-256 and record
+the exact bytes as a spec artifact on the work item:
+`tightbeam artifact-record --kind spec --title "<title>" --path <path> --work-item <workItemId> --sha256 <hex>`.
+The artifact row records the document; a review verdict summarizes a review of it; a
+wake hands the next obligation over; completion closes the assignment. These are
+distinct rows. Do not treat one as a substitute for another.
+
 Your spec has a canonical skeleton, the eight sections spec-homing names: Goal,
 Non-Goals, Terms, Assumptions, Invariants, Architecture, Acceptance, Open Questions.
 The set is canonical, not a starting point and not a menu. Every spec carries all

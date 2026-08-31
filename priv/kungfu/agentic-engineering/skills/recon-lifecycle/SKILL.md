@@ -33,18 +33,24 @@ end.
    them into one word hides which is shaky: a "yes, high confidence" and a "yes, low
    confidence" tell the requester very different things about how much weight the
    decision can put on it.
-5. Cite every load-bearing claim in the answer: file and line, log line, commit, or run
-   output, and weigh the source — a claim nothing independent confirms is weak however
-   plausible. The reader must be able to check the answer without re-running the recon.
-6. Attest the answer as a verdict on your assignment:
-   `tightbeam attest <assignmentId> --kind verdict --verdict <yes|no|conditional|not-proven> --note "<answer + confidence + citations>"`.
-   The verdict is the deliverable; a report that exists only in chat does not exist.
-7. Wake the requester with the verdict:
+5. Cite every load-bearing claim in the recon document: file and line, log line, commit,
+   or run output, and weigh the source. A claim nothing independent confirms is weak
+   however plausible. The reader must be able to check the answer without re-running
+   the recon.
+6. Calculate the document's SHA-256 and record the exact bytes as a report artifact on
+   the work item:
+   `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId> --sha256 <hex>`.
+   The document is the canonical deliverable; a report that exists only in chat does
+   not exist.
+7. Attest the answer as a verdict on your assignment:
+   `tightbeam attest <assignmentId> --kind verdict --verdict <yes|no|conditional|not-proven> --note "<answer + confidence + major points + art_id + sha256>"`.
+   The verdict is the document's concise executive summary, not a second copy of it.
+8. Wake the requester with the verdict:
    `tightbeam wake --role <requester-role> --prompt "recon verdict on <question>: <answer>, attested on <assignmentId>"`.
-8. Then close your obligation: file
-   `tightbeam attest <assignmentId> --kind completion --note "verdict filed: <answer>"`.
+9. Then close your obligation: file
+   `tightbeam attest <assignmentId> --kind completion --note "verdict filed: <answer>; report <art_id>; sha256 <hex>"`.
    A verdict does not close an assignment — only a completion does — and an assignment
    left open keeps drawing the substrate's patrol prods, then strands when your session
-   retires. Verdict, wake, completion: three rows, all yours.
-9. End the session. A recon does not stay resident after its verdict; the requester
+   retires. Report artifact, verdict, wake, completion: four rows, all yours.
+10. End the session. A recon does not stay resident after its verdict; the requester
    retires it (`tightbeam retire --session <key>`), and its history remains readable.

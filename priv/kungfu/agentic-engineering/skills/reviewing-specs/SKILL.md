@@ -41,11 +41,20 @@ defect removal there is — a requirement flaw is injected earliest and caught l
 8. Check the spec answers what operating pattern it teaches agents: an explicit
    "none," or a substrate-manual amendment landing with the spec. A spec that adds
    agent-facing capability without that answer is a finding.
-9. There is no code to reproduce against; instead cite the exact clause text for every
-   finding, with a severity: blocking, important, or nit.
-10. End with the verdict on your assignment:
-   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<basis, citing the reviewed assignment id>"`
-   when nothing blocking or important remains; `--verdict changes-requested` otherwise,
-   with every finding, its severity, and its clause citation in the note. Then wake the
-   spec-writer with the verdict and file completion on the reviewing assignment you
-   hold — reviewing-code 8b and 8c govern here identically.
+9. There is no code to reproduce against. In the review document, cite the exact clause
+   text for every finding and assign a severity: blocking, important, or nit. Blocking
+   and important findings gate this iteration. Record nits for a future pass, but do not
+   hold an MVP when only nits remain.
+10. Write the review document, calculate its SHA-256, and record the exact bytes as a
+   report artifact on the work item. The document is the canonical deliverable: the
+   clause table, citations, evidence, and reasoning live there:
+   `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId> --sha256 <hex>`.
+11. End with the verdict on your assignment:
+   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<summary + art_id + sha256>"`
+   when nothing blocking or important remains, even when the document records outstanding
+   nits. File `--verdict changes-requested` otherwise. The verdict is the document's
+   concise executive summary: name the outcome, the major points, the report artifact's
+   id and SHA-256, and the reviewed assignment id. Do not copy the clause table or every
+   finding into the note. Then wake the spec-writer with the verdict and file completion
+   on the reviewing assignment you hold. The report artifact, verdict, wake, and
+   completion are four different rows; reviewing-code 9b and 9c govern them identically.
