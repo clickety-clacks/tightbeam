@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v13"
+  @shape "coordination-fabric-v1-phase1-v14"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"

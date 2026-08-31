@@ -2581,7 +2581,7 @@ defmodule Tightbeam.Supervision do
         artifact_cursor,
         artifact_max
       ) ++
-        verdict_receipts_in_txn(txn, assignment_id, attest_cursor, attest_max) ++
+        attest_receipts_in_txn(txn, assignment_id, attest_cursor, attest_max) ++
         work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max)
 
     checkpoint =
@@ -2741,18 +2741,18 @@ defmodule Tightbeam.Supervision do
     |> Enum.map(fn [id, at] -> %{kind: "artifact", id: id, at: at, expires_at: nil} end)
   end
 
-  defp verdict_receipts_in_txn(txn, assignment_id, cursor, maximum) do
+  defp attest_receipts_in_txn(txn, assignment_id, cursor, maximum) do
     Txn.q(
       txn,
       """
-      SELECT id, ts
+      SELECT id, kind, ts
       FROM attests
-      WHERE rowid > ?1 AND rowid <= ?2 AND assignmentId=?3 AND kind='verdict'
+      WHERE rowid > ?1 AND rowid <= ?2 AND assignmentId=?3 AND kind IN ('progress','verdict')
       ORDER BY rowid
       """,
       [cursor, maximum, assignment_id]
     )
-    |> Enum.map(fn [id, at] -> %{kind: "verdict", id: id, at: at, expires_at: nil} end)
+    |> Enum.map(fn [id, kind, at] -> %{kind: kind, id: id, at: at, expires_at: nil} end)
   end
 
   defp work_item_receipts_in_txn(txn, work_item_id, cursor, maximum) do

@@ -85,7 +85,8 @@ defmodule Tightbeam.Schema do
   # mechanical status from its sole durable input and advances v11 to v12.
   # Ruled-decision integrity then rebuilds `decision_requests` from that exact
   # shape, so a ruled status cannot exist without its decision, ruler, and time.
-  @shape "coordination-fabric-v1-phase1-v13"
+  @shape "coordination-fabric-v1-phase1-v14"
+  @liveness_progress_receipts_previous_shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
   @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
   @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
@@ -485,7 +486,7 @@ defmodule Tightbeam.Schema do
         receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
         assignmentId TEXT NOT NULL REFERENCES assignments(id),
         sourceKind TEXT NOT NULL CHECK (sourceKind IN (
-          'artifact','work_item_update','verdict','checkpoint'
+          'artifact','work_item_update','verdict','progress','checkpoint'
         )),
         sourceId TEXT NOT NULL,
         sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
@@ -1560,7 +1561,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @ruled_decision_integrity_previous_shape,
-             @shape,
+             @liveness_progress_receipts_previous_shape,
              migration_time
            ])
 
@@ -1571,7 +1572,7 @@ defmodule Tightbeam.Schema do
            :ok
          end) do
       {:ok, :ok} ->
-        :ok
+        upgrade_liveness_progress_receipts_v1(db)
 
       {:error, %ShapeError{} = error} ->
         raise error
@@ -1580,6 +1581,95 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_ruled_decision_integrity_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_liveness_progress_receipts_v1(DB.server()) :: :ok
+  def upgrade_liveness_progress_receipts_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@liveness_progress_receipts_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_liveness_progress_receipts_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Txn.exec(txn, "DROP INDEX supervision_liveness_receipts_assignment")
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE supervision_liveness_receipts RENAME TO supervision_liveness_receipts_v13"
+             )
+
+           table =
+             Enum.find(
+               @supervision_liveness_enforcement_objects,
+               &(&1.name == "supervision_liveness_receipts")
+             )
+
+           :ok = Txn.exec(txn, table.sql)
+
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               INSERT INTO supervision_liveness_receipts
+                 (receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt)
+               SELECT receiptId,assignmentId,sourceKind,sourceId,sourceAt,acceptedAt,generation,expiresAt
+               FROM supervision_liveness_receipts_v13
+               ORDER BY receiptId
+               """
+             )
+
+           :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_receipts_v13")
+
+           index =
+             Enum.find(
+               @supervision_liveness_enforcement_objects,
+               &(&1.name == "supervision_liveness_receipts_assignment")
+             )
+
+           :ok = Txn.exec(txn, index.sql)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @liveness_progress_receipts_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_liveness_progress_receipts_v1: stamp race"
+               )
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_liveness_progress_receipts_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_liveness_progress_receipts_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -1817,6 +1907,9 @@ defmodule Tightbeam.Schema do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
         :ok
+
+      {:ok, [[@liveness_progress_receipts_previous_shape]]} ->
+        upgrade_liveness_progress_receipts_v1(db)
 
       {:ok, [[@ruled_decision_integrity_previous_shape]]} ->
         upgrade_ruled_decision_integrity_v1(db)
