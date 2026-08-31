@@ -980,8 +980,38 @@ defmodule Tightbeam.Gateway do
       "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       "transcript" => fn call -> Tightbeam.Transcript.read(db, call) end,
       "attend" => fn call -> attend_result(db, call) end,
-      "toplines" => fn call -> Tightbeam.Toplines.roster(db, call) end,
-      "topline" => fn call -> Tightbeam.Toplines.topline(db, call) end,
+      "execution-map" => fn call -> Tightbeam.ExecutionMap.roster(db, call) end,
+      "execution-map-select" => fn call -> Tightbeam.ExecutionMap.topline(db, call) end,
+      "toplines" => fn call -> Tightbeam.Toplines.__handle__(db, "toplines", call) end,
+      "topline" => fn call -> Tightbeam.Toplines.__handle__(db, "topline", call) end,
+      "topline-create" => fn call -> Tightbeam.Toplines.__handle__(db, "topline-create", call) end,
+      "topline-update" => fn call -> Tightbeam.Toplines.__handle__(db, "topline-update", call) end,
+      "topline-close" => fn call -> Tightbeam.Toplines.__handle__(db, "topline-close", call) end,
+      "topline-reopen" => fn call -> Tightbeam.Toplines.__handle__(db, "topline-reopen", call) end,
+      "topline-link-work" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-link-work", call)
+      end,
+      "topline-unlink-work" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-unlink-work", call)
+      end,
+      "topline-concern-create" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-concern-create", call)
+      end,
+      "topline-concern-update" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-concern-update", call)
+      end,
+      "topline-concern-resolve" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-concern-resolve", call)
+      end,
+      "topline-concern-reopen" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-concern-reopen", call)
+      end,
+      "topline-concern-link-work" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-concern-link-work", call)
+      end,
+      "topline-concern-unlink-work" => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-concern-unlink-work", call)
+      end,
       "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
       "work-item-update" => fn call ->
         WorkItems.__handle__(
