@@ -43,20 +43,25 @@ as a fact, not a claim.
 7. Cite each finding: file and line, log line, or commit. A finding without a citation
    is a guess. Assign each a severity: blocking, important, or nit — an unlabeled nit
    drowns the one blocking defect.
-8. End with an explicit verdict on your assignment:
-   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<basis>"`
-   when nothing blocking or important remains;
-   `--verdict changes-requested` otherwise, with every finding, its severity, and its
-   citation in the note.
-8b. After filing the verdict, wake the reviewed assignment's holder with it:
+8. Write up the review and record it. The document is your canonical deliverable, and
+   your workspace is REMOVED when the session closes, so a document you did not record
+   is destroyed with it:
+   `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId>`.
+   Every finding, its severity, its citation, and the clause table live here.
+9. File an explicit verdict on your assignment. It is the executive summary of the
+   document, not a second copy of it: name the outcome, the major points, and the report.
+   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<summary + art_id>"`
+   when nothing blocking or important remains - outstanding nits do not hold an MVP, so
+   record them in the document and pass;
+   `--verdict changes-requested` otherwise. Write the note the way the review actually
+   went; it does not have to be complete, and it is not a form.
+9b. After filing the verdict, wake the reviewed assignment's holder with it:
    `tightbeam wake --session <holder> --prompt "review verdict on <assignmentId>: <verdict>"`.
    The party that must act next is the producer; do not file and go silent.
-8c. The verdict is the deliverable; completion closes YOUR obligation — they are two
-   different rows and both are yours to file. After the verdict and the wake, file
+9c. Completion closes YOUR obligation - the report, the verdict and the completion are
+   three different rows and all are yours to file. After the verdict and the wake, file
    `tightbeam attest <yourReviewingAssignmentId> --kind completion --note "verdict filed:
-   <verdict>"` on the REVIEWING assignment you hold. A hirer's brief never overrides
-   this: "the verdict is the deliverable" and "file completion when your obligation
-   ends" are both true, and the lifecycle row is what the substrate's hygiene sweep
-   reads.
-9. Judge the work, not the author. Accept a producer's rejection of a finding only with
+   <verdict>; report <art_id>"` on the REVIEWING assignment you hold. The lifecycle row
+   is what the substrate's hygiene sweep reads.
+10. Judge the work, not the author. Accept a producer's rejection of a finding only with
    evidence; re-reproduce contested findings before conceding them.

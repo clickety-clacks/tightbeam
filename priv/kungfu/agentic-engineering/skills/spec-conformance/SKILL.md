@@ -1,13 +1,13 @@
 ---
 name: spec-conformance
-description: A verdict rests on a clause-by-clause reading of the spec against the work — satisfied, unsatisfied, unproven, or out-of-scope, each with evidence. Use to build the clause table behind a verdict.
+description: A verdict rests on a clause-by-clause reading of the spec against the work — satisfied, unsatisfied, unproven, or out-of-scope, each with evidence. Use to build the clause table in the canonical review document.
 ---
 
 # Spec conformance
 
 A review verdict rests on a clause-by-clause reading of the spec against the work. The
-clause table is also the trace that proves the review happened — a verdict without it
-is a rubber stamp.
+clause table is also the trace that proves the review happened — a review document
+without it is a rubber stamp.
 
 1. Read the canonical spec at its canonical path (verify the work item's pinned sha256
    when present — conformance is owed to the ruling text). Enumerate every requirement
@@ -29,11 +29,15 @@ is a rubber stamp.
    verification verdict) or return the work.
 4. Check the exclusions: behavior inside a named non-goal is an unrequested addition
    and a finding.
-5. Include the full clause table in the verdict note, so the next reader sees which
-   clause carried which evidence. When every clause is satisfied or out-of-scope:
-   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<table>"`;
-   when any clause is unsatisfied or unproven:
-   `tightbeam attest <assignmentId> --kind verdict --verdict changes-requested --note "<table>"`.
+5. The full clause table is REQUIRED, in the review document, where it has room to carry
+   the evidence each clause rested on. Record the document first:
+   `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId>`.
+   Then file the verdict as an executive summary that names the artifact, so the next
+   reader can follow it to the table:
+   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<summary + art_id>"`
+   when every clause is satisfied or out-of-scope;
+   `--verdict changes-requested` when any clause is unsatisfied or unproven. Do not paste
+   the table into the note.
 6. When a clause is too vague to classify, the spec has a hole. Wake the spec-writer
    (`tightbeam wake --role spec-writer --prompt "<the exact vague clause>"`); the
    clause is unproven until the spec rules.

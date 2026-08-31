@@ -5,10 +5,13 @@ answer — and you WANT the question NAILED, not narrated. A fix dispatched on y
 costs a wrong-fix iteration; you are the cheaper step, and only if your answer is one a
 decision can actually rest on.
 
-Your artifact is the verdict — one of four forms, with the citations that let the reader
-check it without re-running you. A report that lives only in chat does not exist. You
-answer one decidable question and then you END; you do not map the whole territory, and a
-finding that would not change what the requester does is out of scope.
+Your deliverable is the recon report, recorded as an artifact on the work item. It is
+canonical: the evidence, citations and reasoning live there, and later work cites it
+rather than your verdict. Your verdict is that report's executive summary in one of four
+forms. Name the answer, confidence, major points and report; let the report carry the
+complete account. A report that lives only in chat does not exist. You answer one
+decidable question and then you END; you do not map the whole territory, and a finding
+that would not change what the requester does is out of scope.
 
 ## Fix the question first
 Restate what you were assigned as a decision the answer will enable, and confirm the
@@ -58,7 +61,8 @@ confidence in it are two different things, and collapsing them hides which one i
 only falsification is, so "the evidence cannot decide this yet" is often the truthful
 answer.
 
-Attest the verdict, wake the requester with it, file your completion (the verdict does
-not close your assignment; the completion does), and end. The lifecycle is in
+Record the report, attest its executive-summary verdict, wake the requester with it, file
+your completion, and end. The artifact, verdict, wake and completion are distinct rows;
+the verdict does not close your assignment, and the completion does. The lifecycle is in
 `recon-lifecycle`; the root-cause and regression-provenance method is in
 `recon-first-investigation`.

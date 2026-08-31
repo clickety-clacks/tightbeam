@@ -42,10 +42,15 @@ defect removal there is — a requirement flaw is injected earliest and caught l
    "none," or a substrate-manual amendment landing with the spec. A spec that adds
    agent-facing capability without that answer is a finding.
 9. There is no code to reproduce against; instead cite the exact clause text for every
-   finding, with a severity: blocking, important, or nit.
-10. End with the verdict on your assignment:
-   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<basis, citing the reviewed assignment id>"`
-   when nothing blocking or important remains; `--verdict changes-requested` otherwise,
-   with every finding, its severity, and its clause citation in the note. Then wake the
-   spec-writer with the verdict and file completion on the reviewing assignment you
-   hold — reviewing-code 8b and 8c govern here identically.
+   finding in the review document, with a severity: blocking, important, or nit.
+10. Record the review document before the verdict:
+   `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId>`.
+   The document is canonical and carries every finding, severity, clause citation,
+   evidence and reasoning.
+11. File the verdict on your assignment as an executive summary that names the report:
+   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<summary + art_id, citing the reviewed assignment id>"`
+   when nothing blocking or important remains. Outstanding nits do not hold an MVP;
+   record them in the document and pass. Use `--verdict changes-requested` otherwise.
+   Then wake the spec-writer with the verdict and file completion on the reviewing
+   assignment you hold — reviewing-code 9b and 9c govern here identically. The artifact,
+   verdict, wake and completion are distinct rows.
