@@ -297,6 +297,15 @@ pub enum Command {
         verb: String,
         params: Vec<(String, String)>,
     },
+    DurableToplines {
+        identity: Identity,
+        state: Option<String>,
+    },
+    DurableTopline {
+        identity: Identity,
+        topline_id: String,
+        history: bool,
+    },
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
@@ -648,6 +657,22 @@ COMMANDS:
       reports the items they resolve to; an assignment belonging to no item
       comes back in noItem rather than being silently dropped.
         tightbeam execution-map-select --under wi_abc123 --as-user flynn
+  toplines [--state open|closed|all]
+      List your visible durable Toplines.
+  topline <toplineId> [--history]
+      Read one visible durable Topline; --history includes its event history.
+  topline-create --title <text> --key <idempotencyKey>
+  topline-update <toplineId> --title <text> --reason <text> --key <idempotencyKey>
+  topline-close <toplineId> --reason <text> --key <idempotencyKey>
+  topline-reopen <toplineId> --reason <text> --key <idempotencyKey>
+  topline-link-work <toplineId> <workItemId> --reason <text> --key <idempotencyKey>
+  topline-unlink-work <membershipId> --reason <text> --key <idempotencyKey>
+  topline-concern-create <toplineId> --title <text> --key <idempotencyKey>
+  topline-concern-update <concernId> --title <text> --reason <text> --key <idempotencyKey>
+  topline-concern-resolve <concernId> --reason <text> --key <idempotencyKey>
+  topline-concern-reopen <concernId> --reason <text> --key <idempotencyKey>
+  topline-concern-link-work <concernId> <membershipId> --reason <text> --key <idempotencyKey>
+  topline-concern-unlink-work <concernRefId> --reason <text> --key <idempotencyKey>
   coordination-share --session <key> --from <epochMs> --to <epochMs>
       What share of a session's turns were spent on coordination traffic over a
       window — every turn a wake materialized, classed or not, except an
@@ -1072,6 +1097,8 @@ const COORDINATION_SHARE_USAGE: &str =
 const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
 
 const TOPLINE_USAGE: &str = "usage: tightbeam execution-map-select (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+const DURABLE_TOPLINES_USAGE: &str = "usage: tightbeam toplines [--state open|closed|all]";
+const DURABLE_TOPLINE_USAGE: &str = "usage: tightbeam topline <toplineId> [--history]";
 
 /// Every roster-filter flag, in one place, so the assignment-mode refusal and the
 /// filter builder cannot drift apart.
@@ -2115,6 +2142,31 @@ fn parse_with_optional_catalog(
                 selection,
             })
         }
+        "toplines" => {
+            if parsed.positional.len() != 1 {
+                return Err(DURABLE_TOPLINES_USAGE.to_owned());
+            }
+            let state = nonempty(flags, "state");
+            if let Some(value) = &state {
+                if !matches!(value.as_str(), "open" | "closed" | "all") {
+                    return Err(DURABLE_TOPLINES_USAGE.to_owned());
+                }
+            }
+            Ok(Command::DurableToplines {
+                identity: identity(flags)?,
+                state,
+            })
+        }
+        "topline" => {
+            if parsed.positional.len() != 2 {
+                return Err(DURABLE_TOPLINE_USAGE.to_owned());
+            }
+            Ok(Command::DurableTopline {
+                identity: identity(flags)?,
+                topline_id: parsed.positional[1].clone(),
+                history: flags.contains_key("history"),
+            })
+        }
         verb @ ("topline-create"
         | "topline-update"
         | "topline-close"
@@ -2346,7 +2398,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, execution-map, execution-map-select, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-update, topline-concern-resolve, topline-concern-reopen, topline-concern-link-work, topline-concern-unlink-work, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -3216,6 +3268,20 @@ mod tests {
                 "unlearn",
                 "execution-map",
                 "execution-map-select",
+                "toplines",
+                "topline",
+                "topline-create",
+                "topline-update",
+                "topline-close",
+                "topline-reopen",
+                "topline-link-work",
+                "topline-unlink-work",
+                "topline-concern-create",
+                "topline-concern-update",
+                "topline-concern-resolve",
+                "topline-concern-reopen",
+                "topline-concern-link-work",
+                "topline-concern-unlink-work",
                 "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",
