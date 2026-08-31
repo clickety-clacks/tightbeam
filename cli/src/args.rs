@@ -1054,6 +1054,14 @@ fn topline_mutation(
                 key()?,
             ]
         }
+        "topline-work-leave-unlinked" => {
+            exact(2)?;
+            vec![
+                ("workItemId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
         _ => return Err(format!("unknown Topline operation: {verb}")),
     };
     Ok(Command::ToplineMutation {
@@ -1786,7 +1794,33 @@ fn parse_with_optional_catalog(
         | "topline-concern-resolve"
         | "topline-concern-reopen"
         | "topline-concern-link-work"
-        | "topline-concern-unlink-work") => topline_mutation(verb, &parsed.positional, flags),
+        | "topline-concern-unlink-work"
+        | "topline-work-leave-unlinked") => topline_mutation(verb, &parsed.positional, flags),
+        "topline-placement-list" => {
+            if parsed.positional.len() != 1 {
+                return Err(
+                    "usage: tightbeam topline-placement-list [--state pending|resolved|all]"
+                        .to_owned(),
+                );
+            }
+            let state = nonempty(flags, "state");
+            if !matches!(
+                state.as_deref(),
+                None | Some("pending" | "resolved" | "all")
+            ) {
+                return Err(
+                    "usage: tightbeam topline-placement-list [--state pending|resolved|all]"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::ToplineMutation {
+                identity: identity(flags)?,
+                verb: "topline-placement-list".to_owned(),
+                params: state
+                    .map(|value| vec![("state".to_owned(), value)])
+                    .unwrap_or_default(),
+            })
+        }
         "work-item-icebox" => {
             if parsed.positional.len() != 2 {
                 return Err("usage: tightbeam work-item-icebox <workItemId>".to_owned());

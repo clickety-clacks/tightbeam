@@ -60,6 +60,8 @@ defmodule Tightbeam.Toplines do
   def __handle__(db, "topline-concern-unlink-work", call), do: unlink_concern_work(db, call)
   def __handle__(db, "toplines", call), do: list(db, call)
   def __handle__(db, "topline", call), do: get(db, call)
+  def __handle__(db, "topline-work-leave-unlinked", call), do: leave_unlinked(db, call)
+  def __handle__(db, "topline-placement-list", call), do: list_placements(db, call)
 
   @doc "Query visible durable Toplines for the shared REST read seam."
   @spec query_public(DB.server(), map()) :: [map()] | map()
@@ -990,6 +992,81 @@ defmodule Tightbeam.Toplines do
     end
   end
 
+  def leave_unlinked(db, call) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:idempotency_key, :reason, :work_item_id]),
+         :ok <- valid_id(param(params, :work_item_id), "wi_"),
+         :ok <- valid_reason(param(params, :reason)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      work_item_id = param(params, :work_item_id)
+      reason = param(params, :reason)
+      key = param(params, :idempotency_key)
+      operation = "topline-work-leave-unlinked"
+      fingerprint = fingerprint(operation, %{workItemId: work_item_id, reason: reason})
+
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, _work_item} <- visible_work_item(txn, work_item_id, caller) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
+
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+            :new ->
+              placement =
+                resolve_placement_in_txn(txn, %{
+                  work_item_id: work_item_id,
+                  state: "resolved",
+                  actor_kind: caller.actor_kind,
+                  actor_ref: caller.actor_ref,
+                  reason: reason,
+                  at: mutation_time(call)
+                })
+
+              if is_nil(placement),
+                do: error("placement_not_pending", "placement is not pending"),
+                else: :ok
+
+              response = %{placement: placement}
+              remember(txn, caller.user, operation, key, fingerprint, response)
+              response
+          end
+        end
+      end)
+    end
+  end
+
+  def list_placements(db, call) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:state], optional: [:state]),
+         {:ok, state} <- placement_state(param(params, :state)) do
+      transaction!(db, fn txn ->
+        {owner_sql, owner_params} = owner_filter(caller, "p")
+
+        {state_sql, state_params} =
+          if state == "all",
+            do: {"", []},
+            else: {" AND p.state = ?#{length(owner_params) + 1}", [state]}
+
+        ids =
+          Txn.q(
+            txn,
+            "SELECT p.id FROM topline_placement_obligations p WHERE 1 = 1 #{owner_sql} #{state_sql} ORDER BY p.openedAt ASC, p.id ASC",
+            owner_params ++ state_params
+          )
+          |> Enum.map(&hd/1)
+
+        %{placements: Enum.map(ids, &placement_in_txn(txn, &1))}
+      end)
+    end
+  end
+
   defp summary_sql(where) do
     """
     SELECT t.id, t.ownerUserId, t.title, t.state, t.createdActorKind,
@@ -1800,6 +1877,10 @@ defmodule Tightbeam.Toplines do
     prefix = if alias_name == "", do: "", else: alias_name <> "."
     {"AND #{prefix}ownerUserId = ?1", [caller.user]}
   end
+
+  defp placement_state(nil), do: {:ok, "pending"}
+  defp placement_state(state) when state in ["pending", "resolved", "all"], do: {:ok, state}
+  defp placement_state(_), do: error("invalid_message", "invalid message")
 
   defp shifted_owner_filter("", _offset), do: ""
 
