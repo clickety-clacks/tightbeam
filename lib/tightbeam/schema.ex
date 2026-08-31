@@ -95,6 +95,7 @@ defmodule Tightbeam.Schema do
   @cold_start_previous_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_previous_shape "coordination-fabric-v1-phase1-v4"
+  @i68_previous_package_shape "operator-decision-requests-v1"
 
   @supervision_liveness_objects [
     %{
@@ -957,6 +958,7 @@ defmodule Tightbeam.Schema do
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
     :ok = check_shape(db)
+    :ok = clear_i68_previous_package_bridge(db)
 
     Enum.each(@schema_modules, fn module ->
       :ok = module.ensure_schema(db)
@@ -1113,6 +1115,79 @@ defmodule Tightbeam.Schema do
   end
 
   @doc false
+  @spec upgrade_i68_previous_package_v1(DB.server()) :: :ok
+  def upgrade_i68_previous_package_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@i68_previous_package_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_i68_previous_package_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok =
+             Txn.exec(
+               txn,
+               "CREATE TABLE i68_previous_package_bridge (id INTEGER PRIMARY KEY CHECK (id=0))"
+             )
+
+           :ok = Txn.exec(txn, "INSERT INTO i68_previous_package_bridge (id) VALUES (0)")
+
+           for {column, type} <- [
+                 {"askedOfRole", "TEXT"},
+                 {"answer", "TEXT"},
+                 {"answeredBy", "TEXT"},
+                 {"answeredAt", "INTEGER"},
+                 {"returnedBy", "TEXT"},
+                 {"returnReason", "TEXT"},
+                 {"returnedAt", "INTEGER"}
+               ] do
+             :ok = Txn.exec(txn, "ALTER TABLE decision_requests ADD COLUMN #{column} #{type}")
+           end
+
+           for {column, type} <- [
+                 {"class", "TEXT"},
+                 {"classElection", "TEXT"},
+                 {"deliveryRule", "TEXT"},
+                 {"digest", "INTEGER NOT NULL DEFAULT 0"},
+                 {"summon", "INTEGER NOT NULL DEFAULT 0"}
+               ] do
+             :ok = Txn.exec(txn, "ALTER TABLE wakes ADD COLUMN #{column} #{type}")
+           end
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [
+               @i68_previous_package_shape,
+               @operational_parent_previous_shape,
+               System.system_time(:millisecond)
+             ]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError, message: "incompatible_i68_previous_package_v1: stamp race"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_i68_previous_package_v1: migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
   @spec upgrade_message_type_v1(DB.server()) :: :ok
   def upgrade_message_type_v1(db) do
     migration_time = System.system_time(:millisecond)
@@ -1127,7 +1202,9 @@ defmodule Tightbeam.Schema do
                  message: "incompatible_message_type_v1: predecessor stamp #{inspect(rows)}"
            end
 
-           :ok = Txn.exec(txn, "ALTER TABLE messages ADD COLUMN messageType TEXT")
+           unless i68_previous_package_bridge?(txn) do
+             :ok = Txn.exec(txn, "ALTER TABLE messages ADD COLUMN messageType TEXT")
+           end
 
            Txn.q(
              txn,
@@ -1812,10 +1889,49 @@ defmodule Tightbeam.Schema do
     """)
   end
 
+  defp i68_previous_package_bridge?(txn) do
+    case Txn.q(
+           txn,
+           "SELECT name FROM sqlite_master WHERE type='table' AND name='i68_previous_package_bridge'"
+         ) do
+      [["i68_previous_package_bridge"]] ->
+        [[0]] = Txn.q(txn, "SELECT id FROM i68_previous_package_bridge")
+        true
+
+      [] ->
+        false
+    end
+  end
+
+  defp clear_i68_previous_package_bridge(db) do
+    case DB.transaction(db, fn txn ->
+           :ok = Txn.exec(txn, "DROP TABLE IF EXISTS i68_previous_package_bridge")
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_i68_previous_package_v1: cleanup failed: #{Exception.message(error)}"
+    end
+  end
+
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
         :ok
+
+      {:ok, [[@i68_previous_package_shape]]} ->
+        :ok = upgrade_i68_previous_package_v1(db)
+        :ok = upgrade_operational_parent_v1(db)
+        :ok = upgrade_cold_start_v1(db)
+        :ok = upgrade_message_type_v1(db)
+        :ok = upgrade_terminal_operator_decision_v1(db)
+        :ok = upgrade_nullable_effective_parent_v1(db)
+        :ok = upgrade_identity_render_stamp_v1(db)
+        :ok = upgrade_effort_request_exit_v1(db)
+        upgrade_session_mechanical_status_v1(db)
 
       {:ok, [[@ruled_decision_integrity_previous_shape]]} ->
         upgrade_ruled_decision_integrity_v1(db)
@@ -1887,7 +2003,7 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         There is no migration from #{found}. The only supported upgrade sources
-        are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
+        are #{@i68_previous_package_shape}, #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
         #{@message_type_previous_shape}, #{@terminal_decision_previous_shape},
         #{@nullable_effective_parent_previous_shape},
         #{@identity_render_stamp_previous_shape},

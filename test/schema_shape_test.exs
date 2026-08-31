@@ -520,6 +520,45 @@ defmodule Tightbeam.SchemaShapeTest do
     assert Enum.at(column, 3) == 0
   end
 
+  test "the I68 bridge refuses a hybrid that does not match the immutable package", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "i68-legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    root = session(db, "i68-root", "flynn")
+    _child = session(db, "i68-child", "flynn", spawned_by: root.session_key)
+
+    downgrade_to_previous_shape(db)
+    :ok = DB.execute(db, "ALTER TABLE messages ADD COLUMN messageType TEXT")
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE schema_stamp SET shape='operator-decision-requests-v1', stampedAt=1"
+             )
+
+    {:ok, legacy_rows} =
+      DB.query(db, "SELECT sessionKey,ownerUserId,spawnedBy FROM sessions ORDER BY sessionKey")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_i68_previous_package_v1"
+
+    assert {:ok, ^legacy_rows} =
+             DB.query(
+               db,
+               "SELECT sessionKey,ownerUserId,spawnedBy FROM sessions ORDER BY sessionKey"
+             )
+
+    assert {:ok, [["operator-decision-requests-v1"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
   test "an interrupted operational-parent upgrade rolls back and retries exactly", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
