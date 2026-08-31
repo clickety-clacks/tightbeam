@@ -780,6 +780,9 @@ defmodule Tightbeam.Escalation do
   id. The asked session remains the preferred responder, not an authorization
   gate. A user principal keeps the existing asked-owner boundary.
 
+  A typed cannot-proceed request is not an ordinary question. Prose cannot
+  settle that durable decision obligation, so answer refuses it unchanged.
+
   Kind and principal standing are checked before a non-agent row is revealed.
   A nonexistent id, a non-agent id, and an agent question outside a user's
   existing expecter boundary are one identical refusal. An authenticated agent
@@ -794,6 +797,9 @@ defmodule Tightbeam.Escalation do
       %{kind: "agent"} = request ->
         if decision_reader?(call, request) do
           cond do
+            cannot_proceed_request?(request) ->
+              cannot_proceed_decision_error()
+
             not (is_binary(text) and String.trim(text) != "") ->
               error("invalid", "an answer requires text")
 
@@ -832,6 +838,7 @@ defmodule Tightbeam.Escalation do
 
   A return is a terminal, reasoned disposition of the exact immutable request,
   not an answer or ruling. The same principal boundary as `answer/2` applies.
+  Typed cannot-proceed requests refuse this generic terminal path unchanged.
   """
   @spec return_request(DB.server(), map()) :: map()
   def return_request(db, call) do
@@ -841,30 +848,34 @@ defmodule Tightbeam.Escalation do
     case get_raw(db, request_id) do
       %{kind: "agent"} = request ->
         if decision_reader?(call, request) do
-          by = principal_id(call)
+          if cannot_proceed_request?(request) do
+            cannot_proceed_decision_error()
+          else
+            by = principal_id(call)
 
-          case trimmed_reason(reason) do
-            {:ok, text} ->
-              cond do
-                request.status == "open" ->
-                  return_open(db, Map.put(request, :firehose_call, call), text, by)
+            case trimmed_reason(reason) do
+              {:ok, text} ->
+                cond do
+                  request.status == "open" ->
+                    return_open(db, Map.put(request, :firehose_call, call), text, by)
 
-                request.status == "returned" and request.returned_by == by and
-                    request.return_reason == text ->
-                  {:ok, request} =
-                    DB.transaction(db, fn txn ->
-                      Publisher.maybe_observed_accepted_in_txn(txn, call)
-                      request
-                    end)
+                  request.status == "returned" and request.returned_by == by and
+                      request.return_reason == text ->
+                    {:ok, request} =
+                      DB.transaction(db, fn txn ->
+                        Publisher.maybe_observed_accepted_in_txn(txn, call)
+                        request
+                      end)
 
-                  request
+                    request
 
-                true ->
-                  error("not_open", "decision request is not open")
-              end
+                  true ->
+                    error("not_open", "decision request is not open")
+                end
 
-            {:error, error} ->
-              error
+              {:error, error} ->
+                error
+            end
           end
         else
           error("not_found", "decision request not found")
@@ -1426,6 +1437,8 @@ defmodule Tightbeam.Escalation do
   asker that filed a `kind = 'agent'` row takes it back with the same verb and
   no other principal's cooperation. `raiserId = 'session:' || raiserSessionKey`
   in the agent arm is what makes the existing raiser check land on the asker.
+  Typed cannot-proceed requests are the exception: their decision obligation
+  remains until exact assignment disposition or an exact release fact.
   """
   @spec withdraw(DB.server(), map()) :: map()
   def withdraw(db, call) do
@@ -1453,9 +1466,21 @@ defmodule Tightbeam.Escalation do
             error("not_raiser", "raiser required")
 
           request ->
-            withdraw_open(db, Map.put(request, :firehose_call, call), call.origin, reason)
+            if cannot_proceed_request?(request),
+              do: cannot_proceed_decision_error(),
+              else: withdraw_open(db, Map.put(request, :firehose_call, call), call.origin, reason)
         end
     end
+  end
+
+  defp cannot_proceed_request?(%{context: %{"verb" => "cannot-proceed"}}), do: true
+  defp cannot_proceed_request?(_request), do: false
+
+  defp cannot_proceed_decision_error do
+    error(
+      "cannot_proceed_standing",
+      "cannot-proceed decisions settle only through exact assignment disposition or release fact"
+    )
   end
 
   @doc "Withdraw open requests and revoke live waivers for one retired session raiser."
@@ -1464,9 +1489,9 @@ defmodule Tightbeam.Escalation do
   # answers to as its own lawful, judgment-free exit (gate Q3 for the agent
   # arm's own doc above). Retirement withdraws ALL of a session's open rows —
   # statute, effort, agent alike — on that session's behalf, exactly as if the
-  # session had called `withdraw` on each itself. This reads `status = 'open'`
-  # with no `kind` predicate because it means to reach every kind, not because
-  # it forgot one.
+  # session had called `withdraw` on each itself. Typed cannot-proceed requests
+  # remain open because retirement is neither an exact assignment disposition
+  # nor an exact release fact.
   @spec withdraw_for_retired(DB.server(), String.t()) :: :ok
   def withdraw_for_retired(db, session_key) do
     raiser_id = "session:" <> session_key
@@ -1477,11 +1502,14 @@ defmodule Tightbeam.Escalation do
         rows =
           Txn.q(
             txn,
-            "SELECT id FROM decision_requests WHERE raiserSessionKey = ?1 AND kind != 'operator' AND status = 'open'",
+            "SELECT id,context FROM decision_requests WHERE raiserSessionKey = ?1 AND kind != 'operator' AND status = 'open'",
             [session_key]
           )
+          |> Enum.reject(fn [_id, context] ->
+            decode_required(context)["verb"] == "cannot-proceed"
+          end)
 
-        Enum.each(rows, fn [id] ->
+        Enum.each(rows, fn [id, _context] ->
           Txn.q(
             txn,
             "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'raiser-retired', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",

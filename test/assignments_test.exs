@@ -1916,7 +1916,44 @@ defmodule Tightbeam.AssignmentsTest do
                [first.id]
              )
 
+    assert %{code: "cannot_proceed_standing"} =
+             Tightbeam.Escalation.answer(
+               ctx.db,
+               call("answer", {:session, "other-session"}, nil, %{
+                 request: filed.decisionRequest.id,
+                 answer: "try again"
+               })
+             )
+
+    assert %{code: "cannot_proceed_standing"} =
+             Tightbeam.Escalation.return_request(
+               ctx.db,
+               call("return", {:session, "other-session"}, nil, %{
+                 request: filed.decisionRequest.id,
+                 reason: "more detail"
+               })
+             )
+
+    assert %{code: "cannot_proceed_standing"} =
+             Tightbeam.Escalation.withdraw(
+               ctx.db,
+               call("withdraw", {:session, "holder"}, nil, %{
+                 request: filed.decisionRequest.id,
+                 reason: "take it back"
+               })
+             )
+
+    assert :ok = Tightbeam.Escalation.withdraw_for_retired(ctx.db, "holder")
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [
+               filed.decisionRequest.id
+             ])
+
     assert Assignments.oldest_prod_eligible(ctx.db, "holder").id == second.id
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:session, "holder"}, second.id))
 
     assert {:ok, fact} =
              DB.transaction(ctx.db, fn txn ->
@@ -1929,6 +1966,17 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert is_integer(fact.fact_id)
     assert Assignments.oldest_prod_eligible(ctx.db, "holder").id == first.id
+
+    released_replay = handle(ctx, "attest", filing)
+    assert released_replay.replayed
+    assert released_replay.cannotProceed.id == filed.cannotProceed.id
+    assert released_replay.cannotProceed.state == "settled"
+    assert Assignments.attest_count(ctx.db, first.id) == 1
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM decision_requests WHERE assignmentId=?1", [
+               first.id
+             ])
 
     assert {:ok, [["withdrawn"]]} =
              DB.query(
@@ -1944,10 +1992,15 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :note], "may finish concurrently")
       |> then(&handle(ctx, "attest", &1))
 
-    completed =
-      handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "completion"))
+    assert %{code: "cannot_proceed_standing"} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "completion"))
 
-    assert completed.assignment.outcome == "completed"
+    assert handle(ctx, "assignment-get", assignment_get_call({:session, "holder"}, terminal.id)).state ==
+             "open"
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:session, "holder"}, terminal.id))
+
     assert Wakes.get(ctx.db, terminal_block.decisionWake.wake_id).state == "canceled"
 
     assert {:ok, [["settled", "disposed"]]} =
@@ -2019,6 +2072,53 @@ defmodule Tightbeam.AssignmentsTest do
                "revoke-assignment",
                revoke_call({:session, "other-session"}, assignment.id)
              )
+  end
+
+  test "failed cannot-proceed bubble recipients gain no disposition authority", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "failed bubble"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the opener is unavailable")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns
+                 (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
+               VALUES
+                 (?1,'cannot-proceed-failed-cause',?2,'process:tightbeam','parent decision',?3,
+                  'failed',1,2)
+               """,
+               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
+             )
+
+    assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns
+                 (sessionKey,messageId,origin,prompt,assignmentId,status,requestRef,createdAt,endedAt)
+               VALUES
+                 ('other-session','cannot-proceed-failed-bubble','process:tightbeam','fault bubble',
+                  ?1,'failed',?2,3,4)
+               """,
+               [assignment.id, "bubble:#{cause_seq}"]
+             )
+
+    assert %{code: "not_authorized"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:session, "other-session"}, assignment.id)
+             )
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
   end
 
   test "reopen-assignment repairs a revoked card (Sol xhigh review, finding 7)", ctx do

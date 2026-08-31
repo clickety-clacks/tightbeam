@@ -2444,17 +2444,36 @@ defmodule Tightbeam.Assignments do
                  ]) != [[1]],
                  do: raise(TransitionRace)
 
-              case {call.params.kind, standing_cannot_proceed(txn, assignment_id)} do
-                {"cannot-proceed", prior} when not is_nil(prior) ->
-                  cannot_proceed_replay(call.params, assignment, prior)
+              case call.params.kind do
+                "cannot-proceed" ->
+                  case latest_cannot_proceed(txn, assignment_id) do
+                    nil -> insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
+                    prior -> cannot_proceed_replay(call.params, assignment, prior)
+                  end
 
-                _ ->
-                  attest = insert_attest(txn, call, assignment_id)
-                  apply_lifecycle_attest(txn, call, assignment, attest, holder)
+                "completion" ->
+                  case standing_cannot_proceed(txn, assignment_id) do
+                    nil ->
+                      insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
+
+                    _standing ->
+                      error(
+                        "cannot_proceed_standing",
+                        "assignment completion is blocked while cannot-proceed is standing"
+                      )
+                  end
+
+                _other ->
+                  insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
               end
             end
         end
     end
+  end
+
+  defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
+    attest = insert_attest(txn, call, assignment.id)
+    apply_lifecycle_attest(txn, call, assignment, attest, holder)
   end
 
   defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest, _holder) do
@@ -2487,14 +2506,6 @@ defmodule Tightbeam.Assignments do
     Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
     liveness_trigger = disposition_liveness_trigger!(txn, closed_assignment.workItemId)
 
-    settle_cannot_proceed_by_disposition_in_txn(
-      txn,
-      assignment.id,
-      "session:" <> holder,
-      attest.ts,
-      liveness_trigger
-    )
-
     supervision_transition!(txn, :terminal_disposition, %{
       kind: "terminal_disposition",
       assignment_id: assignment.id,
@@ -2520,7 +2531,7 @@ defmodule Tightbeam.Assignments do
       release_scope = call.params[:release_fact_scope]
       release_principal = call.params[:release_fact_principal_ref]
 
-      case standing_cannot_proceed(txn, assignment.id) do
+      case latest_cannot_proceed(txn, assignment.id) do
         nil ->
           condition_id = id("cp_")
           opener_ref = assignment_opener_ref(assignment)
@@ -2603,8 +2614,27 @@ defmodule Tightbeam.Assignments do
     else
       error(
         "cannot_proceed_conflict",
-        "assignment already has a different standing cannot-proceed record"
+        "assignment already has a different cannot-proceed record"
       )
+    end
+  end
+
+  defp latest_cannot_proceed(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef, reason,
+                  releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state,
+                  createdAt, settledAt, settlementKind, settlementFactId, settledBy
+           FROM assignment_cannot_proceed
+           WHERE assignmentId=?1
+           ORDER BY createdAt DESC, id DESC
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      [row] -> cannot_proceed(row)
+      [] -> nil
     end
   end
 
@@ -2981,6 +3011,7 @@ defmodule Tightbeam.Assignments do
                FROM turns cause
                JOIN turns bubbled ON bubbled.requestRef='bubble:' || cause.seq
                WHERE cause.wakeId=?1
+                 AND bubbled.status='delivered'
                ORDER BY bubbled.seq DESC LIMIT 1
                """,
                [wake_id]
