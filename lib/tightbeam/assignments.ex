@@ -141,7 +141,7 @@ defmodule Tightbeam.Assignments do
   # A revocation is a terminal fact, not an attest: the revoker is not the
   # holder and does not owe a verdict. Keep its provenance in its own
   # append-only row so reopening does not erase an earlier revocation.
-  @revocations_ddl """
+  @revocations_table_ddl """
   CREATE TABLE IF NOT EXISTS assignment_revocations (
     id TEXT PRIMARY KEY,
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
@@ -163,10 +163,30 @@ defmodule Tightbeam.Assignments do
       )) >= 1
     ),
     CHECK((revokedByUser IS NOT NULL) != (revokedBySession IS NOT NULL))
-  );
-  CREATE INDEX IF NOT EXISTS assignment_revocations_assignment
-    ON assignment_revocations (assignmentId, revokedAt, id);
+  )
   """
+
+  @revocations_index_ddl """
+  CREATE INDEX IF NOT EXISTS assignment_revocations_assignment
+    ON assignment_revocations (assignmentId, revokedAt, id)
+  """
+
+  # The first revision of this table used SQLite's one-argument trim(), which
+  # did not reject every String.trim/1 whitespace code point. A receipt makes
+  # this a one-time upgrade rather than a startup repair loop: migrate the
+  # known predecessor once, then refuse malformed historic provenance instead
+  # of silently inventing a reason for it.
+  @revocation_migrations_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_revocation_migrations (
+    migrationId TEXT PRIMARY KEY,
+    appliedAt INTEGER NOT NULL,
+    affectedRows INTEGER NOT NULL CHECK(affectedRows >= 0),
+    cause TEXT NOT NULL CHECK(cause = 'release_upgrade'),
+    principal TEXT NOT NULL CHECK(principal = 'process:tightbeam')
+  )
+  """
+
+  @revocation_reason_constraint_migration_id "0.2.0/revocation-reason-unicode-whitespace-v1"
 
   # The assignments row remains the terminal-state authority. This trigger
   # makes a revoked close impossible unless the same transaction first wrote a
@@ -226,10 +246,80 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @assignment_priorities_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
     :ok = DB.execute(db, @reopenings_ddl)
-    :ok = DB.execute(db, @revocations_ddl)
+    :ok = DB.execute(db, @revocations_table_ddl)
+    :ok = DB.execute(db, @revocations_index_ddl)
+    :ok = DB.execute(db, @revocation_migrations_ddl)
+    :ok = migrate_revocation_reason_constraint(db)
     :ok = DB.execute(db, @revocation_trigger_ddl)
     migrate_legacy_revocations(db)
     Tightbeam.EffortCheckin.ensure_schema(db)
+  end
+
+  defp migrate_revocation_reason_constraint(db) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  "SELECT 1 FROM assignment_revocation_migrations WHERE migrationId=?1",
+                  [@revocation_reason_constraint_migration_id]
+                ) do
+             [[1]] ->
+               :ok
+
+             [] ->
+               # A trigger can retain the renamed table name while SQLite
+               # rebuilds it, so remove it before the swap and recreate it
+               # after this transaction commits through ensure_schema/1.
+               :ok =
+                 Txn.exec(txn, "DROP TRIGGER IF EXISTS assignments_revocation_reason_required")
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "ALTER TABLE assignment_revocations RENAME TO assignment_revocations_before_unicode_whitespace_v1"
+                 )
+
+               :ok = Txn.exec(txn, @revocations_table_ddl)
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   """
+                   INSERT INTO assignment_revocations
+                     (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                   SELECT id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason
+                   FROM assignment_revocations_before_unicode_whitespace_v1
+                   """
+                 )
+
+               affected_rows = Txn.changes(txn)
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "DROP TABLE assignment_revocations_before_unicode_whitespace_v1"
+                 )
+
+               :ok = Txn.exec(txn, @revocations_index_ddl)
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocation_migrations
+                   (migrationId, appliedAt, affectedRows, cause, principal)
+                 VALUES (?1, ?2, ?3, 'release_upgrade', 'process:tightbeam')
+                 """,
+                 [@revocation_reason_constraint_migration_id, now(), affected_rows]
+               )
+
+               if Txn.changes(txn) != 1,
+                 do: raise("revocation reason constraint migration receipt race")
+
+               :ok
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
   end
 
   # Historical revoked rows predate a required reason. The explicit sentinel

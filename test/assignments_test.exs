@@ -2272,6 +2272,137 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "upgrade rebuilds revocation provenance with the Unicode whitespace constraint", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade reason"))
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+    :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocations")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TABLE assignment_revocations (
+          id TEXT PRIMARY KEY,
+          assignmentId TEXT NOT NULL REFERENCES assignments(id),
+          revokedAt INTEGER NOT NULL,
+          revokedByUser TEXT NULL REFERENCES users(userId),
+          revokedBySession TEXT NULL REFERENCES sessions(sessionKey),
+          reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000 AND length(trim(reason)) >= 1),
+          CHECK((revokedByUser IS NOT NULL) != (revokedBySession IS NOT NULL))
+        );
+        CREATE INDEX assignment_revocations_assignment
+          ON assignment_revocations (assignmentId, revokedAt, id);
+        DELETE FROM assignment_revocation_migrations;
+        """
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_revocations
+                 (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+               VALUES ('revocation-pre-upgrade', ?1, 42, 'flynn', NULL, 'superseded')
+               """,
+               [assignment.id]
+             )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:ok, [["superseded", 42, "flynn", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT reason, revokedAt, revokedByUser, revokedBySession
+               FROM assignment_revocations
+               WHERE id='revocation-pre-upgrade'
+               """
+             )
+
+    assert {:error, %DB.Error{message: trigger_error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=43, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id]
+             )
+
+    assert trigger_error =~ "revoked assignment requires revocation provenance"
+
+    for code_point <- [
+          9,
+          10,
+          11,
+          12,
+          13,
+          32,
+          133,
+          160,
+          5760,
+          8192,
+          8193,
+          8194,
+          8195,
+          8196,
+          8197,
+          8198,
+          8199,
+          8200,
+          8201,
+          8202,
+          8232,
+          8233,
+          8239,
+          8287,
+          12288
+        ] do
+      assert {:error, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                 VALUES (?1, ?2, 43, 'flynn', NULL, ?3)
+                 """,
+                 [
+                   "revocation-upgrade-whitespace-#{code_point}",
+                   assignment.id,
+                   <<code_point::utf8>>
+                 ]
+               )
+    end
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT count(*) FROM assignment_revocation_migrations
+                  WHERE migrationId='0.2.0/revocation-reason-unicode-whitespace-v1'),
+                 (SELECT count(*) FROM assignment_revocations
+                  WHERE id='revocation-pre-upgrade')
+               """
+             )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT count(*) FROM assignment_revocation_migrations
+                  WHERE migrationId='0.2.0/revocation-reason-unicode-whitespace-v1'),
+                 (SELECT count(*) FROM assignment_revocations
+                  WHERE id='revocation-pre-upgrade')
+               """
+             )
+  end
+
   test "query filters, deterministic ordering, role-resolved holder input, and open_count", ctx do
     a = handle(ctx, "assign", assign_call({:user, "flynn"}, "a"))
     b = handle(ctx, "assign", assign_call({:user, "flynn"}, "b"))
