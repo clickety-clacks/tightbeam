@@ -205,6 +205,20 @@ defmodule Tightbeam.Assignments do
   BEGIN
     SELECT RAISE(ABORT, 'revoked assignment requires revocation provenance');
   END;
+
+  CREATE TRIGGER IF NOT EXISTS assignments_revocation_reason_required_insert
+  BEFORE INSERT ON assignments
+  WHEN NEW.state = 'closed' AND NEW.outcome = 'revoked'
+    AND NOT EXISTS (
+      SELECT 1 FROM assignment_revocations r
+      WHERE r.assignmentId = NEW.id
+        AND r.revokedAt = NEW.closedAt
+        AND r.revokedByUser IS NEW.closedByUser
+        AND r.revokedBySession IS NEW.closedBySession
+    )
+  BEGIN
+    SELECT RAISE(ABORT, 'revoked assignment requires revocation provenance');
+  END;
   """
 
   # The `reopen-assignment` papertrail. The assignments CHECK forces an OPEN row
@@ -366,24 +380,27 @@ defmodule Tightbeam.Assignments do
     Enum.each(assignments, fn %{assignment_id: assignment_id, work_item_id: work_item_id} ->
       ts = now()
 
+      {revoked_by_user, revoked_by_session} =
+        retirement_provenance_actor(txn, principal, owner_user_id)
+
       Txn.q(
         txn,
         """
         INSERT INTO assignment_revocations
           (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
-        VALUES (?1, ?2, ?3, ?4, NULL, 'holder session retired')
+        VALUES (?1, ?2, ?3, ?4, ?5, 'holder session retired')
         """,
-        [id("rev_"), assignment_id, ts, owner_user_id]
+        [id("rev_"), assignment_id, ts, revoked_by_user, revoked_by_session]
       )
 
       Txn.q(
         txn,
         """
         UPDATE assignments SET state='closed', outcome='revoked', closedAt=?2,
-          closedByUser=?3
+          closedByUser=?3, closedBySession=?4
         WHERE id=?1 AND state='open'
         """,
-        [assignment_id, ts, owner_user_id]
+        [assignment_id, ts, revoked_by_user, revoked_by_session]
       )
 
       if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -423,6 +440,27 @@ defmodule Tightbeam.Assignments do
 
   def interrupt_for_retire_in_txn(%Txn{}, _session_key, _owner_user_id, _principal) do
     raise ArgumentError, "retirement interruption requires a durable principal"
+  end
+
+  # Retirement receives the caller's durable origin string from Gateway. A
+  # session origin is its actual sessions primary key (often `agent:...`), so
+  # preserve it instead of replacing it with the holder's owner. Process-owned
+  # recovery has no representable user-or-session actor in this schema and
+  # retains the established owner fallback.
+  defp retirement_provenance_actor(_txn, "user:" <> user_id, _owner_user_id),
+    do: {user_id, nil}
+
+  defp retirement_provenance_actor(txn, "session:" <> session_key, owner_user_id),
+    do: retirement_session_or_owner(txn, session_key, owner_user_id)
+
+  defp retirement_provenance_actor(txn, principal, owner_user_id),
+    do: retirement_session_or_owner(txn, principal, owner_user_id)
+
+  defp retirement_session_or_owner(txn, session_key, owner_user_id) do
+    case Txn.q(txn, "SELECT sessionKey FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[^session_key]] -> {nil, session_key}
+      [] -> {owner_user_id, nil}
+    end
   end
 
   @doc "Count open assignments pinned to a holder session."
@@ -1326,13 +1364,15 @@ defmodule Tightbeam.Assignments do
                 error
             end
 
-          if is_map(result) and not Map.has_key?(result, :code),
-            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+          if is_map(result) and not Map.has_key?(result, :code) and
+               not Map.get(result, :revocation_replayed, false),
+             do: Publisher.maybe_accepted_in_txn(txn, call, result)
 
           result
         end)
 
-      if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
+      if not Map.has_key?(result, :code) and not Map.get(result, :revocation_replayed, false) and
+           match?({_id, {:ok, _}}, from) do
         {assignment_id, {:ok, prior_state}} = from
         best_effort(fn -> notify(call, :on_assignment_change, assignment_id, prior_state) end)
       end
@@ -2133,7 +2173,8 @@ defmodule Tightbeam.Assignments do
           assignment.state != "open" ->
             with :ok <- valid_revocation_reason(call.params[:reason]) do
               if assignment.outcome == "revoked" and
-                   assignment.revocationReason == call.params[:reason] do
+                   assignment.revocationReason == call.params[:reason] and
+                   revoked_by?(assignment, call.principal) do
                 Map.put(assignment, :revocation_replayed, true)
               else
                 assignment_closed()
@@ -2264,6 +2305,9 @@ defmodule Tightbeam.Assignments do
 
   defp revoke_allowed?(_txn, {:session, session}, assignment),
     do: assignment.openedBySession == session
+
+  defp revoked_by?(assignment, {:user, user}), do: assignment.closedByUser == user
+  defp revoked_by?(assignment, {:session, session}), do: assignment.closedBySession == session
 
   defp insert_attest(txn, call, assignment_id) do
     {by_user, by_session} = opener(call.principal)

@@ -65,8 +65,19 @@ defmodule Tightbeam.AssignmentsTest do
 
     Enum.each(invalid, fn values ->
       assert {:error, %DB.Error{message: message}} = DB.query(db, base <> values)
-      assert message =~ "CHECK constraint"
+
+      assert message =~ "CHECK constraint" or
+               message =~ "revoked assignment requires revocation provenance"
     end)
+
+    assert {:error, %DB.Error{message: trigger_error}} =
+             DB.query(
+               db,
+               base <>
+                 "('a10','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,'flynn',NULL,NULL)"
+             )
+
+    assert trigger_error =~ "revoked assignment requires revocation provenance"
 
     assert {:error, %DB.Error{}} =
              DB.query(
@@ -2228,6 +2239,22 @@ defmodule Tightbeam.AssignmentsTest do
     assert replayed.id == assignment.id
     assert replayed.revocationReason == "the work moved to its replacement"
 
+    admin_revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "admin revocation"))
+
+    assert %{closedByUser: "admin"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "admin"}, admin_revoked.id)
+             )
+
+    assert %{code: "assignment_closed"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, admin_revoked.id)
+             )
+
     assert %{code: "assignment_closed"} =
              handle(
                ctx,
@@ -2250,6 +2277,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   test "legacy revoked assignments migrate only to the explicit unknown sentinel", ctx do
     :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required_insert")
 
     assert {:ok, _} =
              DB.query(
@@ -2269,6 +2297,59 @@ defmodule Tightbeam.AssignmentsTest do
                ctx,
                "assignment-get",
                assignment_get_call({:user, "flynn"}, "asg_legacy_reason")
+             )
+  end
+
+  test "revocation replay emits no second state callback or accepted handoff", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "replay notices"))
+
+    call =
+      revoke_call({:user, "flynn"}, assignment.id)
+      |> Map.merge(%{
+        firehose_in_txn: true,
+        firehose_hub: self(),
+        on_assignment_change: fn _, _ -> send(self(), :assignment_changed) end
+      })
+
+    assert %{id: assignment_id} = handle(ctx, "revoke-assignment", call)
+    assert assignment_id == assignment.id
+    assert_receive {:"$gen_cast", {:accepted, nil, %{verb: "revoke-assignment"}, _}}
+    assert_receive :assignment_changed
+
+    assert %{id: ^assignment_id} = handle(ctx, "revoke-assignment", call)
+    refute_received {:"$gen_cast", {:accepted, nil, %{verb: "revoke-assignment"}, _}}
+    refute_received :assignment_changed
+  end
+
+  test "retirement attributes revocation provenance to the acting session", ctx do
+    caller = session(ctx.db, "agent:retirement-caller", "flynn")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "retirement actor"))
+
+    assert {:ok, [_]} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "flynn",
+                 caller.session_key
+               )
+             end)
+
+    assert {:ok, [[nil, "agent:retirement-caller", "holder session retired"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revokedByUser, revokedBySession, reason
+               FROM assignment_revocations WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert {:ok, [[nil, "agent:retirement-caller"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT closedByUser, closedBySession FROM assignments WHERE id=?1",
+               [assignment.id]
              )
   end
 
