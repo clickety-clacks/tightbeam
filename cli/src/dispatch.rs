@@ -2760,6 +2760,29 @@ mod tests {
             ),
             (
                 &[
+                    "topline-work-leave-unlinked",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-work-leave-unlinked","params":{"workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-placement-list",
+                    "--state",
+                    "resolved",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-placement-list","params":{"state":"resolved"}}"#,
+            ),
+            (
+                &[
                     "topline-create",
                     "--title",
                     "Ship",

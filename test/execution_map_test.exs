@@ -957,7 +957,7 @@ defmodule Tightbeam.ExecutionMapTest do
     end
 
     for verb <-
-          ~w(toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-update topline-concern-resolve topline-concern-reopen topline-concern-link-work topline-concern-unlink-work) do
+          ~w(toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-update topline-concern-resolve topline-concern-reopen topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list) do
       response =
         post_dispatch(opts, %{verb: verb, asUser: "flynn", sessionKey: "s_real", params: %{}})
 

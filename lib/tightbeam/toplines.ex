@@ -1042,23 +1042,22 @@ defmodule Tightbeam.Toplines do
             :new ->
               now = mutation_time(call)
 
-              placement =
-                resolve_placement_in_txn(txn, %{
-                  work_item_id: work_item_id,
-                  state: "resolved",
-                  actor_kind: caller.actor_kind,
-                  actor_ref: caller.actor_ref,
-                  reason: reason,
-                  at: now
-                })
+              case resolve_placement_in_txn(txn, %{
+                     work_item_id: work_item_id,
+                     state: "left_unlinked",
+                     actor_kind: caller.actor_kind,
+                     actor_ref: caller.actor_ref,
+                     reason: reason,
+                     at: now
+                   }) do
+                nil ->
+                  error("placement_not_pending", "placement is not pending")
 
-              if is_nil(placement),
-                do: error("placement_not_pending", "placement is not pending"),
-                else: :ok
-
-              response = %{placement: placement}
-              remember(txn, caller.user, operation, key, fingerprint, response)
-              response
+                placement ->
+                  response = %{placement: placement}
+                  remember(txn, caller.user, operation, key, fingerprint, response)
+                  response
+              end
           end
         end
       end)
@@ -1076,8 +1075,15 @@ defmodule Tightbeam.Toplines do
 
         {state_sql, state_params} =
           case state do
-            "all" -> {"", []}
-            value -> {" AND p.state = ?#{length(owner_params) + 1}", [value]}
+            "all" ->
+              {"", []}
+
+            "pending" ->
+              {" AND p.state = ?#{length(owner_params) + 1}", ["pending"]}
+
+            "resolved" ->
+              {" AND p.state IN (?#{length(owner_params) + 1}, ?#{length(owner_params) + 2}, ?#{length(owner_params) + 3})",
+               ["linked", "left_unlinked", "work_terminal"]}
           end
 
         ids =
