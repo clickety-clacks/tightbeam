@@ -3,6 +3,8 @@ defmodule Tightbeam.CliIntegrationTest do
   alias Tightbeam.Model
 
   @moduletag :cli_integration
+  @i68_url "https://github.com/clickety-clacks/tightbeam/releases/download/v0.1.8%2B1334/tightbeam-0.1.8-linux-x86_64-2ff4ed2.tgz"
+  @i68_sha256 "e81ddfa69069766545b7eb327c1e4559ae5f60f056291d7a3e2d5a03d201adee"
 
   alias Tightbeam.{
     Assets,
@@ -37,9 +39,6 @@ defmodule Tightbeam.CliIntegrationTest do
       raise "CLI integration binary missing: #{binary}; run cargo build --release in cli/"
     end
 
-    db = :"cli_integration_db_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: ":memory:", name: db})
-
     base_dir =
       Path.join(
         System.tmp_dir!(),
@@ -51,6 +50,9 @@ defmodule Tightbeam.CliIntegrationTest do
     File.mkdir_p!(workdir)
     File.mkdir_p!(outside)
     on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    db = :"cli_integration_db_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: Path.join(base_dir, "state.db"), name: db})
 
     # Delegate to the ONE canonical schema list. A hand-kept copy here is how
     # this test ran without one of the schema modules: three lists had to agree and
@@ -1449,55 +1451,250 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
-  test "real CLI survives router restart while the immutable previous package keeps only telemetry names",
+  test "immutable previous Gateway rolls back on one database and the candidate re-upgrades it",
        ctx do
-    {first, 0} = System.cmd(ctx.binary, ["toplines"], cd: ctx.workdir, stderr_to_stdout: true)
-    assert first =~ "toplines"
-    assert_receive {:cli_call, %{verb: "toplines"}}
-
     :ok = Supervisor.stop(ctx.bandit)
 
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {Router, ctx.router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-
-    File.write!(
-      Path.join(ctx.base_dir, "work/session/.tightbeam-session"),
-      JSON.encode!(%{
-        url: "http://127.0.0.1:#{port}",
-        token: ctx.session.cli_token,
-        sessionKey: ctx.session.session_key
-      })
-    )
-
-    {second, 0} = System.cmd(ctx.binary, ["toplines"], cd: ctx.workdir, stderr_to_stdout: true)
-    assert second =~ "toplines"
-    assert_receive {:cli_call, %{verb: "toplines"}}
-
-    archive =
-      "/home/mike/.tightbeam/work/f8899f5cc784/toplines-i68-019-fixture/tightbeam-0.1.8-linux-x86_64-2ff4ed2.tgz"
-
+    archive = i68_previous_package!(ctx)
     previous = Path.join(ctx.base_dir, "previous")
     File.mkdir_p!(previous)
     {_, 0} = System.cmd("tar", ["-xzf", archive, "-C", previous], stderr_to_stdout: true)
+
+    rollback_base = Path.join(ctx.base_dir, "i68-rollback")
+    File.mkdir_p!(rollback_base)
+    provision_i68_adapter_stubs!(rollback_base)
     old_cli = Path.join(previous, "tightbeam/bin/tightbeam")
-    env = [{"TIGHTBEAM_URL", "http://127.0.0.1:9"}, {"TIGHTBEAM_TOKEN", "synthetic"}]
+    old_gateway = Path.join(previous, "tightbeam/bin/tightbeam-gateway")
+    old_port = unused_port!()
+    old_node = "lane2_i68_#{old_port}"
+
+    old_gateway_port = start_previous_gateway!(old_gateway, rollback_base, old_port, old_node)
+
+    on_exit(fn ->
+      stop_previous_gateway(old_gateway, rollback_base, old_port, old_node, old_gateway_port)
+    end)
+
+    assert %{"version" => "0.1.8"} = get_json!("http://127.0.0.1:#{old_port}/version")
+
+    old_env = [
+      {"TIGHTBEAM_URL", "http://127.0.0.1:#{old_port}"},
+      {"TIGHTBEAM_TOKEN", "i68-untrusted-token"}
+    ]
 
     {old, old_status} =
-      System.cmd(old_cli, ["toplines", "--tree", "--as-user", "flynn"],
-        env: env,
+      System.cmd(old_cli, ["toplines", "--tree"],
+        cd: ctx.outside,
+        env: old_env,
         stderr_to_stdout: true
       )
 
     assert old_status != 0
     refute old =~ "unknown command"
 
+    stop_previous_gateway(old_gateway, rollback_base, old_port, old_node, old_gateway_port)
+
+    candidate_db = :"cli_i68_upgrade_db_#{System.unique_integer([:positive])}"
+
+    start_supervised!({DB, path: Path.join(rollback_base, "state.db"), name: candidate_db},
+      id: candidate_db
+    )
+
+    :ok = Tightbeam.Schema.ensure_all(candidate_db)
+
+    {:ok, _} =
+      DB.query(
+        candidate_db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('i68-flynn', 1, 1)"
+      )
+
+    candidate_session =
+      Org.create(candidate_db, %{
+        session_key: "i68-holder",
+        display_name: "I68 Holder",
+        owner_user_id: "i68-flynn",
+        origin: "user:i68-flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    Roles.create!(candidate_db, "i68-holder", "i68-flynn", candidate_session.session_key)
+
+    candidate_handlers =
+      Gateway.handlers(%{db: candidate_db, base_dir: rollback_base, cwd: rollback_base})
+
+    Rules.load!(rollback_base, Map.keys(candidate_handlers))
+
+    candidate_opts =
+      Router.init(
+        db: candidate_db,
+        base_dir: rollback_base,
+        handlers: candidate_handlers,
+        cli_token: "tbc_cli_integration",
+        session_status: fn _session_key -> :active end
+      )
+
+    candidate_bandit =
+      start_supervised!(
+        {Bandit, plug: {Router, candidate_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+      )
+
+    {:ok, {_address, candidate_port}} = ThousandIsland.listener_info(candidate_bandit)
+    assert %{"version" => version} = get_json!("http://127.0.0.1:#{candidate_port}/version")
+    refute version == "0.1.8"
+
+    write_cli_session!(ctx.outside, candidate_port, candidate_session)
+
+    {upgrade, 0} =
+      System.cmd(ctx.binary, ["execution-map", "--tree"],
+        cd: ctx.outside,
+        stderr_to_stdout: true
+      )
+
+    assert upgrade =~ "\"roots\""
+
+    :ok = Supervisor.stop(candidate_bandit)
+
+    restarted_bandit =
+      start_supervised!(
+        {Bandit, plug: {Router, candidate_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+      )
+
+    {:ok, {_address, restarted_port}} = ThousandIsland.listener_info(restarted_bandit)
+    assert %{"version" => ^version} = get_json!("http://127.0.0.1:#{restarted_port}/version")
+
+    write_cli_session!(ctx.outside, restarted_port, candidate_session)
+
+    {restarted, 0} =
+      System.cmd(ctx.binary, ["execution-map", "--tree"],
+        cd: ctx.outside,
+        stderr_to_stdout: true
+      )
+
+    assert restarted =~ "\"roots\""
+
     {new, 1} =
-      System.cmd(ctx.binary, ["toplines", "--tree"], cd: ctx.workdir, stderr_to_stdout: true)
+      System.cmd(ctx.binary, ["toplines", "--tree"],
+        cd: ctx.outside,
+        stderr_to_stdout: true
+      )
 
     assert new =~ "does not accept --tree"
+  end
+
+  defp i68_previous_package!(ctx) do
+    archive = Path.join(ctx.base_dir, "i68-previous-package.tgz")
+
+    case System.get_env("TIGHTBEAM_I68_PREVIOUS_PACKAGE") do
+      nil ->
+        {_, 0} =
+          System.cmd("curl", ["--fail", "--location", "--output", archive, @i68_url],
+            stderr_to_stdout: true
+          )
+
+      cached ->
+        File.cp!(cached, archive)
+    end
+
+    assert Base.encode16(:crypto.hash(:sha256, File.read!(archive)), case: :lower) == @i68_sha256,
+           "I68 Previous-package digest mismatch"
+
+    archive
+  end
+
+  defp write_cli_session!(dir, port, session) do
+    File.write!(
+      Path.join(dir, ".tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{port}",
+        token: session.cli_token,
+        sessionKey: session.session_key
+      })
+    )
+  end
+
+  defp provision_i68_adapter_stubs!(base_dir) do
+    for binary <- ["claude-agent-acp", "codex-acp"] do
+      path = Path.join([base_dir, "adapters", "node_modules", ".bin", binary])
+      File.mkdir_p!(Path.dirname(path))
+      File.write!(path, "#!/bin/sh\nexit 0\n")
+      File.chmod!(path, 0o755)
+    end
+  end
+
+  defp unused_port! do
+    {:ok, socket} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}])
+    {:ok, port} = :inet.port(socket)
+    :ok = :gen_tcp.close(socket)
+    port
+  end
+
+  defp start_previous_gateway!(launcher, base_dir, port, node) do
+    env = System.find_executable("env") || raise "env executable is required for I68 gateway test"
+
+    Port.open(
+      {:spawn_executable, env},
+      [
+        :binary,
+        :exit_status,
+        {:args,
+         [
+           "-u",
+           "RELEASE_NODE",
+           "TIGHTBEAM_BASE_DIR=#{base_dir}",
+           "TIGHTBEAM_PORT=#{port}",
+           "TIGHTBEAM_NODE=#{node}",
+           launcher
+         ]}
+      ]
+    )
+  end
+
+  defp stop_previous_gateway(launcher, base_dir, port, node, gateway_port) do
+    env = System.find_executable("env") || raise "env executable is required for I68 gateway test"
+
+    _ =
+      System.cmd(
+        env,
+        [
+          "-u",
+          "RELEASE_NODE",
+          "TIGHTBEAM_BASE_DIR=#{base_dir}",
+          "TIGHTBEAM_PORT=#{port}",
+          "TIGHTBEAM_NODE=#{node}",
+          launcher,
+          "stop"
+        ],
+        stderr_to_stdout: true
+      )
+
+    case Port.info(gateway_port, :os_pid) do
+      {:os_pid, os_pid} ->
+        _ = System.cmd("kill", ["-TERM", Integer.to_string(os_pid)], stderr_to_stdout: true)
+
+      nil ->
+        :ok
+    end
+
+    if Port.info(gateway_port), do: Port.close(gateway_port)
+    :ok
+  end
+
+  defp get_json!(url, attempts \\ 60)
+
+  defp get_json!(url, attempts) do
+    case :httpc.request(:get, {String.to_charlist(url), []}, [], []) do
+      {:ok, {{_version, 200, _reason}, _headers, body}} ->
+        JSON.decode!(to_string(body))
+
+      _ when attempts > 1 ->
+        Process.sleep(100)
+        get_json!(url, attempts - 1)
+
+      response ->
+        flunk("Gateway did not become ready at #{url}: #{inspect(response)}")
+    end
   end
 end
