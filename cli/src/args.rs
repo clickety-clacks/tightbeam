@@ -5092,14 +5092,20 @@ mod tests {
 
     #[test]
     fn breathing_accepts_only_the_closed_target_surface() {
-        assert!(matches!(
-            parse(strings(&["breathing", "work-item", "wi_1", "--as-user", "owner"])),
-            Ok(Command::Breathing {
-                identity: Identity::User(user),
-                target_kind,
-                target_id,
-            }) if user == "owner" && target_kind == "work-item" && target_id == "wi_1"
-        ));
+        for (kind, id) in [
+            ("session", "session_1"),
+            ("assignment", "asg_1"),
+            ("work-item", "wi_1"),
+        ] {
+            assert!(matches!(
+                parse(strings(&["breathing", kind, id, "--as-user", "owner"])),
+                Ok(Command::Breathing {
+                    identity: Identity::User(user),
+                    target_kind,
+                    target_id,
+                }) if user == "owner" && target_kind == kind && target_id == id
+            ));
+        }
 
         for args in [
             strings(&["breathing", "turn", "tr_1", "--as-user", "owner"]),
