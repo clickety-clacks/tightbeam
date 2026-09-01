@@ -1,6 +1,6 @@
 ---
 name: reviewing-code
-description: The independent code-review loop — build your own model, break the integrated result, reproduce findings, file the verdict, then close your own assignment. Use when reviewing a coding goal.
+description: The independent code-review loop — build your own model, break the integrated result, reproduce findings, and keep one review card through revision to a clean verdict. Use when reviewing a coding goal.
 ---
 
 # Reviewing code
@@ -53,12 +53,9 @@ as a fact, not a claim.
 8b. After filing the verdict, wake the reviewed assignment's holder with it:
    `tightbeam wake --session <holder> --prompt "review verdict on <assignmentId>: <verdict>"`.
    The party that must act next is the producer; do not file and go silent.
-8c. The verdict is the deliverable; completion closes YOUR obligation — they are two
-   different rows and both are yours to file. After the verdict and the wake, file
-   `tightbeam attest <yourReviewingAssignmentId> --kind completion --note "verdict filed:
-   <verdict>"` on the REVIEWING assignment you hold. A hirer's brief never overrides
-   this: "the verdict is the deliverable" and "file completion when your obligation
-   ends" are both true, and the lifecycle row is what the substrate's hygiene sweep
-   reads.
+8c. Keep this reviewing assignment open after `changes-requested`. The producer revises,
+   and you review the new candidate and file the next verdict on this same linked card.
+   After `reviewed-clean` and the wake, file completion on the reviewing assignment.
+   One change has one review card; revision never creates, closes, or reopens another.
 9. Judge the work, not the author. Accept a producer's rejection of a finding only with
    evidence; re-reproduce contested findings before conceding them.

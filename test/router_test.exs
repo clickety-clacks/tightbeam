@@ -217,8 +217,8 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert JSON.decode!(response.resp_body) == %{
              "error" => %{
-               "code" => "invalid_identity",
-               "message" => "asserted user does not exist"
+               "code" => "forbidden",
+               "message" => "admin required"
              }
            }
 
