@@ -478,6 +478,30 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     refute StateResources.item_shape_superset?("work-items", additive["payload"])
     assert_raise ArgumentError, fn -> Publisher.encode_wire_notice(additive) end
 
+    assert_raise ArgumentError, ~r/no permitted legacy partial shape/, fn ->
+      Publisher.encode_wire_notice(%{
+        "class" => "message.created",
+        "op" => "upsert",
+        "payload" => %{
+          "id" => "s_legacy",
+          "seq" => 1,
+          "sessionKey" => "agent:legacy",
+          "role" => "assistant",
+          "content" => "legacy",
+          "timestamp" => 1,
+          "sender" => "tightbeam",
+          "deviceId" => nil,
+          "clientMessageId" => nil,
+          "replyToMessageId" => nil,
+          "replyToClientMessageId" => nil,
+          "llmVisibleMessageId" => "s_legacy",
+          "attachments" => [],
+          "attentionTier" => 0,
+          "rowVersion" => 1
+        }
+      })
+    end
+
     for {class, payload} <- [
           {"config.updated", %{"key" => "default-priority", "value" => "private-priority"}},
           {"host_env.updated",
