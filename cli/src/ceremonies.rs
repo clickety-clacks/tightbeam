@@ -6,7 +6,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
+use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1029,7 +1029,14 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
     let mut emitted = false;
     let mut buffer = Vec::<u8>::new();
 
-    let outcome = supervise_teed(command, ceremony, &mut emitted, &mut buffer);
+    let outcome = supervise_teed(
+        command,
+        "codex device-code login",
+        None,
+        ceremony,
+        &mut emitted,
+        &mut buffer,
+    );
 
     // Miss path: codex produced a sign-in block we could not parse (a format drift), and it
     // was not an operator cancel. Record the raw teed tail so the deliverable is never
@@ -1063,11 +1070,14 @@ fn run_openai_onboarding(staging: &str, ceremony: &Ceremony<'_>) -> Result<(), S
 /// `/bin/sh` stub that replays a real device-auth capture.
 fn supervise_teed(
     mut command: ProcessCommand,
+    what: &str,
+    stdin: Option<&[u8]>,
     ceremony: &Ceremony<'_>,
     emitted: &mut bool,
     buffer: &mut Vec<u8>,
 ) -> Result<ExitStatus, RunError> {
     command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == -1 {
@@ -1077,12 +1087,9 @@ fn supervise_teed(
         });
     }
 
-    supervise(
-        command,
-        "codex device-code login",
-        ceremony.deadline,
-        |supervised| attend_teed(supervised, ceremony, emitted, buffer),
-    )
+    supervise(command, what, ceremony.deadline, |supervised| {
+        attend_teed(supervised, stdin, ceremony, emitted, buffer)
+    })
     .map(|(_, status)| status)
 }
 
@@ -1093,6 +1100,7 @@ fn supervise_teed(
 /// stdin secret is delivered; codex reads none for device-auth.
 fn attend_teed(
     supervised: &mut Supervised,
+    stdin: Option<&[u8]>,
     ceremony: &Ceremony<'_>,
     emitted: &mut bool,
     buffer: &mut Vec<u8>,
@@ -1108,16 +1116,27 @@ fn attend_teed(
         libc::killpg(pgid, libc::SIGCONT);
     }
 
+    if let Some(bytes) = stdin {
+        deliver(supervised, bytes)?;
+    }
+
     // Take the piped stdout and make it non-blocking, so draining it never wedges the loop
     // that also has to notice the lease expiring. A child whose stdout cannot be made
     // non-blocking is left to the loop (it just gets no passthrough), not failed.
     let mut piped = supervised.child().stdout.take();
+    let mut piped_err = supervised.child().stderr.take();
     if let Some(out) = piped.as_ref() {
+        let _ = nonblocking(out.as_raw_fd());
+    }
+    if let Some(out) = piped_err.as_ref() {
         let _ = nonblocking(out.as_raw_fd());
     }
 
     loop {
         if let Some(out) = piped.as_mut() {
+            tee_pump(out, ceremony, emitted, buffer);
+        }
+        if let Some(out) = piped_err.as_mut() {
             tee_pump(out, ceremony, emitted, buffer);
         }
 
@@ -1131,6 +1150,9 @@ fn attend_teed(
             // A last drain: the bytes that carried the code may have landed between the final
             // pump and the exit.
             if let Some(out) = piped.as_mut() {
+                tee_pump(out, ceremony, emitted, buffer);
+            }
+            if let Some(out) = piped_err.as_mut() {
                 tee_pump(out, ceremony, emitted, buffer);
             }
             return Ok(());
@@ -1148,7 +1170,7 @@ fn attend_teed(
 /// real stdout for passthrough, buffer it, and on the FIRST pass where the URL+code parse out,
 /// emit the delivery. Returns when the pipe would block, is exhausted, or ends.
 fn tee_pump(
-    out: &mut ChildStdout,
+    out: &mut impl Read,
     ceremony: &Ceremony<'_>,
     emitted: &mut bool,
     buffer: &mut Vec<u8>,
@@ -1183,6 +1205,55 @@ fn tee_pump(
             Err(_) => break,
         }
     }
+}
+
+/// Run GitHub CLI's browser/device ceremony through the same bounded first-class
+/// tee used by model-provider device onboarding. The one explicit `Y\n` answer
+/// accepts credential-helper configuration; no ambient terminal input remains.
+pub(crate) fn run_github_device_login(
+    mut command: ProcessCommand,
+    identity: &Identity,
+    endpoint: &Endpoint,
+    machine: &str,
+    owner_user_id: Option<String>,
+) -> Result<ExitStatus, String> {
+    let load_harnesses = |_endpoint: &Endpoint, _deadline: Instant| Ok(None);
+    let send = |endpoint: &Endpoint, request: &RequestSpec, deadline: Option<Instant>| {
+        dispatch::send_to_with_deadline(endpoint, request, deadline)
+    };
+    let ceremony = Ceremony {
+        endpoint,
+        deadline: Instant::now() + Duration::from_secs(15 * 60),
+        load_harnesses: &load_harnesses,
+        identity,
+        send: &send,
+        provider: "github",
+        machine: Some(machine),
+        owner_user_id,
+    };
+    command.stdin(Stdio::piped());
+    let mut emitted = false;
+    let mut buffer = Vec::new();
+    let outcome = supervise_teed(
+        command,
+        "GitHub device login",
+        Some(b"Y\n"),
+        &ceremony,
+        &mut emitted,
+        &mut buffer,
+    );
+    let interrupted = matches!(&outcome, Err(error) if error.is_interrupted());
+    if !emitted && !interrupted && !buffer.is_empty() {
+        let tail = onboard_emit::raw_tail(&String::from_utf8_lossy(&buffer), 4096);
+        if !tail.is_empty() {
+            emit_delivery(
+                &ceremony,
+                &Deliverable::RawTail { tail },
+                Some(Duration::from_secs(15 * 60)),
+            );
+        }
+    }
+    outcome.map_err(|error| error.to_string())
 }
 
 /// The subscription ceremony: `claude setup-token` under a pty, the token read off the
@@ -2754,7 +2825,15 @@ mod tests {
 
         let mut emitted = false;
         let mut buffer = Vec::<u8>::new();
-        let status = supervise_teed(command, &ceremony, &mut emitted, &mut buffer).unwrap();
+        let status = supervise_teed(
+            command,
+            "fixture device login",
+            None,
+            &ceremony,
+            &mut emitted,
+            &mut buffer,
+        )
+        .unwrap();
 
         // Clean up before any assertion can unwind and leak the crate-dir artifact.
         for path in openai_delivery_files(&cwd).difference(&before) {
@@ -2780,6 +2859,85 @@ mod tests {
         assert!(
             body.contains("auth.openai.com/codex/device"),
             "url missing from wake: {body}"
+        );
+    }
+
+    #[test]
+    fn github_device_drive_sends_only_yes_and_tees_both_provider_streams() {
+        let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        let before = fs::read_dir(&cwd)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("onboard-delivery-github-"))
+            })
+            .collect::<std::collections::HashSet<_>>();
+
+        let mut command = ProcessCommand::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "IFS= read -r answer; test \"$answer\" = Y || exit 7; printf 'First copy your one-time code: GH12-AB34\\n' >&2; printf 'Open https://github.example/login/device to continue\\n'; exit 0",
+            ])
+            .stdin(Stdio::piped());
+
+        let endpoint = Endpoint {
+            base: "http://gateway.test".to_owned(),
+            token: "tbc_test".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::cell::RefCell::new(Vec::<String>::new());
+        let send = |_: &Endpoint, request: &RequestSpec, _: Option<Instant>| {
+            sent.borrow_mut().push(request.body_json.clone());
+            Ok(Some(serde_json::json!({ "wakeId": "w_github" })))
+        };
+        let ceremony = Ceremony {
+            endpoint: &endpoint,
+            deadline: Instant::now() + Duration::from_secs(5),
+            load_harnesses: &|_, _| Ok(None),
+            identity: &Identity::User("mike".to_owned()),
+            send: &send,
+            provider: "github",
+            machine: Some("fixture-host"),
+            owner_user_id: Some("mike".to_owned()),
+        };
+        let mut emitted = false;
+        let mut buffer = Vec::new();
+        let status = supervise_teed(
+            command,
+            "GitHub device fixture",
+            Some(b"Y\n"),
+            &ceremony,
+            &mut emitted,
+            &mut buffer,
+        )
+        .unwrap();
+
+        let after = fs::read_dir(&cwd)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("onboard-delivery-github-"))
+            })
+            .collect::<std::collections::HashSet<_>>();
+        for path in after.difference(&before) {
+            let _ = fs::remove_file(path);
+        }
+
+        assert!(status.success());
+        assert!(emitted);
+        let body = sent.into_inner().join("\n");
+        assert!(body.contains("GH12-AB34"), "{body}");
+        assert!(
+            body.contains("https://github.example/login/device"),
+            "{body}"
         );
     }
 
@@ -2951,7 +3109,15 @@ mod tests {
         let mut emitted = false;
         let mut buffer = Vec::<u8>::new();
         let started = Instant::now();
-        let error = supervise_teed(command, &ceremony, &mut emitted, &mut buffer).unwrap_err();
+        let error = supervise_teed(
+            command,
+            "fixture device login",
+            None,
+            &ceremony,
+            &mut emitted,
+            &mut buffer,
+        )
+        .unwrap_err();
 
         assert!(
             error.to_string().contains("onboarding lease expired"),

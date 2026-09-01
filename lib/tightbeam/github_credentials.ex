@@ -166,6 +166,7 @@ defmodule Tightbeam.GithubCredentials do
 
     with {:home, {:ok, home_stat}} <- {:home, File.lstat(home)},
          :ok <- private_directory(home_stat, "credential home"),
+         :ok <- private_credential_ancestors(home),
          {:hosts, {:ok, hosts_stat}} <- {:hosts, File.lstat(hosts)},
          :ok <- private_regular_file(hosts_stat) do
       :valid
@@ -176,6 +177,24 @@ defmodule Tightbeam.GithubCredentials do
       {:hosts, {:error, reason}} -> {:hollow, "hosts_yml_lstat_#{reason}"}
       {:error, cause} -> {:hollow, cause}
     end
+  end
+
+  defp private_credential_ancestors(home) do
+    home
+    |> Stream.iterate(&Path.dirname/1)
+    |> Enum.take(4)
+    |> Enum.reduce_while(:ok, fn directory, :ok ->
+      case File.lstat(directory) do
+        {:ok, stat} ->
+          case private_directory(stat, "credential home ancestor") do
+            :ok -> {:cont, :ok}
+            {:error, cause} -> {:halt, {:error, cause}}
+          end
+
+        {:error, reason} ->
+          {:halt, {:error, "credential_home_ancestor_lstat_#{reason}"}}
+      end
+    end)
   end
 
   @doc "Return the machine-wide configured-hostname recognition index."

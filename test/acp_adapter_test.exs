@@ -435,6 +435,12 @@ defmodule Tightbeam.Acp.AdapterTest do
         end
       end)
       |> then(fn adapter_opts ->
+        case Keyword.fetch(opts, :gate_failure) do
+          {:ok, failure} -> Keyword.put(adapter_opts, :gate_failure, failure)
+          :error -> adapter_opts
+        end
+      end)
+      |> then(fn adapter_opts ->
         case Keyword.get(opts, :on_ready) do
           nil -> adapter_opts
           ready -> Keyword.put(adapter_opts, :on_ready, ready)
@@ -2089,6 +2095,18 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert log =~ "[gate-drift] raw_updates="
     assert log =~ ~s("sessionUpdate":"drifted_shape")
     assert byte_size(log) < 5_000
+  end
+
+  test "a GitHub compiled-law wiring failure refuses readiness by its exact name" do
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        gate_mode: "drift",
+        gate_failure: :"github-rule-unarmed"
+      )
+
+    monitor = Process.monitor(adapter)
+    assert assert_down(adapter, monitor) == {:"github-rule-unarmed", :no_marker}
   end
 
   test "gate log is omitted without real stderr and honors an explicit path" do

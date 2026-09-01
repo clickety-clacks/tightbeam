@@ -58,32 +58,21 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
         };
     }
 
-    let status = gh.output(&["auth", "status", "--active", "--hostname", hostname]);
-    if let Ok(output) = status {
-        if !output.status.success() {
+    let auth_active = match gh.output(&["auth", "status", "--active", "--hostname", hostname]) {
+        Ok(output) => output.status.success(),
+        Err(error) => {
             return GithubStatus {
                 hostname: hostname.to_owned(),
-                state: GithubState::NeedsOnboarding,
+                state: GithubState::Unknown,
                 failed_phase: "gh auth status",
                 account: None,
                 git_protocol: None,
                 git_remote: None,
                 git_ready: None,
-                detail: Scrubbed::new(stderr_or_stdout(&output)),
+                detail: Scrubbed::new(error),
             };
         }
-    } else if let Err(error) = status {
-        return GithubStatus {
-            hostname: hostname.to_owned(),
-            state: GithubState::Unknown,
-            failed_phase: "gh auth status",
-            account: None,
-            git_protocol: None,
-            git_remote: None,
-            git_ready: None,
-            detail: Scrubbed::new(error),
-        };
-    }
+    };
 
     let account = gh.output(&[
         "api",
@@ -95,7 +84,7 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
         ".login",
     ]);
     match account {
-        Ok(output) if output.status.success() => {
+        Ok(output) if output.status.success() && auth_active => {
             let account = String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .rev()
@@ -114,6 +103,16 @@ pub(super) fn probe_with(hostname: &str, gh: &impl Gh) -> GithubStatus {
                 detail: Scrubbed::new("gh api authenticated successfully"),
             }
         }
+        Ok(output) if output.status.success() => GithubStatus {
+            hostname: hostname.to_owned(),
+            state: GithubState::Unknown,
+            failed_phase: "provider disagreement",
+            account: None,
+            git_protocol: git_protocol(gh, hostname),
+            git_remote: None,
+            git_ready: None,
+            detail: Scrubbed::new("gh api returned 200 but gh auth status was not active"),
+        },
         Ok(output) => {
             let detail = stderr_or_stdout(&output);
             GithubStatus {
@@ -171,6 +170,7 @@ pub(super) fn probe_git_remote(status: &GithubStatus, remote: &str, gh: &impl Gh
     }
 }
 
+#[cfg(test)]
 pub(super) fn check_github_ready(
     hostname: &str,
     remote: Option<&str>,
@@ -190,11 +190,13 @@ pub(super) fn check_github_ready(
     Ok(())
 }
 
+#[cfg(test)]
 fn github_refusal(hostname: &str, remote: Option<&str>, status: &GithubStatus) -> String {
     let host = projected_host_label();
     github_refusal_for(&host, hostname, remote, status)
 }
 
+#[cfg(test)]
 fn github_refusal_for(
     host: &str,
     hostname: &str,
@@ -217,6 +219,7 @@ fn github_refusal_for(
     )
 }
 
+#[cfg(test)]
 fn projected_host_label() -> String {
     ["TIGHTBEAM_MACHINE", "TIGHTBEAM_LOCAL_HOST_NAME"]
         .iter()
@@ -346,6 +349,61 @@ mod tests {
         assert_eq!(status.state, GithubState::Live);
         assert_eq!(status.account.as_deref(), Some("octo"));
         assert_eq!(status.git_protocol.as_deref(), Some("https"));
+    }
+
+    #[test]
+    fn api_status_is_authoritative_after_inactive_auth_status() {
+        let disagreement = FakeGh::new(true)
+            .output(
+                &["auth", "status", "--active", "--hostname", "github.com"],
+                out(1, "", "not active"),
+            )
+            .output(
+                &[
+                    "api",
+                    "--hostname",
+                    "github.com",
+                    "-i",
+                    "user",
+                    "--jq",
+                    ".login",
+                ],
+                out(0, "octo\n", "HTTP/2 200"),
+            )
+            .output(
+                &["config", "get", "git_protocol", "--host", "github.com"],
+                out(0, "https\n", ""),
+            );
+        assert_eq!(
+            probe_with("github.com", &disagreement).state,
+            GithubState::Unknown
+        );
+
+        let expired = FakeGh::new(true)
+            .output(
+                &["auth", "status", "--active", "--hostname", "github.com"],
+                out(1, "", "not active"),
+            )
+            .output(
+                &[
+                    "api",
+                    "--hostname",
+                    "github.com",
+                    "-i",
+                    "user",
+                    "--jq",
+                    ".login",
+                ],
+                out(1, "", "HTTP/2 401 unauthorized"),
+            )
+            .output(
+                &["config", "get", "git_protocol", "--host", "github.com"],
+                out(0, "https\n", ""),
+            );
+        assert_eq!(
+            probe_with("github.com", &expired).state,
+            GithubState::Expired
+        );
     }
 
     #[test]

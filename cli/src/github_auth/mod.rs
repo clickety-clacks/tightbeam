@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -76,6 +75,22 @@ pub fn onboard(
     let base_dir = PathBuf::from(
         required_string(&context, "baseDir").or_else(|_| required_string(&context, "base_dir"))?,
     );
+    let owner_user_id = context
+        .get("ownerUserId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|owner| !owner.is_empty())
+        .map(str::to_owned);
+    let binding = context.get("binding").filter(|value| !value.is_null());
+    let prior_state = binding
+        .and_then(|value| value.get("state"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("needs_onboarding")
+        .to_owned();
+    let prior_account = binding
+        .and_then(|value| value.get("account"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let operation_class = if replace { "rotation" } else { "onboarding" };
     if base_dir != crate::base_dir::resolve() {
         return Err("GitHub credential base directory does not match this host".to_owned());
     }
@@ -92,6 +107,25 @@ pub fn onboard(
             if current.state == GithubState::Live
                 && account.is_none_or(|expected| current.account.as_deref() == Some(expected))
             {
+                credential_dispatch(
+                    endpoint,
+                    identity,
+                    serde_json::json!({
+                        "provider":"github", "phase":"begin", "attempt":operation_class,
+                        "machine":machine, "profile":profile, "hostname":hostname,
+                    }),
+                )?;
+                finish_outcome(
+                    endpoint,
+                    identity,
+                    &machine,
+                    profile,
+                    &hostname,
+                    current.account.as_deref(),
+                    "live",
+                    operation_class,
+                    "existing_authority_reconciled",
+                )?;
                 println!(
                     "{}",
                     serde_json::json!({"status":"live","machine":machine,"profile":profile,"hostname":hostname,"account":current.account})
@@ -106,29 +140,133 @@ pub fn onboard(
         identity,
         serde_json::json!({
             "provider": "github", "phase": "begin", "machine": machine,
-            "profile": profile, "hostname": hostname,
+            "profile": profile, "hostname": hostname, "attempt": operation_class,
         }),
     )?;
 
-    let gh = RealGh::banking_into_home(&home)?;
-    let login = gh.status(&[
-        "auth",
-        "login",
-        "--hostname",
-        &hostname,
-        "--web",
-        "--git-protocol",
-        "https",
-        "--insecure-storage",
-    ])?;
+    let before_authority = authority_fingerprint(&home);
+    let gh = match RealGh::banking_into_home(&home) {
+        Ok(gh) => gh,
+        Err(error) => {
+            finish_outcome(
+                endpoint,
+                identity,
+                &machine,
+                profile,
+                &hostname,
+                prior_account.as_deref(),
+                &prior_state,
+                operation_class,
+                "credential_home_prepare_failed",
+            )?;
+            return Err(error);
+        }
+    };
+    let login = gh.login_device(
+        &[
+            "auth",
+            "login",
+            "--hostname",
+            &hostname,
+            "--web",
+            "--git-protocol",
+            "https",
+            "--insecure-storage",
+        ],
+        identity,
+        endpoint,
+        &machine,
+        owner_user_id,
+    );
+    let login = match login {
+        Ok(status) => status,
+        Err(error) => {
+            let changed = authority_fingerprint(&home) != before_authority;
+            finish_outcome(
+                endpoint,
+                identity,
+                &machine,
+                profile,
+                &hostname,
+                if changed {
+                    None
+                } else {
+                    prior_account.as_deref()
+                },
+                if changed {
+                    "present_but_unverified"
+                } else {
+                    &prior_state
+                },
+                operation_class,
+                if error.to_ascii_lowercase().contains("expired") {
+                    "device_flow_expired"
+                } else if changed {
+                    "provider_login_failed_after_write"
+                } else {
+                    "provider_login_failed_before_write"
+                },
+            )?;
+            return Err(error);
+        }
+    };
     if !login.success() {
+        let changed = authority_fingerprint(&home) != before_authority;
+        finish_outcome(
+            endpoint,
+            identity,
+            &machine,
+            profile,
+            &hostname,
+            if changed {
+                None
+            } else {
+                prior_account.as_deref()
+            },
+            if changed {
+                "present_but_unverified"
+            } else {
+                &prior_state
+            },
+            operation_class,
+            if changed {
+                "provider_login_failed_after_write"
+            } else {
+                "provider_login_failed_before_write"
+            },
+        )?;
         return Err(format!(
             "GitHub device login did not complete. Rerun tightbeam onboard github --profile {profile} --hostname {hostname} --replace"
         ));
     }
-    gh.secure_banked_files()?;
-    validate_storage(&home)
-        .map_err(|cause| format!("GitHub credential home is hollow: {cause}"))?;
+    if let Err(error) = gh.secure_banked_files() {
+        finish_outcome(
+            endpoint,
+            identity,
+            &machine,
+            profile,
+            &hostname,
+            None,
+            "present_but_unverified",
+            operation_class,
+            "banked_storage_permissions_failed",
+        )?;
+        return Err(error);
+    }
+    if let Err(cause) = validate_storage(&home) {
+        finish_outcome(
+            endpoint,
+            identity,
+            &machine,
+            profile,
+            &hostname,
+            None,
+            "present_but_unverified",
+            operation_class,
+            cause,
+        )?;
+        return Err(format!("GitHub credential home is hollow: {cause}"));
+    }
     let mut status = probe::probe_with(&hostname, &gh);
     if status.state == GithubState::Live {
         if let Some(remote) = remote {
@@ -136,40 +274,96 @@ pub fn onboard(
         }
     }
     if status.state != GithubState::Live {
+        finish_outcome(
+            endpoint,
+            identity,
+            &machine,
+            profile,
+            &hostname,
+            status.account.as_deref(),
+            "present_but_unverified",
+            operation_class,
+            "post_login_probe_failed",
+        )?;
         return Err(format!(
             "GitHub onboarding ended in {}. Rerun with --replace; do not paste a PAT into an agent.",
             status.state.as_str()
         ));
     }
     if account.is_some_and(|expected| status.account.as_deref() != Some(expected)) {
-        credential_dispatch(
+        finish_outcome(
             endpoint,
             identity,
-            serde_json::json!({
-                "provider":"github", "phase":"finish", "machine":machine,
-                "profile":profile, "hostname":hostname, "account":status.account,
-                "state":"present_but_unverified", "cause":"account_mismatch",
-            }),
+            &machine,
+            profile,
+            &hostname,
+            status.account.as_deref(),
+            "present_but_unverified",
+            operation_class,
+            "account_mismatch",
         )?;
         return Err(
             "GitHub account did not match --account; the provider home is present but unverified"
                 .to_owned(),
         );
     }
-    credential_dispatch(
+    finish_outcome(
         endpoint,
         identity,
-        serde_json::json!({
-            "provider":"github", "phase":"finish", "machine":machine,
-            "profile":profile, "hostname":hostname, "account":status.account,
-            "state":"live", "cause": if replace {"rotation_completed"} else {"onboarding_completed"},
-            "dedupeKey": format!("github-onboard:{machine}:{profile}:{hostname}:{}", status.account.as_deref().unwrap_or("none")),
-        }),
+        &machine,
+        profile,
+        &hostname,
+        status.account.as_deref(),
+        "live",
+        operation_class,
+        if replace {
+            "rotation_completed"
+        } else {
+            "onboarding_completed"
+        },
     )?;
     println!(
         "{}",
         serde_json::json!({"status":"live","machine":machine,"profile":profile,"hostname":hostname,"account":status.account})
     );
+    Ok(())
+}
+
+fn authority_fingerprint(home: &Path) -> Option<(u64, u64, u64, i64, i64, i64, i64)> {
+    let metadata = fs::symlink_metadata(home.join("hosts.yml")).ok()?;
+    Some((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_outcome(
+    endpoint: &crate::dispatch::Endpoint,
+    identity: &crate::args::Identity,
+    machine: &str,
+    profile: &str,
+    hostname: &str,
+    account: Option<&str>,
+    state: &str,
+    operation_class: &str,
+    cause: &str,
+) -> Result<(), String> {
+    credential_dispatch(
+        endpoint,
+        identity,
+        serde_json::json!({
+            "provider":"github", "phase":"finish", "machine":machine,
+            "profile":profile, "hostname":hostname, "account":account,
+            "state":state, "operationClass":operation_class, "cause":cause,
+            "dedupeKey":format!("github-{operation_class}:{machine}:{profile}:{hostname}:{}:{cause}", account.unwrap_or("none")),
+        }),
+    )?;
     Ok(())
 }
 
@@ -200,6 +394,11 @@ pub fn revoke(
         return Err("GitHub credential base directory does not match this host".to_owned());
     }
     let binding = context.get("binding").filter(|value| !value.is_null());
+    let prior_state = binding
+        .and_then(|value| value.get("state"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("needs_onboarding")
+        .to_owned();
     if binding
         .and_then(|value| value.get("state"))
         .and_then(serde_json::Value::as_str)
@@ -230,6 +429,7 @@ pub fn revoke(
         }),
     )?;
     let home = credential_home(&base_dir, &machine, profile);
+    let before_authority = authority_fingerprint(&home);
     let status = RealGh::using_home(&home).status(&[
         "auth",
         "logout",
@@ -237,8 +437,43 @@ pub fn revoke(
         &hostname,
         "--user",
         &account,
-    ])?;
+    ]);
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => {
+            finish_revocation_outcome(
+                endpoint,
+                identity,
+                &machine,
+                profile,
+                &hostname,
+                Some(&account),
+                &prior_state,
+                "provider_logout_could_not_start",
+            )?;
+            return Err(error);
+        }
+    };
     if !status.success() {
+        let changed = authority_fingerprint(&home) != before_authority;
+        finish_revocation_outcome(
+            endpoint,
+            identity,
+            &machine,
+            profile,
+            &hostname,
+            Some(&account),
+            if changed {
+                "present_but_unverified"
+            } else {
+                &prior_state
+            },
+            if changed {
+                "provider_logout_failed_after_write"
+            } else {
+                "provider_logout_failed_before_write"
+            },
+        )?;
         return Err("GitHub CLI could not remove the local login".to_owned());
     }
     credential_dispatch(
@@ -255,6 +490,30 @@ pub fn revoke(
         "{}",
         serde_json::json!({"status":"revoked","machine":machine,"profile":profile,"hostname":hostname,"account":account,"remoteGrant":"revoke separately in GitHub settings if required"})
     );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_revocation_outcome(
+    endpoint: &crate::dispatch::Endpoint,
+    identity: &crate::args::Identity,
+    machine: &str,
+    profile: &str,
+    hostname: &str,
+    account: Option<&str>,
+    state: &str,
+    cause: &str,
+) -> Result<(), String> {
+    credential_dispatch(
+        endpoint,
+        identity,
+        serde_json::json!({
+            "provider":"github", "phase":"revoke-finish", "machine":machine,
+            "profile":profile, "hostname":hostname, "account":account,
+            "state":state, "cause":cause,
+            "dedupeKey":format!("github-revocation:{machine}:{profile}:{hostname}:{}:{cause}", account.unwrap_or("none")),
+        }),
+    )?;
     Ok(())
 }
 
@@ -338,23 +597,10 @@ fn acquire_writer_lock(
 }
 
 pub fn check_tool_call_stdin() -> Result<(), String> {
-    let mut raw = String::new();
-    std::io::stdin()
-        .read_to_string(&mut raw)
-        .map_err(|error| format!("could not read tool-call JSON from stdin: {error}"))?;
-    let base_dir = crate::base_dir::resolve();
-    let machine = std::env::var("TIGHTBEAM_MACHINE")
-        .map_err(|_| "GitHub profile projection is missing TIGHTBEAM_MACHINE".to_owned())?;
-    let profile = std::env::var("TIGHTBEAM_GITHUB_PROFILE")
-        .map_err(|_| "GitHub profile is not elected by the archetype manifest".to_owned())?;
-    validate_profile(&profile)?;
-    let home = credential_home(&base_dir, &machine, &profile);
-    if std::env::var_os("GH_CONFIG_DIR").as_deref() != Some(home.as_os_str()) {
-        return Err(
-            "GitHub credential-home projection does not match the elected profile".to_owned(),
-        );
-    }
-    guard::check_tool_call_with(&raw, &RealGh::using_home(&home))
+    Err(
+        "github-auth-check is compatibility-only and cannot authorize a tool call; install the compiled github-network-auth-required rule"
+            .to_owned(),
+    )
 }
 
 pub fn credential_home(base_dir: &Path, machine: &str, profile: &str) -> PathBuf {
@@ -371,7 +617,7 @@ pub(crate) fn check_compiled_rule(
     machine: &str,
     principal: &str,
     input: &crate::dispatch_rule_check::ToolCallInputV1,
-) -> Result<i32, String> {
+) -> Result<Vec<crate::dispatch_rule_check::ToolCheckMaterialV1>, String> {
     if input.abi != 1 || input.tool != crate::dispatch_rule_check::ToolCallToolV1::Bash {
         return Err(runtime_refusal(
             machine,
@@ -410,7 +656,20 @@ pub(crate) fn check_compiled_rule(
     .map_err(|_| runtime_refusal(machine, principal, "classifier_failed"))?;
 
     match classifier {
-        guard::Classification::NotApplicable => return Ok(0),
+        guard::Classification::NotApplicable => {
+            return Ok(vec![material(
+                machine,
+                principal,
+                None,
+                None,
+                "not_applicable",
+                "not_applicable",
+                "classifier",
+                "command_not_github_network",
+                None,
+                vec![],
+            )]);
+        }
         guard::Classification::ProjectionOverride => {
             return record_and_refuse(
                 endpoint,
@@ -490,7 +749,26 @@ pub(crate) fn check_compiled_rule(
                 );
             }
 
+            let mut materials = Vec::new();
             for target in targets {
+                let _probe_lock =
+                    match acquire_probe_lock(&crate::base_dir::resolve(), machine, &profile) {
+                        Ok(lock) => lock,
+                        Err(_) => {
+                            return record_and_refuse(
+                                endpoint,
+                                identity_sha,
+                                machine,
+                                principal,
+                                Some(&profile),
+                                Some(&target.hostname),
+                                target.operation_class,
+                                "unknown",
+                                "storage",
+                                "credential_writer_active",
+                            );
+                        }
+                    };
                 let binding = github_request(
                     endpoint,
                     "/agent/github/binding",
@@ -588,7 +866,7 @@ pub(crate) fn check_compiled_rule(
                     GithubState::GitUnready => "git_remote_probe_failed",
                     GithubState::Unknown => "provider_response_unknown",
                 };
-                record_observation(
+                let observation_id = record_observation(
                     endpoint,
                     identity_sha,
                     Some(&profile),
@@ -604,11 +882,12 @@ pub(crate) fn check_compiled_rule(
                     target.remote.as_deref(),
                 )?;
                 if status.state != GithubState::Live {
-                    return Err(render_refusal(
+                    return Ok(vec![material(
                         machine,
                         principal,
                         Some(&profile),
                         Some(&target.hostname),
+                        target.operation_class,
                         state,
                         if status.state == GithubState::GitUnready {
                             "git"
@@ -616,12 +895,51 @@ pub(crate) fn check_compiled_rule(
                             "provider"
                         },
                         cause,
-                    ));
+                        Some(repair_for(Some(&profile), Some(&target.hostname))),
+                        vec![observation_id],
+                    )]);
                 }
+                materials.push(material(
+                    machine,
+                    principal,
+                    Some(&profile),
+                    Some(&target.hostname),
+                    target.operation_class,
+                    "live",
+                    "provider",
+                    cause,
+                    None,
+                    vec![observation_id],
+                ));
             }
-            Ok(0)
+            Ok(materials)
         }
     }
+}
+
+fn acquire_probe_lock(
+    base_dir: &Path,
+    machine: &str,
+    profile: &str,
+) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+
+    let path = base_dir
+        .join("credential-homes")
+        .join(machine)
+        .join("github")
+        .join(format!(".{profile}.lock"));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|_| "github_probe_lock_unavailable".to_owned())?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    if result != 0 {
+        return Err("github_credential_busy".to_owned());
+    }
+    Ok(file)
 }
 
 fn valid_profile(profile: &str) -> bool {
@@ -633,6 +951,26 @@ fn valid_profile(profile: &str) -> bool {
 }
 
 fn validate_storage(home: &Path) -> Result<(), &'static str> {
+    let mut directory = home.to_path_buf();
+    for _ in 0..4 {
+        let metadata = fs::symlink_metadata(&directory).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "credential_home_absent"
+            } else {
+                "credential_home_lstat_failed"
+            }
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err("credential_home_ancestor_not_private_directory");
+        }
+        directory = directory
+            .parent()
+            .ok_or("credential_home_ancestor_missing")?
+            .to_path_buf();
+    }
     let home_meta = fs::symlink_metadata(home).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             "credential_home_absent"
@@ -697,8 +1035,8 @@ fn record_observation(
     phase: &str,
     cause: &str,
     remote: Option<&str>,
-) -> Result<(), String> {
-    github_request(
+) -> Result<String, String> {
+    let result = github_request(
         endpoint,
         "/agent/github/observe",
         serde_json::json!({
@@ -712,8 +1050,13 @@ fn record_observation(
             "rule": "github-network-auth-required",
             "sanitizedRemote": remote,
         }),
-    )
-    .map(|_| ())
+    )?;
+    result
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "rule_runtime_failure: observation response omitted id".to_owned())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -728,8 +1071,8 @@ fn record_and_refuse(
     state: &str,
     phase: &str,
     cause: &str,
-) -> Result<i32, String> {
-    record_observation(
+) -> Result<Vec<crate::dispatch_rule_check::ToolCheckMaterialV1>, String> {
+    let observation_id = record_observation(
         endpoint,
         identity_sha,
         profile,
@@ -740,9 +1083,55 @@ fn record_and_refuse(
         cause,
         None,
     )?;
-    Err(render_refusal(
-        machine, principal, profile, hostname, state, phase, cause,
-    ))
+    Ok(vec![material(
+        machine,
+        principal,
+        profile,
+        hostname,
+        operation_class,
+        state,
+        phase,
+        cause,
+        Some(repair_for(profile, hostname)),
+        vec![observation_id],
+    )])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn material(
+    machine: &str,
+    principal: &str,
+    profile: Option<&str>,
+    hostname: Option<&str>,
+    operation_class: &str,
+    state: &str,
+    phase: &str,
+    cause: &str,
+    repair: Option<String>,
+    observation_ids: Vec<String>,
+) -> crate::dispatch_rule_check::ToolCheckMaterialV1 {
+    crate::dispatch_rule_check::ToolCheckMaterialV1 {
+        state: state.to_owned(),
+        operation_class: operation_class.to_owned(),
+        machine: machine.to_owned(),
+        profile: profile.map(str::to_owned),
+        hostname: hostname.map(str::to_owned),
+        phase: phase.to_owned(),
+        cause: cause.to_owned(),
+        principal: principal.to_owned(),
+        repair,
+        observation_ids,
+    }
+}
+
+fn repair_for(profile: Option<&str>, hostname: Option<&str>) -> String {
+    match (profile, hostname) {
+        (Some(profile), Some(hostname)) => {
+            format!("tightbeam onboard github --profile {profile} --hostname {hostname}")
+        }
+        _ => "elect provisioning.credentials.github.profile in the pinned archetype manifest"
+            .to_owned(),
+    }
 }
 
 fn render_refusal(
@@ -756,11 +1145,10 @@ fn render_refusal(
 ) -> String {
     let profile = profile.unwrap_or("none");
     let hostname = hostname.unwrap_or("none");
-    let repair = if profile == "none" {
-        "elect provisioning.credentials.github.profile in the pinned archetype manifest".to_owned()
-    } else {
-        format!("tightbeam onboard github --profile {profile} --hostname {hostname}")
-    };
+    let repair = repair_for(
+        (profile != "none").then_some(profile),
+        (hostname != "none").then_some(hostname),
+    );
     format!(
         "[gate: github-network-auth-required] state={state} machine={machine} profile={profile} hostname={hostname} phase={phase} cause={cause} principal={principal} repair={repair}"
     )
@@ -776,6 +1164,52 @@ fn runtime_refusal(machine: &str, principal: &str, cause: &str) -> String {
         "classifier",
         cause,
     )
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn fixture_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "tightbeam-github-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn storage_requires_every_credential_home_ancestor_to_be_private() {
+        let root = fixture_root("ancestor-mode");
+        let home = credential_home(&root, "fixture", "work");
+        let gh = RealGh::banking_into_home(&home).unwrap();
+        let mut hosts = std::fs::File::create(home.join("hosts.yml")).unwrap();
+        hosts.write_all(b"fixture-authority").unwrap();
+        gh.secure_banked_files().unwrap();
+        assert_eq!(validate_storage(&home), Ok(()));
+
+        let ancestor = root.join("credential-homes");
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            validate_storage(&home),
+            Err("credential_home_ancestor_not_private_directory")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn probe_lock_refuses_while_the_profile_writer_is_active() {
+        let root = fixture_root("probe-lock");
+        let writer = acquire_writer_lock(&root, "fixture", "work", "session:writer").unwrap();
+        assert!(acquire_probe_lock(&root, "fixture", "work").is_err());
+        drop(writer);
+        assert!(acquire_probe_lock(&root, "fixture", "work").is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -795,6 +1229,7 @@ mod test_support {
         git_outputs: Mutex<VecDeque<(&'static str, Output)>>,
         remote_urls: Mutex<VecDeque<(&'static str, Option<&'static str>)>>,
         submodule_urls: Mutex<VecDeque<Vec<&'static str>>>,
+        current_remotes: Mutex<VecDeque<Vec<(&'static str, &'static str, bool)>>>,
     }
 
     impl FakeGh {
@@ -806,6 +1241,7 @@ mod test_support {
                 git_outputs: Mutex::new(VecDeque::new()),
                 remote_urls: Mutex::new(VecDeque::new()),
                 submodule_urls: Mutex::new(VecDeque::new()),
+                current_remotes: Mutex::new(VecDeque::new()),
             }
         }
 
@@ -835,6 +1271,14 @@ mod test_support {
 
         pub(super) fn submodule_urls(self, urls: Vec<&'static str>) -> Self {
             self.submodule_urls.lock().unwrap().push_back(urls);
+            self
+        }
+
+        pub(super) fn current_remotes(
+            self,
+            remotes: Vec<(&'static str, &'static str, bool)>,
+        ) -> Self {
+            self.current_remotes.lock().unwrap().push_back(remotes);
             self
         }
     }
@@ -897,6 +1341,18 @@ mod test_support {
                 .unwrap_or_default()
                 .into_iter()
                 .map(str::to_owned)
+                .collect())
+        }
+
+        fn git_current_remotes(&self) -> Result<Vec<(String, String, bool)>, String> {
+            Ok(self
+                .current_remotes
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(name, url, base)| (name.to_owned(), url.to_owned(), base))
                 .collect())
         }
     }

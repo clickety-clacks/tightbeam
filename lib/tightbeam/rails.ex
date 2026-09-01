@@ -164,6 +164,19 @@ defmodule Tightbeam.Rails do
   @spec statutes?() :: boolean()
   def statutes?, do: :persistent_term.get(@persist_key, []) != []
 
+  @doc "Whether any rail or compiled tool-call rule can deny a harness action."
+  @spec enforcement?() :: boolean()
+  def enforcement?, do: statutes?() or Tightbeam.Rules.tool_call_rules() != []
+
+  @doc "Whether the GitHub compiled operation law is armed in this identity."
+  @spec github_rule?() :: boolean()
+  def github_rule? do
+    Enum.any?(
+      Tightbeam.Rules.tool_call_rules(),
+      &(&1.name == "github-network-auth-required")
+    )
+  end
+
   @doc "The compiled PreToolUse entry for the substrate-reserved codex spawn wiring-check."
   @spec probe_entry() :: map()
   def probe_entry, do: pre_tool_use_entry(@probe_statute)
@@ -295,6 +308,12 @@ defmodule Tightbeam.Rails do
   end
 
   defp tool_call_entry(rule) do
+    effects =
+      rule.check.effects
+      |> Enum.sort()
+      |> Map.new()
+      |> JSON.encode!()
+
     command =
       Enum.join(
         [
@@ -302,7 +321,9 @@ defmodule Tightbeam.Rails do
           "--rule #{rule.name}",
           "--handler #{rule.check.handler}",
           "--abi #{rule.check.abi}",
-          "--identity-sha #{rule.identity_manifest_sha}"
+          "--identity-sha #{rule.identity_manifest_sha}",
+          "--effects #{Tightbeam.Harness.Support.shell_quote(effects)}",
+          "--fallback-repair #{Tightbeam.Harness.Support.shell_quote(rule.check.fallback_repair)}"
         ],
         " "
       )

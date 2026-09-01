@@ -132,20 +132,24 @@ defmodule Tightbeam.Placement do
   """
 
   @env_name ~r/^[A-Z_][A-Z0-9_]*$/
-  @github_unset_env ~w(
-    TIGHTBEAM_GITHUB_PROFILE GH_CONFIG_DIR GH_TOKEN GITHUB_TOKEN
-    GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+  @github_token_env ~w(
+    GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
   )
 
   @doc "Return the stable, redacted adapter key for one session projection."
   @spec adapter_key(Org.session()) :: adapter_key()
   def adapter_key(session) do
     harness = Harness.parse!(session.harness).id()
-    profile = github_profile(session) || "none"
+    # A session's stamped identity revision is the immutable container for its
+    # provisioning election.  Reading the live archetype here made one active
+    # session change coordinator keys after an unrelated identity publication.
+    # Older fixture/upgrade rows without a stamp retain the live-manifest
+    # fallback until the ordinary identity-apply path stamps them.
+    projection = Map.get(session, :identity_revision) || github_profile(session) || "none"
     principal = "session:#{session.session_key}"
 
     fingerprint =
-      [Atom.to_string(harness), session.host, principal, profile]
+      [Atom.to_string(harness), session.host, principal, projection]
       |> Enum.join(<<0>>)
       |> then(&:crypto.hash(:sha256, &1))
       |> Base.encode16(case: :lower)
@@ -173,6 +177,27 @@ defmodule Tightbeam.Placement do
     case Archetypes.get(session.archetype) do
       %{provisioning: %{credentials: %{github: profile}}} -> profile
       _ -> nil
+    end
+  end
+
+  @doc false
+  def github_profile(session, base_dir) do
+    case Map.get(session, :identity_revision) do
+      revision when is_binary(revision) and revision != "" ->
+        base_dir
+        |> Tightbeam.Identity.snapshot_at!(
+          revision,
+          session.archetype,
+          Harness.parse!(session.harness).id()
+        )
+        |> Map.fetch!(:archetype)
+        |> then(fn
+          %{provisioning: %{credentials: %{github: profile}}} -> profile
+          _ -> nil
+        end)
+
+      _ ->
+        github_profile(session)
     end
   end
 
@@ -1370,7 +1395,7 @@ defmodule Tightbeam.Placement do
       if host_config.ssh do
         ["-u", "TIGHTBEAM_GITHUB_PROFILE", "-u", "GH_CONFIG_DIR"] ++
           Enum.flat_map(
-            ~w(GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN),
+            @github_token_env,
             &[
               "-u",
               &1
@@ -1399,7 +1424,8 @@ defmodule Tightbeam.Placement do
         remote_env: remote_env,
         lineage: lineage,
         rails: Rails.hook_settings(),
-        statutes: Rails.statutes?(),
+        statutes: Rails.enforcement?(),
+        github_rule: Rails.github_rule?(),
         credential_kind:
           credential_kind(config, module.credential_provider(), host, module.wire_name()),
         ensure_workdir: &ensure_workdir/4,
@@ -1411,7 +1437,10 @@ defmodule Tightbeam.Placement do
         plan
       else
         Keyword.update!(plan, :cmd, fn command ->
-          ["env" | Enum.flat_map(@github_unset_env, &["-u", &1])] ++ command
+          # The explicit profile and home live in opts[:env].  Unsetting them
+          # in the child wrapper erased the election immediately before exec.
+          # Only ambient token shortcuts are removed here.
+          ["env" | Enum.flat_map(@github_token_env, &["-u", &1])] ++ command
         end)
       end
 
@@ -1457,7 +1486,7 @@ defmodule Tightbeam.Placement do
       credential_kind:
         credential_kind(config, module.credential_provider(), host, module.wire_name()),
       projection_principal: projection && "session:#{projection.session_key}",
-      github_profile: projection && github_profile(projection)
+      github_profile: projection && github_profile(projection, config.base_dir)
     ]
   end
 

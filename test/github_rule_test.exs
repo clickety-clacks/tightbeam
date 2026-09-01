@@ -50,6 +50,8 @@ defmodule Tightbeam.GithubRuleTest do
     assert rule.check.timeout_ms == 60_000
 
     Rails.load!(ctx.base_dir)
+    assert Rails.enforcement?()
+    assert Rails.github_rule?()
 
     assert %{
              "hooks" => %{
@@ -69,9 +71,17 @@ defmodule Tightbeam.GithubRuleTest do
              }
            } = Rails.hook_settings()
 
+    effects =
+      rule.check.effects
+      |> Enum.sort()
+      |> Map.new()
+      |> JSON.encode!()
+      |> Tightbeam.Harness.Support.shell_quote()
+
     assert command ==
              "tightbeam dispatch-rule-check --rule github-network-auth-required " <>
-               "--handler github-network-auth-v1 --abi 1 --identity-sha #{rule.identity_manifest_sha}"
+               "--handler github-network-auth-v1 --abi 1 --identity-sha #{rule.identity_manifest_sha} " <>
+               "--effects #{effects} --fallback-repair 'tightbeam doctor --json'"
 
     assert observation == Rails.observation_entry()
   end

@@ -241,18 +241,19 @@ defmodule Tightbeam.SessionLane do
   defp harness_parked?(state) do
     case DB.query(
            state.db,
-           "SELECT sessionKey,harness,host,archetype FROM sessions WHERE sessionKey=?1",
+           "SELECT sessionKey,harness,host,archetype,identityRevision FROM sessions WHERE sessionKey=?1",
            [
              state.session_key
            ]
          ) do
-      {:ok, [[session_key, harness, host, archetype]]} ->
+      {:ok, [[session_key, harness, host, archetype, identity_revision]]} ->
         adapter_key =
           Tightbeam.Placement.adapter_key(%{
             session_key: session_key,
             harness: harness,
             host: host,
-            archetype: archetype
+            archetype: archetype,
+            identity_revision: identity_revision
           })
 
         HarnessProcess.parked?(state.db, adapter_key)

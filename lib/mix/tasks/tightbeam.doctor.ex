@@ -134,6 +134,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
         identity_check(base_dir),
         advertised_url_check(advertised_url),
         hosts_check(hosts, local_host_name),
+        github_legacy_residue_check(base_dir),
         github_check
       ]
       |> Enum.reject(&is_nil/1)
@@ -449,6 +450,31 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
                "Run on this host: #{repair}. Do not paste a PAT into an agent."
              ), readiness}
         end
+    end
+  end
+
+  defp github_legacy_residue_check(base_dir) do
+    case Tightbeam.GithubCredentials.inert_legacy_residue(base_dir) do
+      :absent ->
+        nil
+
+      {:present, metadata} ->
+        check(
+          "github_inert_legacy_residue",
+          false,
+          "inert_legacy_residue: legacy GitHub authority metadata remains " <>
+            "(type #{metadata.type}, mode #{Integer.to_string(metadata.mode, 8)}, size #{metadata.size}); " <>
+            "0.2.0 did not open or copy it",
+          "On the owning host, remove or revoke the legacy 0.1.9 GitHub authority with an explicit operator action after the new elected profile is live."
+        )
+
+      {:unknown, reason} ->
+        check(
+          "github_inert_legacy_residue",
+          false,
+          "inert_legacy_residue inspection failed: #{inspect(reason)}",
+          "Repair access to the legacy metadata path, then rerun tightbeam doctor --json."
+        )
     end
   end
 

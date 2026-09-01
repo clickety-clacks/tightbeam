@@ -178,7 +178,15 @@ defmodule Tightbeam.Harness.Codex do
           ensure_opts
         )
 
-        [probe_cwd: probe_cwd, probe_model: @probe_model]
+        [
+          probe_cwd: probe_cwd,
+          probe_model: @probe_model,
+          gate_failure:
+            if(Keyword.get(opts, :github_rule),
+              do: :"github-rule-unarmed",
+              else: :gate_attestation_failed
+            )
+        ]
       else
         []
       end

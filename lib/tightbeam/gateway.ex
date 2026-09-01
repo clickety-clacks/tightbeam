@@ -4366,16 +4366,26 @@ defmodule Tightbeam.Gateway do
 
       case Map.get(params, :phase, "context") do
         "context" ->
+          owner_user_id =
+            case resolve_caller(db, call.origin) do
+              %{owner_user_id: owner} when is_binary(owner) -> owner
+              _ -> nil
+            end
+
           %{
             status: "ready",
             machine: machine,
             principal: principal,
+            owner_user_id: owner_user_id,
             base_dir: Placement.hosts(config.base_dir, db)[machine].base_dir,
             binding: Tightbeam.GithubCredentials.binding(db, machine, profile, hostname)
           }
 
         phase when phase in ["begin", "revoke-begin"] ->
-          attempt = if phase == "begin", do: "onboarding", else: "revocation"
+          attempt =
+            if phase == "begin",
+              do: Map.get(params, :attempt, "onboarding"),
+              else: "revocation"
 
           case Tightbeam.GithubCredentials.begin_mutation(db, %{
                  machine: machine,
@@ -4394,7 +4404,12 @@ defmodule Tightbeam.Gateway do
         phase when phase in ["finish", "revoke-finish"] ->
           state = Map.fetch!(params, :state)
           account = Map.get(params, :account)
-          operation_class = if phase == "finish", do: "onboarding", else: "revocation"
+
+          operation_class =
+            if phase == "finish",
+              do: Map.get(params, :operation_class, "onboarding"),
+              else: "revocation"
+
           cause = Map.fetch!(params, :cause)
 
           binding = %{

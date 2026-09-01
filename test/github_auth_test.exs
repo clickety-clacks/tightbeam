@@ -62,4 +62,12 @@ defmodule Tightbeam.GithubAuthTest do
     assert GithubAuth.classify_api_failure("HTTP/2 403 Forbidden") == :insufficient_scope
     assert GithubAuth.classify_api_failure("connection reset by peer") == :unknown
   end
+
+  test "API status remains authoritative when auth status is inactive" do
+    assert GithubAuth.classify_provider_checks(1, {:ok, {"octo\n", 0}}) ==
+             {:error, :unknown, "gh api returned 200 but gh auth status was not active"}
+
+    assert GithubAuth.classify_provider_checks(1, {:ok, {"HTTP/2 401 unauthorized", 1}}) ==
+             {:error, :expired, "HTTP/2 401 unauthorized"}
+  end
 end

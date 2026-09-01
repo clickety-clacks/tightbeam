@@ -424,9 +424,11 @@ defmodule Tightbeam.Acp.Adapter do
             {:noreply, state}
 
           {:error, detail, output, raw_updates} ->
+            failure = Keyword.get(opts, :gate_failure, :gate_attestation_failed)
+
             reason =
               adapter_failure_reason(
-                {:gate_attestation_failed, detail},
+                {failure, detail},
                 state.stderr_path,
                 state.stderr_offset
               )

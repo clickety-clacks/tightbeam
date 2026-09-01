@@ -740,16 +740,17 @@ defmodule Tightbeam.HarnessHealth do
 
     Txn.q(
       txn,
-      "SELECT sessionKey,harness,host,archetype FROM sessions " <>
+      "SELECT sessionKey,harness,host,archetype,identityRevision FROM sessions " <>
         "WHERE harness=?1 AND host=?2" <> session_clause,
       params
     )
-    |> Enum.map(fn [session_key, harness, host, archetype] ->
+    |> Enum.map(fn [session_key, harness, host, archetype, identity_revision] ->
       Placement.adapter_key(%{
         session_key: session_key,
         harness: harness,
         host: host,
-        archetype: archetype
+        archetype: archetype,
+        identity_revision: identity_revision
       })
     end)
     |> Enum.uniq()

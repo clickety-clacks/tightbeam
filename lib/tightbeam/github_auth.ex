@@ -77,32 +77,27 @@ defmodule Tightbeam.GithubAuth do
            }}
           | {:error, atom(), String.t()}
   def probe(base_dir, hostname, remote_url) do
-    env = env(base_dir)
+    probe(base_dir, Tightbeam.Placement.local_host_name(), "default", hostname, remote_url)
+  end
 
-    with :valid <- Tightbeam.GithubCredentials.storage(config_dir(base_dir)),
+  @doc false
+  def probe(base_dir, machine, profile, hostname, remote_url) do
+    home = config_dir(base_dir, machine, profile)
+    env = credential_env(home)
+
+    with :valid <- Tightbeam.GithubCredentials.storage(home),
          {:gh, path} when is_binary(path) <- {:gh, System.find_executable("gh")},
-         {:auth, {:ok, {_out, 0}}} <-
-           {:auth,
-            bounded_cmd("gh", ["auth", "status", "--active", "--hostname", hostname],
-              stderr_to_stdout: true,
-              env: env
-            )},
-         {:api, {:ok, {account, 0}}} <-
-           {:api,
-            bounded_cmd("gh", ["api", "--hostname", hostname, "-i", "user", "--jq", ".login"],
-              stderr_to_stdout: true,
-              env: env
-            )},
+         {:provider, {:ok, account}} <- {:provider, provider_probe(env, hostname)},
          {:git, {:ok, {_out, 0}}} <-
            {:git,
             bounded_cmd("git", ["ls-remote", remote_url, "HEAD"],
               stderr_to_stdout: true,
-              env: env
+              env: [{"GIT_TERMINAL_PROMPT", "0"} | env]
             )} do
       {:ok,
        %{
-         account: String.trim(account),
-         git_protocol: git_protocol(env),
+         account: account,
+         git_protocol: git_protocol(env, hostname),
          gh_path: path,
          storage: "file"
        }}
@@ -117,22 +112,70 @@ defmodule Tightbeam.GithubAuth do
         {:error, :missing_cli,
          "gh is missing from PATH; PATH searched: #{System.get_env("PATH") || ""}"}
 
-      {_step, :timeout} ->
-        {:error, :unknown, "GitHub readiness probe timed out"}
+      {:provider, {:error, state, detail}} ->
+        {:error, state, scrub_detail(detail)}
 
-      {_step, :error} ->
-        {:error, :unknown, "GitHub readiness probe could not run"}
+      {:git, :timeout} ->
+        {:error, :unknown, "GitHub readiness probe timed out during git ls-remote"}
 
-      {:auth, {:ok, {detail, _status}}} ->
-        {:error, :needs_onboarding, scrub_detail(detail)}
-
-      {:api, {:ok, {detail, _status}}} ->
-        {:error, classify_api_failure(detail), scrub_detail(detail)}
+      {:git, :error} ->
+        {:error, :unknown, "GitHub readiness probe could not run git ls-remote"}
 
       {:git, {:ok, {detail, _status}}} ->
         {:error, :git_unready, scrub_detail(detail)}
     end
   end
+
+  defp credential_env(home) do
+    [
+      {"GH_CONFIG_DIR", home},
+      {"GH_TOKEN", nil},
+      {"GITHUB_TOKEN", nil},
+      {"GH_ENTERPRISE_TOKEN", nil},
+      {"GITHUB_ENTERPRISE_TOKEN", nil}
+    ]
+  end
+
+  defp provider_probe(env, hostname) do
+    auth =
+      bounded_cmd("gh", ["auth", "status", "--active", "--hostname", hostname],
+        stderr_to_stdout: true,
+        env: env
+      )
+
+    case auth do
+      :timeout ->
+        {:error, :unknown, "GitHub auth-status probe timed out"}
+
+      :error ->
+        {:error, :unknown, "GitHub auth-status probe could not run"}
+
+      {:ok, {_auth_detail, auth_status}} ->
+        api =
+          bounded_cmd("gh", ["api", "--hostname", hostname, "-i", "user", "--jq", ".login"],
+            stderr_to_stdout: true,
+            env: env
+          )
+
+        classify_provider_checks(auth_status, api)
+    end
+  end
+
+  @doc false
+  def classify_provider_checks(auth_status, {:ok, {account, 0}}) when auth_status == 0,
+    do: {:ok, String.trim(account)}
+
+  def classify_provider_checks(_auth_status, {:ok, {_account, 0}}),
+    do: {:error, :unknown, "gh api returned 200 but gh auth status was not active"}
+
+  def classify_provider_checks(_auth_status, {:ok, {detail, _status}}),
+    do: {:error, classify_api_failure(detail), detail}
+
+  def classify_provider_checks(_auth_status, :timeout),
+    do: {:error, :unknown, "GitHub API probe timed out"}
+
+  def classify_provider_checks(_auth_status, :error),
+    do: {:error, :unknown, "GitHub API probe could not run"}
 
   @doc """
   Redact token material from probe output before it is surfaced anywhere.
@@ -178,8 +221,8 @@ defmodule Tightbeam.GithubAuth do
     end
   end
 
-  defp git_protocol(env) do
-    case bounded_cmd("gh", ["config", "get", "git_protocol"], env: env) do
+  defp git_protocol(env, hostname) do
+    case bounded_cmd("gh", ["config", "get", "git_protocol", "--host", hostname], env: env) do
       {:ok, {protocol, 0}} ->
         protocol = String.trim(protocol)
         if protocol == "", do: nil, else: protocol

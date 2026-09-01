@@ -59,7 +59,11 @@ defmodule Tightbeam.GithubAuthE2ETest do
 
     for home <- [work, personal, legacy] do
       File.mkdir_p!(home)
-      File.chmod!(home, 0o700)
+
+      home
+      |> Stream.iterate(&Path.dirname/1)
+      |> Enum.take(4)
+      |> Enum.each(&File.chmod!(&1, 0o700))
 
       File.write!(
         Path.join(home, "hosts.yml"),
@@ -112,6 +116,32 @@ defmodule Tightbeam.GithubAuthE2ETest do
     end
   end
 
+  test "a pinned identity revision keeps the adapter key stable across live manifest reload",
+       ctx do
+    session = %{
+      harness: "codex",
+      host: "testhost",
+      state: "active",
+      overrides: nil,
+      session_key: "agent:pinned",
+      archetype: "work",
+      identity_name: "work",
+      identity_revision: "0123456789abcdef0123456789abcdef01234567"
+    }
+
+    key = Placement.adapter_key(session)
+    path = Path.join(ctx.root, "identity/archetypes/work.toml")
+
+    File.write!(
+      path,
+      String.replace(File.read!(path), ~s(profile = "work"), ~s(profile = "other"))
+    )
+
+    Archetypes.load!(ctx.root)
+
+    assert Placement.adapter_key(session) == key
+  end
+
   test "local and remote adapters receive only their elected host profile", ctx do
     config = %{
       base_dir: ctx.root,
@@ -135,6 +165,26 @@ defmodule Tightbeam.GithubAuthE2ETest do
     assert {"TIGHTBEAM_GITHUB_PROFILE", "work"} in local[:env]
     assert {"GH_CONFIG_DIR", local_home} in local[:env]
     assert Enum.take(local[:cmd], 2) == ["env", "-u"]
+    refute "TIGHTBEAM_GITHUB_PROFILE" in local[:cmd]
+    refute "GH_CONFIG_DIR" in local[:cmd]
+
+    command = List.replace_at(local[:cmd], -1, "/usr/bin/env")
+
+    {projected, 0} =
+      System.cmd(hd(command), tl(command),
+        env:
+          local[:env] ++
+            [
+              {"GH_TOKEN", @secret},
+              {"GITHUB_TOKEN", @secret},
+              {"GH_ENTERPRISE_TOKEN", @secret},
+              {"GITHUB_ENTERPRISE_TOKEN", @secret}
+            ]
+      )
+
+    assert projected =~ "TIGHTBEAM_GITHUB_PROFILE=work"
+    assert projected =~ "GH_CONFIG_DIR=#{local_home}"
+    refute projected =~ @secret
 
     assert {:ok, _host} =
              Placement.register_host(ctx.db, "worker", %{
@@ -161,7 +211,12 @@ defmodule Tightbeam.GithubAuthE2ETest do
   test "hollow storage fixtures fail before provider work", ctx do
     home = GithubCredentials.home(ctx.root, "testhost", "work")
     File.mkdir_p!(home)
-    File.chmod!(home, 0o700)
+
+    home
+    |> Stream.iterate(&Path.dirname/1)
+    |> Enum.take(4)
+    |> Enum.each(&File.chmod!(&1, 0o700))
+
     hosts = Path.join(home, "hosts.yml")
 
     assert GithubCredentials.storage(home) == :absent

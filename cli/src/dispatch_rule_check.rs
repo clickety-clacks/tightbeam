@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
 use serde::Deserialize;
@@ -9,6 +9,24 @@ use crate::dispatch::{Origin, RequestSpec};
 
 const RULE: &str = "github-network-auth-required";
 const HANDLER: &str = "github-network-auth-v1";
+const RETURNS: &[&str] = &[
+    "not_applicable",
+    "live",
+    "profile_not_elected",
+    "missing_cli",
+    "needs_onboarding",
+    "hollow",
+    "expired",
+    "insufficient_scope",
+    "git_unready",
+    "revoked",
+    "present_but_unverified",
+    "unknown",
+    "ambiguous_hostname",
+    "projection_override",
+    "malformed_tool_call",
+    "rule_runtime_failure",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Args {
@@ -16,6 +34,14 @@ struct Args {
     handler: String,
     abi: u64,
     identity_sha: String,
+    effects: HashMap<String, Effect>,
+    fallback_repair: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Effect {
+    Allow,
+    Deny,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +61,20 @@ pub(crate) struct ToolCallInputV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolCallToolV1 {
     Bash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ToolCheckMaterialV1 {
+    pub(crate) state: String,
+    pub(crate) operation_class: String,
+    pub(crate) machine: String,
+    pub(crate) profile: Option<String>,
+    pub(crate) hostname: Option<String>,
+    pub(crate) phase: String,
+    pub(crate) cause: String,
+    pub(crate) principal: String,
+    pub(crate) repair: Option<String>,
+    pub(crate) observation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,24 +123,70 @@ pub(crate) fn run(raw_args: &[String]) -> Result<i32, String> {
         .map_err(|_| runtime_failure(&context))?;
 
     let input = match normalize(&raw, args.abi) {
-        Ok(input) => input,
-        Err(cause) => {
-            observe_malformed(&endpoint, &args, &context, cause)?;
-            return Err(format!(
-                "[gate: {RULE}] state=malformed_tool_call machine={} profile=none hostname=none phase=normalization cause={} principal={} repair=tightbeam doctor --json",
-                context.machine,
-                cause.as_str(),
-                context.principal
-            ));
-        }
+        Err(cause) => ToolCallInputOrMaterial::Material(ToolCheckMaterialV1 {
+            state: "malformed_tool_call".to_owned(),
+            operation_class: "malformed".to_owned(),
+            machine: context.machine.clone(),
+            profile: None,
+            hostname: None,
+            phase: "normalization".to_owned(),
+            cause: cause.as_str().to_owned(),
+            principal: context.principal.clone(),
+            repair: Some(args.fallback_repair.clone()),
+            observation_ids: vec![observe_malformed(&endpoint, &args, &context, cause)?],
+        }),
+        Ok(input) => ToolCallInputOrMaterial::Input(input),
     };
 
-    crate::github_auth::check_compiled_rule(
-        &endpoint,
-        &args.identity_sha,
-        &context.machine,
-        &context.principal,
-        &input,
+    let materials = match input {
+        ToolCallInputOrMaterial::Material(material) => vec![material],
+        ToolCallInputOrMaterial::Input(input) => crate::github_auth::check_compiled_rule(
+            &endpoint,
+            &args.identity_sha,
+            &context.machine,
+            &context.principal,
+            &input,
+        )?,
+    };
+    execute_materials(&args, materials)
+}
+
+enum ToolCallInputOrMaterial {
+    Input(ToolCallInputV1),
+    Material(ToolCheckMaterialV1),
+}
+
+fn execute_materials(args: &Args, materials: Vec<ToolCheckMaterialV1>) -> Result<i32, String> {
+    for material in materials {
+        match args.effects.get(&material.state) {
+            Some(Effect::Allow) if material.repair.is_none() => continue,
+            Some(Effect::Deny) if material.repair.as_deref().is_some_and(|r| !r.is_empty()) => {
+                return Err(render_refusal(&material));
+            }
+            _ => {
+                return Err(format!(
+                    "[gate: {RULE}] state=rule_runtime_failure machine={} profile=none hostname=none phase=execution cause=invalid_compiled_effect_or_material principal={} repair={}",
+                    material.machine, material.principal, args.fallback_repair
+                ));
+            }
+        }
+    }
+    Ok(0)
+}
+
+fn render_refusal(material: &ToolCheckMaterialV1) -> String {
+    format!(
+        "[gate: {RULE}] state={} operation_class={} machine={} profile={} hostname={} phase={} cause={} principal={} observation_ids={} repair={}",
+        material.state,
+        material.operation_class,
+        material.machine,
+        material.profile.as_deref().unwrap_or("none"),
+        material.hostname.as_deref().unwrap_or("none"),
+        material.phase,
+        material.cause,
+        material.principal,
+        material.observation_ids.join(","),
+        material.repair.as_deref().unwrap_or("none")
     )
 }
 
@@ -109,6 +195,8 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
     let mut handler = None;
     let mut abi = None;
     let mut identity_sha = None;
+    let mut effects = None;
+    let mut fallback_repair = None;
     let mut index = 0;
 
     while index < raw.len() {
@@ -116,6 +204,8 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
             "--rule" => &mut rule,
             "--handler" => &mut handler,
             "--identity-sha" => &mut identity_sha,
+            "--effects" => &mut effects,
+            "--fallback-repair" => &mut fallback_repair,
             "--abi" => {
                 index += 1;
                 let value = raw.get(index).ok_or_else(invalid_invocation)?;
@@ -138,14 +228,36 @@ fn parse_args(raw: &[String]) -> Result<Args, String> {
         index += 1;
     }
 
+    let effects = effects.ok_or_else(invalid_invocation)?;
+    let effects = serde_json::from_str::<HashMap<String, String>>(&effects)
+        .map_err(|_| invalid_invocation())?
+        .into_iter()
+        .map(|(state, effect)| match effect.as_str() {
+            "allow" => Ok((state, Effect::Allow)),
+            "deny" => Ok((state, Effect::Deny)),
+            _ => Err(invalid_invocation()),
+        })
+        .collect::<Result<HashMap<_, _>, _>>()?;
     let parsed = Args {
         rule: rule.ok_or_else(invalid_invocation)?,
         handler: handler.ok_or_else(invalid_invocation)?,
         abi: abi.ok_or_else(invalid_invocation)?,
         identity_sha: identity_sha.ok_or_else(invalid_invocation)?,
+        effects,
+        fallback_repair: fallback_repair.ok_or_else(invalid_invocation)?,
     };
 
-    if parsed.rule != RULE || parsed.handler != HANDLER || parsed.abi != 1 {
+    if parsed.rule != RULE
+        || parsed.handler != HANDLER
+        || parsed.abi != 1
+        || parsed.fallback_repair.trim().is_empty()
+        || parsed.effects.get("malformed_tool_call") != Some(&Effect::Deny)
+        || parsed.effects.get("rule_runtime_failure") != Some(&Effect::Deny)
+        || parsed.effects.len() != RETURNS.len()
+        || RETURNS
+            .iter()
+            .any(|state| !parsed.effects.contains_key(*state))
+    {
         return Err(invalid_invocation());
     }
     Ok(parsed)
@@ -222,7 +334,7 @@ fn observe_malformed(
     args: &Args,
     context: &Context,
     cause: MalformedToolCallCauseV1,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let request = RequestSpec {
         method: "POST",
         path: "/agent/github/observe",
@@ -239,7 +351,11 @@ fn observe_malformed(
         .to_string(),
     };
     crate::dispatch::send_to(endpoint, &request)
-        .map(|_| ())
+        .and_then(|result| {
+            result
+                .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
+                .ok_or_else(|| "observation response omitted id".to_owned())
+        })
         .map_err(|_| {
             format!(
                 "[gate: {RULE}] state=rule_runtime_failure machine={} profile=none hostname=none phase=recording cause=observation_record_failed principal={} repair=tightbeam doctor --json",
@@ -435,5 +551,61 @@ mod tests {
         for (raw, cause) in cases {
             assert_eq!(normalize(raw, 1), Err(*cause), "{}", cause.as_str());
         }
+    }
+
+    #[test]
+    fn compiled_effects_alone_choose_allow_or_deny() {
+        let effects = RETURNS
+            .iter()
+            .map(|state| {
+                (
+                    (*state).to_owned(),
+                    if matches!(*state, "not_applicable" | "live") {
+                        Effect::Allow
+                    } else {
+                        Effect::Deny
+                    },
+                )
+            })
+            .collect();
+        let args = Args {
+            rule: RULE.to_owned(),
+            handler: HANDLER.to_owned(),
+            abi: 1,
+            identity_sha: "fixture".to_owned(),
+            effects,
+            fallback_repair: "tightbeam doctor --json".to_owned(),
+        };
+        let live = ToolCheckMaterialV1 {
+            state: "live".to_owned(),
+            operation_class: "gh".to_owned(),
+            machine: "fixture-host".to_owned(),
+            profile: Some("work".to_owned()),
+            hostname: Some("github.com".to_owned()),
+            phase: "provider".to_owned(),
+            cause: "current_provider_probe_live".to_owned(),
+            principal: "session:fixture".to_owned(),
+            repair: None,
+            observation_ids: vec!["obs_fixture".to_owned()],
+        };
+        assert_eq!(execute_materials(&args, vec![live]), Ok(0));
+
+        let expired = ToolCheckMaterialV1 {
+            state: "expired".to_owned(),
+            operation_class: "git".to_owned(),
+            machine: "fixture-host".to_owned(),
+            profile: Some("work".to_owned()),
+            hostname: Some("github.com".to_owned()),
+            phase: "provider".to_owned(),
+            cause: "provider_http_401".to_owned(),
+            principal: "session:fixture".to_owned(),
+            repair: Some(
+                "tightbeam onboard github --profile work --hostname github.com".to_owned(),
+            ),
+            observation_ids: vec!["obs_fixture".to_owned()],
+        };
+        let refusal = execute_materials(&args, vec![expired]).unwrap_err();
+        assert!(refusal.contains("state=expired"));
+        assert!(refusal.contains("observation_ids=obs_fixture"));
     }
 }

@@ -297,6 +297,22 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert report.github == nil
   end
 
+  test "doctor reports inert legacy residue without opening or copying it", ctx do
+    legacy = Path.join([ctx.base_dir, "auth", "github", "gh"])
+    File.mkdir_p!(Path.dirname(legacy))
+    File.write!(legacy, "github_pat_fixture_secret")
+    inode = File.stat!(legacy).inode
+
+    {1, report} = Doctor.evaluate(ctx.catalog, ctx.inputs)
+    check = find(report, "github_inert_legacy_residue")
+
+    refute check.ok
+    assert check.detail =~ "inert_legacy_residue"
+    refute check.detail =~ "github_pat_fixture_secret"
+    assert File.stat!(legacy).inode == inode
+    assert File.read!(legacy) == "github_pat_fixture_secret"
+  end
+
   test "github auth passes only when the host probe reports live cli and git auth", ctx do
     inputs =
       ctx.inputs

@@ -40,13 +40,22 @@ defmodule Tightbeam.GithubCredentialsTest do
     assert GithubCredentials.storage(home) == :absent
 
     File.mkdir_p!(home)
-    File.chmod!(home, 0o700)
+    ancestors = home |> Stream.iterate(&Path.dirname/1) |> Enum.take(4)
+    Enum.each(ancestors, &File.chmod!(&1, 0o700))
     assert GithubCredentials.storage(home) == :absent
 
     File.write!(hosts, "sentinel-secret")
     File.chmod!(hosts, 0o600)
     assert GithubCredentials.storage(home) == :valid
     assert File.read!(hosts) == "sentinel-secret"
+
+    [_, _, _, credential_homes] = ancestors
+    File.chmod!(credential_homes, 0o755)
+
+    assert GithubCredentials.storage(home) ==
+             {:hollow, "credential home ancestor_permissions"}
+
+    File.chmod!(credential_homes, 0o700)
 
     File.chmod!(hosts, 0o644)
     assert GithubCredentials.storage(home) == {:hollow, "hosts_yml_permissions"}
@@ -115,6 +124,51 @@ defmodule Tightbeam.GithubCredentialsTest do
              )
 
     assert message =~ "append-only"
+  end
+
+  test "rotation preserves prior authority until one atomic terminal settlement", ctx do
+    base = %{
+      machine: "gibson",
+      profile: "work",
+      hostname: "github.com",
+      account: "octo-old",
+      state: "live",
+      principal: "session:producer"
+    }
+
+    assert {:ok, _} = GithubCredentials.upsert_binding(ctx.db, base)
+
+    assert {:ok, rotating} =
+             GithubCredentials.begin_mutation(
+               ctx.db,
+               Map.merge(base, %{mutation_attempt: "rotation"})
+             )
+
+    assert rotating.state == "live"
+    assert rotating.account == "octo-old"
+    assert rotating.mutation_attempt == "rotation"
+
+    assert {:ok, outcome} =
+             GithubCredentials.commit_outcome(
+               ctx.db,
+               Map.merge(base, %{mutation_attempt: nil}),
+               Map.merge(base, %{
+                 operation_class: "rotation",
+                 phase: "provider",
+                 cause: "provider_login_failed_before_write",
+                 dedupe_key: "rotation:gibson:work:github.com:before-write"
+               })
+             )
+
+    assert outcome.binding.state == "live"
+    assert outcome.binding.mutation_attempt == nil
+
+    assert {:ok, [["rotation", "provider_login_failed_before_write"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT operationClass, cause FROM github_capability_observations WHERE id = ?1",
+               [outcome.observation.id]
+             )
   end
 
   test "legacy bank remains inert under metadata-only inspection", ctx do

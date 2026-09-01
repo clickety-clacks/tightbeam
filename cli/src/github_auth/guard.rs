@@ -1,4 +1,5 @@
 use super::bank::Gh;
+#[cfg(test)]
 use super::probe::check_github_ready;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +41,7 @@ pub(super) fn classify_command_with(
         }
 
         if looks_like_gh_repo_call(&command) {
-            let hostname = match gh_target_hostname(&command) {
+            let hostname = match gh_target_hostname(&command, gh, known_hosts) {
                 Ok(hostname) => hostname,
                 Err(SelectorError::Ambiguous) => {
                     return Ok(Classification::AmbiguousHostname);
@@ -137,9 +138,14 @@ enum SelectorError {
     Ambiguous,
 }
 
-fn gh_target_hostname(command: &[String]) -> Result<String, SelectorError> {
-    let command = normalized_command(command);
+fn gh_target_hostname(
+    raw_command: &[String],
+    gh: &impl Gh,
+    known_hosts: &[String],
+) -> Result<String, SelectorError> {
+    let command = normalized_command(raw_command);
     let mut explicit = Vec::new();
+    let mut explicit_repo = false;
     let mut index = 0;
     while index < command.len() {
         let word = command[index].as_str();
@@ -154,6 +160,8 @@ fn gh_target_hostname(command: &[String]) -> Result<String, SelectorError> {
                 repo_selector_hostname(value).map_err(|()| SelectorError::Malformed)?
             {
                 explicit.push(hostname);
+            } else {
+                explicit_repo = true;
             }
         } else if let Some(value) = word.strip_prefix("--hostname=") {
             explicit
@@ -163,6 +171,8 @@ fn gh_target_hostname(command: &[String]) -> Result<String, SelectorError> {
                 repo_selector_hostname(value).map_err(|()| SelectorError::Malformed)?
             {
                 explicit.push(hostname);
+            } else {
+                explicit_repo = true;
             }
         }
         index += 1;
@@ -172,13 +182,65 @@ fn gh_target_hostname(command: &[String]) -> Result<String, SelectorError> {
     if explicit.len() > 1 {
         return Err(SelectorError::Ambiguous);
     }
-    Ok(explicit
-        .pop()
-        .or_else(|| effective_assignment(command, "GH_HOST"))
+    if let Some(hostname) = explicit.pop() {
+        return Ok(hostname);
+    }
+
+    if explicit_repo {
+        return effective_host(raw_command);
+    }
+
+    if let Some(repo) = effective_assignment(raw_command, "GH_REPO") {
+        return match repo_selector_hostname(&repo).map_err(|()| SelectorError::Malformed)? {
+            Some(hostname) => Ok(hostname),
+            None => effective_host(raw_command),
+        };
+    }
+
+    if gh_uses_current_repository(command) {
+        let remotes = gh
+            .git_current_remotes()
+            .map_err(|_| SelectorError::Malformed)?;
+        let marked = remotes
+            .iter()
+            .filter(|(_, _, base)| *base)
+            .collect::<Vec<_>>();
+        if marked.len() > 1 {
+            return Err(SelectorError::Ambiguous);
+        }
+        if let Some((_, url, _)) = marked.first() {
+            return parse_remote_hostname(url).ok_or(SelectorError::Malformed);
+        }
+
+        let mut candidates = remotes
+            .iter()
+            .filter_map(|(_, url, _)| recognized_remote_hostname(url, known_hosts))
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        if candidates.len() > 1 {
+            return Err(SelectorError::Ambiguous);
+        }
+        if let Some(hostname) = candidates.pop() {
+            return Ok(hostname);
+        }
+    }
+
+    effective_host(raw_command)
+}
+
+fn effective_host(command: &[String]) -> Result<String, SelectorError> {
+    effective_assignment(command, "GH_HOST")
         .map(|value| normalize_selector_hostname(&value))
         .transpose()
-        .map_err(|()| SelectorError::Malformed)?
-        .unwrap_or_else(|| "github.com".to_owned()))
+        .map_err(|()| SelectorError::Malformed)
+        .map(|hostname| hostname.unwrap_or_else(|| "github.com".to_owned()))
+}
+
+fn gh_uses_current_repository(command: &[String]) -> bool {
+    command
+        .iter()
+        .any(|word| matches!(word.as_str(), "repo" | "pr" | "issue"))
 }
 
 fn effective_assignment(command: &[String], name: &str) -> Option<String> {
@@ -247,6 +309,7 @@ fn recognized_remote_hostname(remote: &str, known_hosts: &[String]) -> Option<St
         .then_some(hostname)
 }
 
+#[cfg(test)]
 pub(super) fn check_tool_call_with(raw: &str, gh: &impl Gh) -> Result<(), String> {
     let mut remotes = Vec::new();
     let mut gh_repo = false;
@@ -316,6 +379,7 @@ pub(super) fn check_tool_call_with(raw: &str, gh: &impl Gh) -> Result<(), String
 // position" by construction. When the payload has no command field (a non-Bash
 // hook shape, or non-JSON stdin), fall back to scanning everything: over-broad
 // gating of an unknown shape beats silently ignoring it.
+#[cfg(test)]
 fn tool_call_strings(raw: &str) -> Vec<String> {
     match serde_json::from_str::<serde_json::Value>(raw) {
         Ok(value) => {
@@ -334,6 +398,7 @@ fn tool_call_strings(raw: &str) -> Vec<String> {
     }
 }
 
+#[cfg(test)]
 fn collect_json_strings(value: &serde_json::Value, strings: &mut Vec<String>) {
     match value {
         serde_json::Value::String(value) => strings.push(value.clone()),
@@ -719,6 +784,7 @@ fn push_command(commands: &mut Vec<Vec<String>>, command: &mut Vec<String>) {
     }
 }
 
+#[cfg(test)]
 fn github_remotes(text: &str) -> Vec<String> {
     parse_github_remote(text)
         .map(|remote| vec![remote.original])
@@ -726,11 +792,13 @@ fn github_remotes(text: &str) -> Vec<String> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct ParsedGithubRemote {
     original: String,
     hostname: String,
 }
 
+#[cfg(test)]
 fn parse_github_remote(text: &str) -> Option<ParsedGithubRemote> {
     let original = text
         .trim()
@@ -755,11 +823,13 @@ fn parse_github_remote(text: &str) -> Option<ParsedGithubRemote> {
     })
 }
 
+#[cfg(test)]
 fn github_hostname(host: &str) -> Option<String> {
     let hostname = host.trim_end_matches('.').to_ascii_lowercase();
     (hostname == "github.com" || hostname.ends_with(".github.com")).then_some(hostname)
 }
 
+#[cfg(test)]
 fn github_hostname_from_remote(remote: &str) -> Option<String> {
     parse_github_remote(remote).map(|remote| remote.hostname)
 }
@@ -784,6 +854,71 @@ mod tests {
         assert_eq!(
             classify_command_with("gh api --hostname", &gh, &[]).unwrap(),
             Classification::MalformedToolCall
+        );
+    }
+
+    #[test]
+    fn classifier_applies_r15_selector_precedence() {
+        let gh = FakeGh::new(true);
+        let classified = classify_command_with(
+            "GH_REPO=ghe.example/acme/widget GH_HOST=ignored.example gh pr list --repo github.com/acme/widget",
+            &gh,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            classified,
+            Classification::Targets(vec![ClassifiedTarget {
+                operation_class: "gh",
+                hostname: "github.com".to_owned(),
+                remote: None,
+            }])
+        );
+
+        let gh = FakeGh::new(true);
+        let classified = classify_command_with(
+            "GH_REPO=ghe.example/acme/widget GH_HOST=ignored.example gh pr list",
+            &gh,
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            classified,
+            Classification::Targets(ref targets) if targets[0].hostname == "ghe.example"
+        ));
+
+        let gh = FakeGh::new(true);
+        let classified = classify_command_with(
+            "GH_REPO=ghe.example/acme/widget GH_HOST=github.example gh pr list --repo acme/widget",
+            &gh,
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            classified,
+            Classification::Targets(ref targets) if targets[0].hostname == "github.example"
+        ));
+    }
+
+    #[test]
+    fn classifier_uses_one_current_repository_base_marker_and_refuses_conflicts() {
+        let gh = FakeGh::new(true).current_remotes(vec![
+            ("origin", "https://github.com/acme/widget.git", false),
+            ("enterprise", "ssh://git@ghe.example/acme/widget.git", true),
+        ]);
+        let classified = classify_command_with("gh pr list", &gh, &[]).unwrap();
+        assert!(matches!(
+            classified,
+            Classification::Targets(ref targets) if targets[0].hostname == "ghe.example"
+        ));
+
+        let gh = FakeGh::new(true).current_remotes(vec![
+            ("one", "https://github.com/acme/widget.git", true),
+            ("two", "https://ghe.example/acme/widget.git", true),
+        ]);
+        assert_eq!(
+            classify_command_with("gh issue list", &gh, &["ghe.example".to_owned()]).unwrap(),
+            Classification::AmbiguousHostname
         );
     }
 

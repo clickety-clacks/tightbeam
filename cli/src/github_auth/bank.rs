@@ -1,5 +1,4 @@
 use std::fs;
-use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -13,6 +12,9 @@ pub(super) trait Gh {
         Ok(None)
     }
     fn git_submodule_urls(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+    fn git_current_remotes(&self) -> Result<Vec<(String, String, bool)>, String> {
         Ok(Vec::new())
     }
     fn secure_banked_files(&self) -> Result<(), String> {
@@ -38,7 +40,10 @@ impl RealGh {
         fs::create_dir_all(home)
             .map_err(|error| format!("could not create GitHub credential home: {error}"))?;
         let mut current = home.to_path_buf();
-        for _ in 0..3 {
+        // `create_dir_all` may create the credential-homes ancestor too.  It is
+        // part of the private provider-home boundary, not a harmless public
+        // container, so secure every Tightbeam-created directory through it.
+        for _ in 0..4 {
             fs::set_permissions(&current, fs::Permissions::from_mode(0o700)).map_err(|error| {
                 format!("could not secure GitHub credential directory: {error}")
             })?;
@@ -65,16 +70,37 @@ impl RealGh {
         ] {
             command.env_remove(name);
         }
+        if program == "git" {
+            command.env("GIT_TERMINAL_PROMPT", "0");
+        }
         command
+    }
+
+    pub(super) fn login_device(
+        &self,
+        args: &[&str],
+        identity: &crate::args::Identity,
+        endpoint: &crate::dispatch::Endpoint,
+        machine: &str,
+        owner_user_id: Option<String>,
+    ) -> Result<std::process::ExitStatus, String> {
+        let mut command = self.command("gh");
+        command.args(args);
+        crate::ceremonies::run_github_device_login(
+            command,
+            identity,
+            endpoint,
+            machine,
+            owner_user_id,
+        )
     }
 }
 
 /// Probes are bounded: the guard runs inside a PreToolUse hook, and an
 /// unbounded `git ls-remote` against an unreachable host would hang the
 /// agent's whole tool path. A timed-out probe maps to an error, which the
-/// callers treat as `unknown` — per spec, never live. The login ceremony
-/// (`status`) stays unbounded on purpose: a human is completing a browser
-/// flow that legitimately takes minutes.
+/// callers treat as `unknown` — per spec, never live. Device login uses the
+/// separately bounded first-class ceremony runner above.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl Gh for RealGh {
@@ -95,31 +121,11 @@ impl Gh for RealGh {
     }
 
     fn status(&self, args: &[&str]) -> Result<std::process::ExitStatus, String> {
-        if args.starts_with(&["auth", "login"]) {
-            let mut child = self
-                .command("gh")
-                .args(args)
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-                .map_err(|error| format!("failed to run gh auth login: {error}"))?;
-            let mut stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| "gh login stdin unavailable".to_owned())?;
-            stdin
-                .write_all(b"Y\n")
-                .map_err(|error| format!("failed to answer gh login prompt: {error}"))?;
-            drop(stdin);
-            child
-                .wait()
-                .map_err(|error| format!("failed waiting for gh auth login: {error}"))
-        } else {
-            self.command("gh")
-                .args(args)
-                .stdin(std::process::Stdio::null())
-                .status()
-                .map_err(|error| format!("failed to run gh {}: {error}", args.join(" ")))
-        }
+        self.command("gh")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .map_err(|error| format!("failed to run gh {}: {error}", args.join(" ")))
     }
 
     fn git_ls_remote(&self, remote: &str) -> Result<Output, String> {
@@ -181,6 +187,43 @@ impl Gh for RealGh {
         urls.sort();
         urls.dedup();
         Ok(urls)
+    }
+
+    fn git_current_remotes(&self) -> Result<Vec<(String, String, bool)>, String> {
+        let output = self
+            .command("git")
+            .args(["config", "--get-regexp", r"^remote\..*\.url$"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|error| format!("failed to list git remotes: {error}"))?;
+        if !output.status.success() {
+            return Ok(Vec::new());
+        }
+
+        let mut remotes = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Some((key, url)) = line.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let Some(name) = key
+                .strip_prefix("remote.")
+                .and_then(|key| key.strip_suffix(".url"))
+            else {
+                continue;
+            };
+            let marker_key = format!("remote.{name}.gh-resolved");
+            let marker = self
+                .command("git")
+                .args(["config", "--get", &marker_key])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|error| format!("failed to read {marker_key}: {error}"))?;
+            let base =
+                marker.status.success() && String::from_utf8_lossy(&marker.stdout).trim() == "base";
+            remotes.push((name.to_owned(), url.trim().to_owned(), base));
+        }
+        remotes.sort();
+        Ok(remotes)
     }
 
     fn secure_banked_files(&self) -> Result<(), String> {
@@ -275,6 +318,7 @@ mod tests {
             &home,
             &root.join("credential-homes/machine/github"),
             &root.join("credential-homes/machine"),
+            &root.join("credential-homes"),
         ] {
             assert_eq!(
                 fs::metadata(restricted).unwrap().permissions().mode() & 0o777,
