@@ -35,9 +35,9 @@ Do not file "still working," "unchanged," "waiting," or "no update."
 Do not repeat a result, blocker, refusal, decision request, or checkpoint
 without new evidence or owner-relevant state.
 
-A valid receipt ends a stall response for that turn. If a later alarm claims
-the receipt is missing, do not file a rebuttal attest or wake and do not alter
-the work. Report the monitor defect only when the alarm adds new evidence.
+When a holder needs more time, the receipt that earns it carries evidence of what
+moved: the row, commit or artifact, not an assertion of effort. A receipt with no
+evidence in it is not a receipt.
 
 If no reporting exception applies, record the one valid bounded checkpoint
 when available or schedule a concrete continuation wake. Never manufacture
