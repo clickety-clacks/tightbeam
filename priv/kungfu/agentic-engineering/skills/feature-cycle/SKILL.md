@@ -43,8 +43,9 @@ per-feature, but your attention across features is the scarce resource.
    `tightbeam assign --subject "review of spec <id>" --role reviewer:<slug> --work-item <id> --reviews <specAssignmentId>`.
    The reviewer works per `reviewing-specs`. On `changes-requested`, read each
    blocking finding against the ask first: a finding the MVP ships without gets
-   `review-overreach` on the review card (orchestrator kernel, "Verifying without
-   redoing") and the reviewer re-files. Then wake the spec-writer to revise the rest;
+   `review-overreach` on the PRODUCER's card naming the review card (orchestrator
+   kernel, "Verifying without redoing"; a verdict on a review card is holder-only) and
+   the reviewer re-files its own verdict. Then wake the spec-writer to revise the rest;
    repeat until `reviewed-clean`. The spec-writer then pins (or
    re-pins) the reviewed spec's hash on the work item (spec-handoff skill), so builders
    build from the cleared text.
@@ -84,8 +85,8 @@ per-feature, but your attention across features is the scarce resource.
    observable selection evidence; they do not gate completion. A verdict filed
    without the link is a claim the rows cannot confirm. On `changes-requested`, read
    each blocking finding against the ask before you wake anyone: a finding the MVP
-   ships without gets `review-overreach` on the review card and the reviewer re-files
-   with it moved to post-mvp. Then leave the review card open, wake the producer to
+   ships without gets `review-overreach` on the PRODUCER's card naming the review card,
+   and the reviewer re-files its own verdict with that finding moved to post-mvp. Then leave the review card open, wake the producer to
    iterate on what remains, and have the same reviewer re-file on that card until
    `reviewed-clean`. Complete the review card only after its clean verdict; never
    multiply or close-and-reopen cards for review rounds. Under light posture the
