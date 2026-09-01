@@ -920,6 +920,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
+        Command::Breathing {
+            identity,
+            target_kind,
+            target_id,
+        } => Ok(request(
+            identity,
+            "breathing",
+            vec![],
+            vec![
+                string_field("targetKind", target_kind),
+                string_field("targetId", target_id),
+            ],
+        )),
         Command::Attend { identity, high } => {
             // The tier only; the turn is the caller's running turn, which the
             // substrate derives — the CLI never names a turn.
@@ -2028,6 +2041,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
+        | Command::Breathing { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
         | Command::TurnTrace { identity, .. }
