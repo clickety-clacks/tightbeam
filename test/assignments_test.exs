@@ -2491,28 +2491,14 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "completion and surrender notices use the exact shared assignment bytes", ctx do
+  test "completion and historical surrender notices use the exact shared assignment bytes", ctx do
     catalog = %{
       {"eezo", "claude"} => [
         %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
       ]
     }
 
-    for {kind, derived_status} <- [{"completion", "claims-done"}, {"surrender", "abandoned"}] do
-      assignment =
-        handle(
-          ctx,
-          "assign",
-          assign_call({:user, "flynn"}, "#{kind} assignment projection")
-          |> put_in([:params, :files], [
-            "lib/tightbeam/firehose/publisher.ex",
-            "test/assignments_test.exs"
-          ])
-        )
-
-      attest_call = attest_call({:session, "holder"}, assignment.id, kind)
-      result = handle(ctx, "attest", attest_call)
-
+    assert_notice = fn attest_call, result, derived_status ->
       notice =
         ctx.db
         |> Tightbeam.Firehose.Publisher.accepted_notices(attest_call, result)
@@ -2542,6 +2528,59 @@ defmodule Tightbeam.AssignmentsTest do
       assert wire =~ ~s("payload":#{item_bytes})
       assert JSON.decode!(wire) == notice
     end
+
+    completion =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "completion assignment projection")
+        |> put_in([:params, :files], [
+          "lib/tightbeam/firehose/publisher.ex",
+          "test/assignments_test.exs"
+        ])
+      )
+
+    completion_call = attest_call({:session, "holder"}, completion.id, "completion")
+    completion_result = handle(ctx, "attest", completion_call)
+    assert_notice.(completion_call, completion_result, "claims-done")
+
+    historical =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "historical surrender assignment projection")
+        |> put_in([:params, :files], [
+          "lib/tightbeam/firehose/publisher.ex",
+          "test/assignments_test.exs"
+        ])
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_historical_projection', ?1, 'surrender', 'historical', 'holder', 10)",
+               [historical.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed', outcome='surrendered', closedAt=10, closedBySession='holder', closingAttestId='att_historical_projection' WHERE id=?1",
+               [historical.id]
+             )
+
+    historical_assignment =
+      handle(ctx, "assignment-get", assignment_get_call({:session, "holder"}, historical.id))
+
+    [historical_attest] = Assignments.list_attests(ctx.db, historical.id)
+
+    historical_call = attest_call({:session, "holder"}, historical.id, "surrender")
+
+    assert_notice.(
+      historical_call,
+      %{attest: historical_attest, assignment: historical_assignment},
+      "abandoned"
+    )
   end
 
   test "generation upgrade replaces the predecessor tuple trigger before a reopened close", ctx do
