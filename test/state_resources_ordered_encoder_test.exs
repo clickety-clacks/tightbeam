@@ -97,16 +97,20 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   end
 
   test "A17 randomizes map and set order 1,000 times without changing item bytes" do
-    expected =
+    items =
       Map.new(@field_order, fn {resource, fields} ->
-        item = item(resource, fields)
+        {resource, item(resource, fields)}
+      end)
+
+    expected =
+      Map.new(items, fn {resource, item} ->
         {resource, StateResources.encode_item(resource, item, @catalog)}
       end)
 
     :rand.seed(:exsss, {17, 71, 171})
 
-    for _iteration <- 1..1_000, {resource, fields} <- @field_order do
-      randomized = resource |> item(fields) |> randomize_item(resource)
+    for _iteration <- 1..1_000, {resource, _fields} <- @field_order do
+      randomized = items |> Map.fetch!(resource) |> randomize_item(resource)
 
       assert StateResources.encode_item(resource, randomized, @catalog) ==
                Map.fetch!(expected, resource)
