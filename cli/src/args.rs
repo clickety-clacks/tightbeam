@@ -206,6 +206,11 @@ pub enum Command {
         identity: Identity,
         work_item_id: String,
     },
+    Breathing {
+        identity: Identity,
+        target_kind: String,
+        target_id: String,
+    },
     Attend {
         identity: Identity,
         high: bool,
@@ -513,6 +518,7 @@ COMMANDS:
       Raise or lower the work item's priority. Open cards inherit the change.
   work-item-get <workItemId>
   work-item-trace <workItemId>
+  breathing <session|assignment|work-item> <id>
   attend [--high]
       Elect the attention tier of the reply you are about to give, during your
       own turn. --high marks it high; without the flag it is normal, which is
@@ -1461,6 +1467,24 @@ fn parse_with_optional_catalog(
                 work_item_id: parsed.positional[1].clone(),
             })
         }
+        "breathing" => {
+            if parsed.positional.len() != 3
+                || !matches!(
+                    parsed.positional[1].as_str(),
+                    "session" | "assignment" | "work-item"
+                )
+            {
+                return Err(
+                    "usage: tightbeam breathing <session|assignment|work-item> <id>".to_owned(),
+                );
+            }
+
+            Ok(Command::Breathing {
+                identity: identity(flags)?,
+                target_kind: parsed.positional[1].clone(),
+                target_id: parsed.positional[2].clone(),
+            })
+        }
         "attend" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam attend [--high]".to_owned());
@@ -1765,7 +1789,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2685,6 +2709,7 @@ mod tests {
                 "artifacts",
                 "attest",
                 "attests",
+                "breathing",
                 "add-user",
                 "cancel-wake",
                 "condition",
@@ -3267,7 +3292,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 
