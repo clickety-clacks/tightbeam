@@ -1632,6 +1632,9 @@ defmodule Tightbeam.GatewayTest do
     adapter_key = {:claude, "shared", "testhost"}
     assert Tightbeam.HarnessProcess.kill_fenced?(ctx.db, adapter_key)
 
+    assert %{status: "refused", refusal_code: "identity_mismatch"} =
+             Tightbeam.HarnessProcess.latest_kill_request(ctx.db, adapter_key)
+
     {:ok, blocked_seq} =
       Ledger.enqueue(ctx.db, %{
         session_key: "k1",

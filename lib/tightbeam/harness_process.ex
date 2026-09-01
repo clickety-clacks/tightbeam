@@ -338,7 +338,21 @@ defmodule Tightbeam.HarnessProcess do
 
           :no_launch
         else
-          create_no_launch_kill_refusal_in_txn(txn, key, adapter_key, attrs, at)
+          refusal = create_no_launch_kill_refusal_in_txn(txn, key, adapter_key, attrs, at)
+
+          # A rate-limit incident fences new claims even when there is no
+          # process group to signal. The KILL request still closes as the
+          # typed identity_mismatch refusal; this fence represents the open
+          # health incident, not a successful KILL delivery.
+          if no_launch_health_fence_authorized?(txn, key, attrs) do
+            DB.Txn.q(
+              txn,
+              "INSERT OR IGNORE INTO harness_kill_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
+              [adapter_key, at]
+            )
+          end
+
+          refusal
         end
 
       row ->
@@ -434,10 +448,38 @@ defmodule Tightbeam.HarnessProcess do
            do: nil,
            else: "not_authorized"
 
+      {{:process, "tightbeam:harness-health"}, "harness_health_recovery"} ->
+        if no_launch_health_fence_authorized?(txn, {harness, "shared", host}, attrs),
+          do: nil,
+          else: "not_authorized"
+
       _ ->
         "not_authorized"
     end
   end
+
+  defp no_launch_health_fence_authorized?(
+         txn,
+         {harness, _preset, host},
+         %{
+           principal: {:process, "tightbeam:harness-health"},
+           authority_basis: "harness_health_recovery",
+           cause_kind: "harness_health_incident",
+           cause_id: incident_id
+         }
+       ) do
+    DB.Txn.q(
+      txn,
+      """
+      SELECT 1 FROM harness_health_incidents
+      WHERE id=?1 AND state='open' AND failureClass='rate-limit-dead'
+        AND harness=?2 AND host=?3
+      """,
+      [incident_id, to_string(harness), host]
+    ) == [[1]]
+  end
+
+  defp no_launch_health_fence_authorized?(_txn, _key, _attrs), do: false
 
   @doc "Create an authorized durable KILL request before any group signal."
   def request_kill(db, key, attrs) do
