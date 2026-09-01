@@ -58,6 +58,8 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     "critical-state" => "critical state"
   }
 
+  @item_wire_schema StateResources.item_wire_schema()
+
   test "one shared encoder emits the exact R7/R7a order for every rebuildable resource" do
     registry_resources =
       Registry.rows()
@@ -534,7 +536,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   defp value("transcript messages", "messageType"), do: "agent"
 
   defp value(resource, field) do
-    StateResources.item_wire_schema()
+    @item_wire_schema
     |> Map.fetch!(resource)
     |> Map.fetch!(field)
     |> valid_value(field)
