@@ -70,6 +70,115 @@ defmodule Tightbeam.BreathingTest do
     assert winner.openedAt == 1
   end
 
+  test "attestation testimony never makes an otherwise idle assignment breathe", %{
+    db: db,
+    holder: holder
+  } do
+    :ok = insert_work_item(db, "wi_attest")
+    :ok = insert_assignment(db, "asg_attest", holder, "wi_attest", 1)
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_progress', 'asg_attest', 'progress', '#{holder}', 10), ('att_reaffirm', 'asg_attest', 'verdict', '#{holder}', 11)"
+      )
+
+    assert %{breathing: false, reason: "no_current_path"} =
+             query(db, "assignment", "asg_attest")
+  end
+
+  test "all state gates and terminal reasons beat physical paths", %{db: db, holder: holder} do
+    assert %{reason: "session_missing", breathing: false} = query(db, "session", "missing")
+    assert %{reason: "assignment_missing", breathing: false} = query(db, "assignment", "missing")
+    assert %{reason: "work_item_missing", breathing: false} = query(db, "work-item", "missing")
+
+    :ok = insert_work_item(db, "wi_terminal")
+    :ok = insert_assignment(db, "asg_closed", holder, "wi_terminal", 1)
+    :ok = insert_turn(db, holder, "asg_closed", nil, "running", 1, nil)
+    :ok = DB.execute(db, "UPDATE assignments SET state = 'closed' WHERE id = 'asg_closed'")
+
+    assert %{reason: "assignment_closed", breathing: false} =
+             query(db, "assignment", "asg_closed")
+
+    :ok = insert_assignment(db, "asg_canceled", holder, "wi_terminal", 2)
+    :ok = insert_turn(db, holder, "asg_canceled", nil, "canceled", 2, nil)
+
+    assert %{reason: "latest_terminal_canceled", breathing: false} =
+             query(db, "assignment", "asg_canceled")
+
+    :ok = DB.execute(db, "UPDATE work_items SET state = 'closed' WHERE id = 'wi_terminal'")
+
+    assert %{reason: "work_item_terminal", breathing: false} =
+             query(db, "work-item", "wi_terminal")
+  end
+
+  test "session precedence is running, queued, then the earliest pending wake", %{
+    db: db,
+    holder: holder
+  } do
+    :ok = insert_wake(db, "wake_z", holder, nil, nil, 8)
+    :ok = insert_wake(db, "wake_a", holder, nil, nil, 8)
+
+    assert %{reason: "pending_wake", evidence: %{wake: %{"wakeId" => "wake_a"}}} =
+             query(db, "session", holder)
+
+    :ok = insert_turn(db, holder, nil, nil, "queued", 4, nil)
+    :ok = insert_turn(db, holder, nil, nil, "running", 3, nil)
+
+    assert %{reason: "running_turn", breathing: true} = query(db, "session", holder)
+
+    :ok = DB.execute(db, "UPDATE turns SET status = 'delivered' WHERE status = 'running'")
+    assert %{reason: "queued_turn", breathing: true} = query(db, "session", holder)
+  end
+
+  test "retired assignment holder and direct work-item path are physical gates", %{
+    db: db,
+    holder: holder
+  } do
+    :ok = insert_work_item(db, "wi_direct")
+    :ok = insert_turn(db, holder, nil, "wi_direct", "running", 4, nil)
+
+    assert %{reason: "running_turn", breathing: true} = query(db, "work-item", "wi_direct")
+
+    :ok = insert_work_item(db, "wi_holder")
+    :ok = insert_assignment(db, "asg_holder", holder, "wi_holder", 1)
+    :ok = DB.execute(db, "UPDATE sessions SET state = 'retired' WHERE sessionKey = '#{holder}'")
+
+    assert %{reason: "holder_retired", breathing: false} = query(db, "assignment", "asg_holder")
+  end
+
+  test "work-item reports no open and ordered non-lively linked assignments", %{
+    db: db,
+    holder: holder
+  } do
+    :ok = insert_work_item(db, "wi_empty")
+    assert %{reason: "no_open_assignment", breathing: false} = query(db, "work-item", "wi_empty")
+
+    :ok = insert_work_item(db, "wi_idle")
+    :ok = insert_assignment(db, "asg_late", holder, "wi_idle", 2)
+    :ok = insert_assignment(db, "asg_early", holder, "wi_idle", 1)
+
+    assert %{reason: "all_open_assignments_not_lively", evidence: %{open_assignments: entries}} =
+             query(db, "work-item", "wi_idle")
+
+    assert Enum.map(entries, & &1.id) == ["asg_early", "asg_late"]
+    assert Enum.all?(entries, &(!&1.breathing && &1.reason == "no_current_path"))
+  end
+
+  test "authorization errors never return a synthetic breathing answer", %{db: db, holder: holder} do
+    assert %{code: "process_denied"} =
+             Breathing.query(db, %{
+               principal: {:process, "gate"},
+               params: %{target_kind: "session", target_id: holder}
+             })
+
+    assert %{code: "invalid_breathing_target"} =
+             Breathing.query(db, %{
+               principal: {:user, "owner"},
+               params: %{target_kind: "turn", target_id: holder}
+             })
+  end
+
   defp query(db, kind, id),
     do:
       Breathing.query(db, %{
