@@ -1,3 +1,242 @@
+defmodule Tightbeam.Schema.IdleProofDigestSql do
+  @moduledoc false
+
+  @mask 0xFFFFFFFF
+  @initial_hash [
+    0x6A09E667,
+    0xBB67AE85,
+    0x3C6EF372,
+    0xA54FF53A,
+    0x510E527F,
+    0x9B05688C,
+    0x1F83D9AB,
+    0x5BE0CD19
+  ]
+  @round_constants [
+    0x428A2F98,
+    0x71374491,
+    0xB5C0FBCF,
+    0xE9B5DBA5,
+    0x3956C25B,
+    0x59F111F1,
+    0x923F82A4,
+    0xAB1C5ED5,
+    0xD807AA98,
+    0x12835B01,
+    0x243185BE,
+    0x550C7DC3,
+    0x72BE5D74,
+    0x80DEB1FE,
+    0x9BDC06A7,
+    0xC19BF174,
+    0xE49B69C1,
+    0xEFBE4786,
+    0x0FC19DC6,
+    0x240CA1CC,
+    0x2DE92C6F,
+    0x4A7484AA,
+    0x5CB0A9DC,
+    0x76F988DA,
+    0x983E5152,
+    0xA831C66D,
+    0xB00327C8,
+    0xBF597FC7,
+    0xC6E00BF3,
+    0xD5A79147,
+    0x06CA6351,
+    0x14292967,
+    0x27B70A85,
+    0x2E1B2138,
+    0x4D2C6DFC,
+    0x53380D13,
+    0x650A7354,
+    0x766A0ABB,
+    0x81C2C92E,
+    0x92722C85,
+    0xA2BFE8A1,
+    0xA81A664B,
+    0xC24B8B70,
+    0xC76C51A3,
+    0xD192E819,
+    0xD6990624,
+    0xF40E3585,
+    0x106AA070,
+    0x19A4C116,
+    0x1E376C08,
+    0x2748774C,
+    0x34B0BCB5,
+    0x391C0CB3,
+    0x4ED8AA4A,
+    0x5B9CCA4F,
+    0x682E6FF3,
+    0x748F82EE,
+    0x78A5636F,
+    0x84C87814,
+    0x8CC70208,
+    0x90BEFFFA,
+    0xA4506CEB,
+    0xBEF9A3F7,
+    0xC67178F2
+  ]
+
+  def seal_trigger_sql do
+    schedule_word = schedule_word_expression()
+    [t1, t2] = round_terms()
+    next_work = [u32("(#{t1}) + (#{t2})"), "a", "b", "c", u32("d + (#{t1})"), "e", "f", "g"]
+
+    next_hash =
+      Enum.zip(hash_names(), next_work)
+      |> Enum.map(fn {hash, work} ->
+        "CASE WHEN (step % 64)=63 THEN #{u32("#{hash} + (#{work})")} ELSE #{hash} END"
+      end)
+
+    carried_work =
+      Enum.zip(next_hash, next_work)
+      |> Enum.map(fn {hash, work} ->
+        "CASE WHEN (step % 64)=63 THEN (#{hash}) ELSE (#{work}) END"
+      end)
+
+    constants =
+      @round_constants
+      |> Enum.with_index()
+      |> Enum.map_join(",", fn {constant, round} -> "(#{round},#{constant})" end)
+
+    initial = Enum.join(@initial_hash, ",")
+    round_columns = Enum.join(["step" | hash_names() ++ work_names()], ",")
+    round_values = Enum.join(["step + 1" | next_hash ++ carried_work], ",\n          ")
+
+    """
+    CREATE TRIGGER IF NOT EXISTS idle_worker_proof_seal_integrity
+    BEFORE UPDATE OF sealed ON idle_worker_retire_proofs
+    WHEN OLD.sealed=0 AND NEW.sealed=1
+    BEGIN
+      SELECT CASE WHEN NEW.blockerCount != (
+        SELECT COUNT(*) FROM idle_worker_retire_blockers b
+        WHERE b.childSessionKey=NEW.childSessionKey AND b.generation=NEW.generation
+          AND b.proofVersion=NEW.proofVersion
+      ) THEN RAISE(ABORT, 'idle-worker blocker proof header is immutable') END;
+
+      SELECT CASE WHEN NEW.blockerDigest != (
+        WITH RECURSIVE
+        payload(message) AS (
+          SELECT CAST('[' || group_concat(encoded, ',') || ']' AS BLOB)
+          FROM (
+            SELECT json_array(leasedSessionKey,reason,startedAt,expiresAt,hardDeadline,updatedAt) AS encoded
+            FROM idle_worker_retire_blockers
+            WHERE childSessionKey=NEW.childSessionKey AND generation=NEW.generation
+              AND proofVersion=NEW.proofVersion
+            ORDER BY ordinal
+          )
+        ),
+        meta(hex_message, byte_count, padded_count) AS (
+          SELECT hex(message), length(message), ((length(message) + 72) / 64) * 64 FROM payload
+        ),
+        bytes(position, value) AS (
+          SELECT 0,
+            CASE
+              WHEN byte_count > 0 THEN
+                (instr('0123456789ABCDEF', substr(hex_message,1,1))-1) * 16
+                  + instr('0123456789ABCDEF', substr(hex_message,2,1))-1
+              ELSE 128
+            END
+          FROM meta
+          UNION ALL
+          SELECT position + 1,
+            CASE
+              WHEN position + 1 < byte_count THEN
+                (instr('0123456789ABCDEF', substr(hex_message,2*(position+1)+1,1))-1) * 16
+                  + instr('0123456789ABCDEF', substr(hex_message,2*(position+1)+2,1))-1
+              WHEN position + 1 = byte_count THEN 128
+              WHEN position + 1 >= padded_count - 8 THEN
+                ((byte_count * 8) >> ((padded_count - 1 - (position + 1)) * 8)) & 255
+              ELSE 0
+            END
+          FROM bytes, meta
+          WHERE position + 1 < padded_count
+        ),
+        initial_words(block, word_index, word) AS (
+          SELECT position / 64, (position % 64) / 4,
+            SUM(value << (24 - (position % 4) * 8)) & #{@mask}
+          FROM bytes
+          GROUP BY position / 64, (position % 64) / 4
+        ),
+        schedule(block, word_index, words) AS (
+          SELECT block, 15, json_group_array(word)
+          FROM (SELECT block,word_index,word FROM initial_words ORDER BY block,word_index)
+          GROUP BY block
+          UNION ALL
+          SELECT block, word_index + 1,
+            json_insert(words, '$[#]', #{schedule_word})
+          FROM schedule
+          WHERE word_index < 63
+        ),
+        constants(round, constant) AS (VALUES #{constants}),
+        rounds(#{round_columns}) AS (
+          SELECT 0,#{initial},#{initial}
+          UNION ALL
+          SELECT #{round_values}
+          FROM rounds
+          JOIN constants ON constants.round=(step % 64)
+          JOIN schedule ON schedule.block=(step / 64) AND schedule.word_index=63
+          JOIN meta
+          WHERE step < (padded_count / 64) * 64
+        )
+        SELECT lower(printf('%08x%08x%08x%08x%08x%08x%08x%08x',h0,h1,h2,h3,h4,h5,h6,h7))
+        FROM rounds, meta
+        WHERE step=(padded_count / 64) * 64
+      ) THEN RAISE(ABORT, 'idle-worker blocker proof header is immutable') END;
+    END
+    """
+  end
+
+  defp schedule_word_expression do
+    words = "words"
+    index = "word_index"
+    w2 = json_word(words, "#{index}-1")
+    w7 = json_word(words, "#{index}-6")
+    w15 = json_word(words, "#{index}-14")
+    w16 = json_word(words, "#{index}-15")
+    u32("(#{small_sigma1(w2)}) + (#{w7}) + (#{small_sigma0(w15)}) + (#{w16})")
+  end
+
+  defp round_terms do
+    word = json_word("schedule.words", "step % 64")
+
+    t1 =
+      u32("h + (#{big_sigma1("e")}) + ((e & f) | ((~e) & g)) + constants.constant + (#{word})")
+
+    t2 = u32("(#{big_sigma0("a")}) + ((a & b) | (a & c) | (b & c))")
+    [t1, t2]
+  end
+
+  defp small_sigma0(value),
+    do: xor3(rotate_right(value, 7), rotate_right(value, 18), right(value, 3))
+
+  defp small_sigma1(value),
+    do: xor3(rotate_right(value, 17), rotate_right(value, 19), right(value, 10))
+
+  defp big_sigma0(value),
+    do: xor3(rotate_right(value, 2), rotate_right(value, 13), rotate_right(value, 22))
+
+  defp big_sigma1(value),
+    do: xor3(rotate_right(value, 6), rotate_right(value, 11), rotate_right(value, 25))
+
+  defp xor3(left, middle, right) do
+    u32(
+      "(((#{left}) | (#{middle}) | (#{right})) & ~(((#{left}) & (#{middle})) | ((#{left}) & (#{right})) | ((#{middle}) & (#{right})))) | ((#{left}) & (#{middle}) & (#{right}))"
+    )
+  end
+
+  defp rotate_right(value, bits),
+    do: u32("((#{value}) >> #{bits}) | ((#{value}) << #{32 - bits})")
+
+  defp right(value, bits), do: "((#{value}) >> #{bits})"
+  defp u32(expression), do: "((#{expression}) & #{@mask})"
+  defp json_word(json, index), do: "json_extract(#{json}, '$[' || (#{index}) || ']')"
+  defp hash_names, do: Enum.map(0..7, &"h#{&1}")
+  defp work_names, do: ~w(a b c d e f g h)
+end
+
 defmodule Tightbeam.Schema do
   @moduledoc "The single production-owned schema bootstrap for a Tightbeam database."
 
@@ -1088,6 +1327,11 @@ defmodule Tightbeam.Schema do
         OR NEW.blockerDigest IS NOT OLD.blockerDigest OR NOT (OLD.sealed=0 AND NEW.sealed=1)
       BEGIN SELECT RAISE(ABORT, 'idle-worker blocker proof header is immutable'); END
       """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_proof_seal_integrity",
+      sql: Tightbeam.Schema.IdleProofDigestSql.seal_trigger_sql()
     },
     %{
       type: "trigger",

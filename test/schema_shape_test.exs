@@ -32,7 +32,8 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, DB, Schema}
+  alias Tightbeam.{Assignments, DB, Idempotency, Schema}
+  alias Tightbeam.DB.Txn
 
   @shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
@@ -196,6 +197,109 @@ defmodule Tightbeam.SchemaShapeTest do
              )
 
     assert :ok = Schema.ensure_all(db)
+  end
+
+  test "idle-worker blocker proof seal and history reject every direct SQL mutation rail",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    insert_idle_proof_fixture(db)
+
+    blockers = [["lease-one", "critical \"lease\" 雪", 20, 30, 40, 25]]
+    digest = blocker_digest(blockers)
+    assert {:ok, :ok} = insert_proof(db, 1, blockers, 1, digest, seal: true)
+
+    assert_db_refusal(
+      db,
+      """
+      INSERT INTO idle_worker_retire_blockers
+        (childSessionKey,generation,proofVersion,ordinal,leasedSessionKey,reason,
+         startedAt,expiresAt,hardDeadline,updatedAt)
+      VALUES ('proof-child',1,1,2,'lease-two','late',20,30,40,25)
+      """,
+      "idle-worker blocker proof is sealed"
+    )
+
+    assert_db_refusal(
+      db,
+      "UPDATE idle_worker_retire_blockers SET reason='changed' WHERE childSessionKey='proof-child' AND generation=1 AND proofVersion=1 AND ordinal=1",
+      "idle-worker blocker proof row is immutable"
+    )
+
+    assert_db_refusal(
+      db,
+      "DELETE FROM idle_worker_retire_blockers WHERE childSessionKey='proof-child' AND generation=1 AND proofVersion=1 AND ordinal=1",
+      "idle-worker blocker proof row is immutable"
+    )
+
+    assert_db_refusal(
+      db,
+      "UPDATE idle_worker_retire_proofs SET retryAt=41 WHERE childSessionKey='proof-child' AND generation=1 AND proofVersion=1",
+      "idle-worker blocker proof header is immutable"
+    )
+
+    assert_db_refusal(
+      db,
+      "DELETE FROM idle_worker_retire_proofs WHERE childSessionKey='proof-child' AND generation=1 AND proofVersion=1",
+      "idle-worker blocker proof header is immutable"
+    )
+
+    assert_db_refusal(
+      db,
+      "UPDATE idle_worker_generations SET retireProofVersion=99 WHERE childSessionKey='proof-child' AND generation=1",
+      "idle-worker generation requires a sealed blocker proof"
+    )
+
+    other_blockers = [["lease-one", "unsealed", 21, 31, 41, 26]]
+    other_digest = blocker_digest(other_blockers)
+    assert {:ok, :ok} = insert_proof(db, 2, other_blockers, 1, other_digest)
+
+    assert_db_refusal(
+      db,
+      "UPDATE idle_worker_generations SET retireProofVersion=2 WHERE childSessionKey='proof-child' AND generation=1",
+      "idle-worker generation requires a sealed blocker proof"
+    )
+
+    assert_db_refusal(
+      db,
+      """
+      INSERT INTO idle_worker_retire_blockers
+        (childSessionKey,generation,proofVersion,ordinal,leasedSessionKey,reason,
+         startedAt,expiresAt,hardDeadline,updatedAt)
+      VALUES ('proof-child',1,2,1,'lease-two','duplicate ordinal',21,31,41,26)
+      """,
+      "UNIQUE constraint failed"
+    )
+
+    assert_db_refusal(
+      db,
+      """
+      INSERT INTO idle_worker_retire_blockers
+        (childSessionKey,generation,proofVersion,ordinal,leasedSessionKey,reason,
+         startedAt,expiresAt,hardDeadline,updatedAt)
+      VALUES ('proof-child',1,2,2,'lease-one','duplicate lease',21,31,41,26)
+      """,
+      "UNIQUE constraint failed"
+    )
+
+    count_blockers = [["lease-one", "wrong count", 22, 32, 42, 27]]
+
+    assert {:error, %DB.Error{message: count_message}} =
+             insert_proof(db, 3, count_blockers, 2, blocker_digest(count_blockers), seal: true)
+
+    assert count_message =~ "idle-worker blocker proof header is immutable"
+
+    digest_blockers = [["lease-one", "wrong digest", 23, 33, 43, 28]]
+
+    assert {:error, %DB.Error{message: digest_message}} =
+             insert_proof(db, 4, digest_blockers, 1, String.duplicate("0", 64), seal: true)
+
+    assert digest_message =~ "idle-worker blocker proof header is immutable"
+
+    assert {:ok, [[1, ^digest, 1]]} =
+             DB.query(
+               db,
+               "SELECT blockerCount,blockerDigest,sealed FROM idle_worker_retire_proofs WHERE childSessionKey='proof-child' AND generation=1 AND proofVersion=1"
+             )
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
@@ -862,6 +966,103 @@ defmodule Tightbeam.SchemaShapeTest do
       )
 
     List.flatten(rows)
+  end
+
+  defp insert_idle_proof_fixture(db) do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO users(userId,isAdmin,createdAt) VALUES ('proof-owner',0,1);
+      INSERT INTO sessions
+        (sessionKey,displayName,kind,isBuiltIn,ownerUserId,origin,archetype,harness,
+         provider,model,host,state,createdAt,updatedAt)
+      VALUES
+        ('proof-parent','Parent','custom',0,'proof-owner','user:proof-owner','default','claude',
+         'anthropic','fable','local','active',2,2),
+        ('proof-child','Child','custom',0,'proof-owner','user:proof-owner','default','claude',
+         'anthropic','fable','local','active',3,3),
+        ('lease-one','Lease one','custom',0,'proof-owner','user:proof-owner','default','claude',
+         'anthropic','fable','local','active',4,4),
+        ('lease-two','Lease two','custom',0,'proof-owner','user:proof-owner','default','claude',
+         'anthropic','fable','local','active',5,5);
+      INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
+      VALUES ('asg-proof','proof basis','proof-child','proof-owner',6);
+      INSERT INTO decision_requests
+        (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,
+         question,context,status)
+      VALUES
+        ('dr-proof','statute','session:proof-child','proof-owner',7,40,
+         'idle-worker-disposition','session:proof-child#1','Retain or retire?','{}','open');
+      INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,firedAt)
+      VALUES ('w-proof','proof-parent','process:tightbeam','Choose',40,'pending',8,NULL);
+      INSERT INTO idle_worker_generations
+        (childSessionKey,generation,state,armedAt,armedBasisKind,armedBasisId,zeroAt,
+         zeroBasisAssignmentId,initialDeadlineAt,decisionRequestId,promptWakeId,
+         parentSessionKey,routingKind,lineageRung)
+      VALUES
+        ('proof-child',1,'pending',6,'assignment_open','asg-proof',7,'asg-proof',40,
+         'dr-proof','w-proof','proof-parent','lineage',1);
+      """)
+  end
+
+  defp insert_proof(db, version, blockers, count, digest, opts \\ []) do
+    DB.transaction(db, fn txn ->
+      Txn.q(
+        txn,
+        """
+        INSERT INTO idle_worker_retire_proofs
+          (childSessionKey,generation,proofVersion,decisionRequestId,actingPrincipal,
+           capturedAt,retryAt,blockerCount,blockerDigest,sealed)
+        VALUES ('proof-child',1,?1,'dr-proof','session:proof-parent',10,40,?2,?3,0)
+        """,
+        [version, count, digest]
+      )
+
+      Enum.with_index(blockers, 1)
+      |> Enum.each(fn {[leased_session, reason, started_at, expires_at, deadline, updated_at],
+                       ordinal} ->
+        Txn.q(
+          txn,
+          """
+          INSERT INTO idle_worker_retire_blockers
+            (childSessionKey,generation,proofVersion,ordinal,leasedSessionKey,reason,
+             startedAt,expiresAt,hardDeadline,updatedAt)
+          VALUES ('proof-child',1,?1,?2,?3,?4,?5,?6,?7,?8)
+          """,
+          [
+            version,
+            ordinal,
+            leased_session,
+            reason,
+            started_at,
+            expires_at,
+            deadline,
+            updated_at
+          ]
+        )
+      end)
+
+      if Keyword.get(opts, :seal, false) do
+        Txn.q(
+          txn,
+          "UPDATE idle_worker_retire_proofs SET sealed=1 WHERE childSessionKey='proof-child' AND generation=1 AND proofVersion=?1",
+          [version]
+        )
+      end
+
+      :ok
+    end)
+  end
+
+  defp blocker_digest(blockers) do
+    blockers
+    |> Idempotency.canonical_json()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp assert_db_refusal(db, sql, expected) do
+    assert {:error, %DB.Error{message: message}} = DB.query(db, sql)
+    assert message =~ expected
   end
 
   defp drop_liveness_activation(db) do
