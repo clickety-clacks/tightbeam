@@ -49,6 +49,18 @@ defmodule Tightbeam.StateResources do
   FROM turns AS t
   """
 
+  @message_select """
+  SELECT m.seq, m.id, m.sessionKey, m.role, m.messageType, m.content,
+         m.timestamp, m.sender, m.deviceId, m.clientMessageId,
+         m.replyToMessageId, m.replyToClientMessageId, m.llmVisibleMessageId,
+         m.attachments, m.attentionTier,
+         t.seq, t.assignmentId, t.jobRef, t.harness, t.model,
+         t.thinkingLevel, t.modelContext
+  FROM messages AS m
+  LEFT JOIN turns AS t
+    ON t.messageId = CASE m.role WHEN 'user' THEN m.id ELSE m.replyToMessageId END
+  """
+
   alias Tightbeam.{
     AdminProjection,
     Artifacts,
@@ -461,7 +473,18 @@ defmodule Tightbeam.StateResources do
     end
   end
 
-  def query_message(db, id), do: Tightbeam.Projection.get(db, id)
+  # This is the same pinned relationship the transcript reader uses: the user
+  # message owns the turn and an assistant message points back to it. The
+  # production enqueue path is the sole turn-bearing writer, so one message
+  # resolves to zero or one turn. Refuse duplicate dirt instead of selecting a
+  # row by timing or count.
+  def query_message(source, id) do
+    case query(source, @message_select <> " WHERE m.id = ?1", [id]) do
+      [row] -> message_row(row)
+      [] -> nil
+      _rows -> raise ArgumentError, "transcript message resolves to more than one turn"
+    end
+  end
 
   def query_device(db, id) do
     case Devices.by_id(db, id) do
@@ -866,13 +889,43 @@ defmodule Tightbeam.StateResources do
 
   def message(row) do
     stored_type = value(row, :message_type)
-    row = public(row)
+    message_type = nullable_string!(stored_type, "messageType")
 
-    case stored_type do
-      nil -> Map.delete(row, "messageType")
-      type when is_binary(type) -> Map.put(row, "messageType", type)
-      _other -> raise ArgumentError, "messageType must be a string when present"
-    end
+    item =
+      exact!(
+        "transcript messages",
+        %{
+          "id" => required_string!(row, :id),
+          "seq" => required_integer!(row, :seq),
+          "sessionKey" => required_string!(row, :session_key),
+          "role" => required_string!(row, :role),
+          "messageType" => message_type,
+          "content" => required_wire_string!(value(row, :content), "content"),
+          "at" => message_at!(row),
+          "sender" => nullable_string!(value(row, :sender), "sender"),
+          "deviceId" => nullable_string!(value(row, :device_id), "deviceId"),
+          "clientMessageId" =>
+            nullable_string!(value(row, :client_message_id), "clientMessageId"),
+          "replyToMessageId" =>
+            nullable_string!(value(row, :reply_to_message_id), "replyToMessageId"),
+          "replyToClientMessageId" =>
+            nullable_string!(value(row, :reply_to_client_message_id), "replyToClientMessageId"),
+          "llmVisibleMessageId" => required_string!(row, :llm_visible_message_id),
+          "attachments" => required_list!(value(row, :attachments), "attachments"),
+          "attentionTier" => required_integer!(row, :attention_tier),
+          "turnSeq" => nullable_integer!(value(row, :turn_seq), "turnSeq"),
+          "assignmentId" => nullable_string!(value(row, :assignment_id), "assignmentId"),
+          "jobRef" => nullable_string!(value(row, :job_ref), "jobRef"),
+          "harness" => nullable_string!(value(row, :harness), "harness"),
+          "provider" => message_provider(row),
+          "model" => nullable_string!(value(row, :model), "model"),
+          "effort" => message_effort(row),
+          "context" => message_context(row),
+          "rowVersion" => message_row_version!(row)
+        }
+      )
+
+    if is_nil(message_type), do: Map.delete(item, "messageType"), else: item
   end
 
   def condition_fact(row) do
@@ -1157,6 +1210,62 @@ defmodule Tightbeam.StateResources do
     }
   end
 
+  defp message_row([
+         seq,
+         id,
+         session_key,
+         role,
+         message_type,
+         content,
+         at,
+         sender,
+         device_id,
+         client_message_id,
+         reply_to_message_id,
+         reply_to_client_message_id,
+         llm_visible_message_id,
+         attachments,
+         attention_tier,
+         turn_seq,
+         assignment_id,
+         job_ref,
+         harness,
+         model,
+         effort,
+         context
+       ]) do
+    {harness, model, effort, context} =
+      if role == "assistant",
+        do: {harness, model, effort, context},
+        else: {nil, nil, nil, nil}
+
+    %{
+      seq: seq,
+      id: id,
+      session_key: session_key,
+      role: role,
+      message_type: message_type,
+      content: content,
+      at: at,
+      sender: sender,
+      device_id: device_id,
+      client_message_id: client_message_id,
+      reply_to_message_id: reply_to_message_id,
+      reply_to_client_message_id: reply_to_client_message_id,
+      llm_visible_message_id: llm_visible_message_id,
+      attachments: JSON.decode!(attachments),
+      attention_tier: attention_tier,
+      turn_seq: turn_seq,
+      assignment_id: assignment_id,
+      job_ref: job_ref,
+      harness: harness,
+      model: model,
+      effort: effort,
+      context: context,
+      row_version: seq
+    }
+  end
+
   defp correlate(row, primary, source) do
     case row[source] do
       nil -> row
@@ -1221,6 +1330,55 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  defp nullable_integer!(nil, _field), do: nil
+  defp nullable_integer!(value, _field) when is_integer(value), do: value
+
+  defp nullable_integer!(_value, field),
+    do: raise(ArgumentError, "#{field} must be an integer or null")
+
+  defp message_at!(row) do
+    case value(row, :at) || value(row, :timestamp) do
+      at when is_integer(at) -> at
+      _ -> raise ArgumentError, "at must be an integer"
+    end
+  end
+
+  defp message_provider(row) do
+    case value(row, :provider) do
+      nil ->
+        case value(row, :harness) do
+          nil ->
+            nil
+
+          harness when is_binary(harness) ->
+            Harness.parse!(harness).credential_provider() |> to_string()
+
+          _other ->
+            raise ArgumentError, "harness must be a string or null"
+        end
+
+      provider ->
+        nullable_string!(provider, "provider")
+    end
+  end
+
+  defp message_effort(row),
+    do: nullable_string!(value(row, :effort) || value(row, :thinking_level), "effort")
+
+  defp message_context(row) do
+    case value(row, :context) do
+      nil -> value(row, :model_context)
+      context -> context
+    end
+  end
+
+  defp message_row_version!(row) do
+    case value(row, :row_version) || value(row, :seq) do
+      version when is_integer(version) and version > 0 -> version
+      _ -> raise ArgumentError, "rowVersion must be a positive integer"
+    end
+  end
+
   defp required_version!(row) do
     case value(row, :row_version) do
       value when is_integer(value) and value > 0 -> value
@@ -1237,6 +1395,9 @@ defmodule Tightbeam.StateResources do
 
   defp required_list!(value, _field) when is_list(value), do: value
   defp required_list!(_value, field), do: raise(ArgumentError, "#{field} must be an array")
+
+  defp required_wire_string!(value, _field) when is_binary(value), do: value
+  defp required_wire_string!(_value, field), do: raise(ArgumentError, "#{field} must be a string")
 
   defp sorted_strings!(value, field) do
     value

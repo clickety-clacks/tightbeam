@@ -97,16 +97,20 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
   end
 
   test "A17 randomizes map and set order 1,000 times without changing item bytes" do
-    expected =
+    items =
       Map.new(@field_order, fn {resource, fields} ->
-        item = item(resource, fields)
+        {resource, item(resource, fields)}
+      end)
+
+    expected =
+      Map.new(items, fn {resource, item} ->
         {resource, StateResources.encode_item(resource, item, @catalog)}
       end)
 
     :rand.seed(:exsss, {17, 71, 171})
 
-    for _iteration <- 1..1_000, {resource, fields} <- @field_order do
-      randomized = resource |> item(fields) |> randomize_item(resource)
+    for _iteration <- 1..1_000, {resource, item} <- items do
+      randomized = randomize_item(item, resource)
 
       assert StateResources.encode_item(resource, randomized, @catalog) ==
                Map.fetch!(expected, resource)
@@ -473,6 +477,30 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     additive = put_in(notice, ["payload", "priority"], 4)
     refute StateResources.item_shape_superset?("work-items", additive["payload"])
     assert_raise ArgumentError, fn -> Publisher.encode_wire_notice(additive) end
+
+    assert_raise ArgumentError, ~r/no permitted legacy partial shape/, fn ->
+      Publisher.encode_wire_notice(%{
+        "class" => "message.created",
+        "op" => "upsert",
+        "payload" => %{
+          "id" => "s_legacy",
+          "seq" => 1,
+          "sessionKey" => "agent:legacy",
+          "role" => "assistant",
+          "content" => "legacy",
+          "timestamp" => 1,
+          "sender" => "tightbeam",
+          "deviceId" => nil,
+          "clientMessageId" => nil,
+          "replyToMessageId" => nil,
+          "replyToClientMessageId" => nil,
+          "llmVisibleMessageId" => "s_legacy",
+          "attachments" => [],
+          "attentionTier" => 0,
+          "rowVersion" => 1
+        }
+      })
+    end
 
     for {class, payload} <- [
           {"config.updated", %{"key" => "default-priority", "value" => "private-priority"}},

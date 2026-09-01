@@ -561,7 +561,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert :ok =
              Publisher.committed(
                "message.created",
-               %{id: "s_1", seq: 9, session_key: "agent:one", content: "hello"},
+               complete_message("s_1", 9, "agent:one", "hello"),
                %{"ownerUserId" => "flynn", "sessionKey" => "agent:one"}
              )
 
@@ -606,7 +606,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
                  {:appended, message}
                end)
 
-      fetched_item = db |> Projection.get(message.id) |> StateResources.message()
+      fetched_item = StateResources.query_message(db, message.id) |> StateResources.message()
 
       assert %{
                "class" => "message.created",
@@ -631,6 +631,124 @@ defmodule Tightbeam.Firehose.PublisherTest do
         assert payload["messageType"] == expected_type, label
       end
     end)
+  end
+
+  test "message query and Publisher emit exact R7 and R7m bytes from one shared item" do
+    db = :firehose_message_r7_db
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('flynn',1,'admin_add',1)"
+      )
+
+    register_testhost(db)
+
+    Org.create(db, %{
+      session_key: "message-r7",
+      display_name: "Message R7",
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable", effort: "medium", context: "1m")
+    })
+
+    assert {:ok, {:appended, user_message, turn_seq}} =
+             DB.transaction(db, fn txn ->
+               {:appended, message} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: "message-r7",
+                   role: "user",
+                   content: "build the shared item",
+                   timestamp: 1_788_200_000_001,
+                   sender: "user:flynn",
+                   device_id: "device-1",
+                   client_message_id: "client-1",
+                   attachments: []
+                 })
+
+               {:ok, turn_seq} =
+                 Ledger.enqueue_in_txn(txn, %{
+                   session_key: "message-r7",
+                   message_id: message.id,
+                   origin: "agent:requester",
+                   prompt: message.content,
+                   assignment_id: "asg_r7",
+                   job_ref: "wi_r7"
+                 })
+
+               :ok = Publisher.message_in_txn(txn, "message-r7", message, "flynn")
+               {:appended, message, turn_seq}
+             end)
+
+    assert %{"class" => "session.updated"} = receive_notice()
+    r7m_notice = receive_notice()
+    r7m_item = StateResources.query_message(db, user_message.id) |> StateResources.message()
+
+    r7m_bytes =
+      ~s({"id":"#{user_message.id}","seq":#{user_message.seq},"sessionKey":"message-r7","role":"user","content":"build the shared item","at":1788200000001,"sender":"user:flynn","deviceId":"device-1","clientMessageId":"client-1","replyToMessageId":null,"replyToClientMessageId":null,"llmVisibleMessageId":"client-1","attachments":[],"attentionTier":0,"turnSeq":#{turn_seq},"assignmentId":"asg_r7","jobRef":"wi_r7","harness":null,"provider":null,"model":null,"effort":null,"context":null,"rowVersion":#{user_message.seq}})
+
+    assert StateResources.encode_item("messages", r7m_item, %{}) == r7m_bytes
+    assert r7m_notice["payload"] == r7m_item
+
+    r7m_wire = Publisher.encode_wire_notice(r7m_notice, %{})
+    assert r7m_wire =~ ~s("payload":#{r7m_bytes})
+    refute r7m_wire =~ "messageType"
+    refute r7m_wire =~ "timestamp"
+
+    assert {:ok, _turn} = Ledger.claim_next(db, "message-r7", "lease-r7")
+    assert %{"class" => "turn.started"} = receive_notice()
+
+    assert {:ok, {:appended, assistant_message}} =
+             DB.transaction(db, fn txn ->
+               {:appended, message} =
+                 Projection.append_in_txn(txn, %{
+                   session_key: "message-r7",
+                   role: "assistant",
+                   message_type: "agent",
+                   content: "shared item restored",
+                   timestamp: 1_788_200_000_002,
+                   sender: "tightbeam",
+                   reply_to_message_id: user_message.id,
+                   reply_to_client_message_id: user_message.client_message_id,
+                   attachments: [
+                     %{
+                       "assetId" => "asset-1",
+                       "mimeType" => "text/plain",
+                       "filename" => "proof.txt",
+                       "size" => 5
+                     }
+                   ]
+                 })
+
+               :ok = Publisher.message_in_txn(txn, "message-r7", message, "flynn")
+               {:appended, message}
+             end)
+
+    r7_notice = receive_notice()
+    r7_item = StateResources.query_message(db, assistant_message.id) |> StateResources.message()
+
+    r7_bytes =
+      ~s({"id":"#{assistant_message.id}","seq":#{assistant_message.seq},"sessionKey":"message-r7","role":"assistant","messageType":"agent","content":"shared item restored","at":1788200000002,"sender":"tightbeam","deviceId":null,"clientMessageId":null,"replyToMessageId":"#{user_message.id}","replyToClientMessageId":"client-1","llmVisibleMessageId":"#{assistant_message.id}","attachments":[{"assetId":"asset-1","mimeType":"text/plain","filename":"proof.txt","size":5}],"attentionTier":0,"turnSeq":#{turn_seq},"assignmentId":"asg_r7","jobRef":"wi_r7","harness":"claude","provider":"anthropic","model":"fable","effort":"medium","context":"1m","rowVersion":#{assistant_message.seq}})
+
+    catalog = %{
+      {"testhost", "claude"} => [
+        %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    assert StateResources.encode_item("messages", r7_item, catalog) == r7_bytes
+    assert r7_notice["payload"] == r7_item
+    assert Publisher.encode_wire_notice(r7_notice, catalog) =~ ~s("payload":#{r7_bytes})
+
+    for forbidden <- ~w(timestamp thinkingLevel modelContext messageKind kind) do
+      refute Map.has_key?(r7_item, forbidden)
+    end
   end
 
   test "return emits the ruled decision_request.returned class" do
@@ -846,7 +964,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
           Publisher.committed_in_txn(
             txn,
             "message.created",
-            %{id: "first", seq: 1, session_key: "agent:first", content: "one"},
+            complete_message("first", 1, "agent:first", "one"),
             %{"sessionKey" => "agent:first"}
           )
 
@@ -870,7 +988,7 @@ defmodule Tightbeam.Firehose.PublisherTest do
           Publisher.committed_in_txn(
             txn,
             "message.created",
-            %{id: "second", seq: 2, session_key: "agent:second", content: "two"},
+            complete_message("second", 2, "agent:second", "two"),
             %{"sessionKey" => "agent:second"}
           )
         end)
@@ -1054,6 +1172,35 @@ defmodule Tightbeam.Firehose.PublisherTest do
       provider: "anthropic",
       model: Tightbeam.Model.new("fable")
     })
+  end
+
+  defp complete_message(id, seq, session_key, content) do
+    %{
+      id: id,
+      seq: seq,
+      session_key: session_key,
+      role: "assistant",
+      message_type: nil,
+      content: content,
+      timestamp: seq,
+      sender: "tightbeam",
+      device_id: nil,
+      client_message_id: nil,
+      reply_to_message_id: nil,
+      reply_to_client_message_id: nil,
+      llm_visible_message_id: id,
+      attachments: [],
+      attention_tier: 0,
+      turn_seq: nil,
+      assignment_id: nil,
+      job_ref: nil,
+      harness: nil,
+      provider: nil,
+      model: nil,
+      effort: nil,
+      context: nil,
+      row_version: seq
+    }
   end
 
   defp await_mailbox_size(pid, expected, attempts \\ 200)
