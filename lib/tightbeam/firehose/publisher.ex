@@ -11,10 +11,6 @@ defmodule Tightbeam.Firehose.Publisher do
 
   # Preserve only the exact result-shaped payloads already emitted on current main.
   # Any additive drift still refuses at the shared Publisher boundary.
-  @message_public_shape MapSet.new(
-                          ~w(id seq sessionKey role messageType content timestamp sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier rowVersion)
-                        )
-  @message_public_shape_without_type MapSet.delete(@message_public_shape, "messageType")
   @session_public_shape MapSet.new(
                           ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion)
                         )
@@ -36,7 +32,6 @@ defmodule Tightbeam.Firehose.Publisher do
     "work_item.reopened" => [@work_item_public_shape],
     "work_item.closed" => [@work_item_public_shape],
     "work_item.failed" => [@work_item_public_shape],
-    "message.created" => [@message_public_shape, @message_public_shape_without_type],
     "session.updated" => [@session_public_shape],
     "role.created" => [@role_public_shape],
     "role.removed" => [@role_public_shape, @role_removed_shape]
@@ -264,8 +259,14 @@ defmodule Tightbeam.Firehose.Publisher do
         end
 
     if is_binary(owner_user_id) do
-      committed_in_txn(txn, "message.created", message, %{
-        "messageId" => message.id,
+      message_id = message[:id] || message["id"]
+
+      canonical =
+        StateResources.query_message(txn, message_id) ||
+          raise ArgumentError, "committed transcript message is missing from its transaction"
+
+      committed_in_txn(txn, "message.created", canonical, %{
+        "messageId" => message_id,
         "sessionKey" => session_key,
         "ownerUserId" => owner_user_id
       })
