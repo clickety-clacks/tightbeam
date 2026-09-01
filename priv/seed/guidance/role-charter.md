@@ -28,5 +28,5 @@ outlives every card.
 Keep the charter honest as the role bends: authority granted later is a charter
 amendment on the record, never a quiet assumption. And when the role ends, the
 charter is why retirement is clean — what it owed is written, so what survives it
-(cards surrendered, artifacts recorded, desk dissolved) can be checked line by
+(cards disposed, artifacts recorded, desk dissolved) can be checked line by
 line.

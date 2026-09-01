@@ -16,7 +16,7 @@ defmodule Tightbeam.Firehose.Publisher do
                         )
   @message_public_shape_without_type MapSet.delete(@message_public_shape, "messageType")
   @session_public_shape MapSet.new(
-                          ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion effectiveParent effectiveParentSource identityGuidanceDigest identityRenderContract operationalParent)
+                          ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion)
                         )
   @role_public_shape MapSet.new(
                        ~w(role name boundSessionKey ownerUserId createdAt updatedAt rowVersion)

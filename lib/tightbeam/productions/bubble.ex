@@ -30,6 +30,7 @@ defmodule Tightbeam.Productions.Bubble do
   """
 
   alias Tightbeam.{
+    Assignments,
     ConditionFacts,
     ConnRegistry,
     DB,
@@ -262,6 +263,14 @@ defmodule Tightbeam.Productions.Bubble do
           turn.owner,
           "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
         )
+
+        :ok =
+          Assignments.transfer_cannot_proceed_disposer_to_user_in_txn(
+            txn,
+            cause.assignment_id,
+            turn.owner,
+            turn.cause_seq
+          )
 
         ConditionFacts.file_in_txn(txn, %{
           kind: "user-alerted",

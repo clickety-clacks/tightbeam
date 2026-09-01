@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v14"
+  @shape "coordination-fabric-v1-phase1-v15"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -70,6 +70,55 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the exact v13 predecessor preserves historical surrender rows and gains cannot-proceed",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('legacy-owner',0,'admin_add',1)"
+      )
+
+    ensure_main_session(db, "legacy-owner")
+    holder = Org.personal_session_key("legacy-owner")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignments (id,subject,holderKey,holderFallback,openedBySession,openedAt) VALUES ('asg_legacy','legacy',?1,0,?1,1)",
+        [holder]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_legacy','asg_legacy','surrender','historical',?1,2)",
+        [holder]
+      )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE assignments SET state='closed',outcome='surrendered',closedAt=2,closedBySession=?1,closingAttestId='att_legacy' WHERE id='asg_legacy'",
+        [holder]
+      )
+
+    {:ok, _} =
+      DB.query(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v13'")
+
+    assert :ok = Schema.upgrade_cannot_proceed_v1(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v14"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["surrender", "historical"]]} =
+             DB.query(db, "SELECT kind,note FROM attests WHERE id='att_legacy'")
+
+    assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
   end
 
   test "the exact v9 predecessor gains nullable identity render stamps", %{db: db} do
@@ -481,18 +530,18 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
-  test "the exact v13 predecessor is refused before v14 DDL", %{db: db} do
+  test "the exact v14 predecessor is refused before v15 DDL", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v13'")
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v14'")
     before = table_columns(db, "assignments")
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
-    assert error.message =~ "stamped: coordination-fabric-v1-phase1-v13"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v14"
+    assert error.message =~ "stamped: coordination-fabric-v1-phase1-v14"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v15"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v13"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v14"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 

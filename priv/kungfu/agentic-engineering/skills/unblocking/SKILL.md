@@ -21,7 +21,7 @@ missing.
    re-staff the work. On
    every sweep, each active goal is fed or shot — advanced, or retired with a reason;
    nothing sits half-alive.
-2. **Classify the block.** Read the surrender or the last progress attest and decide
+2. **Classify the block.** Read the cannot-proceed or last progress attest and decide
    which kind it is:
    - **Wrong assumption** — the agent believes something false about the code, the
      spec, or the environment. Correct it with evidence and wake the agent.

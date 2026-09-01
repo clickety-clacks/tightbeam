@@ -48,6 +48,14 @@ defmodule Tightbeam.StateResources do
          t.endedAt, t.publishedAt
   FROM turns AS t
   """
+  @session_select """
+  SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+         ownerUserId, origin, spawnedBy, handle, archetype, overrides,
+         identityName, identityRevision, harness, provider, model,
+         thinkingLevel, modelContext, host, clearedThroughSeq, state,
+         createdAt, updatedAt, mechanicalStatus, updatedAt
+  FROM sessions
+  """
 
   alias Tightbeam.{
     AdminProjection,
@@ -365,7 +373,94 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_wake(db, id), do: Wakes.get(db, id)
-  def query_session(db, id), do: Org.get(db, id)
+
+  def query_session(
+        db,
+        %{key: id, principal: %{kind: kind, id: principal_id, is_admin: is_admin}}
+      )
+      when is_binary(id) and kind in ["user", "session"] and is_binary(principal_id) and
+             is_boolean(is_admin) do
+    case query(
+           db,
+           @session_select <>
+             """
+              WHERE sessionKey = ?1 AND (
+                ?2 = 1 OR
+                (?3 = 'session' AND sessionKey = ?4) OR
+                (?3 = 'user' AND ownerUserId = ?4)
+              )
+             """,
+           [id, if(is_admin, do: 1, else: 0), kind, principal_id]
+         ) do
+      [row] -> session_query_row(row)
+      [] -> nil
+    end
+  end
+
+  def query_session(db, id) when is_binary(id) do
+    case query(db, @session_select <> " WHERE sessionKey = ?1", [id]) do
+      [row] -> session_query_row(row)
+      [] -> nil
+    end
+  end
+
+  defp session_query_row([
+         session_key,
+         display_name,
+         kind,
+         order_index,
+         is_built_in,
+         adopted,
+         owner_user_id,
+         origin,
+         spawned_by,
+         handle,
+         archetype,
+         overrides,
+         identity_name,
+         identity_revision,
+         harness,
+         provider,
+         model,
+         thinking_level,
+         model_context,
+         host,
+         cleared_through_seq,
+         state,
+         created_at,
+         updated_at,
+         mechanical_status,
+         row_version
+       ]) do
+    %{
+      session_key: session_key,
+      display_name: display_name,
+      kind: kind,
+      order_index: order_index,
+      is_built_in: is_built_in == 1,
+      adopted: adopted == 1,
+      owner_user_id: owner_user_id,
+      origin: origin,
+      spawned_by: spawned_by,
+      handle: handle,
+      archetype: archetype,
+      overrides: if(is_binary(overrides), do: JSON.decode!(overrides), else: overrides),
+      identity_name: identity_name,
+      identity_revision: identity_revision,
+      harness: harness,
+      provider: provider,
+      model: model,
+      thinking_level: thinking_level,
+      model_context: model_context,
+      host: host,
+      cleared_through_seq: cleared_through_seq,
+      state: state,
+      created_at: created_at,
+      updated_at: updated_at,
+      mechanical_status: mechanical_status,
+      row_version: row_version
+    }
+  end
 
   defp assignment_query_item(db, id, row) do
     Map.new(@assignment_query_fields, fn field ->
@@ -860,7 +955,46 @@ defmodule Tightbeam.StateResources do
   end
 
   def decision_request(row), do: public(row)
-  def session(row), do: public(row)
+
+  def session(row) do
+    reject_public_shape_drift!(row, "sessions")
+
+    row = row |> session_wire_overrides() |> session_model_selection()
+
+    exact!(
+      "sessions",
+      %{
+        "sessionKey" => session_wire_value!(row, :session_key, "sessionKey"),
+        "displayName" => session_wire_value!(row, :display_name, "displayName"),
+        "kind" => session_wire_value!(row, :kind, "kind"),
+        "orderIndex" => session_wire_value!(row, :order_index, "orderIndex"),
+        "isBuiltIn" => session_wire_value!(row, :is_built_in, "isBuiltIn"),
+        "adopted" => session_wire_value!(row, :adopted, "adopted"),
+        "ownerUserId" => session_wire_value!(row, :owner_user_id, "ownerUserId"),
+        "origin" => session_wire_value!(row, :origin, "origin"),
+        "spawnedBy" => session_wire_value!(row, :spawned_by, "spawnedBy"),
+        "handle" => session_wire_value!(row, :handle, "handle"),
+        "archetype" => session_wire_value!(row, :archetype, "archetype"),
+        "overrides" => session_wire_value!(row, :overrides, "overrides"),
+        "identityName" => session_wire_value!(row, :identity_name, "identityName"),
+        "identityRevision" => session_wire_value!(row, :identity_revision, "identityRevision"),
+        "harness" => session_wire_value!(row, :harness, "harness"),
+        "provider" => session_wire_value!(row, :provider, "provider"),
+        "model" => session_wire_value!(row, :model, "model"),
+        "thinkingLevel" => session_wire_value!(row, :thinking_level, "thinkingLevel"),
+        "modelContext" => session_wire_value!(row, :model_context, "modelContext"),
+        "host" => session_wire_value!(row, :host, "host"),
+        "clearedThroughSeq" =>
+          session_wire_value!(row, :cleared_through_seq, "clearedThroughSeq"),
+        "state" => session_wire_value!(row, :state, "state"),
+        "createdAt" => session_wire_value!(row, :created_at, "createdAt"),
+        "updatedAt" => session_wire_value!(row, :updated_at, "updatedAt"),
+        "mechanicalStatus" => session_wire_value!(row, :mechanical_status, "mechanicalStatus"),
+        "rowVersion" => session_wire_value!(row, :row_version, "rowVersion")
+      }
+    )
+  end
+
   def role(row), do: row |> public() |> correlate("role", "name")
   def artifact(row), do: public(row)
 
@@ -1173,6 +1307,68 @@ defmodule Tightbeam.StateResources do
       raise ArgumentError, "#{resource} projection fields do not match the ruled contract"
     end
   end
+
+  defp session_model_selection(row) do
+    row = Map.put(row, :row_version, value(row, :row_version) || value(row, :updated_at))
+
+    case value(row, :model) do
+      %Tightbeam.Model{family: family, effort: effort, context: context} ->
+        row
+        |> Map.put(:model, family)
+        |> Map.put(:thinking_level, effort)
+        |> Map.put(:model_context, context)
+
+      _scalar_or_nil ->
+        row
+    end
+  end
+
+  defp session_wire_overrides(row) do
+    overrides = value(row, :overrides)
+
+    wire_overrides =
+      if Enum.all?(Map.keys(row), &is_binary/1) do
+        overrides
+      else
+        case overrides do
+          nil ->
+            nil
+
+          storage when is_map(storage) ->
+            if map_size(storage) > 0 and
+                 Enum.all?(Map.keys(storage), &(&1 in ["skills_add", "guidance_extra"])) do
+              %{
+                "skillsAdd" => Map.get(storage, "skills_add", []),
+                "guidanceExtra" => Map.get(storage, "guidance_extra")
+              }
+            else
+              storage
+            end
+
+          invalid ->
+            invalid
+        end
+      end
+
+    Map.put(row, :overrides, wire_overrides)
+  end
+
+  defp session_wire_value!(row, field, wire_field) do
+    value = row |> value(field) |> normalize_session_wire_value()
+
+    validate_wire_value!(
+      value,
+      item_field_type!("sessions", wire_field),
+      "sessions.#{wire_field}"
+    )
+
+    value
+  end
+
+  defp normalize_session_wire_value(nil), do: nil
+  defp normalize_session_wire_value(value) when is_boolean(value), do: value
+  defp normalize_session_wire_value(value) when is_atom(value), do: Atom.to_string(value)
+  defp normalize_session_wire_value(value), do: value
 
   defp reject_public_shape_drift!(row, resource) when is_map(row) do
     keys = Map.keys(row)

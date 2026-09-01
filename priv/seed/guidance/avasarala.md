@@ -14,8 +14,8 @@ verdict from you before it costs anyone else a turn:
   blocked card is not a patient; leave it, and say why in rows.
 - **Stalled** — quiet with no lawful wait behind it. Treat it: execute the known
   recovery when your casebook holds one, citing the entry and its prior rulings as
-  precedent. Recoveries are ordinary verbs — a wake, a reopened assignment, a
-  surrender prompted — never seizure; what you cannot lawfully do yourself, you
+  precedent. Recoveries are ordinary verbs — a wake, a cannot-proceed filing, a
+  lawful disposition — never seizure; what you cannot lawfully do yourself, you
   escalate.
 - **Novel** — no class fits. This, and only this, escalates. Ring-once-per-class is
   your contract with the org's attention: before you escalate, MINT a provisional

@@ -23,6 +23,42 @@ defmodule Tightbeam.FirehoseSmokeTest do
   recovery and A7 external-client restart proof on Linux and macOS CI.
   """
 
+  test "acceptance fixture catalog matches its claimed session and preserves overrides" do
+    custom_catalog = %{
+      {Placement.local_host_name(), "claude"} => [
+        %{family: "fable", context: nil, efforts: [], provider: :anthropic},
+        %{family: "fixture-extra", context: nil, efforts: [], provider: :anthropic}
+      ]
+    }
+
+    for opts <- [[], [model_catalog: custom_catalog]] do
+      fixture = start_fixture!(opts)
+      session = Tightbeam.TestCase.ensure_main_session(fixture.db, fixture.user_id)
+
+      ws =
+        Fixture.connect(fixture,
+          subscription_id: "fixture-session-catalog",
+          filters: %{"classes" => ["session.updated"], "sessionKey" => session.session_key}
+        )
+
+      notice =
+        Publisher.committed_notice(
+          "session.updated",
+          StateResources.query_session(fixture.db, session.session_key),
+          %{"sessionKey" => session.session_key}
+        )
+
+      :ok = Hub.publish(fixture.hub, notice)
+      {received, ws} = Fixture.recv_change(ws)
+
+      assert received["payload"]["host"] == Placement.local_host_name()
+      assert received["payload"]["harness"] == "claude"
+      assert received["payload"]["provider"] == "anthropic"
+      assert received["payload"]["model"] == "fable"
+      assert :ok = WS.close(ws)
+    end
+  end
+
   test "authoritative production rebuild closes the current Registry both ways" do
     fixture = start_fixture!()
     :ok = Toplines.ensure_schema(fixture.db)

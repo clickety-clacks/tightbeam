@@ -71,7 +71,11 @@ defmodule Tightbeam.ConditionFacts do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @ddl) do
+      Tightbeam.Assignments.ensure_cannot_proceed_schema(db)
+    end
+  end
 
   @spec file(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file(db, scheduler, input) do
@@ -100,6 +104,11 @@ defmodule Tightbeam.ConditionFacts do
     ts = System.system_time(:millisecond)
     scope = Map.get(input, :scope)
 
+    if kind == "user-alerted" and is_binary(scope) do
+      :ok =
+        Tightbeam.Assignments.transfer_retired_cannot_proceed_disposers_to_user_in_txn(txn, scope)
+    end
+
     Txn.q(
       txn,
       "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (?1, ?2, ?3, ?4)",
@@ -108,6 +117,9 @@ defmodule Tightbeam.ConditionFacts do
 
     [[fact_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
 
+    fact = %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    :ok = Tightbeam.Assignments.release_cannot_proceed_in_txn(txn, fact)
+
     EventLog.lifecycle_in_txn(
       txn,
       "condition_fact_filed",
@@ -115,7 +127,7 @@ defmodule Tightbeam.ConditionFacts do
       "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
     )
 
-    %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    fact
   end
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}

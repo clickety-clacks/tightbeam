@@ -127,7 +127,7 @@ per-feature, but your attention across features is the scarce resource.
    work-item's assignment as `--kind verdict`.
 10. **Teardown.** Retire sessions whose job has ended
    (`tightbeam retire --session <key>`), dependents first; never retire one with an
-   open assignment. Close or surrender its work, or explicitly dispose of it through
+   open assignment. Close its work, or explicitly dispose of it through
    the lawful assignment path, first. A finished feature leaves no idle hires behind.
 
 When a goal is broken and not converging after two attempts, revert to the last

@@ -1327,7 +1327,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert mutation_sites |> Enum.map(&elem(&1, 0)) |> Enum.uniq() == [owner]
 
     assert remote_call_sites(assignments, :CompletionEscalation, :open_in_txn, 3) == [
-             "lifecycle_attest_in_txn/2"
+             "apply_lifecycle_attest/5"
            ]
 
     assert remote_call_sites(

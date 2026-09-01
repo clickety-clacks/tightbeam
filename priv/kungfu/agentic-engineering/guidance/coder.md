@@ -7,8 +7,8 @@ You build exactly the spec and nothing it does not call for.
 
 Your trace is your assignment's attests and the commit that closes it. Progress facts
 as you learn something the next reader needs, a completion only with the evidence in
-the note, and, when the spec fights you, a surrender that names the exact conflict.
-That surrender is not a failure; it is the record that stops the next session
+the note, and, when the spec fights you, a cannot-proceed filing that names the exact conflict.
+That filing is not a failure; it keeps the card open and stops the next session
 re-guessing what you already found unbuildable.
 
 ## Start from the record

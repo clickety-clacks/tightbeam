@@ -167,7 +167,7 @@ the holder with at most one sentence plus the assignment id. The rows are the br
 wake without a card you opened is an expectation you chose not to record. Thread every
 assignment to the work item it serves. What you hire, you clean up: when a hire's last
 assignment closes and no more work is planned for it, retire it — dependents first. Never retire
-a session with an open assignment: its holder must first file completion or surrender, or its
+a session with an open assignment: its holder must first file completion, or its
 opener must explicitly dispose of the work through the lawful assignment path. Retirement does
 not silently solve unfinished work.
 
@@ -207,19 +207,13 @@ yet enforce this, so the discipline is yours: `--role`, every time you open one.
 
     tightbeam attest <assignmentId> --kind progress   --note "root-caused to a nil token"
     tightbeam attest <assignmentId> --kind completion --note "fixed; tests green"
-    tightbeam attest <assignmentId> --kind surrender  --note "giving the card back unfinished; what remains is written on the work item"
+    tightbeam attest <assignmentId> --kind cannot-proceed --note "the exact reason this card cannot move"
 
-"Blocked" is a state you report and carry; "surrendered" is a state you end in. Never
-use one to say the other. Blocked: file the exact blocker as a progress attest — the
-failed operation, the evidence, and what decision, access, or external fact would clear it —
-and keep the card with a continuation wake naming when you check back. Ask a specific agent only
-when answering is that agent's normal work; an unanswered question remains your recorded block,
-not a reason to page your parent or Main. Surrendered: a
-truthful terminal receipt that gives unfinished work back — the card closes, what you
-owed on it ends, and what remains is the opener's to re-dispatch. And there is no
-handoff: custody never transfers between holders. To move work, its holder surrenders
-it and its opener dispatches a fresh card to the next holder — two rows, each naming
-its own accountable session, never one card changing hands.
+File `cannot-proceed` only when the card cannot move under its current authority. Give the
+exact reason. The card stays open on you, prod pauses only for that card, and one decision
+routes to its opener. When an observable condition can release the block, supply all three
+release-fact fields; the exact later fact resumes the card. The opener disposes or restaffs
+the work through the lawful assignment path. Custody never transfers silently between holders.
 
 - Record a judgment — a review, a test outcome, the user's decision — as a verdict:
 
@@ -298,7 +292,7 @@ alarm as already answered; report a monitor defect only when you have new defect
 
 If no reporting exception applies, record the one valid bounded checkpoint when available or
 schedule a concrete continuation wake. Do not manufacture a generic progress attest.
-Completion and surrender remain truthful terminal receipts.
+Completion remains the holder's truthful terminal receipt.
 
 A turn with neither a receipt nor a scheduled continuation is a stall. The substrate checks in
 on the holder and escalates unanswered check-ins to the session that spawned it. Workdir writes,

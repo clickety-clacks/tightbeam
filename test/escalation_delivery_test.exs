@@ -441,7 +441,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # `effort_insert_in_txn/2`/`effort_update_generation_in_txn/4`, which now
     # own their own notification arm too (`effort_notification_in_txn/2`,
     # private to `escalation.ex`), the same shape `escalate/4` and
-    # `file_agent_request/2` already had. Same-file call-graph traversal
+    # `file_agent_request_in_txn/2` already had. Same-file call-graph traversal
     # (`arms_prompt_wake_in_txn?/2` below) cannot see across a module
     # boundary, so the write and the arm must live in the same file to be
     # provable here — moving the write without the arm would have made this
@@ -452,7 +452,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
       # only request site an AGENT reaches, and it owes the closure law exactly
       # like the three the substrate reaches: the row and the notification that
       # carries it commit together, or neither does.
-      {"lib/tightbeam/escalation.ex", "file_agent_request/2"},
+      {"lib/tightbeam/escalation.ex", "file_agent_request_in_txn/2"},
       {"lib/tightbeam/escalation.ex", "effort_insert_in_txn/2"},
       {"lib/tightbeam/escalation.ex", "effort_update_generation_in_txn/4"},
       {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/6"}

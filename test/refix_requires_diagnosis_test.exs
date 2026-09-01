@@ -57,7 +57,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     rules = Rules.load!(base_dir, Map.keys(handlers))
 
     on_exit(fn ->
-      File.rm_rf!(base_dir)
+      Tightbeam.TestCase.cleanup_dir!(base_dir)
       :persistent_term.erase(Rules)
       :persistent_term.erase(Archetypes)
     end)
