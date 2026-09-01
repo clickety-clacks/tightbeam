@@ -329,6 +329,10 @@ work is built on, anything outward-facing or irreversible — goes to the user b
 
     tightbeam ask --user <userId> --question "<the choice, its options, and what depends on it>" --about <assignmentId>
 
+If `decision-requests --status ruled` omits a decision, rationale, ruling principal, or ruling
+time, record one projection specimen and route the defect. Do not wait, invent a choice, or use
+out-of-band state as authority.
+
 Do not guess, and do not dress the question as a status update. The question still holds
 nothing: park only the dependent step, carry on with everything else, and say in the card
 what you asked and what waits on it. The user's answer arrives as a row and releases exactly
