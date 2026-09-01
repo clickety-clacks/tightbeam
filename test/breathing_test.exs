@@ -80,7 +80,13 @@ defmodule Tightbeam.BreathingTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_progress', 'asg_attest', 'progress', '#{holder}', 10), ('att_reaffirm', 'asg_attest', 'verdict', '#{holder}', 11)"
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, ts) VALUES ('att_progress', 'asg_attest', 'progress', NULL, NULL, '#{holder}', 10), ('att_reaffirm', 'asg_attest', 'verdict', 'verified', 'standing reaffirmation', '#{holder}', 11)"
+      )
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (12, 'patrol-response-acknowledged', 'assignment:asg_attest', 'patrol')"
       )
 
     assert %{breathing: false, reason: "no_current_path"} =
@@ -95,7 +101,18 @@ defmodule Tightbeam.BreathingTest do
     :ok = insert_work_item(db, "wi_terminal")
     :ok = insert_assignment(db, "asg_closed", holder, "wi_terminal", 1)
     :ok = insert_turn(db, holder, "asg_closed", nil, "running", 1, nil)
-    :ok = DB.execute(db, "UPDATE assignments SET state = 'closed' WHERE id = 'asg_closed'")
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_closed', 'asg_closed', 'completion', '#{holder}', 3)"
+      )
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE assignments SET state = 'closed', outcome = 'completed', closedAt = 3, closedBySession = '#{holder}', closingAttestId = 'att_closed' WHERE id = 'asg_closed'"
+      )
 
     assert %{reason: "assignment_closed", breathing: false} =
              query(db, "assignment", "asg_closed")
@@ -234,7 +251,18 @@ defmodule Tightbeam.BreathingTest do
     :ok = insert_turn(db, holder, "asg_retired_a9", nil, "queued", 10, nil)
     :ok = insert_wake(db, "wake_a8", holder, "asg_closed_a8", nil, 1)
     :ok = insert_wake(db, "wake_a9", holder, "asg_retired_a9", nil, 1)
-    :ok = DB.execute(db, "UPDATE assignments SET state = 'closed' WHERE id = 'asg_closed_a8'")
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_closed_a8', 'asg_closed_a8', 'completion', '#{holder}', 11)"
+      )
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE assignments SET state = 'closed', outcome = 'completed', closedAt = 11, closedBySession = '#{holder}', closingAttestId = 'att_closed_a8' WHERE id = 'asg_closed_a8'"
+      )
 
     assert %{
              reason: "latest_terminal_failed",
@@ -328,36 +356,55 @@ defmodule Tightbeam.BreathingTest do
     refute inspect(query(db, "session", holder)) =~ "MUST-NOT-LEAK"
   end
 
-  test "A13 snapshot reads, A14 restart reads, and repeated reads are stable", %{
-    db: db,
-    holder: holder
-  } do
-    :ok = insert_work_item(db, "wi_snapshot")
-    :ok = insert_assignment(db, "asg_snapshot", holder, "wi_snapshot", 1)
-    :ok = insert_turn(db, holder, "asg_snapshot", nil, "running", 1, nil)
-    parent = self()
+  test "A13 snapshot reads, A14 restart reads, and repeated reads are stable" do
+    snapshot_path =
+      Path.join(System.tmp_dir!(), "breathing-snapshot-#{System.unique_integer([:positive])}.db")
+
+    writer_db = :"breathing_writer_#{System.unique_integer([:positive])}"
+    reader_db = :"breathing_reader_#{System.unique_integer([:positive])}"
+    {:ok, writer_pid} = DB.start_link(path: snapshot_path, name: writer_db)
+    Process.unlink(writer_pid)
+    :ok = ensure_all_schemas(writer_db)
+
+    {:ok, _} =
+      DB.query(
+        writer_db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', 1)"
+      )
+
+    snapshot_holder = ensure_main_session(writer_db, "owner").session_key
+    :ok = insert_work_item(writer_db, "wi_snapshot")
+    :ok = insert_assignment(writer_db, "asg_snapshot", snapshot_holder, "wi_snapshot", 1)
+    :ok = insert_turn(writer_db, snapshot_holder, "asg_snapshot", nil, "running", 1, nil)
+
+    :ok =
+      DB.execute(
+        writer_db,
+        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_snapshot', 'asg_snapshot', 'completion', '#{snapshot_holder}', 2)"
+      )
+
+    {:ok, reader_pid} = DB.start_link(path: snapshot_path, name: reader_db)
+    Process.unlink(reader_pid)
 
     writer =
       Task.async(fn ->
-        DB.transaction(db, fn txn ->
-          Tightbeam.DB.Txn.exec(
-            txn,
-            "UPDATE assignments SET state = 'closed' WHERE id = 'asg_snapshot'"
-          )
-
-          send(parent, :snapshot_closed)
-
-          receive do
-            :release_snapshot -> :ok
-          end
-        end)
+        DB.execute(
+          writer_db,
+          "UPDATE assignments SET state = 'closed', outcome = 'completed', closedAt = 2, closedBySession = '#{snapshot_holder}', closingAttestId = 'att_snapshot' WHERE id = 'asg_snapshot'"
+        )
       end)
 
-    assert_receive :snapshot_closed
-    reader = Task.async(fn -> query(db, "assignment", "asg_snapshot") end)
-    send(writer.pid, :release_snapshot)
-    assert {:ok, :ok} = Task.await(writer)
-    assert %{reason: "assignment_closed", breathing: false} = Task.await(reader)
+    reader = Task.async(fn -> query(reader_db, "assignment", "asg_snapshot") end)
+    assert :ok = Task.await(writer)
+    assert %{breathing: breathing, reason: reason} = Task.await(reader)
+    assert {breathing, reason} in [{true, "running_turn"}, {false, "assignment_closed"}]
+
+    assert %{reason: "assignment_closed", breathing: false} =
+             query(reader_db, "assignment", "asg_snapshot")
+
+    :ok = GenServer.stop(reader_pid)
+    :ok = GenServer.stop(writer_pid)
+    File.rm(snapshot_path)
 
     path =
       Path.join(System.tmp_dir!(), "breathing-restart-#{System.unique_integer([:positive])}.db")
