@@ -15,10 +15,9 @@ missing.
 1. **Detect stalls.** Sweep your own obligations with
    `tightbeam assignments --role <your-role>`, and the assignments you opened for your
    agents by their recorded ids with `tightbeam attests <assignmentId>`. An assignment
-   with no new fact since your last sweep and no answer to a wake is a stall. First read
-   its liveness receipts: a valid receipt ends the response, even if a later patrol alarm
-   claims it is missing. Do not rebut that false alarm with an attest or wake, and do not
-   re-staff the work. On
+   with no new fact since your last sweep and no answer to a wake is a stall. Judge that
+   from the deliverable, not from whether a receipt exists: a receipt naming what moved
+   is evidence of life, a receipt reporting only effort is not. On
    every sweep, each active goal is fed or shot — advanced, or retired with a reason;
    nothing sits half-alive.
 2. **Classify the block.** Read the cannot-proceed or last progress attest and decide

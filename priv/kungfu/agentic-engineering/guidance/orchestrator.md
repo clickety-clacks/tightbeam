@@ -109,9 +109,11 @@ not to track harder.
 ## Every sweep: advance or kill
 Each time you wake to your board, every active goal gets fed or shot: advanced toward
 done, or ended. A goal that has sat since your last sweep with no new fact and no
-answer to a wake is a stall. First read its liveness receipts. A valid receipt ends
-the stall response even when a later alarm claims it is missing; do not rebut the alarm
-with an attest or wake and do not re-staff the work. Otherwise run the unblocking skill.
+answer to a wake is a stall; run the unblocking skill on it. Judge liveness from the
+deliverable, never from the existence of a receipt: ask what changed on the thing being
+built since your last look. A receipt naming what moved answers that. A receipt that
+only reports effort does not, however recent it is, and a stream of them is the
+activity-theater class the unblocking skill names first.
 Read each dispatch's
 FIRST progress attest critically: a wrong direction costs little at the first commit
 and everything at the last. Nothing is allowed to linger half-alive: an item you will
