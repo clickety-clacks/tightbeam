@@ -111,6 +111,44 @@ defmodule Tightbeam.BreathingTest do
              query(db, "assignment", "asg_attest")
   end
 
+  test "pending assignment continuation wake breathes through its due boundary", %{
+    db: db,
+    holder: holder
+  } do
+    due_at = 9_999_999_999_999
+    :ok = insert_work_item(db, "wi_continuation")
+    :ok = insert_assignment(db, "asg_continuation", holder, "wi_continuation", 1)
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_tick', 'asg_continuation', 'progress', 'semantic testimony', '#{holder}', 10)"
+      )
+
+    assert %{breathing: false, reason: "no_current_path"} =
+             query(db, "assignment", "asg_continuation")
+
+    :ok = insert_wake(db, "wake_continuation", holder, "asg_continuation", nil, due_at)
+
+    assert %{
+             breathing: true,
+             reason: "pending_wake",
+             evidence: %{
+               wake: %{
+                 "wakeId" => "wake_continuation",
+                 "assignmentId" => "asg_continuation",
+                 "dueAt" => ^due_at,
+                 "state" => "pending"
+               }
+             }
+           } = query(db, "assignment", "asg_continuation")
+
+    :ok = DB.execute(db, "UPDATE wakes SET state = 'fired' WHERE wakeId = 'wake_continuation'")
+
+    assert %{breathing: false, reason: "no_current_path"} =
+             query(db, "assignment", "asg_continuation")
+  end
+
   test "all state gates and terminal reasons beat physical paths", %{db: db, holder: holder} do
     assert %{reason: "session_missing", breathing: false} = query(db, "session", "missing")
     assert %{reason: "assignment_missing", breathing: false} = query(db, "assignment", "missing")
