@@ -3279,9 +3279,17 @@ mod tests {
 
     #[test]
     fn breathing_builds_the_closed_gateway_query_shape() {
-        assert_eq!(
-            body(&["breathing", "assignment", "asg_1", "--as-user", "owner"]),
-            r#"{"asUser":"owner","verb":"breathing","params":{"targetKind":"assignment","targetId":"asg_1"}}"#
-        );
+        for (kind, id) in [
+            ("session", "session_1"),
+            ("assignment", "asg_1"),
+            ("work-item", "wi_1"),
+        ] {
+            assert_eq!(
+                body(&["breathing", kind, id, "--as-user", "owner"]),
+                format!(
+                    "{{\"asUser\":\"owner\",\"verb\":\"breathing\",\"params\":{{\"targetKind\":\"{kind}\",\"targetId\":\"{id}\"}}}}"
+                )
+            );
+        }
     }
 }
