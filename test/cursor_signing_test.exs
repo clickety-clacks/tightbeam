@@ -23,6 +23,7 @@ defmodule Tightbeam.CursorSigningTest do
     fcntl_probe = compile_fcntl_forwarding_probe!(control_dir)
     base_dir = Path.join(control_dir, "base")
     active_path = Path.join([base_dir, "secrets", "rest-cursor-signing.v1"])
+    stage_path = Path.join([base_dir, "secrets", ".rest-cursor-signing.v1.provision-preflight"])
     ready_marker = Path.join(control_dir, "probe-ready")
     failure_marker = Path.join(control_dir, "stage-sync-failed")
     unrelated_failure_marker = Path.join(control_dir, "unrelated-sync-failed")
@@ -46,9 +47,14 @@ defmodule Tightbeam.CursorSigningTest do
       end
     end
 
+    File.mkdir_p!(Path.dirname(active_path))
+
     script = """
-    [base_dir] = System.argv()
-    {:error, %Tightbeam.CursorSigning.Error{}} = Tightbeam.CursorSigning.provision(base_dir)
+    [path] = System.argv()
+    {:ok, file} = :file.open(String.to_charlist(path), [:write, :binary, :raw, :exclusive])
+    :ok = :file.write(file, "probe")
+    {:error, _reason} = :file.sync(file)
+    :ok = :file.close(file)
     IO.binwrite("refused")
     """
 
@@ -60,7 +66,7 @@ defmodule Tightbeam.CursorSigningTest do
           {"CURSOR_SIGNING_TEST_FSYNC_FAILED", failure_marker}
         ]
 
-    case external_instrumented_elixir(script, [base_dir], environment) do
+    case external_instrumented_elixir(script, [stage_path], environment) do
       {"refused", 0} ->
         unless File.exists?(ready_marker) and File.exists?(failure_marker) do
           raise "cursor filesystem probe preflight did not activate fault injection"

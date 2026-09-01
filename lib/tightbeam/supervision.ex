@@ -1397,7 +1397,7 @@ defmodule Tightbeam.Supervision do
           {:match, map()} | {:no_match, atom()} | {:no_match, atom(), map()}
   def prod_production_matches?(db, session_key, terminal_seq) do
     case oldest_supervised_assignment(db, session_key) ||
-           Assignments.oldest_open(db, session_key) do
+           Assignments.oldest_prod_eligible(db, session_key) do
       nil ->
         {:no_match, :no_open_obligation}
 
@@ -1424,7 +1424,10 @@ defmodule Tightbeam.Supervision do
   defp oldest_supervised_assignment(db, session_key) do
     transaction!(db, fn txn ->
       watched_assignments_in_txn(txn)
-      |> Enum.find(&(&1.holderKey == session_key))
+      |> Enum.find(fn assignment ->
+        assignment.holderKey == session_key and
+          not Assignments.cannot_proceed_standing_in_txn?(txn, assignment.id)
+      end)
     end)
   end
 
@@ -3313,6 +3316,9 @@ defmodule Tightbeam.Supervision do
 
   defp gate_reason_in_txn(txn, assignment_id, holder) do
     cond do
+      Assignments.cannot_proceed_standing_in_txn?(txn, assignment_id) ->
+        "cannot_proceed"
+
       harness_unavailable_in_txn?(txn, holder) ->
         "harness_unavailable"
 
@@ -4559,7 +4565,7 @@ defmodule Tightbeam.Supervision do
 
   defp prod_prompt(id, subject, k, n) do
     "Your turn ended with no filing and no continuation scheduled for assignment #{id} — \"#{subject}\". " <>
-      "File completion, schedule your continuation, or file surrender. This is prod #{k} of #{n}; " <>
+      "File completion, schedule your continuation, or file cannot-proceed with a reason. This is prod #{k} of #{n}; " <>
       "a reply without a row escalates to your spawner."
   end
 

@@ -26,51 +26,154 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     %{db: db, sup: sup, test_dir: test_dir}
   end
 
-  test "five consecutive boot failures open the circuit (async boot)", ctx do
+  test "five consecutive boot failures latch the circuit across restart races", ctx do
+    path = Path.join(ctx.test_dir, "recovery_fake.js")
+    File.write!(path, @fake)
+    owner = self()
+    context_attempt = :atomics.new(1, signed: false)
+    boot_attempt = :atomics.new(1, signed: false)
+
     coordinator =
       start_supervised!(
         {AdapterCoordinator,
          adapter_sup: ctx.sup,
          backoff_base_ms: 1,
-         adapter_context: fn _ -> [] end,
+         adapter_context: fn key ->
+           attempt = :atomics.add_get(context_attempt, 1, 1)
+           gate = make_ref()
+           send(owner, {:context_capture, attempt, self(), key, gate})
+
+           receive do
+             {:release_context, ^gate} -> []
+           end
+         end,
          adapter_opts: fn _, _ ->
-           [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
+           attempt = :atomics.add_get(boot_attempt, 1, 1)
+           gate = make_ref()
+           send(owner, {:boot_attempt, attempt, self(), gate})
+
+           receive do
+             {:finish_boot, ^gate, :fail} ->
+               [
+                 harness: :claude,
+                 cmd: [System.find_executable("false")],
+                 home: ctx.test_dir,
+                 cwd: ctx.test_dir
+               ]
+
+             {:finish_boot, ^gate, :ready} ->
+               [
+                 harness: :claude,
+                 cmd: [System.find_executable("node"), path],
+                 home: ctx.test_dir,
+                 cwd: ctx.test_dir
+               ]
+           end
          end,
          db: ctx.db,
          name: :"coord_#{System.unique_integer([:positive])}"}
       )
 
-    # Async boot: the first checkout hands out a pid whose boot then fails;
-    # crashes count via :DOWN on the (fast) backoff clock until the circuit
-    # opens and checkout fails fast.
-    assert {:ok, _pid, _gen} =
-             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
+    key = {:claude, "default", "testhost"}
 
-    # MEASURED 2026-07-29, this cascade timed directly on an idle 16-core mac with
-    # only four test files running: 90, 99, 127, 2211, 2532 ms. Bimodal, and the
-    # slow mode is not the nominal work — five `sh -c false` spawns plus a
-    # 1,2,4,8,16ms backoff is the ~100ms cluster. The ~2.2s cluster is fork/exec
-    # contention with the `node` spawns of sibling suites, so what this budget
-    # actually races is process-spawn pressure from the rest of the run, which no
-    # barrier here can remove. The old 200-try (2s) budget lost to it in 2 of 3
-    # combined runs on an IDLE machine; CI is 4-core and busier.
-    assert wait_until(
-             fn ->
-               match?(
-                 %{"claude:default@testhost" => %{circuit: :open}},
-                 AdapterCoordinator.health(coordinator)
-               )
-             end,
-             1_500
-           )
+    state_observer = fn observer_state, event, _server_name ->
+      event_state =
+        case event do
+          {:in, _message, state} -> state
+          {:out, _message, _to, state} -> state
+          {:noreply, state} -> state
+          _ -> nil
+        end
 
-    assert {:error, :degraded} =
-             AdapterCoordinator.adapter_for(coordinator, {:claude, "default", "testhost"})
+      if is_map(event_state) and is_map(event_state[:adapters]) do
+        if entry = event_state.adapters[key] do
+          send(owner, {:coordinator_entry, entry})
+        end
+      end
 
-    assert %{"claude:default@testhost" => %{consecutive_failures: failures}} =
-             AdapterCoordinator.health(coordinator)
+      observer_state
+    end
 
-    assert failures >= 5
+    :ok = :sys.install(coordinator, {:circuit_state, state_observer, nil})
+    checkout = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+
+    assert_receive {:context_capture, 1, context_worker, ^key, context_gate}, 2_000
+    send(context_worker, {:release_context, context_gate})
+    assert {:ok, first_adapter, 1} = Task.await(checkout)
+    assert_receive {:boot_attempt, 1, ^first_adapter, first_boot_gate}, 2_000
+
+    {fifth_adapter, fifth_boot_gate} =
+      Enum.reduce(1..4, {first_adapter, first_boot_gate}, fn attempt, {adapter, boot_gate} ->
+        send(adapter, {:finish_boot, boot_gate, :fail})
+
+        next_attempt = attempt + 1
+
+        assert_receive {:context_capture, ^next_attempt, context_worker, ^key, context_gate},
+                       2_000
+
+        send(context_worker, {:release_context, context_gate})
+
+        assert_receive {:boot_attempt, ^next_attempt, next_adapter, next_boot_gate}, 2_000
+        {next_adapter, next_boot_gate}
+      end)
+
+    send(fifth_adapter, {:finish_boot, fifth_boot_gate, :fail})
+
+    assert_receive {:coordinator_entry,
+                    %{generation: 6, failures: 5, circuit: :open, pid: nil, timer: nil}},
+                   2_000
+
+    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    # A restart signal already in the mailbox when the fifth failure opens the
+    # circuit must not start another context capture for the same generation.
+    send(coordinator, {:restart_adapter, key, 6})
+    _ = AdapterCoordinator.health(coordinator)
+    assert :sys.get_state(coordinator).context_requests == %{}
+
+    # A captured context result can also overtake the failure that opens the
+    # circuit. Even when its generation still matches, completion must observe
+    # the latch instead of installing generation 6.
+    request_ref = make_ref()
+    request_monitor = make_ref()
+
+    :sys.replace_state(coordinator, fn state ->
+      request = %{key: key, purpose: {:restart, 6}, monitor: request_monitor}
+      %{state | context_requests: Map.put(state.context_requests, request_ref, request)}
+    end)
+
+    send(coordinator, {:adapter_context_captured, request_ref, {:ok, []}})
+    _ = AdapterCoordinator.health(coordinator)
+
+    assert %{pid: nil, circuit: :open, failures: 5} =
+             :sys.get_state(coordinator).adapters[key]
+
+    assert :atomics.get(boot_attempt, 1) == 5
+
+    # Credential installation is the lawful recovery boundary. It may start a
+    # replacement, but ordinary checkout remains degraded until that exact
+    # instance completes boot and closes the circuit.
+    recovery =
+      Task.async(fn ->
+        AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
+      end)
+
+    assert {:ok, recovery_adapter, 6} = Task.await(recovery)
+    assert_receive {:boot_attempt, 6, ^recovery_adapter, recovery_gate}, 2_000
+    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+    send(recovery_adapter, {:finish_boot, recovery_gate, :ready})
+
+    assert_receive {:coordinator_entry,
+                    %{
+                      pid: ^recovery_adapter,
+                      ready: true,
+                      circuit: :closed,
+                      failures: 0,
+                      timer: nil
+                    }},
+                   2_000
+
+    assert {:ok, ^recovery_adapter, 6} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
   # THE INCIDENT TEST (2026-08-14). A latched circuit vetoed the credential

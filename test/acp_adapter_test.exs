@@ -389,7 +389,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       )
 
     File.mkdir_p!(run_dir)
-    on_exit(fn -> File.rm_rf!(run_dir) end)
+    on_exit(fn -> Tightbeam.TestCase.cleanup_dir!(run_dir) end)
 
     path = Path.join(run_dir, "fake_harness.js")
     capture_path = Path.join(run_dir, "capture.jsonl")

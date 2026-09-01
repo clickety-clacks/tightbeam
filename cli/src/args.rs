@@ -412,6 +412,9 @@ pub enum Command {
         verdict: Option<String>,
         note: Option<String>,
         commit_refs: Option<Vec<serde_json::Value>>,
+        release_fact_kind: Option<String>,
+        release_fact_scope: Option<String>,
+        release_fact_principal_ref: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -818,7 +821,7 @@ COMMANDS:
       Put one question to another principal and get back its id. THE QUESTION
       HOLDS NOTHING: filing it does not pause your assignment, your turn, or
       anything else — you still owe what you owed, and you choose whether to
-      wait for the answer, work something else, or surrender the card. Read the
+      wait for the answer, work something else, or file cannot-proceed with a reason. Read the
       answer with decision-requests / decision-request, take the question back
       with withdraw --request <id> --reason "...". The person you asked gets it
       at their next turn boundary, or within 30 minutes, whichever is first.
@@ -843,11 +846,15 @@ COMMANDS:
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
-  attest <assignmentId> --kind progress|completion|surrender|verdict
+  attest <assignmentId> --kind progress|completion|cannot-proceed|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
+         [--release-fact-kind <kind> --release-fact-scope <scope>
+          --release-fact-principal-ref <principal>]
       File against an assignment. Verdicts on review cards require the review
       holder; producer-card verdicts may be filed by any session or user.
+      cannot-proceed requires a non-empty --note, keeps the card open, and
+      accepts the three release-fact flags only as one complete tuple.
   attests <assignmentId> [--after <attestId>] [--limit <n>]
       List every attest filed against an assignment. Without --limit you get
       all of them: an audit list that shortens itself silently is worse than a
@@ -2456,13 +2463,39 @@ fn parse_with_optional_catalog(
                         .map_err(|_| "--commit-refs must be a JSON array".to_owned())
                 })
                 .transpose()?;
+            let release_fact_kind = nonempty(flags, "release-fact-kind");
+            let release_fact_scope = nonempty(flags, "release-fact-scope");
+            let release_fact_principal_ref = nonempty(flags, "release-fact-principal-ref");
+            let release_count = [
+                release_fact_kind.as_ref(),
+                release_fact_scope.as_ref(),
+                release_fact_principal_ref.as_ref(),
+            ]
+            .iter()
+            .filter(|value| value.is_some())
+            .count();
+            if release_count != 0 && release_count != 3 {
+                return Err("--release-fact-kind, --release-fact-scope, and --release-fact-principal-ref must be supplied together".to_owned());
+            }
+            if kind != "cannot-proceed" && release_count != 0 {
+                return Err(
+                    "release fact flags are only valid when --kind is cannot-proceed".to_owned(),
+                );
+            }
+            let note = nonempty(flags, "note");
+            if kind == "cannot-proceed" && note.is_none() {
+                return Err("--note is required when --kind is cannot-proceed".to_owned());
+            }
             Ok(Command::Attest {
                 identity: identity(flags)?,
                 assignment_id,
                 kind,
                 verdict,
-                note: nonempty(flags, "note"),
+                note,
                 commit_refs,
+                release_fact_kind,
+                release_fact_scope,
+                release_fact_principal_ref,
             })
         }
         "coordination-share" => {
@@ -4450,6 +4483,46 @@ mod tests {
                 "flynn",
             ])),
             Err("--verdict is only valid when --kind is verdict".to_owned())
+        );
+    }
+
+    #[test]
+    fn cannot_proceed_requires_a_reason_and_an_all_or_none_release_tuple() {
+        assert_eq!(
+            parse(strings(&["attest", "asg_1", "--kind", "cannot-proceed"])),
+            Err("--note is required when --kind is cannot-proceed".to_owned())
+        );
+
+        assert!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "cannot-proceed",
+                "--note",
+                "waiting",
+                "--release-fact-kind",
+                "ready",
+            ]))
+            .unwrap_err()
+            .contains("must be supplied together")
+        );
+
+        assert!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "progress",
+                "--release-fact-kind",
+                "ready",
+                "--release-fact-scope",
+                "asg_1",
+                "--release-fact-principal-ref",
+                "agent:holder",
+            ]))
+            .unwrap_err()
+            .contains("only valid when --kind is cannot-proceed")
         );
     }
 

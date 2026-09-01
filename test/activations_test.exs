@@ -699,7 +699,7 @@ defmodule Tightbeam.ActivationsTest do
     assert length(indexes) == 12
   end
 
-  @tag timeout: 240_000
+  @tag timeout: 420_000
   test "the exact older gateway opens activation rows and current CLI refuses before dispatch" do
     root =
       Path.join(
@@ -714,8 +714,36 @@ defmodule Tightbeam.ActivationsTest do
     reader = :activation_downgrade_reader
     on_exit(fn -> File.rm_rf!(root) end)
 
+    legacy_checkout = exact_legacy_checkout!()
+    legacy_build = Path.join(Path.expand("..", __DIR__), "_build/legacy-base-#{System.pid()}")
+
+    # The legacy gateway must own the database shape used by this downgrade
+    # test. A current bootstrap would stamp a newer shape that the exact older
+    # binary must refuse, which tests schema downgrade rather than CLI feature
+    # negotiation.
+    bootstrap_gateway =
+      case LegGateway.boot(root, free_port(),
+             repo_root: legacy_checkout,
+             boot_timeout_ms: 300_000,
+             env: [
+               {"PATH", System.fetch_env!("PATH")},
+               {"ELIXIR_ERL_OPTIONS", "+fnu"},
+               {"MIX_BUILD_PATH", legacy_build}
+             ]
+           ) do
+        {:ok, gateway} ->
+          gateway
+
+        {:error, reason, gateway} ->
+          log = if File.exists?(gateway.log_path), do: File.read!(gateway.log_path), else: ""
+          LegGateway.teardown(gateway, remove: false)
+          flunk("exact legacy gateway failed to bootstrap: #{inspect(reason)}\n#{log}")
+      end
+
+    assert :ok = LegGateway.teardown(bootstrap_gateway, remove: false)
+
     {:ok, writer_pid} = DB.start_link(path: path, name: writer)
-    :ok = Tightbeam.Schema.ensure_all(writer)
+    :ok = Activations.ensure_schema(writer)
 
     assert {:ok, %{phase: "reserved"}} =
              ColdStart.add_first_user(writer, "legacy", %{
@@ -751,17 +779,16 @@ defmodule Tightbeam.ActivationsTest do
       })
 
     GenServer.stop(writer_pid)
-    legacy_checkout = exact_legacy_checkout!()
     port = free_port()
 
     gateway =
       case LegGateway.boot(root, port,
              repo_root: legacy_checkout,
-             boot_timeout_ms: 180_000,
+             boot_timeout_ms: 300_000,
              env: [
                {"PATH", System.fetch_env!("PATH")},
                {"ELIXIR_ERL_OPTIONS", "+fnu"},
-               {"MIX_BUILD_PATH", Path.join(Path.expand("..", __DIR__), "_build/legacy-base")}
+               {"MIX_BUILD_PATH", legacy_build}
              ]
            ) do
         {:ok, gateway} ->
@@ -960,8 +987,16 @@ defmodule Tightbeam.ActivationsTest do
     checkout = Path.join(repo, "_build/legacy-checkout-#{@legacy_base}")
 
     unless File.dir?(Path.join(checkout, ".git")) do
+      assert {origin, 0} = System.cmd("git", ["remote", "get-url", "origin"], cd: repo)
+
       assert {_output, 0} =
                System.cmd("git", ["clone", "--shared", "--no-checkout", repo, checkout],
+                 stderr_to_stdout: true
+               )
+
+      assert {_output, 0} =
+               System.cmd("git", ["fetch", "--depth=1", String.trim(origin), @legacy_base],
+                 cd: checkout,
                  stderr_to_stdout: true
                )
 
@@ -974,6 +1009,17 @@ defmodule Tightbeam.ActivationsTest do
       File.ln_s!(Path.join(repo, "deps"), Path.join(checkout, "deps"))
       File.ln_s!(Path.join(repo, "cli/target"), Path.join(checkout, "cli/target"))
     end
+
+    # Current clean/build gates may prune a nested checkout's tracked lib tree.
+    # Restore the pinned source before every use; the checkout is generated and
+    # contains no authored work.
+    assert {_output, 0} =
+             System.cmd(
+               "git",
+               ["restore", "--source", @legacy_base, "--staged", "--worktree", "--", "."],
+               cd: checkout,
+               stderr_to_stdout: true
+             )
 
     assert {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: checkout)
     assert String.trim(commit) == @legacy_base

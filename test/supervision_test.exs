@@ -2251,7 +2251,14 @@ defmodule Tightbeam.SupervisionTest do
     Supervision.notify_terminal(name, "holder", retry_seq)
 
     assert_receive {:request_changed_before_park, :withdraw, ^stale_id}
-    assert_receive {:request_rechecked, :withdraw, 2}, 5_000
+
+    # The durable sweep selects a new terminal. Advance the ledger after the
+    # skipped park, then drive that production handler and place a barrier behind
+    # it; mailbox timing is not the event this test proves.
+    sweep_seq = terminal!(ctx.db, "holder")
+    send(name, :scheduled_sweep)
+    :sys.get_state(name)
+    assert_receive {:request_rechecked, :withdraw, 2}
 
     assert eventually(fn ->
              match?(
@@ -2265,7 +2272,7 @@ defmodule Tightbeam.SupervisionTest do
            end),
            "the scheduled supervision sweep never parked the replacement request"
 
-    assert %{lastEvaluatedTerminal: ^retry_seq} = Supervision.watermark(ctx.db, "holder")
+    assert %{lastEvaluatedTerminal: ^sweep_seq} = Supervision.watermark(ctx.db, "holder")
   end
 
   test "only a durable self-created continuation suppresses the turn-end remedy", ctx do
@@ -2729,7 +2736,7 @@ defmodule Tightbeam.SupervisionTest do
     expected_prod =
       "[from process:tightbeam]\n\n" <>
         "Your turn ended with no filing and no continuation scheduled for assignment asg_1 — \"ship it\". " <>
-        "File completion, schedule your continuation, or file surrender. This is prod 1 of 3; " <>
+        "File completion, schedule your continuation, or file cannot-proceed with a reason. This is prod 1 of 3; " <>
         "a reply without a row escalates to your spawner."
 
     assert {:ok, [[^expected_prod]]} =

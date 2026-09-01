@@ -10,7 +10,7 @@ and the office is that seam used deliberately:
   session. Colleagues keep addressing the role; they need not know a desk exists.
 - **Obligations stay on the back desk.** The worker holds its own assignment cards
   and files its own lifecycle attests — the holder-filed doctrine is untouched, and
-  scoped precisely: LIFECYCLE attests (progress, completion, surrender) are
+  scoped precisely: LIFECYCLE attests (progress, completion, cannot-proceed) are
   holder-only; directive-kind attests on a delegation card may be filed by the
   card's named principal, and by nobody else, refused by name.
 - **The delegation card is the written scope.** The exec holds exactly one
@@ -62,7 +62,7 @@ window is named, not hidden:
   already watch it, so a crashed dissolution cannot stay quiet past the floor —
   and a desk that reads its role rebound away stands down on its own (see the exec
   guidance: role gone + card standing = the office is dissolving; stop delivering,
-  surrender the card). (The dangerous direction — a role routing to an OFF-card
+  file cannot-proceed and let the dissolver revoke the card). (The dangerous direction — a role routing to an OFF-card
   desk — cannot occur under this ordering.)
 - **In-flight traffic.** Batched traffic survives on rows: every message is a
   durable row and every digest is signed by the rule that produced it. An

@@ -24,6 +24,12 @@ description: Commit and push discipline — build before committing, one concern
 
 ## Merging your branch into main
 Merging is a semantic integration problem, not a text-selection problem.
+
+When a lane pins an authorized target commit, hold that exact target until the reviewed
+candidate lands. If the target moves for unrelated work, stop and report the hold
+violation. Do not reconcile or rebuild on the moved target unless the owner explicitly
+changes the pin.
+
 1. Merge main into your branch first. Every conflict is resolved on your branch.
 2. Resolve conflicts semantically. Never resolve by wholesale accepting ours, theirs,
    or the newer block. For each conflict, determine what each side contributes — read

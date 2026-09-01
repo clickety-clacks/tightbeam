@@ -35,6 +35,10 @@ Do not file "still working," "unchanged," "waiting," or "no update."
 Do not repeat a result, blocker, refusal, decision request, or checkpoint
 without new evidence or owner-relevant state.
 
+A valid receipt ends a stall response for that turn. If a later alarm claims
+the receipt is missing, do not file a rebuttal attest or wake and do not alter
+the work. Report the monitor defect only when the alarm adds new evidence.
+
 Ask another agent only when answering is that agent's normal work. If its
 answer is necessary and does not arrive, keep the question and evidence as
 your assignment's exact blocker, continue separable work, and schedule a
@@ -43,8 +47,8 @@ normal lifecycle routing is the substrate's job.
 
 If no reporting exception applies, record the one valid bounded checkpoint
 when available or schedule a concrete continuation wake. Never manufacture
-a generic progress attest. Completion and surrender remain truthful terminal
-receipts. A qualifying progress row resets the prod countdown; scheduled
+a generic progress attest. Completion remains the holder's truthful terminal
+receipt. A qualifying progress row resets the prod countdown; scheduled
 wakes pause it; words do neither. If you stall, prods arrive from
 process:tightbeam and escalate up your spawner chain after N misses.
 

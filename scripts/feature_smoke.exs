@@ -67,7 +67,6 @@ defmodule FeatureSmoke do
 
   def run do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
-    install_smoke_rule!(base_dir)
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
     Process.put(:salt, Integer.to_string(System.os_time(:second)) <> "-")
 
@@ -96,7 +95,7 @@ defmodule FeatureSmoke do
       |> check_dispatch_opens_assignment()
       |> check_effort_without_effect()
       |> check_flagship_review_loop()
-      |> check_escalation_to_owner()
+      |> check_cannot_proceed_to_opener()
       |> check_toplines_board()
       |> check_gate_chain_enforced()
       |> check_carrier_on_real_turn()
@@ -256,29 +255,6 @@ defmodule FeatureSmoke do
       |> binary_part(0, 12)
 
     Path.join([base_dir, "work", digest])
-  end
-
-  defp install_smoke_rule!(base_dir) do
-    source = Path.expand("fixtures/smoke-escalation-probe.toml", __DIR__)
-    target = Path.join([base_dir, "identity", "rules", "smoke-escalation-probe.toml"])
-    File.mkdir_p!(Path.dirname(target))
-    File.cp!(source, target)
-
-    # rules/ lives inside the identity repo, and the identity seam requires a clean
-    # working tree. An uncommitted fixture wedges every identity verb, so commit it.
-    dir = Path.join(base_dir, "identity")
-    smoke_git!(dir, ["add", "--", "rules/smoke-escalation-probe.toml"])
-
-    # `--quiet` reports "nothing staged" as exit 0, so this one reads the status rather
-    # than demanding success: a second run of the smoke has nothing to commit.
-    case System.cmd("git", ["diff", "--cached", "--quiet"], cd: dir) do
-      {_, 0} ->
-        :ok
-
-      _ ->
-        smoke_git!(dir, ["commit", "-m", "feature-smoke: escalation probe"])
-        publish_identity_live!(dir)
-    end
   end
 
   # Advance the identity repo's live ref onto the commit just made.
@@ -453,10 +429,8 @@ defmodule FeatureSmoke do
     pass(state, "onboard registered providers interactive entry")
   end
 
-  # --- #3 escalation: a gated verb escalates to the owner for a decision --------
-  # Requires the `surrender-escalates-to-owner` rail. Proves the escalate effect live:
-  # attest surrender → decision-request opened to the owner → owner rules allow → proceeds.
-  defp check_escalation_to_owner(state) do
+  # --- #3 cannot-proceed: one open card routes one opener decision ----------------
+  defp check_cannot_proceed_to_opener(state) do
     u = unique()
     wi = ok!(state, "work-item-create", %{"title" => "esc #{u}", "idempotencyKey" => "ewi-#{u}"})
     wi_id = wi["workItemId"] || wi["id"]
@@ -482,45 +456,31 @@ defmodule FeatureSmoke do
 
     asg_id = asg["id"] || asg["assignmentId"]
 
-    # 1. Coder attests surrender → escalates (does NOT proceed; a decision-request opens).
-    _esc = post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "surrender"})
-
-    # 2. The owner sees an open decision-request for this escalation.
-    drs = ok!(state, "decision-requests", %{})
-
-    dr =
-      (drs["requests"] || drs["decisionRequests"] || drs)
-      |> List.wrap()
-      |> Enum.find(fn d ->
-        (d["statute"] || d["statuteName"]) == "surrender-escalates-to-owner" or
-          (d["ref"] || d["subject"] || "") =~ asg_id
-      end)
+    blocked =
+      ok_as!(state, coder_tok, "attest", %{
+        "assignmentId" => asg_id,
+        "kind" => "cannot-proceed",
+        "note" => "smoke needs its opener"
+      })
 
     assert(
       state,
-      is_map(dr),
-      "escalation: no decision-request opened for the surrender; got #{inspect(drs)}"
+      get_in(blocked, ["assignment", "state"]) == "open" and
+        get_in(blocked, ["cannotProceed", "state"]) == "standing" and
+        is_binary(get_in(blocked, ["decisionWake", "wakeId"])),
+      "cannot-proceed did not keep the card open with one linked opener decision: #{inspect(blocked)}"
     )
 
-    dr_id = dr["id"] || dr["requestId"] || dr["decisionRequestId"]
-
-    # 3. Owner rules allow.
-    ok!(state, "rule", %{"requestId" => dr_id, "decision" => "allow", "rationale" => "smoke ok"})
-
-    # 4. Coder re-attests surrender → the ruling is consumed → the verb proceeds.
-    done = post_as(state, coder_tok, "attest", %{"assignmentId" => asg_id, "kind" => "surrender"})
-
-    assert(
-      state,
-      not (is_map(done) and Map.has_key?(done, "error")),
-      "escalation: surrender after the owner's allow should proceed, got #{inspect(done)}"
-    )
+    ok!(state, "revoke-assignment", %{
+      "assignmentId" => asg_id,
+      "reason" => "smoke opener disposed the blocked card"
+    })
 
     retire(state, coder)
 
     pass(
       state,
-      "escalation to owner: surrender → decision-request → owner rules allow → proceeds"
+      "cannot-proceed keeps the card open, routes one opener decision, and disposes cleanly"
     )
   end
 
@@ -1059,16 +1019,12 @@ defmodule FeatureSmoke do
       # Kind and provenance are the whole contract. Do not add one.
       #
       # The outcome is ACCEPTED, not required. A holder that went on to complete did the
-      # job; one still working has not failed. Only abandonment is a failure, and
-      # `surrendered` is roadmap 0a2 — the escape hatch a holder reaches for when a gate
-      # cannot be satisfied, which is exactly what grounding the work is meant to prevent.
+      # job; one still working has not failed. Only revocation is a failure here.
       #
       # SAMPLED AFTER THE LANE SETTLES, because the wait above returns the instant the
       # record lands and that is normally MID-TURN. Reading the outcome there would ask the
-      # question before the holder had finished answering it: a holder that records and
-      # then surrenders in the same turn would have been read as "still working, fine" and
-      # the 0a2 oracle — the whole reason this matrix exists — would never fire. The matrix
-      # was right; the moment it was sampled was not.
+      # question before the holder had finished answering it. The matrix was right; the
+      # moment it was sampled was not.
       await_lane_idle!(state, holder.key, "before reading the assignment's outcome")
       final = ok!(state, "assignment-get", %{"assignmentId" => asg_id})
 
@@ -1245,10 +1201,7 @@ defmodule FeatureSmoke do
   # the tool call's own command text, so a wrapped call is one of §1.3's legitimately
   # hookless calls and would land `session-concurrent` truthfully.
   #
-  # KEEPING THE ASSIGNMENT OPEN is the guidance-side mitigation for roadmap 0a2, where an
-  # agent meeting a gate it could not satisfy surrendered and closed the work permanently.
-  # The gate is satisfiable now; the instruction is here so a leg cannot fail on an agent
-  # reaching for the old escape.
+  # KEEPING THE ASSIGNMENT OPEN ensures the operator owns the terminal test transition.
   defp artifact_prompt(u, marker, check, wi_id, asg_id) do
     """
     Substrate smoke check #{u} on assignment #{asg_id}. Do exactly these two steps.
@@ -1266,7 +1219,7 @@ defmodule FeatureSmoke do
     or any wrapper, and do not run it through one — the substrate reads the command text of
     the call itself, and a wrapped invocation records weaker provenance than the real one.
 
-    Keep assignment #{asg_id} OPEN. Do not surrender it, do not revoke it, and do not
+    Keep assignment #{asg_id} OPEN. Do not file cannot-proceed, revoke it, or
     attest completion — the operator files completion. If something denies you, satisfy
     that gate and carry on in order; never abandon the assignment to get out of a gate.
     """
@@ -1544,11 +1497,8 @@ defmodule FeatureSmoke do
         )
 
       # An abandoned assignment is DETECTED AND NAMED, never waited out. The budget here is
-      # a full turn ceiling of real model time, and a holder that surrendered will never
-      # record — so without this the roadmap 0a2 hazard reads as a confusing timeout
-      # instead of the confirmed live failure it is. `revoked` is a different animal
-      # (`retire` revokes a session's open assignments), so it is named separately rather
-      # than folded in.
+      # a full turn ceiling of real model time. A revoked card will never record, so name
+      # that terminal state instead of waiting for a confusing timeout.
       outcome = terminal_outcome(state, assignment_id) ->
         assert(
           state,
@@ -1595,22 +1545,16 @@ defmodule FeatureSmoke do
     end
   end
 
-  defp abandonment_note("surrendered") do
-    "That is roadmap 0a2: the holder abandoned the assignment rather than satisfying the " <>
-      "gate, which closes the work permanently. The gate IS satisfiable here — check " <>
-      "whether the holder's turn ever saw this group's prompt."
-  end
-
   defp abandonment_note(_revoked) do
     "Something revoked it mid-journey — a teardown or an operator, not the statute."
   end
 
-  # `surrendered` or `revoked` only — `completed` is not terminal for this loop's purpose,
+  # `revoked` only — `completed` is not terminal for this loop's purpose,
   # because the only way it can appear is the holder completing after a record this loop
   # has not read yet, and the next poll finds that record.
   defp terminal_outcome(state, assignment_id) do
     case ok!(state, "assignment-get", %{"assignmentId" => assignment_id})["outcome"] do
-      outcome when outcome in ["surrendered", "revoked"] -> outcome
+      "revoked" = outcome -> outcome
       _ -> nil
     end
   end

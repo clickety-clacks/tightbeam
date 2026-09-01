@@ -23,7 +23,7 @@ Use these meanings consistently:
 - **Main:** the owner's general Tightbeam session. A user-targeted wake routes to that
   owner's Main.
 - **Wake:** a durable prompt delivered now, later, or when a named condition fact arrives.
-- **Attest:** an attributed progress, completion, surrender, or review-verdict row on one
+- **Attest:** an attributed progress, completion, cannot-proceed, or review-verdict row on one
   assignment.
 - **Artifact:** a pointer to evidence outside the assignment worktree. The pointer records
   location and digest; it does not take custody of the file.
@@ -93,7 +93,7 @@ Use `tightbeam attest <assignment-id> --kind ... --note "..."` for the assignmen
 - File `progress` only for a new material result, exact refusal, or bounded checkpoint.
 - File `completion` only when the obligation is complete and its required gates allow the
   assignment to close.
-- File `surrender` when the obligation cannot be completed under the current authority.
+- File `cannot-proceed` with the exact reason when the obligation cannot move under current authority. The card stays open and routes one decision to its opener.
 - File a `verdict` only when the assignment authorizes that review judgment.
 
 Name the operation, observed result, relevant identifiers, and non-secret evidence. Do not
@@ -136,7 +136,7 @@ Choose the wait instrument by what can observe the event:
 4. To resume your own work at a chosen time, schedule a timed wake to this session.
 
 Before a turn ends with the assignment open, leave one valid liveness receipt: a material
-progress row, a bounded checkpoint, a completion, a surrender, or a concrete continuation
+progress row, a bounded checkpoint, a completion, a cannot-proceed filing, or a concrete continuation
 wake. Do not file empty status prose.
 
 ## Stop on visible failure

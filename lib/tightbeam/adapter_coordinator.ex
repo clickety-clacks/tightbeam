@@ -201,7 +201,7 @@ defmodule Tightbeam.AdapterCoordinator do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
-      live_entry?(entry) ->
+      live_entry?(entry) and entry.circuit == :closed ->
         {:reply, checkout(entry), state}
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
@@ -302,7 +302,7 @@ defmodule Tightbeam.AdapterCoordinator do
             {:reply, error, state}
         end
 
-      live_entry?(entry) ->
+      live_entry?(entry) and (authoritative? or entry.circuit == :closed) ->
         {:reply, checkout(entry), state}
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
@@ -589,9 +589,7 @@ defmodule Tightbeam.AdapterCoordinator do
           # this adapter checked out, and the only one it can ask about.
           died_at = entry.generation
           generation = entry.generation + 1
-          delay = backoff(state, failures)
-
-          timer = Process.send_after(self(), {:restart_adapter, key, generation}, delay)
+          timer = schedule_restart(state, key, generation, failures, circuit)
 
           entry = %{
             entry
@@ -636,7 +634,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_info({:restart_adapter, key, generation}, state) do
     case state.adapters[key] do
-      %{generation: ^generation, pid: nil} = entry ->
+      %{generation: ^generation, pid: nil, circuit: :closed} = entry ->
         state = put_in(state.adapters[key], %{entry | timer: nil})
 
         if Tightbeam.HarnessProcess.fenced?(state.db, key) do
@@ -738,12 +736,7 @@ defmodule Tightbeam.AdapterCoordinator do
         circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
 
-        timer =
-          Process.send_after(
-            self(),
-            {:restart_adapter, key, generation},
-            backoff(state, failures)
-          )
+        timer = schedule_restart(state, key, generation, failures, circuit)
 
         entry = %{
           entry
@@ -813,7 +806,7 @@ defmodule Tightbeam.AdapterCoordinator do
          state
        ) do
     case state.adapters[key] do
-      %{generation: ^generation, pid: nil} = entry ->
+      %{generation: ^generation, pid: nil, circuit: :closed} = entry ->
         if Tightbeam.HarnessProcess.fenced?(state.db, key) do
           state
         else
@@ -832,7 +825,7 @@ defmodule Tightbeam.AdapterCoordinator do
          state
        ) do
     case state.adapters[key] do
-      %{generation: ^generation, pid: nil} = entry ->
+      %{generation: ^generation, pid: nil, circuit: :closed} = entry ->
         if Tightbeam.HarnessProcess.fenced?(state.db, key) do
           state
         else
@@ -868,6 +861,21 @@ defmodule Tightbeam.AdapterCoordinator do
 
   defp backoff(state, failures),
     do: min(state.backoff_base_ms * Integer.pow(2, max(failures - 1, 0)), 60_000)
+
+  # An open circuit is a latch, not another backoff interval. Keeping timer
+  # creation behind this state seam prevents both ordinary deaths and
+  # synchronous start failures from scheduling a generation that checkout
+  # must refuse. Authoritative credential recovery enters through
+  # adapter_for/3 and closes the circuit only when that adapter reports ready.
+  defp schedule_restart(_state, _key, _generation, _failures, :open), do: nil
+
+  defp schedule_restart(state, key, generation, failures, :closed) do
+    Process.send_after(
+      self(),
+      {:restart_adapter, key, generation},
+      backoff(state, failures)
+    )
+  end
 
   defp grant_slot(machine, borrower, state) do
     slot = make_ref()

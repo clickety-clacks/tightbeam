@@ -780,6 +780,9 @@ defmodule Tightbeam.Escalation do
   id. The asked session remains the preferred responder, not an authorization
   gate. A user principal keeps the existing asked-owner boundary.
 
+  A typed cannot-proceed request is not an ordinary question. Prose cannot
+  settle that durable decision obligation, so answer refuses it unchanged.
+
   Kind and principal standing are checked before a non-agent row is revealed.
   A nonexistent id, a non-agent id, and an agent question outside a user's
   existing expecter boundary are one identical refusal. An authenticated agent
@@ -794,6 +797,9 @@ defmodule Tightbeam.Escalation do
       %{kind: "agent"} = request ->
         if decision_reader?(call, request) do
           cond do
+            cannot_proceed_request?(request) ->
+              cannot_proceed_decision_error()
+
             not (is_binary(text) and String.trim(text) != "") ->
               error("invalid", "an answer requires text")
 
@@ -832,6 +838,7 @@ defmodule Tightbeam.Escalation do
 
   A return is a terminal, reasoned disposition of the exact immutable request,
   not an answer or ruling. The same principal boundary as `answer/2` applies.
+  Typed cannot-proceed requests refuse this generic terminal path unchanged.
   """
   @spec return_request(DB.server(), map()) :: map()
   def return_request(db, call) do
@@ -841,30 +848,34 @@ defmodule Tightbeam.Escalation do
     case get_raw(db, request_id) do
       %{kind: "agent"} = request ->
         if decision_reader?(call, request) do
-          by = principal_id(call)
+          if cannot_proceed_request?(request) do
+            cannot_proceed_decision_error()
+          else
+            by = principal_id(call)
 
-          case trimmed_reason(reason) do
-            {:ok, text} ->
-              cond do
-                request.status == "open" ->
-                  return_open(db, Map.put(request, :firehose_call, call), text, by)
+            case trimmed_reason(reason) do
+              {:ok, text} ->
+                cond do
+                  request.status == "open" ->
+                    return_open(db, Map.put(request, :firehose_call, call), text, by)
 
-                request.status == "returned" and request.returned_by == by and
-                    request.return_reason == text ->
-                  {:ok, request} =
-                    DB.transaction(db, fn txn ->
-                      Publisher.maybe_observed_accepted_in_txn(txn, call)
-                      request
-                    end)
+                  request.status == "returned" and request.returned_by == by and
+                      request.return_reason == text ->
+                    {:ok, request} =
+                      DB.transaction(db, fn txn ->
+                        Publisher.maybe_observed_accepted_in_txn(txn, call)
+                        request
+                      end)
 
-                  request
+                    request
 
-                true ->
-                  error("not_open", "decision request is not open")
-              end
+                  true ->
+                    error("not_open", "decision request is not open")
+                end
 
-            {:error, error} ->
-              error
+              {:error, error} ->
+                error
+            end
           end
         else
           error("not_found", "decision request not found")
@@ -879,78 +890,123 @@ defmodule Tightbeam.Escalation do
   # It arms its owner notification inside the same transaction, exactly as
   # `escalate/4` and the effort rail do (escalation-delivery-v1 proof 10).
   defp file_agent_request(db, input) do
-    now = now()
+    case DB.transaction(db, fn txn ->
+           case file_agent_request_in_txn(txn, input) do
+             %{request: request} = filed ->
+               Publisher.maybe_accepted_in_txn(txn, input.firehose_call, request)
+               filed
+
+             error ->
+               error
+           end
+         end) do
+      {:ok, %{request: request}} -> request
+      {:ok, error} -> error
+      {:error, reason} -> raise "agent request transaction failed: #{inspect(reason)}"
+    end
+  end
+
+  @doc false
+  def file_agent_request_in_txn(txn, input) do
+    raised_at = now()
     request_id = "dr_" <> Tightbeam.Id.uuid4()
 
     context =
       JSON.encode!(%{
-        "verb" => "ask",
+        "verb" => Map.get(input, :verb, "ask"),
         "askedOfSessionKey" => input.asked.session_key,
         "askedOfRole" => input.asked_of_role,
-        # The router resolved the elected role to its owner's personal session
-        # because the bound one was absent or retired. Recorded, not corrected:
-        # the asker asked for a role and deserves to know it got a stand-in.
         "roleFallback" => input.role_fallback
       })
 
-    case DB.transaction(db, fn txn ->
-           with {:ok, about} <-
-                  asked_about_in_txn(txn, input.assignment_id, input.asker_session_key) do
-             resolved_input = Map.put(input, :assignment_id, about)
+    with {:ok, about} <-
+           asked_about_in_txn(txn, input.assignment_id, input.asker_session_key) do
+      resolved_input = Map.put(input, :assignment_id, about)
 
-             Txn.q(
-               txn,
-               """
-               INSERT INTO decision_requests
-                 (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
-                  expecterSessionKey, expecterUserId, raisedAt, deadlineAt,
-                  question, context, status, askedOfRole)
-               VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 'open', ?11)
-               """,
-               [
-                 request_id,
-                 "session:" <> resolved_input.asker_session_key,
-                 resolved_input.asker_session_key,
-                 resolved_input.owner_user_id,
-                 resolved_input.assignment_id,
-                 resolved_input.asked.session_key,
-                 resolved_input.asked.owner_user_id,
-                 now,
-                 resolved_input.question,
-                 context,
-                 resolved_input.asked_of_role
-               ]
-             )
+      Txn.q(
+        txn,
+        """
+        INSERT INTO decision_requests
+          (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+           expecterSessionKey, expecterUserId, raisedAt, deadlineAt,
+           question, context, status, askedOfRole)
+        VALUES (?1, 'agent', ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10, 'open', ?11)
+        """,
+        [
+          request_id,
+          "session:" <> resolved_input.asker_session_key,
+          resolved_input.asker_session_key,
+          resolved_input.owner_user_id,
+          resolved_input.assignment_id,
+          resolved_input.asked.session_key,
+          resolved_input.asked.owner_user_id,
+          raised_at,
+          resolved_input.question,
+          context,
+          resolved_input.asked_of_role
+        ]
+      )
 
-             EventLog.lifecycle_in_txn(
-               txn,
-               "decision_request_asked",
-               request_id,
-               "asker=session:#{resolved_input.asker_session_key} askedOf=#{resolved_input.asked.session_key} " <>
-                 "role=#{resolved_input.asked_of_role || "nil"} assignment=#{resolved_input.assignment_id || "nil"}"
-             )
+      EventLog.lifecycle_in_txn(
+        txn,
+        "decision_request_asked",
+        request_id,
+        "asker=session:#{resolved_input.asker_session_key} askedOf=#{resolved_input.asked.session_key} " <>
+          "role=#{resolved_input.asked_of_role || "nil"} assignment=#{resolved_input.assignment_id || "nil"}"
+      )
 
-             # Transactional outbox. `target_gate: 0` because a question the target
-             # never sees is not a question; the class is what shapes WHEN it lands.
-             Wakes.schedule_in_txn(txn, %{
-               session_key: resolved_input.asked.session_key,
-               origin: "session:" <> resolved_input.asker_session_key,
-               prompt: ask_notification(request_id, resolved_input),
-               due_at: now,
-               target_gate: 0,
-               class: "input-needed"
-             })
+      wake =
+        if Map.get(input, :verb) == "cannot-proceed" do
+          Wakes.schedule_in_txn(txn, %{
+            session_key: resolved_input.asked.session_key,
+            origin: "session:" <> resolved_input.asker_session_key,
+            prompt: ask_notification(request_id, resolved_input),
+            due_at: raised_at,
+            target_gate: 0,
+            class: "input-needed",
+            assignment_id: resolved_input.assignment_id
+          })
+        else
+          Wakes.schedule_in_txn(txn, %{
+            session_key: resolved_input.asked.session_key,
+            origin: "session:" <> resolved_input.asker_session_key,
+            prompt: ask_notification(request_id, resolved_input),
+            due_at: raised_at,
+            target_gate: 0,
+            class: "input-needed"
+          })
+        end
 
-             request = request_in_txn(txn, request_id)
-             Publisher.maybe_accepted_in_txn(txn, input.firehose_call, request)
-             request
-           else
-             {:error, error} -> error
-           end
-         end) do
-      {:ok, request} -> request
-      {:error, reason} -> raise "agent request transaction failed: #{inspect(reason)}"
+      %{request: request_in_txn(txn, request_id), wake: wake}
+    else
+      {:error, error} -> error
     end
+  end
+
+  @doc false
+  def settle_agent_request_in_txn(txn, request_id, by, reason) do
+    settled_at = now()
+
+    Txn.q(
+      txn,
+      """
+      UPDATE decision_requests
+      SET status='withdrawn', withdrawnBy=?2, withdrawnReason=?3, withdrawnAt=?4
+      WHERE id=?1 AND kind='agent' AND status='open'
+      """,
+      [request_id, by, reason, settled_at]
+    )
+
+    if Txn.changes(txn) == 1 do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "decision_request_withdrawn",
+        request_id,
+        "by=#{by} reason=#{reason}"
+      )
+    end
+
+    :ok
   end
 
   defp answer_open(db, request, text, answered_by) do
@@ -1381,6 +1437,8 @@ defmodule Tightbeam.Escalation do
   asker that filed a `kind = 'agent'` row takes it back with the same verb and
   no other principal's cooperation. `raiserId = 'session:' || raiserSessionKey`
   in the agent arm is what makes the existing raiser check land on the asker.
+  Typed cannot-proceed requests are the exception: their decision obligation
+  remains until exact assignment disposition or an exact release fact.
   """
   @spec withdraw(DB.server(), map()) :: map()
   def withdraw(db, call) do
@@ -1408,9 +1466,21 @@ defmodule Tightbeam.Escalation do
             error("not_raiser", "raiser required")
 
           request ->
-            withdraw_open(db, Map.put(request, :firehose_call, call), call.origin, reason)
+            if cannot_proceed_request?(request),
+              do: cannot_proceed_decision_error(),
+              else: withdraw_open(db, Map.put(request, :firehose_call, call), call.origin, reason)
         end
     end
+  end
+
+  defp cannot_proceed_request?(%{context: %{"verb" => "cannot-proceed"}}), do: true
+  defp cannot_proceed_request?(_request), do: false
+
+  defp cannot_proceed_decision_error do
+    error(
+      "cannot_proceed_standing",
+      "cannot-proceed decisions settle only through exact assignment disposition or release fact"
+    )
   end
 
   @doc "Withdraw open requests and revoke live waivers for one retired session raiser."
@@ -1419,9 +1489,9 @@ defmodule Tightbeam.Escalation do
   # answers to as its own lawful, judgment-free exit (gate Q3 for the agent
   # arm's own doc above). Retirement withdraws ALL of a session's open rows —
   # statute, effort, agent alike — on that session's behalf, exactly as if the
-  # session had called `withdraw` on each itself. This reads `status = 'open'`
-  # with no `kind` predicate because it means to reach every kind, not because
-  # it forgot one.
+  # session had called `withdraw` on each itself. Typed cannot-proceed requests
+  # remain open because retirement is neither an exact assignment disposition
+  # nor an exact release fact.
   @spec withdraw_for_retired(DB.server(), String.t()) :: :ok
   def withdraw_for_retired(db, session_key) do
     raiser_id = "session:" <> session_key
@@ -1432,11 +1502,14 @@ defmodule Tightbeam.Escalation do
         rows =
           Txn.q(
             txn,
-            "SELECT id FROM decision_requests WHERE raiserSessionKey = ?1 AND kind != 'operator' AND status = 'open'",
+            "SELECT id,context FROM decision_requests WHERE raiserSessionKey = ?1 AND kind != 'operator' AND status = 'open'",
             [session_key]
           )
+          |> Enum.reject(fn [_id, context] ->
+            decode_required(context)["verb"] == "cannot-proceed"
+          end)
 
-        Enum.each(rows, fn [id] ->
+        Enum.each(rows, fn [id, _context] ->
           Txn.q(
             txn,
             "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'raiser-retired', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
@@ -1750,6 +1823,8 @@ defmodule Tightbeam.Escalation do
     grant_waiver: "statute",
     current_request: "statute",
     file_agent_request: "agent",
+    file_agent_request_in_txn: "agent",
+    settle_agent_request_in_txn: "agent",
     answer_open: "agent",
     return_open: "agent",
     effort_open_by_deadline_wake_in_txn: "effort",

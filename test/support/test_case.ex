@@ -85,6 +85,26 @@ defmodule Tightbeam.TestCase do
   @doc "Create the complete production schema for a unit-test database."
   def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
 
+  @doc "Atomically detach a per-test directory before recursively removing it."
+  def cleanup_dir!(dir) do
+    isolated = "#{dir}.cleanup-#{System.unique_integer([:positive])}"
+
+    case File.rename(dir, isolated) do
+      :ok ->
+        File.rm_rf!(isolated)
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error,
+          reason: reason,
+          action: "isolate test directory for cleanup",
+          path: dir
+    end
+  end
+
   @doc "Provision or load the real durable cursor-signing provider for a test base dir."
   def cursor_signing!(base_dir) do
     base_dir = cursor_signing_base_dir(base_dir)
