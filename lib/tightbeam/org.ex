@@ -45,6 +45,8 @@ defmodule Tightbeam.Org do
           cleared_through_seq: integer(),
           state: String.t(),
           mechanical_status: String.t(),
+          lifecycle_generation: non_neg_integer(),
+          lifecycle_request_id: String.t() | nil,
           created_at: integer(),
           updated_at: integer()
         }
@@ -96,6 +98,8 @@ defmodule Tightbeam.Org do
     state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
     mechanicalStatus TEXT NOT NULL DEFAULT 'idle'
                      CHECK (mechanicalStatus IN ('idle','running')),
+    lifecycleGeneration INTEGER NOT NULL DEFAULT 0 CHECK (lifecycleGeneration >= 0),
+    lifecycleRequestId TEXT,
     createdAt     INTEGER NOT NULL,
     updatedAt     INTEGER NOT NULL
   );
@@ -104,6 +108,13 @@ defmodule Tightbeam.Org do
   @ddl @sessions_ddl <>
          """
          CREATE INDEX IF NOT EXISTS sessions_owner ON sessions (ownerUserId, state);
+         CREATE TABLE IF NOT EXISTS session_lifecycle_states (
+           sessionKey TEXT PRIMARY KEY REFERENCES sessions(sessionKey),
+           state TEXT NOT NULL CHECK (state IN ('active','parking','parked','retired')),
+           generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+           requestId TEXT,
+           updatedAt INTEGER NOT NULL
+         );
          CREATE TABLE IF NOT EXISTS harness_pointers (
            id               INTEGER PRIMARY KEY AUTOINCREMENT,
            sessionKey       TEXT NOT NULL REFERENCES sessions(sessionKey),
@@ -978,7 +989,7 @@ defmodule Tightbeam.Org do
       %{state: "retired"} = session ->
         session
 
-      %{state: "active"} ->
+      %{state: state} when state in ["active", "parking", "parked"] ->
         retire_active_in_txn(
           txn,
           session_key,
@@ -995,6 +1006,8 @@ defmodule Tightbeam.Org do
 
   defp retire_active_in_txn(txn, session_key, principal, supervision_interval_ms) do
     retirement_epoch = now()
+
+    Tightbeam.SessionLifecycle.supersede_by_retire_in_txn(txn, session_key)
 
     case Supervision.transition_in_txn(txn, %{
            kind: "parent_target_retired",
@@ -1018,7 +1031,7 @@ defmodule Tightbeam.Org do
             WHERE turns.sessionKey = sessions.sessionKey
               AND turns.status IN ('queued','running')
           ) THEN 'running' ELSE 'idle' END
-      WHERE sessionKey = ?1 AND state = 'active'
+      WHERE sessionKey = ?1 AND state IN ('active','parking','parked')
       """,
       [session_key]
     )
@@ -1729,8 +1742,12 @@ defmodule Tightbeam.Org do
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, operationalParent, handle, archetype, overrides, identityName,
            identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
-           model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
-           mechanicalStatus, createdAt, updatedAt
+           model, thinkingLevel, modelContext, host, clearedThroughSeq,
+           CASE WHEN state='retired' THEN state ELSE COALESCE(
+             (SELECT sl.state FROM session_lifecycle_states sl WHERE sl.sessionKey=sessions.sessionKey),
+             state
+           ) END,
+           mechanicalStatus, lifecycleGeneration, lifecycleRequestId, createdAt, updatedAt
     FROM sessions
     """
   end
@@ -1745,8 +1762,12 @@ defmodule Tightbeam.Org do
     """
   end
 
-  defp insert_legacy_mechanical_status(row),
-    do: List.insert_at(row, length(row) - 2, "idle")
+  defp insert_legacy_mechanical_status(row) do
+    row
+    |> List.insert_at(length(row) - 2, "idle")
+    |> then(&List.insert_at(&1, length(&1) - 2, 0))
+    |> then(&List.insert_at(&1, length(&1) - 2, nil))
+  end
 
   defp to_session([
          session_key,
@@ -1776,6 +1797,8 @@ defmodule Tightbeam.Org do
          cleared_through_seq,
          state,
          mechanical_status,
+         lifecycle_generation,
+         lifecycle_request_id,
          created_at,
          updated_at
        ]) do
@@ -1805,6 +1828,8 @@ defmodule Tightbeam.Org do
       cleared_through_seq: cleared_through_seq,
       state: state,
       mechanical_status: mechanical_status,
+      lifecycle_generation: lifecycle_generation,
+      lifecycle_request_id: lifecycle_request_id,
       created_at: created_at,
       updated_at: updated_at
     }

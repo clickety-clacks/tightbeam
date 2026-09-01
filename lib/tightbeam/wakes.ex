@@ -2469,6 +2469,9 @@ defmodule Tightbeam.Wakes do
         end
 
       case {wake.consumer, delivery} do
+        {"prompt", {:ok, :deferred}} ->
+          :ok
+
         {"prompt", {:ok, :skipped}} when wake.digest ->
           NoticeBatcher.delivery_terminal_failure(db, wake.wake_id, :skipped)
 
@@ -2842,67 +2845,78 @@ defmodule Tightbeam.Wakes do
 
   defp fire_in_txn(txn, %{state: "pending", condition_kind: kind} = wake)
        when is_binary(kind) do
-    {match_sql, params} =
-      if is_nil(wake.condition_scope) do
-        {"SELECT id, scope FROM condition_facts WHERE id > ?1 AND kind = ?2 ORDER BY id ASC LIMIT 1",
-         [wake.condition_after_id, kind]}
-      else
-        {"SELECT id, scope FROM condition_facts INDEXED BY condition_facts_match WHERE id > ?1 AND kind = ?2 AND scope = ?3 ORDER BY id ASC LIMIT 1",
-         [wake.condition_after_id, kind, wake.condition_scope]}
-      end
+    if parked_session_in_txn?(txn, wake.session_key) do
+      :noop
+    else
+      {match_sql, params} =
+        if is_nil(wake.condition_scope) do
+          {"SELECT id, scope FROM condition_facts WHERE id > ?1 AND kind = ?2 ORDER BY id ASC LIMIT 1",
+           [wake.condition_after_id, kind]}
+        else
+          {"SELECT id, scope FROM condition_facts INDEXED BY condition_facts_match WHERE id > ?1 AND kind = ?2 AND scope = ?3 ORDER BY id ASC LIMIT 1",
+           [wake.condition_after_id, kind, wake.condition_scope]}
+        end
 
-    match =
-      case Txn.q(txn, match_sql, params) do
-        [[id, scope]] -> %{id: id, scope: scope}
-        [] -> nil
-      end
+      match =
+        case Txn.q(txn, match_sql, params) do
+          [[id, scope]] -> %{id: id, scope: scope}
+          [] -> nil
+        end
 
-    cause =
-      cond do
-        match -> "condition"
-        wake.due_at <= now() -> "fallback"
-        true -> nil
-      end
+      cause =
+        cond do
+          match -> "condition"
+          wake.due_at <= now() -> "fallback"
+          true -> nil
+        end
 
-    if cause do
-      fired_at = now()
+      if cause do
+        fired_at = now()
 
-      Txn.q(
-        txn,
-        "UPDATE wakes SET state = 'fired', firedAt = ?2, firedBy = ?3 WHERE wakeId = ?1 AND state = 'pending'",
-        [wake.wake_id, fired_at, cause]
-      )
+        Txn.q(
+          txn,
+          "UPDATE wakes SET state = 'fired', firedAt = ?2, firedBy = ?3 WHERE wakeId = ?1 AND state = 'pending'",
+          [wake.wake_id, fired_at, cause]
+        )
 
-      if Txn.changes(txn) == 1 do
-        stamp =
-          if cause == "condition",
-            do: "[woke: fact #{kind}/#{match.scope || "nil"}]",
-            else: "[woke: fallback deadline]"
+        if Txn.changes(txn) == 1 do
+          stamp =
+            if cause == "condition",
+              do: "[woke: fact #{kind}/#{match.scope || "nil"}]",
+              else: "[woke: fallback deadline]"
 
-        delivery =
-          Gateway.deliver_prompt_in_txn(
-            txn,
-            wake.session_key,
-            wake.origin,
-            stamp <> "\n\n" <> wake.prompt,
-            wake_id: wake.wake_id,
-            sender: wake.origin,
-            target_gate: wake,
-            role_ref: wake.target_role
-          )
+          delivery =
+            Gateway.deliver_prompt_in_txn(
+              txn,
+              wake.session_key,
+              wake.origin,
+              stamp <> "\n\n" <> wake.prompt,
+              wake_id: wake.wake_id,
+              sender: wake.origin,
+              target_gate: wake,
+              role_ref: wake.target_role
+            )
 
-        lifecycle_for_fire(txn, wake, cause, match, delivery)
-        publish_change_in_txn(txn, "wake.fired", wake.wake_id)
-        {:fired, delivery}
+          lifecycle_for_fire(txn, wake, cause, match, delivery)
+          publish_change_in_txn(txn, "wake.fired", wake.wake_id)
+          {:fired, delivery}
+        else
+          :noop
+        end
       else
         :noop
       end
-    else
-      :noop
     end
   end
 
   defp fire_in_txn(_txn, _wake), do: :noop
+
+  defp parked_session_in_txn?(txn, session_key) do
+    Txn.q(txn, "SELECT state FROM session_lifecycle_states WHERE sessionKey=?1", [session_key]) in [
+      [["parking"]],
+      [["parked"]]
+    ]
+  end
 
   @doc false
   def publish_change_in_txn(%Txn{} = txn, class, wake_id) do

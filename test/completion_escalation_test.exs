@@ -12,6 +12,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     Model,
     Org,
     Placement,
+    SessionLifecycle,
     Toplines,
     Wakes,
     WorkItems
@@ -852,18 +853,83 @@ defmodule Tightbeam.CompletionEscalationTest do
              )
   end
 
-  test "park remains the separately gated unavailable dependency", ctx do
+  test "park binds one primitive request and leaves completion open when runtime is unavailable",
+       ctx do
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+    completion_id = record.id
+
+    assert %{
+             code: "park_failed",
+             completionId: ^completion_id,
+             requestStatus: "open",
+             parkRequestId: park_request_id,
+             failureCode: "runtime_liveness_unknown",
+             recoveryState: "fenced_unknown_liveness",
+             remedy: "resolve_runtime_then_relaunch"
+           } = disposition(ctx, record.id, "park", {:user, "owner"})
+
+    assert is_binary(park_request_id)
+
+    assert only_notice(ctx, {:user, "owner"}).request.status == "open"
+  end
+
+  test "R12 acknowledges only its exact bound committed parked outcome", ctx do
     assignment = assign(ctx)
     complete(ctx, assignment.id)
     record = only_notice(ctx, {:user, "owner"})
 
-    assert %{
-             code: "park_dependency_unavailable",
-             completionId: record.id,
-             requestStatus: "open"
-           } == disposition(ctx, record.id, "park", {:user, "owner"})
+    {:ok, request_id} =
+      DB.transaction(ctx.db, fn txn ->
+        {:action, row} =
+          CompletionEscalation.preflight_disposition_in_txn(
+            txn,
+            record.id,
+            "park",
+            {:user, "owner"}
+          )
 
-    assert only_notice(ctx, {:user, "owner"}).request.status == "open"
+        {:ok, request_id} =
+          CompletionEscalation.bind_park_in_txn(
+            txn,
+            row,
+            {:user, "owner"},
+            "/tmp/r12-park"
+          )
+
+        request_id
+      end)
+
+    assert SessionLifecycle.settle(ctx.db, request_id, fn _ -> :ok end).outcome.status ==
+             "parked"
+
+    assert SessionLifecycle.read(ctx.db, request_id, {:session, ctx.parent.session_key}).request_id ==
+             request_id
+
+    assert SessionLifecycle.read(ctx.db, request_id, {:session, ctx.sibling.session_key}) == %{
+             code: "not_found"
+           }
+
+    {:ok, acknowledged} =
+      DB.transaction(ctx.db, fn txn ->
+        CompletionEscalation.acknowledge_park_if_parked_in_txn(
+          txn,
+          record.id,
+          {:user, "owner"}
+        )
+      end)
+
+    assert acknowledged.status == "acknowledged"
+    assert acknowledged.decision == "park"
+    assert acknowledged.park_request_id == request_id
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wake_cancellations WHERE dispositionKind='completion_transition' AND dispositionId=?1",
+               [record.id]
+             )
   end
 
   test "reopen supersedes history and later completion appends a new row", ctx do
@@ -1324,7 +1390,9 @@ defmodule Tightbeam.CompletionEscalationTest do
 
     mutation_sites = completion_mutation_sites(root)
     assert mutation_sites != []
-    assert mutation_sites |> Enum.map(&elem(&1, 0)) |> Enum.uniq() == [owner]
+
+    assert mutation_sites |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.sort() ==
+             [owner, Path.join(root, "tightbeam/schema.ex")] |> Enum.sort()
 
     assert remote_call_sites(assignments, :CompletionEscalation, :open_in_txn, 3) == [
              "lifecycle_attest_in_txn/2"
@@ -1347,7 +1415,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert remote_call_sites(owner, :Wakes, :fire_internal_in_txn, 4) == ["fire_deadline!/2"]
 
     assert remote_call_sites(owner, :EventLog, :lifecycle_in_txn, 4) |> Enum.sort() ==
-             ~w(acknowledge_in_txn/5 dispose_undeliverable_delivery_in_txn/2 open_in_txn/3 park_unavailable_in_txn/3 preflight_existing_in_txn/4 record_parent_failure/4 record_parent_failure/4 record_report_to_failure/4 reissue_open_in_txn/2 retire_deferred_in_txn/4 transition_superseded_in_txn/5)
+             ~w(acknowledge_in_txn/5 bind_park_in_txn/4 dispose_undeliverable_delivery_in_txn/2 open_in_txn/3 preflight_existing_in_txn/4 record_parent_failure/4 record_parent_failure/4 record_report_to_failure/4 reissue_open_in_txn/2 retire_deferred_in_txn/4 transition_superseded_in_txn/5)
              |> Enum.sort()
 
     assert local_call_sites(owner, :root_main_now?, 2) |> Enum.sort() ==

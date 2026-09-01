@@ -140,6 +140,9 @@ defmodule Tightbeam.GatewayTest do
       {:reply, :ok, state}
     end
 
+    def handle_call({:close_adapter, key, _kill_attrs}, from, state),
+      do: handle_call({:close_adapter, key}, from, state)
+
     def handle_call(:harness_processes, _from, {_adapter, parent} = state) do
       if is_pid(parent), do: send(parent, :harness_processes)
       {:reply, [%{launch_id: "launch-1", state: "kill_failed"}], state}
@@ -164,6 +167,9 @@ defmodule Tightbeam.GatewayTest do
       send(parent, {:repair_close_adapter, key})
       {:reply, result, state}
     end
+
+    def handle_call({:close_adapter, key, _kill_attrs}, from, state),
+      do: handle_call({:close_adapter, key}, from, state)
   end
 
   defmodule FenceDeleteRaceDB do
@@ -177,7 +183,7 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:query, sql, params} = request, _from, state) do
       state =
         if state.armed and params != [] and
-             String.contains?(sql, "DELETE FROM harness_park_fences") and
+             String.contains?(sql, "DELETE FROM harness_kill_fences") and
              String.contains?(sql, "adapterKey = ?1") do
           send(state.parent, {:before_reconciled_fence_delete, self()})
 
@@ -688,6 +694,84 @@ defmodule Tightbeam.GatewayTest do
       })
 
     %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, main_key: main_key}
+  end
+
+  test "public PARK relaunch/read and no-launch KILL preserve typed lifecycle results", ctx do
+    start_supervised!({
+      SessionLane,
+      session_key: "k1",
+      db: ctx.db,
+      task_sup: Tightbeam.TurnTaskSupervisor,
+      runner: fn _turn -> {:ok, %{text: "unused", stop_reason: "end_turn"}} end
+    })
+
+    config = gateway_config(ctx.catalog_base, ctx.db, 0)
+    handlers = Gateway.handlers(config)
+
+    parked =
+      handlers
+      |> Map.fetch!("session-park")
+      |> then(
+        & &1.(%{
+          origin: "user:flynn",
+          principal: {:user, "flynn"},
+          params: %{
+            session_key: "k1",
+            idempotency_key: "public-park-once",
+            mode: "graceful"
+          }
+        })
+      )
+
+    assert parked.outcome.status == "parked"
+
+    assert handlers["session-park-request"].(%{
+             principal: {:user, "flynn"},
+             params: %{request_id: parked.request_id}
+           }).request_id == parked.request_id
+
+    assert handlers["session-park-request"].(%{
+             principal: {:user, "zoe"},
+             params: %{request_id: parked.request_id}
+           }) == %{code: "not_found"}
+
+    assert %{ok: true, sessionKey: "k1", state: "active"} =
+             handlers["session-relaunch"].(%{
+               principal: {:user, "flynn"},
+               params: %{session_key: "k1"}
+             })
+
+    assert_receive {:ensure_lane, "k1"}
+
+    adapter_sup = :"public_kill_adapter_sup_#{System.unique_integer([:positive])}"
+    coordinator = :"public_kill_coordinator_#{System.unique_integer([:positive])}"
+    start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: adapter_sup})
+
+    start_supervised!(
+      {Tightbeam.AdapterCoordinator,
+       adapter_sup: adapter_sup,
+       adapter_context: fn _ -> [] end,
+       adapter_opts: fn _, _ -> flunk("a no-launch KILL must not start an adapter") end,
+       db: ctx.db,
+       name: coordinator}
+    )
+
+    kill_handler =
+      config
+      |> Map.put(:adapter_coordinator, coordinator)
+      |> Gateway.handlers()
+      |> Map.fetch!("harness-kill")
+
+    assert %{code: "identity_mismatch", request_id: request_id} =
+             kill_handler.(%{
+               principal: {:user, "flynn"},
+               params: %{session_key: "k1"}
+             })
+
+    assert handlers["harness-kill-request"].(%{
+             principal: {:user, "flynn"},
+             params: %{request_id: request_id}
+           }).status == "refused"
   end
 
   test "assignment handlers inject configured supervision and effort settings before mutation",
@@ -1546,7 +1630,7 @@ defmodule Tightbeam.GatewayTest do
   test "rate limit opens a durable no-claim park and explicit resume releases it once", ctx do
     repair = failed_repair_route!(ctx, "asg_rate_resume", "rate-limit-dead", 60)
     adapter_key = {:claude, "shared", "testhost"}
-    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert Tightbeam.HarnessProcess.kill_fenced?(ctx.db, adapter_key)
 
     {:ok, blocked_seq} =
       Ledger.enqueue(ctx.db, %{
@@ -1589,7 +1673,7 @@ defmodule Tightbeam.GatewayTest do
        name: coordinator}
     )
 
-    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert Tightbeam.HarnessProcess.kill_fenced?(ctx.db, adapter_key)
     assert :ok = SessionLane.nudge("k1")
     refute_receive {:rate_runner, _}, 100
 
@@ -1609,7 +1693,7 @@ defmodule Tightbeam.GatewayTest do
                principal: "agent:k1"
              })
 
-    assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    assert Tightbeam.HarnessProcess.kill_fenced?(ctx.db, adapter_key)
     assert HarnessHealth.get(ctx.db, repair.incident.id).state == "open"
 
     {:ok, repair_coordinator} = RepairCoordinatorStub.start_link({self(), :ok})
@@ -1634,7 +1718,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: true, action: "resume"} = first = handler.(call)
     assert handler.(call) == first
-    refute Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
+    refute Tightbeam.HarnessProcess.kill_fenced?(ctx.db, adapter_key)
     assert_receive {:repair_close_adapter, ^adapter_key}
     refute_receive {:repair_close_adapter, _}, 50
 
@@ -2060,10 +2144,10 @@ defmodule Tightbeam.GatewayTest do
                principal: "process:tightbeam"
              })
 
-    assert HarnessProcess.parked?(ctx.db, adapter_key)
+    assert HarnessProcess.kill_fenced?(ctx.db, adapter_key)
     send(proxy, :release_reconciled_fence_delete)
     assert Task.await(reconciliation) == :ok
-    assert HarnessProcess.parked?(ctx.db, adapter_key)
+    assert HarnessProcess.kill_fenced?(ctx.db, adapter_key)
     assert HarnessHealth.get(ctx.db, incident.id).state == "open"
 
     assert :repair_required =
@@ -2100,7 +2184,7 @@ defmodule Tightbeam.GatewayTest do
                }
              })
 
-    refute HarnessProcess.parked?(ctx.db, adapter_key)
+    refute HarnessProcess.kill_fenced?(ctx.db, adapter_key)
     assert_receive {:repair_close_adapter, ^adapter_key}
   end
 

@@ -1,12 +1,27 @@
 defmodule Tightbeam.LaneTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, EventLog, LaneManager, Placement, Schema, SessionLane}
+  alias Tightbeam.{
+    DB,
+    EventLog,
+    LaneManager,
+    Ledger,
+    Placement,
+    Schema,
+    SessionLane,
+    SessionLifecycle
+  }
 
   setup do
     db = :"db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('t',0,'admin_add',1)"
+      )
 
     :ok =
       DB.execute(db, """
@@ -72,6 +87,63 @@ defmodule Tightbeam.LaneTest do
     :ok = LaneManager.reconcile(mgr)
     assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
     assert Agent.get(agent, &Enum.reverse(&1)) == ["first", "second"]
+  end
+
+  test "accepted PARK drains the running turn then closes before the next claim", ctx do
+    parent = self()
+
+    runner = fn turn ->
+      send(parent, {:running, turn.prompt, self()})
+
+      receive do
+        :release -> {:ok, %{text: turn.prompt}}
+      end
+    end
+
+    manager = :"park_drain_#{System.unique_integer([:positive])}"
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: manager,
+        on_idle: fn session_key ->
+          Enum.each(SessionLifecycle.open_requests(ctx.db, session_key), fn request ->
+            closed = SessionLifecycle.settle(ctx.db, request.request_id, fn _ -> :ok end)
+            send(parent, {:park_closed, closed.request_id, closed.outcome.status})
+          end)
+        end
+      )
+
+    first = enqueue!(ctx.db, "k1", "running")
+    :ok = LaneManager.ensure_lane(manager, "k1")
+    assert_receive {:running, "running", runner_pid}
+
+    second = enqueue!(ctx.db, "k1", "preserved")
+
+    accepted =
+      SessionLifecycle.request(ctx.db, %{
+        session_key: "k1",
+        principal: {:user, "t"},
+        idempotency_key: "drain-boundary",
+        workspace_path: "/tmp"
+      })
+
+    assert accepted.outcome.status == "open"
+    send(runner_pid, :release)
+
+    assert_receive {:park_closed, request_id, "parked"}
+    assert request_id == accepted.request_id
+    refute_receive {:running, "preserved", _pid}, 100
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [first])
+
+    assert {:ok, [["queued"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [second])
   end
 
   test "a delivered runner mutation commits with the terminal CAS and publishes afterward", ctx do

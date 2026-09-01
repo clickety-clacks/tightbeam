@@ -250,7 +250,7 @@ defmodule Tightbeam.TerminalDecisionRequestIdIntegrityTest do
 
     assert :ok = Schema.upgrade_ruled_decision_integrity_v1(ctx.db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v14"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v15"]]} =
              DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
     request_id = request.id

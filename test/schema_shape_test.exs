@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v14"
+  @shape "coordination-fabric-v1-phase1-v15"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -481,14 +481,14 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
-  test "the exact v13 predecessor is refused before v14 DDL", %{db: db} do
+  test "the exact v13 predecessor is refused before v15 DDL", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v13'")
     before = table_columns(db, "assignments")
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v13"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v14"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v15"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 

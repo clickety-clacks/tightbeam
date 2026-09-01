@@ -92,6 +92,7 @@ defmodule Tightbeam.Gateway do
     Rules,
     Roles,
     Schema,
+    SessionLifecycle,
     Spinup,
     StateResources,
     SubagentMarkers,
@@ -200,6 +201,12 @@ defmodule Tightbeam.Gateway do
     on_retired = fn session_key ->
       Supervision.notify_retired(session_key)
     end
+
+    on_idle = fn session_key ->
+      reconcile_open_parks(config, db, session_key)
+    end
+
+    on_boot = fn -> reconcile_open_parks(config, db, nil) end
 
     handler_table =
       config
@@ -345,6 +352,8 @@ defmodule Tightbeam.Gateway do
          runner: runner,
          terminal_publisher: terminal_publisher(db),
          on_terminal: on_terminal,
+         on_idle: on_idle,
+         on_boot: on_boot,
          name: Tightbeam.LaneManager},
         {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
       ]
@@ -1084,6 +1093,13 @@ defmodule Tightbeam.Gateway do
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
           %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
         end),
+      {"session-park", []} => fn call -> session_park_result(config, db, call) end,
+      {"session-relaunch", []} => fn call -> session_relaunch_result(config, db, call) end,
+      {"session-park-request", []} => fn call -> session_park_read_result(db, call) end,
+      {"harness-kill", []} => fn call -> harness_kill_result(config, db, call) end,
+      {"harness-kill-request", []} => fn call ->
+        HarnessProcess.read_kill_request(db, call.params[:request_id], call.principal)
+      end,
       {"role-create", ["role.created"]} => fn call -> role_create_result(db, call) end,
       {"role-bind", ["role.bound"]} => fn call -> role_bind_result(db, call) end,
       {"role-rm", ["role.removed"]} => fn call -> role_rm_result(db, call) end,
@@ -1506,10 +1522,15 @@ defmodule Tightbeam.Gateway do
     coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
     key = {Harness.parse!(session.harness).id(), "shared", session.host}
 
-    case AdapterCoordinator.close_adapter(coordinator, key) do
+    case AdapterCoordinator.close_adapter(coordinator, key, %{
+           principal: {:process, "tightbeam:harness-health"},
+           authority_basis: "harness_health_recovery",
+           cause_kind: "harness_health_incident",
+           cause_id: incident.id
+         }) do
       :ok ->
         if incident.failure_class == "rate-limit-dead" do
-          :ok = HarnessProcess.complete_park(db, key)
+          :ok = HarnessProcess.complete_kill(db, key)
         end
 
         rerun_latest(db, call, assignment, incident)
@@ -1677,8 +1698,19 @@ defmodule Tightbeam.Gateway do
           | {:duplicate, map()}
           | {:conflict, map()}
           | :invalid_reply_reference
+          | :deferred
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
+    case parked_wake_delivery?(txn, session_key, opts) do
+      true ->
+        :deferred
+
+      false ->
+        deliver_admitted_prompt_in_txn(txn, session_key, origin, prompt, opts)
+    end
+  end
+
+  defp deliver_admitted_prompt_in_txn(txn, session_key, origin, prompt, opts) do
     case completion_delivery_admission(txn, session_key, opts) do
       :skip ->
         :skipped
@@ -1689,6 +1721,16 @@ defmodule Tightbeam.Gateway do
           duplicate -> duplicate
         end
     end
+  end
+
+  defp parked_wake_delivery?(txn, session_key, opts) do
+    is_binary(opts[:wake_id]) and
+      DB.Txn.q(txn, "SELECT state FROM session_lifecycle_states WHERE sessionKey=?1", [
+        session_key
+      ]) in [
+        [["parking"]],
+        [["parked"]]
+      ]
   end
 
   defp completion_delivery_admission(txn, session_key, opts) do
@@ -2045,6 +2087,7 @@ defmodule Tightbeam.Gateway do
   end
 
   def complete_delivery(_db, :skipped), do: :skipped
+  def complete_delivery(_db, :deferred), do: :deferred
   def complete_delivery(_db, :invalid_reply_reference), do: :invalid_reply_reference
   def complete_delivery(_db, {:duplicate, _message}), do: :duplicate
   def complete_delivery(_db, {:conflict, _message}), do: :conflict
@@ -3344,13 +3387,13 @@ defmodule Tightbeam.Gateway do
          "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is degraded " <>
            "(host unreachable or adapter failing); see /version"}
 
-      {:error, {:parked, detail}} ->
+      {:error, {:kill_in_progress, detail}} ->
         {:error,
-         "adapter for #{session.harness} on host #{session.host} is being parked: #{detail}"}
+         "adapter for #{session.harness} on host #{session.host} is being killed: #{detail}"}
 
-      {:error, {:park_fenced, detail}} ->
+      {:error, {:kill_fenced, detail}} ->
         {:error,
-         "adapter for #{session.harness} on host #{session.host} remains fenced by an incomplete park: #{inspect(detail)}"}
+         "adapter for #{session.harness} on host #{session.host} remains fenced by an incomplete kill: #{inspect(detail)}"}
 
       {:error, reason} ->
         {:error,
@@ -7875,10 +7918,219 @@ defmodule Tightbeam.Gateway do
       end)
 
     case result do
-      {:response, response} -> response
-      {:completion, id} -> CompletionEscalation.get(db, id)
-      {:retired, owner, retired} -> complete_completion_retire(config, db, owner, retired)
+      {:response, response} ->
+        response
+
+      {:completion, id} ->
+        CompletionEscalation.get(db, id)
+
+      {:park, id, request_id, principal} ->
+        settle_completion_park(config, db, id, request_id, principal)
+
+      {:retired, owner, retired} ->
+        complete_completion_retire(config, db, owner, retired)
     end
+  end
+
+  defp session_park_result(config, db, call) do
+    session_key = call.params[:session_key]
+    idempotency_key = call.params[:idempotency_key]
+    mode = call.params[:mode] || "graceful"
+
+    case Org.get(db, session_key) do
+      nil ->
+        SessionLifecycle.request(db, %{
+          session_key: session_key,
+          principal: call.principal,
+          idempotency_key: idempotency_key,
+          mode: mode,
+          cause_kind: "manual",
+          cause_id: idempotency_key
+        })
+
+      session ->
+        request =
+          SessionLifecycle.request(db, %{
+            session_key: session_key,
+            principal: call.principal,
+            idempotency_key: idempotency_key,
+            mode: mode,
+            cause_kind: "manual",
+            cause_id: idempotency_key,
+            workspace_path: Placement.workdir_path(config, session),
+            retry_of_request_id: call.params[:retry_of_request_id]
+          })
+
+        case request do
+          %{request_id: request_id} ->
+            SessionLifecycle.settle(db, request_id, fn accepted ->
+              settle_session_runtime(config, db, accepted.session_key)
+            end)
+
+          refusal ->
+            refusal
+        end
+    end
+  end
+
+  defp session_relaunch_result(config, db, call) do
+    result = SessionLifecycle.relaunch(db, call.params[:session_key], call.principal)
+
+    if result[:ok] do
+      LaneManager.ensure_lane(config[:lane_manager] || LaneManager, call.params[:session_key])
+    end
+
+    result
+  end
+
+  defp session_park_read_result(db, call) do
+    SessionLifecycle.read(db, call.params[:request_id], call.principal)
+  end
+
+  defp harness_kill_result(config, db, call) do
+    session = Org.get(db, call.params[:session_key])
+
+    if session do
+      key = {Harness.parse!(session.harness).id(), "shared", session.host}
+      basis = if admin_principal?(db, call.principal), do: "administrator", else: "owner_user"
+
+      result =
+        AdapterCoordinator.close_adapter(
+          config[:adapter_coordinator] || AdapterCoordinator,
+          key,
+          %{
+            principal: call.principal,
+            authority_basis: basis,
+            cause_kind: "manual_session_kill",
+            cause_id: session.session_key
+          }
+        )
+
+      case result do
+        :ok -> HarnessProcess.latest_kill_request(db, key)
+        {:error, {:kill_refused, refusal}} -> refusal
+        {:error, reason} -> %{code: "kill_failed", reason: inspect(reason)}
+      end
+    else
+      %{code: "unknown_session"}
+    end
+  end
+
+  defp admin_principal?(db, {:user, user}) do
+    DB.query(db, "SELECT isAdmin FROM users WHERE userId=?1", [user]) == {:ok, [[1]]}
+  end
+
+  defp admin_principal?(_db, _principal), do: false
+
+  defp settle_completion_park(config, db, completion_id, request_id, principal) do
+    settled =
+      SessionLifecycle.settle(db, request_id, fn request ->
+        settle_session_runtime(config, db, request.session_key)
+      end)
+
+    if settled.outcome.status == "parked" do
+      {:ok, completion} =
+        DB.transaction(db, fn txn ->
+          CompletionEscalation.acknowledge_park_if_parked_in_txn(
+            txn,
+            completion_id,
+            principal
+          )
+        end)
+
+      completion
+    else
+      %{
+        code: if(settled.outcome.status == "open", do: "park_in_progress", else: "park_failed"),
+        completionId: completion_id,
+        parkRequestId: request_id,
+        requestStatus: "open",
+        failureCode: settled.outcome.failure_code,
+        recoveryState: settled.outcome.recovery_state,
+        remedy: settled.outcome.remedy
+      }
+    end
+  end
+
+  defp settle_session_runtime(config, db, session_key) do
+    try do
+      session = Org.get(db, session_key)
+
+      with %{} <- session,
+           {:ok, result} <-
+             at_session_turn_boundary(config, session_key, fn ->
+               close_parked_runtime(config, db, session)
+             end) do
+        result
+      else
+        nil -> {:error, :runtime_liveness_unknown}
+        {:error, :turn_in_progress} -> :pending
+      end
+    catch
+      :exit, _reason -> {:error, :runtime_liveness_unknown}
+    end
+  end
+
+  defp close_parked_runtime(config, db, session) do
+    case Org.current_pointer(db, session.session_key) do
+      nil ->
+        :ok
+
+      pointer ->
+        key = {Harness.parse!(session.harness).id(), "shared", session.host}
+
+        AdapterCoordinator.park_session(
+          config[:adapter_coordinator] || AdapterCoordinator,
+          key,
+          pointer.harness_session_id
+        )
+    end
+  end
+
+  defp reconcile_open_parks(config, db, session_key) do
+    Enum.each(SessionLifecycle.open_requests(db, session_key), fn request ->
+      request_session_key = request.session_key
+
+      settled =
+        SessionLifecycle.settle(db, request.request_id, fn _request ->
+          session = Org.get(db, request_session_key)
+
+          if session,
+            do: close_parked_runtime(config, db, session),
+            else: {:error, :runtime_liveness_unknown}
+        end)
+
+      if settled.outcome.status == "parked" do
+        acknowledge_reconciled_completion(db, settled)
+      end
+    end)
+  end
+
+  defp acknowledge_reconciled_completion(db, settled) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT id FROM completion_escalations WHERE parkRequestId=?1 AND status='open'",
+        [settled.request_id]
+      )
+
+    principal =
+      case settled.principal do
+        %{kind: "user", id: id} -> {:user, id}
+        %{kind: "session", id: id} -> {:session, id}
+        _ -> {:process, "tightbeam"}
+      end
+
+    Enum.each(rows, fn [completion_id] ->
+      {:ok, _} =
+        DB.transaction(db, fn txn ->
+          CompletionEscalation.acknowledge_park_if_parked_in_txn(
+            txn,
+            completion_id,
+            principal
+          )
+        end)
+    end)
   end
 
   defp completion_action_in_txn(_config, txn, row, "retain", principal) do
@@ -7886,8 +8138,18 @@ defmodule Tightbeam.Gateway do
     {:completion, row.id}
   end
 
-  defp completion_action_in_txn(_config, txn, row, "park", principal) do
-    {:response, CompletionEscalation.park_unavailable_in_txn(txn, row.id, principal)}
+  defp completion_action_in_txn(config, txn, row, "park", principal) do
+    session = Org.get_in_txn(txn, row.child_session_key)
+
+    workspace_path =
+      if config[:base_dir],
+        do: Placement.workdir_path(config, session),
+        else: "unresolved:#{session.session_key}"
+
+    case CompletionEscalation.bind_park_in_txn(txn, row, principal, workspace_path) do
+      {:ok, request_id} -> {:park, row.id, request_id, principal}
+      {:error, refusal} -> {:response, refusal}
+    end
   end
 
   defp completion_action_in_txn(config, txn, row, "retire", principal),
@@ -8452,12 +8714,19 @@ defmodule Tightbeam.Gateway do
           )
         end)
       else
-        case AdapterCoordinator.close_adapter(coordinator, key) do
+        retirement_session = retired |> List.first() |> Map.fetch!(:session_key)
+
+        case AdapterCoordinator.close_adapter(coordinator, key, %{
+               principal: {:process, "tightbeam:retirement"},
+               authority_basis: "retirement",
+               cause_kind: "session_retirement",
+               cause_id: retirement_session
+             }) do
           :ok ->
             :ok
 
           {:error, reason} = error ->
-            EventLog.lifecycle(db, "adapter_park_failed", inspect(key), inspect(reason))
+            EventLog.lifecycle(db, "adapter_kill_failed", inspect(key), inspect(reason))
             error
         end
       end

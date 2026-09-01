@@ -210,8 +210,14 @@ defmodule Tightbeam.Ledger do
   decline without duplicating the rule or provoking a rollback.
   """
   @spec enqueueable_in_txn?(Txn.t(), String.t()) :: boolean()
-  def enqueueable_in_txn?(%Txn{} = txn, session_key),
-    do: session_exists_in_txn?(txn, session_key)
+  def enqueueable_in_txn?(%Txn{} = txn, session_key) do
+    session_exists_in_txn?(txn, session_key) and
+      Txn.q(
+        txn,
+        "SELECT 1 FROM session_lifecycle_states WHERE sessionKey=?1 AND state IN ('parking','parked')",
+        [session_key]
+      ) == []
+  end
 
   defp session_exists_in_txn?(%Txn{} = txn, session_key) do
     Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [session_key]) != []
@@ -499,6 +505,11 @@ defmodule Tightbeam.Ledger do
                                AND EXISTS (
                                  SELECT 1 FROM sessions AS s
                                  WHERE s.sessionKey = t.sessionKey AND s.state = 'active'
+                                   AND NOT EXISTS (
+                                     SELECT 1 FROM session_lifecycle_states sl
+                                     WHERE sl.sessionKey=s.sessionKey
+                                       AND sl.state IN ('parking','parked','retired')
+                                   )
                                )
                              ORDER BY seq LIMIT 1)
                   AND status = 'queued'
@@ -569,12 +580,19 @@ defmodule Tightbeam.Ledger do
       ]) != []
 
     if queued? do
-      case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
+      case Txn.q(
+             txn,
+             "SELECT CASE WHEN s.state='retired' THEN s.state ELSE COALESCE(sl.state,s.state) END FROM sessions s LEFT JOIN session_lifecycle_states sl USING(sessionKey) WHERE s.sessionKey=?1",
+             [session_key]
+           ) do
         [] ->
           {:unclaimable, :no_session}
 
         [["retired"]] ->
           {:unclaimable, :session_retired}
+
+        [[state]] when state in ["parking", "parked"] ->
+          :none
 
         # UNREACHABLE BY CONSTRUCTION since adjudication was deleted. The claim
         # UPDATE's only session predicate is `state = 'active'`, so an active
@@ -825,7 +843,10 @@ defmodule Tightbeam.Ledger do
   @spec pending_sessions(db()) :: [String.t()]
   def pending_sessions(db \\ Tightbeam.DB) do
     {:ok, rows} =
-      DB.query(db, "SELECT DISTINCT sessionKey FROM turns WHERE status IN ('queued','running')")
+      DB.query(
+        db,
+        "SELECT DISTINCT t.sessionKey FROM turns t LEFT JOIN sessions s USING(sessionKey) LEFT JOIN session_lifecycle_states sl USING(sessionKey) WHERE t.status IN ('queued','running') AND COALESCE(sl.state,s.state,'missing') NOT IN ('parking','parked')"
+      )
 
     Enum.map(rows, fn [k] -> k end)
   end

@@ -9,6 +9,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   rl.on("line", (line) => {
     const m = JSON.parse(line);
     if (m.method === "initialize") send({ id: m.id, result: { protocolVersion: 1 } });
+    if (m.method === "session/close") send({ id: m.id, result: {} });
   });
   """
 
@@ -155,6 +156,20 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert_receive {:adapter_context, context_worker, ^key}
     refute context_worker == coordinator
     assert_receive {:adapter_opts, ^adapter, ^key, [credential_kind: :subscription]}
+  end
+
+  test "PARK closes one harness session without stopping its shared adapter", ctx do
+    key = {:claude, "shared", "testhost"}
+
+    coordinator =
+      start_fake_coordinator(ctx, :"park_shared_#{System.unique_integer([:positive])}")
+
+    assert {:ok, adapter, generation} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
+
+    assert :ok = AdapterCoordinator.park_session(coordinator, key, "resident-session-a")
+    assert Process.alive?(adapter)
+    assert {:ok, ^adapter, ^generation} = AdapterCoordinator.adapter_for(coordinator, key)
   end
 
   test "context capture frees the coordinator mailbox for a lifecycle callback", ctx do
@@ -403,7 +418,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # The row says which state the adapter died in. A park that was ASKED for
     # and got :normal is not a death and stays unrecorded (the test below);
     # this one was killed while the park was in flight.
-    assert detail =~ "parked=true"
+    assert detail =~ "kill_requested=true"
     assert detail =~ "137"
   end
 

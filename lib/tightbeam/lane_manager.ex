@@ -16,7 +16,17 @@ defmodule Tightbeam.LaneManager do
   use GenServer
   alias Tightbeam.{Ledger, SessionLane}
 
-  defstruct [:db, :lane_sup, :task_sup, :runner, :interval, :terminal_publisher, :on_terminal]
+  defstruct [
+    :db,
+    :lane_sup,
+    :task_sup,
+    :runner,
+    :interval,
+    :terminal_publisher,
+    :on_terminal,
+    :on_idle,
+    :on_boot
+  ]
 
   @doc """
   Start the reconciler. Required opts: `:lane_sup` (the lane
@@ -60,11 +70,14 @@ defmodule Tightbeam.LaneManager do
       runner: Keyword.fetch!(opts, :runner),
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
       on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
+      on_idle: Keyword.get(opts, :on_idle, fn _ -> :ok end),
+      on_boot: Keyword.get(opts, :on_boot, fn -> :ok end),
       interval: Keyword.get(opts, :interval, 5_000)
     }
 
     # Boot recovery happens before the first scan starts nudging lanes.
     Ledger.recover_running(state.db)
+    state.on_boot.()
     schedule(state.interval)
     {:ok, do_reconcile(state)}
   end
@@ -121,7 +134,8 @@ defmodule Tightbeam.LaneManager do
            task_sup: state.task_sup,
            runner: state.runner,
            terminal_publisher: state.terminal_publisher,
-           on_terminal: state.on_terminal}
+           on_terminal: state.on_terminal,
+           on_idle: state.on_idle}
         )
     end
   end

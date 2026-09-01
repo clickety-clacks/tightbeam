@@ -4,7 +4,7 @@ defmodule Tightbeam.HarnessProcess do
 
   A launch writes its row before opening the process. A small POSIX launcher
   creates a new session, records its leader PID, process-group ID, boot marker,
-  and per-launch token, then execs the harness. Parking authorizes that durable
+  and per-launch token, then execs the harness. Killing authorizes that durable
   identity immediately before signalling the minted group. The row owns the
   identity file until the launch resolves to a terminal state.
   """
@@ -31,10 +31,10 @@ defmodule Tightbeam.HarnessProcess do
     bootIdentity     TEXT,
     identityToken    TEXT,
     state            TEXT NOT NULL CHECK (state IN
-                     ('launching','running','park_requested','closed_gracefully',
+                     ('launching','running','kill_requested','closed_gracefully',
                       'killed','kill_failed','exited')),
     createdAt        INTEGER NOT NULL,
-    parkRequestedAt  INTEGER,
+    killRequestedAt  INTEGER,
     killAttemptedAt  INTEGER,
     killSentAt       INTEGER,
     resolvedAt       INTEGER,
@@ -44,10 +44,122 @@ defmodule Tightbeam.HarnessProcess do
 
   @ddl """
   #{@process_ddl}
-  CREATE TABLE IF NOT EXISTS harness_park_fences (
+  CREATE TABLE IF NOT EXISTS harness_kill_fences (
     adapterKey       TEXT PRIMARY KEY,
     requestedAt      INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS harness_kill_requests (
+    requestId        TEXT PRIMARY KEY,
+    launchId         TEXT REFERENCES harness_processes(launchId),
+    adapterKey       TEXT NOT NULL,
+    osPid            INTEGER CHECK (osPid > 0),
+    processGroupId   INTEGER CHECK (processGroupId > 0),
+    bootIdentity     TEXT,
+    launchIdentity   TEXT,
+    principalKind    TEXT NOT NULL CHECK (principalKind IN ('user','process')),
+    principalId      TEXT NOT NULL,
+    authorityBasis   TEXT NOT NULL CHECK (authorityBasis IN (
+      'owner_user','administrator','operator','harness_health_recovery','retirement'
+    )),
+    causeKind        TEXT NOT NULL,
+    causeId          TEXT NOT NULL,
+    status           TEXT NOT NULL CHECK (status IN ('accepted','killed','kill_failed','refused')),
+    refusalCode      TEXT CHECK (refusalCode IN ('not_authorized','identity_mismatch')),
+    failureCode      TEXT CHECK (failureCode = 'delivery_failed'),
+    signalResult     TEXT CHECK (signalResult IN ('sigkill_delivered','graceful_exit')),
+    acceptedAt       INTEGER NOT NULL,
+    closedAt         INTEGER,
+    CHECK (
+      status = 'accepted' AND osPid IS NOT NULL AND processGroupId IS NOT NULL
+        AND launchId IS NOT NULL
+        AND bootIdentity IS NOT NULL AND launchIdentity IS NOT NULL
+        AND closedAt IS NULL AND refusalCode IS NULL
+        AND failureCode IS NULL AND signalResult IS NULL
+      OR status = 'killed' AND osPid IS NOT NULL AND processGroupId IS NOT NULL
+        AND launchId IS NOT NULL
+        AND bootIdentity IS NOT NULL AND launchIdentity IS NOT NULL
+        AND closedAt IS NOT NULL AND refusalCode IS NULL
+        AND failureCode IS NULL AND signalResult IS NOT NULL
+      OR status = 'kill_failed' AND osPid IS NOT NULL AND processGroupId IS NOT NULL
+        AND launchId IS NOT NULL
+        AND bootIdentity IS NOT NULL AND launchIdentity IS NOT NULL
+        AND closedAt IS NOT NULL AND refusalCode IS NULL
+        AND failureCode = 'delivery_failed' AND signalResult IS NULL
+      OR status = 'refused' AND closedAt IS NOT NULL AND refusalCode IS NOT NULL
+        AND failureCode IS NULL AND signalResult IS NULL
+    )
+  );
+  CREATE INDEX IF NOT EXISTS harness_kill_requests_launch
+    ON harness_kill_requests(launchId, acceptedAt, requestId);
+  CREATE TABLE IF NOT EXISTS harness_kill_request_sessions (
+    requestId        TEXT NOT NULL REFERENCES harness_kill_requests(requestId),
+    sessionKey       TEXT NOT NULL REFERENCES sessions(sessionKey),
+    lifecycleGeneration INTEGER NOT NULL CHECK (lifecycleGeneration >= 0),
+    PRIMARY KEY (requestId, sessionKey)
+  );
+  CREATE TABLE IF NOT EXISTS harness_kill_attempts (
+    requestId        TEXT NOT NULL REFERENCES harness_kill_requests(requestId),
+    attempt          INTEGER NOT NULL CHECK (attempt >= 1),
+    attemptedAt      INTEGER NOT NULL,
+    result           TEXT NOT NULL CHECK (result IN ('delivered','delivery_failed','identity_mismatch')),
+    detail           TEXT,
+    PRIMARY KEY (requestId, attempt)
+  );
+  CREATE TABLE IF NOT EXISTS harness_kill_read_audits (
+    readId TEXT PRIMARY KEY,
+    requestId TEXT NOT NULL,
+    principalKind TEXT NOT NULL CHECK (principalKind IN ('user','session','process','unknown')),
+    principalId TEXT NOT NULL,
+    admitted INTEGER NOT NULL CHECK (admitted IN (0,1)),
+    readAt INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS harness_health_recovery_decisions (
+    decisionId TEXT PRIMARY KEY,
+    incidentId TEXT NOT NULL REFERENCES harness_health_incidents(id),
+    targetKind TEXT NOT NULL CHECK (targetKind IN ('process_group','session')),
+    launchId TEXT REFERENCES harness_processes(launchId),
+    sessionKey TEXT REFERENCES sessions(sessionKey),
+    sessionGeneration INTEGER CHECK (sessionGeneration >= 0),
+    harness TEXT NOT NULL,
+    host TEXT NOT NULL,
+    processGroupId INTEGER CHECK (processGroupId > 0),
+    bootIdentity TEXT,
+    launchIdentity TEXT,
+    action TEXT NOT NULL CHECK (action IN ('kill','park')),
+    mode TEXT NOT NULL CHECK (mode IN ('immediate','graceful')),
+    policyBasis TEXT NOT NULL CHECK (policyBasis IN (
+      'rate_limit_dead','shared_harness_incident_hold'
+    )),
+    evidenceObservationId TEXT NOT NULL REFERENCES harness_health_observations(id),
+    principal TEXT NOT NULL CHECK (principal = 'tightbeam:harness-health'),
+    createdAt INTEGER NOT NULL,
+    CHECK (
+      targetKind='process_group' AND action='kill' AND mode='immediate'
+        AND policyBasis='rate_limit_dead' AND launchId IS NOT NULL
+        AND sessionKey IS NULL AND sessionGeneration IS NULL
+        AND processGroupId IS NOT NULL AND bootIdentity IS NOT NULL
+        AND launchIdentity IS NOT NULL
+      OR targetKind='session' AND action='park' AND mode='graceful'
+        AND policyBasis='shared_harness_incident_hold' AND launchId IS NULL
+        AND sessionKey IS NOT NULL AND sessionGeneration IS NOT NULL
+        AND processGroupId IS NULL AND bootIdentity IS NULL AND launchIdentity IS NULL
+    )
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS harness_health_one_kill_decision
+    ON harness_health_recovery_decisions(incidentId) WHERE action='kill';
+  CREATE UNIQUE INDEX IF NOT EXISTS harness_health_one_park_decision
+    ON harness_health_recovery_decisions(incidentId,sessionKey,sessionGeneration)
+    WHERE action='park';
+  CREATE TRIGGER IF NOT EXISTS harness_health_recovery_decision_immutable_update
+  BEFORE UPDATE ON harness_health_recovery_decisions
+  BEGIN
+    SELECT RAISE(ABORT, 'harness health recovery decision is immutable');
+  END;
+  CREATE TRIGGER IF NOT EXISTS harness_health_recovery_decision_immutable_delete
+  BEFORE DELETE ON harness_health_recovery_decisions
+  BEGIN
+    SELECT RAISE(ABORT, 'harness health recovery decision is immutable');
+  END;
   """
 
   @type row :: %{
@@ -66,7 +178,7 @@ defmodule Tightbeam.HarnessProcess do
           identity_token: String.t() | nil,
           state: String.t(),
           created_at: integer(),
-          park_requested_at: integer() | nil,
+          kill_requested_at: integer() | nil,
           kill_attempted_at: integer() | nil,
           kill_sent_at: integer() | nil,
           resolved_at: integer() | nil,
@@ -96,6 +208,9 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
+  @doc false
+  def ddl_for_migration, do: @ddl
+
   @doc "Insert the durable launch event and wrap the target command to record its identity."
   @spec prepare_launch(keyword(), DB.server(), tuple()) :: keyword()
   def prepare_launch(opts, db, {harness, preset, host} = key) do
@@ -119,10 +234,10 @@ defmodule Tightbeam.HarnessProcess do
                   """
                   SELECT 1 FROM harness_processes
                    WHERE adapterKey = ?1
-                     AND state IN ('launching','running','park_requested','kill_failed')
+                     AND state IN ('launching','running','kill_requested','kill_failed')
                      AND resolvedAt IS NULL
                   UNION ALL
-                  SELECT 1 FROM harness_park_fences WHERE adapterKey = ?1
+                  SELECT 1 FROM harness_kill_fences WHERE adapterKey = ?1
                   LIMIT 1
                   """,
                   [key_name(key)]
@@ -163,7 +278,7 @@ defmodule Tightbeam.HarnessProcess do
            end
          end) do
       {:ok, :ok} -> :ok
-      {:ok, :fenced} -> raise "adapter park in progress for #{key_name(key)}"
+      {:ok, :fenced} -> raise "adapter kill in progress for #{key_name(key)}"
     end
 
     opts
@@ -199,69 +314,271 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  @doc "Atomically establish the durable park fence and return the launch it protects."
-  @spec begin_park(DB.server(), tuple()) :: {:ok, row() | :no_launch}
-  def begin_park(db, key) do
+  @doc "Atomically establish the durable kill fence and return the launch it protects."
+  @spec begin_kill(DB.server(), tuple()) :: {:ok, row() | :no_launch}
+  def begin_kill(db, key) do
     :ok = ensure_schema(db)
-    DB.transaction(db, &begin_park_in_txn(&1, key))
+    DB.transaction(db, &begin_kill_in_txn(&1, key))
   end
 
-  @doc "Establish the park fence as part of a caller-owned incident transaction."
-  @spec begin_park_in_txn(DB.Txn.t(), tuple()) :: row() | :no_launch
-  def begin_park_in_txn(%DB.Txn{} = txn, key) do
+  @doc "Establish the kill fence as part of a caller-owned incident transaction."
+  @spec begin_kill_in_txn(DB.Txn.t(), tuple()) :: row() | :no_launch
+  def begin_kill_in_txn(%DB.Txn{} = txn, key, attrs \\ %{}) do
     at = now()
     adapter_key = key_name(key)
 
-    DB.Txn.q(
-      txn,
-      "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
-      [adapter_key, at]
-    )
-
     case latest_unresolved_in_txn(txn, adapter_key) do
       nil ->
-        :no_launch
+        if map_size(attrs) == 0 do
+          DB.Txn.q(
+            txn,
+            "INSERT OR IGNORE INTO harness_kill_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
+            [adapter_key, at]
+          )
+
+          :no_launch
+        else
+          create_no_launch_kill_refusal_in_txn(txn, key, adapter_key, attrs, at)
+        end
 
       row ->
-        DB.Txn.q(
-          txn,
-          """
-          UPDATE harness_processes
-             SET state = 'park_requested', parkRequestedAt = COALESCE(parkRequestedAt, ?2)
-           WHERE launchId = ?1 AND resolvedAt IS NULL
-          """,
-          [row.launch_id, at]
-        )
+        requested = create_kill_request_in_txn(txn, row, attrs, at)
 
-        %{row | state: "park_requested", park_requested_at: row.park_requested_at || at}
+        if requested.kill_request_status == "refused" do
+          requested
+        else
+          DB.Txn.q(
+            txn,
+            "INSERT OR IGNORE INTO harness_kill_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
+            [adapter_key, at]
+          )
+
+          DB.Txn.q(
+            txn,
+            """
+            UPDATE harness_processes
+               SET state = 'kill_requested', killRequestedAt = COALESCE(killRequestedAt, ?2)
+             WHERE launchId = ?1 AND resolvedAt IS NULL
+            """,
+            [row.launch_id, at]
+          )
+
+          %{requested | state: "kill_requested", kill_requested_at: row.kill_requested_at || at}
+        end
     end
   end
 
-  @doc "True only while an explicit durable park request stands for the key."
-  @spec parked?(DB.server(), tuple()) :: boolean()
-  def parked?(db, key) do
+  defp create_no_launch_kill_refusal_in_txn(txn, key, adapter_key, attrs, at) do
+    row = %{
+      launch_id: nil,
+      adapter_key: adapter_key,
+      os_pid: nil,
+      process_group_id: nil,
+      boot_identity: nil,
+      identity_token: nil
+    }
+
+    attrs = normalize_kill_attrs(attrs, row)
+    {principal_kind, principal_id} = kill_principal(attrs.principal)
+    request_id = "kr_" <> Id.uuid4()
+    attached = no_launch_attached_sessions(txn, key, attrs.cause_id)
+
+    create_identified_kill_request_in_txn(
+      txn,
+      row,
+      attrs,
+      attached,
+      principal_kind,
+      principal_id,
+      request_id,
+      no_launch_authority_refusal(txn, key, attrs) || "identity_mismatch",
+      at
+    )
+  end
+
+  defp no_launch_attached_sessions(txn, {harness, _preset, host}, session_key) do
+    case DB.Txn.q(
+           txn,
+           "SELECT lifecycleGeneration FROM sessions WHERE sessionKey=?1 AND harness=?2 AND host=?3",
+           [session_key, Atom.to_string(harness), host]
+         ) do
+      [[generation]] -> [%{session_key: session_key, generation: generation}]
+      [] -> []
+    end
+  end
+
+  defp no_launch_authority_refusal(txn, {harness, _preset, host}, attrs) do
+    harness = Atom.to_string(harness)
+
+    case {attrs.principal, attrs.authority_basis} do
+      {{:user, user}, "owner_user"} ->
+        if DB.Txn.q(
+             txn,
+             "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND harness=?3 AND host=?4",
+             [attrs.cause_id, user, harness, host]
+           ) == [[1]],
+           do: nil,
+           else: "not_authorized"
+
+      {{:user, user}, basis} when basis in ["administrator", "operator"] ->
+        if DB.Txn.q(txn, "SELECT isAdmin FROM users WHERE userId=?1", [user]) == [[1]],
+          do: nil,
+          else: "not_authorized"
+
+      {{:process, "tightbeam:retirement"}, "retirement"} ->
+        if DB.Txn.q(
+             txn,
+             "SELECT 1 FROM sessions WHERE sessionKey=?1 AND harness=?2 AND host=?3",
+             [attrs.cause_id, harness, host]
+           ) == [[1]],
+           do: nil,
+           else: "not_authorized"
+
+      _ ->
+        "not_authorized"
+    end
+  end
+
+  @doc "Create an authorized durable KILL request before any group signal."
+  def request_kill(db, key, attrs) do
+    :ok = ensure_schema(db)
+
+    case DB.transaction(db, &begin_kill_in_txn(&1, key, attrs)) do
+      {:ok, %{kill_request_status: "refused"} = row} ->
+        {:error, %{code: row.kill_refusal_code, request_id: row.kill_request_id}}
+
+      {:ok, result} ->
+        {:ok, result}
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  @doc "Read one KILL request with its attached-session and retry-attempt audit."
+  def kill_request(db \\ DB, request_id) do
+    :ok = ensure_schema(db)
+
+    with {:ok, [row]} <-
+           DB.query(
+             db,
+             "SELECT requestId,launchId,adapterKey,osPid,processGroupId,bootIdentity,launchIdentity,principalKind,principalId,authorityBasis,causeKind,causeId,status,refusalCode,failureCode,signalResult,acceptedAt,closedAt FROM harness_kill_requests WHERE requestId=?1",
+             [request_id]
+           ) do
+      {:ok, sessions} =
+        DB.query(
+          db,
+          "SELECT sessionKey,lifecycleGeneration FROM harness_kill_request_sessions WHERE requestId=?1 ORDER BY sessionKey",
+          [request_id]
+        )
+
+      {:ok, attempts} =
+        DB.query(
+          db,
+          "SELECT attempt,attemptedAt,result,detail FROM harness_kill_attempts WHERE requestId=?1 ORDER BY attempt",
+          [request_id]
+        )
+
+      decode_kill_request(row, sessions, attempts)
+    else
+      {:ok, []} -> nil
+    end
+  end
+
+  def latest_kill_request(db \\ DB, key) do
+    :ok = ensure_schema(db)
+
+    case DB.query(
+           db,
+           "SELECT requestId FROM harness_kill_requests WHERE adapterKey=?1 ORDER BY acceptedAt DESC,rowid DESC LIMIT 1",
+           [key_name(key)]
+         ) do
+      {:ok, [[request_id]]} -> kill_request(db, request_id)
+      {:ok, []} -> nil
+    end
+  end
+
+  def read_kill_request(db \\ DB, request_id, principal) do
+    request = kill_request(db, request_id)
+    admitted = not is_nil(request) and kill_request_visible?(db, request_id, principal)
+    {kind, id} = kill_read_principal(principal)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO harness_kill_read_audits (readId,requestId,principalKind,principalId,admitted,readAt) VALUES (?1,?2,?3,?4,?5,?6)",
+        ["kread_" <> Id.uuid4(), request_id, kind, id, if(admitted, do: 1, else: 0), now()]
+      )
+
+    if admitted, do: request, else: %{code: "not_found"}
+  end
+
+  defp kill_read_principal({kind, id}) when kind in [:user, :session, :process] and is_binary(id),
+    do: {Atom.to_string(kind), id}
+
+  defp kill_read_principal(_), do: {"unknown", "unknown"}
+
+  defp kill_request_visible?(db, request_id, {:user, user}) do
+    DB.query(db, "SELECT isAdmin FROM users WHERE userId=?1", [user]) == {:ok, [[1]]} or
+      match?(
+        {:ok, [[1]]},
+        DB.query(
+          db,
+          "SELECT 1 FROM harness_kill_request_sessions krs JOIN sessions s USING(sessionKey) WHERE krs.requestId=?1 AND s.ownerUserId=?2 LIMIT 1",
+          [request_id, user]
+        )
+      )
+  end
+
+  defp kill_request_visible?(db, request_id, {:session, reader}) do
+    match?(
+      {:ok, [[1]]},
+      DB.query(
+        db,
+        """
+        SELECT 1
+        FROM sessions reader
+        LEFT JOIN session_lifecycle_states reader_lifecycle
+          ON reader_lifecycle.sessionKey=reader.sessionKey
+        JOIN harness_kill_request_sessions krs ON krs.requestId=?2
+        JOIN sessions attached ON attached.sessionKey=krs.sessionKey
+        WHERE reader.sessionKey=?1 AND reader.state='active'
+          AND COALESCE(reader_lifecycle.state,'active')='active'
+          AND reader.ownerUserId=attached.ownerUserId
+        LIMIT 1
+        """,
+        [reader, request_id]
+      )
+    )
+  end
+
+  defp kill_request_visible?(_db, _request_id, _principal), do: false
+
+  @doc "True only while an explicit durable kill fence stands for the key."
+  @spec kill_fenced?(DB.server(), tuple()) :: boolean()
+  def kill_fenced?(db, key) do
     :ok = ensure_schema(db)
 
     {:ok, [[count]]} =
-      DB.query(db, "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1", [
+      DB.query(db, "SELECT COUNT(*) FROM harness_kill_fences WHERE adapterKey = ?1", [
         key_name(key)
       ])
 
     count > 0
   end
 
-  @doc "Read the explicit durable park fence inside a caller-owned transaction."
-  @spec parked_in_txn?(DB.Txn.t(), tuple()) :: boolean()
-  def parked_in_txn?(%DB.Txn{} = txn, key) do
+  @doc "Read the explicit durable kill fence inside a caller-owned transaction."
+  @spec kill_fenced_in_txn?(DB.Txn.t(), tuple()) :: boolean()
+  def kill_fenced_in_txn?(%DB.Txn{} = txn, key) do
     [[count]] =
-      DB.Txn.q(txn, "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1", [
+      DB.Txn.q(txn, "SELECT COUNT(*) FROM harness_kill_fences WHERE adapterKey = ?1", [
         key_name(key)
       ])
 
     count > 0
   end
 
-  @doc "True while any unresolved durable launch or park request fences the key."
+  @doc "True while any unresolved durable launch or kill request fences the key."
   @spec fenced?(DB.server(), tuple()) :: boolean()
   def fenced?(db, key) do
     :ok = ensure_schema(db)
@@ -273,9 +590,9 @@ defmodule Tightbeam.HarnessProcess do
         SELECT
           (SELECT COUNT(*) FROM harness_processes
             WHERE adapterKey = ?1
-              AND state IN ('launching','running','park_requested','kill_failed')
+              AND state IN ('launching','running','kill_requested','kill_failed')
               AND resolvedAt IS NULL) +
-          (SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1)
+          (SELECT COUNT(*) FROM harness_kill_fences WHERE adapterKey = ?1)
         """,
         [key_name(key)]
       )
@@ -283,27 +600,27 @@ defmodule Tightbeam.HarnessProcess do
     count > 0
   end
 
-  @doc "Release the per-key fence after the park has reached a terminal state."
-  @spec complete_park(DB.server(), tuple()) :: :ok
-  def complete_park(db, key) do
-    {:ok, :ok} = DB.transaction(db, &complete_park_in_txn(&1, key))
+  @doc "Release the per-key fence after the kill has reached a terminal state."
+  @spec complete_kill(DB.server(), tuple()) :: :ok
+  def complete_kill(db, key) do
+    {:ok, :ok} = DB.transaction(db, &complete_kill_in_txn(&1, key))
 
     :ok
   end
 
-  @doc "Release the park fence as part of a caller-owned recovery transaction."
-  @spec complete_park_in_txn(DB.Txn.t(), tuple()) :: :ok
-  def complete_park_in_txn(%DB.Txn{} = txn, key) do
-    DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
+  @doc "Release the kill fence as part of a caller-owned recovery transaction."
+  @spec complete_kill_in_txn(DB.Txn.t(), tuple()) :: :ok
+  def complete_kill_in_txn(%DB.Txn{} = txn, key) do
+    DB.Txn.q(txn, "DELETE FROM harness_kill_fences WHERE adapterKey = ?1", [key_name(key)])
 
     :ok
   end
 
-  @doc "Deliver SIGKILL to a parked process group."
-  @spec park(DB.server(), row()) :: :ok | :already_resolved | {:error, term()}
-  def park(db, row) do
+  @doc "Deliver SIGKILL to an authorized process group."
+  @spec kill(DB.server(), row()) :: :ok | :already_resolved | {:error, term()}
+  def kill(db, row) do
     with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
-      kill(db, row)
+      deliver_kill(db, row)
     else
       {:error, reason} -> unidentified(db, row, reason)
     end
@@ -337,10 +654,10 @@ defmodule Tightbeam.HarnessProcess do
       row ->
         :ok = ensure_fence(db, row.adapter_key)
 
-        terminal_state = if row.state == "park_requested", do: "closed_gracefully", else: "exited"
+        terminal_state = if row.state == "kill_requested", do: "closed_gracefully", else: "exited"
 
         case reconcile_row(db, row, terminal_state) do
-          :ok -> complete_park(db, key)
+          :ok -> complete_kill(db, key)
           :already_resolved -> :already_resolved
           {:error, _reason} = error -> error
         end
@@ -359,7 +676,7 @@ defmodule Tightbeam.HarnessProcess do
         row -> settle_proven_dead_row(db, row)
       end
 
-    :ok = complete_park(db, key)
+    :ok = complete_kill(db, key)
     result
   end
 
@@ -374,7 +691,7 @@ defmodule Tightbeam.HarnessProcess do
         """
         SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
                launchSequence, osPid, processGroupId, bootIdentity, identityToken,
-               state, createdAt, parkRequestedAt,
+               state, createdAt, killRequestedAt,
                killAttemptedAt, killSentAt, resolvedAt,
                lastError
           FROM harness_processes ORDER BY launchSequence DESC
@@ -389,7 +706,7 @@ defmodule Tightbeam.HarnessProcess do
       if reboot_orphan?(row) do
         reboot_orphan(db, row)
       else
-        kill(db, row, terminal_state)
+        deliver_kill(db, row, terminal_state)
       end
     else
       {:error, reason} -> unidentified(db, row, reason)
@@ -402,7 +719,7 @@ defmodule Tightbeam.HarnessProcess do
         if reboot_orphan?(recovered) do
           reboot_orphan(db, recovered)
         else
-          case kill(db, recovered, "exited") do
+          case deliver_kill(db, recovered, "exited") do
             {:error, {:kill_failed, reason}} ->
               settle_cleanup_failure(db, recovered, "process_group_kill", reason)
 
@@ -418,7 +735,7 @@ defmodule Tightbeam.HarnessProcess do
 
   # A recorded pid from a PREVIOUS OS BOOT names a process that cannot exist:
   # pids do not survive the kernel, so a boot-identity mismatch is proof the
-  # process died with the machine — the park's success condition, observed.
+  # process died with the machine — the kill's success condition, observed.
   # Before this clause, the signal helper correctly REFUSED to signal (that
   # pid may be reused by an unrelated process — the refusal is right) but the
   # refusal was recorded as kill_failed, which fences the key forever: a
@@ -470,7 +787,7 @@ defmodule Tightbeam.HarnessProcess do
   # facts wearing the same error. The launcher creates the identity file before
   # it forks, so for a row that never captured a pid an absent file is the
   # launcher's own record that it never ran: no session was created, no process
-  # group exists, and nothing can outlive the row. That is the park's success
+  # group exists, and nothing can outlive the row. That is the kill's success
   # condition, not its failure — recorded as kill_failed it fenced the key
   # FOREVER over a process that never existed, and a crash anywhere between
   # `prepare_launch`'s INSERT and the spawn is enough to leave that row behind.
@@ -495,41 +812,53 @@ defmodule Tightbeam.HarnessProcess do
 
   defp unidentified(db, row, reason), do: kill_failed(db, row, reason)
 
-  defp kill(db, row, terminal_state \\ "killed") do
+  defp deliver_kill(db, row, terminal_state \\ "killed") do
     attempted_at = now()
+    request_id = open_kill_request_id(db, row)
 
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        UPDATE harness_processes
-           SET killAttemptedAt = ?2
-         WHERE launchId = ?1 AND resolvedAt IS NULL
-        """,
-        [row.launch_id, attempted_at]
-      )
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "UPDATE harness_processes SET killAttemptedAt=?2 WHERE launchId=?1 AND resolvedAt IS NULL",
+          [row.launch_id, attempted_at]
+        )
+
+        if request_id do
+          DB.Txn.q(
+            txn,
+            "UPDATE harness_kill_requests SET status='accepted',closedAt=NULL,failureCode=NULL WHERE requestId=?1 AND status='kill_failed'",
+            [request_id]
+          )
+        end
+
+        :ok
+      end)
 
     case send_sigkill(row) do
       :ok ->
         sent_at = now()
 
+        record_kill_attempt(db, request_id, attempted_at, "delivered", nil)
+        close_kill_request(db, request_id, "killed", "sigkill_delivered", nil)
+
         {:ok, _} =
           DB.query(
             db,
-            """
-            UPDATE harness_processes
-               SET killSentAt = ?2
-             WHERE launchId = ?1 AND resolvedAt IS NULL
-            """,
+            "UPDATE harness_processes SET killSentAt=?2 WHERE launchId=?1 AND resolvedAt IS NULL",
             [row.launch_id, sent_at]
           )
 
         resolve(db, row, terminal_state)
 
       {:refused, reason} ->
+        record_kill_attempt(db, request_id, attempted_at, "identity_mismatch", reason)
+        close_kill_request(db, request_id, "refused", nil, "identity_mismatch")
         kill_failed(db, row, {:signal_refused, reason})
 
       {:error, reason} ->
+        record_kill_attempt(db, request_id, attempted_at, "delivery_failed", inspect(reason))
+        close_kill_request(db, request_id, "kill_failed", nil, nil)
         kill_failed(db, row, reason)
     end
   end
@@ -798,11 +1127,11 @@ defmodule Tightbeam.HarnessProcess do
         """
         SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
                launchSequence, osPid, processGroupId, bootIdentity, identityToken,
-               state, createdAt, parkRequestedAt,
+               state, createdAt, killRequestedAt,
                killAttemptedAt, killSentAt, resolvedAt,
                lastError
           FROM harness_processes
-         WHERE adapterKey = ?1 AND state IN ('launching','running','park_requested','kill_failed')
+         WHERE adapterKey = ?1 AND state IN ('launching','running','kill_requested','kill_failed')
            AND resolvedAt IS NULL
          ORDER BY launchSequence DESC LIMIT 1
         """,
@@ -821,11 +1150,11 @@ defmodule Tightbeam.HarnessProcess do
            """
            SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
                   launchSequence, osPid, processGroupId, bootIdentity, identityToken,
-                  state, createdAt, parkRequestedAt,
+                  state, createdAt, killRequestedAt,
                   killAttemptedAt, killSentAt, resolvedAt,
                   lastError
              FROM harness_processes
-            WHERE adapterKey = ?1 AND state IN ('launching','running','park_requested','kill_failed')
+            WHERE adapterKey = ?1 AND state IN ('launching','running','kill_requested','kill_failed')
               AND resolvedAt IS NULL
             ORDER BY launchSequence DESC LIMIT 1
            """,
@@ -843,11 +1172,11 @@ defmodule Tightbeam.HarnessProcess do
         """
         SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
                launchSequence, osPid, processGroupId, bootIdentity, identityToken,
-               state, createdAt, parkRequestedAt,
+               state, createdAt, killRequestedAt,
                killAttemptedAt, killSentAt, resolvedAt,
                lastError
           FROM harness_processes
-         WHERE state IN ('launching','running','park_requested','kill_failed')
+         WHERE state IN ('launching','running','kill_requested','kill_failed')
            AND resolvedAt IS NULL
          ORDER BY launchSequence
         """
@@ -863,7 +1192,7 @@ defmodule Tightbeam.HarnessProcess do
         """
         SELECT launchId, adapterKey, harness, preset, host, ssh, helperPath, identityPath,
                launchSequence, osPid, processGroupId, bootIdentity, identityToken,
-               state, createdAt, parkRequestedAt,
+               state, createdAt, killRequestedAt,
                killAttemptedAt, killSentAt, resolvedAt,
                lastError
           FROM harness_processes WHERE launchId = ?1
@@ -878,7 +1207,7 @@ defmodule Tightbeam.HarnessProcess do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
+        "INSERT OR IGNORE INTO harness_kill_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
         [adapter_key, now()]
       )
 
@@ -892,7 +1221,7 @@ defmodule Tightbeam.HarnessProcess do
       DB.query(
         db,
         """
-        DELETE FROM harness_park_fences
+        DELETE FROM harness_kill_fences
          WHERE adapterKey = ?1
          #{incident_guard}
         """,
@@ -909,12 +1238,12 @@ defmodule Tightbeam.HarnessProcess do
       DB.query(
         db,
         """
-        DELETE FROM harness_park_fences
+        DELETE FROM harness_kill_fences
          WHERE NOT EXISTS (
            SELECT 1
              FROM harness_processes
-            WHERE harness_processes.adapterKey = harness_park_fences.adapterKey
-              AND state IN ('launching','running','park_requested','kill_failed')
+            WHERE harness_processes.adapterKey = harness_kill_fences.adapterKey
+              AND state IN ('launching','running','kill_requested','kill_failed')
               AND resolvedAt IS NULL
          )
          #{incident_guard}
@@ -932,7 +1261,7 @@ defmodule Tightbeam.HarnessProcess do
           FROM harness_health_incidents
          WHERE state = 'open'
            AND failureClass = 'rate-limit-dead'
-           AND harness || ':shared@' || host = harness_park_fences.adapterKey
+           AND harness || ':shared@' || host = harness_kill_fences.adapterKey
       )
       """
     else
@@ -1107,6 +1436,379 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
+  defp create_kill_request_in_txn(txn, row, attrs, at) do
+    internal_without_org? = map_size(attrs) == 0
+    attrs = normalize_kill_attrs(attrs, row)
+    {principal_kind, principal_id} = kill_principal(attrs.principal)
+    attached = if internal_without_org?, do: [], else: attached_sessions_in_txn(txn, row)
+
+    # `begin_kill/2` is the pre-canonical internal fence seam used by isolated
+    # lifecycle recovery. It carries no authenticated caller, so it cannot mint
+    # a public KILL request. Canonical consumers call `request_kill/3`; this
+    # branch preserves the existing fence/reconcile contract only.
+    if internal_without_org? do
+      Map.merge(row, %{
+        kill_request_id: nil,
+        kill_request_status: "accepted",
+        kill_refusal_code: nil
+      })
+    else
+      case matching_open_kill_request_in_txn(txn, row, attrs, principal_kind, principal_id) do
+        [request_id, status] ->
+          Map.merge(row, %{
+            kill_request_id: request_id,
+            kill_request_status: status,
+            kill_refusal_code: nil
+          })
+
+        nil ->
+          request_id = "kr_" <> Id.uuid4()
+          record_health_recovery_decision_in_txn(txn, request_id, row, attrs, at)
+          refusal = kill_authority_refusal(txn, row, attrs, attached)
+
+          identity_refusal =
+            case {row.os_pid, row.process_group_id, row.boot_identity, row.identity_token} do
+              {pid, pgid, boot, launch}
+              when is_integer(pid) and pid > 0 and is_integer(pgid) and pgid > 0 and
+                     is_binary(boot) and is_binary(launch) ->
+                nil
+
+              _ ->
+                "identity_mismatch"
+            end
+
+          create_identified_kill_request_in_txn(
+            txn,
+            row,
+            attrs,
+            attached,
+            principal_kind,
+            principal_id,
+            request_id,
+            refusal || identity_refusal,
+            at
+          )
+      end
+    end
+  end
+
+  defp matching_open_kill_request_in_txn(txn, row, attrs, principal_kind, principal_id) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT requestId,status
+           FROM harness_kill_requests
+           WHERE launchId=?1 AND principalKind=?2 AND principalId=?3
+             AND authorityBasis=?4 AND causeKind=?5 AND causeId=?6
+             AND status IN ('accepted','kill_failed')
+           ORDER BY acceptedAt DESC,rowid DESC
+           LIMIT 1
+           """,
+           [
+             row.launch_id,
+             principal_kind,
+             principal_id,
+             attrs.authority_basis,
+             attrs.cause_kind,
+             attrs.cause_id
+           ]
+         ) do
+      [request] -> request
+      [] -> nil
+    end
+  end
+
+  defp create_identified_kill_request_in_txn(
+         txn,
+         row,
+         attrs,
+         attached,
+         principal_kind,
+         principal_id,
+         request_id,
+         refusal,
+         at
+       ) do
+    status = if refusal, do: "refused", else: "accepted"
+    closed_at = if refusal, do: at, else: nil
+
+    DB.Txn.q(
+      txn,
+      """
+      INSERT INTO harness_kill_requests
+        (requestId,launchId,adapterKey,osPid,processGroupId,bootIdentity,launchIdentity,
+         principalKind,principalId,authorityBasis,causeKind,causeId,status,refusalCode,
+         acceptedAt,closedAt)
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+      """,
+      [
+        request_id,
+        row.launch_id,
+        row.adapter_key,
+        row.os_pid,
+        row.process_group_id,
+        row.boot_identity,
+        row.identity_token,
+        principal_kind,
+        principal_id,
+        attrs.authority_basis,
+        attrs.cause_kind,
+        attrs.cause_id,
+        status,
+        refusal,
+        at,
+        closed_at
+      ]
+    )
+
+    Enum.each(attached, fn %{session_key: session_key, generation: generation} ->
+      DB.Txn.q(
+        txn,
+        "INSERT INTO harness_kill_request_sessions (requestId,sessionKey,lifecycleGeneration) VALUES (?1,?2,?3)",
+        [request_id, session_key, generation]
+      )
+    end)
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      if(refusal, do: "harness_kill_refused", else: "harness_kill_accepted"),
+      request_id,
+      "principal=#{principal_kind}:#{principal_id} authorityBasis=#{attrs.authority_basis} cause=#{attrs.cause_kind}:#{attrs.cause_id}" <>
+        if(refusal, do: " refusal=#{refusal}", else: "")
+    )
+
+    Map.merge(row, %{
+      kill_request_id: request_id,
+      kill_request_status: status,
+      kill_refusal_code: refusal
+    })
+  end
+
+  defp open_kill_request_id(db, row) do
+    case Map.get(row, :kill_request_id) do
+      request_id when is_binary(request_id) ->
+        request_id
+
+      _ ->
+        case DB.query(
+               db,
+               "SELECT requestId FROM harness_kill_requests WHERE launchId=?1 AND status IN ('accepted','kill_failed') ORDER BY acceptedAt DESC,rowid DESC LIMIT 1",
+               [row.launch_id]
+             ) do
+          {:ok, [[request_id]]} -> request_id
+          {:ok, []} -> nil
+        end
+    end
+  end
+
+  defp record_kill_attempt(_db, nil, _at, _result, _detail), do: :ok
+
+  defp record_kill_attempt(db, request_id, at, result, detail) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO harness_kill_attempts (requestId,attempt,attemptedAt,result,detail) SELECT ?1,COALESCE(MAX(attempt),0)+1,?2,?3,?4 FROM harness_kill_attempts WHERE requestId=?1",
+        [request_id, at, result, detail]
+      )
+
+    :ok
+  end
+
+  defp close_kill_request(_db, nil, _status, _signal_result, _refusal), do: :ok
+
+  defp close_kill_request(db, request_id, status, signal_result, refusal) do
+    {failure, refusal} =
+      case status do
+        "kill_failed" -> {"delivery_failed", nil}
+        "refused" -> {nil, refusal}
+        _ -> {nil, nil}
+      end
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE harness_kill_requests SET status=?2,refusalCode=?3,failureCode=?4,signalResult=?5,closedAt=?6 WHERE requestId=?1 AND status IN ('accepted','kill_failed')",
+        [request_id, status, refusal, failure, signal_result, now()]
+      )
+
+    :ok
+  end
+
+  defp normalize_kill_attrs(attrs, row) do
+    attrs = if is_list(attrs), do: Map.new(attrs), else: attrs
+
+    %{
+      principal: Map.get(attrs, :principal, {:process, "tightbeam:harness-health"}),
+      authority_basis: Map.get(attrs, :authority_basis, "harness_health_recovery"),
+      cause_kind: Map.get(attrs, :cause_kind, "adapter_lifecycle"),
+      cause_id: Map.get(attrs, :cause_id, row.adapter_key)
+    }
+  end
+
+  defp kill_principal({:user, id}) when is_binary(id), do: {"user", id}
+  defp kill_principal({:process, id}) when is_binary(id), do: {"process", id}
+  defp kill_principal(_), do: {"process", "unknown"}
+
+  defp attached_sessions_in_txn(txn, row) do
+    DB.Txn.q(
+      txn,
+      """
+      SELECT DISTINCT s.sessionKey,s.lifecycleGeneration
+      FROM sessions s
+      JOIN harness_pointers hp ON hp.sessionKey=s.sessionKey
+      WHERE s.harness=?1 AND s.host=?2 AND s.state IN ('active','parking','parked','retired')
+        AND hp.id=(SELECT MAX(hp2.id) FROM harness_pointers hp2 WHERE hp2.sessionKey=s.sessionKey)
+      ORDER BY s.sessionKey
+      """,
+      [row.harness, row.host]
+    )
+    |> Enum.map(fn [session_key, generation] ->
+      %{session_key: session_key, generation: generation}
+    end)
+  end
+
+  defp record_health_recovery_decision_in_txn(
+         txn,
+         request_id,
+         row,
+         %{
+           principal: {:process, "tightbeam:harness-health"},
+           authority_basis: "harness_health_recovery",
+           cause_kind: "harness_health_incident",
+           cause_id: incident_id
+         },
+         at
+       ) do
+    DB.Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO harness_health_recovery_decisions
+        (decisionId,incidentId,targetKind,launchId,harness,host,processGroupId,bootIdentity,
+         launchIdentity,action,mode,policyBasis,evidenceObservationId,principal,createdAt)
+      SELECT ?1,hhi.id,'process_group',?2,?3,?4,?5,?6,?7,'kill','immediate','rate_limit_dead',
+             hhi.openObservationId,'tightbeam:harness-health',?9
+      FROM harness_health_incidents hhi
+      WHERE hhi.id=?8 AND hhi.state='open' AND hhi.failureClass='rate-limit-dead'
+        AND hhi.harness=?3 AND hhi.host=?4
+      """,
+      [
+        "hhrd_" <> request_id,
+        row.launch_id,
+        row.harness,
+        row.host,
+        row.process_group_id,
+        row.boot_identity,
+        row.identity_token,
+        incident_id,
+        at
+      ]
+    )
+
+    :ok
+  end
+
+  defp record_health_recovery_decision_in_txn(_txn, _request_id, _row, _attrs, _at), do: :ok
+
+  defp kill_authority_refusal(txn, row, attrs, attached) do
+    attached_keys = MapSet.new(attached, & &1.session_key)
+
+    case {attrs.principal, attrs.authority_basis} do
+      {{:process, "tightbeam:harness-health"}, "harness_health_recovery"} ->
+        if attrs.cause_kind == "harness_health_incident" and
+             DB.Txn.q(
+               txn,
+               """
+               SELECT 1 FROM harness_health_recovery_decisions
+               WHERE incidentId=?1 AND launchId=?2 AND harness=?3 AND host=?4
+                 AND targetKind='process_group'
+                 AND processGroupId=?5 AND bootIdentity=?6 AND launchIdentity=?7
+                 AND action='kill' AND mode='immediate' AND policyBasis='rate_limit_dead'
+                 AND principal='tightbeam:harness-health'
+               """,
+               [
+                 attrs.cause_id,
+                 row.launch_id,
+                 row.harness,
+                 row.host,
+                 row.process_group_id,
+                 row.boot_identity,
+                 row.identity_token
+               ]
+             ) == [[1]],
+           do: nil,
+           else: "not_authorized"
+
+      {{:process, "tightbeam:retirement"}, "retirement"} ->
+        if MapSet.member?(attached_keys, attrs.cause_id), do: nil, else: "not_authorized"
+
+      {{:user, user}, basis} when basis in ["administrator", "operator"] ->
+        if DB.Txn.q(txn, "SELECT isAdmin FROM users WHERE userId=?1", [user]) == [[1]],
+          do: nil,
+          else: "not_authorized"
+
+      {{:user, user}, "owner_user"} ->
+        if Enum.any?(attached, fn %{session_key: key} ->
+             DB.Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [key]) == [
+               [user]
+             ]
+           end),
+           do: nil,
+           else: "not_authorized"
+
+      _ ->
+        "not_authorized"
+    end
+  end
+
+  defp decode_kill_request(
+         [
+           request_id,
+           launch_id,
+           adapter_key,
+           os_pid,
+           pgid,
+           boot,
+           launch,
+           principal_kind,
+           principal_id,
+           basis,
+           cause_kind,
+           cause_id,
+           status,
+           refusal,
+           failure,
+           signal_result,
+           accepted_at,
+           closed_at
+         ],
+         sessions,
+         attempts
+       ) do
+    %{
+      request_id: request_id,
+      launch_id: launch_id,
+      adapter_key: adapter_key,
+      identity: %{os_pid: os_pid, process_group_id: pgid, boot: boot, launch: launch},
+      principal: %{kind: principal_kind, id: principal_id},
+      authority_basis: basis,
+      cause: %{kind: cause_kind, id: cause_id},
+      status: status,
+      refusal_code: refusal,
+      failure_code: failure,
+      signal_result: signal_result,
+      accepted_at: accepted_at,
+      closed_at: closed_at,
+      attached_sessions:
+        Enum.map(sessions, fn [session_key, generation] ->
+          %{session_key: session_key, lifecycle_generation: generation}
+        end),
+      attempts:
+        Enum.map(attempts, fn [attempt, attempted_at, result, detail] ->
+          %{attempt: attempt, attempted_at: attempted_at, result: result, detail: detail}
+        end)
+    }
+  end
+
   defp decode_row([
          launch_id,
          adapter_key,
@@ -1123,7 +1825,7 @@ defmodule Tightbeam.HarnessProcess do
          identity_token,
          state,
          created_at,
-         park_requested_at,
+         kill_requested_at,
          kill_attempted_at,
          kill_sent_at,
          resolved_at,
@@ -1145,7 +1847,7 @@ defmodule Tightbeam.HarnessProcess do
       identity_token: identity_token,
       state: state,
       created_at: created_at,
-      park_requested_at: park_requested_at,
+      kill_requested_at: kill_requested_at,
       kill_attempted_at: kill_attempted_at,
       kill_sent_at: kill_sent_at,
       resolved_at: resolved_at,

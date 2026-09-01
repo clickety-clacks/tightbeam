@@ -244,6 +244,29 @@ pub enum Command {
         session_key: String,
         idempotency_key: Option<String>,
     },
+    SessionPark {
+        identity: Identity,
+        session_key: String,
+        idempotency_key: String,
+        mode: String,
+        retry_of_request_id: Option<String>,
+    },
+    SessionRelaunch {
+        identity: Identity,
+        session_key: String,
+    },
+    SessionParkRequest {
+        identity: Identity,
+        request_id: String,
+    },
+    HarnessKill {
+        identity: Identity,
+        session_key: String,
+    },
+    HarnessKillRequest {
+        identity: Identity,
+        request_id: String,
+    },
     Assign {
         identity: Identity,
         subject: String,
@@ -723,6 +746,18 @@ COMMANDS:
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
+
+  session-park --session <key> --key <idempotencyKey> [--mode graceful|immediate]
+               [--retry-of <parkRequestId>]
+      Preserve one Tightbeam session and close its runtime intake for relaunch.
+  session-relaunch --session <key>
+      Relaunch the same successfully parked Tightbeam session.
+  session-park-request <parkRequestId>
+      Read one authorized session PARK request and its immutable outcome.
+  harness-kill --session <key>
+      Kill the exact shared harness process group attached to a session.
+  harness-kill-request <killRequestId>
+      Read one authorized harness KILL request and its delivery attempts.
 
   work-item-create --title "<title>" [--spec-ref <name> --spec-sha256 <hex>]
                    [--priority <0..8>] [--key <idempotencyKey>]
@@ -1968,6 +2003,66 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key"),
             })
         }
+        "session-park" => {
+            let usage = "usage: tightbeam session-park --session <key> --key <idempotencyKey> [--mode graceful|immediate] [--retry-of <parkRequestId>]";
+            let session_key = nonempty(flags, "session");
+            let idempotency_key = nonempty(flags, "key");
+            let mode = nonempty(flags, "mode").unwrap_or_else(|| "graceful".to_owned());
+            if parsed.positional.len() != 1
+                || session_key.is_none()
+                || idempotency_key.is_none()
+                || !matches!(mode.as_str(), "graceful" | "immediate")
+            {
+                return Err(usage.to_owned());
+            }
+            Ok(Command::SessionPark {
+                identity: identity(flags)?,
+                session_key: session_key.expect("checked above"),
+                idempotency_key: idempotency_key.expect("checked above"),
+                mode,
+                retry_of_request_id: nonempty(flags, "retry-of"),
+            })
+        }
+        "session-relaunch" | "harness-kill" => {
+            let session_key = nonempty(flags, "session");
+            if parsed.positional.len() != 1 || session_key.is_none() {
+                return Err(format!(
+                    "usage: tightbeam {} --session <key>",
+                    parsed.positional[0]
+                ));
+            }
+            let identity = identity(flags)?;
+            let session_key = session_key.expect("checked above");
+            if parsed.positional[0] == "session-relaunch" {
+                Ok(Command::SessionRelaunch {
+                    identity,
+                    session_key,
+                })
+            } else {
+                Ok(Command::HarnessKill {
+                    identity,
+                    session_key,
+                })
+            }
+        }
+        "session-park-request" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam session-park-request <parkRequestId>".to_owned());
+            }
+            Ok(Command::SessionParkRequest {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+            })
+        }
+        "harness-kill-request" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam harness-kill-request <killRequestId>".to_owned());
+            }
+            Ok(Command::HarnessKillRequest {
+                identity: identity(flags)?,
+                request_id: parsed.positional[1].clone(),
+            })
+        }
         "assign" => {
             let targets = [
                 nonempty(flags, "session").map(Target::Session),
@@ -2675,7 +2770,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, session-park, session-relaunch, session-park-request, harness-kill, harness-kill-request, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2912,6 +3007,58 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn lifecycle_commands_parse_exactly() {
+        assert_eq!(
+            parse(strings(&[
+                "session-park",
+                "--session",
+                "agent:coder:one",
+                "--key",
+                "park-once",
+                "--mode",
+                "immediate",
+                "--retry-of",
+                "park_1",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::SessionPark {
+                identity: Identity::User("flynn".to_owned()),
+                session_key: "agent:coder:one".to_owned(),
+                idempotency_key: "park-once".to_owned(),
+                mode: "immediate".to_owned(),
+                retry_of_request_id: Some("park_1".to_owned()),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "harness-kill-request",
+                "kill_1",
+                "--as",
+                "operator",
+            ])),
+            Ok(Command::HarnessKillRequest {
+                identity: Identity::Role("operator".to_owned()),
+                request_id: "kill_1".to_owned(),
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "session-park",
+                "--session",
+                "agent:coder:one",
+                "--key",
+                "park-once",
+                "--mode",
+                "eventually",
+            ])),
+            Err("usage: tightbeam session-park --session <key> --key <idempotencyKey> [--mode graceful|immediate] [--retry-of <parkRequestId>]".to_owned())
+        );
     }
 
     #[test]
@@ -3684,6 +3831,8 @@ mod tests {
                 "dispatch",
                 "doctor",
                 "effort-rule",
+                "harness-kill",
+                "harness-kill-request",
                 "harness-process",
                 "host-env-list",
                 "host-env-set",
@@ -3701,6 +3850,9 @@ mod tests {
                 "reopen-assignment",
                 "repair-assignment",
                 "revoke-assignment",
+                "session-park",
+                "session-park-request",
+                "session-relaunch",
                 "spawn",
                 "tune",
                 "wake",
@@ -3738,6 +3890,11 @@ mod tests {
             "host-env-list [--host <host>] [--harness <harness>]",
             "host-env-unset --host <host> --harness <harness> NAME",
             "harness-process list",
+            "harness-kill --session <key>",
+            "harness-kill-request <killRequestId>",
+            "session-park --session <key> --key <idempotencyKey>",
+            "session-park-request <parkRequestId>",
+            "session-relaunch --session <key>",
             "kungfu list",
         ] {
             assert!(help.contains(syntax), "missing HELP syntax: {syntax}");
@@ -4326,7 +4483,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, session-park, session-relaunch, session-park-request, harness-kill, harness-kill-request, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
         );
     }
 

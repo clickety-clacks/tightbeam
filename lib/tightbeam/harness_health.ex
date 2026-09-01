@@ -14,7 +14,17 @@ defmodule Tightbeam.HarnessHealth do
   recycling remain outside this module.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Harness, HarnessProcess, Id, Org}
+  alias Tightbeam.{
+    ConditionFacts,
+    DB,
+    EventLog,
+    Harness,
+    HarnessProcess,
+    Id,
+    Org,
+    SessionLifecycle
+  }
+
   alias Tightbeam.DB.Txn
 
   @failure_classes ~w(
@@ -214,6 +224,104 @@ defmodule Tightbeam.HarnessHealth do
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+
+  @doc "Request an exact incident-member PARK through a durable health recovery decision."
+  def request_session_park(db \\ DB, input) do
+    :ok = ensure_schema(db)
+    :ok = HarnessProcess.ensure_schema(db)
+    :ok = SessionLifecycle.ensure_schema(db)
+
+    transaction!(db, fn txn -> request_session_park_in_txn(txn, input) end)
+  end
+
+  defp request_session_park_in_txn(txn, input) do
+    session_key = Map.fetch!(input, :session_key)
+    incident_id = Map.fetch!(input, :incident_id)
+    idempotency_key = Map.fetch!(input, :idempotency_key)
+    mode = Map.get(input, :mode, "graceful")
+
+    request_attrs = %{
+      session_key: session_key,
+      principal: {:process, "tightbeam:harness-health"},
+      authority_basis: "harness_health_recovery",
+      idempotency_key: idempotency_key,
+      mode: mode,
+      cause_kind: "harness_health_recovery",
+      workspace_path: Map.get(input, :workspace_path, "unresolved:#{session_key}")
+    }
+
+    case Txn.q(
+           txn,
+           "SELECT causeId FROM park_requests WHERE principalKind='process' AND principalId='tightbeam:harness-health' AND sessionKey=?1 AND idempotencyKey=?2",
+           [session_key, idempotency_key]
+         ) do
+      [[decision_id]] ->
+        SessionLifecycle.request_in_txn(txn, Map.put(request_attrs, :cause_id, decision_id))
+
+      [] ->
+        decision_id =
+          health_park_decision_in_txn(txn, incident_id, session_key, mode) ||
+            "unbound-health-decision:#{incident_id}"
+
+        SessionLifecycle.request_in_txn(txn, Map.put(request_attrs, :cause_id, decision_id))
+    end
+  end
+
+  defp health_park_decision_in_txn(txn, incident_id, session_key, "graceful") do
+    case Txn.q(
+           txn,
+           """
+           SELECT hhi.harness,hhi.host,hhi.openObservationId,s.lifecycleGeneration
+           FROM harness_health_incidents hhi
+           JOIN harness_health_members hhm ON hhm.incidentId=hhi.id
+           JOIN sessions s ON s.sessionKey=hhm.sessionKey
+           WHERE hhi.id=?1 AND hhm.sessionKey=?2 AND hhi.state='open'
+             AND hhi.failureClass!='rate-limit-dead' AND s.state='active'
+           """,
+           [incident_id, session_key]
+         ) do
+      [[harness, host, evidence_id, generation]] ->
+        case Txn.q(
+               txn,
+               "SELECT decisionId FROM harness_health_recovery_decisions WHERE incidentId=?1 AND sessionKey=?2 AND sessionGeneration=?3 AND action='park'",
+               [incident_id, session_key, generation]
+             ) do
+          [[decision_id]] ->
+            decision_id
+
+          [] ->
+            decision_id = "hhrd_" <> Id.uuid4()
+
+            Txn.q(
+              txn,
+              """
+              INSERT INTO harness_health_recovery_decisions
+                (decisionId,incidentId,targetKind,sessionKey,sessionGeneration,harness,host,
+                 action,mode,policyBasis,evidenceObservationId,principal,createdAt)
+              VALUES (?1,?2,'session',?3,?4,?5,?6,'park','graceful',
+                      'shared_harness_incident_hold',?7,'tightbeam:harness-health',?8)
+              """,
+              [
+                decision_id,
+                incident_id,
+                session_key,
+                generation,
+                harness,
+                host,
+                evidence_id,
+                System.system_time(:millisecond)
+              ]
+            )
+
+            decision_id
+        end
+
+      [] ->
+        nil
+    end
+  end
+
+  defp health_park_decision_in_txn(_txn, _incident_id, _session_key, _mode), do: nil
 
   @doc "The fixed inference window established by the reviewed patrol design."
   @spec evidence_window_ms() :: pos_integer()
@@ -499,7 +607,7 @@ defmodule Tightbeam.HarnessHealth do
     validate_session_membership!(txn, input)
 
     if input.failure_class == "rate-limit-dead" and
-         HarnessProcess.parked_in_txn?(txn, adapter_key(input.harness, input.host)) do
+         HarnessProcess.kill_fenced_in_txn?(txn, adapter_key(input.harness, input.host)) do
       :repair_required
     else
       case observation_by_correlation(txn, input.correlation_id) do
@@ -613,7 +721,12 @@ defmodule Tightbeam.HarnessHealth do
     )
 
     if input.failure_class == "rate-limit-dead" do
-      HarnessProcess.begin_park_in_txn(txn, adapter_key(input.harness, input.host))
+      HarnessProcess.begin_kill_in_txn(txn, adapter_key(input.harness, input.host), %{
+        principal: {:process, "tightbeam:harness-health"},
+        authority_basis: "harness_health_recovery",
+        cause_kind: "harness_health_incident",
+        cause_id: incident_id
+      })
     end
 
     snapshot_affected_work(txn, incident_id, input)
@@ -675,7 +788,7 @@ defmodule Tightbeam.HarnessHealth do
         if Txn.changes(txn) != 1, do: raise("harness health incident resolution race")
 
         if input.failure_class == "rate-limit-dead" do
-          HarnessProcess.complete_park_in_txn(txn, adapter_key(input.harness, input.host))
+          HarnessProcess.complete_kill_in_txn(txn, adapter_key(input.harness, input.host))
         end
 
         EventLog.lifecycle_in_txn(
@@ -1087,7 +1200,7 @@ defmodule Tightbeam.HarnessHealth do
       action: "resume",
       requires: [],
       message:
-        "The harness remains parked until an opener or admin explicitly resumes it after the limit clears."
+        "The harness remains stopped until an opener or admin explicitly resumes it after the limit clears."
     }
 
   defp repair_guidance("auth-dead"),

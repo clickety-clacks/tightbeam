@@ -1,7 +1,17 @@
 defmodule Tightbeam.HarnessProcessTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{AdapterCoordinator, DB, EventLog, HarnessProcess}
+  alias Tightbeam.{
+    AdapterCoordinator,
+    DB,
+    EventLog,
+    HarnessHealth,
+    HarnessProcess,
+    Model,
+    Org,
+    Schema
+  }
+
   alias Tightbeam.HarnessProcessCensus
 
   # A BARE NAME MUST RESOLVE. `Port.open({:spawn_executable, name})` never searches PATH --
@@ -110,7 +120,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert {:ok, [[0]]} =
              DB.query(
                old_db,
-               "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'harness_park_fences'"
+               "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'harness_kill_fences'"
              )
   end
 
@@ -139,7 +149,7 @@ defmodule Tightbeam.HarnessProcessTest do
             process_helper: @helper
           ]
         end,
-        park_grace_ms: 5_000,
+        kill_grace_ms: 5_000,
         db: ctx.db,
         name: :identity_integration_coordinator
       })
@@ -275,7 +285,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
   test "kill delivery failure remains fenced and the reconcile sweep retries it", ctx do
     {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
-    assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+    assert {:ok, fenced} = HarnessProcess.begin_kill(ctx.db, {:claude, "shared", "testhost"})
     failing_helper = System.find_executable("false")
 
     {:ok, _} =
@@ -288,7 +298,7 @@ defmodule Tightbeam.HarnessProcessTest do
     fenced = %{fenced | helper_path: failing_helper}
 
     assert {:error, {:kill_failed, {:sigkill_not_delivered, 1, ""}}} =
-             HarnessProcess.park(ctx.db, fenced)
+             HarnessProcess.kill(ctx.db, fenced)
 
     assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
     assert [%{state: "kill_failed"}] = HarnessProcess.list(ctx.db)
@@ -304,12 +314,195 @@ defmodule Tightbeam.HarnessProcessTest do
     refute HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
   end
 
-  test "a kill command that never returns is bounded and remains kill_failed", ctx do
+  test "KILL records typed authority, exact identity, attached sessions, refusal, and delivery",
+       ctx do
+    :ok = Schema.ensure_all(ctx.db)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('owner',0,'admin_add',1),('other',0,'admin_add',1)"
+      )
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "kill-owner-session",
+        display_name: "Kill owner",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "harness-session", "created")
+    {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
+
+    assert {:error, %{code: "not_authorized", request_id: refusal_id}} =
+             HarnessProcess.request_kill(ctx.db, {:claude, "shared", "testhost"}, %{
+               principal: {:user, "other"},
+               authority_basis: "owner_user",
+               cause_kind: "manual_session_kill",
+               cause_id: session.session_key
+             })
+
+    assert HarnessProcess.kill_request(ctx.db, refusal_id).status == "refused"
+    refute HarnessProcess.kill_fenced?(ctx.db, {:claude, "shared", "testhost"})
+
+    assert {:ok, requested} =
+             HarnessProcess.request_kill(ctx.db, {:claude, "shared", "testhost"}, %{
+               principal: {:user, "owner"},
+               authority_basis: "owner_user",
+               cause_kind: "manual_session_kill",
+               cause_id: session.session_key
+             })
+
+    request = HarnessProcess.kill_request(ctx.db, requested.kill_request_id)
+    assert request.status == "accepted"
+    assert request.identity.process_group_id == row.process_group_id
+    assert request.identity.boot == row.boot_identity
+    assert request.identity.launch == row.identity_token
+
+    assert request.attached_sessions == [
+             %{session_key: session.session_key, lifecycle_generation: 0}
+           ]
+
+    assert :ok = HarnessProcess.kill(ctx.db, requested)
+    closed = HarnessProcess.kill_request(ctx.db, requested.kill_request_id)
+    assert closed.status == "killed"
+    assert closed.signal_result == "sigkill_delivered"
+
+    assert [%{attempt: 1, result: "delivered"}] =
+             Enum.map(closed.attempts, &Map.take(&1, [:attempt, :result]))
+
+    assert HarnessProcess.read_kill_request(
+             ctx.db,
+             requested.kill_request_id,
+             {:user, "owner"}
+           ).request_id == requested.kill_request_id
+
+    assert HarnessProcess.read_kill_request(
+             ctx.db,
+             requested.kill_request_id,
+             {:user, "other"}
+           ) == %{code: "not_found"}
+
+    assert {:ok, [[2, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*),sum(admitted) FROM harness_kill_read_audits WHERE requestId=?1",
+               [requested.kill_request_id]
+             )
+  end
+
+  test "harness health KILL requires an exact durable recovery decision", ctx do
+    :ok = Schema.ensure_all(ctx.db)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "health-kill-session",
+        display_name: "Health kill",
+        owner_user_id: "owner",
+        origin: "user:owner",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "testhost"
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "health-kill-harness", "created")
+    {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
+
+    assert {:error, %{code: "not_authorized", request_id: refused_id}} =
+             HarnessProcess.request_kill(ctx.db, {:claude, "shared", "testhost"}, %{
+               principal: {:process, "tightbeam:harness-health"},
+               authority_basis: "harness_health_recovery",
+               cause_kind: "harness_health_incident",
+               cause_id: "not-an-incident"
+             })
+
+    assert HarnessProcess.kill_request(ctx.db, refused_id).status == "refused"
+
+    assert {:opened, incident} =
+             HarnessHealth.observe(ctx.db, %{
+               harness: "claude",
+               host: "testhost",
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: session.session_key,
+               assignment_id: nil,
+               observed_at: 10,
+               correlation_id: "exact-health-kill",
+               cause: "provider declared rate limit terminal",
+               principal: "process:tightbeam"
+             })
+
+    assert {:ok, [[request_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT requestId FROM harness_kill_requests WHERE causeId=?1",
+               [incident.id]
+             )
+
+    request = HarnessProcess.kill_request(ctx.db, request_id)
+    assert request.status == "accepted"
+    assert request.cause == %{kind: "harness_health_incident", id: incident.id}
+
+    assert {:ok, repeated} =
+             HarnessProcess.request_kill(ctx.db, {:claude, "shared", "testhost"}, %{
+               principal: {:process, "tightbeam:harness-health"},
+               authority_basis: "harness_health_recovery",
+               cause_kind: "harness_health_incident",
+               cause_id: incident.id
+             })
+
+    assert repeated.kill_request_id == request_id
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_kill_requests WHERE causeId=?1",
+               [incident.id]
+             )
+
+    assert {:ok, [decision_identity]} =
+             DB.query(
+               ctx.db,
+               "SELECT launchId,processGroupId,bootIdentity,launchIdentity FROM harness_health_recovery_decisions WHERE incidentId=?1",
+               [incident.id]
+             )
+
+    assert decision_identity == [
+             row.launch_id,
+             row.process_group_id,
+             row.boot_identity,
+             row.identity_token
+           ]
+  end
+
+  test "a failed KILL delivery retries the same durable request", ctx do
+    :ok = Schema.ensure_all(ctx.db)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('kill-admin',1,'admin_add',1)"
+      )
+
     {_port, row} = launch_stubborn(ctx, {:claude, "shared", "testhost"})
     hanging = grouped_helper(ctx, "hanging-helper", "exec sleep 30")
     Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 50)
 
-    assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+    assert {:ok, fenced} =
+             HarnessProcess.request_kill(ctx.db, {:claude, "shared", "testhost"}, %{
+               principal: {:user, "kill-admin"},
+               authority_basis: "administrator",
+               cause_kind: "test_delivery",
+               cause_id: row.launch_id
+             })
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE harness_processes SET helperPath = ?2 WHERE launchId = ?1", [
@@ -320,10 +513,30 @@ defmodule Tightbeam.HarnessProcessTest do
     fenced = %{fenced | helper_path: hanging}
 
     assert {:error, {:kill_failed, :sigkill_delivery_unconfirmed}} =
-             HarnessProcess.park(ctx.db, fenced)
+             HarnessProcess.kill(ctx.db, fenced)
 
     assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
     assert [%{state: "kill_failed", resolved_at: nil}] = HarnessProcess.list(ctx.db)
+
+    failed = HarnessProcess.kill_request(ctx.db, fenced.kill_request_id)
+    assert failed.status == "kill_failed"
+    assert [%{attempt: 1, result: "delivery_failed"}] = failed.attempts
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE harness_processes SET helperPath = ?2 WHERE launchId = ?1", [
+        row.launch_id,
+        row.helper_path
+      ])
+
+    assert :ok = HarnessProcess.kill(ctx.db, %{fenced | helper_path: row.helper_path})
+
+    retried = HarnessProcess.kill_request(ctx.db, fenced.kill_request_id)
+    assert retried.status == "killed"
+
+    assert Enum.map(retried.attempts, &{&1.attempt, &1.result}) == [
+             {1, "delivery_failed"},
+             {2, "delivered"}
+           ]
   end
 
   test "continuous helper output cannot starve the absolute command deadline", ctx do
@@ -331,7 +544,7 @@ defmodule Tightbeam.HarnessProcessTest do
     noisy = grouped_helper(ctx, "noisy-helper", "while :; do printf x; done")
     Application.put_env(:tightbeam, :harness_process_command_timeout_ms, 50)
 
-    assert {:ok, fenced} = HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+    assert {:ok, fenced} = HarnessProcess.begin_kill(ctx.db, {:claude, "shared", "testhost"})
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE harness_processes SET helperPath = ?2 WHERE launchId = ?1", [
@@ -342,7 +555,7 @@ defmodule Tightbeam.HarnessProcessTest do
     started_at = System.monotonic_time(:millisecond)
 
     assert {:error, {:kill_failed, :sigkill_delivery_unconfirmed}} =
-             HarnessProcess.park(ctx.db, %{fenced | helper_path: noisy})
+             HarnessProcess.kill(ctx.db, %{fenced | helper_path: noisy})
 
     assert System.monotonic_time(:millisecond) - started_at < 1_000
 
@@ -356,7 +569,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
     assert HarnessProcess.fenced?(ctx.db, {:claude, "shared", "testhost"})
 
-    assert_raise RuntimeError, ~r/adapter park in progress/, fn ->
+    assert_raise RuntimeError, ~r/adapter kill in progress/, fn ->
       HarnessProcess.prepare_launch(
         [
           cmd: [System.find_executable("false")],
@@ -385,8 +598,8 @@ defmodule Tightbeam.HarnessProcessTest do
         )
     end
 
-    assert {:ok, %{launch_id: "aa_new", state: "park_requested"}} =
-             HarnessProcess.begin_park(ctx.db, {:claude, "shared", "testhost"})
+    assert {:ok, %{launch_id: "aa_new", state: "kill_requested"}} =
+             HarnessProcess.begin_kill(ctx.db, {:claude, "shared", "testhost"})
   end
 
   test "boot reconciliation waits for a launcher identity that appears after row insertion",
@@ -428,7 +641,7 @@ defmodule Tightbeam.HarnessProcessTest do
   test "boot reconciliation clears a fence with no unresolved launch", ctx do
     key = {:codex, "shared", "testhost"}
 
-    assert {:ok, :no_launch} = HarnessProcess.begin_park(ctx.db, key)
+    assert {:ok, :no_launch} = HarnessProcess.begin_kill(ctx.db, key)
     assert HarnessProcess.fenced?(ctx.db, key)
 
     assert :ok = HarnessProcess.reconcile(ctx.db)
@@ -626,7 +839,7 @@ defmodule Tightbeam.HarnessProcessTest do
              process_helper: @helper
            ]
          end,
-         park_grace_ms: 50,
+         kill_grace_ms: 50,
          db: ctx.db,
          name: :failed_planned_close_coordinator}
       )
@@ -755,7 +968,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1",
+               "SELECT COUNT(*) FROM harness_kill_fences WHERE adapterKey = ?1",
                ["claude:shared@testhost"]
              )
 
@@ -858,7 +1071,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert {:ok, [[0]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1",
+               "SELECT COUNT(*) FROM harness_kill_fences WHERE adapterKey = ?1",
                ["claude:shared@testhost"]
              )
 
@@ -896,7 +1109,7 @@ defmodule Tightbeam.HarnessProcessTest do
     checkout = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
     assert_receive {:context_started, context_worker}
     assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
-    assert Task.await(checkout) == {:error, {:parked, "claude:shared@testhost"}}
+    assert Task.await(checkout) == {:error, {:kill_in_progress, "claude:shared@testhost"}}
 
     send(context_worker, :release_context)
     refute_receive :adapter_started
@@ -926,7 +1139,7 @@ defmodule Tightbeam.HarnessProcessTest do
     File.write!(identity_path, "this names no process\n")
     on_exit(fn -> File.rm(identity_path) end)
 
-    assert {:ok, %{state: "park_requested"}} = HarnessProcess.begin_park(ctx.db, key)
+    assert {:ok, %{state: "kill_requested"}} = HarnessProcess.begin_kill(ctx.db, key)
     owner = self()
 
     coordinator =
@@ -942,7 +1155,7 @@ defmodule Tightbeam.HarnessProcessTest do
          name: :durable_fence_coordinator}
       )
 
-    assert {:error, {:park_fenced, "claude:shared@testhost"}} =
+    assert {:error, {:kill_fenced, "claude:shared@testhost"}} =
              AdapterCoordinator.adapter_for(coordinator, key)
 
     refute_receive :adapter_started
@@ -1044,7 +1257,7 @@ defmodule Tightbeam.HarnessProcessTest do
       key
     )
 
-    assert {:ok, %{state: "park_requested"}} = HarnessProcess.begin_park(ctx.db, key)
+    assert {:ok, %{state: "kill_requested"}} = HarnessProcess.begin_kill(ctx.db, key)
     owner = self()
 
     # The successor coordinator reconciles at init, exactly as the rebooted

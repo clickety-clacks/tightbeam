@@ -572,6 +572,59 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::SessionPark {
+            identity,
+            session_key,
+            idempotency_key,
+            mode,
+            retry_of_request_id,
+        } => {
+            let mut params = vec![
+                string_field("sessionKey", session_key),
+                string_field("idempotencyKey", idempotency_key),
+                string_field("mode", mode),
+            ];
+            if let Some(value) = retry_of_request_id {
+                params.push(string_field("retryOfRequestId", value));
+            }
+            Ok(request(identity, "session-park", vec![], params))
+        }
+        Command::SessionRelaunch {
+            identity,
+            session_key,
+        } => Ok(request(
+            identity,
+            "session-relaunch",
+            vec![],
+            vec![string_field("sessionKey", session_key)],
+        )),
+        Command::SessionParkRequest {
+            identity,
+            request_id,
+        } => Ok(request(
+            identity,
+            "session-park-request",
+            vec![],
+            vec![string_field("requestId", request_id)],
+        )),
+        Command::HarnessKill {
+            identity,
+            session_key,
+        } => Ok(request(
+            identity,
+            "harness-kill",
+            vec![],
+            vec![string_field("sessionKey", session_key)],
+        )),
+        Command::HarnessKillRequest {
+            identity,
+            request_id,
+        } => Ok(request(
+            identity,
+            "harness-kill-request",
+            vec![],
+            vec![string_field("requestId", request_id)],
+        )),
         Command::Assign {
             identity,
             subject,
@@ -1980,6 +2033,11 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::List { identity }
         | Command::Tune { identity, .. }
         | Command::Retire { identity, .. }
+        | Command::SessionPark { identity, .. }
+        | Command::SessionRelaunch { identity, .. }
+        | Command::SessionParkRequest { identity, .. }
+        | Command::HarnessKill { identity, .. }
+        | Command::HarnessKillRequest { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
@@ -3620,6 +3678,44 @@ mod tests {
                     "flynn",
                 ][..],
                 r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"idempotencyKey":"retire-k"}}"#,
+            ),
+            (
+                &[
+                    "session-park",
+                    "--session",
+                    "agent:r",
+                    "--key",
+                    "park-k",
+                    "--mode",
+                    "immediate",
+                    "--retry-of",
+                    "park_1",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"session-park","params":{"sessionKey":"agent:r","idempotencyKey":"park-k","mode":"immediate","retryOfRequestId":"park_1"}}"#,
+            ),
+            (
+                &[
+                    "session-relaunch",
+                    "--session",
+                    "agent:r",
+                    "--as",
+                    "operator",
+                ][..],
+                r#"{"as":"operator","verb":"session-relaunch","params":{"sessionKey":"agent:r"}}"#,
+            ),
+            (
+                &["session-park-request", "park_1", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"session-park-request","params":{"requestId":"park_1"}}"#,
+            ),
+            (
+                &["harness-kill", "--session", "agent:r", "--as", "operator"][..],
+                r#"{"as":"operator","verb":"harness-kill","params":{"sessionKey":"agent:r"}}"#,
+            ),
+            (
+                &["harness-kill-request", "kill_1", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"harness-kill-request","params":{"requestId":"kill_1"}}"#,
             ),
             (
                 &["cancel-wake", "wake-1", "--as-process", "cron"][..],

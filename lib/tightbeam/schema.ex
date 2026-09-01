@@ -25,6 +25,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
+    Tightbeam.SessionLifecycle,
     Tightbeam.Productions.CompletionEscalation,
     Tightbeam.Activations,
     Tightbeam.EffortCheckin,
@@ -90,8 +91,10 @@ defmodule Tightbeam.Schema do
   # completion-owned tables, and the `completion_transition` cancellation
   # classification. SQLite cannot widen those existing shapes in place. The
   # reviewed R17 boundary therefore refuses every predecessor and recreates at
-  # v14; the older named migration helpers remain explicit test seams only.
-  @shape "coordination-fabric-v1-phase1-v14"
+  # v14. KILL/PARK then advances that one exact predecessor transactionally to
+  # v15; every older named migration helper remains an explicit test seam only.
+  @shape "coordination-fabric-v1-phase1-v15"
+  @kill_park_previous_shape "coordination-fabric-v1-phase1-v14"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
   @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
   @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
@@ -1835,6 +1838,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@kill_park_previous_shape]]} ->
+        upgrade_kill_park_v1(db)
+
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
         # written before stamping existed. Those are DIFFERENT, and telling
@@ -1865,6 +1871,114 @@ defmodule Tightbeam.Schema do
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
+    end
+  end
+
+  @doc false
+  def upgrade_kill_park_v1(db) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@kill_park_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_kill_park_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Txn.exec(txn, "PRAGMA legacy_alter_table=ON")
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE sessions ADD COLUMN lifecycleGeneration INTEGER NOT NULL DEFAULT 0 CHECK (lifecycleGeneration >= 0)"
+             )
+
+           :ok = Txn.exec(txn, "ALTER TABLE sessions ADD COLUMN lifecycleRequestId TEXT")
+           :ok = Txn.exec(txn, Tightbeam.SessionLifecycle.ddl_for_migration())
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE completion_escalations RENAME TO completion_escalations_kill_park_v1"
+             )
+
+           :ok = Txn.exec(txn, "DROP INDEX IF EXISTS completion_escalations_child_status")
+           :ok = Txn.exec(txn, "DROP INDEX IF EXISTS completion_escalations_assignment")
+           :ok = Txn.exec(txn, "DROP INDEX IF EXISTS completion_escalations_one_open_child")
+           :ok = Txn.exec(txn, Tightbeam.Productions.CompletionEscalation.ddl_for_migration())
+
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               INSERT INTO completion_escalations
+                 (id,dedupeKey,assignmentId,workItemId,childSessionKey,remainingOpenAssignments,
+                  closingAttestId,outcome,causeBySession,ownerUserId,rootMainHolder,
+                  immediateParentSessionKey,parentSessionKey,parentResolutionSource,parentRouteStatus,
+                  reportToSessionKey,reportToRouteStatus,generation,currentParentNoticeWakeId,
+                  reportToNoticeWakeId,deadlineWakeId,parkRequestId,actionDeadlineAt,status,decision,
+                  actedBySession,actedByUser,actedAt,supersededReason,supersededByAssignmentId,
+                  supersededAt,createdAt)
+               SELECT id,dedupeKey,assignmentId,workItemId,childSessionKey,remainingOpenAssignments,
+                  closingAttestId,outcome,causeBySession,ownerUserId,rootMainHolder,
+                  immediateParentSessionKey,parentSessionKey,parentResolutionSource,parentRouteStatus,
+                  reportToSessionKey,reportToRouteStatus,generation,currentParentNoticeWakeId,
+                  reportToNoticeWakeId,deadlineWakeId,NULL,actionDeadlineAt,status,decision,
+                  actedBySession,actedByUser,actedAt,supersededReason,supersededByAssignmentId,
+                  supersededAt,createdAt
+               FROM completion_escalations_kill_park_v1
+               """
+             )
+
+           :ok = Txn.exec(txn, "DROP TABLE completion_escalations_kill_park_v1")
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE harness_processes RENAME TO harness_processes_kill_park_v1"
+             )
+
+           :ok = Txn.exec(txn, "DROP INDEX IF EXISTS harness_processes_adapter_launch_sequence")
+           :ok = Txn.exec(txn, "ALTER TABLE harness_park_fences RENAME TO harness_kill_fences")
+           :ok = Txn.exec(txn, Tightbeam.HarnessProcess.ddl_for_migration())
+
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               INSERT INTO harness_processes
+                 (launchId,adapterKey,harness,preset,host,ssh,helperPath,identityPath,
+                  launchSequence,osPid,processGroupId,bootIdentity,identityToken,state,createdAt,
+                  killRequestedAt,killAttemptedAt,killSentAt,resolvedAt,lastError)
+               SELECT launchId,adapterKey,harness,preset,host,ssh,helperPath,identityPath,
+                  launchSequence,osPid,processGroupId,bootIdentity,identityToken,
+                  CASE state WHEN 'park_requested' THEN 'kill_requested'
+                             WHEN 'park_failed' THEN 'kill_failed' ELSE state END,
+                  createdAt,parkRequestedAt,killAttemptedAt,killSentAt,resolvedAt,lastError
+               FROM harness_processes_kill_park_v1
+               """
+             )
+
+           :ok = Txn.exec(txn, "DROP TABLE harness_processes_kill_park_v1")
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2", [
+             @shape,
+             System.system_time(:millisecond)
+           ])
+
+           :ok = Txn.exec(txn, "PRAGMA legacy_alter_table=OFF")
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_kill_park_v1: migration failed: #{Exception.message(error)}"
     end
   end
 

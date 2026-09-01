@@ -150,7 +150,14 @@ defmodule Tightbeam.AdapterCoordinator do
   """
   @spec close_adapter(GenServer.server(), adapter_key()) :: :ok | {:error, term()}
   def close_adapter(server \\ __MODULE__, key) do
-    GenServer.call(server, {:close_adapter, key}, 30_000)
+    close_adapter(server, key, %{})
+  catch
+    :exit, reason -> {:error, {:coordinator_unavailable, reason}}
+  end
+
+  @doc "Planned teardown with the typed principal and durable cause copied into KILL."
+  def close_adapter(server, key, kill_attrs) do
+    GenServer.call(server, {:close_adapter, key, kill_attrs}, 30_000)
   catch
     :exit, reason -> {:error, {:coordinator_unavailable, reason}}
   end
@@ -166,6 +173,15 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.cast(server, {:close_adapter, key})
   end
 
+  @doc "Gracefully close one resident harness session without stopping its shared adapter."
+  @spec park_session(GenServer.server(), adapter_key(), String.t()) ::
+          :ok | {:error, term()}
+  def park_session(server \\ __MODULE__, key, harness_session_id) do
+    GenServer.call(server, {:park_session, key, harness_session_id}, :infinity)
+  catch
+    :exit, reason -> {:error, {:coordinator_unavailable, reason}}
+  end
+
   @impl true
   def init(opts) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
@@ -178,7 +194,7 @@ defmodule Tightbeam.AdapterCoordinator do
        adapter_context: Keyword.fetch!(opts, :adapter_context),
        adapter_opts: Keyword.fetch!(opts, :adapter_opts),
        db: db,
-       park_grace_ms: Keyword.get(opts, :park_grace_ms, 10_000),
+       kill_grace_ms: Keyword.get(opts, :kill_grace_ms, 10_000),
        backoff_base_ms: Keyword.get(opts, :backoff_base_ms, 1_000),
        load_soft_cap: Application.get_env(:tightbeam, :adapter_load_soft_cap, 3),
        failure_circuit: Application.get_env(:tightbeam, :adapter_failure_circuit, 5),
@@ -205,7 +221,7 @@ defmodule Tightbeam.AdapterCoordinator do
         {:reply, checkout(entry), state}
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
-        {:reply, {:error, {:park_fenced, key_name(key)}}, state}
+        {:reply, {:error, {:kill_fenced, key_name(key)}}, state}
 
       entry.circuit == :open ->
         {:reply, {:error, :degraded}, state}
@@ -274,7 +290,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
     {result, state} =
       Enum.reduce_while(command.adapter_keys, {:ok, state}, fn key, {:ok, state} ->
-        case do_close_adapter(key, state) do
+        case do_close_adapter(key, %{}, state) do
           {:ok, state} -> {:cont, {:ok, state}}
           {{:error, _reason} = error, state} -> {:halt, {error, state}}
         end
@@ -284,7 +300,32 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   def handle_call({:close_adapter, key}, _from, state) do
-    {result, state} = do_close_adapter(key, state)
+    {result, state} = do_close_adapter(key, %{}, state)
+    {:reply, result, state}
+  end
+
+  def handle_call({:close_adapter, key, kill_attrs}, _from, state) do
+    {result, state} = do_close_adapter(key, kill_attrs, state)
+    {:reply, result, state}
+  end
+
+  def handle_call({:park_session, key, harness_session_id}, _from, state) do
+    result =
+      case state.adapters[key] do
+        %{pid: pid} = entry when is_pid(pid) ->
+          if live_entry?(entry) do
+            Tightbeam.Acp.Adapter.close_session(pid, harness_session_id)
+          else
+            {:error, :runtime_liveness_unknown}
+          end
+
+        _ ->
+          # A pointer plus no resident adapter is not proof that the harness
+          # context settled. PARK never starts an adapter to probe and never
+          # tears down the shared group; the durable outcome stays explicit.
+          {:error, :runtime_liveness_unknown}
+      end
+
     {:reply, result, state}
   end
 
@@ -293,7 +334,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
     cond do
       live_entry?(entry) and authoritative? and entry.context != normalize_context(context) ->
-        case do_close_adapter(key, state) do
+        case do_close_adapter(key, %{}, state) do
           {:ok, state} ->
             {reply, state} = start_adapter(key, state.adapters[key], state, context)
             {:reply, reply, state}
@@ -306,7 +347,7 @@ defmodule Tightbeam.AdapterCoordinator do
         {:reply, checkout(entry), state}
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
-        {:reply, {:error, {:park_fenced, key_name(key)}}, state}
+        {:reply, {:error, {:kill_fenced, key_name(key)}}, state}
 
       # THE CIRCUIT DOES NOT GATE CREDENTIAL INSTALLATION (the credential-swap
       # incident, 2026-08-14). It protects agent connections from a dead
@@ -333,7 +374,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def handle_cast({:close_adapter, key}, state) do
-    {_result, state} = do_close_adapter(key, state)
+    {_result, state} = do_close_adapter(key, %{}, state)
     {:noreply, state}
   end
 
@@ -341,8 +382,21 @@ defmodule Tightbeam.AdapterCoordinator do
     {:noreply, release_slot(machine, slot, state)}
   end
 
-  defp do_close_adapter(key, state) do
-    {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
+  defp do_close_adapter(key, kill_attrs, state) do
+    request =
+      if map_size(kill_attrs) == 0 do
+        Tightbeam.HarnessProcess.begin_kill(state.db, key)
+      else
+        Tightbeam.HarnessProcess.request_kill(state.db, key, kill_attrs)
+      end
+
+    case request do
+      {:ok, process_row} -> do_close_adapter_requested(key, process_row, state)
+      {:error, refusal} -> {{:error, {:kill_refused, refusal}}, state}
+    end
+  end
+
+  defp do_close_adapter_requested(key, process_row, state) do
     state = cancel_pending_starts(key, state)
 
     exited? =
@@ -350,7 +404,7 @@ defmodule Tightbeam.AdapterCoordinator do
         %{pid: pid, monitor: monitor} when is_pid(pid) and is_reference(monitor) ->
           Tightbeam.Acp.Adapter.request_close(pid)
 
-          case await_adapter_exit(monitor, pid, state.park_grace_ms) do
+          case await_adapter_exit(monitor, pid, state.kill_grace_ms) do
             # The park asked for :normal and got a FAULT: this adapter was
             # killed or crashed inside the park window. The selective receive
             # below is the only place that death is ever observed —
@@ -366,7 +420,7 @@ defmodule Tightbeam.AdapterCoordinator do
                   key,
                   MapSet.member?(state.ready_refs, monitor),
                   reason,
-                  "absorbed=false parked=true"
+                  "absorbed=false kill_requested=true"
                 )
 
               true
@@ -390,12 +444,12 @@ defmodule Tightbeam.AdapterCoordinator do
       case process_row do
         :no_launch -> :ok
         _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
-        row -> Tightbeam.HarnessProcess.park(state.db, row)
+        row -> Tightbeam.HarnessProcess.kill(state.db, row)
       end
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result
     state = retire_adapter(key, state)
-    if result == :ok, do: Tightbeam.HarnessProcess.complete_park(state.db, key)
+    if result == :ok, do: Tightbeam.HarnessProcess.complete_kill(state.db, key)
 
     {result, state}
   end
@@ -416,7 +470,7 @@ defmodule Tightbeam.AdapterCoordinator do
       Enum.reduce(state.context_requests, state.context_requests, fn
         {request_ref, %{key: ^key, monitor: monitor, purpose: {:checkout, from}}}, requests ->
           Process.demonitor(monitor, [:flush])
-          GenServer.reply(from, {:error, {:parked, key_name(key)}})
+          GenServer.reply(from, {:error, {:kill_in_progress, key_name(key)}})
           Map.delete(requests, request_ref)
 
         {request_ref, %{key: ^key, monitor: monitor}}, requests ->
@@ -446,7 +500,7 @@ defmodule Tightbeam.AdapterCoordinator do
   # a prompt that vanished — with no marker of its own, because the failure
   # path publishes terminal turn-state and no chat line.
   # `state_detail` names the STATE the adapter died in — the caller knows it and
-  # the row must carry it, because "absorbed" and "parked" are the two ways a
+  # the row must carry it, because "absorbed" and "kill_requested" are the two ways a
   # death reaches this function by a path other than a live monitor.
   defp record_adapter_down(state, key, was_ready?, reason, state_detail) do
     name = key_name(key)
@@ -507,7 +561,7 @@ defmodule Tightbeam.AdapterCoordinator do
     case state.adapters[key] do
       %{pid: pid, monitor: monitor} = entry ->
         if is_reference(monitor), do: Process.demonitor(monitor, [:flush])
-        if is_pid(pid) and Process.alive?(pid), do: Process.exit(pid, :kill)
+        if is_pid(pid), do: Process.exit(pid, :kill)
 
         entry = %{entry | pid: nil, monitor: nil, ready: false, context: nil, timer: nil}
 
@@ -664,7 +718,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   defp start_adapter(key, entry, state, context) do
     if Tightbeam.HarnessProcess.fenced?(state.db, key) do
-      {{:error, {:park_fenced, key_name(key)}}, state}
+      {{:error, {:kill_fenced, key_name(key)}}, state}
     else
       start_adapter_unfenced(key, entry, state, context)
     end

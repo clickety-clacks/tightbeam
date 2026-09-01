@@ -27,6 +27,7 @@ defmodule Tightbeam.SessionLane do
     :task_sup,
     terminal_publisher: nil,
     on_terminal: nil,
+    on_idle: nil,
     task_ref: nil,
     task_pid: nil,
     current_seq: nil,
@@ -125,7 +126,8 @@ defmodule Tightbeam.SessionLane do
       # cancel races) — without it a crashed turn leaves the client's typing
       # indicator stuck forever. No-op default keeps unit tests standalone.
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
-      on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end)
+      on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
+      on_idle: Keyword.get(opts, :on_idle, fn _ -> :ok end)
     }
 
     send(self(), :nudge)
@@ -169,7 +171,9 @@ defmodule Tightbeam.SessionLane do
   def handle_info({ref, {seq, outcome}}, %{task_ref: ref} = state) do
     Process.demonitor(ref, [:flush])
     finalize(state, seq, outcome, cause: "turn-runner", principal: "process:tightbeam")
-    {:noreply, maybe_start(%{state | task_ref: nil})}
+    state = %{state | task_ref: nil}
+    state.on_idle.(state.session_key)
+    {:noreply, maybe_start(state)}
   end
 
   # TurnTask crashed.
@@ -185,11 +189,15 @@ defmodule Tightbeam.SessionLane do
       principal: "process:tightbeam"
     )
 
-    {:noreply, maybe_start(%{state | task_ref: nil})}
+    state = %{state | task_ref: nil}
+    state.on_idle.(state.session_key)
+    {:noreply, maybe_start(state)}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _}, %{task_ref: ref} = state) do
-    {:noreply, maybe_start(%{state | task_ref: nil})}
+    state = %{state | task_ref: nil}
+    state.on_idle.(state.session_key)
+    {:noreply, maybe_start(state)}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -231,19 +239,19 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp claim_and_start(state) do
-    if harness_parked?(state) do
+    if harness_kill_fenced?(state) do
       state
     else
       claim_next(state)
     end
   end
 
-  defp harness_parked?(state) do
+  defp harness_kill_fenced?(state) do
     case DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [
            state.session_key
          ]) do
       {:ok, [[harness, host]]} ->
-        HarnessProcess.parked?(state.db, {Harness.parse!(harness).id(), "shared", host})
+        HarnessProcess.kill_fenced?(state.db, {Harness.parse!(harness).id(), "shared", host})
 
       {:ok, []} ->
         false

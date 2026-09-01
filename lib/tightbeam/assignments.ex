@@ -1808,7 +1808,11 @@ defmodule Tightbeam.Assignments do
   end
 
   defp reopen_holder_active(txn, assignment) do
-    case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [assignment.holderKey]) do
+    case Txn.q(
+           txn,
+           "SELECT CASE WHEN s.state='retired' THEN s.state ELSE COALESCE(sl.state,s.state) END FROM sessions s LEFT JOIN session_lifecycle_states sl USING(sessionKey) WHERE s.sessionKey=?1",
+           [assignment.holderKey]
+         ) do
       [["active"]] ->
         :ok
 
@@ -1998,13 +2002,16 @@ defmodule Tightbeam.Assignments do
   defp create_assignment(txn, call, owner, key, files, verb) do
     case Txn.q(
            txn,
-           "SELECT state, harness, provider, ownerUserId FROM sessions WHERE sessionKey = ?1",
+           "SELECT CASE WHEN s.state='retired' THEN s.state ELSE COALESCE(sl.state,s.state) END, s.harness, s.provider, s.ownerUserId FROM sessions s LEFT JOIN session_lifecycle_states sl USING(sessionKey) WHERE s.sessionKey = ?1",
            [
              call.session_key
            ]
          ) do
       [["retired", _harness, _provider, _holder_owner]] ->
         error("session_retired", "assignments require an active holder session")
+
+      [[state, _harness, _provider, _holder_owner]] when state in ["parking", "parked"] ->
+        error("session_parked", "assignments require an active holder session")
 
       [["active", harness, provider, holder_owner]] ->
         report_to = call.params[:report_to_session_key]

@@ -37,6 +37,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     currentParentNoticeWakeId TEXT NULL UNIQUE REFERENCES wakes(wakeId),
     reportToNoticeWakeId TEXT NULL UNIQUE REFERENCES wakes(wakeId),
     deadlineWakeId TEXT NULL UNIQUE REFERENCES wakes(wakeId),
+    parkRequestId TEXT NULL UNIQUE REFERENCES park_requests(requestId),
     actionDeadlineAt INTEGER NULL,
     status TEXT NOT NULL CHECK (
       status IN ('notice-only','open','acknowledged','retained_root','superseded')
@@ -90,6 +91,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
         AND decision IS NULL AND actionDeadlineAt IS NULL AND deadlineWakeId IS NULL
         AND actedBySession IS NULL AND actedByUser IS NULL AND actedAt IS NULL
         AND supersededReason IS NULL AND supersededByAssignmentId IS NULL AND supersededAt IS NULL
+        AND parkRequestId IS NULL
       OR status = 'open'
         AND remainingOpenAssignments = 0
         AND decision IS NULL AND actionDeadlineAt IS NOT NULL AND deadlineWakeId IS NOT NULL
@@ -101,12 +103,15 @@ defmodule Tightbeam.Productions.CompletionEscalation do
         AND decision IS NOT NULL AND actionDeadlineAt IS NOT NULL AND deadlineWakeId IS NULL
         AND ((actedBySession IS NOT NULL) != (actedByUser IS NOT NULL)) AND actedAt IS NOT NULL
         AND supersededReason IS NULL AND supersededByAssignmentId IS NULL AND supersededAt IS NULL
+        AND ((decision = 'park' AND parkRequestId IS NOT NULL)
+             OR (decision != 'park' AND parkRequestId IS NULL))
       OR status = 'retained_root'
         AND rootMainHolder = 1
         AND remainingOpenAssignments = 0
         AND decision = 'retain' AND actionDeadlineAt IS NOT NULL AND deadlineWakeId IS NULL
         AND ((actedBySession IS NOT NULL) != (actedByUser IS NOT NULL)) AND actedAt IS NOT NULL
         AND supersededReason IS NULL AND supersededByAssignmentId IS NULL AND supersededAt IS NULL
+        AND parkRequestId IS NULL
       OR status = 'superseded'
         AND remainingOpenAssignments = 0
         AND decision IS NULL AND actionDeadlineAt IS NOT NULL AND deadlineWakeId IS NULL
@@ -138,6 +143,9 @@ defmodule Tightbeam.Productions.CompletionEscalation do
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+
+  @doc false
+  def ddl_for_migration, do: @ddl
 
   @doc "Create one completion record and its admitted wakes in the assignment close transaction."
   @spec open_in_txn(Txn.t(), map(), map()) :: map()
@@ -403,21 +411,91 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     fetch_in_txn!(txn, completion_id)
   end
 
-  @doc "Record the reviewed park dependency refusal without acknowledging the request."
-  @spec park_unavailable_in_txn(Txn.t(), String.t(), term()) :: map()
-  def park_unavailable_in_txn(%Txn{} = txn, completion_id, principal) do
-    EventLog.lifecycle_in_txn(
-      txn,
-      "completion_escalation_park_failed",
-      completion_id,
-      "reason=park_dependency_unavailable principal=#{principal_string(principal)}"
-    )
+  @doc "Bind R12 to one exact accepted PARK request in the disposition transaction."
+  @spec bind_park_in_txn(Txn.t(), map(), term(), String.t()) ::
+          {:ok, String.t()} | {:error, map()}
+  def bind_park_in_txn(%Txn{} = txn, row, principal, workspace_path) do
+    if is_binary(row.park_request_id) do
+      {:ok, row.park_request_id}
+    else
+      request =
+        Tightbeam.SessionLifecycle.request_in_txn(txn, %{
+          session_key: row.child_session_key,
+          principal: principal,
+          idempotency_key: "completion:#{row.id}",
+          authority_basis: "completion_disposition",
+          cause_kind: "completion",
+          cause_id: row.id,
+          mode: "graceful",
+          workspace_path: workspace_path
+        })
 
-    %{
-      code: "park_dependency_unavailable",
-      completionId: completion_id,
-      requestStatus: "open"
-    }
+      case request do
+        %{request_id: request_id} ->
+          Txn.q(
+            txn,
+            "UPDATE completion_escalations SET parkRequestId=?2 WHERE id=?1 AND status='open' AND parkRequestId IS NULL",
+            [row.id, request_id]
+          )
+
+          if Txn.changes(txn) != 1, do: raise("completion park binding race")
+          {:ok, request_id}
+
+        %{code: code} = refusal ->
+          EventLog.lifecycle_in_txn(
+            txn,
+            "completion_escalation_park_failed",
+            row.id,
+            "reason=#{code} principal=#{principal_string(principal)}"
+          )
+
+          {:error, Map.merge(refusal, %{completionId: row.id, requestStatus: "open"})}
+      end
+    end
+  end
+
+  @doc "Acknowledge PARK only when the exact R12 foreign key joins to `parked`."
+  @spec acknowledge_park_if_parked_in_txn(Txn.t(), String.t(), term()) :: map()
+  def acknowledge_park_if_parked_in_txn(%Txn{} = txn, completion_id, principal) do
+    row = fetch_in_txn!(txn, completion_id)
+
+    outcome =
+      case Txn.q(
+             txn,
+             "SELECT status,failureCode,recoveryState,remedy FROM park_outcomes WHERE requestId=?1",
+             [row.park_request_id]
+           ) do
+        [[status, failure, recovery, remedy]] ->
+          %{status: status, failure: failure, recovery: recovery, remedy: remedy}
+
+        [] ->
+          nil
+      end
+
+    case outcome do
+      %{status: "parked"} ->
+        acknowledge_in_txn(txn, row, "park", principal, "acknowledged")
+        fetch_in_txn!(txn, completion_id)
+
+      %{status: "park_failed"} = failed ->
+        %{
+          code: "park_failed",
+          completionId: completion_id,
+          parkRequestId: row.park_request_id,
+          requestStatus: "open",
+          failureCode: failed.failure,
+          recoveryState: failed.recovery,
+          remedy: failed.remedy
+        }
+
+      _ ->
+        %{
+          code: "park_in_progress",
+          completionId: completion_id,
+          parkRequestId: row.park_request_id,
+          requestStatus: "open"
+        }
+    end
   end
 
   @doc "Acknowledge any open completion request before the shared retirement mutation."
@@ -1046,7 +1124,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
            [wake_id]
          ) do
       [raw] ->
-        {completion_raw, [wake_generation, kind, wake_state, id]} = Enum.split(raw, 31)
+        {completion_raw, [wake_generation, kind, wake_state, id]} = Enum.split(raw, 32)
 
         completion_raw
         |> row()
@@ -1161,6 +1239,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
       request: %{
         status: row.status,
         decision: row.decision,
+        parkRequestId: row.park_request_id,
         deadlineAt: row.action_deadline_at,
         generation: row.generation,
         actedBySession: row.acted_by_session,
@@ -1283,7 +1362,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
        closingAttestId outcome causeBySession ownerUserId rootMainHolder
        immediateParentSessionKey parentSessionKey parentResolutionSource parentRouteStatus reportToSessionKey
        reportToRouteStatus generation currentParentNoticeWakeId reportToNoticeWakeId
-       deadlineWakeId actionDeadlineAt status decision actedBySession actedByUser actedAt
+       deadlineWakeId parkRequestId actionDeadlineAt status decision actedBySession actedByUser actedAt
        supersededReason supersededByAssignmentId supersededAt createdAt)
     |> Enum.map_join(",", &(prefix <> &1))
   end
@@ -1310,6 +1389,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
          current_parent_notice_wake_id,
          report_to_notice_wake_id,
          deadline_wake_id,
+         park_request_id,
          action_deadline_at,
          status,
          decision,
@@ -1342,6 +1422,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
       current_parent_notice_wake_id: current_parent_notice_wake_id,
       report_to_notice_wake_id: report_to_notice_wake_id,
       deadline_wake_id: deadline_wake_id,
+      park_request_id: park_request_id,
       action_deadline_at: action_deadline_at,
       status: status,
       decision: decision,
