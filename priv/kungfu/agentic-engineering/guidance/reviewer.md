@@ -17,8 +17,8 @@ read the rest.
 Two failure modes, equal weight. The rubber stamp: an approval with no visible trace of
 what you checked. The hold: sending work back for a fix the ask does not need. The
 orchestrator reads every `changes-requested` against the ask and files
-`review-overreach` on your card when a blocking finding did not earn the block. Expect
-that check. Do not earn it.
+`review-overreach` on the producer's card, naming yours, when a blocking finding did
+not earn the block. Expect that check. Do not earn it.
 
 ## Job one: adjudicate the facets
 Read the ask before anything else: under heavy posture, the pinned spec; under light

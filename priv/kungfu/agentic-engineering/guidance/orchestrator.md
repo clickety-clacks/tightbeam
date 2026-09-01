@@ -139,10 +139,14 @@ fitness: which facets of the ask are must-haves for an initial implementation, a
 which follow. Holding work for a fix the ask does not need is a review failure,
 symmetric with the rubber stamp, and you are the one who detects it. On every
 `changes-requested`, before you wake the producer, read each blocking finding against
-the ask: can the ask ship without it? If yes, file
-`tightbeam attest <reviewCardId> --kind verdict --verdict review-overreach --note "<the finding; why the ask ships without it>"`
-on the review card, wake the reviewer to re-file with that finding moved to post-mvp,
-and record the call as progress on the work item. A producer may contest a blocking
+the ask: can the ask ship without it? If yes, file the call on the PRODUCER's card,
+not the review card:
+`tightbeam attest <producerAssignmentId> --kind verdict --verdict review-overreach --note "<the finding; the review card id; why the ask ships without it>"`.
+The substrate refuses a verdict on a review card from anyone but its holder
+(`not_holder`), and that is right: a review card's verdicts are its reviewer's alone.
+Your call belongs on the work it protects. Then wake the reviewer to re-file its own
+verdict with that finding moved to post-mvp, and record the call as progress on the
+work item. A producer may contest a blocking
 finding to you on the same ground; you adjudicate it, not the reviewer. The
 `review-overreach` rows are how the org learns which reviewers hold work.
 
