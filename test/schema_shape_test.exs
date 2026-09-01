@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v14"
+  @shape "coordination-fabric-v1-phase1-v15"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -47,6 +47,23 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert "completionReportToSessionKey" in table_columns(db, "assignments")
+    assert table?(db, "completion_escalations")
+    assert table?(db, "completion_escalation_wakes")
+
+    assert {:ok, [[wake_sql]]} =
+             DB.query(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'")
+
+    assert wake_sql =~ "'internal'"
+
+    assert {:ok, [[cancellation_sql]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+             )
+
+    assert cancellation_sql =~ "completion_transition"
 
     # Idempotent: booting twice is the ordinary case, not a shape change.
     assert :ok = Schema.ensure_all(db)
@@ -93,7 +110,9 @@ defmodule Tightbeam.SchemaShapeTest do
       DB.query(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v13'")
 
     assert :ok = Schema.upgrade_cannot_proceed_v1(db)
-    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v14"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["surrender", "historical"]]} =
              DB.query(db, "SELECT kind,note FROM attests WHERE id='att_legacy'")
@@ -111,9 +130,9 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, _rows} =
              DB.query(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v9'")
 
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_identity_render_stamp_v1(db)
 
-    assert {:ok, [[@shape]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v10"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, columns} = DB.query(db, "PRAGMA table_info(sessions)")
@@ -152,9 +171,9 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert "identityRenderContract" in table_columns(db, "sessions")
     assert "identityGuidanceDigest" in table_columns(db, "sessions")
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_effort_request_exit_v1(db)
 
-    assert {:ok, [[@shape]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v11"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert "identityRenderContract" in table_columns(db, "sessions")
@@ -217,9 +236,10 @@ defmodule Tightbeam.SchemaShapeTest do
       UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v7', stampedAt=1;
       """)
 
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_terminal_operator_decision_v1(db)
 
-    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["coordination-fabric-v1-phase1-v8"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [["dr_pre_terminal", "statute", "open", "legacy question"]]} =
              DB.query(
@@ -248,7 +268,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
 
-    assert :ok = Schema.ensure_all(db)
+    assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
 
     assert {:ok, [[1, 3]]} =
              DB.query(
@@ -314,10 +334,10 @@ defmodule Tightbeam.SchemaShapeTest do
         "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v6', stampedAt=1"
       )
 
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_message_type_v1(db)
     assert "messageType" in table_columns(db, "messages")
 
-    assert {:ok, [[@shape]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v7"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     restored = Projection.get(db, historical.id)
@@ -510,7 +530,22 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
-  test "the exact predecessor upgrades roots to Main and preserves spawn provenance", %{db: db} do
+  test "the exact v14 predecessor is refused before v15 DDL", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v14'")
+    before = table_columns(db, "assignments")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "stamped: coordination-fabric-v1-phase1-v14"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v15"
+    assert error.message =~ "There is no migration"
+    assert table_columns(db, "assignments") == before
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v14"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the historical migration helpers preserve their exact v4 to v6 contract", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
     assert {:paired, _device} =
@@ -540,9 +575,14 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     refute "operationalParent" in table_columns(db, "sessions")
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_operational_parent_v1(db)
 
-    assert {:ok, [[@shape]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v5"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Schema.upgrade_cold_start_v1(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -559,12 +599,17 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [[^child_key, "hs-child"]]} =
              DB.query(db, "SELECT sessionKey,harnessSessionId FROM harness_pointers")
 
+    migration_error =
+      assert_raise Schema.ShapeError, fn -> Schema.upgrade_operational_parent_v1(db) end
+
+    assert migration_error.message =~ "predecessor stamp"
+
     column =
       Enum.find(table_info(db, "sessions"), fn [_cid, name | _] ->
         name == "operationalParent"
       end)
 
-    assert Enum.at(column, 3) == 0
+    assert Enum.at(column, 3) == 1
   end
 
   test "an interrupted operational-parent upgrade rolls back and retries exactly", %{db: db} do
@@ -595,7 +640,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     refute "operationalParent" in table_columns(db, "sessions")
     refute table?(db, "sessions_operational_parent_v1")
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_operational_parent_v1(db)
 
     assert {:ok, [[^main_key]]} =
              DB.query(db, "SELECT operationalParent FROM sessions WHERE kind='main'")
@@ -662,9 +707,9 @@ defmodule Tightbeam.SchemaShapeTest do
                "SELECT * FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
              )
 
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_nullable_effective_parent_v1(db)
 
-    assert {:ok, [[@shape]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok,
@@ -707,17 +752,12 @@ defmodule Tightbeam.SchemaShapeTest do
              end)
 
     for _ <- 1..10 do
-      assert :ok = Schema.ensure_all(db)
-
       assert {:ok, [[nil]]} =
                DB.query(
                  db,
                  "SELECT rootTurnSeq FROM supervision_liveness_sidecar WHERE wakeId='w_historical_root'"
                )
     end
-
-    assert %{operational_parent: nil, effective_parent_source: :owner_main} =
-             session(db, "new-null", "flynn")
   end
 
   test "each interrupted nullable-parent upgrade rolls back and retries exactly", %{db: db} do

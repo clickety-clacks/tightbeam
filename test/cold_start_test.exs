@@ -354,24 +354,27 @@ defmodule Tightbeam.ColdStartTest do
 
   test "captured empty v5 migrates to open v6", _ctx do
     db = captured_db!("v5-empty")
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_cold_start_v1(db)
 
     assert ColdStart.state(db) == %{
              "state" => "open",
              "action" => "choose pair-first or host-local bootstrap"
            }
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v14"]]} =
+    assert {:ok, [["coordination-fabric-v1-phase1-v6"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   test "captured healthy v5 migrates to one activated legacy receipt", _ctx do
     db = captured_db!("v5-healthy")
     assert {:ok, [[token]]} = DB.query(db, "SELECT token FROM devices")
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_cold_start_v1(db)
 
-    assert %{"state" => "claimed", "cause" => "v5_observed", "activated" => true} =
-             ColdStart.state(db)
+    assert {:ok, [["v5_observed", "complete", "captured-admin", "captured-device"]]} =
+             DB.query(
+               db,
+               "SELECT cause,phase,userId,deviceId FROM cold_start_receipts"
+             )
 
     assert {:ok, [["legacy"]]} = DB.query(db, "SELECT creationKind FROM users")
     assert Devices.by_token(db, token).device_id == "captured-device"
@@ -460,8 +463,9 @@ defmodule Tightbeam.ColdStartTest do
       assert migration_snapshot(db) == before
 
       assert :ok = Schema.upgrade_cold_start_v1(db)
-      assert :ok = Schema.ensure_all(db)
-      assert %{"state" => "claimed", "cause" => "v5_observed"} = ColdStart.state(db)
+
+      assert {:ok, [["v5_observed", "complete"]]} =
+               DB.query(db, "SELECT cause,phase FROM cold_start_receipts")
     end
   end
 
@@ -474,7 +478,7 @@ defmodule Tightbeam.ColdStartTest do
         ] do
       db = captured_db!(fixture)
 
-      error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+      error = assert_raise Schema.ShapeError, fn -> Schema.upgrade_cold_start_v1(db) end
 
       assert error.message ==
                "incompatible_cold_start_v1: legacy_witness_missing; recovery: Recover an unusable fresh database"

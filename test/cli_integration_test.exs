@@ -192,6 +192,283 @@ defmodule Tightbeam.CliIntegrationTest do
     assert version == CliCompatibility.required_version()
   end
 
+  test "A22 real completion smoke delivers both notices and retains from the exact parent", ctx do
+    main_key = Org.personal_session_key("flynn")
+
+    parent =
+      completion_session!(ctx.db, "a22-parent", main_key)
+
+    child =
+      completion_session!(ctx.db, "a22-child", parent.session_key)
+
+    report =
+      completion_session!(ctx.db, "a22-report", main_key)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('a22-admin',1,'admin_add',1)"
+      )
+
+    child_dir = session_workdir!(ctx, child)
+    parent_dir = session_workdir!(ctx, parent)
+    report_dir = session_workdir!(ctx, report)
+
+    {work_json, 0} =
+      System.cmd(ctx.binary, ["work-item-create", "--title", "A22 real completion smoke"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    work_item_id = JSON.decode!(work_json)["id"]
+
+    dispatch_args = [
+      "dispatch",
+      "--holder",
+      child.session_key,
+      "--subject",
+      "Complete the A22 smoke",
+      "--brief",
+      "File completion so the exact parent can retain.",
+      "--work-item",
+      work_item_id,
+      "--key",
+      "a22-real-completion",
+      "--report-to",
+      report.session_key
+    ]
+
+    {rumination_json, 0} =
+      System.cmd(ctx.binary, dispatch_args, cd: ctx.workdir, stderr_to_stdout: true)
+
+    assert JSON.decode!(rumination_json)["ruminationRequired"]
+
+    assert {:ok, [[rumination_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE rumination=1 AND work_item_id=?1 AND creatorSessionKey=?2",
+               [work_item_id, ctx.session.session_key]
+             )
+
+    deliver_completion_wake!(ctx, rumination_wake_id)
+
+    {assignment_json, 0} =
+      System.cmd(ctx.binary, dispatch_args, cd: ctx.workdir, stderr_to_stdout: true)
+
+    assignment_response = JSON.decode!(assignment_json)
+    assignment_id = assignment_response["id"] || assignment_response["assignment"]["id"]
+    assert is_binary(assignment_id), inspect(assignment_response)
+
+    {completion_json, 0} =
+      System.cmd(ctx.binary, ["attest", assignment_id, "--kind", "completion"],
+        cd: child_dir,
+        stderr_to_stdout: true
+      )
+
+    closing_attest_id = JSON.decode!(completion_json)["attest"]["id"]
+    parent_key = parent.session_key
+    report_key = report.session_key
+
+    assert {:ok,
+            [
+              [
+                completion_id,
+                ^closing_attest_id,
+                "open",
+                ^parent_key,
+                ^report_key
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,closingAttestId,status,parentSessionKey,reportToSessionKey FROM completion_escalations WHERE assignmentId=?1",
+               [assignment_id]
+             )
+
+    assert {:ok, wake_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT kind,wakeId FROM completion_escalation_wakes WHERE completionId=?1",
+               [completion_id]
+             )
+
+    wake_ids = Map.new(wake_rows, fn [kind, wake_id] -> {kind, wake_id} end)
+    deadline_wake_id = wake_ids["deadline"]
+    deliver_completion_wake!(ctx, wake_ids["parent-notice"])
+    deliver_completion_wake!(ctx, wake_ids["report-to-notice"])
+
+    {parent_read, 0} =
+      System.cmd(ctx.binary, ["completion-notices", "--status", "open"],
+        cd: parent_dir,
+        stderr_to_stdout: true
+      )
+
+    {report_read, 0} =
+      System.cmd(ctx.binary, ["completion-notices", "--status", "open"],
+        cd: report_dir,
+        stderr_to_stdout: true
+      )
+
+    {child_read, 0} =
+      System.cmd(ctx.binary, ["completion-notices", "--status", "open"],
+        cd: child_dir,
+        stderr_to_stdout: true
+      )
+
+    {owner_read, 0} = completion_notices_as_user(ctx, "flynn")
+    {admin_read, 0} = completion_notices_as_user(ctx, "a22-admin")
+
+    for body <- [parent_read, report_read, child_read, owner_read, admin_read] do
+      assert body =~ completion_id
+    end
+
+    {opener_read, 0} =
+      System.cmd(ctx.binary, ["completion-notices", "--status", "open"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    refute opener_read =~ completion_id
+
+    {report_denial, 1} =
+      System.cmd(
+        ctx.binary,
+        ["completion-disposition", completion_id, "--decision", "retain"],
+        cd: report_dir,
+        stderr_to_stdout: true
+      )
+
+    assert report_denial =~ "not_authorized"
+
+    {retained_json, 0} =
+      System.cmd(
+        ctx.binary,
+        ["completion-disposition", completion_id, "--decision", "retain"],
+        cd: parent_dir,
+        stderr_to_stdout: true
+      )
+
+    retained = JSON.decode!(retained_json)
+    assert retained["request"]["status"] == "acknowledged"
+    assert retained["request"]["decision"] == "retain"
+
+    {assignment_projection, 0} =
+      System.cmd(ctx.binary, ["assignments", "--session", child.session_key, "--state", "all"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert assignment_projection =~ assignment_id
+    assert assignment_projection =~ closing_attest_id
+
+    {trace_json, 0} =
+      System.cmd(ctx.binary, ["work-item-trace", work_item_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    timeline = JSON.decode!(trace_json)["timeline"]
+    completion_wake_ids = Map.values(wake_ids)
+
+    assert Enum.map(
+             Enum.filter(timeline, &(&1["type"] == "completion_escalation")),
+             & &1["phase"]
+           ) == ["opened", "acknowledged"]
+
+    assert Enum.map(
+             Enum.filter(timeline, &(&1["type"] == "completion_escalation_event")),
+             & &1["kind"]
+           ) == ["completion_escalation_opened", "completion_escalation_acknowledged"]
+
+    assert timeline
+           |> Enum.filter(&(&1["type"] == "wake_fired" and &1["id"] in completion_wake_ids))
+           |> Enum.map(& &1["id"])
+           |> Enum.sort() ==
+             Enum.sort([wake_ids["parent-notice"], wake_ids["report-to-notice"]])
+
+    assert timeline
+           |> Enum.filter(&(&1["type"] == "wake_canceled" and &1["id"] in completion_wake_ids))
+           |> Enum.map(& &1["id"]) == [wake_ids["deadline"]]
+
+    assert {:ok, message_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,content FROM messages WHERE content LIKE ?1 ORDER BY sessionKey",
+               ["%completionId=#{completion_id}%"]
+             )
+
+    assert Enum.map(message_rows, &hd/1) == Enum.sort([parent.session_key, report.session_key])
+    refute Enum.any?(message_rows, &(hd(&1) == ctx.session.session_key))
+
+    assert {:ok, turn_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sessionKey FROM turns WHERE wakeId IN (?1,?2) ORDER BY wakeId",
+               [wake_ids["parent-notice"], wake_ids["report-to-notice"]]
+             )
+
+    assert Enum.sort(Enum.map(turn_rows, &List.last/1)) ==
+             Enum.sort([parent.session_key, report.session_key])
+
+    assert {:ok, wake_states} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,state FROM wakes WHERE wakeId IN (?1,?2,?3) ORDER BY wakeId",
+               [wake_ids["parent-notice"], wake_ids["report-to-notice"], wake_ids["deadline"]]
+             )
+
+    assert Map.new(wake_states, fn [wake_id, state] -> {wake_id, state} end) == %{
+             wake_ids["parent-notice"] => "fired",
+             wake_ids["report-to-notice"] => "fired",
+             wake_ids["deadline"] => "canceled"
+           }
+
+    assert {:ok, [[^deadline_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wake_cancellations WHERE wakeId IN (?1,?2,?3)",
+               [wake_ids["parent-notice"], wake_ids["report-to-notice"], wake_ids["deadline"]]
+             )
+
+    assert {:ok, lifecycle_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT kind,subject FROM lifecycle_events WHERE subject=?1 ORDER BY rowid",
+               [completion_id]
+             )
+
+    assert lifecycle_rows == [
+             ["completion_escalation_opened", completion_id],
+             ["completion_escalation_acknowledged", completion_id]
+           ]
+
+    IO.puts(
+      "A22_CAPTURE " <>
+        JSON.encode!(%{
+          assignmentId: assignment_id,
+          assignmentProjection: JSON.decode!(assignment_projection),
+          closingAttestId: closing_attest_id,
+          completionId: completion_id,
+          lifecycle: lifecycle_rows,
+          messages: message_rows,
+          retain: retained,
+          trace: timeline,
+          turns: turn_rows,
+          visibility: %{
+            admin: JSON.decode!(admin_read),
+            child: JSON.decode!(child_read),
+            opener: JSON.decode!(opener_read),
+            owner: JSON.decode!(owner_read),
+            parent: JSON.decode!(parent_read),
+            reportTo: JSON.decode!(report_read),
+            reportToDisposition: report_denial
+          },
+          wakes: wake_states,
+          workItemId: work_item_id
+        })
+    )
+  end
+
   test "version refusal is distinguishable from auth and network failures", ctx do
     session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
 
@@ -977,6 +1254,57 @@ defmodule Tightbeam.CliIntegrationTest do
     )
 
     dir
+  end
+
+  defp completion_session!(db, session_key, parent_session_key) do
+    session =
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: session_key,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        spawned_by: parent_session_key,
+        operational_parent: parent_session_key,
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    Roles.create!(db, session_key, "flynn", session.session_key)
+    session
+  end
+
+  defp completion_notices_as_user(ctx, user_id) do
+    System.cmd(
+      ctx.binary,
+      ["completion-notices", "--status", "open", "--as-user", user_id],
+      cd: ctx.outside,
+      stderr_to_stdout: true,
+      env: [
+        {"TIGHTBEAM_URL", "ws://127.0.0.1:#{ctx.port}"},
+        {"TIGHTBEAM_TOKEN", "tbc_cli_integration"},
+        {"TIGHTBEAM_BASE_DIR", nil},
+        {"TIGHTBEAM_HOME", nil}
+      ]
+    )
+  end
+
+  defp deliver_completion_wake!(ctx, wake_id) do
+    wake = Wakes.get(ctx.db, wake_id)
+
+    assert {:ok, {:appended, _owner, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(txn, wake.session_key, wake.origin, wake.prompt,
+                 db: ctx.db,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 principal: {:process, "tightbeam"},
+                 target_gate: wake,
+                 fire_wake_in_txn: true
+               )
+             end)
   end
 
   defp raw_agent_dispatch(ctx, token, body) do

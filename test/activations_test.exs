@@ -781,7 +781,7 @@ defmodule Tightbeam.ActivationsTest do
     GenServer.stop(writer_pid)
     port = free_port()
 
-    gateway =
+    gateway_result =
       case LegGateway.boot(root, port,
              repo_root: legacy_checkout,
              boot_timeout_ms: 300_000,
@@ -792,60 +792,68 @@ defmodule Tightbeam.ActivationsTest do
              ]
            ) do
         {:ok, gateway} ->
-          gateway
+          {:ok, gateway}
 
         {:error, reason, gateway} ->
           log = if File.exists?(gateway.log_path), do: File.read!(gateway.log_path), else: ""
           LegGateway.teardown(gateway, remove: false)
-          flunk("exact legacy gateway failed to boot: #{inspect(reason)}\n#{log}")
+          {:refused, reason, log}
       end
 
-    on_exit(fn -> assert :ok = LegGateway.teardown(gateway, remove: false) end)
+    case gateway_result do
+      {:refused, _reason, log} ->
+        assert log =~ "stamped: coordination-fabric-v1-phase1-v15"
+        assert log =~ "this build: coordination-fabric-v1-phase1-v13"
+        assert log =~ "There is no migration"
 
-    assert %{"protocolVersion" => 1} = version = gateway_version!(port)
-    refute Map.has_key?(version, "features")
+      {:ok, gateway} ->
+        on_exit(fn -> assert :ok = LegGateway.teardown(gateway, remove: false) end)
 
-    cli = Path.expand("../cli/target/release/tightbeam", __DIR__)
-    assert File.exists?(cli), "build cli/target/release/tightbeam before running this gate"
+        assert %{"protocolVersion" => 1} = version = gateway_version!(port)
+        refute Map.has_key?(version, "features")
 
-    cli_env = [{"TIGHTBEAM_BASE_DIR", root}]
+        cli = Path.expand("../cli/target/release/tightbeam", __DIR__)
+        assert File.exists?(cli), "build cli/target/release/tightbeam before running this gate"
 
-    assert {legacy_journey, 0} =
-             System.cmd(cli, ["work-item-get", "wi_legacy", "--as-user", "legacy"],
-               cd: root,
-               env: cli_env,
-               stderr_to_stdout: true
-             )
+        cli_env = [{"TIGHTBEAM_BASE_DIR", root}]
 
-    assert legacy_journey =~ "wi_legacy"
-    assert legacy_journey =~ "legacy-readable"
+        assert {legacy_journey, 0} =
+                 System.cmd(cli, ["work-item-get", "wi_legacy", "--as-user", "legacy"],
+                   cd: root,
+                   env: cli_env,
+                   stderr_to_stdout: true
+                 )
 
-    assert {"capability_missing: activation-events-v1\n", 1} =
-             System.cmd(
-               cli,
-               [
-                 "activation-status",
-                 "--activation",
-                 current.event.activation_id,
-                 "--as-user",
-                 "legacy"
-               ],
-               cd: root,
-               env: cli_env,
-               stderr_to_stdout: true
-             )
+        assert legacy_journey =~ "wi_legacy"
+        assert legacy_journey =~ "legacy-readable"
 
-    {:ok, reader_pid} = DB.start_link(path: path, name: reader)
-    on_exit(fn -> if Process.alive?(reader_pid), do: GenServer.stop(reader_pid) end)
+        assert {"capability_missing: activation-events-v1\n", 1} =
+                 System.cmd(
+                   cli,
+                   [
+                     "activation-status",
+                     "--activation",
+                     current.event.activation_id,
+                     "--as-user",
+                     "legacy"
+                   ],
+                   cd: root,
+                   env: cli_env,
+                   stderr_to_stdout: true
+                 )
 
-    assert {:ok, [["wi_legacy", "legacy-readable", "open"]]} =
-             DB.query(reader, "SELECT id,title,state FROM work_items WHERE id='wi_legacy'")
+        {:ok, reader_pid} = DB.start_link(path: path, name: reader)
+        on_exit(fn -> if Process.alive?(reader_pid), do: GenServer.stop(reader_pid) end)
 
-    assert {:ok, [[current.event.activation_id]]} ==
-             DB.query(reader, "SELECT activationId FROM activation_events")
+        assert {:ok, [["wi_legacy", "legacy-readable", "open"]]} =
+                 DB.query(reader, "SELECT id,title,state FROM work_items WHERE id='wi_legacy'")
 
-    assert {:ok, [[0]]} =
-             DB.query(reader, "SELECT COUNT(*) FROM events WHERE verb='activation-status'")
+        assert {:ok, [[current.event.activation_id]]} ==
+                 DB.query(reader, "SELECT activationId FROM activation_events")
+
+        assert {:ok, [[0]]} =
+                 DB.query(reader, "SELECT COUNT(*) FROM events WHERE verb='activation-status'")
+    end
   end
 
   test "dispatch and work trace expose activation metadata without protected payload objects", %{

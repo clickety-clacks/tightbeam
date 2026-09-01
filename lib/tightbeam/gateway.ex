@@ -106,6 +106,7 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Productions.CompletionEscalation
   alias Tightbeam.Wire.Payloads
   require Logger
 
@@ -317,7 +318,8 @@ defmodule Tightbeam.Gateway do
          deliver: deliver,
          internal_consumers: %{
            "effort_probe" => &EffortCheckin.probe(db, config, &1),
-           "effort_deadline" => &EffortCheckin.deadline(db, config, &1)
+           "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
+           "completion_disposition_deadline" => &CompletionEscalation.reissue(db, &1)
          },
          tick_ms: config.wake_tick_ms,
          name: Tightbeam.WakeScheduler},
@@ -1202,6 +1204,10 @@ defmodule Tightbeam.Gateway do
         repair_assignment_result(config, db, call)
       end,
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
+      {"completion-notices", []} => fn call -> CompletionEscalation.notices(db, call) end,
+      {"completion-disposition", []} => fn call ->
+        completion_disposition_result(config, db, call)
+      end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
       {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,
       {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
@@ -1684,9 +1690,28 @@ defmodule Tightbeam.Gateway do
           | :invalid_reply_reference
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
-    case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-      nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
-      duplicate -> duplicate
+    case completion_delivery_admission(txn, session_key, opts) do
+      :skip ->
+        :skipped
+
+      :continue ->
+        case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
+          nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+          duplicate -> duplicate
+        end
+    end
+  end
+
+  defp completion_delivery_admission(txn, session_key, opts) do
+    case opts[:wake_id] do
+      wake_id when is_binary(wake_id) ->
+        case CompletionEscalation.admit_delivery_in_txn(txn, wake_id, session_key) do
+          :skip -> :skip
+          result when result in [:ordinary, :deliver] -> :continue
+        end
+
+      _ ->
+        :continue
     end
   end
 
@@ -7828,97 +7853,346 @@ defmodule Tightbeam.Gateway do
     tier
   end
 
-  defp retire_result(config, db, call) do
-    p = call.params
-    # Resolve the caller's owner, do not string-strip the origin: an agent's
-    # origin is `agent:<role>`, which stripping leaves intact, so it matched no
-    # ownerUserId and every agent got `not_found` — including for sessions its own
-    # owner controls, which the guidance we ship tells agents to retire.
-    # `resolve_caller/2` handles all three origin classes and yields a nil owner
-    # for a process, which cannot match a NOT NULL ownerUserId, so unknown and
-    # process callers keep getting `not_found`.
-    caller = principal_caller(db, call)
-    owner = caller[:owner_user_id]
-    prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
+  defp completion_disposition_result(config, db, call) do
+    completion_id = call.params[:completion_id]
+    decision = call.params[:decision]
+    principal = call[:principal]
 
-    cond do
-      prior && prior.session_key == call.session_key ->
-        retire_replay_observation(db, call, %{
-          deleted_session_key: call.session_key,
-          retired_session_keys: retired_subtree_keys(db, call.session_key),
-          deferred: []
-        })
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        case CompletionEscalation.preflight_disposition_in_txn(
+               txn,
+               completion_id,
+               decision,
+               principal
+             ) do
+          {:error, error} ->
+            {:response, error}
 
-      true ->
-        case Org.get(db, call.session_key) do
-          # A Main is every role's fallback and every user reference's
-          # resolution target: retiring one would open the void invariant 1
-          # forbids. Mains are permanent by construction, not by vigilance.
-          %{owner_user_id: ^owner, is_built_in: true} ->
-            %{
-              code: "denied",
-              message:
-                "main sessions are permanent — they are the fallback for roles and user references"
-            }
+          {:replay, _row} ->
+            {:completion, completion_id}
 
-          %{owner_user_id: ^owner} = session ->
-            if session.state == "active" do
-              {:ok, result} =
-                DB.transaction(db, fn txn ->
-                  Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+          {:action, row} ->
+            case pending_retire_intents_in_txn(txn, row.child_session_key, row.owner_user_id) do
+              [] ->
+                completion_action_in_txn(config, txn, row, decision, principal)
 
-                  result =
-                    retire_cascade_in_txn(
-                      txn,
-                      session.session_key,
-                      owner,
-                      call.origin,
-                      retirement_provenance_principal(call, caller),
-                      Map.fetch!(config, :wake_tick_ms),
-                      "retired: session retired before execution"
-                    )
+              deferred ->
+                {:response,
+                 %{
+                   code: "retire_deferred",
+                   completionId: row.id,
+                   requestStatus: "open",
+                   deferred: deferred
+                 }}
+            end
+        end
+      end)
 
-                  if result.retired != [] and p[:idempotency_key] do
-                    Idempotency.put_in_txn(txn, %{
-                      owner_user_id: owner,
-                      operation: "retire",
-                      idempotency_key: p.idempotency_key,
-                      session_key: session.session_key
-                    })
-                  end
+    case result do
+      {:response, response} -> response
+      {:completion, id} -> CompletionEscalation.get(db, id)
+      {:retired, owner, retired} -> complete_completion_retire(config, db, owner, retired)
+    end
+  end
 
-                  result
-                end)
+  defp completion_action_in_txn(_config, txn, row, "retain", principal) do
+    CompletionEscalation.retain_in_txn(txn, row.id, principal)
+    {:completion, row.id}
+  end
 
-              Enum.each(result.retired, fn retired ->
-                broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
-                Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+  defp completion_action_in_txn(_config, txn, row, "park", principal) do
+    {:response, CompletionEscalation.park_unavailable_in_txn(txn, row.id, principal)}
+  end
 
-                Enum.each(retired.assignments, fn assignment ->
-                  emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
-                end)
-              end)
+  defp completion_action_in_txn(config, txn, row, "retire", principal),
+    do: completion_retire_in_txn(config, txn, row, principal)
 
-              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+  defp pending_retire_intents_in_txn(txn, root_key, owner) do
+    rows =
+      Txn.q(txn, "SELECT sessionKey,ownerUserId FROM sessions WHERE state='active'")
+      |> Enum.map(fn [session_key, row_owner] ->
+        [session_key, Org.effective_parent_in_txn(txn, session_key).session_key, row_owner]
+      end)
 
-              %{
-                deleted_session_key: session.session_key,
-                retired_session_keys: Enum.map(result.retired, & &1.session_key),
-                deferred: result.deferred
-              }
+    by_key = Map.new(rows, fn [key, parent, row_owner] -> {key, {parent, row_owner}} end)
+    children = Enum.group_by(rows, &Enum.at(&1, 1))
+
+    members =
+      walk_owned_subtree(children, root_key, owner)
+      |> Enum.uniq()
+
+    candidates =
+      Enum.flat_map(members, fn member ->
+        owned_ancestors(by_key, member, owner)
+        |> Enum.map(&{retire_intent_wake_id(&1, member), member})
+      end)
+
+    Enum.flat_map(candidates, fn {wake_id, member} ->
+      case Txn.q(
+             txn,
+             "SELECT dueAt FROM wakes WHERE wakeId=?1 AND state='pending'",
+             [wake_id]
+           ) do
+        [[due_at]] ->
+          [%{session_key: member, until: due_at, reason: "pending generic-retire intent"}]
+
+        [] ->
+          []
+      end
+    end)
+    |> Enum.uniq_by(& &1.session_key)
+    |> Enum.sort_by(& &1.session_key)
+  end
+
+  defp walk_owned_subtree(children, root_key, owner) do
+    case Enum.find(Map.get(children, parent_of(children, root_key), []), &(hd(&1) == root_key)) do
+      [^root_key, _parent, ^owner] ->
+        descendants =
+          children
+          |> Map.get(root_key, [])
+          |> Enum.flat_map(fn
+            [^root_key, _parent, _row_owner] -> []
+            [child, _parent, ^owner] -> walk_owned_subtree(children, child, owner)
+            _foreign -> []
+          end)
+
+        [root_key | descendants]
+
+      _ ->
+        []
+    end
+  end
+
+  defp parent_of(children, key) do
+    Enum.find_value(children, fn {parent, rows} ->
+      if Enum.any?(rows, &(hd(&1) == key)), do: parent
+    end)
+  end
+
+  defp owned_ancestors(by_key, key, owner), do: owned_ancestors(by_key, key, owner, MapSet.new())
+
+  defp owned_ancestors(by_key, key, owner, seen) do
+    if MapSet.member?(seen, key) do
+      []
+    else
+      case Map.get(by_key, key) do
+        {_parent, row_owner} when row_owner != owner ->
+          []
+
+        {parent, ^owner} ->
+          [key | owned_ancestors(by_key, parent, owner, MapSet.put(seen, key))]
+
+        nil ->
+          []
+      end
+    end
+  end
+
+  defp completion_retire_in_txn(config, txn, row, principal) do
+    case retirement_actor_in_txn(txn, principal) do
+      nil ->
+        {:response, %{code: "principal_not_allowed"}}
+
+      %{owner: owner, serialized: serialized} ->
+        case Txn.q(txn, "SELECT isBuiltIn FROM sessions WHERE sessionKey=?1", [
+               row.child_session_key
+             ]) do
+          [[1]] ->
+            {:response,
+             %{
+               code: "denied",
+               message:
+                 "main sessions are permanent — they are the fallback for roles and user references"
+             }}
+
+          [[0]] ->
+            result =
+              retire_cascade_in_txn(
+                txn,
+                row.child_session_key,
+                owner,
+                serialized,
+                principal,
+                Map.fetch!(config, :wake_tick_ms),
+                "retired: session retired before execution",
+                schedule_intents: false
+              )
+
+            if result.deferred == [] do
+              {:retired, owner, result}
             else
-              retire_replay_observation(db, call, %{
-                deleted_session_key: session.session_key,
-                retired_session_keys: [],
-                deferred: []
-              })
+              {:response,
+               CompletionEscalation.retire_deferred_in_txn(
+                 txn,
+                 row.id,
+                 principal,
+                 result.deferred
+               )}
             end
 
           _ ->
-            %{code: "not_found"}
+            {:response, %{code: "child_not_active"}}
         end
     end
   end
+
+  defp complete_completion_retire(config, db, owner, result) do
+    Enum.each(result.retired, fn retired ->
+      broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
+      Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+
+      Enum.each(retired.assignments, fn assignment ->
+        emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+      end)
+    end)
+
+    reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+
+    completion_id =
+      result.retired
+      |> List.last()
+      |> Map.fetch!(:session_key)
+
+    case DB.query(
+           db,
+           "SELECT id FROM completion_escalations WHERE childSessionKey=?1 AND decision='retire' ORDER BY actedAt DESC LIMIT 1",
+           [completion_id]
+         ) do
+      {:ok, [[id]]} -> CompletionEscalation.get(db, id)
+      _ -> %{code: "unknown_completion"}
+    end
+  end
+
+  defp retirement_actor_in_txn(txn, {:user, user}) when is_binary(user) and user != "" do
+    case Txn.q(txn, "SELECT 1 FROM users WHERE userId=?1", [user]) do
+      [[1]] -> %{owner: user, serialized: "user:#{user}"}
+      _ -> nil
+    end
+  end
+
+  defp retirement_actor_in_txn(txn, {:session, session_key})
+       when is_binary(session_key) and session_key != "" do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[owner]] -> %{owner: owner, serialized: "session:#{session_key}"}
+      _ -> nil
+    end
+  end
+
+  defp retirement_actor_in_txn(_txn, _principal), do: nil
+
+  defp retire_result(config, db, call) do
+    p = call.params
+
+    case retirement_actor(db, call[:principal]) do
+      nil ->
+        %{code: "not_found"}
+
+      %{owner: owner, principal: principal, serialized: serialized} ->
+        prior =
+          if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
+
+        if prior && prior.session_key == call.session_key do
+          retire_replay_observation(db, call, %{
+            deleted_session_key: call.session_key,
+            retired_session_keys: retired_subtree_keys(db, call.session_key),
+            deferred: []
+          })
+        else
+          case Org.get(db, call.session_key) do
+            # A Main is every role's fallback and every user reference's
+            # resolution target: retiring one would open the void invariant 1
+            # forbids. Mains are permanent by construction, not by vigilance.
+            %{owner_user_id: ^owner, is_built_in: true} ->
+              %{
+                code: "denied",
+                message:
+                  "main sessions are permanent — they are the fallback for roles and user references"
+              }
+
+            %{owner_user_id: ^owner} = session ->
+              if session.state == "active" do
+                {:ok, result} =
+                  DB.transaction(db, fn txn ->
+                    Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+                    result =
+                      retire_cascade_in_txn(
+                        txn,
+                        session.session_key,
+                        owner,
+                        serialized,
+                        principal,
+                        Map.fetch!(config, :wake_tick_ms),
+                        "retired: session retired before execution"
+                      )
+
+                    if result.retired != [] and p[:idempotency_key] do
+                      Idempotency.put_in_txn(txn, %{
+                        owner_user_id: owner,
+                        operation: "retire",
+                        idempotency_key: p.idempotency_key,
+                        session_key: session.session_key
+                      })
+                    end
+
+                    result
+                  end)
+
+                Enum.each(result.retired, fn retired ->
+                  broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
+                  Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+
+                  Enum.each(retired.assignments, fn assignment ->
+                    emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+                  end)
+                end)
+
+                reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+
+                %{
+                  deleted_session_key: session.session_key,
+                  retired_session_keys: Enum.map(result.retired, & &1.session_key),
+                  deferred: result.deferred
+                }
+              else
+                retire_replay_observation(db, call, %{
+                  deleted_session_key: session.session_key,
+                  retired_session_keys: [],
+                  deferred: []
+                })
+              end
+
+            _ ->
+              %{code: "not_found"}
+          end
+        end
+    end
+  end
+
+  defp retirement_actor(db, {:user, user}) when is_binary(user) and user != "" do
+    case DB.query(db, "SELECT 1 FROM users WHERE userId=?1", [user]) do
+      {:ok, [[1]]} -> %{owner: user, principal: {:user, user}, serialized: "user:#{user}"}
+      _ -> nil
+    end
+  end
+
+  defp retirement_actor(db, {:session, session_key})
+       when is_binary(session_key) and session_key != "" do
+    case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      {:ok, [[owner]]} ->
+        %{
+          owner: owner,
+          principal: {:session, session_key},
+          serialized: "session:#{session_key}"
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  defp retirement_actor(_db, _principal), do: nil
 
   defp retire_replay_observation(db, call, result) do
     {:ok, :ok} =
@@ -8008,10 +8282,11 @@ defmodule Tightbeam.Gateway do
          txn,
          root_key,
          owner,
-         principal,
-         revocation_principal,
+         serialized_principal,
+         typed_principal,
          supervision_interval_ms,
-         drain_reason
+         drain_reason,
+         opts \\ []
        ) do
     # Invariant: this operational-parent walk visits each active member of the target's
     # transitive subtree exactly once, parent-last. This is the lifecycle
@@ -8035,8 +8310,8 @@ defmodule Tightbeam.Gateway do
               txn,
               member.session_key,
               owner,
-              principal,
-              revocation_principal,
+              serialized_principal,
+              typed_principal,
               supervision_interval_ms,
               drain_reason
             )
@@ -8052,7 +8327,7 @@ defmodule Tightbeam.Gateway do
         Enum.map(subtree, fn member ->
           direct = Enum.find(leased, &(&1.session_key == member.session_key))
 
-          if direct do
+          if not is_nil(direct) and Keyword.get(opts, :schedule_intents, true) do
             schedule_retire_intent_in_txn(txn, root_key, member.session_key, owner, direct)
           end
 
@@ -8098,37 +8373,24 @@ defmodule Tightbeam.Gateway do
          txn,
          session_key,
          owner,
-         principal,
-         revocation_principal,
+         serialized_principal,
+         typed_principal,
          supervision_interval_ms,
          drain_reason
        ) do
     assignments =
-      Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, revocation_principal)
+      Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, serialized_principal)
+
+    CompletionEscalation.acknowledge_retire_in_txn(txn, session_key, typed_principal)
+    session = Org.retire_in_txn(txn, session_key, serialized_principal, supervision_interval_ms)
 
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason,
       cause: "session-retired",
-      principal: TurnLifecycle.principal(principal)
+      principal: TurnLifecycle.principal(serialized_principal)
     )
-
-    session = Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
 
     {assignments, session}
   end
-
-  # The router's immutable principal identifies the actual revoker. Origin is
-  # retained for the unrelated ledger and session-retirement records, where an
-  # agent role origin is part of their existing audit vocabulary.
-  defp retirement_provenance_principal(%{principal: {:user, user_id}}, _caller),
-    do: "user:" <> user_id
-
-  defp retirement_provenance_principal(%{principal: {:session, session_key}}, _caller),
-    do: "session:" <> session_key
-
-  defp retirement_provenance_principal(_call, %{caller_session: %{session_key: session_key}}),
-    do: "session:" <> session_key
-
-  defp retirement_provenance_principal(_call, %{owner_user_id: user_id}), do: "user:" <> user_id
 
   # Retire durability owns the ordering: every DB transition commits before
   # this seam touches a harness. Adapters are shared by key, so each retired
