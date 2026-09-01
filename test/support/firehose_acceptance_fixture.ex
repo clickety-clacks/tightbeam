@@ -31,7 +31,14 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     model_catalog =
       Keyword.get_lazy(opts, :model_catalog, fn ->
         Map.new(Harness.all(), fn harness ->
-          {{Placement.local_host_name(), harness.wire_name()}, []}
+          entries =
+            if harness.wire_name() == "claude" do
+              [%{family: "fable", context: nil, efforts: [], provider: :anthropic}]
+            else
+              []
+            end
+
+          {{Placement.local_host_name(), harness.wire_name()}, entries}
         end)
       end)
 
