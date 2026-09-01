@@ -1,6 +1,6 @@
 ---
 name: reviewing-code
-description: The independent code-review loop: adjudicate the ask's facets, build your own model, break the must-haves, reproduce findings, and keep one review card through revision to a clean verdict. Use when reviewing a coding goal.
+description: The independent code-review loop: adjudicate the ask's facets, build your own model, break the must-haves, reproduce findings, file the verdict, then close your own assignment. Use when reviewing a coding goal.
 ---
 
 # Reviewing code
@@ -64,18 +64,18 @@ as a fact, not a claim.
 9b. After filing the verdict, wake the reviewed assignment's holder with it:
    `tightbeam wake --session <holder> --prompt "review verdict on <assignmentId>: <verdict>"`.
    The party that must act next is the producer; do not file and go silent.
-9c. Keep this reviewing assignment OPEN after `changes-requested`. The producer
-   revises, and you review the new candidate and file the next verdict on this same
-   linked card; one change has one review card, and revision never creates, closes, or
-   reopens another. After `reviewed-clean` and its wake, the report artifact, verdict,
-   wake, and completion are four different rows and all are yours to file:
+9c. Completion closes YOUR obligation, and it closes on the verdict you just filed,
+   whatever that verdict was. Do not hold the card open for the producer's revision:
+   whether that revision warrants a fresh review is the orchestrator's judgment, and a
+   reviewer that carries its own prior findings into the next round has a stake in them
+   and stops reviewing adversarially. The report artifact, verdict, wake, and
+   completion are four different rows and all are yours to file:
    `tightbeam attest <yourReviewingAssignmentId> --kind completion --note "verdict filed:
    <verdict>; report <art_id>; sha256 <hex>"` on the REVIEWING assignment you hold. The
    lifecycle row is what the substrate's hygiene sweep reads.
 10. Judge the work, not the author. A producer may contest a blocking finding on one
    ground: the ask ships without it. The orchestrator adjudicates that contest, not
    you. A contested behavioral claim you re-reproduce before you concede it. A producer may contest one blocking finding on the ground that the ask ships without
-   it; the orchestrator rules on that, since you cannot rule on your own finding. When
-   it upholds the contest and files `review-overreach` on the producer's card naming
-   yours, re-file your verdict on your own card with that finding moved to post-mvp;
-   only you can file it.
+   it; the orchestrator rules on that, since you cannot rule on your own finding. Its
+   `review-overreach` verdict lands on the producer's card, and the next review of that
+   work reads it before judging the same ground twice.

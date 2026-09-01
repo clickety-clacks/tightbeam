@@ -178,8 +178,12 @@ repository's prose defines verification, records the results as a report artifac
 and files the `verified` verdict — green tests and a clean review are not that proof,
 and the substrate blocks a completion that lacks the papertrail.
 
-Keep that one linked review card open across every `changes-requested` revision. The
-same holder reviews each new candidate on it and completes it only after `reviewed-clean`.
+When a producer revises after `changes-requested`, YOU judge whether the revision
+warrants a fresh review, and you commission it deliberately. Real code changes usually
+do, and a cold reviewer is fine or better: a reviewer carrying its own prior findings
+has a stake in them and drifts toward coaching the fix it proposed. A moved base, a
+rebuild onto a green main, and a missing hash in a report are not new code and get no
+new review.
 
 ## Closing the loop: the completion rail
 `completion-requires-review` backstops the evidence shape; it never chooses a model.

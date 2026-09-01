@@ -76,11 +76,13 @@ per-feature, but your attention across features is the scarce resource.
    The `--reviews` link and the verdict by that card's different-session holder are
    what let the substrate compute independence. Harness and provider differences stay
    observable selection evidence; they do not gate completion. A verdict filed
-   without the link is a claim the rows cannot confirm. On `changes-requested`, leave
-   the review card open, wake the producer to
-   iterate, and have the same reviewer re-file on that card until
-   `reviewed-clean`. Complete the review card only after its clean verdict; never
-   multiply or close-and-reopen cards for review rounds. Under light posture the
+   without the link is a claim the rows cannot confirm. On `changes-requested`, wake
+   the producer to iterate. When it returns, judge whether the revision warrants a
+   fresh review (orchestrator kernel, "Verifying without redoing"): real code changes
+   usually do and a cold reviewer is fine or better; a moved base, a rebuild onto green
+   main, or a missing hash in a report are not new code and get no new review.
+   Commission the review you want rather than letting a completion attest manufacture
+   one. Under light posture the
    reviewer's bar is "nothing egregiously wrong." A producer that believes a blocking
    finding is not needed for the ask contests it to you, and you rule on that one
    finding (orchestrator kernel, "Verifying without redoing"); you do not audit

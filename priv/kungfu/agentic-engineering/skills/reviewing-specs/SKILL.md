@@ -61,6 +61,9 @@ load-bearing?
    must-have it protects. The verdict is the document's concise executive summary: the
    outcome, the major points, the report artifact's id and SHA-256, and the reviewed
    assignment id. Then wake the spec-writer with the verdict and file completion on the
-   reviewing assignment you hold. The report artifact, verdict, wake, and completion
-   are four different rows; reviewing-code 9b and 9c govern them identically. A
-   contested blocking finding goes to the orchestrator, as in reviewing-code 10.
+   reviewing assignment you hold, whatever the verdict was. The report artifact,
+   verdict, wake, and completion are four different rows; reviewing-code 9b and 9c
+   govern them identically, including closing your card rather than sitting on it while
+   the spec-writer revises. Whether a revision warrants a fresh spec review is the
+   orchestrator's judgment. A contested blocking finding goes to the orchestrator, as
+   in reviewing-code 10.

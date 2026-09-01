@@ -51,5 +51,8 @@ changes the pin.
    (`git merge-base --is-ancestor main <branch>`), then advance main from the
    branch — fast-forward, because the reconciliation already happened on the
    branch.
-6. When main moved during reconciliation, merge it in again and re-prove before
-   advancing.
+6. When main moves during reconciliation, that is a hold violation to report, not a
+   reason to reconcile again. Stop and tell the owner the pinned target moved; do not
+   merge the new tip in and re-prove unless the owner changes the pin. Chasing a moving
+   target invalidates the review that just cleared your work, and on a busy target that
+   loop never ends: reconcile, review goes stale, re-review, target moves, reconcile.
