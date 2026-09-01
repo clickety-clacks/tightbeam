@@ -503,16 +503,32 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemUpdate {
             identity,
             work_item_id,
+            title,
+            spec_ref_name,
+            spec_ref_sha256,
+            clear_spec_ref,
             priority,
-        } => Ok(request(
-            identity,
-            "work-item-update",
-            vec![],
-            vec![
-                string_field("workItemId", work_item_id),
-                format!("\"priority\":{priority}"),
-            ],
-        )),
+        } => {
+            let mut params = vec![string_field("workItemId", work_item_id)];
+            if let Some(value) = title {
+                params.push(string_field("title", value));
+            }
+            if *clear_spec_ref {
+                params.push("\"specRefName\":null".to_owned());
+                params.push("\"specRefSha256\":null".to_owned());
+            } else {
+                if let Some(value) = spec_ref_name {
+                    params.push(string_field("specRefName", value));
+                }
+                if let Some(value) = spec_ref_sha256 {
+                    params.push(string_field("specRefSha256", value));
+                }
+            }
+            if let Some(value) = priority {
+                params.push(format!("\"priority\":{value}"));
+            }
+            Ok(request(identity, "work-item-update", vec![], params))
+        }
         Command::WorkItemGet {
             identity,
             work_item_id,
@@ -2272,6 +2288,41 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","priority":2}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "Retitled",
+                "--spec-ref",
+                "governing.md",
+                "--spec-sha256",
+                &sha,
+                "--priority",
+                "6",
+                "--as-user",
+                "flynn"
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Retitled","specRefName":"governing.md","specRefSha256":"{sha}","priority":6}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--priority",
+                "1",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null,"priority":1}}"#
         );
         assert_eq!(
             body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
