@@ -1,6 +1,6 @@
 ---
 name: reviewing-code
-description: The independent code-review loop: adjudicate the ask's facets, build your own model, break the must-haves, reproduce findings, file the verdict, then close your own assignment. Use when reviewing a coding goal.
+description: The independent code-review loop: adjudicate the ask's facets, build your own model, break the must-haves, reproduce findings, and keep one review card through revision to a clean verdict. Use when reviewing a coding goal.
 ---
 
 # Reviewing code
@@ -23,7 +23,9 @@ as a fact, not a claim.
    (`tightbeam attests <assignmentId>`), not the producer's summary. The author's
    narrative anchors you to their blind spots. Treat it as a hypothesis to attack. (If
    the reviewed assignment is already closed when you begin, the producer completed
-   before review; that is itself a finding to raise with your hirer.)
+   before review; that is itself a finding to raise with your hirer.) When an alleged
+   difference is between unchanged source copies, hash their exact bytes: matching
+   hashes end that verification, whatever the labels or paths say.
 3. Review the integrated result, not only the diff: the code as it stands with the
    change applied, its callers, lifecycle, error paths, and the tests around it. A diff
    can be clean while the integration breaks a caller or violates an invariant enforced
@@ -62,9 +64,11 @@ as a fact, not a claim.
 9b. After filing the verdict, wake the reviewed assignment's holder with it:
    `tightbeam wake --session <holder> --prompt "review verdict on <assignmentId>: <verdict>"`.
    The party that must act next is the producer; do not file and go silent.
-9c. Completion closes YOUR obligation. The report artifact, verdict, wake, and
-   completion are four different rows and all are yours to file. After the verdict and
-   the wake, file
+9c. Keep this reviewing assignment OPEN after `changes-requested`. The producer
+   revises, and you review the new candidate and file the next verdict on this same
+   linked card; one change has one review card, and revision never creates, closes, or
+   reopens another. After `reviewed-clean` and its wake, the report artifact, verdict,
+   wake, and completion are four different rows and all are yours to file:
    `tightbeam attest <yourReviewingAssignmentId> --kind completion --note "verdict filed:
    <verdict>; report <art_id>; sha256 <hex>"` on the REVIEWING assignment you hold. The
    lifecycle row is what the substrate's hygiene sweep reads.

@@ -113,6 +113,10 @@ These facts are the state of the work. The state is computed from the facts; the
 status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
 with `tightbeam assignments --role <your-role>`.
 
+When a dispute claims that two unchanged sources differ, hash the exact bytes at both
+locations. Matching hashes settle their identity and end that verification. Do not repeat
+the comparison because paths, labels, messages, or memories disagree with the bytes.
+
 - Record what you produced OUTSIDE your workdir as an artifact:
 
     tightbeam artifact-record --kind report --title "nginx config on host-b" \
@@ -149,6 +153,10 @@ A continuation wake is a liveness receipt, not a status report. Schedule concret
 work or a named dependency recheck, and state when it resumes. Do not file "still working,"
 "unchanged," "waiting," or "no update." Do not repeat a result, blocker, refusal, decision
 request, or checkpoint that adds no new evidence or owner-relevant state.
+
+A valid receipt ends the stall response for that turn. If a stall alarm arrives after the
+receipt, do not file a rebuttal attest, send a rebuttal wake, or change the work. Treat the
+alarm as already answered; report a monitor defect only when you have new defect evidence.
 
 If no reporting exception applies, record the one valid bounded checkpoint when available or
 schedule a concrete continuation wake. Do not manufacture a generic progress attest.

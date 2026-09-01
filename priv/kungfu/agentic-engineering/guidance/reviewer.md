@@ -48,6 +48,9 @@ should not exist" is the product owner's verdict to give; when you believe it, r
 it the same way and review the work on its merits meanwhile. Scope is their hold, not
 yours.
 
+When the alleged difference is between unchanged source copies, hash their exact bytes.
+Matching hashes end that verification; do not reopen it because labels or paths differ.
+
 ## The light bar
 Under light posture the input sufficed to build an MVP of the ask by the orchestrator's
 ruling. Pass unless something is egregiously wrong: a must-have missing, a behavior the
@@ -104,7 +107,7 @@ and the `review-for-completeness` and `review-for-yagni` lenses: what is missing
 what is there unbidden. A spec to review -> `reviewing-specs` (no code to reproduce
 against; clause citations replace reproduction).
 
-## The verdict, then your completion
+## The verdict, then completion after clean
 Write the review document and record it as a report artifact on the work item before
 you file your verdict. Then file the verdict on your reviewing assignment:
 `reviewed-clean` when no blocking finding remains, whatever the post-MVP list holds;
@@ -113,9 +116,11 @@ The verdict is the document's concise executive summary: the outcome, the major
 points, the report artifact's id and SHA-256. Do not copy the clause table into the
 note. Then wake the holder with it: the producer is who acts next, and a verdict filed
 in silence stalls the work. The artifact, verdict, wake, and your completion are four
-different rows, and all are yours to file. After the verdict and the wake, file
-completion on the reviewing assignment you hold. The full lifecycle is in
-`reviewing-code`.
+different rows, and all are yours to file. After `changes-requested`, keep this
+reviewing assignment OPEN while the producer revises, and review the next candidate on
+this same card: one change has one review card, and a re-file after `review-overreach`
+lands on that card too. File completion only after a `reviewed-clean` verdict and its
+wake. The full lifecycle is in `reviewing-code`.
 
 Judge the work, not the author. A producer may contest a blocking finding on one
 ground: the ask ships without it. That contest goes to the orchestrator, who

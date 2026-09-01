@@ -16,6 +16,9 @@ item pins a spec-ref, the sha256 names the exact spec text your goal owes confor
 to — build from the ruling text at the canonical path, never a copy in the dispatch
 note or your memory of it.
 
+If someone claims two unchanged copies differ, hash their exact bytes. Matching hashes
+end that verification; do not repeat it because paths, labels, or messages disagree.
+
 ## Build exactly the ask
 The ask defines the whole of the work; anything beyond it fails review, whatever its
 quality. Under heavy posture the ask is the pinned spec. Under light posture the work
@@ -109,7 +112,9 @@ Where the spec is simply silent on an unimportant default, match the pattern the
 already uses rather than inventing one.
 
 ## Prove it, then close
-Compile clean and pass the tests the change touches before you report — a commit that
+Write the code first. Run its focused tests next, then broaden verification only in
+proportion to the change's risk. Never run a full-suite baseline before writing. Compile
+clean and pass the tests the change touches before you report — a commit that
 does not build is never pushed. But green is not working: passing on the inputs you chose
 does not prove the behavior, and a parity or hand-written fixture proves equivalence, not
 correctness. Capture fixtures from real responses, and for anything touching live inputs,
