@@ -370,8 +370,17 @@ pub(crate) fn check_compiled_rule(
     identity_sha: &str,
     machine: &str,
     principal: &str,
-    command: &str,
+    input: &crate::dispatch_rule_check::ToolCallInputV1,
 ) -> Result<i32, String> {
+    if input.abi != 1 || input.tool != crate::dispatch_rule_check::ToolCallToolV1::Bash {
+        return Err(runtime_refusal(
+            machine,
+            principal,
+            "normalized_input_invalid",
+        ));
+    }
+    let command = input.command.as_str();
+
     let mut known_hosts = Vec::new();
     if guard::might_need_hostname_index(command) {
         let result = github_request(

@@ -28,7 +28,13 @@ struct Context {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ToolCallInputV1 {
     pub(crate) abi: u64,
+    pub(crate) tool: ToolCallToolV1,
     pub(crate) command: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolCallToolV1 {
+    Bash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,7 +100,7 @@ pub(crate) fn run(raw_args: &[String]) -> Result<i32, String> {
         &args.identity_sha,
         &context.machine,
         &context.principal,
-        &input.command,
+        &input,
     )
 }
 
@@ -290,6 +296,7 @@ pub(crate) fn normalize(raw: &[u8], abi: u64) -> Result<ToolCallInputV1, Malform
 
     Ok(ToolCallInputV1 {
         abi,
+        tool: ToolCallToolV1::Bash,
         command: command.to_owned(),
     })
 }
@@ -373,9 +380,19 @@ mod tests {
             normalize(raw, 1),
             Ok(ToolCallInputV1 {
                 abi: 1,
+                tool: ToolCallToolV1::Bash,
                 command: " echo  x\n".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn harness_metadata_does_not_change_the_typed_normalized_input() {
+        let claude =
+            br#"{"tool_name":"Bash","tool_input":{"command":"git status"},"session_id":"claude"}"#;
+        let codex = br#"{"tool_name":"Bash","tool_input":{"command":"git status"},"hook_event_name":"PreToolUse"}"#;
+
+        assert_eq!(normalize(claude, 1), normalize(codex, 1));
     }
 
     #[test]
