@@ -40,12 +40,8 @@ per-feature, but your attention across features is the scarce resource.
    Spawn the selected reviewer as a fresh session. Link the review to the work it
    reviews so the substrate can witness the independence:
    `tightbeam assign --subject "review of spec <id>" --role reviewer:<slug> --work-item <id> --reviews <specAssignmentId>`.
-   The reviewer works per `reviewing-specs`. On `changes-requested`, read each
-   blocking finding against the ask first: a finding the MVP ships without gets
-   `review-overreach` on the PRODUCER's card naming the review card (orchestrator
-   kernel, "Verifying without redoing"; a verdict on a review card is holder-only) and
-   the reviewer re-files its own verdict. Then wake the spec-writer to revise the rest;
-   repeat until `reviewed-clean`. The spec-writer then pins (or
+   The reviewer works per `reviewing-specs`. On `changes-requested`, wake the
+   spec-writer to revise; repeat until `reviewed-clean`. The spec-writer then pins (or
    re-pins) the reviewed spec's hash on the work item (spec-handoff skill), so builders
    build from the cleared text.
 3. **Decompose.** Break the spec into focused, independently verifiable coding goals —
@@ -80,14 +76,15 @@ per-feature, but your attention across features is the scarce resource.
    The `--reviews` link and the verdict by that card's different-session holder are
    what let the substrate compute independence. Harness and provider differences stay
    observable selection evidence; they do not gate completion. A verdict filed
-   without the link is a claim the rows cannot confirm. On `changes-requested`, read
-   each blocking finding against the ask before you wake anyone: a finding the MVP
-   ships without gets `review-overreach` on the PRODUCER's card naming the review card,
-   and the reviewer re-files its own verdict with that finding moved to post-mvp. Then leave the review card open, wake the producer to
-   iterate on what remains, and have the same reviewer re-file on that card until
+   without the link is a claim the rows cannot confirm. On `changes-requested`, leave
+   the review card open, wake the producer to
+   iterate, and have the same reviewer re-file on that card until
    `reviewed-clean`. Complete the review card only after its clean verdict; never
    multiply or close-and-reopen cards for review rounds. Under light posture the
-   reviewer's bar is "nothing egregiously wrong," and the same overreach check applies.
+   reviewer's bar is "nothing egregiously wrong." A producer that believes a blocking
+   finding is not needed for the ask contests it to you, and you rule on that one
+   finding (orchestrator kernel, "Verifying without redoing"); you do not audit
+   reviews that nobody contested.
    The product owner's spirit review (step 6) asks a different question, whether the
    built thing is the product; the reviewer asks whether it is the ask. Nobody gates
    the same question twice, and spirit is judged once per work item (step 6), never

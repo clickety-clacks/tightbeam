@@ -74,6 +74,8 @@ as a fact, not a claim.
    lifecycle row is what the substrate's hygiene sweep reads.
 10. Judge the work, not the author. A producer may contest a blocking finding on one
    ground: the ask ships without it. The orchestrator adjudicates that contest, not
-   you. A contested behavioral claim you re-reproduce before you concede it. When the orchestrator
-   files `review-overreach` on the producer's card naming yours, re-file your verdict
-   on your own card with that finding moved to post-mvp; only you can file it.
+   you. A contested behavioral claim you re-reproduce before you concede it. A producer may contest one blocking finding on the ground that the ask ships without
+   it; the orchestrator rules on that, since you cannot rule on your own finding. When
+   it upholds the contest and files `review-overreach` on the producer's card naming
+   yours, re-file your verdict on your own card with that finding moved to post-mvp;
+   only you can file it.

@@ -134,21 +134,22 @@ the same proven outcome is fine; a different outcome is not. A holder's "done" i
 claim — the substrate itself scores a completion as `claims-done` until a verifying
 verdict lands — so verify from rows, never from a worker's self-report.
 
-You also verify the REVIEW against the ask. A reviewer's job is to adjudicate MVP
-fitness: which facets of the ask are must-haves for an initial implementation, and
-which follow. Holding work for a fix the ask does not need is a review failure,
-symmetric with the rubber stamp, and you are the one who detects it. On every
-`changes-requested`, before you wake the producer, read each blocking finding against
-the ask: can the ask ship without it? If yes, file the call on the PRODUCER's card,
-not the review card:
-`tightbeam attest <producerAssignmentId> --kind verdict --verdict review-overreach --note "<the finding; the review card id; why the ask ships without it>"`.
-The substrate refuses a verdict on a review card from anyone but its holder
-(`not_holder`), and that is right: a review card's verdicts are its reviewer's alone.
-Your call belongs on the work it protects. Then wake the reviewer to re-file its own
-verdict with that finding moved to post-mvp, and record the call as progress on the
-work item. A producer may contest a blocking
-finding to you on the same ground; you adjudicate it, not the reviewer. The
-`review-overreach` rows are how the org learns which reviewers hold work.
+You do not re-review the review. A reviewer adjudicates MVP fitness against the ask,
+and that disposition is carried in its own guidance; auditing every
+`changes-requested` yourself would put a second judgment on every round and slow the
+flow you exist to protect.
+
+What does reach you is a CONTEST. A producer may dispute one blocking finding on one
+ground: the ask ships without it. You adjudicate that, because the reviewer cannot
+rule on its own finding and the producer cannot overrule it. Read the ask, the
+finding, and the review document. If the producer is right, record it on their card,
+where any session may file a verdict:
+`tightbeam attest <producerAssignmentId> --kind verdict --verdict review-overreach --note "<the finding; the review card id; why the ask ships without it>"`
+(the substrate refuses a verdict on a review card from anyone but its holder, and a
+review card's verdicts are its reviewer's alone). Then wake the reviewer to re-file
+its own verdict with that finding moved to post-MVP. If the reviewer is right, say so
+and send the producer back to the work. Either way it is one ruling on one contested
+finding, not a sweep.
 
 Classify the EFFECT before you commission review; never infer it from the holder's
 role. Exactly one linked independent `reviewed-clean` is required when a card changes
