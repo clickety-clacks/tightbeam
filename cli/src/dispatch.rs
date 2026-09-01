@@ -503,16 +503,32 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemUpdate {
             identity,
             work_item_id,
+            title,
+            spec_ref_name,
+            spec_ref_sha256,
+            clear_spec_ref,
             priority,
-        } => Ok(request(
-            identity,
-            "work-item-update",
-            vec![],
-            vec![
-                string_field("workItemId", work_item_id),
-                format!("\"priority\":{priority}"),
-            ],
-        )),
+        } => {
+            let mut params = vec![string_field("workItemId", work_item_id)];
+            if let Some(value) = title {
+                params.push(string_field("title", value));
+            }
+            if *clear_spec_ref {
+                params.push("\"specRefName\":null".to_owned());
+                params.push("\"specRefSha256\":null".to_owned());
+            } else {
+                if let Some(value) = spec_ref_name {
+                    params.push(string_field("specRefName", value));
+                }
+                if let Some(value) = spec_ref_sha256 {
+                    params.push(string_field("specRefSha256", value));
+                }
+            }
+            if let Some(value) = priority {
+                params.push(format!("\"priority\":{value}"));
+            }
+            Ok(request(identity, "work-item-update", vec![], params))
+        }
         Command::WorkItemGet {
             identity,
             work_item_id,
@@ -2214,6 +2230,7 @@ mod tests {
     #[test]
     fn builds_byte_exact_work_item_bodies() {
         let sha = "a".repeat(64);
+        let class_a_sha = "d4e8260c8a82faf07ab2659e1f317bef961441af6ba43a4b9d1ef62fa01d4b86";
         assert_eq!(
             body(&[
                 "work-item-create",
@@ -2233,6 +2250,69 @@ mod tests {
         assert_eq!(
             body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "Retitled",
+                "--spec-sha256",
+                &sha,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Retitled","specRefSha256":"{sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "Together",
+                "--spec-ref",
+                "governing.md",
+                "--spec-sha256",
+                &sha,
+                "--priority",
+                "7",
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Together","specRefName":"governing.md","specRefSha256":"{sha}","priority":7}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_6d418db1-26b4-4ad0-9886-86e757e93342",
+                "--spec-ref",
+                "patrol-failure-classification-and-escalation-v1.md",
+                "--spec-sha256",
+                class_a_sha,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_6d418db1-26b4-4ad0-9886-86e757e93342","specRefName":"patrol-failure-classification-and-escalation-v1.md","specRefSha256":"{class_a_sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null}}"#
         );
         assert_eq!(
             body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),
