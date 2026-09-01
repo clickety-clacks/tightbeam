@@ -250,7 +250,7 @@ defmodule Tightbeam.Dispatch do
   # whose result carries ONE page list. A verb returning two lists would have them
   # summed, and one returning none would report 0 — so a second member either
   # accepts that meaning of N or brings its own counter.
-  @result_elided ~w(transcript)
+  @result_elided ~w(transcript breathing)
 
   # The CALL is audited with its params — that IS the access trail — and the
   # RESULT is replaced by a count. Denials are NOT elided: an error map is useful
