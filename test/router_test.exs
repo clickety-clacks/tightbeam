@@ -74,6 +74,17 @@ defmodule Tightbeam.Wire.RouterTest do
           do: %{code: call.params.return_code},
           else: %{workItem: %{id: call.params.work_item_id}, assignments: []}
       end,
+      "breathing" => fn call ->
+        send(parent, {:call, call})
+
+        %{
+          schema: "breathing-v1",
+          target: %{kind: call.params.target_kind, id: call.params.target_id},
+          breathing: false,
+          reason: "no_current_path",
+          evidence: %{}
+        }
+      end,
       "work-item-trace" => fn call ->
         send(parent, {:call, call})
         %{workItem: %{id: call.params.work_item_id}, assignments: [], timeline: []}
