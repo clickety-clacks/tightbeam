@@ -110,8 +110,12 @@ per-feature, but your attention across features is the scarce resource.
    decomposed. Otherwise, the work item does not integrate until the product owner has
    answered one spirit summary. Wake the owner with what changed in product terms,
    which Spirit clauses it serves, and what it forecloses. Keep revisions on that same
-   spirit-review assignment. The answer is `spirit-accepted`, or `changes-requested`
-   with what the spirit refuses. An unanswered
+   spirit-review assignment. The answer is an attest on that assignment, and its
+   verdict name is exact because the dispatch rail reads it:
+   `tightbeam attest <spiritAssignmentId> --kind verdict --verdict spirit-approved --note "<basis>"`,
+   or `--verdict changes-requested` with what the spirit refuses. `spirit-accepted`
+   releases nothing: `spec-dispatch-requires-spirit` denies every slice dispatch on a
+   spec-backed work item until a `spirit-approved` verdict lands on it. An unanswered
    gate queues the merge indefinitely — that wait is the accepted cost; chase it
    up the existing wake rungs, never around the gate. An answer from before
    integration is stale where integration changed the product-visible semantics; revise
