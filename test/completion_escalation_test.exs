@@ -1,6 +1,9 @@
 defmodule Tightbeam.CompletionEscalationTest do
   use Tightbeam.TestCase, async: false
 
+  import Plug.Conn
+  import Plug.Test
+
   alias Tightbeam.{
     Assignments,
     ConnRegistry,
@@ -9,11 +12,13 @@ defmodule Tightbeam.CompletionEscalationTest do
     Model,
     Org,
     Placement,
+    Toplines,
     Wakes,
     WorkItems
   }
 
   alias Tightbeam.Productions.CompletionEscalation
+  alias Tightbeam.Wire.Router
 
   setup do
     db = :"completion_escalation_db_#{System.unique_integer([:positive])}"
@@ -317,6 +322,230 @@ defmodule Tightbeam.CompletionEscalationTest do
                "SELECT sum(kind='parent-notice'),sum(kind='report-to-notice') FROM completion_escalation_wakes WHERE completionId=?1",
                [record.id]
              )
+  end
+
+  test "explicit commission leaves work parentage and Toplines byte-identical", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:owner",
+        principal: {:user, "owner"},
+        session_key: nil,
+        params: %{title: "A7 topology fixture"}
+      })
+
+    topline =
+      Toplines.create(ctx.db, %{
+        verb: "topline-create",
+        origin: "user:owner",
+        principal: {:user, "owner"},
+        session_key: nil,
+        params: %{title: "A7 Topline", idempotency_key: "a7-topline"}
+      })
+
+    Toplines.link_work(ctx.db, %{
+      verb: "topline-link-work",
+      origin: "user:owner",
+      principal: {:user, "owner"},
+      session_key: nil,
+      params: %{
+        topline_id: topline.topline.id,
+        work_item_id: item.id,
+        reason: "A7 completion topology",
+        idempotency_key: "a7-link"
+      }
+    })
+
+    assignment =
+      assign(ctx,
+        work_item: item.id,
+        report_to: ctx.report.session_key,
+        principal: {:session, ctx.sibling.session_key}
+      )
+
+    topology_before = topology_snapshot(ctx.db, assignment.id)
+    toplines_before = toplines_bytes(ctx.db)
+
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+
+    assert record.routing.parent.sessionKey == ctx.parent.session_key
+    assert record.routing.reportTo.sessionKey == ctx.report.session_key
+    assert record.routing.reportTo.sharesParentNotice == false
+    assert topology_snapshot(ctx.db, assignment.id) == topology_before
+    assert toplines_bytes(ctx.db) == toplines_before
+  end
+
+  test "dangling exact parent commits diagnostics while foreign keys stay enabled", ctx do
+    missing_parent = "missing-parent-a8"
+
+    assert :ok = DB.execute(ctx.db, "PRAGMA foreign_keys=OFF")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET spawnedBy=?2,operationalParent=?2 WHERE sessionKey=?1",
+               [ctx.child.session_key, missing_parent]
+             )
+
+    assert :ok = DB.execute(ctx.db, "PRAGMA foreign_keys=ON")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "PRAGMA foreign_keys")
+
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+
+    assert record.routing.parent.sessionKey == missing_parent
+    assert record.routing.parent.routeStatus == "unavailable"
+    assert record.routing.parent.receipt == %{state: "not-created", turnSeq: nil}
+    assert record.request.status == "open"
+
+    assert {:ok, [[^missing_parent, ^missing_parent]]} =
+             DB.query(
+               ctx.db,
+               "SELECT immediateParentSessionKey,parentSessionKey FROM completion_escalations WHERE id=?1",
+               [record.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM completion_escalation_wakes WHERE completionId=?1 AND kind='parent-notice'",
+               [record.id]
+             )
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "PRAGMA foreign_keys")
+  end
+
+  test "authenticated device retirement propagates its typed user principal", ctx do
+    token = "tbt_a14_completion_device_token"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO devices (deviceId,userId,claimedName,status,token,createdAt) VALUES ('a14-device','owner','Owner','allowlisted',?1,1)",
+               [token]
+             )
+
+    child = session(ctx.db, "a14-device-child", "owner", ctx.parent.session_key)
+    descendant = session(ctx.db, "a14-device-descendant", "owner", child.session_key)
+    completion_assignment = assign(ctx, holder: child.session_key)
+    complete(ctx, completion_assignment.id, child.session_key)
+    record = only_notice_for(ctx, {:user, "owner"}, completion_assignment.id)
+    interrupted = assign(ctx, holder: descendant.session_key)
+
+    base_dir =
+      Path.join(System.tmp_dir!(), "completion-a14-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+    real_retire = ctx.handlers["retire"]
+    caller = self()
+
+    handlers =
+      Map.put(ctx.handlers, "retire", fn call ->
+        send(caller, {:device_retire_call, call})
+        real_retire.(call)
+      end)
+
+    opts =
+      Router.init(
+        db: ctx.db,
+        handlers: handlers,
+        cli_token: "unused",
+        cursor_signing: cursor_signing!(base_dir),
+        defaults: %{},
+        session_status: fn _ -> nil end
+      )
+
+    response =
+      conn(:delete, "/api/streams/#{child.session_key}", JSON.encode!(%{}))
+      |> put_req_header("authorization", "Bearer #{token}")
+      |> Router.call(opts)
+
+    assert response.status == 200
+
+    assert_receive {:device_retire_call,
+                    %{
+                      verb: "retire",
+                      origin: "user:owner",
+                      principal: {:user, "owner"},
+                      session_key: key
+                    }}
+
+    assert key == child.session_key
+
+    assert {:ok, [["acknowledged", "retire", "owner", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,decision,actedByUser,actedBySession FROM completion_escalations WHERE id=?1",
+               [record.id]
+             )
+
+    assert {:ok, [["owner", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedByUser,revokedBySession FROM assignment_revocations WHERE assignmentId=?1",
+               [interrupted.id]
+             )
+
+    assert {:ok, [["process", "tightbeam:completion-escalation"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT DISTINCT requesterKind,requesterId FROM wake_cancellations WHERE causalSourceKind='completion_transition' AND causalSourceId=?1",
+               [record.id]
+             )
+
+    assert {:ok, [[detail]]} =
+             DB.query(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE kind='completion_escalation_acknowledged' AND subject=?1",
+               [record.id]
+             )
+
+    assert detail == "decision=retire"
+
+    assert Org.get(ctx.db, child.session_key).state == "retired"
+    assert Org.get(ctx.db, descendant.session_key).state == "retired"
+
+    spoofed = session(ctx.db, "a14-spoofed-origin", "owner", ctx.parent.session_key)
+    spoofed_assignment = assign(ctx, holder: spoofed.session_key)
+    complete(ctx, spoofed_assignment.id, spoofed.session_key)
+    spoofed_record = only_notice_for(ctx, {:user, "owner"}, spoofed_assignment.id)
+
+    assert %{deleted_session_key: key} =
+             real_retire.(%{
+               verb: "retire",
+               origin: "user:other",
+               principal: {:user, "owner"},
+               session_key: spoofed.session_key,
+               params: %{}
+             })
+
+    assert key == spoofed.session_key
+
+    assert {:ok, [["owner", "decision=retire"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT ce.actedByUser,le.detail FROM completion_escalations ce JOIN lifecycle_events le ON le.subject=ce.id AND le.kind='completion_escalation_acknowledged' WHERE ce.id=?1",
+               [spoofed_record.id]
+             )
+
+    refused = session(ctx.db, "a14-missing-principal", "owner", ctx.parent.session_key)
+    refused_assignment = assign(ctx, holder: refused.session_key)
+    complete(ctx, refused_assignment.id, refused.session_key)
+    refused_record = only_notice_for(ctx, {:user, "owner"}, refused_assignment.id)
+    before = generic_retire_snapshot(ctx.db, refused_record.id, refused_assignment.id)
+
+    assert %{code: "not_found"} =
+             real_retire.(%{
+               verb: "retire",
+               origin: "user:owner",
+               principal: nil,
+               session_key: refused.session_key,
+               params: %{idempotency_key: "a14-refused"}
+             })
+
+    assert generic_retire_snapshot(ctx.db, refused_record.id, refused_assignment.id) == before
   end
 
   test "null parent selects owner Main and inactive report-to stays independent", ctx do
@@ -1241,6 +1470,7 @@ defmodule Tightbeam.CompletionEscalationTest do
 
   defp assign(ctx, opts \\ []) do
     holder = Keyword.get(opts, :holder, ctx.child.session_key)
+    principal = Keyword.get(opts, :principal, {:user, "owner"})
 
     params = %{
       subject: "completion work",
@@ -1251,8 +1481,8 @@ defmodule Tightbeam.CompletionEscalationTest do
 
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
-      origin: "user:owner",
-      principal: {:user, "owner"},
+      origin: origin(principal),
+      principal: principal,
       session_key: holder,
       target_role: nil,
       role_fallback: false,
@@ -1395,6 +1625,68 @@ defmodule Tightbeam.CompletionEscalationTest do
       )
 
     rows
+  end
+
+  defp topology_snapshot(db, assignment_id) do
+    {:ok, assignment_parentage} =
+      DB.query(
+        db,
+        "SELECT id,workItemId,reviewsAssignmentId,openedByUser,openedBySession FROM assignments WHERE id=?1",
+        [assignment_id]
+      )
+
+    {:ok, memberships} =
+      DB.query(
+        db,
+        "SELECT id,toplineId,workItemId,linkedAt,unlinkedAt FROM topline_work_memberships ORDER BY id"
+      )
+
+    :erlang.term_to_binary({assignment_parentage, memberships})
+  end
+
+  defp toplines_bytes(db) do
+    db
+    |> Toplines.query_public(%{principal: {:user, "owner"}, state: nil})
+    |> JSON.encode!()
+  end
+
+  defp generic_retire_snapshot(db, completion_id, assignment_id) do
+    {:ok, completion} =
+      DB.query(db, "SELECT * FROM completion_escalations WHERE id=?1", [completion_id])
+
+    {:ok, assignment} = DB.query(db, "SELECT * FROM assignments WHERE id=?1", [assignment_id])
+
+    {:ok, session} =
+      DB.query(
+        db,
+        "SELECT sessionKey,state,updatedAt FROM sessions WHERE sessionKey=(SELECT childSessionKey FROM completion_escalations WHERE id=?1)",
+        [completion_id]
+      )
+
+    {:ok, wakes} =
+      DB.query(
+        db,
+        "SELECT w.* FROM wakes w JOIN completion_escalation_wakes cew ON cew.wakeId=w.wakeId WHERE cew.completionId=?1 ORDER BY w.wakeId",
+        [completion_id]
+      )
+
+    {:ok, cancellations} =
+      DB.query(
+        db,
+        "SELECT c.* FROM wake_cancellations c JOIN completion_escalation_wakes cew ON cew.wakeId=c.wakeId WHERE cew.completionId=?1 ORDER BY c.wakeId",
+        [completion_id]
+      )
+
+    {:ok, lifecycle} =
+      DB.query(db, "SELECT * FROM lifecycle_events WHERE subject=?1 ORDER BY id", [completion_id])
+
+    {:ok, idempotency} =
+      DB.query(
+        db,
+        "SELECT * FROM wire_idempotency WHERE operation='retire' ORDER BY idempotencyKey"
+      )
+
+    {completion, assignment, session, wakes, cancellations, lifecycle, idempotency}
   end
 
   defp eventually(check, remaining \\ 80) do
