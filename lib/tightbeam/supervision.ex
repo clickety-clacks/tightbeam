@@ -810,6 +810,114 @@ defmodule Tightbeam.Supervision do
     end
   end
 
+  @doc "Resolve the current same-owner parent, with the active root Main as fallback."
+  @spec responsible_parent(DB.server() | Txn.t(), String.t()) :: map() | nil
+  def responsible_parent(db_or_txn, child_key) do
+    case query(
+           db_or_txn,
+           "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey=?1",
+           [child_key]
+         ) do
+      [[owner, spawned_by]] ->
+        case responsible_lineage(db_or_txn, spawned_by, owner, 1, MapSet.new([child_key])) do
+          nil -> responsible_main(db_or_txn, owner)
+          target -> target
+        end
+
+      [] ->
+        nil
+    end
+  end
+
+  @doc "Whether one session is the target's current disposition principal."
+  @spec disposition_principal?(DB.server() | Txn.t(), String.t(), String.t()) :: boolean()
+  def disposition_principal?(db_or_txn, child_key, caller_key) do
+    match?(%{session_key: ^caller_key}, responsible_parent(db_or_txn, child_key))
+  end
+
+  @doc "Resolve an idle-worker prompt or reminder to its current responsible session."
+  @spec idle_disposition_wake_target(Txn.t(), String.t()) :: String.t() | nil | :not_idle
+  def idle_disposition_wake_target(%Txn{} = txn, wake_id) do
+    case query(
+           txn,
+           """
+           SELECT g.childSessionKey
+           FROM idle_worker_generations g
+           LEFT JOIN decision_requests dr ON dr.id=g.decisionRequestId
+           WHERE g.state='pending' AND (g.promptWakeId=?1 OR dr.parkWakeId=?1)
+           """,
+           [wake_id]
+         ) do
+      [[child_key]] ->
+        case responsible_parent(txn, child_key) do
+          %{session_key: target} -> target
+          nil -> nil
+        end
+
+      [] ->
+        :not_idle
+    end
+  end
+
+  defp responsible_lineage(_db, nil, _owner, _rung, _visited), do: nil
+
+  defp responsible_lineage(db_or_txn, key, owner, rung, visited) do
+    if MapSet.member?(visited, key) do
+      nil
+    else
+      case query(
+             db_or_txn,
+             "SELECT ownerUserId, state, spawnedBy FROM sessions WHERE sessionKey=?1",
+             [key]
+           ) do
+        [[^owner, "active", _spawned_by]] ->
+          %{
+            session_key: key,
+            owner_user_id: owner,
+            routing_kind: "lineage",
+            lineage_rung: rung
+          }
+
+        [[^owner, _state, spawned_by]] ->
+          responsible_lineage(
+            db_or_txn,
+            spawned_by,
+            owner,
+            rung + 1,
+            MapSet.put(visited, key)
+          )
+
+        # A missing or foreign-owner ancestor terminates lineage authority.
+        _ ->
+          nil
+      end
+    end
+  end
+
+  defp responsible_main(db_or_txn, owner) do
+    key = Org.personal_session_key(owner)
+
+    case query(
+           db_or_txn,
+           """
+           SELECT 1 FROM sessions
+           WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active' AND isBuiltIn=1
+           """,
+           [key, owner]
+         ) do
+      [[1]] ->
+        %{
+          session_key: key,
+          owner_user_id: owner,
+          routing_kind: "main_fallback",
+          lineage_rung: nil
+        }
+
+      [] ->
+        nil
+    end
+  end
+
   defp active_personal_key(db_or_txn, owner) do
     key = Org.personal_session_key(owner)
 

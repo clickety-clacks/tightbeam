@@ -136,6 +136,68 @@ defmodule Tightbeam.SchemaShapeTest do
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
   end
 
+  test "idle-worker activation is epoch-last, rollback-safe, and deterministically backfilled",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    drop_idle_worker_activation(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO users(userId,isAdmin,createdAt) VALUES ('idle-owner',0,1);
+      INSERT INTO sessions
+        (sessionKey,displayName,kind,isBuiltIn,ownerUserId,origin,archetype,harness,
+         provider,model,host,state,createdAt,updatedAt)
+      VALUES
+        ('agent:main:clawline:idle-owner:main','Main','main',1,'idle-owner','user:idle-owner',
+         'default','claude','anthropic','fable','local','active',1,1),
+        ('idle-child','Child','custom',0,'idle-owner','user:idle-owner','default','claude',
+         'anthropic','fable','local','active',2,2),
+        ('idle-never-worked','Never','custom',0,'idle-owner','user:idle-owner','default','claude',
+         'anthropic','fable','local','active',3,3);
+      INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt)
+      VALUES ('asg_activation','activation work','idle-child','idle-owner',4);
+      """)
+
+    source = Schema.idle_worker_predecessor_sql_for_test()
+
+    for statement <- 1..source.activation_statement_count do
+      assert {:error, %RuntimeError{message: "forced idle-worker activation interruption"}} =
+               DB.transaction(db, fn txn ->
+                 Schema.ensure_idle_worker_disposition_v1_in_txn(txn, 99,
+                   fail_after_statement: statement
+                 )
+               end)
+
+      assert {:ok, []} =
+               DB.query(
+                 db,
+                 "SELECT name FROM sqlite_master WHERE name='idle_worker_disposition_epoch'"
+               )
+
+      assert length(table_columns(db, "wake_cancellations")) == 18
+      assert length(table_columns(db, "wire_idempotency")) == 4
+    end
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Schema.ensure_idle_worker_disposition_v1_in_txn(txn, 99)
+             end)
+
+    assert {:ok, [["idle-child", 1, "armed", 99, "schema_activation", nil]]} =
+             DB.query(db, """
+             SELECT childSessionKey,generation,state,armedAt,armedBasisKind,armedBasisId
+             FROM idle_worker_generations
+             """)
+
+    assert {:ok, [[0, 99, "schema_activation", "process:tightbeam"]]} =
+             DB.query(
+               db,
+               "SELECT id,activatedAt,cause,principal FROM idle_worker_disposition_epoch"
+             )
+
+    assert :ok = Schema.ensure_all(db)
+  end
+
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
     :ok = Schema.ensure_all(db)
     downgrade_decision_requests_to_model_identity(db)
@@ -683,6 +745,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_decision_requests_to_model_identity(db) do
+    drop_idle_worker_activation(db)
+
     :ok =
       DB.execute(db, """
       DROP INDEX decision_requests_owner;
@@ -801,6 +865,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp drop_liveness_activation(db) do
+    drop_idle_worker_activation(db)
+
     :ok =
       DB.execute(db, """
       DROP TRIGGER IF EXISTS supervision_liveness_retirement_immutable_delete;
@@ -827,6 +893,67 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS supervision_liveness_epoch;
       DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
+      """)
+  end
+
+  defp drop_idle_worker_activation(db) do
+    source = Schema.idle_worker_predecessor_sql_for_test()
+
+    {:ok, objects} =
+      DB.query(db, """
+      SELECT type,name FROM sqlite_master
+      WHERE name LIKE 'idle_worker_%' AND name!='idle_worker_disposition_epoch'
+      ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'index' THEN 1 ELSE 2 END
+      """)
+
+    Enum.each(objects, fn
+      ["trigger", name] -> :ok = DB.execute(db, "DROP TRIGGER IF EXISTS #{name}")
+      ["index", name] -> :ok = DB.execute(db, "DROP INDEX IF EXISTS #{name}")
+      ["table", _name] -> :ok
+    end)
+
+    :ok =
+      DB.execute(db, """
+      DROP TABLE IF EXISTS idle_worker_retire_blockers;
+      DROP TABLE IF EXISTS idle_worker_generations;
+      DROP TABLE IF EXISTS idle_worker_retire_proofs;
+      DROP TABLE IF EXISTS idle_worker_disposition_epoch;
+      DROP TRIGGER IF EXISTS wake_cancellations_pending_insert;
+      DROP TRIGGER IF EXISTS wakes_typed_cancellation_required;
+      """)
+
+    wake_source =
+      String.replace(source.wake_cancellations, "wake_cancellations", "wake_cancellations_source")
+
+    :ok = DB.execute(db, wake_source)
+
+    columns =
+      "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+        "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+        "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId," <>
+        "workImpactKind,livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO wake_cancellations_source (#{columns})
+      SELECT #{columns} FROM wake_cancellations;
+      DROP TABLE wake_cancellations;
+      ALTER TABLE wake_cancellations_source RENAME TO wake_cancellations;
+      """)
+
+    Enum.each(source.wake_triggers, fn sql -> :ok = DB.execute(db, sql) end)
+
+    wire_source =
+      String.replace(source.wire_idempotency, "wire_idempotency", "wire_idempotency_source")
+
+    :ok = DB.execute(db, wire_source)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO wire_idempotency_source(ownerUserId,operation,idempotencyKey,sessionKey)
+      SELECT ownerUserId,operation,idempotencyKey,sessionKey FROM wire_idempotency;
+      DROP TABLE wire_idempotency;
+      ALTER TABLE wire_idempotency_source RENAME TO wire_idempotency;
       """)
   end
 end

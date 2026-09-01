@@ -834,6 +834,340 @@ defmodule Tightbeam.Schema do
     }
   ]
 
+  @wire_idempotency_v1_ddl """
+  CREATE TABLE IF NOT EXISTS wire_idempotency (
+    ownerUserId    TEXT NOT NULL,
+    operation      TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign','condition','work-item-create')),
+    idempotencyKey TEXT NOT NULL,
+    sessionKey     TEXT NOT NULL,
+    PRIMARY KEY (ownerUserId, operation, idempotencyKey)
+  );
+  """
+
+  @wire_idempotency_v2_new_ddl """
+  CREATE TABLE wire_idempotency_new (
+    ownerUserId TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('spawn','retire','retain','wake','assign','condition','work-item-create')),
+    idempotencyKey TEXT NOT NULL,
+    sessionKey TEXT NOT NULL,
+    inputDigest TEXT,
+    resultJson TEXT,
+    completedAt INTEGER,
+    PRIMARY KEY (ownerUserId, operation, idempotencyKey),
+    CHECK (inputDigest IS NULL OR (length(inputDigest)=64 AND inputDigest NOT GLOB '*[^0-9a-f]*')),
+    CHECK (resultJson IS NULL OR json_valid(resultJson)),
+    CHECK (completedAt IS NULL OR completedAt >= 0),
+    CHECK (
+      (operation='retain' AND inputDigest IS NOT NULL AND resultJson IS NOT NULL AND completedAt IS NOT NULL)
+      OR
+      (operation='retire' AND ((inputDigest IS NULL AND resultJson IS NULL AND completedAt IS NULL)
+        OR (inputDigest IS NOT NULL AND resultJson IS NOT NULL AND completedAt IS NOT NULL)))
+      OR
+      (operation NOT IN ('retain','retire') AND inputDigest IS NULL AND resultJson IS NULL AND completedAt IS NULL)
+    )
+  )
+  """
+  @wire_idempotency_v2_ddl String.replace(
+                             @wire_idempotency_v2_new_ddl,
+                             "wire_idempotency_new",
+                             "wire_idempotency"
+                           )
+
+  @wake_cancellations_v1_ddl Enum.find(
+                               @supervision_liveness_objects,
+                               &(&1.name == "wake_cancellations")
+                             ).sql
+  @wake_cancellations_v2_new_ddl String.replace(
+                                   @wake_cancellations_v1_ddl,
+                                   "wake_cancellations",
+                                   "wake_cancellations_new"
+                                 )
+                                 |> String.replace(
+                                   "(requesterId = 'tightbeam:work-items' AND",
+                                   "(requesterId = 'tightbeam:idle-worker-disposition' AND\n" <>
+                                     "             ((reasonKind = 'superseded' AND causalSourceKind = 'decision_request' AND\n" <>
+                                     "               outcomeKind IN ('replacement','no_replacement'))\n" <>
+                                     "              OR\n" <>
+                                     "              (reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND\n" <>
+                                     "               outcomeKind = 'disposition')))\n" <>
+                                     "            OR\n" <>
+                                     "            (requesterId = 'tightbeam:work-items' AND"
+                                 )
+                                 |> String.replace(
+                                   "workImpactKind != 'linked_work_not_open')",
+                                   "(workImpactKind != 'linked_work_not_open' OR requesterId = 'tightbeam:idle-worker-disposition'))"
+                                 )
+  @wake_cancellations_v2_ddl String.replace(
+                               @wake_cancellations_v2_new_ddl,
+                               "wake_cancellations_new",
+                               "wake_cancellations"
+                             )
+
+  @idle_worker_objects [
+    %{
+      type: "table",
+      name: "idle_worker_generations",
+      sql: """
+      CREATE TABLE IF NOT EXISTS idle_worker_generations (
+        childSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        state TEXT NOT NULL CHECK (state IN ('armed','pending','resolved')),
+        armedAt INTEGER NOT NULL CHECK (armedAt >= 0),
+        armedBasisKind TEXT NOT NULL CHECK (armedBasisKind IN ('assignment_open','schema_activation')),
+        armedBasisId TEXT REFERENCES assignments(id),
+        zeroAt INTEGER CHECK (zeroAt >= 0),
+        zeroBasisAssignmentId TEXT REFERENCES assignments(id),
+        initialDeadlineAt INTEGER CHECK (initialDeadlineAt >= 0),
+        decisionRequestId TEXT UNIQUE REFERENCES decision_requests(id),
+        promptWakeId TEXT REFERENCES wakes(wakeId),
+        parentSessionKey TEXT REFERENCES sessions(sessionKey),
+        routingKind TEXT CHECK (routingKind IN ('lineage','main_fallback')),
+        lineageRung INTEGER CHECK (lineageRung > 0),
+        resolution TEXT CHECK (resolution IN ('retain','retire','superseded')),
+        resolvedAt INTEGER CHECK (resolvedAt >= 0),
+        resolvedBy TEXT,
+        resolutionCauseKind TEXT,
+        resolutionCauseId TEXT,
+        retireProofVersion INTEGER,
+        PRIMARY KEY (childSessionKey, generation),
+        FOREIGN KEY (childSessionKey, generation, retireProofVersion)
+          REFERENCES idle_worker_retire_proofs(childSessionKey, generation, proofVersion)
+          DEFERRABLE INITIALLY DEFERRED,
+        CHECK ((armedBasisKind='assignment_open' AND armedBasisId IS NOT NULL)
+          OR (armedBasisKind='schema_activation' AND armedBasisId IS NULL)),
+        CHECK ((routingKind='lineage' AND lineageRung > 0)
+          OR (routingKind='main_fallback' AND lineageRung IS NULL)
+          OR (routingKind IS NULL AND lineageRung IS NULL)),
+        CHECK (
+          (state='armed' AND zeroAt IS NULL AND zeroBasisAssignmentId IS NULL
+            AND initialDeadlineAt IS NULL AND decisionRequestId IS NULL AND promptWakeId IS NULL
+            AND parentSessionKey IS NULL AND routingKind IS NULL AND lineageRung IS NULL
+            AND resolution IS NULL AND resolvedAt IS NULL AND resolvedBy IS NULL
+            AND resolutionCauseKind IS NULL AND resolutionCauseId IS NULL AND retireProofVersion IS NULL)
+          OR
+          (state='pending' AND zeroAt IS NOT NULL AND zeroBasisAssignmentId IS NOT NULL
+            AND initialDeadlineAt IS NOT NULL AND decisionRequestId IS NOT NULL AND promptWakeId IS NOT NULL
+            AND parentSessionKey IS NOT NULL AND routingKind IS NOT NULL
+            AND resolution IS NULL AND resolvedAt IS NULL AND resolvedBy IS NULL
+            AND resolutionCauseKind IS NULL AND resolutionCauseId IS NULL)
+          OR
+          (state='resolved' AND resolution IS NOT NULL AND resolvedAt IS NOT NULL
+            AND resolvedBy IS NOT NULL AND resolutionCauseKind IS NOT NULL AND resolutionCauseId IS NOT NULL
+            AND ((decisionRequestId IS NULL AND zeroAt IS NULL AND zeroBasisAssignmentId IS NULL
+                  AND initialDeadlineAt IS NULL AND promptWakeId IS NULL AND parentSessionKey IS NULL
+                  AND routingKind IS NULL AND lineageRung IS NULL AND resolution='retire')
+              OR (decisionRequestId IS NOT NULL AND zeroAt IS NOT NULL
+                  AND zeroBasisAssignmentId IS NOT NULL AND initialDeadlineAt IS NOT NULL
+                  AND promptWakeId IS NOT NULL AND parentSessionKey IS NOT NULL AND routingKind IS NOT NULL)))
+        )
+      )
+      """
+    },
+    %{
+      type: "table",
+      name: "idle_worker_retire_proofs",
+      sql: """
+      CREATE TABLE IF NOT EXISTS idle_worker_retire_proofs (
+        childSessionKey TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        proofVersion INTEGER NOT NULL CHECK (proofVersion > 0),
+        decisionRequestId TEXT NOT NULL REFERENCES decision_requests(id),
+        actingPrincipal TEXT NOT NULL,
+        capturedAt INTEGER NOT NULL CHECK (capturedAt >= 0),
+        retryAt INTEGER NOT NULL CHECK (retryAt >= 0),
+        blockerCount INTEGER NOT NULL CHECK (blockerCount > 0),
+        blockerDigest TEXT NOT NULL CHECK (length(blockerDigest)=64 AND blockerDigest NOT GLOB '*[^0-9a-f]*'),
+        sealed INTEGER NOT NULL CHECK (sealed IN (0,1)),
+        PRIMARY KEY (childSessionKey, generation, proofVersion),
+        UNIQUE (childSessionKey, generation, blockerDigest),
+        FOREIGN KEY (childSessionKey, generation)
+          REFERENCES idle_worker_generations(childSessionKey, generation)
+          DEFERRABLE INITIALLY DEFERRED
+      )
+      """
+    },
+    %{
+      type: "table",
+      name: "idle_worker_retire_blockers",
+      sql: """
+      CREATE TABLE IF NOT EXISTS idle_worker_retire_blockers (
+        childSessionKey TEXT NOT NULL,
+        generation INTEGER NOT NULL,
+        proofVersion INTEGER NOT NULL,
+        ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+        leasedSessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+        reason TEXT NOT NULL,
+        startedAt INTEGER NOT NULL CHECK (startedAt >= 0),
+        expiresAt INTEGER NOT NULL CHECK (expiresAt >= 0),
+        hardDeadline INTEGER NOT NULL CHECK (hardDeadline >= 0),
+        updatedAt INTEGER NOT NULL CHECK (updatedAt >= 0),
+        PRIMARY KEY (childSessionKey, generation, proofVersion, ordinal),
+        UNIQUE (childSessionKey, generation, proofVersion, leasedSessionKey),
+        FOREIGN KEY (childSessionKey, generation, proofVersion)
+          REFERENCES idle_worker_retire_proofs(childSessionKey, generation, proofVersion)
+          DEFERRABLE INITIALLY DEFERRED
+      )
+      """
+    },
+    %{
+      type: "table",
+      name: "idle_worker_disposition_epoch",
+      sql: """
+      CREATE TABLE IF NOT EXISTS idle_worker_disposition_epoch (
+        id INTEGER PRIMARY KEY CHECK (id=0),
+        activatedAt INTEGER NOT NULL CHECK (activatedAt >= 0),
+        cause TEXT NOT NULL CHECK (cause='schema_activation'),
+        principal TEXT NOT NULL CHECK (principal='process:tightbeam')
+      )
+      """
+    },
+    %{
+      type: "index",
+      name: "idle_worker_one_current",
+      sql:
+        "CREATE UNIQUE INDEX IF NOT EXISTS idle_worker_one_current ON idle_worker_generations(childSessionKey) WHERE state IN ('armed','pending')"
+    },
+    %{
+      type: "index",
+      name: "idle_worker_request_unique",
+      sql:
+        "CREATE UNIQUE INDEX IF NOT EXISTS idle_worker_request_unique ON idle_worker_generations(decisionRequestId) WHERE decisionRequestId IS NOT NULL"
+    },
+    %{
+      type: "index",
+      name: "idle_worker_blocker_order",
+      sql:
+        "CREATE INDEX IF NOT EXISTS idle_worker_blocker_order ON idle_worker_retire_blockers(childSessionKey,generation,proofVersion,ordinal)"
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_generation_no_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_generation_no_delete BEFORE DELETE ON idle_worker_generations
+      BEGIN SELECT RAISE(ABORT, 'idle-worker generation history is immutable'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_generation_resolved_immutable",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_generation_resolved_immutable BEFORE UPDATE ON idle_worker_generations
+      WHEN OLD.state='resolved'
+      BEGIN SELECT RAISE(ABORT, 'idle-worker resolved generation is immutable'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_generation_identity_immutable",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_generation_identity_immutable BEFORE UPDATE ON idle_worker_generations
+      WHEN NEW.childSessionKey IS NOT OLD.childSessionKey OR NEW.generation IS NOT OLD.generation
+        OR NEW.armedAt IS NOT OLD.armedAt OR NEW.armedBasisKind IS NOT OLD.armedBasisKind
+        OR NEW.armedBasisId IS NOT OLD.armedBasisId
+      BEGIN SELECT RAISE(ABORT, 'idle-worker generation identity is immutable'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_proof_sealed",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_proof_sealed BEFORE UPDATE ON idle_worker_retire_proofs
+      WHEN OLD.sealed=1
+      BEGIN SELECT RAISE(ABORT, 'idle-worker blocker proof is sealed'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_proof_header_immutable",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_proof_header_immutable BEFORE UPDATE ON idle_worker_retire_proofs
+      WHEN NEW.childSessionKey IS NOT OLD.childSessionKey OR NEW.generation IS NOT OLD.generation
+        OR NEW.proofVersion IS NOT OLD.proofVersion OR NEW.decisionRequestId IS NOT OLD.decisionRequestId
+        OR NEW.actingPrincipal IS NOT OLD.actingPrincipal OR NEW.capturedAt IS NOT OLD.capturedAt
+        OR NEW.retryAt IS NOT OLD.retryAt OR NEW.blockerCount IS NOT OLD.blockerCount
+        OR NEW.blockerDigest IS NOT OLD.blockerDigest OR NOT (OLD.sealed=0 AND NEW.sealed=1)
+      BEGIN SELECT RAISE(ABORT, 'idle-worker blocker proof header is immutable'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_proof_header_unsealed_insert",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_proof_header_unsealed_insert BEFORE INSERT ON idle_worker_retire_proofs
+      WHEN NEW.sealed!=0
+      BEGIN SELECT RAISE(ABORT, 'idle-worker blocker proof is sealed'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_proof_header_no_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_proof_header_no_delete BEFORE DELETE ON idle_worker_retire_proofs
+      BEGIN SELECT RAISE(ABORT, 'idle-worker blocker proof header is immutable'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_proof_row_no_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_proof_row_no_update BEFORE UPDATE ON idle_worker_retire_blockers
+      BEGIN SELECT RAISE(ABORT, 'idle-worker blocker proof row is immutable'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_proof_row_unsealed_insert",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_proof_row_unsealed_insert BEFORE INSERT ON idle_worker_retire_blockers
+      WHEN NOT EXISTS (
+        SELECT 1 FROM idle_worker_retire_proofs p WHERE p.childSessionKey=NEW.childSessionKey
+          AND p.generation=NEW.generation AND p.proofVersion=NEW.proofVersion AND p.sealed=0
+      )
+      BEGIN SELECT RAISE(ABORT, 'idle-worker blocker proof is sealed'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_proof_row_no_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_proof_row_no_delete BEFORE DELETE ON idle_worker_retire_blockers
+      BEGIN SELECT RAISE(ABORT, 'idle-worker blocker proof row is immutable'); END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "idle_worker_generation_sealed_proof",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS idle_worker_generation_sealed_proof BEFORE UPDATE OF retireProofVersion ON idle_worker_generations
+      WHEN NEW.retireProofVersion IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM idle_worker_retire_proofs p WHERE p.childSessionKey=NEW.childSessionKey
+          AND p.generation=NEW.generation AND p.proofVersion=NEW.retireProofVersion AND p.sealed=1
+      )
+      BEGIN SELECT RAISE(ABORT, 'idle-worker generation requires a sealed blocker proof'); END
+      """
+    }
+  ]
+  @wake_cancellation_columns ~w(wakeId wakeState canceledAt requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind replacementWakeId dispositionKind dispositionId primaryWorkKind primaryWorkId workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)
+  @wire_idempotency_legacy_columns ~w(ownerUserId operation idempotencyKey sessionKey)
+
+  if Application.compile_env(:tightbeam, :fixture_harness, false) do
+    @doc false
+    def idle_worker_predecessor_sql_for_test do
+      triggers =
+        Enum.filter(
+          @supervision_liveness_objects,
+          &(&1.name in ["wake_cancellations_pending_insert", "wakes_typed_cancellation_required"])
+        )
+
+      %{
+        wake_cancellations: @wake_cancellations_v1_ddl,
+        wire_idempotency: @wire_idempotency_v1_ddl,
+        wake_triggers: Enum.map(triggers, & &1.sql),
+        activation_statement_count: length(@idle_worker_objects) + 14
+      }
+    end
+  end
+
   defmodule ShapeError do
     @moduledoc "A database whose stamped shape this build cannot read or migrate exactly."
     defexception [:message]
@@ -881,7 +1215,332 @@ defmodule Tightbeam.Schema do
           message:
             "incompatible_supervision_liveness_v1: additive activation failed: #{Exception.message(error)}"
     end
+
+    case DB.transaction(db, fn txn ->
+           ensure_idle_worker_disposition_v1_in_txn(txn, activated_at)
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_idle_worker_disposition_v1: activation failed: #{Exception.message(error)}"
+    end
   end
+
+  @doc false
+  def ensure_idle_worker_disposition_v1_in_txn(%Txn{} = txn),
+    do: ensure_idle_worker_disposition_v1_in_txn(txn, System.system_time(:millisecond), [])
+
+  @doc false
+  def ensure_idle_worker_disposition_v1_in_txn(%Txn{} = txn, activated_at),
+    do: ensure_idle_worker_disposition_v1_in_txn(txn, activated_at, [])
+
+  @doc false
+  def ensure_idle_worker_disposition_v1_in_txn(%Txn{} = txn, activated_at, opts)
+      when is_integer(activated_at) and activated_at >= 0 and is_list(opts) do
+    present = Enum.filter(@idle_worker_objects, &owned_object_present?(txn, &1))
+
+    cond do
+      present == [] ->
+        activate_idle_worker_disposition!(txn, activated_at, opts)
+
+      length(present) == length(@idle_worker_objects) ->
+        validate_idle_worker_shape!(txn)
+
+      true ->
+        missing =
+          @idle_worker_objects
+          |> Kernel.--(present)
+          |> Enum.map_join(", ", & &1.name)
+
+        incompatible_idle_worker!("incomplete feature shape; missing #{missing}")
+    end
+
+    :ok
+  end
+
+  def ensure_idle_worker_disposition_v1_in_txn(%Txn{}, _activated_at, _opts),
+    do: incompatible_idle_worker!("activation epoch must be a nonnegative integer")
+
+  defp activate_idle_worker_disposition!(txn, activated_at, opts) do
+    validate_idle_object!(txn, "table", "wake_cancellations", @wake_cancellations_v1_ddl)
+    validate_idle_object!(txn, "table", "wire_idempotency", @wire_idempotency_v1_ddl)
+
+    wake_triggers =
+      Enum.filter(
+        @supervision_liveness_objects,
+        &(&1.name in ["wake_cancellations_pending_insert", "wakes_typed_cancellation_required"])
+      )
+
+    statements = [
+      "DROP TRIGGER wake_cancellations_pending_insert",
+      "DROP TRIGGER wakes_typed_cancellation_required",
+      @wake_cancellations_v2_new_ddl,
+      """
+      INSERT INTO wake_cancellations_new
+        (wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind,
+         causalSourceKind,causalSourceId,outcomeKind,replacementWakeId,
+         dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,
+         workImpactKind,livenessTriggerKind,livenessTriggerId,actionNeeded)
+      SELECT wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind,
+             causalSourceKind,causalSourceId,outcomeKind,replacementWakeId,
+             dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,
+             workImpactKind,livenessTriggerKind,livenessTriggerId,actionNeeded
+      FROM wake_cancellations
+      """
+    ]
+
+    index = exec_idle_statements!(txn, statements, opts, 0)
+    prove_copy!(txn, "wake_cancellations", "wake_cancellations_new", @wake_cancellation_columns)
+
+    index =
+      exec_idle_statements!(
+        txn,
+        [
+          "DROP TABLE wake_cancellations",
+          "ALTER TABLE wake_cancellations_new RENAME TO wake_cancellations"
+        ] ++
+          Enum.map(wake_triggers, & &1.sql),
+        opts,
+        index
+      )
+
+    index =
+      exec_idle_statements!(
+        txn,
+        [
+          @wire_idempotency_v2_new_ddl,
+          """
+          INSERT INTO wire_idempotency_new
+            (ownerUserId,operation,idempotencyKey,sessionKey,inputDigest,resultJson,completedAt)
+          SELECT ownerUserId,operation,idempotencyKey,sessionKey,NULL,NULL,NULL
+          FROM wire_idempotency
+          """
+        ],
+        opts,
+        index
+      )
+
+    prove_copy!(txn, "wire_idempotency", "wire_idempotency_new", @wire_idempotency_legacy_columns)
+
+    index =
+      exec_idle_statements!(
+        txn,
+        [
+          "DROP TABLE wire_idempotency",
+          "ALTER TABLE wire_idempotency_new RENAME TO wire_idempotency"
+        ],
+        opts,
+        index
+      )
+
+    index =
+      Enum.reduce(@idle_worker_objects, index, fn object, cursor ->
+        next = exec_idle_statements!(txn, [object.sql], opts, cursor)
+        validate_idle_object!(txn, object.type, object.name, object.sql)
+        next
+      end)
+
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT s.sessionKey
+        FROM sessions s
+        WHERE s.state='active'
+          AND NOT (s.isBuiltIn=1 AND s.sessionKey='agent:main:clawline:' || s.ownerUserId || ':main')
+          AND EXISTS (SELECT 1 FROM assignments a WHERE a.holderKey=s.sessionKey AND a.state='open')
+        ORDER BY s.createdAt, s.sessionKey
+        """
+      )
+
+    Enum.each(rows, fn [session_key] ->
+      Txn.q(
+        txn,
+        """
+        INSERT INTO idle_worker_generations
+          (childSessionKey,generation,state,armedAt,armedBasisKind,armedBasisId)
+        VALUES (?1,1,'armed',?2,'schema_activation',NULL)
+        """,
+        [session_key, activated_at]
+      )
+    end)
+
+    maybe_interrupt_idle!(opts, index + 1)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO idle_worker_disposition_epoch(id,activatedAt,cause,principal)
+      VALUES (0,?1,'schema_activation','process:tightbeam')
+      """,
+      [activated_at]
+    )
+
+    maybe_interrupt_idle!(opts, index + 2)
+    validate_idle_worker_shape!(txn)
+  end
+
+  defp exec_idle_statements!(txn, statements, opts, start) do
+    Enum.reduce(statements, start, fn sql, index ->
+      :ok = Txn.exec(txn, sql)
+      next = index + 1
+      maybe_interrupt_idle!(opts, next)
+      next
+    end)
+  end
+
+  defp prove_copy!(txn, source, target, columns) do
+    selection = Enum.join(columns, ",")
+    [[source_count]] = Txn.q(txn, "SELECT count(*) FROM #{source}")
+    [[target_count]] = Txn.q(txn, "SELECT count(*) FROM #{target}")
+
+    mismatch =
+      source_count != target_count or
+        Txn.q(txn, "SELECT #{selection} FROM #{source} EXCEPT SELECT #{selection} FROM #{target}") !=
+          [] or
+        Txn.q(txn, "SELECT #{selection} FROM #{target} EXCEPT SELECT #{selection} FROM #{source}") !=
+          []
+
+    if mismatch,
+      do: incompatible_idle_worker!("migration preservation proof failed for #{source}")
+  end
+
+  defp maybe_interrupt_idle!(opts, statement_index) do
+    if Keyword.get(opts, :fail_after_statement) == statement_index,
+      do: raise("forced idle-worker activation interruption")
+  end
+
+  defp validate_idle_worker_shape!(txn) do
+    validate_idle_object!(txn, "table", "wake_cancellations", @wake_cancellations_v2_ddl)
+    validate_idle_object!(txn, "table", "wire_idempotency", @wire_idempotency_v2_ddl)
+    Enum.each(@idle_worker_objects, &validate_idle_object!(txn, &1.type, &1.name, &1.sql))
+
+    case Txn.q(txn, "SELECT id,activatedAt,cause,principal FROM idle_worker_disposition_epoch") do
+      [[0, at, "schema_activation", "process:tightbeam"]] when is_integer(at) and at >= 0 -> :ok
+      _ -> incompatible_idle_worker!("malformed idle_worker_disposition_epoch row")
+    end
+
+    invalid_generations =
+      Txn.q(txn, """
+      SELECT g.childSessionKey,g.generation
+      FROM idle_worker_generations g
+      JOIN sessions s ON s.sessionKey=g.childSessionKey
+      LEFT JOIN decision_requests d ON d.id=g.decisionRequestId
+      LEFT JOIN wakes p ON p.wakeId=g.promptWakeId
+      LEFT JOIN wakes r ON r.wakeId=d.parkWakeId
+      LEFT JOIN sessions historical_parent ON historical_parent.sessionKey=g.parentSessionKey
+      WHERE
+        (g.decisionRequestId IS NOT NULL AND (
+          d.id IS NULL OR d.ownerUserId!=s.ownerUserId OR d.statuteName!='idle-worker-disposition'
+          OR d.actionKey!='session:' || g.childSessionKey || '#' || g.generation
+          OR p.wakeId IS NULL OR r.wakeId IS NULL OR d.deadlineAt < 0
+          OR historical_parent.ownerUserId!=s.ownerUserId
+        ))
+        OR (g.state='pending' AND (s.state!='active' OR d.status!='open'))
+        OR (g.state='resolved' AND g.resolution IN ('retain','retire')
+          AND g.decisionRequestId IS NOT NULL AND d.status!='consumed')
+        OR (g.state='resolved' AND g.resolution='superseded' AND d.status!='superseded')
+      """)
+
+    if invalid_generations != [], do: incompatible_idle_worker!("invalid generation linkage")
+
+    nonmonotonic =
+      Txn.q(txn, """
+      SELECT childSessionKey
+      FROM idle_worker_generations
+      GROUP BY childSessionKey
+      HAVING MIN(generation)!=1 OR MAX(generation)!=COUNT(*)
+      """)
+
+    if nonmonotonic != [], do: incompatible_idle_worker!("nonmonotonic generations")
+
+    pending_children =
+      Txn.q(
+        txn,
+        "SELECT childSessionKey FROM idle_worker_generations WHERE state='pending'"
+      )
+
+    Enum.each(pending_children, fn [child] ->
+      case Tightbeam.Supervision.responsible_parent(txn, child) do
+        %{owner_user_id: _owner} -> :ok
+        _ -> incompatible_idle_worker!("pending generation has no responsible parent")
+      end
+    end)
+
+    validate_idle_proofs!(txn)
+    validate_lifecycle_results!(txn)
+    :ok
+  end
+
+  defp validate_idle_proofs!(txn) do
+    proofs =
+      Txn.q(txn, """
+      SELECT p.childSessionKey,p.generation,p.proofVersion,p.blockerCount,p.blockerDigest,p.sealed
+      FROM idle_worker_retire_proofs p ORDER BY p.childSessionKey,p.generation,p.proofVersion
+      """)
+
+    Enum.each(proofs, fn [child, generation, version, count, digest, sealed] ->
+      rows =
+        Txn.q(
+          txn,
+          """
+          SELECT leasedSessionKey,reason,startedAt,expiresAt,hardDeadline,updatedAt
+          FROM idle_worker_retire_blockers
+          WHERE childSessionKey=?1 AND generation=?2 AND proofVersion=?3 ORDER BY ordinal
+          """,
+          [child, generation, version]
+        )
+
+      computed =
+        rows
+        |> Tightbeam.Idempotency.canonical_json()
+        |> then(&:crypto.hash(:sha256, &1))
+        |> Base.encode16(case: :lower)
+
+      if sealed != 1 or count != length(rows) or digest != computed,
+        do: incompatible_idle_worker!("invalid blocker proof")
+    end)
+  end
+
+  defp validate_lifecycle_results!(txn) do
+    rows =
+      Txn.q(txn, """
+      SELECT resultJson FROM wire_idempotency
+      WHERE operation IN ('retain','retire') AND resultJson IS NOT NULL
+      """)
+
+    Enum.each(rows, fn [json] ->
+      try do
+        if Tightbeam.Idempotency.canonical_json(JSON.decode!(json)) != json,
+          do: incompatible_idle_worker!("noncanonical lifecycle result JSON")
+      rescue
+        _ -> incompatible_idle_worker!("malformed lifecycle result JSON")
+      end
+    end)
+  end
+
+  defp validate_idle_object!(txn, type, name, expected_sql) do
+    case Txn.q(txn, "SELECT sql FROM sqlite_master WHERE type=?1 AND name=?2", [type, name]) do
+      [[actual]] when is_binary(actual) ->
+        if normalize_schema_sql(actual) != normalize_schema_sql(expected_sql),
+          do: incompatible_idle_worker!("malformed owned object #{name}")
+
+      [] ->
+        incompatible_idle_worker!("missing owned object #{name}")
+
+      _ ->
+        incompatible_idle_worker!("duplicate owned object #{name}")
+    end
+  end
+
+  defp incompatible_idle_worker!(detail),
+    do: raise(ShapeError, message: "incompatible_idle_worker_disposition_v1: #{detail}")
 
   @doc false
   @spec ensure_supervision_liveness_v1_in_txn(Txn.t()) :: :ok
@@ -966,6 +1625,31 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  defp validate_owned_object!(txn, %{type: "table", name: "wake_cancellations"}) do
+    case Txn.q(
+           txn,
+           "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+         ) do
+      [[actual_sql]] when is_binary(actual_sql) ->
+        normalized = normalize_schema_sql(actual_sql)
+
+        if normalized in [
+             normalize_schema_sql(@wake_cancellations_v1_ddl),
+             normalize_schema_sql(@wake_cancellations_v2_ddl)
+           ] do
+          :ok
+        else
+          incompatible_supervision_liveness!("malformed owned object wake_cancellations")
+        end
+
+      [] ->
+        incompatible_supervision_liveness!("missing owned object wake_cancellations")
+
+      _ ->
+        incompatible_supervision_liveness!("duplicate owned object wake_cancellations")
+    end
+  end
+
   defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}) do
     case Txn.q(
            txn,
@@ -991,6 +1675,7 @@ defmodule Tightbeam.Schema do
     sql
     |> String.downcase()
     |> String.replace(~r/\bif\s+not\s+exists\b/u, "")
+    |> String.replace("\"", "")
     |> String.replace(~r/\s+/u, "")
     |> String.trim_trailing(";")
   end

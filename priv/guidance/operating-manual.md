@@ -59,6 +59,7 @@ Start a new session:
 address it. Add `--archetype <name>` to give the session that archetype's identity — its
 guidance, skills, and allowed hosts; add `--host <name>` to place it on a machine the
 archetype allows. End a session with `tightbeam retire --session <key>`; its history is kept.
+When a worker reaches zero open assignments, Tightbeam opens one idle-worker decision request for its responsible parent. Read the current request before you act. Copy one command from the prompt; its session key is already quoted as one shell argument. Run `tightbeam retain --session '<key>' --generation <n>` to keep the worker, or `tightbeam retire --session '<key>' --generation <n>` to end it. Use the generation printed in the prompt; a stale generation refuses without effect. A critical lease can defer retirement until its hard deadline. Re-read the request and retry the same generation after the blocker ends. Tightbeam records the choice and does not choose for you.
 Pass `--key <idempotencyKey>` on a spawn, assign, or wake you may retry, so the retry does not
 create a duplicate.
 Name what you hire so a directory of fifty reads at a glance. `--display` is

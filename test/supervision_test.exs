@@ -150,6 +150,62 @@ defmodule Tightbeam.SupervisionTest do
     refute "pendingTarget" in names
   end
 
+  test "idle disposition parent authority follows current same-owner rows", ctx do
+    assert %{
+             session_key: "supervisor",
+             routing_kind: "lineage",
+             lineage_rung: 1
+           } = Supervision.responsible_parent(ctx.db, "holder")
+
+    assert %{session_key: "supervisor", state: "retired"} = retire!(ctx.db, "supervisor")
+
+    assert %{
+             session_key: main_key,
+             routing_kind: "lineage",
+             lineage_rung: 2
+           } = Supervision.responsible_parent(ctx.db, "holder")
+
+    assert main_key == ctx.main.session_key
+    assert Supervision.disposition_principal?(ctx.db, "holder", main_key)
+    refute Supervision.disposition_principal?(ctx.db, "holder", "supervisor")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('foreign',0,1)"
+             )
+
+    foreign =
+      Org.create(ctx.db, %{
+        session_key: "foreign-parent",
+        display_name: "foreign-parent",
+        owner_user_id: "foreign",
+        origin: "user:foreign",
+        spawned_by: nil,
+        kind: "custom",
+        is_built_in: false,
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable"),
+        host: "eezo"
+      })
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+               "holder",
+               foreign.session_key
+             ])
+
+    assert %{
+             session_key: ^main_key,
+             routing_kind: "main_fallback",
+             lineage_rung: nil
+           } = Supervision.responsible_parent(ctx.db, "holder")
+
+    refute Supervision.disposition_principal?(ctx.db, "holder", foreign.session_key)
+  end
+
   test "startup refuses noncanonical liveness epoch provenance", ctx do
     {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_liveness_epoch")
 

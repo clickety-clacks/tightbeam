@@ -117,6 +117,13 @@ pub enum Command {
     Retire {
         identity: Identity,
         session_key: String,
+        generation: Option<u64>,
+        idempotency_key: Option<String>,
+    },
+    Retain {
+        identity: Identity,
+        session_key: String,
+        generation: u64,
         idempotency_key: Option<String>,
     },
     Tune {
@@ -469,7 +476,11 @@ COMMANDS:
       valid model catalog per harness — and, for admins, pending devices.
         tightbeam list --as orchestrator:news
 
-  retire --session <key> [--key <idempotencyKey>]
+  retain --session <key> --generation <n> [--key <idempotencyKey>]
+      Keep a worker active and consume its current idle-worker disposition request.
+      The generation is mandatory, positive, and copied from the request prompt.
+
+  retire --session <key> [--generation <n>] [--key <idempotencyKey>]
       End a session deliberately.
 
   tune --session <key> (--harness <harness> --model <model> |
@@ -741,6 +752,22 @@ fn split_args(args: Vec<String>) -> Flags {
 
 fn nonempty(flags: &HashMap<String, String>, name: &str) -> Option<String> {
     flags.get(name).filter(|value| !value.is_empty()).cloned()
+}
+
+fn positive_generation(
+    flags: &HashMap<String, String>,
+    required: bool,
+) -> Result<Option<u64>, String> {
+    match nonempty(flags, "generation") {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(value) if value > 0 => Ok(Some(value)),
+            _ => Err("--generation must be a positive integer".to_owned()),
+        },
+        None if required => {
+            Err("--generation is required and must be a positive integer".to_owned())
+        }
+        None => Ok(None),
+    }
 }
 
 /// PRESENCE, for the fields where an empty value means something. `nonempty`
@@ -1165,6 +1192,25 @@ fn parse_with_optional_catalog(
         "list" => Ok(Command::List {
             identity: identity(flags)?,
         }),
+        "retain" => {
+            let session_key = nonempty(flags, "session");
+            let usage =
+                "usage: tightbeam retain --session <key> --generation <n> [--key <idempotencyKey>]";
+            if parsed.positional.get(1).is_some()
+                || session_key.is_none()
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
+                return Err(usage.to_owned());
+            }
+            let generation = positive_generation(flags, true).map_err(|_| usage.to_owned())?;
+            Ok(Command::Retain {
+                identity: identity(flags)?,
+                session_key: session_key.expect("checked above"),
+                generation: generation.expect("required above"),
+                idempotency_key: nonempty(flags, "key"),
+            })
+        }
         "retire" => {
             let session_key = nonempty(flags, "session");
             if parsed.positional.get(1).is_some()
@@ -1172,11 +1218,12 @@ fn parse_with_optional_catalog(
                 || nonempty(flags, "role").is_some()
                 || nonempty(flags, "user").is_some()
             {
-                return Err("usage: tightbeam retire --session <key>".to_owned());
+                return Err("usage: tightbeam retire --session <key> [--generation <n>] [--key <idempotencyKey>]".to_owned());
             }
             Ok(Command::Retire {
                 identity: identity(flags)?,
                 session_key: session_key.expect("checked above"),
+                generation: positive_generation(flags, false)?,
                 idempotency_key: nonempty(flags, "key"),
             })
         }
@@ -1662,7 +1709,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retain, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2577,6 +2624,7 @@ mod tests {
                 "operator-ask",
                 "operator-rule",
                 "operator-withdraw",
+                "retain",
                 "retire",
                 "revoke-assignment",
                 "spawn",
@@ -3124,7 +3172,54 @@ mod tests {
         ] {
             assert_eq!(
                 parse(args),
-                Err("usage: tightbeam retire --session <key>".to_owned())
+                Err("usage: tightbeam retire --session <key> [--generation <n>] [--key <idempotencyKey>]".to_owned())
+            );
+        }
+
+        assert_eq!(
+            parse(strings(&[
+                "retain",
+                "--session",
+                "agent:child",
+                "--generation",
+                "7",
+                "--key",
+                "choice-7",
+                "--as",
+                "parent",
+            ])),
+            Ok(Command::Retain {
+                identity: Identity::Role("parent".to_owned()),
+                session_key: "agent:child".to_owned(),
+                generation: 7,
+                idempotency_key: Some("choice-7".to_owned()),
+            })
+        );
+
+        for args in [
+            strings(&["retain", "--session", "s", "--as-user", "flynn"]),
+            strings(&[
+                "retain",
+                "--session",
+                "s",
+                "--generation",
+                "0",
+                "--as-user",
+                "flynn",
+            ]),
+            strings(&[
+                "retain",
+                "--session",
+                "s",
+                "--generation",
+                "not-a-number",
+                "--as-user",
+                "flynn",
+            ]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam retain --session <key> --generation <n> [--key <idempotencyKey>]".to_owned())
             );
         }
     }
@@ -3133,7 +3228,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, revoke-assignment, work-item-create, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retain, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -3461,6 +3556,7 @@ mod tests {
                 Command::Retire {
                     identity: Identity::Role("owner".to_owned()),
                     session_key: "agent:x".to_owned(),
+                    generation: None,
                     idempotency_key: Some("retire-k".to_owned()),
                 },
             ),

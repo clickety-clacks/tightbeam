@@ -51,6 +51,7 @@ defmodule Tightbeam.GatewayTest do
     Assignments,
     ConnRegistry,
     Credentials,
+    CriticalLeases,
     DB,
     Devices,
     Dispatch,
@@ -732,6 +733,167 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "permanent"
     assert Org.get(ctx.db, Org.personal_session_key("flynn")).state == "active"
+  end
+
+  test "generation-bound retire is parent-authorized, terminally replayable, and lease-proofed",
+       ctx do
+    ensure_global_registry()
+    main_key = Org.personal_session_key("flynn")
+
+    Org.create(ctx.db, %{
+      session_key: main_key,
+      display_name: "Root Main",
+      kind: "main",
+      is_built_in: true,
+      owner_user_id: "flynn",
+      origin: "user:flynn",
+      archetype: "default",
+      host: "testhost",
+      harness: "claude",
+      provider: "anthropic",
+      model: Model.new("fable")
+    })
+
+    child = create_session(ctx.db, "generation-retire-child", "flynn", main_key)
+    sibling = create_session(ctx.db, "generation-retire-sibling", "flynn", main_key)
+
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 1_000})
+
+    assignment =
+      handlers["assign"].(%{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: child.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "one bounded epoch"}
+      })
+
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:child",
+      principal: {:session, child.session_key},
+      session_key: nil,
+      params: %{assignment_id: assignment.id, kind: "completion"}
+    })
+
+    call = %{
+      verb: "retire",
+      origin: "agent:main",
+      principal: {:session, main_key},
+      session_key: child.session_key,
+      params: %{generation: 1, idempotency_key: "generation-retire-one"}
+    }
+
+    assert %{retired_session_keys: [child_key], deferred: []} = result = handlers["retire"].(call)
+    assert child_key == child.session_key
+    assert Org.get(ctx.db, child.session_key).state == "retired"
+
+    assert {:ok, [["resolved", "retire"], ["consumed"]]} =
+             DB.query(ctx.db, """
+             SELECT g.state,g.resolution,d.status
+             FROM idle_worker_generations g
+             JOIN decision_requests d ON d.id=g.decisionRequestId
+             WHERE g.childSessionKey='generation-retire-child'
+             """)
+             |> then(fn {:ok, [[state, resolution, status]]} ->
+               {:ok, [[state, resolution], [status]]}
+             end)
+
+    assert Idempotency.canonical_json(handlers["retire"].(call)) ==
+             Idempotency.canonical_json(result)
+
+    assert %{code: "forbidden"} =
+             handlers["retire"].(%{
+               call
+               | origin: "agent:sibling",
+                 principal: {:session, sibling.session_key}
+             })
+
+    assert %{code: "not_found"} =
+             handlers["retire"].(%{
+               call
+               | session_key: "generation-retire-missing",
+                 params: %{idempotency_key: "generation-retire-one"}
+             })
+
+    leased_child = create_session(ctx.db, "generation-retire-leased", "flynn", main_key)
+
+    leased_assignment =
+      handlers["assign"].(%{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: leased_child.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "lease bounded epoch"}
+      })
+
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:leased",
+      principal: {:session, leased_child.session_key},
+      session_key: nil,
+      params: %{assignment_id: leased_assignment.id, kind: "completion"}
+    })
+
+    lease =
+      CriticalLeases.declare(
+        ctx.db,
+        leased_child.session_key,
+        60_000,
+        "finish atomic write",
+        120_000
+      )
+
+    leased_call = %{
+      verb: "retire",
+      origin: "agent:main",
+      principal: {:session, main_key},
+      session_key: leased_child.session_key,
+      params: %{generation: 1, idempotency_key: "generation-retire-leased"}
+    }
+
+    assert %{
+             retired_session_keys: [],
+             generation: 1,
+             proof_version: 1,
+             retry_at: retry_at,
+             deferred: [_]
+           } = deferred = handlers["retire"].(leased_call)
+
+    assert retry_at == lease.hard_deadline
+    assert Org.get(ctx.db, leased_child.session_key).state == "active"
+    assert handlers["retire"].(leased_call) == deferred
+
+    assert {:ok, [[1, ^retry_at, ^retry_at, 1]]} =
+             DB.query(ctx.db, """
+             SELECT p.proofVersion,p.retryAt,d.deadlineAt,p.sealed
+             FROM idle_worker_retire_proofs p
+             JOIN idle_worker_generations g
+               ON g.childSessionKey=p.childSessionKey AND g.generation=p.generation
+             JOIN decision_requests d ON d.id=g.decisionRequestId
+             WHERE p.childSessionKey='generation-retire-leased'
+             """)
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE wakeId LIKE 'w_retire_%' AND sessionKey=?1",
+               [leased_child.session_key]
+             )
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE critical_leases SET expiresAt=0 WHERE sessionKey=?1", [
+               leased_child.session_key
+             ])
+
+    assert %{retired_session_keys: [leased_key], deferred: []} =
+             handlers["retire"].(leased_call)
+
+    assert leased_key == leased_child.session_key
   end
 
   test "admin operator handler lists durable harness launches", ctx do

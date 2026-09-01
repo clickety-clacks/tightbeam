@@ -54,7 +54,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend toplines topline harness-processes)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retain retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend toplines topline harness-processes)
   @max_upload_bytes 32 * 1024 * 1024
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
@@ -131,6 +131,7 @@ defmodule Tightbeam.Wire.Router do
          {:ok, body, conn} <- read_json(conn),
          {:ok, verb} <- required_string(body["verb"]),
          :ok <- allowed_agent_verb(verb),
+         :ok <- valid_lifecycle_generation(verb, body["params"] || %{}),
          {:ok, origin, principal} <- agent_identity(body, auth, conn),
          {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
       call = %{
@@ -172,7 +173,15 @@ defmodule Tightbeam.Wire.Router do
   get "/api/streams" do
     with {:ok, device} <- device_auth(conn) do
       streams =
-        Org.list_for_user(db(conn), device.user_id, false) |> Enum.map(&Payloads.stream_session/1)
+        Org.list_for_user(db(conn), device.user_id, false)
+        |> Enum.map(fn session ->
+          session
+          |> Payloads.stream_session()
+          |> Map.put(
+            "idleWorkerDisposition",
+            Tightbeam.Assignments.idle_worker_projection(db(conn), session.session_key)
+          )
+        end)
 
       json(conn, 200, %{"streams" => streams})
     else
@@ -614,12 +623,15 @@ defmodule Tightbeam.Wire.Router do
       length(given) > 1 ->
         {:error, 400, "invalid_message", "exactly one of sessionKey, role, userId"}
 
-      verb == "retire" and (given == ["role"] or given == ["userId"]) ->
-        {:error, 400, "invalid_message", "retire takes sessionKey only"}
+      verb in ["retain", "retire"] and (given == ["role"] or given == ["userId"]) ->
+        {:error, 400, "invalid_message", "#{verb} takes sessionKey only"}
 
       verb in ["assign", "dispatch", "assignments"] and given == ["userId"] ->
         {:error, 400, "invalid_target_kind",
          "assignments are held by sessions; target a sessionKey or role"}
+
+      verb == "retain" and given == [] ->
+        {:error, 400, "missing_target", "retain requires a sessionKey target"}
 
       verb in ["assign", "dispatch"] and given == [] ->
         {:error, 400, "missing_target", "#{verb} requires a sessionKey or role target"}
@@ -989,6 +1001,23 @@ defmodule Tightbeam.Wire.Router do
 
   defp required_string(value) when is_binary(value) and value != "", do: {:ok, value}
   defp required_string(_), do: {:error, 400, "invalid_message", nil}
+
+  defp valid_lifecycle_generation("retain", %{"generation" => generation})
+       when is_integer(generation) and generation > 0,
+       do: :ok
+
+  defp valid_lifecycle_generation("retain", _params),
+    do: {:error, 400, "invalid_message", "retain requires a positive integer generation"}
+
+  defp valid_lifecycle_generation("retire", params) do
+    case Map.fetch(params, "generation") do
+      :error -> :ok
+      {:ok, generation} when is_integer(generation) and generation > 0 -> :ok
+      _ -> {:error, 400, "invalid_message", "retire generation must be a positive integer"}
+    end
+  end
+
+  defp valid_lifecycle_generation(_verb, _params), do: :ok
 
   defp streams_overrides_unsupported(body) do
     if Map.has_key?(body, "overrides") do

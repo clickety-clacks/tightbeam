@@ -11,6 +11,8 @@ defmodule Tightbeam.Escalation do
   alias Tightbeam.DB.Txn
 
   @default_decision_deadline_ms 86_400_000
+  @idle_worker_statute "idle-worker-disposition"
+  @idle_worker_remedy "Use retain --session <key> --generation <n> or retire --session <key> --generation <n>."
 
   # The `status` values a decision request row can hold — the schema CHECK's own set
   # (see @ddl). `list/4` accepts these plus the sentinel "all" (no status filter); any
@@ -159,111 +161,144 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  @doc "Open or re-return the one current open request for this action."
-  @spec escalate(DB.server(), map(), map(), map()) :: {:decision_pending, String.t()}
+  @doc "Open or re-return a request, including the transaction-owned idle lifecycle form."
+  @spec escalate(DB.server() | Txn.t(), map(), map(), map()) ::
+          {:decision_pending, String.t()} | :ok
   def escalate(db, call, statute, ctx) do
-    case Map.get(ctx, :dr_id) || Map.get(ctx, "dr_id") do
-      id when is_binary(id) ->
-        {:decision_pending, id}
+    if match?(%Txn{}, db) do
+      request = call
 
-      nil ->
-        now = now()
-        episode_key = Map.get(ctx, :episode_key) || Map.get(ctx, "episode_key")
-        {raiser_id, raiser_session_key} = raiser(call, episode_key)
-        owner_user_id = owner_user_id!(db, call)
-        statute_name = statute_name(statute)
-        action_key = action_key(call, episode_key)
-        assignment_id = assignment_id(call)
-        request_id = "dr_" <> Tightbeam.Id.uuid4()
-        question = fetch_string!(ctx, :question)
+      Txn.q(
+        db,
+        """
+        INSERT INTO decision_requests
+          (id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+           raisedAt, deadlineAt, statuteName, actionKey, question, options,
+           context, status, parkWakeId)
+        VALUES (?1, 'statute', 'process:tightbeam', NULL, ?2, ?3, ?4, ?5,
+                'idle-worker-disposition', ?6, ?7, ?8, ?9, 'open', ?10)
+        """,
+        [
+          request.id,
+          request.owner_user_id,
+          request.assignment_id,
+          request.raised_at,
+          request.deadline_at,
+          request.action_key,
+          request.question,
+          request.options,
+          request.context,
+          request.park_wake_id
+        ]
+      )
 
-        options =
-          ctx
-          |> then(&(Map.get(&1, :options) || Map.get(&1, "options")))
-          |> validate_options!()
-          |> encode_optional()
+      Wakes.schedule_in_txn(db, statute)
+      Wakes.schedule_in_txn(db, ctx)
+      :ok
+    else
+      case Map.get(ctx, :dr_id) || Map.get(ctx, "dr_id") do
+        id when is_binary(id) ->
+          {:decision_pending, id}
 
-        context =
-          JSON.encode!(%{verb: Map.fetch!(call, :verb), params: Map.fetch!(call, :params)})
+        nil ->
+          now = now()
+          episode_key = Map.get(ctx, :episode_key) || Map.get(ctx, "episode_key")
+          {raiser_id, raiser_session_key} = raiser(call, episode_key)
+          owner_user_id = owner_user_id!(db, call)
+          statute_name = statute_name(statute)
+          action_key = action_key(call, episode_key)
+          assignment_id = assignment_id(call)
+          request_id = "dr_" <> Tightbeam.Id.uuid4()
+          question = fetch_string!(ctx, :question)
 
-        deadline_at = now + decision_deadline_ms()
+          options =
+            ctx
+            |> then(&(Map.get(&1, :options) || Map.get(&1, "options")))
+            |> validate_options!()
+            |> encode_optional()
 
-        {:ok, request} =
-          DB.transaction(db, fn txn ->
-            Txn.q(
-              txn,
-              """
-              INSERT INTO decision_requests
-                (id, raiserId, raiserSessionKey, ownerUserId, assignmentId, raisedAt,
-                 deadlineAt, statuteName, actionKey, question, options, context, status)
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open')
-              ON CONFLICT DO NOTHING
-              """,
-              [
-                request_id,
-                raiser_id,
-                raiser_session_key,
-                owner_user_id,
-                assignment_id,
-                now,
-                deadline_at,
-                statute_name,
-                action_key,
-                question,
-                options,
-                context
-              ]
-            )
+          context =
+            JSON.encode!(%{verb: Map.fetch!(call, :verb), params: Map.fetch!(call, :params)})
 
-            inserted? = Txn.changes(txn) == 1
+          deadline_at = now + decision_deadline_ms()
 
-            [row] =
+          {:ok, request} =
+            DB.transaction(db, fn txn ->
               Txn.q(
                 txn,
-                "SELECT #{@request_columns} FROM decision_requests WHERE raiserId = ?1 AND statuteName = ?2 AND actionKey = ?3 AND status = 'open' ORDER BY rowid DESC LIMIT 1",
-                [raiser_id, statute_name, action_key]
+                """
+                INSERT INTO decision_requests
+                  (id, raiserId, raiserSessionKey, ownerUserId, assignmentId, raisedAt,
+                   deadlineAt, statuteName, actionKey, question, options, context, status)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'open')
+                ON CONFLICT DO NOTHING
+                """,
+                [
+                  request_id,
+                  raiser_id,
+                  raiser_session_key,
+                  owner_user_id,
+                  assignment_id,
+                  now,
+                  deadline_at,
+                  statute_name,
+                  action_key,
+                  question,
+                  options,
+                  context
+                ]
               )
 
-            request = request_from_row(row)
+              inserted? = Txn.changes(txn) == 1
 
-            if inserted? do
-              EventLog.lifecycle_in_txn(
-                txn,
-                "decision_request_opened",
-                request.id,
-                "raiser=#{raiser_id} statute=#{statute_name} owner=#{owner_user_id} assignment=#{assignment_id || "nil"}"
-              )
+              [row] =
+                Txn.q(
+                  txn,
+                  "SELECT #{@request_columns} FROM decision_requests WHERE raiserId = ?1 AND statuteName = ?2 AND actionKey = ?3 AND status = 'open' ORDER BY rowid DESC LIMIT 1",
+                  [raiser_id, statute_name, action_key]
+                )
 
-              # Transactional outbox: the owner notification is a durable wake
-              # armed with the request itself. Only the winning insert arms one;
-              # a conflict or replay arms none.
-              Wakes.schedule_in_txn(txn, %{
-                session_key: Org.personal_session_key(request.owner_user_id),
-                origin: "process:tightbeam",
-                prompt: owner_notification(request),
-                due_at: now,
-                target_gate: 0
-              })
-            end
+              request = request_from_row(row)
 
-            # Observability only (see @summon_kind). Ordering does not depend on this
-            # row landing, or on its position — the single writer stamped its own
-            # sequence before this transaction was opened. It stays inside the
-            # transaction so the record matches what actually happened, not because
-            # anything reads it back.
-            if is_binary(episode_key) do
-              EventLog.lifecycle_in_txn(
-                txn,
-                @summon_kind,
-                request.id,
-                "statute=#{statute_name} class=#{episode_key} opened=#{inserted?}"
-              )
-            end
+              if inserted? do
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "decision_request_opened",
+                  request.id,
+                  "raiser=#{raiser_id} statute=#{statute_name} owner=#{owner_user_id} assignment=#{assignment_id || "nil"}"
+                )
 
-            request
-          end)
+                # Transactional outbox: the owner notification is a durable wake
+                # armed with the request itself. Only the winning insert arms one;
+                # a conflict or replay arms none.
+                Wakes.schedule_in_txn(txn, %{
+                  session_key: Org.personal_session_key(request.owner_user_id),
+                  origin: "process:tightbeam",
+                  prompt: owner_notification(request),
+                  due_at: now,
+                  target_gate: 0
+                })
+              end
 
-        {:decision_pending, request.id}
+              # Observability only (see @summon_kind). Ordering does not depend on this
+              # row landing, or on its position — the single writer stamped its own
+              # sequence before this transaction was opened. It stays inside the
+              # transaction so the record matches what actually happened, not because
+              # anything reads it back.
+              if is_binary(episode_key) do
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  @summon_kind,
+                  request.id,
+                  "statute=#{statute_name} class=#{episode_key} opened=#{inserted?}"
+                )
+              end
+
+              request
+            end)
+
+          {:decision_pending, request.id}
+      end
     end
   end
 
@@ -383,6 +418,16 @@ defmodule Tightbeam.Escalation do
     request_id = param(call, :request_id) || param(call, :request)
     request = get_raw(db, request_id)
 
+    case request do
+      %{statute_name: @idle_worker_statute} ->
+        lifecycle_action_required()
+
+      _ ->
+        rule_request(db, call, request, opts)
+    end
+  end
+
+  defp rule_request(db, call, request, opts) do
     case request && request.kind do
       "effort" ->
         error("invalid", "effort requests use effort-rule")
@@ -430,6 +475,9 @@ defmodule Tightbeam.Escalation do
             not (is_binary(session_key) and is_binary(statute_name)) ->
               error("invalid", "waive requires --request or --session with --statute")
 
+            statute_name == @idle_worker_statute ->
+              lifecycle_action_required()
+
             raiser_id(call) == target_raiser_id ->
               error("not_owner", "raiser cannot waive its own statute")
 
@@ -442,6 +490,9 @@ defmodule Tightbeam.Escalation do
 
         %{kind: "operator"} ->
           error("invalid", "operator requests cannot be waived")
+
+        %{statute_name: @idle_worker_statute} ->
+          lifecycle_action_required()
 
         request ->
           if raiser_id(call) == request.raiser_id,
@@ -461,12 +512,21 @@ defmodule Tightbeam.Escalation do
       revoked_at = now()
 
       {:ok, rows} =
-        DB.query(db, "SELECT raiserId FROM escalation_waivers WHERE id = ?1", [waiver_id])
+        DB.query(db, "SELECT raiserId, statuteName FROM escalation_waivers WHERE id = ?1", [
+          waiver_id
+        ])
 
-      if rows == [[raiser_id(call)]] do
-        error("not_owner", "raiser cannot revoke its own waiver")
-      else
-        revoke_waiver_as_owner(db, waiver_id, call.origin, revoked_at)
+      caller_raiser = raiser_id(call)
+
+      case rows do
+        [[_raiser, @idle_worker_statute]] ->
+          lifecycle_action_required()
+
+        [[raiser, _statute]] when raiser == caller_raiser ->
+          error("not_owner", "raiser cannot revoke its own waiver")
+
+        _ ->
+          revoke_waiver_as_owner(db, waiver_id, call.origin, revoked_at)
       end
     else
       error("not_owner", "admin owner required")
@@ -515,6 +575,9 @@ defmodule Tightbeam.Escalation do
 
           %{kind: "operator"} ->
             error("invalid", "operator requests require operator-withdraw")
+
+          %{statute_name: @idle_worker_statute} ->
+            lifecycle_action_required()
 
           request when request.raiser_id != caller_raiser_id ->
             error("not_raiser", "raiser required")
@@ -703,7 +766,10 @@ defmodule Tightbeam.Escalation do
         params
       )
 
-    Enum.map(rows, &(request_from_row(&1) |> list_projection()))
+    rows
+    |> Enum.map(&request_from_row/1)
+    |> Enum.filter(&visible_idle_request?(db, call, &1))
+    |> Enum.map(&list_projection/1)
   end
 
   @doc """
@@ -723,10 +789,24 @@ defmodule Tightbeam.Escalation do
       )
 
     case rows do
-      [row] -> request_from_row(row)
-      [] -> nil
+      [row] ->
+        request = request_from_row(row)
+        if visible_idle_request?(db, call, request), do: request
+
+      [] ->
+        nil
     end
   end
+
+  @doc "Configured finite deadline used by native lifecycle requests."
+  @spec decision_deadline_ms() :: pos_integer()
+  def decision_deadline_ms,
+    do:
+      Application.get_env(
+        :tightbeam,
+        :escalation_decision_deadline_ms,
+        @default_decision_deadline_ms
+      )
 
   @doc "Canonical SHA-256 action fingerprint."
   @spec digest(map()) :: String.t()
@@ -1659,13 +1739,29 @@ defmodule Tightbeam.Escalation do
   defp param(call, key),
     do: Map.get(call.params, key) || Map.get(call.params, Atom.to_string(key))
 
-  defp decision_deadline_ms,
-    do:
-      Application.get_env(
-        :tightbeam,
-        :escalation_decision_deadline_ms,
-        @default_decision_deadline_ms
-      )
+  defp visible_idle_request?(_db, _call, %{statute_name: statute})
+       when statute != @idle_worker_statute,
+       do: true
+
+  defp visible_idle_request?(_db, %{principal: {:user, owner}}, %{owner_user_id: owner}),
+    do: true
+
+  defp visible_idle_request?(db, %{principal: {:session, caller}}, request) do
+    case DB.query(
+           db,
+           "SELECT childSessionKey FROM idle_worker_generations WHERE decisionRequestId=?1",
+           [request.id]
+         ) do
+      {:ok, [[child]]} -> Tightbeam.Supervision.disposition_principal?(db, child, caller)
+      _ -> false
+    end
+  end
+
+  defp visible_idle_request?(_db, _call, _request), do: false
+
+  defp lifecycle_action_required do
+    error("lifecycle_action_required", @idle_worker_remedy)
+  end
 
   defp fetch_string!(map, key) do
     value = Map.get(map, key) || Map.get(map, Atom.to_string(key))

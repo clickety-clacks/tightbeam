@@ -300,7 +300,8 @@ defmodule Tightbeam.Wakes do
     "tightbeam:assignments" => ~w(obligation_disposed),
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
-    "tightbeam:retirement" => ~w(target_retired obligation_disposed)
+    "tightbeam:retirement" => ~w(target_retired obligation_disposed),
+    "tightbeam:idle-worker-disposition" => ~w(superseded obligation_disposed)
   }
 
   @reason_matrix %{
@@ -494,7 +495,18 @@ defmodule Tightbeam.Wakes do
     source_id = Map.get(causal_source, :id)
 
     with :ok <- compatible?(requester_id, reason_kind, source_kind, outcome_kind),
-         {:ok, tagged} <- validate_outcome(txn, outcome_kind, outcome, wake, primary),
+         {:ok, tagged} <-
+           validate_outcome(
+             txn,
+             outcome_kind,
+             Map.put(
+               outcome,
+               :idle_worker_disposition,
+               requester_id == "tightbeam:idle-worker-disposition"
+             ),
+             wake,
+             primary
+           ),
          {:ok, durable_source_id, accepted_event_id} <-
            durable_source(txn, command, source_kind, source_id, wake, canceled_at) do
       {:ok,
@@ -582,6 +594,14 @@ defmodule Tightbeam.Wakes do
       source not in sources or outcome not in outcomes ->
         :error
 
+      requester_id == "tightbeam:idle-worker-disposition" ->
+        if (reason == "superseded" and source == "decision_request" and
+              outcome in ["replacement", "no_replacement"]) or
+             (reason == "obligation_disposed" and source == "decision_request" and
+                outcome == "disposition"),
+           do: :ok,
+           else: :error
+
       requester_id == "tightbeam:supervision" ->
         if reason == "superseded" and source == "progress_attest" and
              outcome == "no_replacement",
@@ -651,7 +671,9 @@ defmodule Tightbeam.Wakes do
   defp validate_outcome(txn, "replacement", outcome, wake, primary) do
     replacement_id = Map.get(outcome, :replacement_wake_id)
 
-    with true <- primary.impact != "linked_work_not_open",
+    with true <-
+           primary.impact != "linked_work_not_open" or
+             Map.get(outcome, :idle_worker_disposition) == true,
          true <- is_binary(replacement_id) and replacement_id != wake.wake_id,
          :ok <- replacement_matches(txn, replacement_id, primary),
          true <- is_nil(Map.get(outcome, :disposition_kind)),

@@ -65,6 +65,14 @@ defmodule Tightbeam.Wire.RouterTest do
         send(parent, {:call, call})
         %{assignments: []}
       end,
+      "retain" => fn call ->
+        send(parent, {:call, call})
+        %{session_key: call.session_key, generation: call.params.generation}
+      end,
+      "retire" => fn call ->
+        send(parent, {:call, call})
+        %{session_key: call.session_key, generation: call.params[:generation]}
+      end,
       "work-item-create" => fn call ->
         send(parent, {:call, call})
         %{id: "wi_test", title: call.params.title}
@@ -1304,6 +1312,62 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     assert missing_assignment.status == 404
+  end
+
+  test "lifecycle verbs require exact session targets and positive wire generations", ctx do
+    create_session(ctx.db, "idle-wire-child", "flynn")
+
+    for body <- [
+          %{verb: "retain", asUser: "flynn", sessionKey: "idle-wire-child", params: %{}},
+          %{
+            verb: "retain",
+            asUser: "flynn",
+            sessionKey: "idle-wire-child",
+            params: %{generation: 0}
+          },
+          %{
+            verb: "retire",
+            asUser: "flynn",
+            sessionKey: "idle-wire-child",
+            params: %{generation: "1"}
+          }
+        ] do
+      response = dispatch_cli(ctx, "tbc_test", body)
+      assert response.status == 400
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_message"
+      refute_receive {:call, _}
+    end
+
+    missing =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "retain",
+        asUser: "flynn",
+        params: %{generation: 1}
+      })
+
+    assert missing.status == 400
+
+    assert JSON.decode!(missing.resp_body)["error"] == %{
+             "code" => "missing_target",
+             "message" => "retain requires a sessionKey target"
+           }
+
+    valid =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "retain",
+        asUser: "flynn",
+        sessionKey: "idle-wire-child",
+        params: %{generation: 7, idempotencyKey: "choice-7"}
+      })
+
+    assert valid.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "retain",
+                      session_key: "idle-wire-child",
+                      params: %{generation: 7, idempotency_key: "choice-7"}
+                    }}
   end
 
   test "org CLI reserves process:tightbeam while other process origins still attribute", ctx do

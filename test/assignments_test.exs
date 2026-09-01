@@ -73,6 +73,209 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
+  test "idle work epochs request an explicit parent choice and only retain rearms", ctx do
+    main_key = Org.personal_session_key("flynn")
+
+    session(ctx.db, main_key, "flynn", %{
+      kind: "main",
+      is_built_in: true
+    })
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+               "holder",
+               main_key
+             ])
+
+    first = handle(ctx, "assign", assign_call({:user, "flynn"}, "first epoch"))
+
+    assert {:ok, [[1, "armed", first_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,state,armedBasisId FROM idle_worker_generations WHERE childSessionKey='holder'"
+             )
+
+    assert first_id == first.id
+
+    handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
+
+    assert {:ok, [[1, "pending", request_id, ^main_key]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,state,decisionRequestId,parentSessionKey FROM idle_worker_generations WHERE childSessionKey='holder'"
+             )
+
+    assert {:ok, [["open", deadline_at, reminder_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,deadlineAt,parkWakeId FROM decision_requests WHERE id=?1",
+               [
+                 request_id
+               ]
+             )
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND state='pending'",
+               [first.id]
+             )
+
+    assert %{code: "forbidden"} =
+             Assignments.retain(ctx.db, %{
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: "holder",
+               params: %{generation: 1}
+             })
+
+    assert %{
+             session_key: "holder",
+             generation: 1,
+             decision_request_id: ^request_id,
+             decision: "retain",
+             state: "active"
+           } =
+             Assignments.retain(ctx.db, %{
+               origin: "agent:main",
+               principal: {:session, main_key},
+               session_key: "holder",
+               params: %{generation: 1, idempotency_key: "retain-one"}
+             })
+
+    assert {:ok,
+            [
+              [
+                "tightbeam:idle-worker-disposition",
+                "obligation_disposed",
+                "decision_request",
+                "disposition"
+              ],
+              [
+                "tightbeam:idle-worker-disposition",
+                "obligation_disposed",
+                "decision_request",
+                "disposition"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT requesterId,reasonKind,causalSourceKind,outcomeKind FROM wake_cancellations ORDER BY wakeId"
+             )
+
+    second_assignment =
+      handle(ctx, "assign", assign_call({:user, "flynn"}, "second epoch"))
+
+    assert {:ok, [["resolved", "retain"], ["armed", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,resolution FROM idle_worker_generations WHERE childSessionKey='holder' ORDER BY generation"
+             )
+
+    handle(
+      ctx,
+      "attest",
+      attest_call({:session, "holder"}, second_assignment.id, "completion")
+    )
+
+    third = handle(ctx, "assign", assign_call({:user, "flynn"}, "third epoch"))
+    assert is_binary(third.id)
+
+    assert {:ok, [[2, "resolved", "superseded"], [3, "armed", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,state,resolution FROM idle_worker_generations WHERE childSessionKey='holder' AND generation>=2 ORDER BY generation"
+             )
+
+    assert {:ok, [["superseded"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id!=?1", [request_id])
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wake_cancellations WHERE requesterId='tightbeam:idle-worker-disposition' AND reasonKind='superseded' AND causalSourceKind='decision_request' AND outcomeKind='no_replacement'"
+             )
+
+    assert {:ok, [[^deadline_at, ^reminder_id]]} =
+             DB.query(ctx.db, "SELECT deadlineAt,parkWakeId FROM decision_requests WHERE id=?1", [
+               request_id
+             ])
+  end
+
+  test "idle disposition prompt shell-quotes custom session keys as one CLI argument", ctx do
+    main_key = Org.personal_session_key("flynn")
+
+    session(ctx.db, main_key, "flynn", %{
+      kind: "main",
+      is_built_in: true
+    })
+
+    fixture_dir =
+      Path.join(System.tmp_dir!(), "idle-disposition-argv-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(fixture_dir)
+    cli = Path.join(fixture_dir, "tightbeam")
+
+    File.write!(cli, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+    File.chmod!(cli, 0o755)
+    on_exit(fn -> File.rm_rf!(fixture_dir) end)
+
+    for child_key <- [Org.custom_session_key("flynn"), "idle'worker"] do
+      session(ctx.db, child_key, "flynn")
+
+      assert {:ok, _} =
+               DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+                 child_key,
+                 main_key
+               ])
+
+      assignment =
+        assign_call({:user, "flynn"}, "quoted child")
+        |> Map.put(:session_key, child_key)
+        |> then(&handle(ctx, "assign", &1))
+
+      attest_call({:session, child_key}, assignment.id, "completion")
+      |> then(&handle(ctx, "attest", &1))
+
+      assert {:ok, [[context_json]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT context FROM decision_requests WHERE actionKey=?1",
+                 ["session:#{child_key}#1"]
+               )
+
+      context = JSON.decode!(context_json)
+      quoted = "'" <> String.replace(child_key, "'", "'\"'\"'") <> "'"
+
+      for {verb, field} <- [{"retain", "retainCommand"}, {"retire", "retireCommand"}] do
+        command = context[field]
+
+        assert command == "tightbeam #{verb} --session #{quoted} --generation 1"
+
+        assert {argv, 0} =
+                 System.cmd("/bin/sh", ["-c", command], env: [{"PATH", fixture_dir}])
+
+        assert String.split(argv, "\n", trim: true) == [
+                 verb,
+                 "--session",
+                 child_key,
+                 "--generation",
+                 "1"
+               ]
+      end
+
+      assert {:ok, [[prompt]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT prompt FROM wakes WHERE assignmentId=?1 ORDER BY dueAt LIMIT 1",
+                 [assignment.id]
+               )
+
+      assert prompt =~ context["retainCommand"]
+      assert prompt =~ context["retireCommand"]
+    end
+  end
+
   test "assignment text limits are fixed by the specs, not application config", ctx do
     old_values =
       for key <- [:max_subject_len, :max_note_len, :max_verdict_kind_len, :max_idem_key_len],

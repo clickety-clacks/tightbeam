@@ -93,6 +93,66 @@ defmodule Tightbeam.EscalationTest do
     assert {:deny, %{code: "escalation_denied"}} = Escalation.resolve(ctx.db, call, statute)
   end
 
+  test "reserved idle-worker requests accept only lifecycle actions", ctx do
+    request_id = "dr_idle_worker_contract"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO decision_requests (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,question,context,status) VALUES (?1,'statute','process:tightbeam','flynn',1,2,'idle-worker-disposition','session:child#1','retain or retire','{}','open')",
+               [request_id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO escalation_waivers (id,raiserId,statuteName,grantedBy,grantedAt) VALUES ('waiver_idle','process:tightbeam','idle-worker-disposition','user:flynn',1)"
+             )
+
+    expected = %{
+      code: "lifecycle_action_required",
+      message:
+        "Use retain --session <key> --generation <n> or retire --session <key> --generation <n>."
+    }
+
+    assert ^expected =
+             Escalation.rule(ctx.db, rule_call(request_id, "allow"), authorized: true)
+
+    assert ^expected =
+             Escalation.waive(
+               ctx.db,
+               %{
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{request_id: request_id}
+               },
+               authorized: true
+             )
+
+    assert ^expected =
+             Escalation.revoke_waiver(
+               ctx.db,
+               %{
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{waiver_id: "waiver_idle"}
+               },
+               authorized: true
+             )
+
+    assert ^expected =
+             Escalation.withdraw(ctx.db, %{
+               origin: "process:tightbeam",
+               principal: {:process, "tightbeam"},
+               params: %{request_id: request_id, reason: "generic path"}
+             })
+
+    assert request(ctx, request_id).status == "open"
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT revokedAt FROM escalation_waivers WHERE id='waiver_idle'")
+  end
+
   test "concurrent nil-branch racers return the one partial-index winner", ctx do
     call = call(ctx.raiser, %{assignment_id: "a-race", kind: "completion"})
     parent = self()

@@ -6,7 +6,18 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
+
+  alias Tightbeam.{
+    EffortCheckin,
+    Escalation,
+    EventLog,
+    Idempotency,
+    Org,
+    Placement,
+    Projection,
+    Supervision,
+    Wakes
+  }
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
@@ -199,6 +210,12 @@ defmodule Tightbeam.Assignments do
           liveness_trigger
         )
       )
+
+      idle_terminal_in_txn(txn, session_key, assignment_id, %{
+        cause: "holder_retired",
+        requester_id: "tightbeam:retirement",
+        principal: principal
+      })
     end)
 
     assignments
@@ -217,6 +234,171 @@ defmodule Tightbeam.Assignments do
       ])
 
     count
+  end
+
+  @doc "Count open assignments through an existing writer transaction."
+  @spec open_count_in_txn(Txn.t(), String.t()) :: non_neg_integer()
+  def open_count_in_txn(%Txn{} = txn, session_key) do
+    [[count]] =
+      Txn.q(
+        txn,
+        "SELECT count(*) FROM assignments WHERE holderKey = ?1 AND state = 'open'",
+        [session_key]
+      )
+
+    count
+  end
+
+  @doc "Resolve one current pending idle-worker generation as retain."
+  @spec retain(DB.server(), map()) :: map()
+  def retain(db, call) do
+    with :ok <- valid_idempotency_key(call.params[:idempotency_key]) do
+      transaction(db, fn txn -> retain_in_txn(txn, call) end)
+    end
+  end
+
+  @doc "Authorize and fence one generation-bound retire inside its canonical transaction."
+  @spec generation_retire_preflight_in_txn(Txn.t(), map()) ::
+          {:ready, String.t(), String.t(), map()} | {:replay, map()} | map()
+  def generation_retire_preflight_in_txn(%Txn{} = txn, call) do
+    lifecycle_preflight_in_txn(txn, call, "retire")
+  end
+
+  @doc "Resolve the current generation immediately before canonical session retirement."
+  @spec resolve_for_retire_in_txn(Txn.t(), String.t(), String.t(), String.t()) :: :ok
+  def resolve_for_retire_in_txn(%Txn{} = txn, child_key, resolved_by, cause_id) do
+    case current_idle_generation(txn, child_key) do
+      nil ->
+        :ok
+
+      %{state: "armed"} = generation ->
+        resolve_generation_in_txn(
+          txn,
+          generation,
+          "retire",
+          resolved_by,
+          "session_transition",
+          cause_id
+        )
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "idle_worker_disposition_retired",
+          generation.child_session_key,
+          "generation=#{generation.generation} cause=session_transition:#{cause_id} principal=#{resolved_by}"
+        )
+
+      %{state: "pending"} = generation ->
+        consume_idle_request_in_txn(txn, generation, "retire", resolved_by, cause_id)
+
+      %{state: "resolved"} ->
+        :ok
+    end
+  end
+
+  @doc "Capture or reuse the immutable proof for a deferred generation-bound retire."
+  @spec defer_session_disposition_in_txn(Txn.t(), String.t(), pos_integer(), String.t(), [map()]) ::
+          map()
+  def defer_session_disposition_in_txn(
+        %Txn{} = txn,
+        child_key,
+        generation_number,
+        acting_principal,
+        blockers
+      ) do
+    generation = current_idle_generation(txn, child_key)
+
+    if not match?(%{state: "pending", generation: ^generation_number}, generation) do
+      raise "stale idle-worker disposition generation during lease deferral"
+    end
+
+    blockers = Enum.sort_by(blockers, & &1.session_key)
+
+    canonical =
+      Enum.map(blockers, fn blocker ->
+        [
+          blocker.session_key,
+          blocker.reason,
+          blocker.started_at,
+          blocker.expires_at,
+          blocker.hard_deadline,
+          blocker.updated_at
+        ]
+      end)
+
+    digest =
+      canonical
+      |> Idempotency.canonical_json()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    case Txn.q(
+           txn,
+           """
+           SELECT proofVersion, retryAt
+           FROM idle_worker_retire_proofs
+           WHERE childSessionKey=?1 AND generation=?2 AND blockerDigest=?3 AND sealed=1
+           """,
+           [child_key, generation_number, digest]
+         ) do
+      [[proof_version, retry_at]] ->
+        proof_result(generation, proof_version, digest, retry_at)
+
+      [] ->
+        create_retire_proof_in_txn(txn, generation, acting_principal, blockers, digest)
+    end
+  end
+
+  @doc "Current public idle-worker state for one session catalog row."
+  @spec idle_worker_projection(DB.server(), String.t()) :: map() | nil
+  def idle_worker_projection(db, child_key) do
+    case DB.query(
+           db,
+           """
+           SELECT g.generation, g.state, g.decisionRequestId, g.initialDeadlineAt,
+                  dr.deadlineAt, g.resolution, g.resolvedAt, g.resolvedBy,
+                  g.retireProofVersion, p.retryAt
+           FROM idle_worker_generations g
+           LEFT JOIN decision_requests dr ON dr.id=g.decisionRequestId
+           LEFT JOIN idle_worker_retire_proofs p
+             ON p.childSessionKey=g.childSessionKey AND p.generation=g.generation
+            AND p.proofVersion=g.retireProofVersion
+           WHERE g.childSessionKey=?1
+           ORDER BY g.generation DESC LIMIT 1
+           """,
+           [child_key]
+         ) do
+      {:ok,
+       [
+         [
+           generation,
+           state,
+           request_id,
+           initial_deadline,
+           deadline,
+           resolution,
+           resolved_at,
+           resolved_by,
+           proof_version,
+           retry_at
+         ]
+       ]} ->
+        %{
+          generation: generation,
+          state: state,
+          decisionRequestId: request_id,
+          initialDeadlineAt: initial_deadline,
+          deadlineAt: deadline,
+          resolution: resolution,
+          resolvedAt: resolved_at,
+          resolvedBy: resolved_by,
+          retireProofVersion: proof_version,
+          retryAt: retry_at
+        }
+
+      {:ok, []} ->
+        nil
+    end
   end
 
   @doc "Return the oldest open assignment held by a session."
@@ -1016,6 +1198,8 @@ defmodule Tightbeam.Assignments do
           )
         end)
 
+        idle_assignment_open_in_txn(txn, call.session_key, id, now, principal_id(call.principal))
+
         supervision_transition!(txn, :armed, %{
           kind: "assignment_open",
           assignment_id: id,
@@ -1187,6 +1371,12 @@ defmodule Tightbeam.Assignments do
                   )
                 )
 
+                idle_terminal_in_txn(txn, holder, assignment_id, %{
+                  cause: "terminal_disposition",
+                  requester_id: "tightbeam:assignments",
+                  principal: principal_id(call.principal)
+                })
+
                 append_attest_marker(txn, attest)
                 append_assignment_marker(txn, closed_assignment, :closed)
                 %{assignment: closed_assignment, attest: attest}
@@ -1280,6 +1470,12 @@ defmodule Tightbeam.Assignments do
                 liveness_trigger
               )
             )
+
+            idle_terminal_in_txn(txn, assignment.holderKey, assignment_id, %{
+              cause: "terminal_disposition",
+              requester_id: "tightbeam:assignments",
+              principal: principal_id(call.principal)
+            })
 
             append_assignment_marker(txn, revoked_assignment, :revoked)
             revoked_assignment
@@ -1677,6 +1873,733 @@ defmodule Tightbeam.Assignments do
 
   defp absent_verdict_kind(_),
     do: error("invalid_verdict_kind", "verdictKind is only valid when kind is verdict")
+
+  defp retain_in_txn(txn, call) do
+    case lifecycle_preflight_in_txn(txn, call, "retain") do
+      {:replay, result} ->
+        result
+
+      {:ready, owner, digest, generation} ->
+        resolved_by = principal_id(call.principal)
+
+        consume_idle_request_in_txn(
+          txn,
+          generation,
+          "retain",
+          resolved_by,
+          generation.decision_request_id
+        )
+
+        result = %{
+          session_key: call.session_key,
+          generation: generation.generation,
+          decision_request_id: generation.decision_request_id,
+          decision: "retain",
+          state: "active"
+        }
+
+        if is_binary(call.params[:idempotency_key]) do
+          Idempotency.put_lifecycle_in_txn(txn, %{
+            owner_user_id: owner,
+            operation: "retain",
+            idempotency_key: call.params.idempotency_key,
+            session_key: call.session_key,
+            input_digest: digest,
+            result: result,
+            completed_at: now()
+          })
+        end
+
+        result
+
+      refusal ->
+        refusal
+    end
+  end
+
+  defp lifecycle_preflight_in_txn(txn, call, operation) do
+    requested = call.params[:generation]
+
+    with true <- is_integer(requested) and requested > 0,
+         {:ok, owner, session_state} <-
+           authorize_disposition_in_txn(txn, call.principal, call.session_key) do
+      digest = Idempotency.lifecycle_input_digest(call.session_key, requested)
+      key = call.params[:idempotency_key]
+
+      replay =
+        if is_binary(key),
+          do: Idempotency.lifecycle_get_in_txn(txn, owner, operation, key, digest),
+          else: :miss
+
+      case replay do
+        {:replay, result} ->
+          {:replay, result}
+
+        :conflict ->
+          error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+        :miss ->
+          generation = current_idle_generation(txn, call.session_key)
+
+          if session_state == "active" and
+               match?(%{state: "pending", generation: ^requested}, generation) and
+               open_count_in_txn(txn, call.session_key) == 0 and
+               idle_request_open?(txn, generation.decision_request_id) do
+            {:ready, owner, digest, generation}
+          else
+            stale_generation(requested, generation)
+          end
+      end
+    else
+      false -> error("invalid", "generation must be a positive integer")
+      %{code: _} = refusal -> refusal
+    end
+  end
+
+  defp authorize_disposition_in_txn(txn, principal, child_key) do
+    case Txn.q(txn, "SELECT ownerUserId, state FROM sessions WHERE sessionKey=?1", [child_key]) do
+      [] ->
+        error("not_found", "session not found")
+
+      [[owner, state]] ->
+        case principal do
+          {:session, caller} ->
+            case Txn.q(
+                   txn,
+                   "SELECT ownerUserId, state FROM sessions WHERE sessionKey=?1",
+                   [caller]
+                 ) do
+              [[^owner, "active"]] ->
+                if Supervision.disposition_principal?(txn, child_key, caller),
+                  do: {:ok, owner, state},
+                  else: error("forbidden", "current responsible parent or Main required")
+
+              [[_foreign_owner, _state]] ->
+                error("not_found", "session not found")
+
+              [] ->
+                error("forbidden", "current responsible parent or Main required")
+            end
+
+          _ ->
+            error("forbidden", "current responsible parent or Main required")
+        end
+    end
+  end
+
+  defp idle_assignment_open_in_txn(txn, child_key, assignment_id, armed_at, principal) do
+    case Txn.q(
+           txn,
+           "SELECT ownerUserId, isBuiltIn, state FROM sessions WHERE sessionKey=?1",
+           [child_key]
+         ) do
+      [[owner, is_built_in, "active"]] ->
+        root? = is_built_in == 1 and child_key == Org.personal_session_key(owner)
+
+        unless root? do
+          current = current_idle_generation(txn, child_key)
+
+          next_generation =
+            case current do
+              nil ->
+                1
+
+              %{state: "armed"} ->
+                nil
+
+              %{state: "pending"} = pending ->
+                supersede_idle_generation_in_txn(txn, pending, assignment_id, principal)
+                pending.generation + 1
+
+              %{state: "resolved"} = resolved ->
+                resolved.generation + 1
+            end
+
+          if is_integer(next_generation) do
+            Txn.q(
+              txn,
+              """
+              INSERT INTO idle_worker_generations
+                (childSessionKey, generation, state, armedAt, armedBasisKind, armedBasisId)
+              VALUES (?1, ?2, 'armed', ?3, 'assignment_open', ?4)
+              """,
+              [child_key, next_generation, armed_at, assignment_id]
+            )
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "idle_worker_generation_armed",
+              child_key,
+              "generation=#{next_generation} cause=assignment_open:#{assignment_id} principal=#{principal}"
+            )
+          end
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp supersede_idle_generation_in_txn(txn, generation, assignment_id, principal) do
+    at = now()
+
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status='superseded' WHERE id=?1 AND status='open'",
+      [generation.decision_request_id]
+    )
+
+    cancel_idle_request_wakes_in_txn(txn, generation, "superseded", "no_replacement", nil)
+
+    resolve_generation_in_txn(
+      txn,
+      generation,
+      "superseded",
+      principal,
+      "assignment_open",
+      assignment_id,
+      at
+    )
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "idle_worker_disposition_superseded",
+      generation.child_session_key,
+      "generation=#{generation.generation} cause=assignment_open:#{assignment_id} principal=#{principal}"
+    )
+  end
+
+  defp idle_terminal_in_txn(
+         _txn,
+         _child_key,
+         _assignment_id,
+         %{cause: "holder_retired", requester_id: "tightbeam:retirement"}
+       ),
+       do: :ok
+
+  defp idle_terminal_in_txn(txn, child_key, assignment_id, transition) do
+    if open_count_in_txn(txn, child_key) == 0 do
+      case current_idle_generation(txn, child_key) do
+        %{state: "armed"} = generation ->
+          open_idle_request_in_txn(txn, generation, assignment_id, transition)
+
+        _ ->
+          :ok
+      end
+    end
+  end
+
+  defp open_idle_request_in_txn(txn, generation, assignment_id, transition) do
+    case Txn.q(
+           txn,
+           """
+           SELECT ownerUserId, state, isBuiltIn
+           FROM sessions WHERE sessionKey=?1
+           """,
+           [generation.child_session_key]
+         ) do
+      [[owner, "active", is_built_in]] ->
+        root? =
+          is_built_in == 1 and generation.child_session_key == Org.personal_session_key(owner)
+
+        if not root? do
+          parent = Supervision.responsible_parent(txn, generation.child_session_key)
+
+          if parent do
+            at = now()
+            deadline_at = at + Escalation.decision_deadline_ms()
+            request_id = id("dr_")
+            prompt_id = idle_wake_id(generation, request_id, "prompt")
+            reminder_id = idle_wake_id(generation, request_id, "deadline")
+            quoted = idle_shell_quote(generation.child_session_key)
+
+            retain_command =
+              "tightbeam retain --session #{quoted} --generation #{generation.generation}"
+
+            retire_command =
+              "tightbeam retire --session #{quoted} --generation #{generation.generation}"
+
+            prompt =
+              "IDLE WORKER DISPOSITION: session #{generation.child_session_key} has zero open assignments in generation #{generation.generation}. Choose one: #{retain_command}, or #{retire_command}. Tightbeam will not choose or auto-retire."
+
+            reminder =
+              "Decision request #{request_id} reached its attention deadline; re-read current rows before acting. " <>
+                "Choose one: #{retain_command}, or #{retire_command}. Tightbeam will not choose or auto-retire."
+
+            question =
+              "Session #{generation.child_session_key} reached zero open assignments in generation #{generation.generation}; retain or retire it."
+
+            Escalation.escalate(
+              txn,
+              %{
+                id: request_id,
+                owner_user_id: owner,
+                assignment_id: assignment_id,
+                raised_at: at,
+                deadline_at: deadline_at,
+                action_key: "session:#{generation.child_session_key}##{generation.generation}",
+                question: question,
+                options:
+                  JSON.encode!([
+                    %{label: "retain", command: retain_command},
+                    %{label: "retire", command: retire_command}
+                  ]),
+                context:
+                  JSON.encode!(%{
+                    childSessionKey: generation.child_session_key,
+                    generation: generation.generation,
+                    zeroBasisAssignmentId: assignment_id,
+                    retainCommand: retain_command,
+                    retireCommand: retire_command
+                  }),
+                park_wake_id: reminder_id
+              },
+              %{
+                wake_id: prompt_id,
+                session_key: parent.session_key,
+                origin: "process:tightbeam",
+                prompt: prompt,
+                due_at: at,
+                assignment_id: assignment_id,
+                target_gate: 1
+              },
+              %{
+                wake_id: reminder_id,
+                session_key: parent.session_key,
+                origin: "process:tightbeam",
+                prompt: reminder,
+                due_at: deadline_at,
+                assignment_id: assignment_id,
+                target_gate: 1
+              }
+            )
+
+            Txn.q(
+              txn,
+              """
+              UPDATE idle_worker_generations
+              SET state='pending', zeroAt=?3, zeroBasisAssignmentId=?4,
+                  initialDeadlineAt=?5, decisionRequestId=?6, promptWakeId=?7,
+                  parentSessionKey=?8, routingKind=?9, lineageRung=?10
+              WHERE childSessionKey=?1 AND generation=?2 AND state='armed'
+              """,
+              [
+                generation.child_session_key,
+                generation.generation,
+                at,
+                assignment_id,
+                deadline_at,
+                request_id,
+                prompt_id,
+                parent.session_key,
+                parent.routing_kind,
+                parent.lineage_rung
+              ]
+            )
+
+            if Txn.changes(txn) != 1, do: raise("idle-worker pending transition lost its arm")
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "idle_worker_disposition_requested",
+              generation.child_session_key,
+              "generation=#{generation.generation} cause=#{transition.cause}:#{assignment_id} principal=#{transition.principal} request=#{request_id}"
+            )
+          end
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp consume_idle_request_in_txn(txn, generation, resolution, resolved_by, cause_id) do
+    at = now()
+
+    Txn.q(
+      txn,
+      """
+      UPDATE decision_requests
+      SET status='consumed', consumedAt=?2
+      WHERE id=?1 AND status='open' AND statuteName='idle-worker-disposition'
+      """,
+      [generation.decision_request_id, at]
+    )
+
+    if Txn.changes(txn) != 1, do: raise("idle-worker request is not open")
+
+    cancel_idle_request_wakes_in_txn(txn, generation, "obligation_disposed", "disposition", nil)
+
+    resolve_generation_in_txn(
+      txn,
+      generation,
+      resolution,
+      resolved_by,
+      "decision_request",
+      cause_id,
+      at
+    )
+
+    event =
+      if resolution == "retain",
+        do: "idle_worker_disposition_retained",
+        else: "idle_worker_disposition_retired"
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      event,
+      generation.child_session_key,
+      "generation=#{generation.generation} cause=decision_request:#{cause_id} principal=#{resolved_by}"
+    )
+  end
+
+  defp resolve_generation_in_txn(
+         txn,
+         generation,
+         resolution,
+         resolved_by,
+         cause_kind,
+         cause_id,
+         at \\ nil
+       ) do
+    at = at || now()
+
+    Txn.q(
+      txn,
+      """
+      UPDATE idle_worker_generations
+      SET state='resolved', resolution=?3, resolvedAt=?4, resolvedBy=?5,
+          resolutionCauseKind=?6, resolutionCauseId=?7
+      WHERE childSessionKey=?1 AND generation=?2 AND state IN ('armed','pending')
+      """,
+      [
+        generation.child_session_key,
+        generation.generation,
+        resolution,
+        at,
+        resolved_by,
+        cause_kind,
+        cause_id
+      ]
+    )
+
+    if Txn.changes(txn) != 1, do: raise("idle-worker generation resolution lost its row")
+    :ok
+  end
+
+  defp cancel_idle_request_wakes_in_txn(txn, generation, reason, outcome, replacement_id) do
+    [[park_wake_id]] =
+      Txn.q(txn, "SELECT parkWakeId FROM decision_requests WHERE id=?1", [
+        generation.decision_request_id
+      ])
+
+    [generation.prompt_wake_id, park_wake_id]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.each(
+      &cancel_idle_wake_in_txn(
+        txn,
+        &1,
+        generation.decision_request_id,
+        reason,
+        outcome,
+        replacement_id
+      )
+    )
+  end
+
+  defp cancel_idle_wake_in_txn(txn, wake_id, request_id, reason, outcome, replacement_id) do
+    tagged_outcome =
+      case outcome do
+        "replacement" ->
+          %{kind: "replacement", replacement_wake_id: replacement_id}
+
+        "disposition" ->
+          %{
+            kind: "disposition",
+            disposition_kind: "decision_request_transition",
+            disposition_id: request_id
+          }
+
+        "no_replacement" ->
+          %{kind: "no_replacement"}
+      end
+
+    Wakes.cancel_in_txn(txn, %{
+      wake_id: wake_id,
+      requester: %{kind: "process", id: "tightbeam:idle-worker-disposition"},
+      reason_kind: reason,
+      causal_source: %{kind: "decision_request", id: request_id},
+      outcome: tagged_outcome
+    })
+  end
+
+  defp create_retire_proof_in_txn(txn, generation, acting_principal, blockers, digest) do
+    [[last_version]] =
+      Txn.q(
+        txn,
+        """
+        SELECT COALESCE(MAX(proofVersion), 0)
+        FROM idle_worker_retire_proofs
+        WHERE childSessionKey=?1 AND generation=?2
+        """,
+        [generation.child_session_key, generation.generation]
+      )
+
+    proof_version = last_version + 1
+    captured_at = now()
+    retry_at = blockers |> Enum.map(& &1.hard_deadline) |> Enum.max()
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO idle_worker_retire_proofs
+        (childSessionKey, generation, proofVersion, decisionRequestId,
+         actingPrincipal, capturedAt, retryAt, blockerCount, blockerDigest, sealed)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+      """,
+      [
+        generation.child_session_key,
+        generation.generation,
+        proof_version,
+        generation.decision_request_id,
+        acting_principal,
+        captured_at,
+        retry_at,
+        length(blockers),
+        digest
+      ]
+    )
+
+    blockers
+    |> Enum.with_index(1)
+    |> Enum.each(fn {blocker, ordinal} ->
+      Txn.q(
+        txn,
+        """
+        INSERT INTO idle_worker_retire_blockers
+          (childSessionKey, generation, proofVersion, ordinal, leasedSessionKey,
+           reason, startedAt, expiresAt, hardDeadline, updatedAt)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        """,
+        [
+          generation.child_session_key,
+          generation.generation,
+          proof_version,
+          ordinal,
+          blocker.session_key,
+          blocker.reason,
+          blocker.started_at,
+          blocker.expires_at,
+          blocker.hard_deadline,
+          blocker.updated_at
+        ]
+      )
+    end)
+
+    stored =
+      Txn.q(
+        txn,
+        """
+        SELECT leasedSessionKey, reason, startedAt, expiresAt, hardDeadline, updatedAt
+        FROM idle_worker_retire_blockers
+        WHERE childSessionKey=?1 AND generation=?2 AND proofVersion=?3
+        ORDER BY ordinal
+        """,
+        [generation.child_session_key, generation.generation, proof_version]
+      )
+
+    stored_digest =
+      stored
+      |> Idempotency.canonical_json()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    if length(stored) != length(blockers) or stored_digest != digest do
+      raise "idle-worker blocker proof verification failed"
+    end
+
+    Txn.q(
+      txn,
+      """
+      UPDATE idle_worker_retire_proofs SET sealed=1
+      WHERE childSessionKey=?1 AND generation=?2 AND proofVersion=?3 AND sealed=0
+      """,
+      [generation.child_session_key, generation.generation, proof_version]
+    )
+
+    replacement_id =
+      idle_wake_id(generation, generation.decision_request_id, "proof:#{proof_version}")
+
+    [[prior_deadline]] =
+      Txn.q(txn, "SELECT deadlineAt FROM decision_requests WHERE id=?1", [
+        generation.decision_request_id
+      ])
+
+    quoted = idle_shell_quote(generation.child_session_key)
+
+    Wakes.schedule_in_txn(txn, %{
+      wake_id: replacement_id,
+      session_key: generation.parent_session_key,
+      origin: "process:tightbeam",
+      prompt:
+        "Decision request #{generation.decision_request_id} reached its attention deadline; re-read current rows before acting. Choose one: tightbeam retain --session #{quoted} --generation #{generation.generation}, or tightbeam retire --session #{quoted} --generation #{generation.generation}. Tightbeam will not choose or auto-retire.",
+      due_at: retry_at,
+      assignment_id: generation.zero_basis_assignment_id,
+      target_gate: 1
+    })
+
+    cancel_idle_wake_in_txn(
+      txn,
+      park_wake_id(txn, generation.decision_request_id),
+      generation.decision_request_id,
+      "superseded",
+      "replacement",
+      replacement_id
+    )
+
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET deadlineAt=?2, parkWakeId=?3 WHERE id=?1 AND status='open'",
+      [generation.decision_request_id, retry_at, replacement_id]
+    )
+
+    Txn.q(
+      txn,
+      """
+      UPDATE idle_worker_generations SET retireProofVersion=?3
+      WHERE childSessionKey=?1 AND generation=?2 AND state='pending'
+      """,
+      [generation.child_session_key, generation.generation, proof_version]
+    )
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "idle_worker_retire_deferred",
+      generation.child_session_key,
+      "generation=#{generation.generation} cause=critical_lease principal=#{acting_principal} proofVersion=#{proof_version} digest=#{digest} priorDeadline=#{prior_deadline} retryAt=#{retry_at}"
+    )
+
+    proof_result(generation, proof_version, digest, retry_at)
+  end
+
+  defp proof_result(generation, proof_version, digest, retry_at) do
+    %{
+      decision_request_id: generation.decision_request_id,
+      generation: generation.generation,
+      proof_version: proof_version,
+      proof_digest: digest,
+      retry_at: retry_at
+    }
+  end
+
+  defp current_idle_generation(txn, child_key) do
+    case Txn.q(
+           txn,
+           """
+           SELECT childSessionKey, generation, state, armedAt, armedBasisKind, armedBasisId,
+                  zeroAt, zeroBasisAssignmentId, initialDeadlineAt, decisionRequestId,
+                  promptWakeId, parentSessionKey, routingKind, lineageRung, resolution,
+                  resolvedAt, resolvedBy, resolutionCauseKind, resolutionCauseId,
+                  retireProofVersion
+           FROM idle_worker_generations
+           WHERE childSessionKey=?1 ORDER BY generation DESC LIMIT 1
+           """,
+           [child_key]
+         ) do
+      [row] -> idle_generation(row)
+      [] -> nil
+    end
+  end
+
+  defp idle_generation([
+         child,
+         generation,
+         state,
+         armed_at,
+         armed_basis_kind,
+         armed_basis_id,
+         zero_at,
+         zero_basis_assignment_id,
+         initial_deadline_at,
+         decision_request_id,
+         prompt_wake_id,
+         parent_session_key,
+         routing_kind,
+         lineage_rung,
+         resolution,
+         resolved_at,
+         resolved_by,
+         cause_kind,
+         cause_id,
+         proof_version
+       ]) do
+    %{
+      child_session_key: child,
+      generation: generation,
+      state: state,
+      armed_at: armed_at,
+      armed_basis_kind: armed_basis_kind,
+      armed_basis_id: armed_basis_id,
+      zero_at: zero_at,
+      zero_basis_assignment_id: zero_basis_assignment_id,
+      initial_deadline_at: initial_deadline_at,
+      decision_request_id: decision_request_id,
+      prompt_wake_id: prompt_wake_id,
+      parent_session_key: parent_session_key,
+      routing_kind: routing_kind,
+      lineage_rung: lineage_rung,
+      resolution: resolution,
+      resolved_at: resolved_at,
+      resolved_by: resolved_by,
+      resolution_cause_kind: cause_kind,
+      resolution_cause_id: cause_id,
+      retire_proof_version: proof_version
+    }
+  end
+
+  defp idle_request_open?(txn, request_id) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM decision_requests WHERE id=?1 AND status='open' AND statuteName='idle-worker-disposition'",
+      [request_id]
+    ) == [[1]]
+  end
+
+  defp stale_generation(requested, current) do
+    %{
+      code: "stale_disposition_generation",
+      message: "idle-worker disposition generation is stale",
+      requestedGeneration: requested,
+      currentGeneration: current && current.generation
+    }
+  end
+
+  defp idle_wake_id(generation, request_id, kind) do
+    digest =
+      :crypto.hash(
+        :sha256,
+        Enum.join(
+          [
+            generation.child_session_key,
+            Integer.to_string(generation.generation),
+            request_id,
+            kind
+          ],
+          <<0>>
+        )
+      )
+      |> Base.encode16(case: :lower)
+
+    "w_idle_" <> digest
+  end
+
+  defp park_wake_id(txn, request_id) do
+    [[wake_id]] = Txn.q(txn, "SELECT parkWakeId FROM decision_requests WHERE id=?1", [request_id])
+    wake_id
+  end
+
+  defp idle_shell_quote(value), do: "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
 
   defp valid_verdict_kind(nil),
     do: error("missing_verdict_kind", "verdictKind is required when kind is verdict")

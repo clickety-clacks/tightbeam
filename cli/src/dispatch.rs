@@ -256,15 +256,36 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Retire {
             identity,
             session_key,
+            generation,
             idempotency_key,
         } => {
-            let params = idempotency_key
-                .as_ref()
-                .map(|value| vec![string_field("idempotencyKey", value)])
-                .unwrap_or_default();
+            let mut params = Vec::new();
+            if let Some(value) = generation {
+                params.push(format!("\"generation\":{value}"));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
             Ok(request(
                 identity,
                 "retire",
+                vec![string_field("sessionKey", session_key)],
+                params,
+            ))
+        }
+        Command::Retain {
+            identity,
+            session_key,
+            generation,
+            idempotency_key,
+        } => {
+            let mut params = vec![format!("\"generation\":{generation}")];
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            Ok(request(
+                identity,
+                "retain",
                 vec![string_field("sessionKey", session_key)],
                 params,
             ))
@@ -1465,6 +1486,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Artifacts { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
+        | Command::Retain { identity, .. }
         | Command::Retire { identity, .. }
         | Command::Tune { identity, .. }
         | Command::Assign { identity, .. }
@@ -2304,6 +2326,34 @@ mod tests {
                     "flynn",
                 ][..],
                 r#"{"asUser":"flynn","verb":"retire","sessionKey":"agent:r","params":{"idempotencyKey":"retire-k"}}"#,
+            ),
+            (
+                &[
+                    "retire",
+                    "--session",
+                    "agent:r",
+                    "--generation",
+                    "9",
+                    "--key",
+                    "retire-generation-9",
+                    "--as",
+                    "parent",
+                ][..],
+                r#"{"as":"parent","verb":"retire","sessionKey":"agent:r","params":{"generation":9,"idempotencyKey":"retire-generation-9"}}"#,
+            ),
+            (
+                &[
+                    "retain",
+                    "--session",
+                    "agent:r",
+                    "--generation",
+                    "9",
+                    "--key",
+                    "retain-generation-9",
+                    "--as",
+                    "parent",
+                ][..],
+                r#"{"as":"parent","verb":"retain","sessionKey":"agent:r","params":{"generation":9,"idempotencyKey":"retain-generation-9"}}"#,
             ),
             (
                 &["cancel-wake", "wake-1", "--as-process", "cron"][..],

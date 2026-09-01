@@ -141,6 +141,22 @@ defmodule Tightbeam.ArchetypesTest do
     refute manual =~ "worktree-session"
   end
 
+  test "the operating manual carries the idle-worker disposition directive exactly once" do
+    manual = Archetypes.builtin_fragments()["operating-manual.md"]
+
+    directive =
+      "When a worker reaches zero open assignments, Tightbeam opens one idle-worker decision request for its responsible parent. Read the current request before you act. Copy one command from the prompt; its session key is already quoted as one shell argument. Run `tightbeam retain --session '<key>' --generation <n>` to keep the worker, or `tightbeam retire --session '<key>' --generation <n>` to end it. Use the generation printed in the prompt; a stale generation refuses without effect. A critical lease can defer retirement until its hard deadline. Re-read the request and retry the same generation after the blocker ends. Tightbeam records the choice and does not choose for you."
+
+    assert length(:binary.matches(manual, directive)) == 1
+
+    [before_hire, hire_section] =
+      String.split(manual, "## Hire help: spawn and retire", parts: 2)
+
+    refute before_hire =~ "tightbeam retain"
+    assert hire_section =~ directive
+    assert hire_section =~ "tightbeam retire --session <key>"
+  end
+
   test "the shipped bundle loads role guidance and elected shared skills", ctx do
     Identity.init!(ctx.base_dir)
 
