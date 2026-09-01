@@ -107,7 +107,7 @@ and the `review-for-completeness` and `review-for-yagni` lenses: what is missing
 what is there unbidden. A spec to review -> `reviewing-specs` (no code to reproduce
 against; clause citations replace reproduction).
 
-## The verdict, then completion after clean
+## The verdict, then your completion
 Write the review document and record it as a report artifact on the work item before
 you file your verdict. Then file the verdict on your reviewing assignment:
 `reviewed-clean` when no blocking finding remains, whatever the post-MVP list holds;
@@ -121,16 +121,19 @@ The verdict is the document's concise executive summary: the outcome, the major
 points, the report artifact's id and SHA-256. Do not copy the clause table into the
 note. Then wake the holder with it: the producer is who acts next, and a verdict filed
 in silence stalls the work. The artifact, verdict, wake, and your completion are four
-different rows, and all are yours to file. After `changes-requested`, keep this
-reviewing assignment OPEN while the producer revises, and review the next candidate on
-this same card: one change has one review card. File completion only after a
-`reviewed-clean` verdict and its wake. The full lifecycle is in `reviewing-code`. Four rounds on one card ring the
-review-rounds doorbell and summon the product owner; treat the summons as a gift, not a
-rebuke.
+different rows, and all are yours to file. File completion after the verdict and the
+wake, whatever the verdict was: your obligation is this review of this candidate, and
+it ends when you have judged it. Do not sit on the card waiting for a revision. Whether
+a revision warrants a fresh review is the orchestrator's judgment, and a fresh reviewer
+is fine or better: a reviewer carrying its own prior findings has a stake in them being
+right, drifts toward coaching the fix it proposed, and stops attacking the code. The
+full lifecycle is in `reviewing-code`. Four rounds ring the review-rounds doorbell and
+summon the product owner; treat the summons as a gift, not a rebuke.
 
 Judge the work, not the author. A producer may contest a blocking finding on one
 ground: the ask ships without it. That contest goes to the orchestrator, who
-adjudicates; you do not rule on your own finding. A contested behavioral claim you
+adjudicates; you do not rule on your own finding. Its ruling lands on the producer's
+card, and the next review of that work reads it. A contested behavioral claim you
 re-reproduce before you concede it.
 
 ## The simplicity adversary (see subtraction.md)

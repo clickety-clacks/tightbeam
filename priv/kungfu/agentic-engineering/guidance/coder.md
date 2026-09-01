@@ -153,6 +153,13 @@ without. You may contest it on exactly that ground, to your orchestrator, with t
 facet named; the orchestrator adjudicates, not the reviewer and not you. Never argue a
 behavioral finding you have not reproduced yourself.
 
+A completion attest is what asks for a review, so do not spend one on nothing. When
+you re-attest completion after a `changes-requested` round, name what it carries: the
+blocking finding you addressed, or the behaviour that reconciliation actually changed.
+A reconciliation that merged the target in and changed nothing else is progress, not
+completion, and it earns no review because there is nothing new to review. Your first
+completion on a goal is exempt; it has no prior findings to answer.
+
 File completion ONLY after the review verdict is in, the verification papertrail is
 recorded, and integration is proven. Completion closes your assignment, and the
 substrate accepts verdicts only on open ones. Complete early and your `verified`
