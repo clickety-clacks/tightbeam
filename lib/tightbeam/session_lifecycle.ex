@@ -226,6 +226,7 @@ defmodule Tightbeam.SessionLifecycle do
   defp accept_new_in_txn(txn, attrs, input) do
     session = Org.get_in_txn(txn, input.session_key)
     admission = authority_admission(txn, session, input.principal, attrs, input)
+    fenced_retry? = fenced_unknown_liveness_retry?(txn, session, input, admission)
 
     refusal =
       cond do
@@ -245,7 +246,7 @@ defmodule Tightbeam.SessionLifecycle do
         not retry_valid?(txn, input.cause_kind, input.cause_id, input.retry_of) ->
           "invalid_retry"
 
-        session.state != "active" ->
+        session.state != "active" and not fenced_retry? ->
           if session.state in ["parking", "parked"],
             do: "lifecycle_contended",
             else: "session_not_active"
@@ -257,11 +258,11 @@ defmodule Tightbeam.SessionLifecycle do
     if refusal do
       record_refusal(txn, input, refusal)
     else
-      accept_request(txn, session, input, admission, attrs)
+      accept_request(txn, session, input, admission, attrs, fenced_retry?)
     end
   end
 
-  defp accept_request(txn, session, input, admission, attrs) do
+  defp accept_request(txn, session, input, admission, attrs, fenced_retry?) do
     request_id = "pr_" <> Id.uuid4()
     generation = session.lifecycle_generation + 1
     accepted_at = now()
@@ -327,24 +328,63 @@ defmodule Tightbeam.SessionLifecycle do
       ]
     )
 
-    Txn.q(
-      txn,
-      """
-      UPDATE sessions
-      SET lifecycleGeneration=?2, lifecycleRequestId=?3,
-          updatedAt=MAX(updatedAt + 1, ?4)
-      WHERE sessionKey=?1 AND state='active' AND lifecycleGeneration=?5
-      """,
-      [input.session_key, generation, request_id, accepted_at, session.lifecycle_generation]
-    )
+    if fenced_retry? do
+      Txn.q(
+        txn,
+        """
+        UPDATE sessions
+        SET lifecycleGeneration=?2, lifecycleRequestId=?3,
+            updatedAt=MAX(updatedAt + 1, ?4)
+        WHERE sessionKey=?1 AND state='active' AND lifecycleGeneration=?5
+          AND lifecycleRequestId=?6
+        """,
+        [
+          input.session_key,
+          generation,
+          request_id,
+          accepted_at,
+          session.lifecycle_generation,
+          input.retry_of
+        ]
+      )
+    else
+      Txn.q(
+        txn,
+        """
+        UPDATE sessions
+        SET lifecycleGeneration=?2, lifecycleRequestId=?3,
+            updatedAt=MAX(updatedAt + 1, ?4)
+        WHERE sessionKey=?1 AND state='active' AND lifecycleGeneration=?5
+          AND lifecycleRequestId IS NULL
+        """,
+        [input.session_key, generation, request_id, accepted_at, session.lifecycle_generation]
+      )
+    end
 
     if Txn.changes(txn) != 1, do: raise("park lifecycle acceptance race")
 
-    Txn.q(
-      txn,
-      "INSERT INTO session_lifecycle_states (sessionKey,state,generation,requestId,updatedAt) VALUES (?1,'parking',?2,?3,?4) ON CONFLICT(sessionKey) DO UPDATE SET state='parking',generation=excluded.generation,requestId=excluded.requestId,updatedAt=excluded.updatedAt WHERE session_lifecycle_states.state='active'",
-      [input.session_key, generation, request_id, accepted_at]
-    )
+    if fenced_retry? do
+      Txn.q(
+        txn,
+        "UPDATE session_lifecycle_states SET generation=?2,requestId=?3,updatedAt=?4 WHERE sessionKey=?1 AND state='parking' AND generation=?5 AND requestId=?6",
+        [
+          input.session_key,
+          generation,
+          request_id,
+          accepted_at,
+          session.lifecycle_generation,
+          input.retry_of
+        ]
+      )
+    else
+      Txn.q(
+        txn,
+        "INSERT INTO session_lifecycle_states (sessionKey,state,generation,requestId,updatedAt) VALUES (?1,'parking',?2,?3,?4) ON CONFLICT(sessionKey) DO UPDATE SET state='parking',generation=excluded.generation,requestId=excluded.requestId,updatedAt=excluded.updatedAt WHERE session_lifecycle_states.state='active'",
+        [input.session_key, generation, request_id, accepted_at]
+      )
+    end
+
+    if Txn.changes(txn) != 1, do: raise("park lifecycle fence race")
 
     EventLog.lifecycle_in_txn(
       txn,
@@ -894,6 +934,35 @@ defmodule Tightbeam.SessionLifecycle do
   defp retry_valid?(_txn, "retry", _cause_id, _retry_of), do: false
   defp retry_valid?(_txn, _cause_kind, _cause_id, nil), do: true
   defp retry_valid?(_txn, _cause_kind, _cause_id, _retry_of), do: false
+
+  # The failed request is the fence token. Recovery may replace only that
+  # exact token, and only after the ordinary owner/operator admission has
+  # succeeded. Settlement still calls the runtime boundary; this CAS proves no
+  # lifecycle fact beyond permission to try the named remedy again.
+  defp fenced_unknown_liveness_retry?(txn, session, input, admission) do
+    not is_nil(session) and input.cause_kind == "retry" and
+      is_binary(input.retry_of) and input.cause_id == input.retry_of and
+      admission[:basis] in ["owner_user", "administrator", "operator"] and
+      Txn.q(
+        txn,
+        """
+        SELECT 1
+        FROM park_requests pr
+        JOIN park_outcomes po USING(requestId)
+        JOIN session_lifecycle_states sls ON sls.sessionKey=pr.sessionKey
+        WHERE pr.requestId=?1 AND pr.sessionKey=?2
+          AND pr.sessionGeneration=?3
+          AND po.status='park_failed'
+          AND po.resultingLifecycleState='parking'
+          AND po.recoveryState='fenced_unknown_liveness'
+          AND po.failureCode='runtime_liveness_unknown'
+          AND po.remedy='resolve_runtime_then_relaunch'
+          AND sls.state='parking' AND sls.generation=pr.sessionGeneration
+          AND sls.requestId=pr.requestId
+        """,
+        [input.retry_of, input.session_key, session.lifecycle_generation]
+      ) == [[1]]
+  end
 
   defp record_refusal(txn, input, code) do
     refusal_id = "pref_" <> Id.uuid4()

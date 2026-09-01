@@ -7453,7 +7453,7 @@ defmodule Tightbeam.Gateway do
     |> harnesses_for_provider()
     |> Enum.reduce(:ok, fn module, result ->
       close_result =
-        AdapterCoordinator.close_adapter(
+        AdapterCoordinator.close_adapter_gracefully(
           Tightbeam.AdapterCoordinator,
           {module.id(), "shared", machine}
         )
@@ -7936,6 +7936,10 @@ defmodule Tightbeam.Gateway do
     session_key = call.params[:session_key]
     idempotency_key = call.params[:idempotency_key]
     mode = call.params[:mode] || "graceful"
+    retry_of = call.params[:retry_of_request_id]
+
+    {cause_kind, cause_id} =
+      if is_binary(retry_of), do: {"retry", retry_of}, else: {"manual", idempotency_key}
 
     case Org.get(db, session_key) do
       nil ->
@@ -7944,8 +7948,9 @@ defmodule Tightbeam.Gateway do
           principal: call.principal,
           idempotency_key: idempotency_key,
           mode: mode,
-          cause_kind: "manual",
-          cause_id: idempotency_key
+          cause_kind: cause_kind,
+          cause_id: cause_id,
+          retry_of_request_id: retry_of
         })
 
       session ->
@@ -7955,10 +7960,10 @@ defmodule Tightbeam.Gateway do
             principal: call.principal,
             idempotency_key: idempotency_key,
             mode: mode,
-            cause_kind: "manual",
-            cause_id: idempotency_key,
+            cause_kind: cause_kind,
+            cause_id: cause_id,
             workspace_path: Placement.workdir_path(config, session),
-            retry_of_request_id: call.params[:retry_of_request_id]
+            retry_of_request_id: retry_of
           })
 
         case request do

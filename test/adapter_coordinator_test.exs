@@ -188,7 +188,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
            Agent.get(lifecycle, fn _ ->
              send(owner, {:capture_entered, self(), key})
-             :ok = AdapterCoordinator.close_adapter(coordinator, lifecycle_key)
+             :ok = AdapterCoordinator.close_adapter_gracefully(coordinator, lifecycle_key)
              [credential_kind: :subscription]
            end)
          end,
@@ -403,10 +403,15 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # handle_info/2 never sees it. That is the whole hazard: the park window is
     # a second, silent path a genuine death can leave by.
     :erlang.suspend_process(coordinator)
-    :ok = AdapterCoordinator.request_close_adapter(coordinator, key)
+
+    close =
+      Task.async(fn -> AdapterCoordinator.close_adapter_gracefully(coordinator, key) end)
+
     send(adapter, {:acp_exit, 137})
     assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}, 2_000
     :erlang.resume_process(coordinator)
+
+    assert {:error, {:graceful_close_failed, _reason}} = Task.await(close)
 
     assert eventually(fn ->
              ctx.db |> EventLog.lifecycle_events() |> Enum.any?(&(&1.kind == "adapter_down"))
@@ -418,7 +423,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # The row says which state the adapter died in. A park that was ASKED for
     # and got :normal is not a death and stays unrecorded (the test below);
     # this one was killed while the park was in flight.
-    assert detail =~ "kill_requested=true"
+    assert detail =~ "graceful_close=true"
     assert detail =~ "137"
   end
 
@@ -447,7 +452,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     ref = Process.monitor(adapter)
 
-    assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
+    assert :ok = AdapterCoordinator.close_adapter_gracefully(coordinator, key)
     assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}, 2_000
 
     assert [] = ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "adapter_down"))
@@ -560,7 +565,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     ref = Process.monitor(adapter)
 
-    assert :ok = AdapterCoordinator.close_adapter(coordinator, key)
+    assert :ok = AdapterCoordinator.close_adapter_gracefully(coordinator, key)
     assert_receive {:DOWN, ^ref, :process, ^adapter, _reason}, 2_000
 
     # A planned teardown IS a death for generation purposes: the successor must

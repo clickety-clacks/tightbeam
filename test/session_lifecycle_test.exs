@@ -207,6 +207,88 @@ defmodule Tightbeam.SessionLifecycleTest do
     assert SessionLifecycle.get(ctx.db, first.request_id).retry_request_ids == [retry.request_id]
   end
 
+  test "an owner causally retries the exact unknown-liveness fence before relaunch", ctx do
+    first =
+      SessionLifecycle.request(ctx.db, %{
+        session_key: ctx.session.session_key,
+        principal: {:user, "owner"},
+        idempotency_key: "unknown-runtime",
+        workspace_path: ctx.workdir
+      })
+
+    failed =
+      SessionLifecycle.settle(ctx.db, first.request_id, fn _ ->
+        {:error, :runtime_liveness_unknown}
+      end)
+
+    assert failed.outcome.status == "park_failed"
+    assert failed.outcome.resulting_lifecycle_state == "parking"
+    assert failed.outcome.recovery_state == "fenced_unknown_liveness"
+
+    retry =
+      SessionLifecycle.request(ctx.db, %{
+        session_key: ctx.session.session_key,
+        principal: {:user, "owner"},
+        idempotency_key: "runtime-resolved",
+        cause_kind: "retry",
+        cause_id: first.request_id,
+        retry_of_request_id: first.request_id,
+        workspace_path: ctx.workdir
+      })
+
+    refute retry.request_id == first.request_id
+    assert retry.outcome.status == "open"
+    assert retry.cause.retry_of_request_id == first.request_id
+
+    parked = SessionLifecycle.settle(ctx.db, retry.request_id, fn _ -> :ok end)
+    assert parked.outcome.status == "parked"
+
+    assert %{ok: true, sessionKey: session_key, state: "active"} =
+             SessionLifecycle.relaunch(ctx.db, ctx.session.session_key, {:user, "owner"})
+
+    assert session_key == ctx.session.session_key
+    assert SessionLifecycle.get(ctx.db, first.request_id).retry_request_ids == [retry.request_id]
+  end
+
+  test "a fenced unknown-liveness retry requires its exact request and an outside owner", ctx do
+    first =
+      SessionLifecycle.request(ctx.db, %{
+        session_key: ctx.session.session_key,
+        principal: {:user, "owner"},
+        idempotency_key: "unknown-runtime-refusals",
+        workspace_path: ctx.workdir
+      })
+
+    SessionLifecycle.settle(ctx.db, first.request_id, fn _ ->
+      {:error, :runtime_liveness_unknown}
+    end)
+
+    assert %{code: "lifecycle_contended"} =
+             SessionLifecycle.request(ctx.db, %{
+               session_key: ctx.session.session_key,
+               principal: {:session, ctx.session.session_key},
+               idempotency_key: "self-cannot-recover",
+               cause_kind: "retry",
+               cause_id: first.request_id,
+               retry_of_request_id: first.request_id,
+               workspace_path: ctx.workdir
+             })
+
+    assert %{code: "invalid_retry"} =
+             SessionLifecycle.request(ctx.db, %{
+               session_key: ctx.session.session_key,
+               principal: {:user, "owner"},
+               idempotency_key: "wrong-fence",
+               cause_kind: "retry",
+               cause_id: "pr_not_the_fence",
+               retry_of_request_id: "pr_not_the_fence",
+               workspace_path: ctx.workdir
+             })
+
+    assert SessionLifecycle.get(ctx.db, first.request_id).outcome.recovery_state ==
+             "fenced_unknown_liveness"
+  end
+
   test "retirement wins one accepted PARK race through its existing outcome", ctx do
     request =
       SessionLifecycle.request(ctx.db, %{

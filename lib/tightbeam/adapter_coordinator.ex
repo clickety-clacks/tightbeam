@@ -144,13 +144,16 @@ defmodule Tightbeam.AdapterCoordinator do
   def key_name({harness, archetype, host}), do: "#{harness}:#{archetype}@#{host}"
 
   @doc """
-  Best-effort planned teardown of the currently running adapter for `key`.
+  Graceful planned teardown of the currently running adapter for `key`.
   Bumps the generation: the successor's ready token must outrank every token
   stamped against the closed process, exactly as after a crash.
+
+  This boundary never sends a group signal. A caller that requires KILL must
+  use `close_adapter/3` with its typed principal and durable cause.
   """
-  @spec close_adapter(GenServer.server(), adapter_key()) :: :ok | {:error, term()}
-  def close_adapter(server \\ __MODULE__, key) do
-    close_adapter(server, key, %{})
+  @spec close_adapter_gracefully(GenServer.server(), adapter_key()) :: :ok | {:error, term()}
+  def close_adapter_gracefully(server \\ __MODULE__, key) do
+    GenServer.call(server, {:close_adapter_gracefully, key}, 30_000)
   catch
     :exit, reason -> {:error, {:coordinator_unavailable, reason}}
   end
@@ -160,17 +163,6 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, {:close_adapter, key, kill_attrs}, 30_000)
   catch
     :exit, reason -> {:error, {:coordinator_unavailable, reason}}
-  end
-
-  @doc """
-  Request planned teardown without synchronously entering the coordinator.
-
-  Used by lower-tier lifecycle owners whose notification must not wait on the
-  coordinator or on the Adapter it is closing.
-  """
-  @spec request_close_adapter(GenServer.server(), adapter_key()) :: :ok
-  def request_close_adapter(server \\ __MODULE__, key) do
-    GenServer.cast(server, {:close_adapter, key})
   end
 
   @doc "Gracefully close one resident harness session without stopping its shared adapter."
@@ -290,7 +282,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
     {result, state} =
       Enum.reduce_while(command.adapter_keys, {:ok, state}, fn key, {:ok, state} ->
-        case do_close_adapter(key, %{}, state) do
+        case do_close_adapter_gracefully(key, state) do
           {:ok, state} -> {:cont, {:ok, state}}
           {{:error, _reason} = error, state} -> {:halt, {error, state}}
         end
@@ -299,8 +291,8 @@ defmodule Tightbeam.AdapterCoordinator do
     {:reply, result, state}
   end
 
-  def handle_call({:close_adapter, key}, _from, state) do
-    {result, state} = do_close_adapter(key, %{}, state)
+  def handle_call({:close_adapter_gracefully, key}, _from, state) do
+    {result, state} = do_close_adapter_gracefully(key, state)
     {:reply, result, state}
   end
 
@@ -334,7 +326,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
     cond do
       live_entry?(entry) and authoritative? and entry.context != normalize_context(context) ->
-        case do_close_adapter(key, %{}, state) do
+        case do_close_adapter_gracefully(key, state) do
           {:ok, state} ->
             {reply, state} = start_adapter(key, state.adapters[key], state, context)
             {:reply, reply, state}
@@ -373,24 +365,12 @@ defmodule Tightbeam.AdapterCoordinator do
   end
 
   @impl true
-  def handle_cast({:close_adapter, key}, state) do
-    {_result, state} = do_close_adapter(key, %{}, state)
-    {:noreply, state}
-  end
-
   def handle_cast({:release_load_slot, machine, slot}, state) do
     {:noreply, release_slot(machine, slot, state)}
   end
 
   defp do_close_adapter(key, kill_attrs, state) do
-    request =
-      if map_size(kill_attrs) == 0 do
-        Tightbeam.HarnessProcess.begin_kill(state.db, key)
-      else
-        Tightbeam.HarnessProcess.request_kill(state.db, key, kill_attrs)
-      end
-
-    case request do
+    case Tightbeam.HarnessProcess.request_kill(state.db, key, kill_attrs) do
       {:ok, process_row} -> do_close_adapter_requested(key, process_row, state)
       {:error, refusal} -> {{:error, {:kill_refused, refusal}}, state}
     end
@@ -399,7 +379,7 @@ defmodule Tightbeam.AdapterCoordinator do
   defp do_close_adapter_requested(key, process_row, state) do
     state = cancel_pending_starts(key, state)
 
-    exited? =
+    exit_observation =
       case state.adapters[key] do
         %{pid: pid, monitor: monitor} when is_pid(pid) and is_reference(monitor) ->
           Tightbeam.Acp.Adapter.request_close(pid)
@@ -423,35 +403,79 @@ defmodule Tightbeam.AdapterCoordinator do
                   "absorbed=false kill_requested=true"
                 )
 
-              true
+              {:fault, reason}
 
             {:exited, :normal} ->
-              true
+              :graceful
 
             :grace_expired ->
-              false
+              :grace_expired
           end
 
         %{pid: pid} when is_pid(pid) ->
           Tightbeam.Acp.Adapter.request_close(pid)
-          false
+          :unobserved
 
         _ ->
-          false
+          :not_resident
       end
 
     reconcile_result =
-      case process_row do
-        :no_launch -> :ok
-        _row when exited? -> Tightbeam.HarnessProcess.reconcile_key(state.db, key)
-        row -> Tightbeam.HarnessProcess.kill(state.db, row)
+      case exit_observation do
+        :graceful -> Tightbeam.HarnessProcess.settle_graceful_exit(state.db, key)
+        _ -> Tightbeam.HarnessProcess.kill(state.db, process_row)
       end
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result
     state = retire_adapter(key, state)
-    if result == :ok, do: Tightbeam.HarnessProcess.complete_kill(state.db, key)
+
+    if result == :ok and exit_observation != :graceful,
+      do: Tightbeam.HarnessProcess.complete_kill(state.db, key)
 
     {result, state}
+  end
+
+  defp do_close_adapter_gracefully(key, state) do
+    case state.adapters[key] do
+      %{pid: pid, monitor: monitor} when is_pid(pid) and is_reference(monitor) ->
+        Tightbeam.Acp.Adapter.request_close(pid)
+
+        case await_adapter_exit(monitor, pid, state.kill_grace_ms) do
+          {:exited, :normal} ->
+            state = cancel_pending_starts(key, state)
+            result = Tightbeam.HarnessProcess.settle_graceful_exit(state.db, key)
+            result = if result == :already_resolved, do: :ok, else: result
+            {result, if(result == :ok, do: retire_adapter(key, state), else: state)}
+
+          {:exited, reason} ->
+            state = cancel_pending_starts(key, state)
+
+            :ok =
+              record_adapter_down(
+                state,
+                key,
+                MapSet.member?(state.ready_refs, monitor),
+                reason,
+                "absorbed=false graceful_close=true"
+              )
+
+            {{:error, {:graceful_close_failed, reason}}, retire_adapter(key, state)}
+
+          :grace_expired ->
+            {{:error, :graceful_close_timeout}, state}
+        end
+
+      %{pid: pid} when is_pid(pid) ->
+        Tightbeam.Acp.Adapter.request_close(pid)
+        {{:error, :runtime_liveness_unknown}, state}
+
+      _ ->
+        state = cancel_pending_starts(key, state)
+
+        if Tightbeam.HarnessProcess.fenced?(state.db, key),
+          do: {{:error, :runtime_liveness_unknown}, state},
+          else: {:ok, state}
+    end
   end
 
   # The REASON comes back, not just the fact of an exit. "Closed as asked" and

@@ -73,6 +73,7 @@ defmodule Tightbeam.GatewayTest do
     Roles,
     Rules,
     SessionLane,
+    SessionLifecycle,
     Wakes,
     WorkItems
   }
@@ -134,14 +135,14 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
       do: {:reply, make_ref(), state}
 
-    def handle_call({:close_adapter, key}, _from, {adapter, parent} = state) do
+    def handle_call({:close_adapter_gracefully, key}, _from, {adapter, parent} = state) do
       if is_pid(parent), do: send(parent, {:close_adapter, key})
       GenServer.stop(adapter)
       {:reply, :ok, state}
     end
 
     def handle_call({:close_adapter, key, _kill_attrs}, from, state),
-      do: handle_call({:close_adapter, key}, from, state)
+      do: handle_call({:close_adapter_gracefully, key}, from, state)
 
     def handle_call(:harness_processes, _from, {_adapter, parent} = state) do
       if is_pid(parent), do: send(parent, :harness_processes)
@@ -149,12 +150,6 @@ defmodule Tightbeam.GatewayTest do
     end
 
     def handle_cast({:release_load_slot, _machine, _slot}, state), do: {:noreply, state}
-
-    def handle_cast({:close_adapter, key}, {adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, {:close_adapter, key})
-      GenServer.stop(adapter)
-      {:noreply, state}
-    end
   end
 
   defmodule RepairCoordinatorStub do
@@ -170,6 +165,23 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call({:close_adapter, key, _kill_attrs}, from, state),
       do: handle_call({:close_adapter, key}, from, state)
+  end
+
+  defmodule ParkRecoveryCoordinatorStub do
+    use GenServer
+
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, %{parent: parent, result: {:error, :runtime_liveness_unknown}}}
+
+    def resolve_runtime(server), do: GenServer.call(server, :resolve_runtime)
+
+    def handle_call({:park_session, key, harness_session_id}, _from, state) do
+      send(state.parent, {:park_session, key, harness_session_id, state.result})
+      {:reply, state.result, state}
+    end
+
+    def handle_call(:resolve_runtime, _from, state),
+      do: {:reply, :ok, %{state | result: :ok}}
   end
 
   defmodule FenceDeleteRaceDB do
@@ -772,6 +784,76 @@ defmodule Tightbeam.GatewayTest do
              principal: {:user, "flynn"},
              params: %{request_id: request_id}
            }).status == "refused"
+  end
+
+  test "public PARK causally resolves the exact unknown-liveness fence then relaunches", ctx do
+    start_supervised!({
+      SessionLane,
+      session_key: "k1",
+      db: ctx.db,
+      task_sup: Tightbeam.TurnTaskSupervisor,
+      runner: fn _turn -> {:ok, %{text: "unused", stop_reason: "end_turn"}} end
+    })
+
+    Org.append_pointer(ctx.db, "k1", "resident-session", "loaded")
+    coordinator = start_supervised!({ParkRecoveryCoordinatorStub, self()})
+
+    handlers =
+      ctx.catalog_base
+      |> gateway_config(ctx.db, 0)
+      |> Map.put(:adapter_coordinator, coordinator)
+      |> Gateway.handlers()
+
+    failed =
+      handlers["session-park"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{
+          session_key: "k1",
+          idempotency_key: "unknown-runtime",
+          mode: "graceful"
+        }
+      })
+
+    assert failed.outcome.status == "park_failed"
+    assert failed.outcome.recovery_state == "fenced_unknown_liveness"
+    assert failed.outcome.remedy == "resolve_runtime_then_relaunch"
+
+    assert_receive {:park_session, {:claude, "shared", "testhost"}, "resident-session",
+                    {:error, :runtime_liveness_unknown}}
+
+    :ok = ParkRecoveryCoordinatorStub.resolve_runtime(coordinator)
+
+    parked =
+      handlers["session-park"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{
+          session_key: "k1",
+          idempotency_key: "resolved-runtime",
+          mode: "graceful",
+          retry_of_request_id: failed.request_id
+        }
+      })
+
+    assert parked.outcome.status == "parked"
+    assert parked.cause.kind == "retry"
+    assert parked.cause.id == failed.request_id
+    assert parked.cause.retry_of_request_id == failed.request_id
+
+    assert SessionLifecycle.get(ctx.db, failed.request_id).retry_request_ids == [
+             parked.request_id
+           ]
+
+    assert_receive {:park_session, {:claude, "shared", "testhost"}, "resident-session", :ok}
+
+    assert %{ok: true, sessionKey: "k1", state: "active"} =
+             handlers["session-relaunch"].(%{
+               principal: {:user, "flynn"},
+               params: %{session_key: "k1"}
+             })
+
+    assert_receive {:ensure_lane, "k1"}
   end
 
   test "assignment handlers inject configured supervision and effort settings before mutation",

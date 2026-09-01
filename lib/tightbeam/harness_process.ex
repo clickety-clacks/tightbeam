@@ -485,6 +485,16 @@ defmodule Tightbeam.HarnessProcess do
   def request_kill(db, key, attrs) do
     :ok = ensure_schema(db)
 
+    # An empty map used to select the pre-canonical fence-only seam. Keep that
+    # seam available to boot recovery, but make it impossible for the public
+    # request boundary to return a signal-capable row without a durable typed
+    # refusal or acceptance record.
+    attrs =
+      case attrs do
+        %{} = typed when map_size(typed) > 0 -> typed
+        _ -> %{principal: {:process, "unknown"}}
+      end
+
     case DB.transaction(db, &begin_kill_in_txn(&1, key, attrs)) do
       {:ok, %{kill_request_status: "refused"} = row} ->
         {:error, %{code: row.kill_refusal_code, request_id: row.kill_request_id}}
@@ -661,10 +671,31 @@ defmodule Tightbeam.HarnessProcess do
   @doc "Deliver SIGKILL to an authorized process group."
   @spec kill(DB.server(), row()) :: :ok | :already_resolved | {:error, term()}
   def kill(db, row) do
-    with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
-      deliver_kill(db, row)
+    if is_nil(open_kill_request_id(db, row)) do
+      {:error, {:kill_refused, :durable_request_required}}
     else
-      {:error, reason} -> unidentified(db, row, reason)
+      with {:ok, row} <- recover_identity_until(db, row, deadline(identity_wait_ms())) do
+        deliver_kill(db, row)
+      else
+        {:error, reason} -> unidentified(db, row, reason)
+      end
+    end
+  end
+
+  @doc "Settle the exact adapter exit already observed during the graceful KILL phase."
+  @spec settle_graceful_exit(DB.server(), tuple()) :: :ok | :already_resolved | {:error, term()}
+  def settle_graceful_exit(db, key) do
+    :ok = ensure_schema(db)
+
+    case DB.transaction(db, fn txn -> settle_graceful_exit_in_txn(txn, key) end) do
+      {:ok, {:resolved, row}} ->
+        remove_resolved_identity(db, row)
+
+      {:ok, result} ->
+        result
+
+      {:error, error} ->
+        raise error
     end
   end
 
@@ -752,6 +783,61 @@ defmodule Tightbeam.HarnessProcess do
       end
     else
       {:error, reason} -> unidentified(db, row, reason)
+    end
+  end
+
+  defp settle_graceful_exit_in_txn(txn, key) do
+    case latest_unresolved_in_txn(txn, key_name(key)) do
+      nil ->
+        :already_resolved
+
+      row ->
+        request_id = open_kill_request_id_in_txn(txn, row)
+
+        if row.state == "kill_requested" and is_nil(request_id) do
+          {:error, {:kill_refused, :durable_request_required}}
+        else
+          at = now()
+
+          DB.Txn.q(
+            txn,
+            "UPDATE harness_processes SET state='closed_gracefully',resolvedAt=?2,lastError=NULL WHERE launchId=?1 AND resolvedAt IS NULL",
+            [row.launch_id, at]
+          )
+
+          if DB.Txn.changes(txn) != 1, do: raise("graceful harness resolution race")
+
+          if request_id do
+            DB.Txn.q(
+              txn,
+              "UPDATE harness_kill_requests SET status='killed',refusalCode=NULL,failureCode=NULL,signalResult='graceful_exit',closedAt=?2 WHERE requestId=?1 AND status IN ('accepted','kill_failed')",
+              [request_id, at]
+            )
+
+            if DB.Txn.changes(txn) != 1, do: raise("graceful KILL request close race")
+            complete_kill_in_txn(txn, key)
+          end
+
+          {:resolved, row}
+        end
+    end
+  end
+
+  defp remove_resolved_identity(db, row) do
+    case remove_identity(row) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        :ok =
+          EventLog.lifecycle(
+            db,
+            "identity_remove_failed",
+            row.adapter_key,
+            inspect(%{launch_id: row.launch_id, reason: reason})
+          )
+
+        :ok
     end
   end
 
@@ -1639,6 +1725,23 @@ defmodule Tightbeam.HarnessProcess do
              ) do
           {:ok, [[request_id]]} -> request_id
           {:ok, []} -> nil
+        end
+    end
+  end
+
+  defp open_kill_request_id_in_txn(txn, row) do
+    case Map.get(row, :kill_request_id) do
+      request_id when is_binary(request_id) ->
+        request_id
+
+      _ ->
+        case DB.Txn.q(
+               txn,
+               "SELECT requestId FROM harness_kill_requests WHERE launchId=?1 AND status IN ('accepted','kill_failed') ORDER BY acceptedAt DESC,rowid DESC LIMIT 1",
+               [row.launch_id]
+             ) do
+          [[request_id]] -> request_id
+          [] -> nil
         end
     end
   end
