@@ -929,6 +929,15 @@ defmodule Tightbeam.HarnessProcess do
       """
       AND NOT EXISTS (
         SELECT 1
+          FROM harness_health_incidents AS incident
+          JOIN harness_health_adapter_keys AS projection
+            ON projection.incidentId = incident.id
+         WHERE incident.state = 'open'
+           AND incident.failureClass = 'rate-limit-dead'
+           AND projection.adapterKey = harness_park_fences.adapterKey
+      )
+      AND NOT EXISTS (
+        SELECT 1
           FROM harness_health_incidents
          WHERE state = 'open'
            AND failureClass = 'rate-limit-dead'
@@ -1153,7 +1162,8 @@ defmodule Tightbeam.HarnessProcess do
     }
   end
 
-  defp key_name({harness, preset, host}), do: "#{harness}:#{preset}@#{host}"
+  @doc false
+  def key_name({harness, preset, host}), do: "#{harness}:#{preset}@#{host}"
 
   defp command_timeout_ms,
     do: Application.get_env(:tightbeam, :harness_process_command_timeout_ms, @command_timeout_ms)

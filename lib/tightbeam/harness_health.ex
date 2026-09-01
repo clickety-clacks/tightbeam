@@ -14,7 +14,7 @@ defmodule Tightbeam.HarnessHealth do
   recycling remain outside this module.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Harness, HarnessProcess, Id, Org}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, HarnessProcess, Id, Org, Placement}
   alias Tightbeam.DB.Txn
 
   @failure_classes ~w(
@@ -99,6 +99,14 @@ defmodule Tightbeam.HarnessHealth do
     sessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
     PRIMARY KEY (incidentId, sessionKey)
   );
+
+  CREATE TABLE IF NOT EXISTS harness_health_adapter_keys (
+    incidentId TEXT NOT NULL REFERENCES harness_health_incidents(id),
+    adapterKey TEXT NOT NULL CHECK(length(trim(adapterKey)) > 0),
+    PRIMARY KEY (incidentId, adapterKey)
+  );
+  CREATE INDEX IF NOT EXISTS harness_health_adapter_key_lookup
+    ON harness_health_adapter_keys (adapterKey, incidentId);
   CREATE INDEX IF NOT EXISTS harness_health_member_session
     ON harness_health_members (sessionKey, incidentId);
 
@@ -499,7 +507,7 @@ defmodule Tightbeam.HarnessHealth do
     validate_session_membership!(txn, input)
 
     if input.failure_class == "rate-limit-dead" and
-         HarnessProcess.parked_in_txn?(txn, adapter_key(input.harness, input.host)) do
+         Enum.any?(adapter_keys(txn, input), &HarnessProcess.parked_in_txn?(txn, &1)) do
       :repair_required
     else
       case observation_by_correlation(txn, input.correlation_id) do
@@ -613,7 +621,15 @@ defmodule Tightbeam.HarnessHealth do
     )
 
     if input.failure_class == "rate-limit-dead" do
-      HarnessProcess.begin_park_in_txn(txn, adapter_key(input.harness, input.host))
+      Enum.each(adapter_keys(txn, input), fn adapter_key ->
+        Txn.q(
+          txn,
+          "INSERT OR IGNORE INTO harness_health_adapter_keys (incidentId,adapterKey) VALUES (?1,?2)",
+          [incident_id, HarnessProcess.key_name(adapter_key)]
+        )
+
+        HarnessProcess.begin_park_in_txn(txn, adapter_key)
+      end)
     end
 
     snapshot_affected_work(txn, incident_id, input)
@@ -675,7 +691,7 @@ defmodule Tightbeam.HarnessHealth do
         if Txn.changes(txn) != 1, do: raise("harness health incident resolution race")
 
         if input.failure_class == "rate-limit-dead" do
-          HarnessProcess.complete_park_in_txn(txn, adapter_key(input.harness, input.host))
+          Enum.each(adapter_keys(txn, input), &HarnessProcess.complete_park_in_txn(txn, &1))
         end
 
         EventLog.lifecycle_in_txn(
@@ -712,7 +728,32 @@ defmodule Tightbeam.HarnessHealth do
     count
   end
 
-  defp adapter_key(harness, host), do: {Harness.parse!(harness).id(), "shared", host}
+  defp adapter_keys(txn, input) do
+    {session_clause, params} =
+      case input.session_key do
+        session_key when is_binary(session_key) ->
+          {" AND sessionKey=?3", [input.harness, input.host, session_key]}
+
+        nil ->
+          {" AND state='active'", [input.harness, input.host]}
+      end
+
+    Txn.q(
+      txn,
+      "SELECT sessionKey,harness,host,archetype FROM sessions " <>
+        "WHERE harness=?1 AND host=?2" <> session_clause,
+      params
+    )
+    |> Enum.map(fn [session_key, harness, host, archetype] ->
+      Placement.adapter_key(%{
+        session_key: session_key,
+        harness: harness,
+        host: host,
+        archetype: archetype
+      })
+    end)
+    |> Enum.uniq()
+  end
 
   defp observations_to_attach(txn, input) do
     authoritative =

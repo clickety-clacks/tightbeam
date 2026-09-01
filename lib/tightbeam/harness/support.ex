@@ -2,7 +2,11 @@ defmodule Tightbeam.Harness.Support do
   @moduledoc false
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
-  @reserved_overlay_env_vars ~w(PATH CLAUDE_CONFIG_DIR CODEX_HOME TIGHTBEAM_URL)
+  @reserved_overlay_env_vars ~w(
+    PATH CLAUDE_CONFIG_DIR CODEX_HOME TIGHTBEAM_URL
+    TIGHTBEAM_MACHINE TIGHTBEAM_PRINCIPAL TIGHTBEAM_GITHUB_PROFILE GH_CONFIG_DIR
+    GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+  )
   @bundle_path Application.app_dir(:tightbeam, "priv/harness_bundle.json")
   @external_resource @bundle_path
   @credential_live_timeout_ms @bundle_path

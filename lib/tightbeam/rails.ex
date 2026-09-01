@@ -83,7 +83,6 @@ defmodule Tightbeam.Rails do
   # the same turn it would have bound anyway, while a miss silently downgrades a
   # correct agent's evidence.
   @observation_pattern "tightbeam[^\"]*artifact-record"
-
   @typedoc "A validated gate statute."
   @type statute :: %{
           name: String.t(),
@@ -146,7 +145,10 @@ defmodule Tightbeam.Rails do
 
     %{
       "hooks" => %{
-        "PreToolUse" => Enum.map(statutes, &pre_tool_use_entry/1) ++ [observation_entry()]
+        "PreToolUse" =>
+          Enum.map(statutes, &pre_tool_use_entry/1) ++
+            Enum.map(Tightbeam.Rules.tool_call_rules(), &tool_call_entry/1) ++
+            [observation_entry()]
       }
     }
   end
@@ -288,6 +290,31 @@ defmodule Tightbeam.Rails do
       "matcher" => statute.tool,
       "hooks" => [
         %{"type" => "command", "command" => "sh -c '" <> escape_single_quotes(payload) <> "'"}
+      ]
+    }
+  end
+
+  defp tool_call_entry(rule) do
+    command =
+      Enum.join(
+        [
+          "tightbeam dispatch-rule-check",
+          "--rule #{rule.name}",
+          "--handler #{rule.check.handler}",
+          "--abi #{rule.check.abi}",
+          "--identity-sha #{rule.identity_manifest_sha}"
+        ],
+        " "
+      )
+
+    %{
+      "matcher" => rule.actors.capability,
+      "hooks" => [
+        %{
+          "type" => "command",
+          "command" => command,
+          "timeout" => div(rule.check.timeout_ms + 999, 1_000)
+        }
       ]
     }
   end

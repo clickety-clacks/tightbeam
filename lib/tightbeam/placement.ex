@@ -106,7 +106,7 @@ defmodule Tightbeam.Placement do
           optional(:cli_bin) => String.t() | nil
         }
 
-  @typedoc "Adapter key. The reserved identity `shared` is the one runtime per harness+host."
+  @typedoc "Adapter key. Projection-scoped keys isolate immutable process environments."
   @type adapter_key :: {harness :: atom(), archetype :: String.t(), host :: String.t()}
 
   @hosts_ddl """
@@ -132,6 +132,49 @@ defmodule Tightbeam.Placement do
   """
 
   @env_name ~r/^[A-Z_][A-Z0-9_]*$/
+  @github_unset_env ~w(
+    TIGHTBEAM_GITHUB_PROFILE GH_CONFIG_DIR GH_TOKEN GITHUB_TOKEN
+    GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+  )
+
+  @doc "Return the stable, redacted adapter key for one session projection."
+  @spec adapter_key(Org.session()) :: adapter_key()
+  def adapter_key(session) do
+    harness = Harness.parse!(session.harness).id()
+    profile = github_profile(session) || "none"
+    principal = "session:#{session.session_key}"
+
+    fingerprint =
+      [Atom.to_string(harness), session.host, principal, profile]
+      |> Enum.join(<<0>>)
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 24)
+
+    {harness, "projection-" <> fingerprint, session.host}
+  end
+
+  @doc "List active projection keys for one harness and machine."
+  @spec adapter_keys(DB.server(), atom(), String.t()) :: [adapter_key()]
+  def adapter_keys(db, harness, host) do
+    db
+    |> Org.list_all()
+    |> Enum.filter(fn session ->
+      session.state == "active" and session.host == host and
+        Harness.parse!(session.harness).id() == harness
+    end)
+    |> Enum.map(&adapter_key/1)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  @doc false
+  def github_profile(session) do
+    case Archetypes.get(session.archetype) do
+      %{provisioning: %{credentials: %{github: profile}}} -> profile
+      _ -> nil
+    end
+  end
 
   @doc "Create the placement schema."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
@@ -1295,23 +1338,54 @@ defmodule Tightbeam.Placement do
       |> env_overlays(host, module.wire_name())
       |> Enum.map(&{&1.name, &1.value})
 
+    principal = Map.get(config, :projection_principal)
+    github_profile = Map.get(config, :github_profile)
+    credential_base = if host_config.ssh, do: host_config.base_dir, else: config.base_dir
+
+    projection_env =
+      if principal do
+        [{"TIGHTBEAM_PRINCIPAL", principal}] ++
+          if(github_profile,
+            do:
+              Tightbeam.GithubCredentials.projection(
+                credential_base,
+                host,
+                github_profile
+              ),
+            else: []
+          )
+      else
+        []
+      end
+
     common_env =
       [
         {"TIGHTBEAM_HOME", config.base_dir},
         {"TIGHTBEAM_MACHINE", host},
         {"PATH", config.cli_bin <> ":" <> (System.get_env("PATH") || "")},
         {"TIGHTBEAM_LINEAGE", lineage}
-      ] ++ overlay_env
+      ] ++ projection_env ++ overlay_env
 
     remote_env =
       if host_config.ssh do
-        [
-          "TIGHTBEAM_HOME=#{host_config.base_dir}",
-          "TIGHTBEAM_MACHINE=#{host}",
-          "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
-          "PATH=#{host_config[:cli_bin] || ""}:$PATH",
-          "TIGHTBEAM_LINEAGE=#{lineage}"
-        ] ++
+        ["-u", "TIGHTBEAM_GITHUB_PROFILE", "-u", "GH_CONFIG_DIR"] ++
+          Enum.flat_map(
+            ~w(GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN),
+            &[
+              "-u",
+              &1
+            ]
+          ) ++
+          [
+            "TIGHTBEAM_HOME=#{host_config.base_dir}",
+            "TIGHTBEAM_MACHINE=#{host}",
+            "TIGHTBEAM_URL=#{Application.fetch_env!(:tightbeam, :advertised_url)}",
+            "PATH=#{host_config[:cli_bin] || ""}:$PATH",
+            "TIGHTBEAM_LINEAGE=#{lineage}"
+          ] ++
+          Enum.map(projection_env, fn {name, value} ->
+            "#{name}=#{Tightbeam.Harness.Support.shell_quote(value)}"
+          end) ++
           Enum.map(overlay_env, fn {name, value} ->
             "#{name}=#{Tightbeam.Harness.Support.shell_quote(value)}"
           end)
@@ -1332,6 +1406,15 @@ defmodule Tightbeam.Placement do
         sh_out: Map.get(config, :sh_out)
       )
 
+    plan =
+      if host_config.ssh do
+        plan
+      else
+        Keyword.update!(plan, :cmd, fn command ->
+          ["env" | Enum.flat_map(@github_unset_env, &["-u", &1])] ++ command
+        end)
+      end
+
     [
       harness: harness,
       home: home,
@@ -1347,6 +1430,11 @@ defmodule Tightbeam.Placement do
     |> Keyword.merge(plan)
   end
 
+  @doc false
+  @spec github_config_dir(String.t()) :: String.t()
+  def github_config_dir(base_dir),
+    do: Tightbeam.GithubCredentials.home(base_dir, local_host_name(), "default")
+
   @doc """
   Capture same-tier adapter boot inputs in the higher-tier coordinator.
 
@@ -1354,12 +1442,22 @@ defmodule Tightbeam.Placement do
   lifecycle read must complete before the Adapter process is started.
   """
   @spec adapter_context(map(), adapter_key()) :: keyword()
-  def adapter_context(config, {harness, _identity_name, host}) do
+  def adapter_context(config, {harness, _identity_name, host} = key) do
     module = Harness.module!(harness)
+
+    projection =
+      config
+      |> Map.get(:db, DB)
+      |> Org.list_all()
+      |> Enum.find(fn session ->
+        session.state == "active" and adapter_key(session) == key
+      end)
 
     [
       credential_kind:
-        credential_kind(config, module.credential_provider(), host, module.wire_name())
+        credential_kind(config, module.credential_provider(), host, module.wire_name()),
+      projection_principal: projection && "session:#{projection.session_key}",
+      github_profile: projection && github_profile(projection)
     ]
   end
 

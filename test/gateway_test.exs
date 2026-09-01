@@ -944,12 +944,13 @@ defmodule Tightbeam.GatewayTest do
     assert child.spawned_by == spawn_parent.session_key
   end
 
-  test "retiring the last live session closes its harness session and shared adapter", ctx do
+  test "retiring the last live session closes its harness session and projection adapter", ctx do
     ensure_global_registry()
     Org.retire(ctx.db, "k1", "test:gateway", 1_000)
     Org.retire(ctx.db, ctx.main_key, "test:gateway", 1_000)
     session = create_session(ctx.db, "reap-last", "flynn")
     session = Org.set_identity(ctx.db, session.session_key, nil, "reap-last-identity")
+    adapter_key = Placement.adapter_key(session)
     Org.append_pointer(ctx.db, session.session_key, "harness-last", "created")
 
     adapter =
@@ -975,7 +976,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert result.retired_session_keys == [session.session_key]
     assert_receive {:close_session, "harness-last"}
-    assert_receive {:close_adapter, {:claude, "shared", "testhost"}}
+    assert_receive {:close_adapter, ^adapter_key}
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
   end
 
@@ -1072,10 +1073,11 @@ defmodule Tightbeam.GatewayTest do
     assert unchanged_external.home == nil
   end
 
-  test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do
+  test "retiring with a live sibling closes only the retired session's projection adapter", ctx do
     ensure_global_registry()
     retired = create_session(ctx.db, "reap-sibling-retired", "flynn")
     retired = Org.set_identity(ctx.db, retired.session_key, nil, "reap-sibling-identity")
+    retired_adapter_key = Placement.adapter_key(retired)
     sibling = create_session(ctx.db, "reap-sibling-live", "flynn")
     _sibling = Org.set_identity(ctx.db, sibling.session_key, nil, "reap-sibling-identity")
     Org.append_pointer(ctx.db, retired.session_key, "harness-retired", "created")
@@ -1088,6 +1090,7 @@ defmodule Tightbeam.GatewayTest do
       })
 
     coordinator = start_supervised!({CoordinatorStub, {adapter, self()}})
+    monitor = Process.monitor(adapter)
 
     result =
       Gateway.handlers(%{
@@ -1102,14 +1105,11 @@ defmodule Tightbeam.GatewayTest do
 
     assert result.retired_session_keys == [retired.session_key]
     assert_receive {:close_session, "harness-retired"}
-    refute_receive {:close_adapter, _key}
-    assert Process.alive?(adapter)
+    assert_receive {:close_adapter, ^retired_adapter_key}
+    assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
 
-    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "harness_context_resident" and
-               event.subject == retired.session_key and
-               event.detail == "harness context resident until adapter recycle"
-           end)
+    sibling_adapter_key = Placement.adapter_key(Org.get(ctx.db, sibling.session_key))
+    refute sibling_adapter_key == retired_adapter_key
   end
 
   test "a harness session close error cannot fail the committed retire", ctx do
@@ -1118,6 +1118,7 @@ defmodule Tightbeam.GatewayTest do
     Org.retire(ctx.db, ctx.main_key, "test:gateway", 1_000)
     session = create_session(ctx.db, "reap-close-error", "flynn")
     session = Org.set_identity(ctx.db, session.session_key, nil, "reap-error-identity")
+    adapter_key = Placement.adapter_key(session)
     Org.append_pointer(ctx.db, session.session_key, "harness-close-error", "created")
 
     adapter =
@@ -1143,7 +1144,7 @@ defmodule Tightbeam.GatewayTest do
     assert result.retired_session_keys == [session.session_key]
     assert Org.get(ctx.db, session.session_key).state == "retired"
     assert_receive {:close_session_failed, "harness-close-error"}
-    assert_receive {:close_adapter, {:claude, "shared", "testhost"}}
+    assert_receive {:close_adapter, ^adapter_key}
   end
 
   test "critical lease renewal is hard-capped and defers the entire cascade idempotently", ctx do
@@ -1430,7 +1431,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: true, action: "restart"} = first = handler.(call)
     assert handler.(call) == first
-    assert_receive {:repair_close_adapter, {:claude, "shared", "testhost"}}
+    adapter_key = Placement.adapter_key(Org.get(ctx.db, "k1"))
+    assert_receive {:repair_close_adapter, ^adapter_key}
     refute_receive {:repair_close_adapter, _}, 50
     assert_receive {:ensure_lane, "k1"}
     refute_receive {:ensure_lane, "k1"}, 50
@@ -1471,7 +1473,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: false, code: "repair_failed"} = first = handler.(call)
     assert handler.(call) == first
-    assert_receive {:repair_close_adapter, {:claude, "shared", "testhost"}}
+    adapter_key = Placement.adapter_key(Org.get(ctx.db, "k1"))
+    assert_receive {:repair_close_adapter, ^adapter_key}
     refute_receive {:repair_close_adapter, _}, 50
 
     assert HarnessHealth.get(ctx.db, repair.incident.id).state == "open"
@@ -1532,7 +1535,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "rate limit opens a durable no-claim park and explicit resume releases it once", ctx do
     repair = failed_repair_route!(ctx, "asg_rate_resume", "rate-limit-dead", 60)
-    adapter_key = {:claude, "shared", "testhost"}
+    adapter_key = Placement.adapter_key(Org.get(ctx.db, "k1"))
     assert Tightbeam.HarnessProcess.parked?(ctx.db, adapter_key)
 
     {:ok, blocked_seq} =
@@ -1977,8 +1980,8 @@ defmodule Tightbeam.GatewayTest do
 
   test "reconciliation cannot delete a rate-limit fence opened at its cleanup boundary", ctx do
     assignment_id = "asg_rate_reconcile_race"
-    adapter_key = {:claude, "shared", "testhost"}
     session = Org.get(ctx.db, "k1")
+    adapter_key = Placement.adapter_key(session)
 
     assert {:ok, []} =
              DB.query(
@@ -5796,7 +5799,8 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    assert_receive {:adapter_key, {:claude, "shared", ^local_host}}
+    expected_key = Placement.adapter_key(Org.get(ctx.db, "k1"))
+    assert_receive {:adapter_key, ^expected_key}
     assert_receive {:tune_residency_checked, "existing-session"}
 
     assert_receive {:tune_session_switched, "existing-session",
@@ -6864,7 +6868,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert_per_verb_effects!(config, "cancel", observed_state_classes())
 
-    assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
+    expected_key = Placement.adapter_key(Org.get(ctx.db, "k1"))
+    assert_receive {:adapter_key, ^expected_key}
     assert Process.alive?(lane)
 
     assert {:ok, [["canceled"]]} =
@@ -7211,7 +7216,8 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
     task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
 
-    assert_receive {:adapter_key, {:codex, "shared", ^local_host}}
+    expected_key = Placement.adapter_key(Org.get(ctx.db, "k1"))
+    assert_receive {:adapter_key, ^expected_key}
     assert_receive {:new_session_mcp_servers, _mcp_servers}, @cold_runner_prompt_timeout
     assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
 
@@ -7720,7 +7726,8 @@ defmodule Tightbeam.GatewayTest do
 
     task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
 
-    assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
+    expected_key = Placement.adapter_key(Org.get(ctx.db, "k1"))
+    assert_receive {:adapter_key, ^expected_key}
 
     assert_receive {:new_session_mcp_servers, []}, @cold_runner_prompt_timeout
 
@@ -10885,17 +10892,46 @@ defmodule Tightbeam.GatewayTest do
     config = gateway_config(base_dir, ctx.db, 0)
     children = Gateway.children(config)
 
+    codex_session =
+      Org.create(ctx.db, %{
+        session_key: "credential-runtime-codex",
+        display_name: "Credential runtime Codex",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    fixture_session =
+      Org.create(ctx.db, %{
+        session_key: "credential-runtime-fixture",
+        display_name: "Credential runtime fixture",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: Model.new("fixture-model")
+      })
+
+    codex_key = Placement.adapter_key(codex_session)
+    fixture_key = Placement.adapter_key(fixture_session)
+
     %{start: {Credentials, :start_link, [credential_opts]}} =
       Enum.find(children, &match?(%{id: {Credentials, "testhost"}}, &1))
 
     parent = self()
 
     start_result = fn
-      {:codex, "shared", "testhost"} = key ->
+      ^codex_key = key ->
         send(parent, {:runtime_start, key})
         {:error, :codex_failed}
 
-      {:fixture, "shared", "testhost"} = key ->
+      ^fixture_key = key ->
         send(parent, {:runtime_start, key})
         {:ok, parent, 1}
     end
@@ -10920,8 +10956,8 @@ defmodule Tightbeam.GatewayTest do
                failed: [%{harness: "codex", reason: :codex_failed}]
              }}} = Credentials.onboard(:openai, server)
 
-    assert_receive {:runtime_start, {:codex, "shared", "testhost"}}
-    refute_receive {:runtime_start, {:fixture, "shared", "testhost"}}
+    assert_receive {:runtime_start, ^codex_key}
+    refute_receive {:runtime_start, ^fixture_key}
     refute Credentials.status(:openai, server) == :onboarded
 
     fixture_opts =
@@ -10937,7 +10973,7 @@ defmodule Tightbeam.GatewayTest do
 
     {:ok, fixture_server} = Credentials.start_link(fixture_opts)
     assert :ok = Credentials.onboard(:fixture_provider, fixture_server)
-    assert_receive {:runtime_start, {:fixture, "shared", "testhost"}}
+    assert_receive {:runtime_start, ^fixture_key}
   end
 
   # Driven through real spawns rather than hand-built session maps: the point of

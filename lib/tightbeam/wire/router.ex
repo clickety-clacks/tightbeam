@@ -55,6 +55,7 @@ defmodule Tightbeam.Wire.Router do
     ColdStart,
     Devices,
     Dispatch,
+    GithubCredentials,
     ModelCatalog,
     Org,
     Roles,
@@ -252,6 +253,96 @@ defmodule Tightbeam.Wire.Router do
       json(conn, 200, %{"observed" => true})
     else
       {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  post "/agent/github/context" do
+    with {:ok, {:session, session}} <- session_cli_auth(conn),
+         {:ok, body, conn} <- read_json(conn),
+         {:ok, identity_sha} <- required_string(body["identitySha"]),
+         :ok <- github_context_matches(session, identity_sha, body) do
+      json(conn, 200, %{
+        "result" => %{
+          "machine" => session.host,
+          "principal" => github_principal(session),
+          "identitySha" => session.identity_revision
+        }
+      })
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  post "/agent/github/hostnames" do
+    with {:ok, {:session, session}} <- session_cli_auth(conn),
+         {:ok, body, conn} <- read_json(conn),
+         {:ok, identity_sha} <- required_string(body["identitySha"]),
+         :ok <- github_context_matches(session, identity_sha, body) do
+      hostnames =
+        db(conn)
+        |> GithubCredentials.hostname_index(session.host)
+        |> MapSet.to_list()
+        |> Enum.sort()
+
+      json(conn, 200, %{"result" => %{"hostnames" => hostnames}})
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  post "/agent/github/binding" do
+    try do
+      with {:ok, {:session, session}} <- session_cli_auth(conn),
+           {:ok, body, conn} <- read_json(conn),
+           {:ok, identity_sha} <- required_string(body["identitySha"]),
+           :ok <- github_context_matches(session, identity_sha, body),
+           {:ok, profile} <- required_string(body["profile"]),
+           {:ok, hostname} <- required_string(body["hostname"]) do
+        binding = GithubCredentials.binding(db(conn), session.host, profile, hostname)
+        json(conn, 200, %{"result" => %{"binding" => binding}})
+      else
+        {:error, status, code, message} -> error(conn, status, code, message)
+      end
+    rescue
+      error in ArgumentError -> error(conn, 400, "invalid_message", Exception.message(error))
+    end
+  end
+
+  post "/agent/github/observe" do
+    try do
+      with {:ok, {:session, session}} <- session_cli_auth(conn),
+           {:ok, body, conn} <- read_json(conn),
+           {:ok, identity_sha} <- required_string(body["identitySha"]),
+           :ok <- github_context_matches(session, identity_sha, body),
+           {:ok, state} <- required_string(body["state"]),
+           {:ok, cause} <- github_safe_marker(body["cause"]),
+           {:ok, operation_class} <- required_string(body["operationClass"]),
+           {:ok, phase} <- github_safe_marker(body["phase"]),
+           {:ok, rule} <- github_safe_marker(body["rule"]) do
+        attrs = %{
+          machine: session.host,
+          profile: github_optional_string(body["profile"]),
+          hostname: github_optional_string(body["hostname"]),
+          account: github_optional_string(body["account"]),
+          state: state,
+          cause: cause,
+          principal: github_principal(session),
+          operation_class: operation_class,
+          phase: phase,
+          rule: rule,
+          protocol: github_optional_string(body["protocol"]),
+          sanitized_remote: github_optional_string(body["sanitizedRemote"])
+        }
+
+        case GithubCredentials.append_observation(db(conn), attrs) do
+          {:ok, observation} -> json(conn, 200, %{"result" => observation})
+          {:error, _error} -> error(conn, 500, "observation_record_failed", nil)
+        end
+      else
+        {:error, status, code, message} -> error(conn, status, code, message)
+      end
+    rescue
+      error in ArgumentError -> error(conn, 400, "invalid_message", Exception.message(error))
     end
   end
 
@@ -1219,6 +1310,44 @@ defmodule Tightbeam.Wire.Router do
       error -> error
     end
   end
+
+  defp github_context_matches(session, identity_sha, body) do
+    expected_principal = github_principal(session)
+
+    cond do
+      not is_binary(session.identity_revision) or session.identity_revision == "" ->
+        {:error, 409, "github_identity_unpinned", nil}
+
+      identity_sha != session.identity_revision ->
+        {:error, 409, "github_identity_mismatch", nil}
+
+      Map.get(body, "machine", session.host) != session.host ->
+        {:error, 409, "github_machine_mismatch", nil}
+
+      Map.get(body, "principal", expected_principal) != expected_principal ->
+        {:error, 409, "github_principal_mismatch", nil}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp github_principal(session), do: "session:#{session.session_key}"
+
+  defp github_safe_marker(value)
+       when is_binary(value) and byte_size(value) in 1..128 do
+    if Regex.match?(~r/^[a-z0-9][a-z0-9_-]*$/, value),
+      do: {:ok, value},
+      else: {:error, 400, "invalid_message", nil}
+  end
+
+  defp github_safe_marker(_value), do: {:error, 400, "invalid_message", nil}
+
+  defp github_optional_string(nil), do: nil
+  defp github_optional_string(value) when is_binary(value) and value != "", do: value
+
+  defp github_optional_string(_value),
+    do: raise(ArgumentError, "optional GitHub field is invalid")
 
   defp device_auth(conn) do
     token =

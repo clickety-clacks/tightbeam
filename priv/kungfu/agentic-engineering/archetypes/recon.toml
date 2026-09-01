@@ -1,6 +1,12 @@
 name = "recon"
 skills = ["worktree-session", "recon-first-investigation", "recon-lifecycle", "bug-provenance", "human-communication"]
 
+[provisioning]
+class = "workshop"
+
+[provisioning.credentials.github]
+profile = "default"
+
 [guidance]
 text = """
 #include "golden-rule.md"

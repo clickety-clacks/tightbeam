@@ -18,7 +18,7 @@ defmodule Tightbeam.SessionLane do
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Ledger, Placement}
+  alias Tightbeam.{DB, EventLog, HarnessProcess, Ledger, Placement}
 
   defstruct [
     :session_key,
@@ -239,11 +239,23 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp harness_parked?(state) do
-    case DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [
-           state.session_key
-         ]) do
-      {:ok, [[harness, host]]} ->
-        HarnessProcess.parked?(state.db, {Harness.parse!(harness).id(), "shared", host})
+    case DB.query(
+           state.db,
+           "SELECT sessionKey,harness,host,archetype FROM sessions WHERE sessionKey=?1",
+           [
+             state.session_key
+           ]
+         ) do
+      {:ok, [[session_key, harness, host, archetype]]} ->
+        adapter_key =
+          Tightbeam.Placement.adapter_key(%{
+            session_key: session_key,
+            harness: harness,
+            host: host,
+            archetype: archetype
+          })
+
+        HarnessProcess.parked?(state.db, adapter_key)
 
       {:ok, []} ->
         false

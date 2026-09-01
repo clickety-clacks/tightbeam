@@ -69,7 +69,8 @@ defmodule Tightbeam.Rules do
                "effect",
                "remedy",
                "external_producer",
-               "recurrence_suppression"
+               "recurrence_suppression",
+               "actors"
              ])
   @condition_keys MapSet.new(["fact", "op", "value"])
   @recurrence_keys MapSet.new([
@@ -82,6 +83,24 @@ defmodule Tightbeam.Rules do
   @rearm_keys MapSet.new(["recovered_when", "recurred_when"])
   @recurrence_fingerprint ~w(statute target_session subject failure_class failure_code)
   @check_keys MapSet.new(["script", "returns", "timeout_ms", "effects"])
+  @tool_call_check_keys MapSet.new([
+                          "handler",
+                          "abi",
+                          "timeout_ms",
+                          "fallback_repair",
+                          "returns",
+                          "effects"
+                        ])
+  @tool_call_handlers %{
+    "github-network-auth-v1" => %{
+      abi: 1,
+      returns: ~w(
+        not_applicable live profile_not_elected missing_cli needs_onboarding hollow
+        expired insufficient_scope git_unready revoked present_but_unverified unknown
+        ambiguous_hostname projection_override malformed_tool_call rule_runtime_failure
+      )
+    }
+  }
   @remedy_keys MapSet.new([
                  "action",
                  "produces",
@@ -216,6 +235,14 @@ defmodule Tightbeam.Rules do
     |> Enum.find_value(& &1.identity_manifest_sha)
   end
 
+  @doc "The validated synthetic pre-execution rules compiled into harness homes."
+  @spec tool_call_rules() :: [rule()]
+  def tool_call_rules do
+    @persist_key
+    |> :persistent_term.get([])
+    |> Enum.filter(&(&1.verb == "tool-call"))
+  end
+
   defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
     contents = File.read!(path)
 
@@ -251,7 +278,12 @@ defmodule Tightbeam.Rules do
        when is_map(rule) do
     raw_name = Map.get(rule, "name")
     label = if valid_name?(raw_name), do: "rule #{inspect(raw_name)}", else: "rule ##{ordinal}"
-    fail = fn message -> raise ArgumentError, "#{path}: #{label}: #{message}" end
+    tool_call? = Map.get(rule, "verb") == "tool-call"
+
+    fail = fn message ->
+      prefix = if tool_call?, do: "tool-call-rule-invalid: ", else: ""
+      raise ArgumentError, "#{path}: #{label}: #{prefix}#{message}"
+    end
 
     unknown = unknown_keys(rule, @rule_keys)
     if unknown != [], do: fail.("unknown keys: #{Enum.join(unknown, ", ")}")
@@ -259,27 +291,62 @@ defmodule Tightbeam.Rules do
 
     verb = Map.get(rule, "verb")
     unless is_binary(verb) and String.trim(verb) != "", do: fail.("missing or blank verb")
-    unless MapSet.member?(valid_verbs, verb), do: fail.("unknown verb: #{inspect(verb)}")
+
+    unless tool_call? or MapSet.member?(valid_verbs, verb),
+      do: fail.("unknown verb: #{inspect(verb)}")
+
+    if not tool_call? and Map.has_key?(rule, "actors"),
+      do: fail.("actors is valid only on verb tool-call")
 
     text = Map.get(rule, "text")
     unless is_binary(text) and String.trim(text) != "", do: fail.("missing or blank text")
 
+    if tool_call? and Map.has_key?(rule, "deny_when"),
+      do: fail.("deny_when is not valid on verb tool-call")
+
     conditions = validate_conditions!(Map.get(rule, "deny_when"), fail)
-    check = validate_check!(Map.get(rule, "check"), base_dir, fail)
+
+    check =
+      if tool_call?,
+        do: validate_tool_call_check!(Map.get(rule, "check"), fail),
+        else: validate_check!(Map.get(rule, "check"), base_dir, fail)
 
     if conditions == [] and is_nil(check),
       do: fail.("must carry at least one of deny_when or [rule.check]")
 
-    edges = validate_edges!(Map.get(rule, "edges", ["verb"]), verb, fail)
+    edges =
+      if tool_call?,
+        do: validate_tool_call_edges!(Map.get(rule, "edges"), fail),
+        else: validate_edges!(Map.get(rule, "edges", ["verb"]), verb, fail)
+
+    actors =
+      if tool_call?, do: validate_tool_call_actors!(Map.get(rule, "actors"), fail), else: nil
+
+    if tool_call? and Map.has_key?(rule, "effect"),
+      do: fail.("effect is not valid on verb tool-call")
 
     effect =
-      validate_effect!(Map.get(rule, "effect", "deny"), check, Map.has_key?(rule, "effect"), fail)
+      if tool_call?,
+        do: "deny",
+        else:
+          validate_effect!(
+            Map.get(rule, "effect", "deny"),
+            check,
+            Map.has_key?(rule, "effect"),
+            fail
+          )
 
     effects = if check, do: Map.values(check.effects), else: [effect]
     remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail)
 
+    if tool_call? and Map.has_key?(rule, "remedy"),
+      do: fail.("remedy is not valid on verb tool-call")
+
     recurrence_suppression =
       validate_recurrence_suppression!(Map.get(rule, "recurrence_suppression"), fail)
+
+    if tool_call? and Map.has_key?(rule, "recurrence_suppression"),
+      do: fail.("recurrence_suppression is not valid on verb tool-call")
 
     if Enum.any?(effects, &(&1 in ~w(remedy notice))) and is_nil(remedy),
       do: fail.("effect remedy or notice requires [rule.remedy]")
@@ -293,12 +360,16 @@ defmodule Tightbeam.Rules do
     external_producer = Map.get(rule, "external_producer", false)
     unless is_boolean(external_producer), do: fail.("external_producer must be a boolean")
 
+    if tool_call? and Map.has_key?(rule, "external_producer"),
+      do: fail.("external_producer is not valid on verb tool-call")
+
     if external_producer and verdict_requirements(conditions) == [],
       do: fail.("external_producer is valid only on a verdict-fact gate")
 
     %{
       name: raw_name,
       verb: verb,
+      actors: actors,
       text: String.trim(text),
       conditions: conditions,
       edges: edges,
@@ -430,6 +501,20 @@ defmodule Tightbeam.Rules do
     edges
   end
 
+  defp validate_tool_call_edges!(edges, fail) do
+    unless edges == ["pre-execution"],
+      do: fail.(~s(edges must be exactly ["pre-execution"]))
+
+    edges
+  end
+
+  defp validate_tool_call_actors!(actors, fail) do
+    unless actors == %{"capability" => "Bash"},
+      do: fail.(~s(actors must be exactly { capability = "Bash" }))
+
+    %{capability: "Bash"}
+  end
+
   defp validate_effect!(effect, check, explicit?, fail) do
     unless effect in ~w(deny remedy escalate notice),
       do: fail.("effect must be one of deny, remedy, escalate, notice")
@@ -481,6 +566,59 @@ defmodule Tightbeam.Rules do
   end
 
   defp validate_check!(_check, _base_dir, fail), do: fail.("check must be a table")
+
+  defp validate_tool_call_check!(check, fail) when is_map(check) do
+    unknown = unknown_keys(check, @tool_call_check_keys)
+    if unknown != [], do: fail.("check has unknown keys: #{Enum.join(unknown, ", ")}")
+
+    handler = Map.get(check, "handler")
+
+    registration =
+      Map.get(@tool_call_handlers, handler) || fail.("unknown check handler: #{inspect(handler)}")
+
+    abi = Map.get(check, "abi")
+    unless abi == registration.abi, do: fail.("check ABI must be #{registration.abi}")
+
+    timeout_ms = Map.get(check, "timeout_ms")
+
+    unless is_integer(timeout_ms) and timeout_ms in 1..60_000,
+      do: fail.("check timeout_ms must be an integer in 1..60000")
+
+    fallback_repair = Map.get(check, "fallback_repair")
+
+    unless is_binary(fallback_repair) and String.trim(fallback_repair) != "",
+      do: fail.("check fallback_repair must be a non-empty safe display command")
+
+    returns = Map.get(check, "returns")
+
+    unless returns == registration.returns,
+      do: fail.("check returns must equal the registered handler token set")
+
+    effects = Map.get(check, "effects")
+    unless is_map(effects), do: fail.("check effects must be a table")
+
+    unless Map.keys(effects) |> Enum.sort() == Enum.sort(returns),
+      do: fail.("check effects must map every declared return and no others")
+
+    unless Enum.all?(effects, fn {_token, effect} -> effect in ~w(allow deny) end),
+      do: fail.("check effects must be allow or deny")
+
+    for token <- ~w(malformed_tool_call rule_runtime_failure) do
+      unless effects[token] == "deny", do: fail.("check effect #{token} must be deny")
+    end
+
+    %{
+      handler: handler,
+      abi: abi,
+      timeout_ms: timeout_ms,
+      fallback_repair: String.trim(fallback_repair),
+      returns: returns,
+      effects: effects
+    }
+  end
+
+  defp validate_tool_call_check!(_check, fail),
+    do: fail.("check must be a handler table")
 
   defp validate_remedy!(nil, _conditions, _check, _effects, _fail), do: nil
 

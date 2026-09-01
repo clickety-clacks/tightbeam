@@ -21,6 +21,10 @@ defmodule Tightbeam.Archetypes do
           defaults: %{optional(:harness) => atom(), optional(:model) => Tightbeam.Model.t()},
           references: [%{name: String.t(), location: String.t(), access: String.t() | nil}],
           model_preferences: [Tightbeam.Model.t()],
+          provisioning: %{
+            class: :workshop | :desk,
+            credentials: %{github: String.t() | nil}
+          },
           containment: %{fs: :off, network: :open},
           mcp: [
             %{
@@ -121,10 +125,10 @@ defmodule Tightbeam.Archetypes do
     fragments
   end
 
-  @doc "The loaded archetype by name, or nil. Reads :persistent_term (load!/1 must have run)."
+  @doc "The loaded archetype by name, or nil when the registry has not loaded yet."
   @spec get(String.t()) :: t() | nil
   def get(name) do
-    {archetypes, _fragments} = :persistent_term.get(@persist_key)
+    {archetypes, _fragments} = :persistent_term.get(@persist_key, {%{}, builtin_fragments()})
     Map.get(archetypes, name)
   end
 
@@ -584,6 +588,7 @@ defmodule Tightbeam.Archetypes do
       defaults: %{},
       references: [],
       model_preferences: [],
+      provisioning: %{class: :workshop, credentials: %{github: nil}},
       containment: %{fs: :off, network: :open},
       mcp: [],
       guidance: nil,
@@ -602,7 +607,8 @@ defmodule Tightbeam.Archetypes do
         "model_preferences",
         "guidance",
         "mcp",
-        "containment"
+        "containment",
+        "provisioning"
       ])
 
     unknown =
@@ -672,18 +678,89 @@ defmodule Tightbeam.Archetypes do
 
     mcp = validate_mcp!(Map.get(manifest, "mcp", %{}))
     containment = validate_containment!(Map.get(manifest, "containment", %{}), path)
+    provisioning = validate_provisioning!(Map.get(manifest, "provisioning", %{}), path)
 
     %{
       name: name,
       skills: skills,
       where: where,
       model_preferences: model_preferences,
+      provisioning: provisioning,
       containment: containment,
       defaults: defaults,
       references: references,
       mcp: mcp,
       guidance: get_in(manifest, ["guidance", "text"])
     }
+  end
+
+  defp validate_provisioning!(raw, path) when is_map(raw) do
+    unknown = Map.keys(raw) -- ["class", "credentials"]
+
+    if unknown != [] do
+      raise ArgumentError,
+            "unknown provisioning keys in #{path}: #{unknown |> Enum.sort() |> Enum.join(", ")}"
+    end
+
+    class = Map.get(raw, "class", "workshop")
+
+    unless class in ["workshop", "desk"] do
+      raise ArgumentError, "archetype provisioning.class must be workshop or desk: #{path}"
+    end
+
+    credentials = Map.get(raw, "credentials", %{})
+
+    unless is_map(credentials) do
+      raise ArgumentError, "archetype provisioning.credentials must be a table: #{path}"
+    end
+
+    unknown_credentials = Map.keys(credentials) -- ["github"]
+
+    if unknown_credentials != [] do
+      raise ArgumentError,
+            "unknown provisioning credential kinds in #{path}: " <>
+              Enum.join(Enum.sort(unknown_credentials), ", ")
+    end
+
+    github = get_in(credentials, ["github", "profile"])
+
+    case Map.get(credentials, "github") do
+      nil ->
+        :ok
+
+      %{} = github_config ->
+        unknown_github = Map.keys(github_config) -- ["profile"]
+
+        if unknown_github != [] do
+          raise ArgumentError,
+                "unknown provisioning.credentials.github keys in #{path}: " <>
+                  Enum.join(Enum.sort(unknown_github), ", ")
+        end
+
+        unless is_binary(github) do
+          raise ArgumentError,
+                "archetype provisioning.credentials.github.profile is required: #{path}"
+        end
+
+        Tightbeam.GithubCredentials.validate_profile!(github)
+
+      _other ->
+        raise ArgumentError,
+              "archetype provisioning.credentials.github must be a table: #{path}"
+    end
+
+    if class == "desk" and is_binary(github) do
+      raise ArgumentError, "desk archetype may not elect a GitHub credential profile: #{path}"
+    end
+
+    %{
+      class: if(class == "workshop", do: :workshop, else: :desk),
+      credentials: %{github: github}
+    }
+  end
+
+  defp validate_provisioning!(_raw, path) do
+    raise ArgumentError, "archetype provisioning must be a table: #{path}"
   end
 
   # A stored preference holds FIELDS, like every other stored selection: a

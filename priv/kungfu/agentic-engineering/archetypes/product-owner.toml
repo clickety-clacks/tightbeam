@@ -1,6 +1,12 @@
 name = "product-owner"
 skills = ["worktree-session", "tightbeam-dispatching", "product-discovery", "human-communication"]
 
+[provisioning]
+class = "workshop"
+
+[provisioning.credentials.github]
+profile = "default"
+
 [guidance]
 text = """
 #include "golden-rule.md"

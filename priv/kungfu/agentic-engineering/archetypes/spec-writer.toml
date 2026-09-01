@@ -1,6 +1,12 @@
 name = "spec-writer"
 skills = ["worktree-session", "drafting-requirements", "spec-homing", "spec-handoff", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
 
+[provisioning]
+class = "workshop"
+
+[provisioning.credentials.github]
+profile = "default"
+
 [guidance]
 text = """
 #include "golden-rule.md"

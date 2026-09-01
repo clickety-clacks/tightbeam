@@ -15,6 +15,7 @@ defmodule Tightbeam.SupervisionTest do
     Ledger,
     NoticeBatcher,
     Org,
+    Placement,
     Projection,
     RailRemedy,
     Roles,
@@ -3700,7 +3701,8 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   defp resolve_rate_limit_incident!(ctx, terminal_seq) do
-    :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "eezo"})
+    :ok = HarnessProcess.complete_park(ctx.db, Placement.adapter_key(ctx.holder))
+    :ok = HarnessProcess.complete_park(ctx.db, Placement.adapter_key(ctx.supervisor))
 
     assert {:resolved, _} =
              HarnessHealth.resolve(ctx.db, %{
@@ -3738,7 +3740,7 @@ defmodule Tightbeam.SupervisionTest do
 
   defp resolve_harness_incident!(ctx, failure_class, index) do
     if failure_class == "rate-limit-dead" do
-      :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "eezo"})
+      :ok = HarnessProcess.complete_park(ctx.db, Placement.adapter_key(ctx.holder))
     end
 
     assert {:resolved, _} =

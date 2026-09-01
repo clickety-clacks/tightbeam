@@ -1,0 +1,37 @@
+[[rule]]
+name = "github-network-auth-required"
+verb = "tool-call"
+edges = ["pre-execution"]
+actors = { capability = "Bash" }
+text = "GitHub network work requires the elected host profile to pass a current check."
+
+[rule.check]
+handler = "github-network-auth-v1"
+abi = 1
+timeout_ms = 60000
+fallback_repair = "tightbeam doctor --json"
+returns = [
+  "not_applicable", "live", "profile_not_elected", "missing_cli",
+  "needs_onboarding", "hollow", "expired", "insufficient_scope",
+  "git_unready", "revoked", "present_but_unverified", "unknown",
+  "ambiguous_hostname", "projection_override", "malformed_tool_call",
+  "rule_runtime_failure"
+]
+
+[rule.check.effects]
+not_applicable = "allow"
+live = "allow"
+profile_not_elected = "deny"
+missing_cli = "deny"
+needs_onboarding = "deny"
+hollow = "deny"
+expired = "deny"
+insufficient_scope = "deny"
+git_unready = "deny"
+revoked = "deny"
+present_but_unverified = "deny"
+unknown = "deny"
+ambiguous_hostname = "deny"
+projection_override = "deny"
+malformed_tool_call = "deny"
+rule_runtime_failure = "deny"

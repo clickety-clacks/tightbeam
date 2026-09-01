@@ -211,6 +211,10 @@ pub enum Command {
     /// observation is the session's by definition — the gateway resolves the
     /// turn from the session token, so there is nothing for a flag to say.
     ToolCallObserved,
+    /// Substrate-reserved: the GitHub PreToolUse hook guard. It reads the raw
+    /// tool-call JSON from stdin and refuses only GitHub-dependent calls when
+    /// this host's GitHub auth is not ready.
+    GithubAuthCheck,
     Spawn {
         identity: Identity,
         display_name: String,
@@ -482,6 +486,17 @@ pub enum Command {
         identity: Identity,
         provider: String,
         api_key: bool,
+        hostname: Option<String>,
+        profile: Option<String>,
+        account: Option<String>,
+        remote: Option<String>,
+        replace: bool,
+    },
+    RevokeGithub {
+        identity: Identity,
+        hostname: String,
+        profile: String,
+        account: Option<String>,
     },
     AddUser {
         identity: Identity,
@@ -888,13 +903,20 @@ COMMANDS:
   identity apply (<session> | --all)
       Refresh selected sessions from the current live identity revision.
   onboard openai|anthropic [--api-key]
-      Run this machine's credential onboarding flow. Without --api-key this is
-      the interactive subscription ceremony. With it the flow is
+      Run this machine's model-provider credential onboarding flow. Without
+      --api-key this is the interactive subscription ceremony. With it the flow is
       non-interactive and the KEY is read from stdin -- never as an argument,
       which would put a secret in this machine's process table:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+  onboard github [--hostname github.com] [--profile default] [--account LOGIN]
+                 [--remote URL] [--replace]
+      Prove or create this host's GitHub CLI browser/device login in the
+      provider-owned credential profile. With --remote, also prove git can
+      read that repository. This never asks an agent for a PAT.
+  revoke github [--hostname github.com] [--profile default] [--account LOGIN]
+      Remove one local gh login and retain its non-secret revocation tombstone.
 
   add-user <userId> [--admin]
       Add a user, optionally as an admin. An existing admin may run this over
@@ -995,7 +1017,7 @@ fn opens_entry(line: &str, command: &str) -> bool {
 
 const BOOLEAN_FLAGS: &[&str] = &[
     "abort", "admin", "all", "api-key", "dry-run", "help", "json", "manifest", "resolve", "rm",
-    "tree",
+    "replace", "tree",
 ];
 
 #[derive(Debug)]
@@ -1765,6 +1787,13 @@ fn parse_with_optional_catalog(
             }
             Ok(Command::ToolCallObserved)
         }
+        "github-auth-check" => {
+            if parsed.positional.len() != 1 || !flags.is_empty() {
+                return Err("usage: tightbeam github-auth-check".to_owned());
+            }
+            Ok(Command::GithubAuthCheck)
+        }
+        "revoke" => parse_revoke(&parsed, flags),
         "artifacts" => {
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| {
@@ -2831,12 +2860,50 @@ fn parse_identity_command(
 
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
-        return Err("usage: tightbeam onboard <provider> [--api-key]".to_owned());
+        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
     }
     let provider = parsed.positional[1].clone();
     let fixture_provider = cfg!(test) && provider == "fixture-provider";
-    if !matches!(provider.as_str(), "openai" | "anthropic") && !fixture_provider {
-        return Err("provider must be openai or anthropic".to_owned());
+    if !matches!(provider.as_str(), "openai" | "anthropic" | "github") && !fixture_provider {
+        return Err("provider must be openai, anthropic, or github".to_owned());
+    }
+    let allowed = [
+        "api-key",
+        "hostname",
+        "profile",
+        "account",
+        "remote",
+        "replace",
+        "as",
+        "as-user",
+        "as-process",
+    ];
+    if flags.keys().any(|flag| !allowed.contains(&flag.as_str())) {
+        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+    }
+    let hostname = nonempty(flags, "hostname");
+    let profile = nonempty(flags, "profile");
+    let account = nonempty(flags, "account");
+    let remote = nonempty(flags, "remote");
+    if provider == "github" && flags.contains_key("api-key") {
+        return Err(
+            "tightbeam onboard github does not accept --api-key; use GitHub CLI browser/device auth"
+                .to_owned(),
+        );
+    }
+    if provider != "github" && hostname.is_some() {
+        return Err("--hostname is only valid for tightbeam onboard github".to_owned());
+    }
+    if provider != "github" && remote.is_some() {
+        return Err("--remote is only valid for tightbeam onboard github".to_owned());
+    }
+    if provider != "github"
+        && (profile.is_some() || account.is_some() || flags.contains_key("replace"))
+    {
+        return Err(
+            "--profile, --account, and --replace are only valid for tightbeam onboard github"
+                .to_owned(),
+        );
     }
     Ok(Command::Onboard {
         identity: identity(flags)?,
@@ -2845,6 +2912,34 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         // this process's argv, where anyone on the box can read it out of the
         // process table. The key arrives on stdin instead.
         api_key: flags.contains_key("api-key"),
+        hostname,
+        profile,
+        account,
+        remote,
+        replace: flags.contains_key("replace"),
+    })
+}
+
+fn parse_revoke(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
+    if parsed.positional.as_slice() != ["revoke", "github"] {
+        return Err("usage: tightbeam revoke github [--hostname github.com] [--profile default] [--account LOGIN]".to_owned());
+    }
+    let allowed = [
+        "hostname",
+        "profile",
+        "account",
+        "as",
+        "as-user",
+        "as-process",
+    ];
+    if flags.keys().any(|flag| !allowed.contains(&flag.as_str())) {
+        return Err("usage: tightbeam revoke github [--hostname github.com] [--profile default] [--account LOGIN]".to_owned());
+    }
+    Ok(Command::RevokeGithub {
+        identity: identity(flags)?,
+        hostname: nonempty(flags, "hostname").unwrap_or_else(|| "github.com".to_owned()),
+        profile: nonempty(flags, "profile").unwrap_or_else(|| "default".to_owned()),
+        account: nonempty(flags, "account"),
     })
 }
 
@@ -3111,7 +3206,70 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
+                hostname: None,
+                profile: None,
+                account: None,
+                remote: None,
+                replace: false,
             })
+        );
+    }
+
+    #[test]
+    fn github_onboard_is_host_local_and_has_no_api_key_path() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "github",
+                "--hostname",
+                "github.example"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::Session,
+                provider: "github".to_owned(),
+                api_key: false,
+                hostname: Some("github.example".to_owned()),
+                profile: None,
+                account: None,
+                remote: None,
+                replace: false,
+            })
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "github",
+                "--remote",
+                "https://github.com/example/project.git"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::Session,
+                provider: "github".to_owned(),
+                api_key: false,
+                hostname: None,
+                profile: None,
+                account: None,
+                remote: Some("https://github.com/example/project.git".to_owned()),
+                replace: false,
+            })
+        );
+        assert!(matches!(
+            parse(strings(&["onboard", "github", "--as-user", "flynn"])),
+            Ok(Command::Onboard {
+                identity: Identity::User(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            parse(strings(&["onboard", "github", "--api-key"])),
+            Err(
+                "tightbeam onboard github does not accept --api-key; use GitHub CLI browser/device auth"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "openai", "--hostname", "github.com"])),
+            Err("--hostname is only valid for tightbeam onboard github".to_owned())
         );
     }
 
@@ -3544,6 +3702,7 @@ mod tests {
                 "return",
                 "reopen-assignment",
                 "repair-assignment",
+                "revoke",
                 "revoke-assignment",
                 "spawn",
                 "tune",
@@ -3574,6 +3733,8 @@ mod tests {
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
+            "onboard github [--hostname github.com] [--profile default] [--account LOGIN]",
+            "revoke github [--hostname github.com] [--profile default] [--account LOGIN]",
             "add-user <userId> [--admin]",
             "config get default-archetype|default-priority",
             "config set default-archetype <name>",
@@ -4653,6 +4814,11 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     provider: "openai".to_owned(),
                     api_key: false,
+                    hostname: None,
+                    profile: None,
+                    account: None,
+                    remote: None,
+                    replace: false,
                 },
             ),
             (

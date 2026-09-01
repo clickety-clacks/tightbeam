@@ -36,6 +36,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.HarnessProcess,
     Tightbeam.AdminProjection,
     Tightbeam.HarnessHealth,
+    Tightbeam.GithubCredentials,
     Tightbeam.Toplines
   ]
 

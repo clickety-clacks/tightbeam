@@ -80,6 +80,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
              "code-review-requires-passing-tests",
              "spec-dispatch-requires-spirit",
              "review-rounds-doorbell",
+             "github-network-auth-required",
              "completion-requires-verification",
              "completion-requires-results-artifact"
            ]

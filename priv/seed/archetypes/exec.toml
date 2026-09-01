@@ -1,6 +1,9 @@
 name = "exec"
 skills = []
 
+[provisioning]
+class = "desk"
+
 [guidance]
 text = '''
 #include "exec.md"

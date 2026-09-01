@@ -172,7 +172,19 @@ defmodule Tightbeam.ArchetypesTest do
 
     for role <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
       assert "worktree-session" in loaded[role].skills
+
+      assert loaded[role].provisioning == %{
+               class: :workshop,
+               credentials: %{github: "default"}
+             }
     end
+
+    assert loaded["exec"].provisioning == %{class: :desk, credentials: %{github: nil}}
+
+    assert loaded["default"].provisioning == %{
+             class: :workshop,
+             credentials: %{github: nil}
+           }
 
     coder =
       Identity.snapshot_at!(

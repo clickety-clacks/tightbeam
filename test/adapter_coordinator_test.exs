@@ -18,6 +18,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     test_dir = Path.join(System.tmp_dir!(), "adapter-coordinator-#{test_nonce()}")
     File.mkdir_p!(test_dir)
     on_exit(fn -> File.rm_rf!(test_dir) end)
+    Tightbeam.Archetypes.load!(test_dir)
     start_supervised!({DB, path: ":memory:", name: db})
     # The whole schema, not just the events table: a death is now told to the
     # sessions it halted, so the coordinator reads `sessions` and `messages`.
@@ -726,10 +727,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   ## Task #14 — the guard covers the ACTION, not the RECORD
 
   test "a death absorbed by a replacement is recorded and told, but restarts nothing", ctx do
-    key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"absorbed_#{System.unique_integer([:positive])}")
 
     session_key = seed_session!(ctx.db)
+    key = Tightbeam.Placement.adapter_key(Tightbeam.Org.get(ctx.db, session_key))
     running_turn!(ctx.db, session_key)
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
@@ -753,7 +754,9 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     send(coordinator, {:DOWN, stale_ref, :process, adapter, :killed})
     _ = :sys.get_state(coordinator)
 
-    assert [%{kind: "adapter_down", subject: "claude:shared@testhost", detail: detail}] =
+    expected_subject = AdapterCoordinator.key_name(key)
+
+    assert [%{kind: "adapter_down", subject: ^expected_subject, detail: detail}] =
              EventLog.lifecycle_events(ctx.db)
 
     assert detail =~ "absorbed=true"
@@ -804,10 +807,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
   test "a ready adapter's death is told even when a replacement already took the entry over",
        ctx do
-    key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"absorbed2_#{System.unique_integer([:positive])}")
 
     session_key = seed_session!(ctx.db)
+    key = Tightbeam.Placement.adapter_key(Tightbeam.Org.get(ctx.db, session_key))
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     await_ready!(coordinator, key)
@@ -875,10 +878,10 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   test "a death posts a fault message the session's reader sees", ctx do
-    key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"halted_#{System.unique_integer([:positive])}")
 
     session_key = seed_session!(ctx.db)
+    key = Tightbeam.Placement.adapter_key(Tightbeam.Org.get(ctx.db, session_key))
 
     seq = running_turn!(ctx.db, session_key)
     :ok = Tightbeam.Ledger.stamp_adapter(ctx.db, seq, 1)
@@ -895,7 +898,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # "[adapter recovered]" probe that already reaches this reader.
     assert [marker] = Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10)
     assert marker.content =~ "[adapter down]"
-    assert marker.content =~ "claude:shared@testhost"
+    assert marker.content =~ AdapterCoordinator.key_name(key)
     assert marker.sender == "process:tightbeam"
     assert marker.attention_tier == 0
 
@@ -903,7 +906,6 @@ defmodule Tightbeam.AdapterCoordinatorTest do
   end
 
   test "a session resident on the adapter is told even with no turn in flight", ctx do
-    key = {:claude, "shared", "testhost"}
     coordinator = start_fake_coordinator(ctx, :"unstamped_#{System.unique_integer([:positive])}")
 
     # No turn at all. The engine this session runs on died and its harness
@@ -911,6 +913,7 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # flight — and the turn-attribution predicates that would have excluded
     # this session are exactly what three review rounds found unsound.
     session_key = seed_session!(ctx.db)
+    key = Tightbeam.Placement.adapter_key(Tightbeam.Org.get(ctx.db, session_key))
 
     assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
     await_ready!(coordinator, key)

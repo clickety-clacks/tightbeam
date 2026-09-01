@@ -388,9 +388,9 @@ defmodule Tightbeam.Gateway do
         machine: machine,
         ssh: host.ssh,
         gate: fn _provider -> :ok end,
-        stop: fn provider -> stop_provider_runtime(provider, machine) end,
+        stop: fn provider -> stop_provider_runtime(db, provider, machine) end,
         park_edge: Tightbeam.CommandEdge.request_to(Tightbeam.AdapterCoordinator),
-        start: fn provider, kind -> start_provider_runtime(provider, kind, machine) end,
+        start: fn provider, kind -> start_provider_runtime(db, provider, kind, machine) end,
         resume: fn _provider -> :ok end,
         capture_sessions: fn provider ->
           capture_credential_sessions(db, provider, machine)
@@ -1048,7 +1048,13 @@ defmodule Tightbeam.Gateway do
             %{kungfu: call.params.name, paths: candidate.paths}
           )
         end),
-      {"onboard", []} => admin_call_handler(db, fn call -> onboard_result(config, call) end),
+      {"onboard", []} => fn call ->
+        if call.params[:provider] == "github" do
+          github_credential_result(config, db, call)
+        else
+          admin_call_handler(db, fn authorized -> onboard_result(config, authorized) end).(call)
+        end
+      end,
       {"promote-user", ["user.promoted"]} =>
         admin_call_handler(db, fn call ->
           result = Devices.promote_user_with_firehose(db, call.params.user_id, call)
@@ -1498,7 +1504,7 @@ defmodule Tightbeam.Gateway do
        )
        when action in ["restart", "resume"] do
     coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
-    key = {Harness.parse!(session.harness).id(), "shared", session.host}
+    key = Placement.adapter_key(session)
 
     case AdapterCoordinator.close_adapter(coordinator, key) do
       :ok ->
@@ -3186,7 +3192,7 @@ defmodule Tightbeam.Gateway do
 
   defp assistant_message_texts(%{text: text}) when is_binary(text), do: [text]
 
-  defp adapter_key(session), do: {Harness.parse!(session.harness).id(), "shared", session.host}
+  defp adapter_key(session), do: Placement.adapter_key(session)
 
   # Wire publication for terminals that lost their runner closure: turns
   # recovered at boot (failed_unknown), task crashes, republished rows. The
@@ -3295,7 +3301,7 @@ defmodule Tightbeam.Gateway do
 
   defp harness_cancel(db, session) do
     with %{harness_session_id: sid} <- Org.current_pointer(db, session.session_key),
-         key = {Harness.parse!(session.harness).id(), "shared", session.host},
+         key = Placement.adapter_key(session),
          {:ok, adapter, _gen} <- AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key) do
       Tightbeam.Acp.Conn.notify(Tightbeam.Acp.Adapter.conn(adapter), "session/cancel", %{
         sessionId: sid
@@ -3308,7 +3314,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp checkout_adapter(session) do
-    key = {Harness.parse!(session.harness).id(), "shared", session.host}
+    key = Placement.adapter_key(session)
 
     case AdapterCoordinator.adapter_for_turn(Tightbeam.AdapterCoordinator, key) do
       {:ok, adapter, generation} ->
@@ -3944,10 +3950,9 @@ defmodule Tightbeam.Gateway do
 
   defp close_resident_main_session(config, session, pointer) do
     coordinator = config[:adapter_coordinator] || AdapterCoordinator
-    harness = Harness.parse!(session.harness).id()
 
     with {:ok, adapter, _generation} <-
-           AdapterCoordinator.adapter_for(coordinator, {harness, "shared", session.host}) do
+           AdapterCoordinator.adapter_for(coordinator, Placement.adapter_key(session)) do
       case Adapter.knows_session?(adapter, pointer.harness_session_id) do
         true -> Adapter.close_session(adapter, pointer.harness_session_id)
         false -> :ok
@@ -4282,7 +4287,7 @@ defmodule Tightbeam.Gateway do
 
   defp identity_apply_started_session(config, db, session, revision, pointer) do
     harness = Harness.parse!(session.harness).id()
-    key = {harness, "shared", session.host}
+    key = Placement.adapter_key(session)
     cwd = Placement.holder_workdir(config, session)
     snapshot = served_snapshot(config, session, harness, revision)
     mcp_servers = mcp_servers_for_archetype(session.archetype)
@@ -4352,6 +4357,104 @@ defmodule Tightbeam.Gateway do
                             do: ["fixture-provider"],
                             else: []
                           )
+
+  defp github_credential_result(config, db, %{params: params} = call) do
+    with {:ok, principal, machine} <- github_dispatch_principal(config, db, call, params),
+         true <- Map.has_key?(Placement.hosts(config.base_dir, db), machine) do
+      profile = Map.get(params, :profile, "default")
+      hostname = Map.get(params, :hostname, "github.com")
+
+      case Map.get(params, :phase, "context") do
+        "context" ->
+          %{
+            status: "ready",
+            machine: machine,
+            principal: principal,
+            base_dir: Placement.hosts(config.base_dir, db)[machine].base_dir,
+            binding: Tightbeam.GithubCredentials.binding(db, machine, profile, hostname)
+          }
+
+        phase when phase in ["begin", "revoke-begin"] ->
+          attempt = if phase == "begin", do: "onboarding", else: "revocation"
+
+          case Tightbeam.GithubCredentials.begin_mutation(db, %{
+                 machine: machine,
+                 profile: profile,
+                 hostname: hostname,
+                 mutation_attempt: attempt,
+                 principal: principal
+               }) do
+            {:ok, binding} ->
+              %{status: "ready", binding: binding, machine: machine, principal: principal}
+
+            {:error, error} ->
+              %{code: "github_binding_write_failed", message: Exception.message(error)}
+          end
+
+        phase when phase in ["finish", "revoke-finish"] ->
+          state = Map.fetch!(params, :state)
+          account = Map.get(params, :account)
+          operation_class = if phase == "finish", do: "onboarding", else: "revocation"
+          cause = Map.fetch!(params, :cause)
+
+          binding = %{
+            machine: machine,
+            profile: profile,
+            hostname: hostname,
+            account: account,
+            state: state,
+            mutation_attempt: nil,
+            principal: principal
+          }
+
+          observation = %{
+            machine: machine,
+            profile: profile,
+            hostname: hostname,
+            account: account,
+            state: state,
+            cause: cause,
+            principal: principal,
+            operation_class: operation_class,
+            phase: "provider",
+            dedupe_key: Map.get(params, :dedupe_key)
+          }
+
+          case Tightbeam.GithubCredentials.commit_outcome(db, binding, observation) do
+            {:ok, outcome} ->
+              %{status: state, outcome: outcome}
+
+            {:error, error} ->
+              %{code: "github_outcome_write_failed", message: Exception.message(error)}
+          end
+
+        _ ->
+          %{code: "invalid_message", message: "unknown GitHub credential phase"}
+      end
+    else
+      false -> %{code: "unknown_host", message: "unknown GitHub credential machine"}
+      {:error, code} -> %{code: code, message: "authenticated user or session principal required"}
+    end
+  rescue
+    error in [ArgumentError, KeyError] ->
+      %{code: "invalid_message", message: Exception.message(error)}
+  end
+
+  defp github_dispatch_principal(_config, db, call, params) do
+    case identity_query_principal(db, call) do
+      {:session, session_key} ->
+        case Org.get(db, session_key) do
+          %{host: host} -> {:ok, "session:#{session_key}", host}
+          nil -> {:error, "unknown_caller"}
+        end
+
+      {:user, user_id} ->
+        {:ok, "user:#{user_id}", Map.get(params, :machine, Placement.local_host_name())}
+
+      _ ->
+        {:error, "unknown_caller"}
+    end
+  end
 
   defp onboard_result(config, %{params: %{provider: provider, phase: phase} = params} = call)
        when provider in @onboarding_providers and phase in ["begin", "finish", "cancel"] do
@@ -6904,7 +7007,7 @@ defmodule Tightbeam.Gateway do
              {:ok, adapter, _generation} <-
                AdapterCoordinator.adapter_for(
                  coordinator,
-                 {harness, "shared", session.host}
+                 Placement.adapter_key(session)
                ) do
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
             # RESIDENT: Claude bound its offered-model set when it created this
@@ -7380,15 +7483,20 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp stop_provider_runtime(provider, machine) do
+  defp stop_provider_runtime(db, provider, machine) do
     provider
     |> harnesses_for_provider()
     |> Enum.reduce(:ok, fn module, result ->
       close_result =
-        AdapterCoordinator.close_adapter(
-          Tightbeam.AdapterCoordinator,
-          {module.id(), "shared", machine}
-        )
+        db
+        |> Placement.adapter_keys(module.id(), machine)
+        |> Enum.reduce(:ok, fn key, key_result ->
+          case {key_result, AdapterCoordinator.close_adapter(Tightbeam.AdapterCoordinator, key)} do
+            {:ok, :ok} -> :ok
+            {:ok, {:error, _} = error} -> error
+            {error, _} -> error
+          end
+        end)
 
       case {result, close_result} do
         {:ok, :ok} -> :ok
@@ -7465,22 +7573,32 @@ defmodule Tightbeam.Gateway do
     "#{provider} credential on #{machine} was re-onboarded; this session may resume."
   end
 
-  defp start_provider_runtime(provider, kind, machine) do
+  defp start_provider_runtime(db, provider, kind, machine) do
     {started, failed} =
       Enum.reduce(harnesses_for_provider(provider), {[], []}, fn module, {started, failed} ->
-        key = {module.id(), "shared", machine}
+        Enum.reduce(Placement.adapter_keys(db, module.id(), machine), {started, failed}, fn key,
+                                                                                            {started,
+                                                                                             failed} ->
+          case AdapterCoordinator.adapter_for(
+                 Tightbeam.AdapterCoordinator,
+                 key,
+                 credential_kind: kind
+               ) do
+            {:ok, _pid, _generation} ->
+              {[AdapterCoordinator.key_name(key) | started], failed}
 
-        case AdapterCoordinator.adapter_for(
-               Tightbeam.AdapterCoordinator,
-               key,
-               credential_kind: kind
-             ) do
-          {:ok, _pid, _generation} ->
-            {[module.wire_name() | started], failed}
-
-          {:error, reason} ->
-            {started, [%{harness: module.wire_name(), reason: reason} | failed]}
-        end
+            {:error, reason} ->
+              {started,
+               [
+                 %{
+                   harness: module.wire_name(),
+                   key: AdapterCoordinator.key_name(key),
+                   reason: reason
+                 }
+                 | failed
+               ]}
+          end
+        end)
       end)
 
     case Enum.reverse(failed) do
@@ -8135,7 +8253,7 @@ defmodule Tightbeam.Gateway do
           %{
             session_key: session_key,
             sid: sid,
-            key: {Harness.parse!(session.harness).id(), "shared", session.host}
+            key: Placement.adapter_key(session)
           }
         ]
       else
@@ -8206,15 +8324,12 @@ defmodule Tightbeam.Gateway do
     :exit, _ -> :ok
   end
 
-  defp live_session_on_adapter?(db, {harness, "shared", host}) do
-    {:ok, [[count]]} =
-      DB.query(
-        db,
-        "SELECT COUNT(*) FROM sessions WHERE state='active' AND harness=?1 AND host=?2",
-        [Atom.to_string(harness), host]
-      )
-
-    count > 0
+  defp live_session_on_adapter?(db, key) do
+    db
+    |> Org.list_all()
+    |> Enum.any?(fn session ->
+      session.state == "active" and Placement.adapter_key(session) == key
+    end)
   end
 
   # Says four things and nothing more: the engine changed, from what to what,

@@ -38,8 +38,8 @@ defmodule Tightbeam.RailsTest do
   test "empty and missing rails dirs are a valid empty set", ctx do
     assert Rails.load!(ctx.base_dir) == []
 
-    # No law, but still a hook: the observation entry is the substrate's, not the
-    # org's, and an org that has authored no statute still records artifacts.
+    # No law, but still one hook: artifact observation is substrate-reserved.
+    # GitHub auth now compiles only from the dispatch-rule law.
     assert Rails.hook_settings() == %{
              "hooks" => %{"PreToolUse" => [Rails.observation_entry()]}
            }
@@ -111,8 +111,10 @@ defmodule Tightbeam.RailsTest do
     Rails.load!(ctx.base_dir)
 
     # Statutes first, in filename-then-table order; the reserved observation
-    # entry last, because it is not law and never decides anything.
-    assert %{"hooks" => %{"PreToolUse" => [entry, observation]}} = Rails.hook_settings()
+    # entry follows operator law.
+    assert %{"hooks" => %{"PreToolUse" => [entry, observation]}} =
+             Rails.hook_settings()
+
     assert observation == Rails.observation_entry()
     assert entry["matcher"] == "Bash"
     assert [%{"type" => "command", "command" => command}] = entry["hooks"]
@@ -144,7 +146,10 @@ defmodule Tightbeam.RailsTest do
     })
 
     Rails.load!(ctx.base_dir)
-    %{"hooks" => %{"PreToolUse" => [entry, _observation]}} = Rails.hook_settings()
+
+    %{"hooks" => %{"PreToolUse" => [entry, _observation]}} =
+      Rails.hook_settings()
+
     [%{"command" => command}] = entry["hooks"]
 
     assert command ==

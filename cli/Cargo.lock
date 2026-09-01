@@ -555,6 +555,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "ureq",

@@ -1,6 +1,12 @@
 name = "orchestrator"
 skills = ["worktree-session", "feature-cycle", "work-tracking", "unblocking", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication", "security-incident"]
 
+[provisioning]
+class = "workshop"
+
+[provisioning.credentials.github]
+profile = "default"
+
 [guidance]
 text = """
 #include "golden-rule.md"

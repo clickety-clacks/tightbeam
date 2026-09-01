@@ -6,6 +6,8 @@ mod ceremonies;
 mod child_process;
 mod contain;
 mod dispatch;
+mod dispatch_rule_check;
+mod github_auth;
 mod harness_process;
 mod harnesses;
 mod lease;
@@ -42,6 +44,16 @@ fn main() {
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);
+            }
+        }
+    }
+
+    if args.first().is_some_and(|arg| arg == "dispatch-rule-check") {
+        match dispatch_rule_check::run(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
             }
         }
     }

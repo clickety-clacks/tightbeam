@@ -355,6 +355,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         | Command::CommandHelp(_)
         | Command::IdentityCurrent
         | Command::Doctor { .. }
+        | Command::GithubAuthCheck
+        | Command::RevokeGithub { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
@@ -1438,7 +1440,7 @@ where
     endpoint_from_gateway_file(&path)
 }
 
-fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
+pub(crate) fn discover_session_from(cwd: &Path) -> Result<Option<Endpoint>, String> {
     for directory in cwd.ancestors() {
         let path = directory.join(".tightbeam-session");
         if !path.exists() {
@@ -1859,11 +1861,30 @@ where
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
+        Command::GithubAuthCheck => crate::github_auth::check_tool_call_stdin(),
         Command::Onboard {
             identity,
             provider,
             api_key,
+            hostname,
+            profile,
+            account,
+            remote,
+            replace,
         } => {
+            if provider == "github" {
+                let endpoint = discover_endpoint()?;
+                require_session_endpoint(&identity, &endpoint)?;
+                return crate::github_auth::onboard(
+                    &endpoint,
+                    &identity,
+                    hostname.as_deref().unwrap_or("github.com"),
+                    profile.as_deref().unwrap_or("default"),
+                    account.as_deref(),
+                    remote.as_deref(),
+                    replace,
+                );
+            }
             let endpoint = discover_endpoint()?;
             require_session_endpoint(&identity, &endpoint)?;
             crate::ceremonies::onboard(
@@ -1873,6 +1894,22 @@ where
                 &endpoint,
                 send_request,
                 load_harnesses,
+            )
+        }
+        Command::RevokeGithub {
+            identity,
+            hostname,
+            profile,
+            account,
+        } => {
+            let endpoint = discover_endpoint()?;
+            require_session_endpoint(&identity, &endpoint)?;
+            crate::github_auth::revoke(
+                &endpoint,
+                &identity,
+                &hostname,
+                &profile,
+                account.as_deref(),
             )
         }
         command => {
@@ -1990,6 +2027,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::KungfuList { identity }
         | Command::IdentityApply { identity, .. }
         | Command::Onboard { identity, .. }
+        | Command::RevokeGithub { identity, .. }
         | Command::AddUser { identity, .. }
         | Command::ConfigGet { identity, .. }
         | Command::ConfigSet { identity, .. }
@@ -2002,9 +2040,29 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::ToolCallObserved
+        | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
     }
+}
+
+pub(crate) fn github_dispatch(
+    endpoint: &Endpoint,
+    identity: &Identity,
+    params: Value,
+) -> Result<Value, String> {
+    let mut body = identity_field(identity).into_iter().collect::<Vec<_>>();
+    body.push(string_field("verb", "onboard"));
+    body.push(format!("\"params\":{params}"));
+    send_to(
+        endpoint,
+        &RequestSpec {
+            method: "POST",
+            path: "/agent/dispatch",
+            body_json: object(body),
+        },
+    )?
+    .ok_or_else(|| "GitHub credential dispatch returned no result".to_owned())
 }
 
 fn print_current_session_identity() -> Result<(), String> {
@@ -4100,6 +4158,11 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                hostname: None,
+                profile: None,
+                account: None,
+                remote: None,
+                replace: false,
             },
             || {
                 discoveries.set(discoveries.get() + 1);
@@ -4207,6 +4270,11 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                hostname: None,
+                profile: None,
+                account: None,
+                remote: None,
+                replace: false,
             },
             || {
                 Ok(Endpoint {

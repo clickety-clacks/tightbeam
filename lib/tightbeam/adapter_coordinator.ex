@@ -488,20 +488,14 @@ defmodule Tightbeam.AdapterCoordinator do
   # still gets its row; the turn that asked for it gets its own spawn error.
   defp told_sessions(_db, _key, false = _was_ready?), do: []
 
-  defp told_sessions(db, {harness, "shared", host}, true) do
-    {:ok, rows} =
-      Tightbeam.DB.query(
-        db,
-        "SELECT sessionKey FROM sessions WHERE state = 'active' AND harness = ?1 AND host = ?2",
-        [Atom.to_string(harness), host]
-      )
-
-    Enum.map(rows, fn [session_key] -> session_key end)
+  defp told_sessions(db, key, true) do
+    db
+    |> Tightbeam.Org.list_all()
+    |> Enum.filter(fn session ->
+      session.state == "active" and Tightbeam.Placement.adapter_key(session) == key
+    end)
+    |> Enum.map(& &1.session_key)
   end
-
-  # Sessions reach a key the way the gateway builds one — harness and host,
-  # shared archetype — so a key of any other shape is resident to nobody.
-  defp told_sessions(_db, _key, _was_ready?), do: []
 
   defp retire_adapter(key, state) do
     case state.adapters[key] do

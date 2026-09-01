@@ -1,6 +1,12 @@
 name = "coder"
 skills = ["worktree-session", "committing-and-pushing", "human-communication"]
 
+[provisioning]
+class = "workshop"
+
+[provisioning.credentials.github]
+profile = "default"
+
 [guidance]
 text = """
 #include "golden-rule.md"
