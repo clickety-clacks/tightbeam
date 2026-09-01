@@ -179,6 +179,213 @@ defmodule Tightbeam.BreathingTest do
              })
   end
 
+  test "A16 matches the shared dual-line JSON fixture", %{db: db} do
+    assert File.read!("test/fixtures/breathing-v1-parity.json") ==
+             "{\"schema\":\"breathing-v1\",\"target\":{\"kind\":\"session\",\"id\":\"parity_missing\"},\"breathing\":false,\"reason\":\"session_missing\",\"evidence\":{}}\n"
+
+    assert %{
+             schema: "breathing-v1",
+             target: %{kind: "session", id: "parity_missing"},
+             breathing: false,
+             reason: "session_missing",
+             evidence: %{}
+           } = query(db, "session", "parity_missing")
+  end
+
+  test "A1 through A9 select the closed session and assignment vocabulary", %{
+    db: db,
+    holder: holder
+  } do
+    assert %{
+             schema: "breathing-v1",
+             target: %{kind: "session", id: "missing"},
+             breathing: false,
+             reason: "session_missing",
+             evidence: %{}
+           } = query(db, "session", "missing")
+
+    :ok = insert_turn(db, holder, nil, nil, "running", 2, nil)
+    :ok = insert_turn(db, holder, nil, nil, "running", 3, nil)
+
+    assert %{reason: "running_turn", evidence: %{turn: %{"seq" => 2}}} =
+             query(db, "session", holder)
+
+    :ok = DB.execute(db, "UPDATE turns SET status = 'delivered' WHERE status = 'running'")
+    :ok = insert_turn(db, holder, nil, nil, "queued", 4, nil)
+    :ok = insert_turn(db, holder, nil, nil, "queued", 5, nil)
+
+    assert %{reason: "queued_turn", evidence: %{turn: %{"seq" => 4}}} =
+             query(db, "session", holder)
+
+    :ok = insert_wake(db, "wake_b", holder, nil, nil, 6)
+    :ok = DB.execute(db, "UPDATE sessions SET state = 'retired' WHERE sessionKey = '#{holder}'")
+    assert %{reason: "session_retired", breathing: false} = query(db, "session", holder)
+
+    :ok = insert_work_item(db, "wi_a6_a9")
+    :ok = insert_assignment(db, "asg_failed_a6", holder, "wi_a6_a9", 1)
+    :ok = insert_assignment(db, "asg_delivered_a7", holder, "wi_a6_a9", 2)
+    :ok = insert_assignment(db, "asg_closed_a8", holder, "wi_a6_a9", 3)
+    :ok = insert_assignment(db, "asg_retired_a9", holder, "wi_a6_a9", 4)
+    :ok = DB.execute(db, "UPDATE sessions SET state = 'active' WHERE sessionKey = '#{holder}'")
+    :ok = insert_turn(db, holder, "asg_failed_a6", nil, "failed", 6, "usageLimitExceeded")
+    :ok = insert_turn(db, holder, "asg_delivered_a7", nil, "delivered", 7, nil)
+    :ok = insert_turn(db, holder, "asg_closed_a8", nil, "running", 8, nil)
+    :ok = insert_turn(db, holder, "asg_retired_a9", nil, "delivered", 9, nil)
+    :ok = insert_turn(db, holder, "asg_retired_a9", nil, "queued", 10, nil)
+    :ok = insert_wake(db, "wake_a8", holder, "asg_closed_a8", nil, 1)
+    :ok = insert_wake(db, "wake_a9", holder, "asg_retired_a9", nil, 1)
+    :ok = DB.execute(db, "UPDATE assignments SET state = 'closed' WHERE id = 'asg_closed_a8'")
+
+    assert %{
+             reason: "latest_terminal_failed",
+             evidence: %{turn: %{"error" => "usageLimitExceeded"}}
+           } =
+             query(db, "assignment", "asg_failed_a6")
+
+    assert %{reason: "no_current_path", breathing: false} =
+             query(db, "assignment", "asg_delivered_a7")
+
+    assert %{reason: "assignment_closed", breathing: false} =
+             query(db, "assignment", "asg_closed_a8")
+
+    :ok = DB.execute(db, "UPDATE sessions SET state = 'retired' WHERE sessionKey = '#{holder}'")
+
+    assert %{reason: "holder_retired", breathing: false} =
+             query(db, "assignment", "asg_retired_a9")
+  end
+
+  test "A10 through A20 compose direct, linked, excluded, and private evidence", %{
+    db: db,
+    holder: holder
+  } do
+    :ok = insert_work_item(db, "wi_direct_wake")
+    :ok = insert_wake(db, "wake_direct", holder, nil, "wi_direct_wake", 1)
+    assert %{reason: "pending_wake", breathing: true} = query(db, "work-item", "wi_direct_wake")
+
+    :ok = insert_work_item(db, "wi_ordered")
+
+    for {id, opened_at, status} <- [
+          {"asg_idle", 1, nil},
+          {"asg_pending", 4, :wake},
+          {"asg_queued", 3, "queued"},
+          {"asg_running", 2, "running"}
+        ] do
+      :ok = insert_assignment(db, id, holder, "wi_ordered", opened_at)
+
+      if is_binary(status),
+        do: :ok = insert_turn(db, holder, id, nil, status, opened_at + 20, nil)
+
+      if status == :wake, do: :ok = insert_wake(db, "wake_#{id}", holder, id, nil, 20)
+    end
+
+    assert %{reason: "open_assignment_lively", evidence: %{assignment: winner}} =
+             query(db, "work-item", "wi_ordered")
+
+    assert %{id: "asg_running", reason: "running_turn"} = winner
+
+    :ok = insert_work_item(db, "wi_all_idle")
+    :ok = insert_assignment(db, "asg_same_b", holder, "wi_all_idle", 1)
+    :ok = insert_assignment(db, "asg_same_a", holder, "wi_all_idle", 1)
+
+    assert %{reason: "all_open_assignments_not_lively", evidence: %{open_assignments: idle}} =
+             query(db, "work-item", "wi_all_idle")
+
+    assert Enum.map(idle, & &1.id) == ["asg_same_a", "asg_same_b"]
+
+    :ok = insert_work_item(db, "wi_terminal_conflict")
+    :ok = insert_turn(db, holder, nil, "wi_terminal_conflict", "running", 40, nil)
+
+    :ok =
+      DB.execute(db, "UPDATE work_items SET state = 'closed' WHERE id = 'wi_terminal_conflict'")
+
+    assert %{reason: "work_item_terminal", breathing: false} =
+             query(db, "work-item", "wi_terminal_conflict")
+
+    :ok = insert_work_item(db, "wi_excluded")
+    :ok = insert_assignment(db, "asg_excluded", holder, "wi_excluded", 1)
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO attests (id, assignmentId, kind, verdictKind, note, bySession, ts) VALUES ('att_attest', 'asg_excluded', 'progress', NULL, 'attest', '#{holder}', 1), ('att_reaffirmation', 'asg_excluded', 'verdict', 'verified', 'standing reaffirmation', '#{holder}', 2)"
+      )
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (3, 'patrol-response-acknowledged', 'asg_excluded', 'test')"
+      )
+
+    assert %{reason: "no_current_path", breathing: false} =
+             query(db, "assignment", "asg_excluded")
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE sessions SET cliToken = 'MUST-NOT-LEAK' WHERE sessionKey = '#{holder}'"
+      )
+
+    refute inspect(query(db, "session", holder)) =~ "MUST-NOT-LEAK"
+  end
+
+  test "A13 snapshot reads, A14 restart reads, and repeated reads are stable", %{
+    db: db,
+    holder: holder
+  } do
+    :ok = insert_work_item(db, "wi_snapshot")
+    :ok = insert_assignment(db, "asg_snapshot", holder, "wi_snapshot", 1)
+    :ok = insert_turn(db, holder, "asg_snapshot", nil, "running", 1, nil)
+    parent = self()
+
+    writer =
+      Task.async(fn ->
+        DB.transaction(db, fn txn ->
+          Tightbeam.DB.Txn.exec(
+            txn,
+            "UPDATE assignments SET state = 'closed' WHERE id = 'asg_snapshot'"
+          )
+
+          send(parent, :snapshot_closed)
+
+          receive do
+            :release_snapshot -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :snapshot_closed
+    reader = Task.async(fn -> query(db, "assignment", "asg_snapshot") end)
+    send(writer.pid, :release_snapshot)
+    assert {:ok, :ok} = Task.await(writer)
+    assert %{reason: "assignment_closed", breathing: false} = Task.await(reader)
+
+    path =
+      Path.join(System.tmp_dir!(), "breathing-restart-#{System.unique_integer([:positive])}.db")
+
+    restart_db = :"breathing_restart_#{System.unique_integer([:positive])}"
+    {:ok, restart_pid} = DB.start_link(path: path, name: restart_db)
+    Process.unlink(restart_pid)
+    :ok = ensure_all_schemas(restart_db)
+
+    {:ok, _} =
+      DB.query(
+        restart_db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', 1)"
+      )
+
+    restart_holder = ensure_main_session(restart_db, "owner").session_key
+    :ok = insert_wake(restart_db, "wake_restart", restart_holder, nil, nil, 9)
+    before = query(restart_db, "session", restart_holder)
+    assert before == query(restart_db, "session", restart_holder)
+    :ok = GenServer.stop(restart_pid)
+
+    {:ok, restarted_pid} = DB.start_link(path: path, name: restart_db)
+    Process.unlink(restarted_pid)
+    assert before == query(restart_db, "session", restart_holder)
+    :ok = GenServer.stop(restarted_pid)
+    File.rm(path)
+  end
+
   defp query(db, kind, id),
     do:
       Breathing.query(db, %{
