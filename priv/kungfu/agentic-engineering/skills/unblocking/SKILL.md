@@ -28,8 +28,8 @@ missing.
    - **Unneeded gate** — the agent waits for permission or input the work does not
      require. Name the authority it already holds and wake it. A review holding work
      for a facet the ask ships without is this class: file `review-overreach` on the
-     review card and have the reviewer re-file (orchestrator kernel, "Verifying without
-     redoing").
+     PRODUCER's card naming the review card, and have the reviewer re-file its own
+     verdict (orchestrator kernel, "Verifying without redoing").
    - **Refused workaround** — a viable path that breaks no rule exists and the agent
      has not taken it. State the path and wake the agent to take it.
    - **Real block** — the work cannot proceed without a decision that belongs to the
