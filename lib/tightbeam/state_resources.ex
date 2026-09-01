@@ -1220,6 +1220,12 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  @doc "Public compact-row serializer for deterministic physical queries."
+  def breathing_evidence(row) when is_map(row) do
+    Map.new(row, fn {key, value} -> {wire_key(key), public(value)} end)
+    |> Map.reject(fn {key, _value} -> MapSet.member?(@secret_keys, key) end)
+  end
+
   def decision_request(%{status: "ruled"} = row) do
     unless complete_ruled_decision?(row) do
       raise ArgumentError, "decision_request_integrity_invalid"
