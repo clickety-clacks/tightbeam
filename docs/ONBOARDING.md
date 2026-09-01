@@ -40,8 +40,9 @@ once without passing the key through an agent or CLI request:
    `opencode-go-api-key` in that directory.
 3. Set the file mode to `0600` or `0400`.
 4. Set `TIGHTBEAM_CREDENTIALS_DIRECTORY` on the gateway service to the absolute
-   directory path. A systemd unit can use its standard `CREDENTIALS_DIRECTORY`
-   instead.
+   directory path. On a systemd unit, set
+   `LoadCredential=opencode-go-api-key:<abs-source>` instead — systemd populates
+   `$CREDENTIALS_DIRECTORY/opencode-go-api-key`, the fixed name the daemon reads.
 5. Run `tightbeam onboard opencode-go --daemon-credential --as-user <userId>`.
 
 The daemon refuses relative directories, symlinks, non-regular files,

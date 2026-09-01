@@ -384,7 +384,10 @@ mode `0600` or `0400`. Then run:
 ```
 
 The key does not enter the CLI process, request, response, or event record.
-systemd services may supply the standard `CREDENTIALS_DIRECTORY` instead.
+On a systemd unit, `LoadCredential=opencode-go-api-key:<abs-source>` supplies the
+standard `CREDENTIALS_DIRECTORY` instead of `TIGHTBEAM_CREDENTIALS_DIRECTORY`:
+systemd copies `<abs-source>` into `$CREDENTIALS_DIRECTORY/opencode-go-api-key`,
+the fixed name the daemon reads — see the systemd unit below.
 
 `<userId>` is the admin created by that first pairing. From a
 release install `tightbeam` is already on PATH, so the `<base_dir>/bin/` prefix
@@ -574,6 +577,9 @@ Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
 Environment=TIGHTBEAM_PORT=11373
 Environment=TIGHTBEAM_ADVERTISED_URL=ws://gibson.local:11373
 Environment=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Daemon-owned OpenCode Go key (optional): systemd copies the source file into
+# $CREDENTIALS_DIRECTORY/opencode-go-api-key, the fixed name the gateway reads.
+# LoadCredential=opencode-go-api-key:/home/you/secrets/opencode-go-api-key
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

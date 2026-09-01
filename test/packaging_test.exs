@@ -5,6 +5,61 @@ defmodule Tightbeam.PackagingTest do
   @purity Path.expand("../packaging/purity-check.sh", __DIR__)
   @finalize Path.expand("../packaging/finalize-artifact.sh", __DIR__)
 
+  @repo_root Path.expand("..", __DIR__)
+  @importer Path.join(@repo_root, "lib/tightbeam/credentials.ex")
+  @runtime Path.join(@repo_root, "config/runtime.exs")
+  @credential_docs [
+    Path.join(@repo_root, "README.md"),
+    Path.join(@repo_root, "docs/ONBOARDING.md")
+  ]
+
+  test "the systemd daemon-credential docs stay bound to both halves of the importer seam" do
+    # systemd LoadCredential delivers the seeded key as $CREDENTIALS_DIRECTORY/<id>.
+    # BOTH halves of that path are code the docs must not drift from, or a
+    # daemon-onboarded key lands where the gateway never looks and onboarding fails
+    # at read time. Both are derived from source here, so a doc-only or code-only
+    # rename turns this test red:
+    #
+    #   1. FILENAME (<id>): systemd delivers the key under the LoadCredential id, so
+    #      the documented id must equal the fixed name the importer reads
+    #      (read_daemon_credential/2 in credentials.ex).
+    #   2. DIRECTORY ($env): the env the docs join that name onto must be an env var
+    #      config/runtime.exs actually reads into :credentials_directory — the
+    #      standard CREDENTIALS_DIRECTORY systemd sets, not a lookalike.
+    credential_name =
+      case Regex.run(~r/Path\.join\(directory, "([^"]+)"\)/, File.read!(@importer)) do
+        [_, name] -> name
+        _ -> flunk("could not find the daemon credential filename in credentials.ex; the anti-drift anchor moved")
+      end
+
+    runtime_credential_env_vars =
+      ~r/System\.get_env\("([A-Za-z0-9_]*CREDENTIALS_DIRECTORY)"\)/
+      |> Regex.scan(File.read!(@runtime))
+      |> Enum.map(fn [_, var] -> var end)
+
+    assert "CREDENTIALS_DIRECTORY" in runtime_credential_env_vars,
+           "config/runtime.exs must read the standard systemd CREDENTIALS_DIRECTORY " <>
+             "into :credentials_directory, or LoadCredential never reaches the importer"
+
+    for doc <- @credential_docs do
+      body = File.read!(doc)
+
+      assert body =~ "LoadCredential=#{credential_name}",
+             "#{Path.relative_to(doc, @repo_root)} must document LoadCredential=#{credential_name} " <>
+               "to match the importer's fixed credential file"
+
+      documented_dir_env =
+        case Regex.run(~r/\$([A-Za-z0-9_]+)\/#{Regex.escape(credential_name)}/, body) do
+          [_, env] -> env
+          _ -> flunk("#{Path.relative_to(doc, @repo_root)} must document the $<dir>/#{credential_name} delivery path")
+        end
+
+      assert documented_dir_env in runtime_credential_env_vars,
+             "#{Path.relative_to(doc, @repo_root)} joins #{credential_name} onto $#{documented_dir_env}, " <>
+               "which config/runtime.exs does not read into :credentials_directory"
+    end
+  end
+
   test "the extracted artifact refuses a stale gateway version" do
     artifact = artifact_fixture("0.1.6", "0.1.5")
 
