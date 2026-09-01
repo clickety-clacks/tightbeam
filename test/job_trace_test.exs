@@ -345,6 +345,14 @@ defmodule Tightbeam.JobTraceTest do
         "causal_event" ->
           ~w(assignmentId at detail id jobRef kind seqTiebreak sessionKey type)a
 
+        "completion_escalation" ->
+          ~w(actingPrincipal assignmentId at childSessionKey closingAttestId completionId
+             causePrincipal currentStatus decision id phase supersededByAssignmentId
+             supersededReason type workItemId)a
+
+        "completion_escalation_event" ->
+          ~w(at completionId detail id kind type)a
+
         "wake_canceled" ->
           ~w(assignmentId at id reason seqTiebreak type)a
       end

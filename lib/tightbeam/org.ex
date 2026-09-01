@@ -1042,6 +1042,9 @@ defmodule Tightbeam.Org do
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND w.targetGate=1
         AND (w.sessionKey=?1 OR r.boundSessionKey=?1)
+        AND NOT EXISTS (
+          SELECT 1 FROM completion_escalation_wakes cew WHERE cew.wakeId=w.wakeId
+        )
       ORDER BY w.createdAt, w.wakeId
       """,
       [session_key]

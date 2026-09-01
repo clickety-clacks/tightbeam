@@ -404,6 +404,7 @@ defmodule Tightbeam.WorkStateTest do
     result =
       handlers["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: "retiring",
         params: %{}
       })

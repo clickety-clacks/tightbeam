@@ -570,6 +570,7 @@ defmodule Tightbeam.RulesTest do
 
   test "zero rules lets completion close with null verdict filer fields and one verb event",
        ctx do
+    ensure_users(ctx.db, ["flynn"])
     holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -1063,6 +1064,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "P3 review and artifact statutes deny before attest and allow after proof", ctx do
+    ensure_users(ctx.db, ["flynn", "other"])
     holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "gate-reviewer", "other", archetype: "reviewer")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
@@ -1153,6 +1155,12 @@ defmodule Tightbeam.RulesTest do
     reviewer = session(ctx.db, "receipt-reviewer", "reviewer", archetype: "reviewer")
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
 
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+      )
+
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
@@ -1199,6 +1207,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
+    ensure_users(ctx.db, ["flynn"])
     coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
     noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
     reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
@@ -1481,5 +1490,16 @@ defmodule Tightbeam.RulesTest do
       provider: Keyword.get(opts, :provider, "anthropic"),
       model: Model.new("fable")
     })
+  end
+
+  defp ensure_users(db, users) do
+    Enum.each(users, fn user ->
+      {:ok, _} =
+        DB.query(
+          db,
+          "INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, 0, 'admin_add', 1)",
+          [user]
+        )
+    end)
   end
 end

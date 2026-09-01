@@ -333,7 +333,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     refute Enum.any?(
              EventLog.lifecycle_events(ctx.db),
-             &(&1.detail =~ "verification" or &1.kind =~ "verification")
+             &((is_binary(&1.detail) and &1.detail =~ "verification") or
+                 &1.kind =~ "verification")
            )
   end
 

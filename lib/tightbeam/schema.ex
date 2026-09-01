@@ -25,6 +25,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
+    Tightbeam.Productions.CompletionEscalation,
     Tightbeam.Activations,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
@@ -85,7 +86,12 @@ defmodule Tightbeam.Schema do
   # mechanical status from its sole durable input and advances v11 to v12.
   # Ruled-decision integrity then rebuilds `decision_requests` from that exact
   # shape, so a ruled status cannot exist without its decision, ruler, and time.
-  @shape "coordination-fabric-v1-phase1-v13"
+  # Completion escalation adds the immutable assignment report-to declaration,
+  # completion-owned tables, and the `completion_transition` cancellation
+  # classification. SQLite cannot widen those existing shapes in place. The
+  # reviewed R17 boundary therefore refuses every predecessor and recreates at
+  # v14; the older named migration helpers remain explicit test seams only.
+  @shape "coordination-fabric-v1-phase1-v14"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
   @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
   @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
@@ -243,7 +249,7 @@ defmodule Tightbeam.Schema do
         causalSourceKind TEXT NOT NULL CHECK (causalSourceKind IN (
           'verb_call','wake','progress_attest','condition_fact','assignment_transition',
           'work_item_transition','decision_request','monitor_generation','routing_bracket',
-          'session_transition','scheduler_delivery'
+          'session_transition','scheduler_delivery','completion_transition'
         )),
         causalSourceId TEXT NOT NULL,
         outcomeKind TEXT NOT NULL CHECK (
@@ -252,7 +258,7 @@ defmodule Tightbeam.Schema do
         replacementWakeId TEXT REFERENCES wakes(wakeId) DEFERRABLE INITIALLY DEFERRED,
         dispositionKind TEXT CHECK (dispositionKind IN (
           'assignment_transition','work_item_transition',
-          'decision_request_transition','monitor_generation_transition'
+          'decision_request_transition','monitor_generation_transition','completion_transition'
         )),
         dispositionId TEXT,
         primaryWorkKind TEXT CHECK (primaryWorkKind IN ('assignment','work_item')),
@@ -323,6 +329,16 @@ defmodule Tightbeam.Schema do
             (requesterId = 'tightbeam:assignments' AND
              reasonKind = 'obligation_disposed' AND causalSourceKind = 'assignment_transition' AND
              outcomeKind = 'disposition')
+            OR
+            (requesterId = 'tightbeam:completion-escalation' AND
+             ((reasonKind = 'superseded' AND causalSourceKind = 'wake' AND
+               outcomeKind = 'replacement')
+              OR
+              (reasonKind = 'obligation_disposed' AND
+               causalSourceKind = 'completion_transition' AND outcomeKind = 'disposition')
+              OR
+              (reasonKind = 'target_unresolvable' AND
+               causalSourceKind = 'scheduler_delivery' AND outcomeKind = 'no_replacement')))
             OR
             (requesterId = 'tightbeam:effort-checkin' AND
              ((reasonKind = 'superseded' AND
@@ -952,7 +968,8 @@ defmodule Tightbeam.Schema do
   Note the direction — the one existence question below is asked to REFUSE,
   never to deduce a shape and accommodate it. The sole accepted predecessor is
   named by the exact migration stamps below; each upgrade is transactional.
-  No shape is inferred from stored DDL.
+  No shape is inferred from stored DDL. Completion escalation deliberately
+  accepts no predecessor at boot.
   """
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
@@ -1818,61 +1835,6 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
-      {:ok, [[@ruled_decision_integrity_previous_shape]]} ->
-        upgrade_ruled_decision_integrity_v1(db)
-
-      {:ok, [[@session_mechanical_status_previous_shape]]} ->
-        upgrade_session_mechanical_status_v1(db)
-
-      {:ok, [[@effort_request_exit_previous_shape]]} ->
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
-
-      {:ok, [[@identity_render_stamp_previous_shape]]} ->
-        :ok = upgrade_identity_render_stamp_v1(db)
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
-
-      {:ok, [[@nullable_effective_parent_previous_shape]]} ->
-        :ok = upgrade_nullable_effective_parent_v1(db)
-        :ok = upgrade_identity_render_stamp_v1(db)
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
-
-      {:ok, [[@terminal_decision_previous_shape]]} ->
-        :ok = upgrade_terminal_operator_decision_v1(db)
-        :ok = upgrade_nullable_effective_parent_v1(db)
-        :ok = upgrade_identity_render_stamp_v1(db)
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
-
-      {:ok, [[@message_type_previous_shape]]} ->
-        :ok = upgrade_message_type_v1(db)
-        :ok = upgrade_terminal_operator_decision_v1(db)
-        :ok = upgrade_nullable_effective_parent_v1(db)
-        :ok = upgrade_identity_render_stamp_v1(db)
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
-
-      {:ok, [[@cold_start_previous_shape]]} ->
-        :ok = upgrade_cold_start_v1(db)
-        :ok = upgrade_message_type_v1(db)
-        :ok = upgrade_terminal_operator_decision_v1(db)
-        :ok = upgrade_nullable_effective_parent_v1(db)
-        :ok = upgrade_identity_render_stamp_v1(db)
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
-
-      {:ok, [[@operational_parent_previous_shape]]} ->
-        :ok = upgrade_operational_parent_v1(db)
-        :ok = upgrade_cold_start_v1(db)
-        :ok = upgrade_message_type_v1(db)
-        :ok = upgrade_terminal_operator_decision_v1(db)
-        :ok = upgrade_nullable_effective_parent_v1(db)
-        :ok = upgrade_identity_render_stamp_v1(db)
-        :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_session_mechanical_status_v1(db)
-
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
         # written before stamping existed. Those are DIFFERENT, and telling
@@ -1887,15 +1849,7 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration from #{found}. The only supported upgrade sources
-        are #{@operational_parent_previous_shape}, #{@cold_start_previous_shape},
-        #{@message_type_previous_shape}, #{@terminal_decision_previous_shape},
-        #{@nullable_effective_parent_previous_shape},
-        #{@identity_render_stamp_previous_shape},
-        #{@effort_request_exit_previous_shape}, and
-        #{@session_mechanical_status_previous_shape}, and
-        #{@ruled_decision_integrity_previous_shape}.
-        Move this database aside and let it be recreated.
+        There is no migration from #{found}. Move this database aside and let it be recreated.
         """
 
       # More than one shape stamped. Nothing writes a second row, so this is a

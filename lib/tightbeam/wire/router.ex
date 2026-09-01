@@ -68,7 +68,7 @@ defmodule Tightbeam.Wire.Router do
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack activation-status activations spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user read-marker-set read-marker-clear config register-host host-env-set host-env-list host-env-unset update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw ask answer return operator-ask operator-rule operator-withdraw decision-requests decision-request transcript turn-trace attend toplines topline coordination-share digest-members harness-processes)
+  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack activation-status activations spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user read-marker-set read-marker-clear config register-host host-env-set host-env-list host-env-unset update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment assignments completion-notices completion-disposition work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw ask answer return operator-ask operator-rule operator-withdraw decision-requests decision-request transcript turn-trace attend toplines topline coordination-share digest-members harness-processes)
   @max_upload_bytes 32 * 1024 * 1024
   @state_cursor_version 1
   @state_default_limit 50
@@ -389,6 +389,7 @@ defmodule Tightbeam.Wire.Router do
       call = %{
         verb: "retire",
         origin: "user:#{device.user_id}",
+        principal: {:user, device.user_id},
         session_key: session_key,
         params: params
       }
@@ -1464,7 +1465,7 @@ defmodule Tightbeam.Wire.Router do
   # owner-or-admin check (mirroring `coordination-share`'s) is the read's
   # actual gate, and a volunteered `--session` alongside `--wake-id` must not
   # get answered by the router first.
-  @non_target_verbs ~w(activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack activation-status activations transcript turn-trace toplines topline coordination-share digest-members answer return operator-ask operator-rule operator-withdraw decision-request decision-requests)
+  @non_target_verbs ~w(activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack activation-status activations completion-notices completion-disposition transcript turn-trace toplines topline coordination-share digest-members answer return operator-ask operator-rule operator-withdraw decision-request decision-requests)
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
   # number, a boolean or an object — is still a caller volunteering a typed target
