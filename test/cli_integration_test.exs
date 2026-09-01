@@ -2293,6 +2293,161 @@ defmodule Tightbeam.CliIntegrationTest do
     assert pairing =~ "supplied together"
   end
 
+  test "real CLI composes priority and metadata in one work-item update", ctx do
+    sha = String.duplicate("a", 64)
+    sha2 = String.duplicate("b", 64)
+
+    {created, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-create",
+          "--title",
+          "Before",
+          "--spec-ref",
+          "governing.md",
+          "--spec-sha256",
+          sha,
+          "--priority",
+          "4"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    work_item_id = JSON.decode!(created)["id"]
+    assert_receive {:cli_call, %{verb: "work-item-create"}}
+
+    {priority_only, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--priority", "5"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "title" => "Before",
+             "priority" => 5,
+             "specRefName" => "governing.md",
+             "specRefSha256" => ^sha
+           } = JSON.decode!(priority_only)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{work_item_id: ^work_item_id, priority: 5}
+                    }}
+
+    {metadata_only, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--title", "After"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"title" => "After", "priority" => 5, "specRefSha256" => ^sha} =
+             JSON.decode!(metadata_only)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{work_item_id: ^work_item_id, title: "After"}
+                    }}
+
+    {combined, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--spec-sha256", sha2, "--priority", "6"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "title" => "After",
+             "priority" => 6,
+             "specRefName" => "governing.md",
+             "specRefSha256" => ^sha2
+           } = JSON.decode!(combined)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        spec_ref_sha256: ^sha2,
+                        priority: 6
+                      }
+                    }}
+
+    {noop, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(noop) == JSON.decode!(combined)
+
+    assert_receive {:cli_call,
+                    %{verb: "work-item-update", params: %{work_item_id: ^work_item_id}}}
+
+    {cleared, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--clear-spec-ref"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"priority" => 6, "specRefName" => nil, "specRefSha256" => nil} =
+             JSON.decode!(cleared)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        spec_ref_name: nil,
+                        spec_ref_sha256: nil
+                      }
+                    }}
+
+    {incomplete, 1} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--spec-ref", "next.md"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert incomplete =~ "invalid_spec_ref"
+    assert_receive {:cli_call, %{verb: "work-item-update"}}
+
+    {set, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--spec-ref", "next.md", "--spec-sha256", sha],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"specRefName" => "next.md", "specRefSha256" => ^sha} = JSON.decode!(set)
+    assert_receive {:cli_call, %{verb: "work-item-update"}}
+
+    {conflict, 1} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--clear-spec-ref", "--spec-ref", "next.md"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert conflict =~ "conflicts"
+    refute_receive {:cli_call, %{verb: "work-item-update"}}, 50
+
+    {got, 0} =
+      System.cmd(ctx.binary, ["work-item-get", work_item_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"workItem" => %{"priority" => 6, "specRefName" => "next.md"}} = JSON.decode!(got)
+    assert_receive {:cli_call, %{verb: "work-item-get"}}
+  end
+
   defp open_agent_request(ctx, opts \\ []) do
     request_id = "dr_agent_#{System.unique_integer([:positive])}"
     expecter_session_key = Keyword.get(opts, :expecter_session_key, "cli-holder")

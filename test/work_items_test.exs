@@ -300,6 +300,49 @@ defmodule Tightbeam.WorkItemsTest do
     refute_received :work_item_change
   end
 
+  test "gateway serializes concurrent full re-pins without a torn governing-spec pair", ctx do
+    item =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Concurrent current-spec pin",
+        spec_ref_name: "initial.md",
+        spec_ref_sha256: @sha
+      })
+
+    parent = self()
+
+    tasks =
+      for {name, sha} <- [{"first.md", @sha}, {"second.md", @sha2}] do
+        Task.async(fn ->
+          send(parent, {:update_ready, self()})
+
+          receive do
+            :apply_update ->
+              ctx.handlers["work-item-update"].(
+                update_call({:user, "flynn"}, item.id, %{
+                  spec_ref_name: name,
+                  spec_ref_sha256: sha
+                })
+              )
+          end
+        end)
+      end
+
+    task_pids =
+      for _ <- tasks do
+        assert_receive {:update_ready, pid}
+        pid
+      end
+
+    Enum.each(task_pids, &send(&1, :apply_update))
+    results = Task.await_many(tasks)
+
+    expected = MapSet.new([{"first.md", @sha}, {"second.md", @sha2}])
+    assert MapSet.new(results, &{&1.specRefName, &1.specRefSha256}) == expected
+
+    current = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert MapSet.member?(expected, {current.specRefName, current.specRefSha256})
+  end
+
   test "get and list return deterministic eras, aspects, and ordering", ctx do
     assert %{workItems: []} = list(ctx, {:user, "flynn"})
     assert %{code: "unknown_work_item"} = get(ctx, {:user, "flynn"}, "missing")
