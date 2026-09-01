@@ -5187,4 +5187,26 @@ mod tests {
             Command::IdentityEdit { content: Some(content), .. } if content == "a\u{fffd}b"
         ));
     }
+
+    #[test]
+    fn breathing_accepts_only_the_closed_target_surface() {
+        assert!(matches!(
+            parse(strings(&["breathing", "work-item", "wi_1", "--as-user", "owner"])),
+            Ok(Command::Breathing {
+                identity: Identity::User(user),
+                target_kind,
+                target_id,
+            }) if user == "owner" && target_kind == "work-item" && target_id == "wi_1"
+        ));
+
+        for args in [
+            strings(&["breathing", "turn", "tr_1", "--as-user", "owner"]),
+            strings(&["breathing", "session", "s_1", "extra", "--as-user", "owner"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam breathing <session|assignment|work-item> <id>".to_owned())
+            );
+        }
+    }
 }
