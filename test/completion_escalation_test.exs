@@ -150,9 +150,19 @@ defmodule Tightbeam.CompletionEscalationTest do
     |> Enum.each(fn {{table, condition}, index} ->
       child = session(ctx.db, "rollback-child-#{index}", "owner", ctx.parent.session_key)
 
+      item =
+        WorkItems.__handle__(ctx.db, "work-item-create", %{
+          verb: "work-item-create",
+          origin: "user:owner",
+          principal: {:user, "owner"},
+          session_key: nil,
+          params: %{title: "rollback fixture #{index}"}
+        })
+
       assignment =
         assign(ctx,
           holder: child.session_key,
+          work_item: item.id,
           report_to: ctx.report.session_key
         )
 
@@ -209,6 +219,39 @@ defmodule Tightbeam.CompletionEscalationTest do
              )
   end
 
+  test "partial unique index refuses a second open row for one child", ctx do
+    first = assign(ctx)
+    _spare = progress(ctx, first.id)
+    complete(ctx, first.id)
+    record = only_notice(ctx, {:user, "owner"})
+
+    {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(completion_escalations)")
+    names = Enum.map(columns, &Enum.at(&1, 1))
+
+    projection =
+      Enum.map_join(names, ",", fn
+        "id" -> "'ce_corrupt_open'"
+        "dedupeKey" -> "'completion:att_corrupt_open'"
+        "closingAttestId" -> "'att_corrupt_open'"
+        name -> ~s("#{name}")
+      end)
+
+    # The corruption probe isolates the partial index from the two unrelated
+    # foreign/closing-attest constraints. It restores FK enforcement before it
+    # observes any product behavior.
+    assert :ok = DB.execute(ctx.db, "PRAGMA foreign_keys=OFF")
+
+    assert {:error, %DB.Error{message: message}} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO completion_escalations (#{Enum.map_join(names, ",", &~s("#{&1}"))}) SELECT #{projection} FROM completion_escalations WHERE id=?1",
+               [record.id]
+             )
+
+    assert message =~ "completion_escalations.childSessionKey"
+    assert :ok = DB.execute(ctx.db, "PRAGMA foreign_keys=ON")
+  end
+
   test "report-to validation is exact, immutable, and grants no disposition authority", ctx do
     for key <- ["missing", ctx.foreign.session_key] do
       before = assignment_count(ctx.db)
@@ -231,6 +274,17 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert only_notice(ctx, {:user, "owner"}).request.status == "open"
   end
 
+  test "dispatch rejects missing, inactive, and foreign report-to without a card", ctx do
+    retired = session(ctx.db, "dispatch-retired-report", "owner", ctx.main.session_key)
+    Org.retire(ctx.db, retired.session_key, "user:owner", 1_000)
+
+    for key <- ["dispatch-missing", retired.session_key, ctx.foreign.session_key] do
+      before = assignment_count(ctx.db)
+      assert %{code: "invalid_report_to", reportToSessionKey: ^key} = dispatch(ctx, key)
+      assert assignment_count(ctx.db) == before
+    end
+  end
+
   test "no declaration infers no opener or commission notice", ctx do
     assignment = assign(ctx)
     complete(ctx, assignment.id)
@@ -243,6 +297,44 @@ defmodule Tightbeam.CompletionEscalationTest do
                ctx.db,
                "SELECT count(*) FROM completion_escalation_wakes WHERE kind='report-to-notice'"
              )
+  end
+
+  test "report-to equal to exact parent shares the parent wake", ctx do
+    assignment = assign(ctx, report_to: ctx.parent.session_key)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+
+    assert record.routing.reportTo == %{
+             sessionKey: ctx.parent.session_key,
+             routeStatus: "shared-parent",
+             sharesParentNotice: true,
+             receipt: record.routing.parent.receipt
+           }
+
+    assert {:ok, [[1, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sum(kind='parent-notice'),sum(kind='report-to-notice') FROM completion_escalation_wakes WHERE completionId=?1",
+               [record.id]
+             )
+  end
+
+  test "null parent selects owner Main and inactive report-to stays independent", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET operationalParent=NULL WHERE sessionKey=?1", [
+               ctx.child.session_key
+             ])
+
+    assignment = assign(ctx, report_to: ctx.report.session_key)
+    Org.retire(ctx.db, ctx.report.session_key, "user:owner", 1_000)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+
+    assert record.routing.parent.sessionKey == ctx.main.session_key
+    assert record.routing.parent.resolutionSource == "owner_main"
+    assert record.routing.parent.routeStatus == "scheduled"
+    assert record.routing.reportTo.routeStatus == "unavailable"
+    assert record.routing.reportTo.receipt == %{state: "not-created", turnSeq: nil}
   end
 
   test "exact parent delivery creates one real message and turn", ctx do
@@ -265,6 +357,48 @@ defmodule Tightbeam.CompletionEscalationTest do
              DB.query(ctx.db, "SELECT count(*) FROM messages WHERE sessionKey=?1", [
                ctx.parent.session_key
              ])
+  end
+
+  test "notice-only receipt projects real turn terminals and fired-without-turn dirt", ctx do
+    for status <- ~w(running delivered failed failed_unknown) do
+      child = session(ctx.db, "receipt-#{status}", "owner", ctx.parent.session_key)
+      first = assign(ctx, holder: child.session_key)
+      _remaining = assign(ctx, holder: child.session_key)
+      complete(ctx, first.id, child.session_key)
+      record = only_notice_for(ctx, {:user, "owner"}, first.id)
+      wake = wake_for(ctx.db, record.id, "parent-notice")
+      assert :appended = deliver(ctx.db, wake)
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE turns SET status=?2,endedAt=CASE WHEN ?2='running' THEN NULL ELSE ?3 END WHERE wakeId=?1",
+                 [wake.wake_id, status, System.system_time(:millisecond)]
+               )
+
+      assert CompletionEscalation.get(ctx.db, record.id).routing.parent.receipt.state == status
+      assert CompletionEscalation.get(ctx.db, record.id).request.status == "notice-only"
+    end
+
+    child = session(ctx.db, "receipt-fired-dirt", "owner", ctx.parent.session_key)
+    first = assign(ctx, holder: child.session_key)
+    _remaining = assign(ctx, holder: child.session_key)
+    complete(ctx, first.id, child.session_key)
+    record = only_notice_for(ctx, {:user, "owner"}, first.id)
+    wake = wake_for(ctx.db, record.id, "parent-notice")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='fired' WHERE wakeId=?1", [wake.wake_id])
+
+    before = lifecycle_count(ctx.db, record.id)
+
+    assert CompletionEscalation.get(ctx.db, record.id).routing.parent.receipt.state ==
+             "inconsistent"
+
+    assert CompletionEscalation.get(ctx.db, record.id).routing.parent.receipt.state ==
+             "inconsistent"
+
+    assert lifecycle_count(ctx.db, record.id) == before
   end
 
   test "retired exact target is canceled in the delivery transaction without rerouting", ctx do
@@ -298,6 +432,31 @@ defmodule Tightbeam.CompletionEscalationTest do
              ])
   end
 
+  test "retired exact target never inspects or delivers to a foreign ancestor", ctx do
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET operationalParent=?2 WHERE sessionKey=?1", [
+               ctx.parent.session_key,
+               ctx.foreign.session_key
+             ])
+
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+    wake = wake_for(ctx.db, record.id, "parent-notice")
+    Org.retire(ctx.db, ctx.parent.session_key, "user:owner", 1_000)
+
+    assert :skipped = deliver(ctx.db, wake)
+
+    assert CompletionEscalation.get(ctx.db, record.id).routing.parent.sessionKey ==
+             ctx.parent.session_key
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM messages WHERE sessionKey IN (?1,?2)", [
+               ctx.foreign.session_key,
+               ctx.main.session_key
+             ])
+  end
+
   test "an inactive exact parent is recorded without climbing", ctx do
     Org.retire(ctx.db, ctx.parent.session_key, "user:owner", 1_000)
     assignment = assign(ctx)
@@ -325,6 +484,122 @@ defmodule Tightbeam.CompletionEscalationTest do
                "SELECT count(*) FROM completion_escalation_wakes WHERE completionId=?1 AND kind='parent-notice'",
                [record.id]
              )
+  end
+
+  test "file-backed restart boot tick delivers the durable parent notice" do
+    suffix = System.unique_integer([:positive])
+    db = String.to_atom("completion_restart_db_#{suffix}")
+    scheduler = String.to_atom("completion_restart_wakes_#{suffix}")
+    path = Path.join(System.tmp_dir!(), "tightbeam-completion-restart-#{suffix}.sqlite3")
+    on_exit(fn -> File.rm(path) end)
+
+    db_child = %{id: db, start: {DB, :start_link, [[path: path, name: db]]}}
+    start_supervised!(db_child)
+    :ok = Tightbeam.Schema.ensure_all(db)
+    assert {:ok, _} = Placement.register_host(db, "gibson", %{ssh: "gibson", base_dir: "/tmp"})
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('restart-owner',0,'admin_add',1)"
+             )
+
+    main = ensure_main_session(db, "restart-owner")
+    parent = session(db, "restart-parent", "restart-owner", main.session_key)
+    child = session(db, "restart-child", "restart-owner", parent.session_key)
+
+    restart_ctx = %{
+      db: db,
+      child: child,
+      handlers: Gateway.handlers(%{db: db, wake_tick_ms: 25, critical_lease_hard_cap_ms: 60_000})
+    }
+
+    assignment = assign(restart_ctx, holder: child.session_key)
+    complete(restart_ctx, assignment.id, child.session_key)
+    record = only_notice(restart_ctx, {:user, "restart-owner"})
+    wake = wake_for(db, record.id, "parent-notice")
+    assert Wakes.get(db, wake.wake_id).state == "pending"
+
+    stop_supervised!(db)
+    start_supervised!(db_child)
+
+    deliver = fn due -> deliver(db, due) end
+
+    start_supervised!(%{
+      id: scheduler,
+      start:
+        {Wakes, :start_link,
+         [[db: db, deliver: deliver, internal_consumers: %{}, tick_ms: 25, name: scheduler]]}
+    })
+
+    assert eventually(fn ->
+             match?(
+               {:ok, [["fired", 1]]},
+               DB.query(
+                 db,
+                 "SELECT w.state,count(t.seq) FROM wakes w LEFT JOIN turns t ON t.wakeId=w.wakeId WHERE w.wakeId=?1 GROUP BY w.state",
+                 [wake.wake_id]
+               )
+             )
+           end)
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT count(*) FROM completion_escalations WHERE id=?1", [record.id])
+  end
+
+  test "scheduler retries pre-acceptance failure and dedupes legacy pending residue", ctx do
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+    wake = wake_for(ctx.db, record.id, "parent-notice")
+    suffix = System.unique_integer([:positive])
+    gate = String.to_atom("completion_delivery_gate_#{suffix}")
+    scheduler = String.to_atom("completion_retry_wakes_#{suffix}")
+    start_supervised!(%{id: gate, start: {Agent, :start_link, [fn -> :closed end, [name: gate]]}})
+
+    deliver = fn due ->
+      if Agent.get(gate, & &1) == :closed, do: raise("delivery dependency unavailable")
+      deliver(ctx.db, due)
+    end
+
+    start_supervised!(%{
+      id: scheduler,
+      start:
+        {Wakes, :start_link,
+         [
+           [
+             db: ctx.db,
+             deliver: deliver,
+             internal_consumers: %{},
+             tick_ms: 60_000,
+             name: scheduler
+           ]
+         ]}
+    })
+
+    :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    Agent.update(gate, fn _ -> :open end)
+    :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET state='pending',firedAt=NULL WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
+    :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
   end
 
   test "retain is explicit, authorized, terminal, and replayable", ctx do
@@ -422,8 +697,61 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert %{code: "root_lifecycle_unsupported", decision: "retire"} =
              disposition(ctx, record.id, "retire", {:session, ctx.main.session_key})
 
+    assert %{code: "root_lifecycle_unsupported", decision: "park"} =
+             disposition(ctx, record.id, "park", {:session, ctx.main.session_key})
+
     assert %{request: %{status: "retained_root", decision: "retain"}} =
              disposition(ctx, record.id, "retain", {:session, ctx.main.session_key})
+
+    retained = disposition_state(ctx.db, record.id)
+
+    assert %{request: %{status: "retained_root", decision: "retain"}} =
+             disposition(ctx, record.id, "retain", {:session, ctx.main.session_key})
+
+    assert disposition_state(ctx.db, record.id) == retained
+  end
+
+  test "stale root Main snapshot cannot authorize self-retain", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:owner",
+        principal: {:user, "owner"},
+        session_key: nil,
+        params: %{title: "stale root authority"}
+      })
+
+    assignment = assign(ctx, holder: ctx.main.session_key, work_item: item.id)
+    complete(ctx, assignment.id, ctx.main.session_key)
+    record = only_notice(ctx, {:user, "owner"})
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET kind='custom' WHERE sessionKey=?1",
+               [ctx.main.session_key]
+             )
+
+    before = disposition_state(ctx.db, record.id)
+
+    assert %{code: "not_authorized"} =
+             disposition(ctx, record.id, "retain", {:session, ctx.main.session_key})
+
+    assert disposition_state(ctx.db, record.id) == before
+  end
+
+  test "ordinary child cannot self-disposition by retain, park, or retire", ctx do
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+    before = disposition_state(ctx.db, record.id)
+
+    for decision <- ~w(retain park retire) do
+      assert %{code: "not_authorized"} =
+               disposition(ctx, record.id, decision, {:session, ctx.child.session_key})
+
+      assert disposition_state(ctx.db, record.id) == before
+    end
   end
 
   test "work remaining creates a queryable notice-only record without a deadline", ctx do
@@ -476,6 +804,37 @@ defmodule Tightbeam.CompletionEscalationTest do
              )
 
     assert is_binary(replacement)
+
+    before = completion_wake_state(ctx.db, first.id)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               CompletionEscalation.reissue_in_txn(txn, deadline.wake_id)
+             end)
+
+    assert completion_wake_state(ctx.db, first.id) == before
+  end
+
+  test "deadline advances without rerouting when the exact parent is unavailable", ctx do
+    assignment = assign(ctx, report_to: ctx.report.session_key)
+    complete(ctx, assignment.id)
+    first = only_notice(ctx, {:user, "owner"})
+    old_parent = wake_for(ctx.db, first.id, "parent-notice")
+    old_deadline = wake_for(ctx.db, first.id, "deadline")
+    report = wake_for(ctx.db, first.id, "report-to-notice")
+    Org.retire(ctx.db, ctx.parent.session_key, "user:owner", 1_000)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               CompletionEscalation.reissue_in_txn(txn, old_deadline.wake_id)
+             end)
+
+    current = CompletionEscalation.get(ctx.db, first.id)
+    assert current.request.generation == 1
+    assert current.routing.parent.routeStatus == "unavailable"
+    assert current.routing.parent.receipt.state == "not-created"
+    assert Wakes.get(ctx.db, old_parent.wake_id).state == "canceled"
+    assert Wakes.get(ctx.db, report.wake_id).state == "pending"
   end
 
   test "new assignment supersedes the request atomically", ctx do
@@ -490,6 +849,43 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert superseded.request.supersededByAssignmentId == new_assignment.id
   end
 
+  test "supersede cancellation refusal rolls back the new assignment", ctx do
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+    before = {assignment_count(ctx.db), disposition_state(ctx.db, record.id)}
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER refuse_completion_cancel BEFORE INSERT ON wake_cancellations
+      BEGIN SELECT RAISE(ABORT, 'refuse completion cancellation'); END;
+      """)
+
+    assert_raise DB.Error, ~r/refuse completion cancellation/, fn -> assign(ctx) end
+    assert {assignment_count(ctx.db), disposition_state(ctx.db, record.id)} == before
+    :ok = DB.execute(ctx.db, "DROP TRIGGER refuse_completion_cancel")
+  end
+
+  test "retain cancellation refusal rolls back acknowledgment and lifecycle", ctx do
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+    before = disposition_state(ctx.db, record.id)
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER refuse_completion_cancel BEFORE INSERT ON wake_cancellations
+      BEGIN SELECT RAISE(ABORT, 'refuse completion cancellation'); END;
+      """)
+
+    assert_raise MatchError, fn ->
+      disposition(ctx, record.id, "retain", {:session, ctx.parent.session_key})
+    end
+
+    assert disposition_state(ctx.db, record.id) == before
+    :ok = DB.execute(ctx.db, "DROP TRIGGER refuse_completion_cancel")
+  end
+
   test "owner-selected retire acknowledges and retires in one transaction", ctx do
     assignment = assign(ctx)
     complete(ctx, assignment.id)
@@ -499,6 +895,22 @@ defmodule Tightbeam.CompletionEscalationTest do
              disposition(ctx, record.id, "retire", {:user, "owner"})
 
     assert Org.get(ctx.db, ctx.child.session_key).state == "retired"
+  end
+
+  test "corrupt built-in ordinary child is denied before retirement mutation", ctx do
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET isBuiltIn=1 WHERE sessionKey=?1", [
+               ctx.child.session_key
+             ])
+
+    before = disposition_state(ctx.db, record.id)
+
+    assert %{code: "denied"} = disposition(ctx, record.id, "retire", {:user, "owner"})
+    assert disposition_state(ctx.db, record.id) == before
   end
 
   test "completion retire defers without scheduling a generic intent wake", ctx do
@@ -577,6 +989,60 @@ defmodule Tightbeam.CompletionEscalationTest do
 
     assert %{code: "principal_not_allowed"} =
              disposition(ctx, record.id, "retain", {:process, "tightbeam"})
+
+    before = disposition_state(ctx.db, record.id)
+
+    for principal <- [
+          {:session, ctx.main.session_key},
+          {:session, ctx.child.session_key},
+          {:session, ctx.report.session_key},
+          {:session, ctx.sibling.session_key},
+          {:session, ctx.foreign.session_key},
+          {:user, "other"},
+          {:user, "admin"}
+        ] do
+      assert %{code: "not_authorized"} = disposition(ctx, record.id, "retain", principal)
+      assert disposition_state(ctx.db, record.id) == before
+    end
+
+    assert %{code: "principal_not_allowed"} =
+             disposition(ctx, record.id, "retain", {:remedy, "manual"})
+  end
+
+  test "terminal replay stays bound to the current acting principal", ctx do
+    parent_assignment = assign(ctx)
+    complete(ctx, parent_assignment.id)
+    parent_record = only_notice(ctx, {:user, "owner"})
+
+    assert %{request: %{status: "acknowledged"}} =
+             disposition(ctx, parent_record.id, "retain", {:session, ctx.parent.session_key})
+
+    Org.retire(ctx.db, ctx.parent.session_key, "user:owner", 1_000)
+
+    assert %{completionNotices: []} =
+             CompletionEscalation.notices(
+               ctx.db,
+               notice_call({:session, ctx.parent.session_key}, "all")
+             )
+
+    assert %{code: "not_authorized"} =
+             disposition(ctx, parent_record.id, "retain", {:session, ctx.parent.session_key})
+
+    assert %{code: "request_not_open"} =
+             disposition(ctx, parent_record.id, "retain", {:user, "owner"})
+
+    replacement_parent = session(ctx.db, "replacement-parent", "owner", ctx.main.session_key)
+
+    replacement_child =
+      session(ctx.db, "replacement-child", "owner", replacement_parent.session_key)
+
+    owner_assignment = assign(ctx, holder: replacement_child.session_key)
+    complete(ctx, owner_assignment.id, replacement_child.session_key)
+    owner_record = only_notice_for(ctx, {:user, "owner"}, owner_assignment.id)
+
+    first = disposition(ctx, owner_record.id, "retain", {:user, "owner"})
+    assert first.request.status == "acknowledged"
+    assert disposition(ctx, owner_record.id, "retain", {:user, "owner"}) == first
   end
 
   test "cross-owner spawnedBy fails closed and remains diagnostic", ctx do
@@ -620,50 +1086,63 @@ defmodule Tightbeam.CompletionEscalationTest do
              )
   end
 
-  test "completion table mutation remains behind one production seam" do
+  test "completion closure law is structural across every production definition" do
     root = Path.expand("../lib", __DIR__)
     owner = Path.join(root, "tightbeam/productions/completion_escalation.ex")
-    production = File.read!(owner)
-    assignments = File.read!(Path.join(root, "tightbeam/assignments.ex"))
-    gateway = File.read!(Path.join(root, "tightbeam/gateway.ex"))
-    router = File.read!(Path.join(root, "tightbeam/wire/router.ex"))
+    assignments = Path.join(root, "tightbeam/assignments.ex")
+    gateway = Path.join(root, "tightbeam/gateway.ex")
+    router = Path.join(root, "tightbeam/wire/router.ex")
 
-    offenders =
-      root
-      |> Path.join("**/*.ex")
-      |> Path.wildcard()
-      |> Enum.reject(&(&1 == owner))
-      |> Enum.filter(fn path ->
-        File.read!(path) =~
-          ~r/(INSERT\s+INTO|UPDATE)\s+completion_escalations|INSERT\s+INTO\s+completion_escalation_wakes/i
-      end)
+    mutation_sites = completion_mutation_sites(root)
+    assert mutation_sites != []
+    assert mutation_sites |> Enum.map(&elem(&1, 0)) |> Enum.uniq() == [owner]
 
-    assert offenders == []
+    assert remote_call_sites(assignments, :CompletionEscalation, :open_in_txn, 3) == [
+             "lifecycle_attest_in_txn/2"
+           ]
 
-    assert length(Regex.scan(~r/CompletionEscalation\.open_in_txn/, assignments)) == 1
+    assert remote_call_sites(
+             assignments,
+             :CompletionEscalation,
+             :supersede_open_for_assignment_in_txn,
+             3
+           )
+           |> Enum.sort() == ["apply_reopen/3", "create_assignment/6"]
 
-    assert length(
-             Regex.scan(
-               ~r/CompletionEscalation\.supersede_open_for_assignment_in_txn/,
-               assignments
-             )
-           ) == 2
+    assert remote_call_sites(gateway, :CompletionEscalation, :acknowledge_retire_in_txn, 3) == [
+             "retire_session_in_txn/7"
+           ]
 
-    assert production =~ "Wakes.cancel_in_txn"
-    assert production =~ "Wakes.fire_internal_in_txn"
-    refute production =~ ~r/UPDATE\s+wakes\s+SET\s+state/i
+    assert remote_call_sites(owner, :Org, :effective_parent_in_txn, 2) == ["open_in_txn/3"]
+    assert remote_call_sites(owner, :Wakes, :cancel_in_txn, 2) == ["cancel_wake!/3"]
+    assert remote_call_sites(owner, :Wakes, :fire_internal_in_txn, 4) == ["fire_deadline!/2"]
 
-    assert Regex.scan(~r/reason_kind:\s+"([^"]+)"/, production, capture: :all_but_first)
-           |> List.flatten()
-           |> Enum.uniq()
-           |> Enum.sort() == ~w(obligation_disposed superseded target_unresolvable)
+    assert remote_call_sites(owner, :EventLog, :lifecycle_in_txn, 4) |> Enum.sort() ==
+             ~w(acknowledge_in_txn/5 dispose_undeliverable_delivery_in_txn/2 open_in_txn/3 park_unavailable_in_txn/3 preflight_existing_in_txn/4 record_parent_failure/4 record_parent_failure/4 record_report_to_failure/4 reissue_open_in_txn/2 retire_deferred_in_txn/4 transition_superseded_in_txn/5)
+             |> Enum.sort()
 
-    refute production =~ "lifecycle_event"
-    refute production =~ "openedBySession"
-    refute production =~ "openedByUser"
-    assert gateway =~ "\"completion_disposition_deadline\" => &CompletionEscalation.reissue"
-    assert gateway =~ "CompletionEscalation.acknowledge_retire_in_txn"
-    assert router =~ "principal: {:user, device.user_id}"
+    assert local_call_sites(owner, :root_main_now?, 2) |> Enum.sort() ==
+             ["authorized_in_txn?/3", "retain_in_txn/3"]
+
+    root_literals = definition_literals(owner, "root_main_now?/2") |> Enum.join("\n")
+    assert root_literals =~ "ownerUserId=?2"
+    assert root_literals =~ "state='active'"
+    assert root_literals =~ "isBuiltIn=1"
+    assert root_literals =~ "kind='main'"
+
+    producer_literals =
+      owner |> definitions() |> Enum.flat_map(fn {_ref, body} -> literals(body) end)
+
+    refute Enum.any?(producer_literals, &Regex.match?(~r/UPDATE\s+wakes\s+SET\s+state/i, &1))
+    refute Enum.any?(producer_literals, &String.contains?(&1, "lifecycle_event"))
+    refute Enum.any?(producer_literals, &String.contains?(&1, "openedBySession"))
+    refute Enum.any?(producer_literals, &String.contains?(&1, "openedByUser"))
+
+    assert map_string_values(owner, :reason_kind) |> Enum.uniq() |> Enum.sort() ==
+             ~w(obligation_disposed superseded target_unresolvable)
+
+    assert file_ast_contains?(router, :device_user_principal)
+    assert definition_ast_contains?(gateway, "children_after_preflight/1", :deadline_consumer)
   end
 
   test "work-item trace includes completion history, lifecycle, and member wakes", ctx do
@@ -718,6 +1197,48 @@ defmodule Tightbeam.CompletionEscalationTest do
            |> Enum.sort() == Enum.sort(member_wake_ids)
   end
 
+  test "work-item slate and completion request coexist and cancel through separate seams", ctx do
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:owner",
+        principal: {:user, "owner"},
+        session_key: nil,
+        params: %{title: "coexisting obligations"}
+      })
+
+    assignment = assign(ctx, work_item: item.id)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+
+    assert {:ok, [[slate_wake_id]]} =
+             DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert is_binary(slate_wake_id)
+    assert Wakes.get(ctx.db, slate_wake_id).state == "pending"
+
+    assert {:ok, [[2, 0, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*),sum(w.assignmentId IS NOT NULL),sum(w.work_item_id IS NOT NULL) FROM completion_escalation_wakes cew JOIN wakes w ON w.wakeId=cew.wakeId WHERE cew.completionId=?1",
+               [record.id]
+             )
+
+    replacement = assign(ctx, holder: ctx.child.session_key, work_item: item.id)
+
+    assert CompletionEscalation.get(ctx.db, record.id).request.supersededByAssignmentId ==
+             replacement.id
+
+    assert Wakes.get(ctx.db, slate_wake_id).state == "canceled"
+
+    assert {:ok, [["assignment_transition"], ["completion_transition"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT DISTINCT causalSourceKind FROM wake_cancellations WHERE wakeId=?1 OR causalSourceId=?2 ORDER BY causalSourceKind",
+               [slate_wake_id, record.id]
+             )
+  end
+
   defp assign(ctx, opts \\ []) do
     holder = Keyword.get(opts, :holder, ctx.child.session_key)
 
@@ -752,6 +1273,41 @@ defmodule Tightbeam.CompletionEscalationTest do
     })
   end
 
+  defp progress(ctx, assignment_id, session_key \\ nil) do
+    session_key = session_key || ctx.child.session_key
+
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:holder",
+      principal: {:session, session_key},
+      session_key: nil,
+      params: %{assignment_id: assignment_id, kind: "progress"}
+    })
+  end
+
+  defp dispatch(ctx, report_to) do
+    Assignments.__handle__(ctx.db, "dispatch", %{
+      verb: "dispatch",
+      origin: "user:owner",
+      principal: {:user, "owner"},
+      session_key: ctx.child.session_key,
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 1_000,
+      effort_config: %{db: ctx.db},
+      params: %{
+        subject: "completion dispatch",
+        brief: "complete this work",
+        work_item_id: nil,
+        workdir_root: nil,
+        idempotency_key: nil,
+        effect_kind: nil,
+        files: [],
+        report_to_session_key: report_to
+      }
+    })
+  end
+
   defp disposition(ctx, completion_id, decision, principal) do
     ctx.handlers["completion-disposition"].(%{
       verb: "completion-disposition",
@@ -767,6 +1323,14 @@ defmodule Tightbeam.CompletionEscalationTest do
              CompletionEscalation.notices(ctx.db, notice_call(principal, "all"))
 
     record
+  end
+
+  defp only_notice_for(ctx, principal, assignment_id) do
+    assert %{completionNotices: records} =
+             CompletionEscalation.notices(ctx.db, notice_call(principal, "all"))
+
+    Enum.find(records, &(&1.assignmentId == assignment_id)) ||
+      flunk("missing completion notice for #{assignment_id}")
   end
 
   defp notice_call(principal, status) do
@@ -815,11 +1379,37 @@ defmodule Tightbeam.CompletionEscalationTest do
     count
   end
 
-  defp rollback_snapshot(db, assignment_id) do
-    {:ok, [assignment]} =
+  defp lifecycle_count(db, completion_id) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT count(*) FROM lifecycle_events WHERE subject=?1", [completion_id])
+
+    count
+  end
+
+  defp completion_wake_state(db, completion_id) do
+    {:ok, rows} =
       DB.query(
         db,
-        "SELECT state,outcome,closedAt,closingAttestId FROM assignments WHERE id=?1",
+        "SELECT cew.generation,cew.kind,w.state FROM completion_escalation_wakes cew JOIN wakes w ON w.wakeId=cew.wakeId WHERE cew.completionId=?1 ORDER BY cew.generation,cew.kind",
+        [completion_id]
+      )
+
+    rows
+  end
+
+  defp eventually(check, remaining \\ 80) do
+    cond do
+      check.() -> true
+      remaining == 0 -> false
+      true -> Process.sleep(25) && eventually(check, remaining - 1)
+    end
+  end
+
+  defp rollback_snapshot(db, assignment_id) do
+    {:ok, [[work_item_id | _] = assignment]} =
+      DB.query(
+        db,
+        "SELECT workItemId,state,outcome,closedAt,closingAttestId FROM assignments WHERE id=?1",
         [assignment_id]
       )
 
@@ -838,7 +1428,189 @@ defmodule Tightbeam.CompletionEscalationTest do
         [assignment_id]
       )
 
-    {assignment, attests, completions, completion_wakes}
+    {:ok, work_item} = DB.query(db, "SELECT * FROM work_items WHERE id=?1", [work_item_id])
+
+    side_effect_counts =
+      for table <-
+            ~w(wakes wake_cancellations messages turns lifecycle_events supervision_entitlements supervision_liveness_sidecar effort_checkin_generations) do
+        {:ok, [[count]]} = DB.query(db, "SELECT count(*) FROM #{table}")
+        {table, count}
+      end
+
+    {assignment, work_item, attests, completions, completion_wakes, side_effect_counts}
+  end
+
+  defp disposition_state(db, completion_id) do
+    {:ok, [completion]} =
+      DB.query(
+        db,
+        "SELECT status,decision,actedByUser,actedBySession,actedAt FROM completion_escalations WHERE id=?1",
+        [completion_id]
+      )
+
+    {:ok, [session]} =
+      DB.query(
+        db,
+        "SELECT state,harness,kind,isBuiltIn FROM sessions WHERE sessionKey=(SELECT childSessionKey FROM completion_escalations WHERE id=?1)",
+        [completion_id]
+      )
+
+    {:ok, wakes} =
+      DB.query(
+        db,
+        "SELECT w.wakeId,w.state,w.canceledAt FROM wakes w JOIN completion_escalation_wakes cew ON cew.wakeId=w.wakeId WHERE cew.completionId=?1 ORDER BY w.wakeId",
+        [completion_id]
+      )
+
+    {:ok, [[lifecycle_count]]} =
+      DB.query(
+        db,
+        "SELECT count(*) FROM lifecycle_events WHERE subject=?1",
+        [completion_id]
+      )
+
+    {:ok, [assignment]} =
+      DB.query(
+        db,
+        "SELECT state,outcome,closedAt,closingAttestId FROM assignments WHERE id=(SELECT assignmentId FROM completion_escalations WHERE id=?1)",
+        [completion_id]
+      )
+
+    {:ok, work_item} =
+      DB.query(
+        db,
+        "SELECT * FROM work_items WHERE id=(SELECT workItemId FROM completion_escalations WHERE id=?1)",
+        [completion_id]
+      )
+
+    {completion, session, wakes, lifecycle_count, assignment, work_item}
+  end
+
+  defp definitions(file) do
+    file
+    |> File.read!()
+    |> Code.string_to_quoted!()
+    |> then(fn ast ->
+      {_, found} =
+        Macro.prewalk(ast, [], fn
+          {kind, _meta, [head, body]} = node, acc when kind in [:def, :defp] ->
+            {node, [{definition_ref(head), body} | acc]}
+
+          node, acc ->
+            {node, acc}
+        end)
+
+      found
+    end)
+  end
+
+  defp definition_ref({:when, _, [head | _]}), do: definition_ref(head)
+  defp definition_ref({name, _, args}) when is_list(args), do: "#{name}/#{length(args)}"
+  defp definition_ref({name, _, nil}), do: "#{name}/0"
+
+  defp collect(ast, matcher) do
+    {_, found} =
+      Macro.prewalk(ast, [], fn node, acc ->
+        case matcher.(node) do
+          nil -> {node, acc}
+          hit -> {node, [hit | acc]}
+        end
+      end)
+
+    found
+  end
+
+  defp literals(ast),
+    do:
+      collect(ast, fn
+        value when is_binary(value) -> value
+        _ -> nil
+      end)
+
+  defp definition_literals(file, ref) do
+    for {^ref, body} <- definitions(file), literal <- literals(body), do: literal
+  end
+
+  defp remote_call_sites(file, module, name, arity) do
+    for {ref, body} <- definitions(file),
+        _ <-
+          collect(body, fn
+            {{:., _, [{:__aliases__, _, aliases}, ^name]}, _, args}
+            when length(args) == arity ->
+              if List.last(aliases) == module, do: :call, else: nil
+
+            _ ->
+              nil
+          end),
+        do: ref
+  end
+
+  defp local_call_sites(file, name, arity) do
+    for {ref, body} <- definitions(file),
+        _ <-
+          collect(body, fn
+            {^name, _, args} when is_list(args) and length(args) == arity -> :call
+            _ -> nil
+          end),
+        do: ref
+  end
+
+  defp completion_mutation_sites(root) do
+    for file <- Path.wildcard(Path.join(root, "**/*.ex")),
+        {ref, body} <- definitions(file),
+        sql <- literals(body),
+        Regex.match?(
+          ~r/(INSERT\s+INTO|UPDATE)\s+["`\[]?completion_escalations\b|INSERT\s+INTO\s+["`\[]?completion_escalation_wakes\b/i,
+          sql
+        ),
+        do: {file, ref}
+  end
+
+  defp map_string_values(file, key) do
+    file
+    |> File.read!()
+    |> Code.string_to_quoted!()
+    |> collect(fn
+      {:%{}, _, pairs} ->
+        case Keyword.get(pairs, key) do
+          value when is_binary(value) -> value
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp definition_ast_contains?(file, ref, token) do
+    Enum.any?(definitions(file), fn
+      {^ref, body} -> ast_contains?(body, token)
+      _ -> false
+    end)
+  end
+
+  defp file_ast_contains?(file, token) do
+    file |> File.read!() |> Code.string_to_quoted!() |> ast_contains?(token)
+  end
+
+  defp ast_contains?(ast, :device_user_principal) do
+    collect(ast, fn
+      {{:., _, [_device, :user_id]}, _, []} -> :device_user
+      {{:., _, [{:device, _, _}, :user_id]}, _, []} -> :device_user
+      _ -> nil
+    end) != [] and Macro.to_string(ast) =~ "principal: {:user, device.user_id}"
+  end
+
+  defp ast_contains?(ast, :deadline_consumer) do
+    collect(ast, fn
+      {:%{}, _, pairs} ->
+        if Enum.any?(pairs, &match?({"completion_disposition_deadline", _}, &1)),
+          do: :consumer,
+          else: nil
+
+      _ ->
+        nil
+    end) != [] and Macro.to_string(ast) =~ "CompletionEscalation.reissue"
   end
 
   defp session(db, key, owner, spawned_by) do
@@ -860,4 +1632,5 @@ defmodule Tightbeam.CompletionEscalationTest do
   defp origin({:session, key}), do: "agent:#{key}"
   defp origin({:user, user}), do: "user:#{user}"
   defp origin({:process, process}), do: "process:#{process}"
+  defp origin({:remedy, remedy}), do: "remedy:#{remedy}"
 end

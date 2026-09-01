@@ -1208,8 +1208,8 @@ defmodule Tightbeam.Productions.CompletionEscalation do
 
   defp authorized_in_txn?(txn, row, {:session, session}) do
     active_owner_session?(txn, session, row.owner_user_id) and
-      ((row.root_main_holder and session == row.child_session_key and
-          session == row.parent_session_key) or
+      ((session == row.child_session_key and session == row.parent_session_key and
+          root_main_now?(txn, row)) or
          (session != row.child_session_key and session == row.parent_session_key))
   end
 
@@ -1237,7 +1237,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     row.root_main_holder and row.child_session_key == Org.personal_session_key(row.owner_user_id) and
       Txn.q(
         txn,
-        "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND isBuiltIn=1",
+        "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active' AND isBuiltIn=1 AND kind='main'",
         [row.child_session_key, row.owner_user_id]
       ) == [[1]]
   end

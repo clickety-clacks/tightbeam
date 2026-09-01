@@ -306,25 +306,14 @@ defmodule Tightbeam.EventLog do
   @doc "Record a lifecycle event inside an existing DB transaction."
   @spec lifecycle_in_txn(Txn.t(), String.t(), String.t(), String.t() | nil) :: :ok
   def lifecycle_in_txn(%Txn{} = txn, kind, subject, detail) do
-    lifecycle_with_id_in_txn(txn, kind, subject, detail)
-
-    :ok
-  end
-
-  @doc "Record a lifecycle event inside a transaction and return its row id."
-  @spec lifecycle_with_id_in_txn(Txn.t(), String.t(), String.t(), String.t() | nil) ::
-          pos_integer()
-  def lifecycle_with_id_in_txn(%Txn{} = txn, kind, subject, detail) do
     Txn.q(
       txn,
       "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)",
       [now(), kind, subject, detail]
     )
 
-    [[id]] = Txn.q(txn, "SELECT last_insert_rowid()")
-
     publish_lifecycle_in_txn(txn, kind, subject, detail)
-    id
+    :ok
   end
 
   ## Record-and-notify
