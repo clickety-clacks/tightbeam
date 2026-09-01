@@ -750,6 +750,14 @@ defmodule Tightbeam.ActivationsTest do
         idempotency_key: "downgrade-declare"
       })
 
+    :ok =
+      DB.execute(writer, """
+      DROP TRIGGER decision_requests_r7_row_version;
+      ALTER TABLE decision_requests DROP COLUMN rowVersion;
+      UPDATE schema_stamp
+        SET shape='coordination-fabric-v1-phase1-v13', stampedAt=1;
+      """)
+
     GenServer.stop(writer_pid)
     legacy_checkout = exact_legacy_checkout!()
     port = free_port()

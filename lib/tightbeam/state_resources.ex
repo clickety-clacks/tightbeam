@@ -41,7 +41,7 @@ defmodule Tightbeam.StateResources do
   """
 
   @turn_select """
-  SELECT t.seq, t.sessionKey, t.messageId, t.wakeId, t.origin, t.roleRef,
+  SELECT t.seq, t.sessionKey, t.messageId, t.wakeId, t.origin, t.prompt, t.roleRef,
          t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
          t.modelContext, t.harness, t.replyAttention, t.status, t.owner,
          t.adapterGen, t.requestRef, t.error, t.createdAt, t.startedAt,
@@ -161,7 +161,7 @@ defmodule Tightbeam.StateResources do
         ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt rowVersion),
       booleans: [],
       nullable:
-        ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context)
+        ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context)
     },
     "sessions" => %{
       strings:
@@ -843,7 +843,27 @@ defmodule Tightbeam.StateResources do
   def attest(row), do: public(row)
   def wake(row), do: public(row)
   def production(row), do: row |> public() |> correlate("eventId", "seq")
-  def turn(row), do: row |> public() |> correlate("turnSeq", "seq")
+
+  def turn(row) do
+    case value(row, :prompt) do
+      prompt when is_binary(prompt) ->
+        row = public(row)
+
+        role_fallback =
+          case row["roleFallback"] do
+            0 -> nil
+            1 -> "owner"
+            _invalid -> raise ArgumentError, "roleFallback is projection_invalid"
+          end
+
+        row
+        |> Map.put("roleFallback", role_fallback)
+        |> closed_projection("turns")
+
+      _other ->
+        raise ArgumentError, "prompt must be a string"
+    end
+  end
 
   def decision_request(%{status: "ruled"} = row) do
     unless complete_ruled_decision?(row) do
@@ -855,11 +875,11 @@ defmodule Tightbeam.StateResources do
         row |> Tightbeam.Escalation.terminal_operator_projection() |> public()
 
       _ ->
-        public(row)
+        decision_request_projection(row)
     end
   end
 
-  def decision_request(row), do: public(row)
+  def decision_request(row), do: decision_request_projection(row)
   def session(row), do: public(row)
   def role(row), do: row |> public() |> correlate("role", "name")
   def artifact(row), do: public(row)
@@ -1111,6 +1131,7 @@ defmodule Tightbeam.StateResources do
          message_id,
          wake_id,
          origin,
+         prompt,
          role_ref,
          role_fallback,
          assignment_id,
@@ -1136,15 +1157,16 @@ defmodule Tightbeam.StateResources do
       message_id: message_id,
       wake_id: wake_id,
       origin: origin,
+      prompt: prompt,
       role_ref: role_ref,
-      role_fallback: role_fallback == 1,
+      role_fallback: role_fallback,
       assignment_id: assignment_id,
       job_ref: job_ref,
       model: model,
       thinking_level: thinking_level,
       model_context: model_context,
       harness: harness,
-      reply_attention: reply_attention == 1,
+      reply_attention: reply_attention,
       status: status,
       owner: owner,
       adapter_gen: adapter_gen,
@@ -1155,6 +1177,77 @@ defmodule Tightbeam.StateResources do
       ended_at: ended_at,
       published_at: published_at
     }
+  end
+
+  defp decision_request_projection(row) do
+    unless is_integer(value(row, :row_version)) and value(row, :row_version) > 0 do
+      raise ArgumentError, "decision request rowVersion is projection_invalid"
+    end
+
+    row = row |> public() |> Map.update!("options", &decision_options!/1)
+    validate_decision_deadline!(row)
+
+    row =
+      case row["kind"] do
+        kind when kind in ~w(statute agent) ->
+          case {row["lineageRung"], row["effortGeneration"]} do
+            {nil, nil} ->
+              row
+              |> Map.put("lineageRung", 0)
+              |> Map.put("effortGeneration", 0)
+
+            _stored_values ->
+              raise ArgumentError,
+                    "lineageRung and effortGeneration must be null when not applicable"
+          end
+
+        "effort" ->
+          if is_integer(row["lineageRung"]) and is_integer(row["effortGeneration"]) do
+            row
+          else
+            raise ArgumentError,
+                  "lineageRung and effortGeneration must be stored integers for effort"
+          end
+
+        _other_kind ->
+          row
+      end
+
+    closed_projection(row, "decision requests")
+  end
+
+  defp validate_decision_deadline!(%{"kind" => "agent", "deadlineAt" => nil}), do: :ok
+
+  defp validate_decision_deadline!(%{"kind" => kind, "deadlineAt" => deadline_at})
+       when kind in ~w(statute effort) and is_integer(deadline_at) and deadline_at > 0,
+       do: :ok
+
+  defp validate_decision_deadline!(%{"kind" => kind}) when kind in ~w(statute effort agent),
+    do: raise(ArgumentError, "decision request deadlineAt is projection_invalid")
+
+  defp validate_decision_deadline!(_row), do: :ok
+
+  defp decision_options!(nil), do: []
+
+  defp decision_options!(options) when is_list(options) do
+    Enum.map(options, fn
+      label when is_binary(label) ->
+        %{"label" => label}
+
+      %{"label" => label} = option when map_size(option) == 1 and is_binary(label) ->
+        option
+
+      _invalid ->
+        raise ArgumentError, "decision request options are projection_invalid"
+    end)
+  end
+
+  defp decision_options!(_invalid),
+    do: raise(ArgumentError, "decision request options are projection_invalid")
+
+  defp closed_projection(row, resource) do
+    fields = Map.fetch!(@item_field_order, resource)
+    row |> Map.take(fields) |> then(&exact!(resource, &1))
   end
 
   defp correlate(row, primary, source) do

@@ -85,7 +85,10 @@ defmodule Tightbeam.Schema do
   # mechanical status from its sole durable input and advances v11 to v12.
   # Ruled-decision integrity then rebuilds `decision_requests` from that exact
   # shape, so a ruled status cannot exist without its decision, ruler, and time.
-  @shape "coordination-fabric-v1-phase1-v13"
+  # Stored decision-request row versions advance v13 to v14. Existing rows
+  # start at one, and the table-owned trigger advances only R7 field changes.
+  @shape "coordination-fabric-v1-phase1-v14"
+  @decision_request_row_version_previous_shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
   @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
   @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
@@ -1583,6 +1586,51 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  @doc false
+  @spec upgrade_decision_request_row_version_v1(DB.server()) :: :ok
+  def upgrade_decision_request_row_version_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@decision_request_row_version_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_decision_request_row_version_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Escalation.migrate_decision_request_row_version_v1_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @decision_request_row_version_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_decision_request_row_version_v1: stamp race"
+               )
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_decision_request_row_version_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
   defp maybe_interrupt_nullable_effective_parent_migration!(opts, point) do
     if Keyword.get(opts, :fail_at) == point,
       do: raise("forced nullable-effective-parent migration interruption")
@@ -1818,6 +1866,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@decision_request_row_version_previous_shape]]} ->
+        upgrade_decision_request_row_version_v1(db)
+
       {:ok, [[@ruled_decision_integrity_previous_shape]]} ->
         upgrade_ruled_decision_integrity_v1(db)
 
@@ -1894,7 +1945,8 @@ defmodule Tightbeam.Schema do
         #{@identity_render_stamp_previous_shape},
         #{@effort_request_exit_previous_shape}, and
         #{@session_mechanical_status_previous_shape}, and
-        #{@ruled_decision_integrity_previous_shape}.
+        #{@ruled_decision_integrity_previous_shape}, and
+        #{@decision_request_row_version_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
