@@ -1,7 +1,7 @@
 defmodule Tightbeam.BreathingTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Breathing, DB}
+  alias Tightbeam.{Breathing, DB, Dispatch}
 
   setup do
     db = :"breathing_db_#{System.unique_integer([:positive])}"
@@ -129,6 +129,30 @@ defmodule Tightbeam.BreathingTest do
 
     assert %{breathing: false, reason: "no_current_path"} =
              query(db, "assignment", "asg_continuation")
+  end
+
+  test "dispatch stores the breathing access trail without its result", %{db: db} do
+    call = %{
+      verb: "breathing",
+      origin: "user:owner",
+      principal: {:user, "owner"},
+      session_key: nil,
+      params: %{target_kind: "session", target_id: "missing"}
+    }
+
+    assert {:ok, %{breathing: false, reason: "session_missing"}} =
+             Dispatch.dispatch(db, %{"breathing" => &Breathing.query(db, &1)}, call)
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               db,
+               "SELECT payload FROM events WHERE kind = 'verb' AND verb = 'breathing' ORDER BY id DESC LIMIT 1"
+             )
+
+    assert payload =~ "elided: true"
+    assert payload =~ ~s(target_id: "missing")
+    refute payload =~ "breathing-v1"
+    refute payload =~ "session_missing"
   end
 
   test "all state gates and terminal reasons beat physical paths", %{db: db, holder: holder} do
