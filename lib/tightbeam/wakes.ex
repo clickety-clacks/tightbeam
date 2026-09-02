@@ -133,7 +133,23 @@ defmodule Tightbeam.Wakes do
   );
   INSERT OR IGNORE INTO scheduler_state (id, afterFact) VALUES (0, 0);
   CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);
+  CREATE TABLE IF NOT EXISTS wake_retry_attempts (
+    wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
+    rootWakeId TEXT NOT NULL REFERENCES wakes(wakeId),
+    predecessorWakeId TEXT UNIQUE REFERENCES wakes(wakeId),
+    attempt INTEGER NOT NULL CHECK (attempt >= 0),
+    sourceTurnSeq INTEGER UNIQUE REFERENCES turns(seq),
+    outcome TEXT NOT NULL CHECK (outcome IN ('pending','failed','acted','canceled')),
+    retryWakeId TEXT UNIQUE REFERENCES wakes(wakeId),
+    observedAt INTEGER NOT NULL,
+    UNIQUE (rootWakeId, attempt)
+  );
+  CREATE INDEX IF NOT EXISTS wake_retry_root
+    ON wake_retry_attempts (rootWakeId, attempt);
   """
+
+  @retry_base_ms 30_000
+  @retry_ceiling_ms 30 * 60_000
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
@@ -405,6 +421,200 @@ defmodule Tightbeam.Wakes do
     else
       wake
     end
+  end
+
+  @doc """
+  Preserve a prompt wake after a rate-limit terminal by scheduling a new,
+  traceable attempt. The failed turn remains terminal and every attempt keeps
+  its own `wakeId`; replay returns the already-created successor.
+
+  This deliberately admits only the existing closed `rate-limit-dead` class.
+  Without a typed proof that inference did not start, retrying any other
+  failure could repeat effects.
+  """
+  @spec preserve_failed_intent_in_txn(Txn.t(), map(), String.t() | nil) ::
+          :not_wake | :not_retryable | :settled | {:retry, String.t()}
+  def preserve_failed_intent_in_txn(%Txn{} = txn, turn, failure_class)
+      when is_map(turn) do
+    case Map.get(turn, :wake_id) do
+      wake_id when is_binary(wake_id) ->
+        preserve_wake_terminal_in_txn(txn, turn, wake_id, failure_class)
+
+      _ ->
+        :not_wake
+    end
+  end
+
+  defp preserve_wake_terminal_in_txn(txn, turn, wake_id, failure_class) do
+    case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
+      [row] ->
+        wake = to_wake(row)
+
+        cond do
+          retry_attempt?(txn, wake_id) and turn.status == "delivered" ->
+            settle_retry_attempt_in_txn(txn, wake_id, turn.seq, "acted", turn.ended_at)
+            :settled
+
+          retry_attempt?(txn, wake_id) and turn.status == "canceled" ->
+            settle_retry_attempt_in_txn(txn, wake_id, turn.seq, "canceled", turn.ended_at)
+            :settled
+
+          turn.status == "failed" and failure_class == "rate-limit-dead" and
+              retryable_prompt_wake?(wake, turn) ->
+            schedule_retry_in_txn(txn, wake, turn)
+
+          true ->
+            :not_retryable
+        end
+
+      [] ->
+        :not_wake
+    end
+  end
+
+  defp retry_attempt?(txn, wake_id) do
+    Txn.q(txn, "SELECT 1 FROM wake_retry_attempts WHERE wakeId=?1", [wake_id]) != []
+  end
+
+  defp retryable_prompt_wake?(wake, turn) do
+    wake.consumer == "prompt" and not wake.digest and is_nil(wake.assignment_id) and
+      not String.starts_with?(turn.request_ref || "", "bubble:")
+  end
+
+  defp schedule_retry_in_txn(txn, wake, turn) do
+    {root_wake_id, attempt} = retry_identity_in_txn(txn, wake.wake_id)
+    next_attempt = attempt + 1
+    retry_wake_id = retry_wake_id(root_wake_id, next_attempt)
+    observed_at = turn.ended_at || now()
+
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO wake_retry_attempts
+        (wakeId, rootWakeId, predecessorWakeId, attempt, sourceTurnSeq,
+         outcome, retryWakeId, observedAt)
+      VALUES (?1, ?2, NULL, ?3, ?4, 'failed', NULL, ?5)
+      """,
+      [wake.wake_id, root_wake_id, attempt, turn.seq, observed_at]
+    )
+
+    Txn.q(
+      txn,
+      """
+      UPDATE wake_retry_attempts
+      SET sourceTurnSeq=COALESCE(sourceTurnSeq, ?2), outcome='failed',
+          observedAt=?3
+      WHERE wakeId=?1 AND outcome='pending'
+      """,
+      [wake.wake_id, turn.seq, observed_at]
+    )
+
+    case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [retry_wake_id]) do
+      [] ->
+        due_at = observed_at + retry_delay_ms(next_attempt)
+        insert_retry_wake_in_txn(txn, wake, turn.prompt, retry_wake_id, due_at, observed_at)
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO wake_retry_attempts
+            (wakeId, rootWakeId, predecessorWakeId, attempt, sourceTurnSeq,
+             outcome, retryWakeId, observedAt)
+          VALUES (?1, ?2, ?3, ?4, NULL, 'pending', NULL, ?5)
+          """,
+          [retry_wake_id, root_wake_id, wake.wake_id, next_attempt, observed_at]
+        )
+
+        Txn.q(
+          txn,
+          "UPDATE wake_retry_attempts SET retryWakeId=?2 WHERE wakeId=?1",
+          [wake.wake_id, retry_wake_id]
+        )
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "wake_retry_scheduled",
+          root_wake_id,
+          "sourceTurnSeq=#{turn.seq} failedWakeId=#{wake.wake_id} retryWakeId=#{retry_wake_id} attempt=#{next_attempt} dueAt=#{due_at} cause=rate-limit-dead principal=process:tightbeam"
+        )
+
+        {:retry, retry_wake_id}
+
+      [[1]] ->
+        {:retry, retry_wake_id}
+    end
+  end
+
+  defp retry_identity_in_txn(txn, wake_id) do
+    case Txn.q(
+           txn,
+           "SELECT rootWakeId, attempt FROM wake_retry_attempts WHERE wakeId=?1",
+           [wake_id]
+         ) do
+      [[root_wake_id, attempt]] -> {root_wake_id, attempt}
+      [] -> {wake_id, 0}
+    end
+  end
+
+  defp retry_wake_id(root_wake_id, attempt) do
+    digest = :crypto.hash(:sha256, "#{root_wake_id}:#{attempt}")
+    "wr_" <> Base.encode16(digest, case: :lower)
+  end
+
+  defp retry_delay_ms(attempt) do
+    multiplier = Integer.pow(2, min(attempt - 1, 10))
+    min(@retry_base_ms * multiplier, @retry_ceiling_ms)
+  end
+
+  defp insert_retry_wake_in_txn(txn, wake, prompt, retry_wake_id, due_at, created_at) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO wakes
+        (wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state,
+         createdAt, firedAt, reresolve, reresolveSeed, reresolveRung,
+         conditionKind, conditionScope, conditionAfterId, firedBy,
+         creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt,
+         targetGate, class, classElection, deliveryRule, digest, summon)
+      VALUES (?1, ?2, ?3, ?4, ?5, 'prompt', ?6, 'pending', ?7, NULL,
+              ?8, ?9, ?10, NULL, NULL, NULL, NULL, ?11, ?12, ?13, NULL, NULL,
+              ?14, ?15, ?16, ?17, 0, ?18)
+      """,
+      [
+        retry_wake_id,
+        wake.session_key,
+        wake.target_role,
+        wake.origin,
+        prompt,
+        due_at,
+        created_at,
+        wake.reresolve,
+        wake.reresolve_seed,
+        wake.reresolve_rung,
+        wake.creator_session_key,
+        if(wake.rumination, do: 1, else: 0),
+        wake.work_item_id,
+        wake.target_gate,
+        wake.class,
+        wake.class_election,
+        wake.delivery_rule,
+        if(wake.summon, do: 1, else: 0)
+      ]
+    )
+
+    publish_change_in_txn(txn, "wake.scheduled", retry_wake_id)
+  end
+
+  defp settle_retry_attempt_in_txn(txn, wake_id, turn_seq, outcome, observed_at) do
+    Txn.q(
+      txn,
+      """
+      UPDATE wake_retry_attempts
+      SET sourceTurnSeq=COALESCE(sourceTurnSeq, ?2), outcome=?3, observedAt=?4
+      WHERE wakeId=?1 AND outcome='pending'
+      """,
+      [wake_id, turn_seq, outcome, observed_at || now()]
+    )
   end
 
   defp bypass_v1_batching_in_txn(txn, wake, policy_ref, refusal) do
@@ -791,15 +1001,48 @@ defmodule Tightbeam.Wakes do
   end
 
   defp pending_wake(txn, %{wake_id: wake_id}) when is_binary(wake_id) do
-    case Txn.q(
-           txn,
-           "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId, consumer FROM wakes WHERE wakeId=?1",
-           [wake_id]
-         ) do
-      [[^wake_id, origin, "pending", condition_kind, work_item_id, assignment_id, consumer]] ->
+    rows =
+      Txn.q(
+        txn,
+        "SELECT wakeId, origin, state, conditionKind, work_item_id, assignmentId, consumer FROM wakes WHERE wakeId=?1",
+        [wake_id]
+      )
+
+    rows =
+      case rows do
+        [[^wake_id, _origin, "pending", _condition, _work_item, _assignment, _consumer]] ->
+          rows
+
+        _ ->
+          Txn.q(
+            txn,
+            """
+            SELECT w.wakeId, w.origin, w.state, w.conditionKind, w.work_item_id,
+                   w.assignmentId, w.consumer
+            FROM wake_retry_attempts r
+            JOIN wakes w ON w.wakeId=r.wakeId
+            WHERE r.rootWakeId=?1 AND r.outcome='pending' AND w.state='pending'
+            ORDER BY r.attempt DESC LIMIT 1
+            """,
+            [wake_id]
+          )
+      end
+
+    case rows do
+      [
+        [
+          resolved_wake_id,
+          origin,
+          "pending",
+          condition_kind,
+          work_item_id,
+          assignment_id,
+          consumer
+        ]
+      ] ->
         {:ok,
          %{
-           wake_id: wake_id,
+           wake_id: resolved_wake_id,
            origin: origin,
            condition_kind: condition_kind,
            work_item_id: work_item_id,
@@ -1573,6 +1816,12 @@ defmodule Tightbeam.Wakes do
     )
 
     if Txn.changes(txn) == 1 do
+      Txn.q(
+        txn,
+        "UPDATE wake_retry_attempts SET outcome='canceled', observedAt=?2 WHERE wakeId=?1 AND outcome='pending'",
+        [wake.wake_id, canceled_at]
+      )
+
       Txn.q(
         txn,
         """
