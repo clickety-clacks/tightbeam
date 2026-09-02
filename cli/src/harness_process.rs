@@ -148,12 +148,45 @@ struct HarnessTarget {
     launch_id: String,
 }
 
+/// A single deterministic post-stop revalidation fault for the freeze early-return control.
+///
+/// The freeze must never unwind after it has stopped the tree, but a live reproduction needs
+/// the recorded target's identity to drift AFTER the initial SIGSTOP and only then — a race no
+/// test can pin without a seam. `Armed` is set by the negative control; `freeze_harness_tree`
+/// promotes it to `Firing` the instant the recorded group is stopped; the next revalidation
+/// fires exactly once and disarms, so the kill phase that follows still reaches its SIGKILL.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+enum PostStopFault {
+    Disarmed,
+    Armed,
+    Firing,
+}
+
+#[cfg(test)]
+thread_local! {
+    static POST_STOP_FAULT: std::cell::Cell<PostStopFault> =
+        const { std::cell::Cell::new(PostStopFault::Disarmed) };
+}
+
 impl HarnessTarget {
     /// Re-read boot identity, the identity file, and the live session leader before a signal.
     ///
     /// A pgid can be reused once the leader is gone; signalling the number alone is not enough
     /// to know the process group still belongs to this launch.
     fn revalidate_before_signal(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if POST_STOP_FAULT.with(|fault| {
+            if fault.get() == PostStopFault::Firing {
+                fault.set(PostStopFault::Disarmed);
+                true
+            } else {
+                false
+            }
+        }) {
+            return Err("injected post-stop revalidation fault".into());
+        }
+
         authorize_group_signal(
             Path::new(&self.identity_path),
             self.pgid,
@@ -456,6 +489,7 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
         frozen: BTreeSet::new(),
         groups: BTreeSet::from([pgid]),
         incomplete: false,
+        failures: Vec::new(),
     };
     sweep.groups.remove(&my_group);
 
@@ -468,10 +502,28 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
         signal_process_group(pgid, libc::SIGSTOP, target)?;
     }
 
+    // The tree is now stopped. Promote an armed post-stop fault so the negative control's
+    // next revalidation drifts exactly here, proving the loop below records and continues.
+    #[cfg(test)]
+    POST_STOP_FAULT.with(|fault| {
+        if fault.get() == PostStopFault::Armed {
+            fault.set(PostStopFault::Firing);
+        }
+    });
+
     let mut rounds = 0;
     let mut found_more = true;
     while rounds < FREEZE_ROUNDS {
-        target.revalidate_before_signal()?;
+        // Post-stop: revalidation now guards fresh signals against identity that drifted
+        // since the freeze began. A failure here means the target is no longer provably
+        // ours, so we stop enumerating NEW members — but the members already frozen were
+        // each verified before capture and still get killed below, so record and break to
+        // the kill phase rather than unwinding out with the tree left stopped.
+        if let Err(reason) = target.revalidate_before_signal() {
+            sweep.incomplete = true;
+            sweep.failures.push(reason);
+            break;
+        }
 
         let snapshot = match Snapshot::capture() {
             Ok(snapshot) => snapshot,
@@ -500,9 +552,15 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
                 Ok(start_time) => start_time,
                 Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
                 Err(error) => {
-                    return Err(format!(
+                    // Post-stop: the recorded group is frozen. An unreadable start time for
+                    // one member means we cannot bind an instance token to it, so we do not
+                    // freeze it — but we must not abandon the members already stopped. Record
+                    // the gap (the walk is now incomplete) and keep going to the kill phase.
+                    sweep.incomplete = true;
+                    sweep.failures.push(format!(
                         "process {pid} start time could not be read before freeze: {error}"
                     ));
+                    continue;
                 }
             };
             let instance = ProcessInstance {
@@ -512,7 +570,13 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
             };
             found_more = true;
             sweep.frozen.insert(instance);
-            signal_process(instance, libc::SIGSTOP, target)?;
+            // Post-stop: this instance is already recorded in `frozen`, so a failed SIGSTOP
+            // is recorded rather than propagated — the kill phase still SIGKILLs it under its
+            // captured birth token. Unwinding here would strand the whole frozen tree.
+            if let Err(reason) = signal_process(instance, libc::SIGSTOP, target) {
+                sweep.incomplete = true;
+                sweep.failures.push(reason);
+            }
         }
 
         // The exit condition is the state itself — a reading that adds nobody — not a
@@ -539,6 +603,11 @@ struct Sweep {
     groups: BTreeSet<libc::pid_t>,
     /// True when the walk could not prove it saw the whole tree before the kill.
     incomplete: bool,
+    /// Every post-stop failure the freeze met, recorded rather than returned. Once the tree
+    /// is frozen, a failure that unwinds out of the freeze leaves it stopped forever (worse
+    /// than the orphan the sweep replaces), so each is carried here and surfaced loudly by
+    /// `kill_harness_tree` AFTER every kill has run.
+    failures: Vec<String>,
 }
 
 fn signal_process_group(
@@ -614,6 +683,9 @@ fn kill_harness_tree(target: &HarnessTarget, sweep: Sweep) -> Result<i32, String
     if sweep.incomplete {
         cleanup_failures.push("harness tree freeze did not prove complete before kill".to_string());
     }
+    // Post-stop failures the freeze recorded rather than unwinding on: surface each so the
+    // loud incomplete verdict names why, after every kill below has still run.
+    cleanup_failures.extend(sweep.failures.iter().cloned());
 
     for group in sweep.groups.iter().filter(|group| **group != pgid) {
         if let Some(reason) = sigkill_stray(Stray::Group(*group), target, &sweep.frozen) {
@@ -627,11 +699,25 @@ fn kill_harness_tree(target: &HarnessTarget, sweep: Sweep) -> Result<i32, String
         }
     }
 
-    target.revalidate_before_signal()?;
-    let recorded = if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
-        Ok(0)
-    } else {
-        classify_group_kill(pgid, std::io::Error::last_os_error())
+    // The recorded group is signalled by number, so its identity is revalidated one last
+    // time before the killpg — a reused pgid must not be SIGKILLed. But a revalidation
+    // failure here must not unwind past the loud verdict: every frozen member was already
+    // killed above under its own birth token, so we record the group as unconfirmed and
+    // fall through to the incomplete-cleanup refusal instead of returning early.
+    let recorded = match target.revalidate_before_signal() {
+        Ok(()) => {
+            if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
+                Ok(0)
+            } else {
+                classify_group_kill(pgid, std::io::Error::last_os_error())
+            }
+        }
+        Err(reason) => {
+            cleanup_failures.push(format!(
+                "recorded group {pgid} identity could not be revalidated before the final kill: {reason}"
+            ));
+            Ok(0)
+        }
     };
 
     if cleanup_failures.is_empty() {
@@ -810,7 +896,8 @@ mod signal_target_gone_tests {
 #[cfg(test)]
 mod instance_authority_tests {
     use super::{
-        ProcessInstance, parse_proc_starttime, read_process_start_time, verify_process_instance,
+        ProcessInstance, ProcessStartTime, parse_proc_starttime, read_process_start_time,
+        verify_process_instance,
     };
 
     #[test]
@@ -842,6 +929,47 @@ mod instance_authority_tests {
         assert!(
             !error.contains("pid reuse"),
             "must not pass via pid-reuse branch: {error}"
+        );
+    }
+
+    /// PID reuse must be refused by the captured start-time birth token alone. The instance
+    /// carries the LIVE pid and its true process group, so the group-reuse branch cannot fire;
+    /// only the captured start time differs, exactly as when a reaped pid number is handed to a
+    /// new process. Removing the start-time authority in `verify_process_instance` lets this
+    /// reused pid pass verification, turning this control red. Boot identity is not consulted
+    /// here, so a boot-id mismatch alone could never stand in for this proof.
+    #[test]
+    fn pid_reuse_is_refused_when_only_the_start_time_differs() {
+        let pid = unsafe { libc::getpid() };
+        let actual_pgid = unsafe { libc::getpgid(pid) };
+        assert_ne!(
+            actual_pgid, -1,
+            "live pid must have a readable process group"
+        );
+        let live = read_process_start_time(pid).expect("live pid start time readable");
+        // A birth token from a DIFFERENT process at the same pid number: same pid, same group,
+        // stale start time. Only the start-time check can tell it apart from the live process.
+        let stale = ProcessStartTime {
+            seconds: live.seconds ^ 0x5a5a,
+            microseconds: live.microseconds,
+        };
+        assert_ne!(
+            stale, live,
+            "the stale start time must differ from the live one"
+        );
+        let instance = ProcessInstance {
+            pid,
+            pgid: actual_pgid,
+            start_time: stale,
+        };
+        let error = verify_process_instance(&instance).unwrap_err();
+        assert!(
+            error.contains("pid reuse"),
+            "expected pid-reuse refusal from the start-time check, got: {error}"
+        );
+        assert!(
+            !error.contains("group reuse"),
+            "must be refused by the start-time token, not the group branch: {error}"
         );
     }
 }
@@ -995,6 +1123,7 @@ mod tests {
             frozen: BTreeSet::new(),
             groups: BTreeSet::new(),
             incomplete: true,
+            failures: Vec::new(),
         };
 
         let verdict = kill_harness_tree(&target, sweep);
@@ -1007,6 +1136,118 @@ mod tests {
         assert!(
             matches!(verdict, Err(ref reason) if reason.contains("harness cleanup incomplete")),
             "incomplete cleanup must be a loud failure, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_post_stop_freeze_failure_records_and_still_kills_the_frozen_tree() {
+        // F1 negative control: once freeze has SIGSTOPped the recorded group, NO error path may
+        // unwind out of the freeze. A frozen tree that never reaches SIGKILL is stopped forever
+        // — strictly worse than the orphan the sweep exists to prevent. We fork an owned
+        // session-leader child (killing it is safe), arm a deterministic post-stop revalidation
+        // fault, and drive the REAL freeze_harness_tree then kill_harness_tree. With the
+        // record-and-continue fix, freeze returns Ok with the failure recorded on the sweep and
+        // the kill phase still SIGKILLs the child. Reverting any post-stop `?` turns freeze back
+        // into an early Err, the kill phase never runs, and the child is left stopped — red.
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // Own session + group, announce readiness, then hold still to be killed. The
+            // bounded sleep is a safety net so a bug here cannot wedge the suite.
+            unsafe {
+                libc::setsid();
+                libc::write(write_fd, b"x".as_ptr() as *const libc::c_void, 1);
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+
+        unsafe { libc::close(write_fd) };
+        let mut ready = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(read_fd, ready.as_mut_ptr() as *mut libc::c_void, 1) },
+            1,
+            "child never signalled readiness"
+        );
+        unsafe { libc::close(read_fd) };
+
+        // After setsid the child leads its own group: pgid == pid == child.
+        let pgid = child;
+        let boot = boot_identity().unwrap();
+        let launch = "post-stop-freeze-launch";
+        let path = test_path("post-stop-freeze");
+        fs::write(&path, format!("{pgid}\t{pgid}\t{boot}\t{launch}")).unwrap();
+
+        let target = HarnessTarget {
+            pgid,
+            identity_path: path.to_string_lossy().into_owned(),
+            boot_identity: boot,
+            launch_id: launch.into(),
+        };
+
+        // Arm the fault: freeze stops the group, then the first post-stop revalidation fails.
+        POST_STOP_FAULT.with(|fault| fault.set(PostStopFault::Armed));
+        let freeze = freeze_harness_tree(&target);
+        // Never let the injected fault leak into another test that reuses this thread.
+        POST_STOP_FAULT.with(|fault| fault.set(PostStopFault::Disarmed));
+
+        // The fix keeps the freeze from unwinding after the stop: it returns the recorded sweep.
+        let sweep = match freeze {
+            Ok(sweep) => sweep,
+            Err(reason) => {
+                // Old behaviour: freeze returned early, the child is still stopped. Clean up
+                // before failing so a reverted build cannot wedge the suite.
+                unsafe { libc::kill(child, libc::SIGKILL) };
+                let mut status = 0;
+                unsafe { libc::waitpid(child, &mut status, 0) };
+                fs::remove_file(&path).ok();
+                panic!("freeze must record the post-stop fault and return Ok, got Err: {reason}");
+            }
+        };
+        assert!(
+            sweep.incomplete,
+            "a recorded post-stop fault must mark the sweep incomplete"
+        );
+        assert!(
+            sweep
+                .failures
+                .iter()
+                .any(|reason| reason.contains("injected post-stop revalidation fault")),
+            "the sweep must carry the post-stop failure, got {:?}",
+            sweep.failures
+        );
+
+        // The kill phase still runs and reaches the frozen tree.
+        let verdict = kill_harness_tree(&target, sweep);
+
+        // Reap the child, bounded, so a regression that leaves it stopped fails loudly instead
+        // of wedging the suite on a blocking wait.
+        let mut status = 0;
+        let mut reaped = false;
+        for _ in 0..200 {
+            if unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) } == child {
+                reaped = true;
+                break;
+            }
+            unsafe { libc::usleep(25_000) };
+        }
+        if !reaped {
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            unsafe { libc::waitpid(child, &mut status, 0) };
+        }
+        fs::remove_file(&path).ok();
+
+        assert!(
+            reaped && libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL,
+            "the frozen child must be SIGKILLed by the kill phase, not left stopped"
+        );
+        assert!(
+            matches!(verdict, Err(ref reason) if reason.contains("harness cleanup incomplete")),
+            "a recorded freeze failure must surface as a loud incomplete cleanup, got {verdict:?}"
         );
     }
 
