@@ -1,0 +1,50 @@
+{
+  "schema": "tightbeam-sanitized-installed-gh-device-capture-v1",
+  "capture_time": "2026-08-18T18:26:00Z",
+  "terminal_time": "2026-08-18T18:40:58Z",
+  "host_os": "Darwin arm64",
+  "binary_path": "/opt/homebrew/bin/gh",
+  "binary_version": "gh version 2.83.2 (2025-12-10)",
+  "binary_sha256": null,
+  "binary_sha256_note": "The released source capture did not hash the installed gh binary; this null is deliberate and must not be replaced with an inferred hash.",
+  "argv": [
+    "/opt/homebrew/bin/gh",
+    "auth",
+    "login",
+    "--hostname",
+    "github.com",
+    "--web",
+    "--git-protocol",
+    "https",
+    "--insecure-storage"
+  ],
+  "stdin_utf8": "Y\n",
+  "stdin_closed_after_write": true,
+  "capture_channel": "combined-pty",
+  "events": [
+    {
+      "replay_channel": "stderr",
+      "text": "! First copy your one-time code: REDACTED-EXPIRED-CODE\n"
+    },
+    {
+      "replay_channel": "stdout",
+      "text": "Open this URL to continue in your web browser: https://github.com/login/device\n"
+    },
+    {
+      "replay_channel": "stderr",
+      "text": "failed to authenticate via web browser: context deadline exceeded\n"
+    }
+  ],
+  "exit_status": 1,
+  "banked_credential": false,
+  "sanitization": "The one-time code was already expired and is replaced by REDACTED-EXPIRED-CODE. No token, credential, gh config, or live authentication state is present.",
+  "source_refs": [
+    "att_4341d983",
+    "att_0b121834",
+    "att_addf98cc",
+    "att_a10f54ca",
+    "art_d45aa153",
+    "art_0bb78344",
+    "art_f0a39171"
+  ]
+}

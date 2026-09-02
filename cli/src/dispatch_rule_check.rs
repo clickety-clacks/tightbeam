@@ -113,14 +113,68 @@ impl MalformedToolCallCauseV1 {
 }
 
 pub(crate) fn run(raw_args: &[String]) -> Result<i32, String> {
-    let args = parse_args(raw_args)?;
-    let endpoint = authenticated_session_endpoint()?;
-    let context = authenticate_context(&endpoint, &args)?;
+    let args = match parse_args(raw_args) {
+        Ok(args) => args,
+        Err(_) => {
+            return execute_runtime_failure(
+                &closed_failure_args(),
+                RuntimeFailure::projected(
+                    "invocation",
+                    "invalid_compiled_dispatch_rule_invocation",
+                ),
+            );
+        }
+    };
+
+    let materials = match collect_materials(&args) {
+        Ok(materials) => materials,
+        Err(failure) => return execute_runtime_failure(&args, failure),
+    };
+    execute_materials(&args, materials)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeFailure {
+    phase: &'static str,
+    cause: &'static str,
+    machine: String,
+    profile: Option<String>,
+    principal: String,
+}
+
+impl RuntimeFailure {
+    fn projected(phase: &'static str, cause: &'static str) -> Self {
+        Self {
+            phase,
+            cause,
+            machine: projected_field("TIGHTBEAM_MACHINE"),
+            profile: projected_optional_field("TIGHTBEAM_GITHUB_PROFILE"),
+            principal: projected_field("TIGHTBEAM_PRINCIPAL"),
+        }
+    }
+
+    fn authenticated(phase: &'static str, cause: &'static str, context: &Context) -> Self {
+        Self {
+            phase,
+            cause,
+            machine: marker_field(&context.machine),
+            profile: projected_optional_field("TIGHTBEAM_GITHUB_PROFILE"),
+            principal: marker_field(&context.principal),
+        }
+    }
+}
+
+fn collect_materials(args: &Args) -> Result<Vec<ToolCheckMaterialV1>, RuntimeFailure> {
+    let endpoint = authenticated_session_endpoint().map_err(|_| {
+        RuntimeFailure::projected("authentication", "session_authentication_failed")
+    })?;
+    let context = authenticate_context(&endpoint, args)
+        .map_err(|_| RuntimeFailure::projected("authentication", "authenticated_context_failed"))?;
 
     let mut raw = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut raw)
-        .map_err(|_| runtime_failure(&context))?;
+    std::io::stdin().read_to_end(&mut raw).map_err(|_| {
+        RuntimeFailure::authenticated("normalization", "tool_input_read_failed", &context)
+    })?;
 
     let input = match normalize(&raw, args.abi) {
         Err(cause) => ToolCallInputOrMaterial::Material(ToolCheckMaterialV1 {
@@ -133,7 +187,15 @@ pub(crate) fn run(raw_args: &[String]) -> Result<i32, String> {
             cause: cause.as_str().to_owned(),
             principal: context.principal.clone(),
             repair: Some(args.fallback_repair.clone()),
-            observation_ids: vec![observe_malformed(&endpoint, &args, &context, cause)?],
+            observation_ids: vec![observe_malformed(&endpoint, args, &context, cause).map_err(
+                |_| {
+                    RuntimeFailure::authenticated(
+                        "recording",
+                        "observation_record_failed",
+                        &context,
+                    )
+                },
+            )?],
         }),
         Ok(input) => ToolCallInputOrMaterial::Input(input),
     };
@@ -146,9 +208,12 @@ pub(crate) fn run(raw_args: &[String]) -> Result<i32, String> {
             &context.machine,
             &context.principal,
             &input,
-        )?,
+        )
+        .map_err(|_| {
+            RuntimeFailure::authenticated("handler", "compiled_handler_failed", &context)
+        })?,
     };
-    execute_materials(&args, materials)
+    Ok(materials)
 }
 
 enum ToolCallInputOrMaterial {
@@ -164,14 +229,103 @@ fn execute_materials(args: &Args, materials: Vec<ToolCheckMaterialV1>) -> Result
                 return Err(render_refusal(&material));
             }
             _ => {
-                return Err(format!(
-                    "[gate: {RULE}] state=rule_runtime_failure machine={} profile=none hostname=none phase=execution cause=invalid_compiled_effect_or_material principal={} repair={}",
-                    material.machine, material.principal, args.fallback_repair
-                ));
+                return execute_runtime_failure(
+                    args,
+                    RuntimeFailure {
+                        phase: "execution",
+                        cause: "invalid_compiled_effect_or_material",
+                        machine: projected_field("TIGHTBEAM_MACHINE"),
+                        profile: projected_optional_field("TIGHTBEAM_GITHUB_PROFILE"),
+                        principal: projected_field("TIGHTBEAM_PRINCIPAL"),
+                    },
+                );
             }
         }
     }
     Ok(0)
+}
+
+fn execute_runtime_failure(args: &Args, failure: RuntimeFailure) -> Result<i32, String> {
+    let material = ToolCheckMaterialV1 {
+        state: "rule_runtime_failure".to_owned(),
+        operation_class: "not_applicable".to_owned(),
+        machine: failure.machine,
+        profile: failure.profile,
+        hostname: None,
+        phase: failure.phase.to_owned(),
+        cause: failure.cause.to_owned(),
+        principal: failure.principal,
+        repair: Some(args.fallback_repair.clone()),
+        observation_ids: Vec::new(),
+    };
+
+    match args.effects.get("rule_runtime_failure") {
+        Some(Effect::Deny) if !args.fallback_repair.trim().is_empty() => {
+            Err(render_refusal(&material))
+        }
+        _ => Err(render_refusal(&ToolCheckMaterialV1 {
+            cause: "invalid_compiled_runtime_failure_effect".to_owned(),
+            repair: Some("tightbeam doctor --json".to_owned()),
+            ..material
+        })),
+    }
+}
+
+fn closed_failure_args() -> Args {
+    let effects = RETURNS
+        .iter()
+        .map(|state| {
+            (
+                (*state).to_owned(),
+                if matches!(*state, "not_applicable" | "live") {
+                    Effect::Allow
+                } else {
+                    Effect::Deny
+                },
+            )
+        })
+        .collect();
+    Args {
+        rule: RULE.to_owned(),
+        handler: HANDLER.to_owned(),
+        abi: 1,
+        identity_sha: String::new(),
+        effects,
+        fallback_repair: "tightbeam doctor --json".to_owned(),
+    }
+}
+
+fn projected_field(name: &str) -> String {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| marker_field(&value))
+        .unwrap_or_else(|| "none".to_owned())
+}
+
+fn projected_optional_field(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|value| marker_field(&value))
+}
+
+fn marker_field(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '@') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.is_empty() {
+        "none".to_owned()
+    } else {
+        safe
+    }
 }
 
 fn render_refusal(material: &ToolCheckMaterialV1) -> String {
@@ -308,7 +462,7 @@ fn authenticate_context(
         || principal.as_deref() != Some(context.principal.as_str())
         || context.identity_sha != args.identity_sha
     {
-        return Err(runtime_failure(&context));
+        return Err("rule_runtime_failure: authenticated context mismatch".to_owned());
     }
     Ok(context)
 }
@@ -320,13 +474,6 @@ fn required_result_string(result: &Value, key: &str) -> Result<String, String> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| "rule_runtime_failure: invalid authenticated context".to_owned())
-}
-
-fn runtime_failure(context: &Context) -> String {
-    format!(
-        "[gate: {RULE}] state=rule_runtime_failure machine={} profile=none hostname=none phase=authentication cause=authenticated_context_failure principal={} repair=tightbeam doctor --json",
-        context.machine, context.principal
-    )
 }
 
 fn observe_malformed(
@@ -607,5 +754,64 @@ mod tests {
         let refusal = execute_materials(&args, vec![expired]).unwrap_err();
         assert!(refusal.contains("state=expired"));
         assert!(refusal.contains("observation_ids=obs_fixture"));
+    }
+
+    #[test]
+    fn invalid_compiled_invocation_is_a_named_runtime_failure_material() {
+        let refusal = run(&[]).unwrap_err();
+        assert!(refusal.starts_with("[gate: github-network-auth-required]"));
+        assert!(refusal.contains("state=rule_runtime_failure"));
+        assert!(refusal.contains("operation_class=not_applicable"));
+        assert!(refusal.contains("phase=invocation"));
+        assert!(refusal.contains("cause=invalid_compiled_dispatch_rule_invocation"));
+        assert!(refusal.contains("repair=tightbeam doctor --json"));
+        assert!(!refusal.contains("invalid compiled dispatch-rule invocation"));
+    }
+
+    #[test]
+    fn invalid_handler_material_reenters_the_runtime_failure_effect() {
+        let args = closed_failure_args();
+        let invalid = ToolCheckMaterialV1 {
+            state: "live".to_owned(),
+            operation_class: "gh".to_owned(),
+            machine: "fixture host\nspoof".to_owned(),
+            profile: Some("work".to_owned()),
+            hostname: Some("github.com".to_owned()),
+            phase: "provider".to_owned(),
+            cause: "current_provider_probe_live".to_owned(),
+            principal: "session:fixture\nspoof".to_owned(),
+            repair: Some("unexpected repair".to_owned()),
+            observation_ids: Vec::new(),
+        };
+
+        let refusal = execute_materials(&args, vec![invalid]).unwrap_err();
+        assert!(refusal.contains("state=rule_runtime_failure"));
+        assert!(refusal.contains("phase=execution"));
+        assert!(refusal.contains("cause=invalid_compiled_effect_or_material"));
+        assert!(!refusal.contains("fixture_host_spoof"));
+        assert!(!refusal.contains("session:fixture_spoof"));
+        assert_eq!(refusal.lines().count(), 1);
+    }
+
+    #[test]
+    fn synthetic_runtime_failure_carries_only_projected_marker_fields() {
+        let refusal = execute_runtime_failure(
+            &closed_failure_args(),
+            RuntimeFailure {
+                phase: "handler",
+                cause: "compiled_handler_failed",
+                machine: "fixture-host".to_owned(),
+                profile: Some("work_profile".to_owned()),
+                principal: "session:fixture".to_owned(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(refusal.contains("machine=fixture-host"));
+        assert!(refusal.contains("profile=work_profile"));
+        assert!(refusal.contains("principal=session:fixture"));
+        assert!(refusal.contains("phase=handler"));
+        assert!(refusal.contains("cause=compiled_handler_failed"));
+        assert!(refusal.contains("observation_ids="));
     }
 }

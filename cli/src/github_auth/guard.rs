@@ -177,6 +177,15 @@ fn gh_target_hostname(
         }
         index += 1;
     }
+    if let Some(value) = gh_positional_repo_selector(command)? {
+        if let Some(hostname) =
+            repo_selector_hostname(value).map_err(|()| SelectorError::Malformed)?
+        {
+            explicit.push(hostname);
+        } else {
+            explicit_repo = true;
+        }
+    }
     explicit.sort();
     explicit.dedup();
     if explicit.len() > 1 {
@@ -227,6 +236,95 @@ fn gh_target_hostname(
     }
 
     effective_host(raw_command)
+}
+
+/// Return the repository selector carried in a gh command's positional repository slot.
+///
+/// `gh repo <verb> [repository]` accepts both `owner/repo` and `HOST/owner/repo`. The `pr`
+/// and `issue` groups also accept full GitHub object URLs, but their ordinary positional value
+/// can be a number or branch, so only a host-bearing selector is authoritative there.
+fn gh_positional_repo_selector(command: &[String]) -> Result<Option<&str>, SelectorError> {
+    let Some(group_index) = command[1..]
+        .iter()
+        .position(|word| matches!(word.as_str(), "repo" | "pr" | "issue" | "api"))
+        .map(|index| index + 1)
+    else {
+        return Ok(None);
+    };
+    let group = command[group_index].as_str();
+    if group == "api" {
+        return Ok(None);
+    }
+
+    let Some(subcommand_index) = next_gh_positional(command, group_index + 1)? else {
+        return Ok(None);
+    };
+    let Some(selector_index) = next_gh_positional(command, subcommand_index + 1)? else {
+        return Ok(None);
+    };
+    let selector = command[selector_index].as_str();
+
+    if group == "repo" {
+        return Ok(Some(selector));
+    }
+    repo_selector_hostname(selector)
+        .map_err(|()| SelectorError::Malformed)
+        .map(|hostname| hostname.map(|_| selector))
+}
+
+fn next_gh_positional(
+    command: &[String],
+    mut index: usize,
+) -> Result<Option<usize>, SelectorError> {
+    while index < command.len() {
+        let word = command[index].as_str();
+        if word == "--" {
+            return Ok(command.get(index + 1).map(|_| index + 1));
+        }
+        if word.starts_with('-') {
+            if gh_option_takes_value(word) && !word.contains('=') {
+                index += 1;
+                if command.get(index).is_none() {
+                    return Err(SelectorError::Malformed);
+                }
+            }
+            index += 1;
+            continue;
+        }
+        return Ok(Some(index));
+    }
+    Ok(None)
+}
+
+fn gh_option_takes_value(word: &str) -> bool {
+    matches!(
+        word,
+        "--hostname"
+            | "-R"
+            | "--repo"
+            | "--branch"
+            | "-b"
+            | "--json"
+            | "--jq"
+            | "--template"
+            | "--limit"
+            | "-L"
+            | "--state"
+            | "--author"
+            | "-A"
+            | "--assignee"
+            | "-a"
+            | "--label"
+            | "-l"
+            | "--milestone"
+            | "-m"
+            | "--search"
+            | "-S"
+            | "--base"
+            | "-B"
+            | "--head"
+            | "-H"
+    )
 }
 
 fn effective_host(command: &[String]) -> Result<String, SelectorError> {
@@ -898,6 +996,56 @@ mod tests {
             classified,
             Classification::Targets(ref targets) if targets[0].hostname == "github.example"
         ));
+
+        let classified = classify_command_with(
+            "gh repo view ghe.example/acme/widget",
+            &FakeGh::new(true),
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            classified,
+            Classification::Targets(ref targets) if targets[0].hostname == "ghe.example"
+        ));
+
+        let classified = classify_command_with(
+            "gh repo view https://github.enterprise.example/acme/widget",
+            &FakeGh::new(true),
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            classified,
+            Classification::Targets(ref targets) if targets[0].hostname == "github.enterprise.example"
+        ));
+
+        let gh = FakeGh::new(true).current_remotes(vec![(
+            "origin",
+            "https://ghe.example/acme/widget.git",
+            true,
+        )]);
+        let classified =
+            classify_command_with("GH_HOST=github.com gh repo view acme/widget", &gh, &[]).unwrap();
+        assert!(matches!(
+            classified,
+            Classification::Targets(ref targets) if targets[0].hostname == "github.com"
+        ));
+
+        let classified = classify_command_with("gh pr view 42", &gh, &[]).unwrap();
+        assert!(matches!(
+            classified,
+            Classification::Targets(ref targets) if targets[0].hostname == "ghe.example"
+        ));
+
+        assert_eq!(
+            classify_command_with(
+                "gh repo view ghe.example/acme/widget --hostname github.com",
+                &FakeGh::new(true),
+                &[],
+            )
+            .unwrap(),
+            Classification::AmbiguousHostname
+        );
     }
 
     #[test]

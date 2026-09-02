@@ -2864,6 +2864,58 @@ mod tests {
 
     #[test]
     fn github_device_drive_sends_only_yes_and_tees_both_provider_streams() {
+        let capture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/gh-auth-login-2.83.2-device.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            capture["schema"],
+            "tightbeam-sanitized-installed-gh-device-capture-v1"
+        );
+        assert_eq!(capture["host_os"], "Darwin arm64");
+        assert_eq!(capture["binary_path"], "/opt/homebrew/bin/gh");
+        assert_eq!(capture["binary_version"], "gh version 2.83.2 (2025-12-10)");
+        assert!(capture["binary_sha256"].is_null());
+        assert!(
+            capture["binary_sha256_note"]
+                .as_str()
+                .unwrap()
+                .contains("must not be replaced with an inferred hash")
+        );
+        assert_eq!(
+            capture["argv"],
+            serde_json::json!([
+                "/opt/homebrew/bin/gh",
+                "auth",
+                "login",
+                "--hostname",
+                "github.com",
+                "--web",
+                "--git-protocol",
+                "https",
+                "--insecure-storage"
+            ])
+        );
+        assert_eq!(capture["stdin_utf8"], "Y\n");
+        assert_eq!(capture["stdin_closed_after_write"], true);
+        assert_eq!(capture["capture_channel"], "combined-pty");
+        assert_eq!(capture["exit_status"], 1);
+        assert_eq!(capture["banked_credential"], false);
+        let events = capture["events"].as_array().unwrap();
+        let stderr_code = events[0]["text"].as_str().unwrap();
+        let stdout_url = events[1]["text"].as_str().unwrap();
+        let stderr_terminal = events[2]["text"].as_str().unwrap();
+        assert_eq!(events[0]["replay_channel"], "stderr");
+        assert_eq!(events[1]["replay_channel"], "stdout");
+        assert_eq!(events[2]["replay_channel"], "stderr");
+        assert!(
+            capture["source_refs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "art_d45aa153")
+        );
+
         let _cwd_guard = DELIVERY_CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let cwd = std::env::current_dir().unwrap();
         let before = fs::read_dir(&cwd)
@@ -2881,8 +2933,11 @@ mod tests {
         command
             .args([
                 "-c",
-                "IFS= read -r answer; test \"$answer\" = Y || exit 7; printf 'First copy your one-time code: GH12-AB34\\n' >&2; printf 'Open https://github.example/login/device to continue\\n'; exit 0",
+                "IFS= read -r answer; test \"$answer\" = Y || exit 7; if IFS= read -r extra; then exit 8; fi; printf '%s' \"$GH_CAPTURE_CODE\" >&2; printf '%s' \"$GH_CAPTURE_URL\"; printf '%s' \"$GH_CAPTURE_TERMINAL\" >&2; exit 1",
             ])
+            .env("GH_CAPTURE_CODE", stderr_code)
+            .env("GH_CAPTURE_URL", stdout_url)
+            .env("GH_CAPTURE_TERMINAL", stderr_terminal)
             .stdin(Stdio::piped());
 
         let endpoint = Endpoint {
@@ -2931,14 +2986,14 @@ mod tests {
             let _ = fs::remove_file(path);
         }
 
-        assert!(status.success());
+        assert_eq!(status.code(), Some(1));
         assert!(emitted);
         let body = sent.into_inner().join("\n");
-        assert!(body.contains("GH12-AB34"), "{body}");
-        assert!(
-            body.contains("https://github.example/login/device"),
-            "{body}"
-        );
+        assert!(body.contains("REDACTED-EXPIRED-CODE"), "{body}");
+        assert!(body.contains("https://github.com/login/device"), "{body}");
+        let output = String::from_utf8(buffer).unwrap();
+        assert!(output.contains("context deadline exceeded"), "{output}");
+        assert!(!output.contains("1078-EE24"));
     }
 
     /// The full OpenAI onboarding leg delivers the device code and banks the credential.
