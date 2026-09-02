@@ -57,8 +57,8 @@ defmodule Tightbeam.MixProject do
 
   defp deps do
     [
-      {:exqlite, "~> 0.27"},
       {:elixir_make, "~> 0.10", runtime: false},
+      {:exqlite, "~> 0.27"},
       # Wire front: Bandit serves Plug (HTTP control plane) + WebSock (Clawline WS).
       # The floor is the advisory boundary, stated as the advisory states it:
       # EEF-CVE-2026-65623 / GHSA-vg8x-66vg-5pxh affects >= 1.11.0 and < 1.12.1.

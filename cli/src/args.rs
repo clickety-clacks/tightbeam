@@ -167,6 +167,9 @@ pub enum Command {
         json: bool,
         base_dir: Option<String>,
     },
+    VisitorKeyringInit {
+        base_dir: Option<String>,
+    },
     Wake {
         identity: Identity,
         target: Target,
@@ -947,6 +950,11 @@ COMMANDS:
   doctor [--json] [--base-dir p]
       Check the local Tightbeam installation and report its health.
 
+  visitor keyring-init [--base-dir p]
+      Provision the local visitor credential keyring through locked,
+      same-directory, atomic no-replace publication. Prints only the final
+      path and active key ids after the keyring is durable and verified.
+
   assimilate <ssh-dest> [--name n] [--base-dir p] [--harness {{HARNESSES_CSV}}]
              [--dry-run]
       Prepare a machine to run agent harnesses and register it as a host
@@ -1702,6 +1710,17 @@ fn parse_with_optional_catalog(
                 json: flags.contains_key("json"),
                 base_dir,
             })
+        }
+        "visitor" => {
+            let base_dir = nonempty(flags, "base-dir");
+            if parsed.positional.get(1).map(String::as_str) != Some("keyring-init")
+                || parsed.positional.len() != 2
+                || flags.keys().any(|flag| flag != "base-dir")
+                || (flags.contains_key("base-dir") && base_dir.is_none())
+            {
+                return Err("usage: tightbeam visitor keyring-init [--base-dir DIR]".to_owned());
+            }
+            Ok(Command::VisitorKeyringInit { base_dir })
         }
         "harness-process" => parse_harness_process(&parsed, flags),
         "wake" => {
@@ -2751,7 +2770,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
         )),
     }
 }
@@ -3789,6 +3808,7 @@ mod tests {
                 "transcript",
                 "turn-trace",
                 "unlearn",
+                "visitor",
                 "topline",
                 "toplines",
                 "work-item-trace",
@@ -3815,6 +3835,7 @@ mod tests {
             "host-env-unset --host <host> --harness <harness> NAME",
             "harness-process list",
             "kungfu list",
+            "visitor keyring-init [--base-dir p]",
         ] {
             assert!(help.contains(syntax), "missing HELP syntax: {syntax}");
         }
@@ -4402,7 +4423,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -4607,6 +4628,43 @@ mod tests {
             assert_eq!(
                 parse(args),
                 Err("usage: tightbeam doctor [--json] [--base-dir DIR]".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn visitor_keyring_init_is_a_closed_local_command_shape() {
+        let help = render_command_help(None, "visitor").unwrap();
+        assert!(help.starts_with("  visitor keyring-init [--base-dir p]"));
+        assert!(help.contains("no-replace publication"));
+        assert!(!help.contains("  assimilate "));
+
+        assert_eq!(
+            parse(strings(&[
+                "visitor",
+                "keyring-init",
+                "--base-dir",
+                "/srv/tightbeam",
+            ])),
+            Ok(Command::VisitorKeyringInit {
+                base_dir: Some("/srv/tightbeam".to_owned()),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["visitor", "keyring-init"])),
+            Ok(Command::VisitorKeyringInit { base_dir: None })
+        );
+
+        for args in [
+            strings(&["visitor"]),
+            strings(&["visitor", "other"]),
+            strings(&["visitor", "keyring-init", "extra"]),
+            strings(&["visitor", "keyring-init", "--base-dir"]),
+            strings(&["visitor", "keyring-init", "--unknown", "value"]),
+        ] {
+            assert_eq!(
+                parse(args),
+                Err("usage: tightbeam visitor keyring-init [--base-dir DIR]".to_owned())
             );
         }
     }
