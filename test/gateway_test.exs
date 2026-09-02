@@ -784,6 +784,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{code: "denied", message: message} =
              handlers["retire"].(%{
                origin: "user:flynn",
+               principal: {:user, "flynn"},
                session_key: Org.personal_session_key("flynn"),
                params: %{}
              })
@@ -843,6 +844,7 @@ defmodule Tightbeam.GatewayTest do
     result =
       handlers["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: root.session_key,
         params: %{}
       })
@@ -898,6 +900,7 @@ defmodule Tightbeam.GatewayTest do
         adapter_coordinator: coordinator
       })["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: session.session_key,
         params: %{}
       })
@@ -983,6 +986,7 @@ defmodule Tightbeam.GatewayTest do
     result =
       Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: session.session_key,
         params: %{}
       })
@@ -1025,6 +1029,7 @@ defmodule Tightbeam.GatewayTest do
         adapter_coordinator: coordinator
       })["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: retired.session_key,
         params: %{}
       })
@@ -1064,6 +1069,7 @@ defmodule Tightbeam.GatewayTest do
         adapter_coordinator: coordinator
       })["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: session.session_key,
         params: %{}
       })
@@ -1100,7 +1106,13 @@ defmodule Tightbeam.GatewayTest do
     assert renewed.hard_deadline == first.hard_deadline
     assert renewed.expires_at == first.hard_deadline
 
-    call = %{origin: "user:flynn", session_key: root.session_key, params: %{}}
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: root.session_key,
+      params: %{}
+    }
+
     deferred = handlers["retire"].(call)
 
     assert deferred.retired_session_keys == []
@@ -8323,6 +8335,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{retired_session_keys: [active_key]} =
              retire.(%{
                origin: "user:flynn",
+               principal: {:user, "flynn"},
                session_key: active.session_key,
                params: %{}
              })
@@ -8445,7 +8458,12 @@ defmodule Tightbeam.GatewayTest do
 
     for reference <- references, command <- reference.clear_commands do
       assert Map.has_key?(handlers, command.verb)
-      result = handlers[command.verb].(Map.put(command, :origin, "user:flynn"))
+
+      result =
+        handlers[command.verb].(
+          Map.merge(command, %{origin: "user:flynn", principal: {:user, "flynn"}})
+        )
+
       refute result[:code], inspect({reference, command, result})
     end
 

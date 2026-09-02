@@ -7,6 +7,7 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
   alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
+  alias Tightbeam.Productions.CompletionEscalation
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
@@ -50,6 +51,7 @@ defmodule Tightbeam.Assignments do
     closingAttestId TEXT NULL REFERENCES attests(id),
     workItemId TEXT NULL REFERENCES work_items(id),
     reviewsAssignmentId TEXT NULL REFERENCES assignments(id),
+    completionReportToSessionKey TEXT NULL REFERENCES sessions(sessionKey),
     holderHarness TEXT NULL,
     holderProvider TEXT NULL,
     CHECK(holderRole IS NOT NULL OR holderFallback = 0),
@@ -127,6 +129,45 @@ defmodule Tightbeam.Assignments do
   );
   """
 
+  @revocations_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_revocations (
+    id TEXT PRIMARY KEY,
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    revokedAt INTEGER NOT NULL,
+    revokedByUser TEXT NULL REFERENCES users(userId),
+    revokedBySession TEXT NULL REFERENCES sessions(sessionKey),
+    reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000 AND length(trim(reason)) >= 1),
+    CHECK((revokedByUser IS NOT NULL) != (revokedBySession IS NOT NULL))
+  );
+  CREATE INDEX IF NOT EXISTS assignment_revocations_assignment
+    ON assignment_revocations (assignmentId, revokedAt, id);
+
+  CREATE TABLE IF NOT EXISTS assignment_revocation_generations (
+    revocationId TEXT PRIMARY KEY REFERENCES assignment_revocations(id),
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    reopeningId TEXT NULL CHECK(reopeningId IS NULL),
+    UNIQUE (assignmentId, reopeningId)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS assignment_revocation_generation_initial
+    ON assignment_revocation_generations (assignmentId) WHERE reopeningId IS NULL;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocations_immutable_update
+  BEFORE UPDATE ON assignment_revocations
+  BEGIN SELECT RAISE(ABORT, 'revocation provenance is immutable'); END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocations_immutable_delete
+  BEFORE DELETE ON assignment_revocations
+  BEGIN SELECT RAISE(ABORT, 'revocation provenance is immutable'); END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocation_generations_immutable_update
+  BEFORE UPDATE ON assignment_revocation_generations
+  BEGIN SELECT RAISE(ABORT, 'revocation generation is immutable'); END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocation_generations_immutable_delete
+  BEFORE DELETE ON assignment_revocation_generations
+  BEGIN SELECT RAISE(ABORT, 'revocation generation is immutable'); END;
+  """
+
   @doc "Create the assignment/attest schema."
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB) do
@@ -138,6 +179,7 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @assignment_effects_ddl)
     :ok = DB.execute(db, @assignment_priorities_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
+    :ok = DB.execute(db, @revocations_ddl)
     Tightbeam.EffortCheckin.ensure_schema(db)
   end
 
@@ -511,7 +553,8 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
-         {:ok, _files} <- assignment_files(verb, call.params) do
+         {:ok, _files} <- assignment_files(verb, call.params),
+         :ok <- valid_report_to(db, call.session_key, call.params[:report_to_session_key]) do
       key = call.params[:idempotency_key]
       replay = if is_binary(key), do: replayed_assignment(db, call), else: nil
 
@@ -577,6 +620,7 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          {:ok, _files} <- assignment_files("dispatch", call.params),
          :ok <- valid_brief(call.params[:brief]),
+         :ok <- valid_report_to(db, call.session_key, call.params[:report_to_session_key]),
          :ok <- normalize_root_validation(call.params[:workdir_root]) do
       case replayed_assignment(db, call) do
         nil ->
@@ -640,6 +684,7 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
          {:ok, files} <- assignment_files(verb, call.params),
+         :ok <- valid_report_to(db, call.session_key, call.params[:report_to_session_key]),
          :ok <- extra_validation.() do
       owner = principal_id(call.principal)
       key = call.params[:idempotency_key]
@@ -950,13 +995,23 @@ defmodule Tightbeam.Assignments do
   end
 
   defp create_assignment(txn, call, owner, key, files, verb) do
-    case Txn.q(txn, "SELECT state, harness, provider FROM sessions WHERE sessionKey = ?1", [
-           call.session_key
-         ]) do
-      [["retired", _harness, _provider]] ->
+    case Txn.q(
+           txn,
+           "SELECT state, harness, provider, ownerUserId FROM sessions WHERE sessionKey = ?1",
+           [
+             call.session_key
+           ]
+         ) do
+      [["retired", _harness, _provider, _holder_owner]] ->
         error("session_retired", "assignments require an active holder session")
 
-      [["active", harness, provider]] ->
+      [["active", harness, provider, holder_owner]] ->
+        report_to = call.params[:report_to_session_key]
+
+        if not valid_report_to_in_txn?(txn, report_to, holder_owner) do
+          throw({:invalid_report_to, report_to})
+        end
+
         # F7 amendment: dispatch persists workItemId exactly as assign does.
         work_item_id = call.params[:work_item_id]
 
@@ -1014,8 +1069,8 @@ defmodule Tightbeam.Assignments do
           INSERT INTO assignments
             (id, subject, holderKey, holderRole, holderFallback, openedByUser,
              openedBySession, openedAt, workItemId, reviewsAssignmentId,
-             holderHarness, holderProvider)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             completionReportToSessionKey, holderHarness, holderProvider)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
           """,
           [
             id,
@@ -1028,6 +1083,7 @@ defmodule Tightbeam.Assignments do
             now,
             work_item_id,
             reviews_assignment_id,
+            report_to,
             harness,
             provider
           ]
@@ -1052,6 +1108,8 @@ defmodule Tightbeam.Assignments do
             [id, path]
           )
         end)
+
+        CompletionEscalation.supersede_open_for_assignment_in_txn(txn, call.session_key, id)
 
         supervision_transition!(txn, :armed, %{
           kind: "assignment_open",
@@ -1106,6 +1164,9 @@ defmodule Tightbeam.Assignments do
 
     :review_of_review ->
       error("review_of_review", "a review assignment cannot itself be reviewed")
+
+    {:invalid_report_to, report_to} ->
+      invalid_report_to(report_to)
   end
 
   defp resolve_work_item_id_in_txn(txn, assignment_id, visited) do
@@ -1201,6 +1262,16 @@ defmodule Tightbeam.Assignments do
 
                 if Txn.changes(txn) != 1, do: raise(TransitionRace)
                 closed_assignment = fetch_assignment!(txn, assignment_id)
+
+                if call.params.kind == "completion" do
+                  CompletionEscalation.open_terminal_in_txn(
+                    txn,
+                    closed_assignment,
+                    "attest",
+                    attest
+                  )
+                end
+
                 Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
 
                 liveness_trigger =
@@ -1282,6 +1353,35 @@ defmodule Tightbeam.Assignments do
 
           true ->
             {closed_user, closed_session} = opener(call.principal)
+            closed_at = now()
+            revocation_id = id("rev_")
+
+            Txn.q(
+              txn,
+              """
+              INSERT INTO assignment_revocations
+                (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+              """,
+              [
+                revocation_id,
+                assignment_id,
+                closed_at,
+                closed_user,
+                closed_session,
+                call.params[:reason] || "revoked"
+              ]
+            )
+
+            Txn.q(
+              txn,
+              """
+              INSERT INTO assignment_revocation_generations
+                (revocationId, assignmentId, reopeningId)
+              VALUES (?1, ?2, NULL)
+              """,
+              [revocation_id, assignment_id]
+            )
 
             Txn.q(
               txn,
@@ -1290,11 +1390,18 @@ defmodule Tightbeam.Assignments do
                 closedByUser = ?3, closedBySession = ?4
               WHERE id = ?1 AND state = 'open'
               """,
-              [assignment_id, now(), closed_user, closed_session]
+              [assignment_id, closed_at, closed_user, closed_session]
             )
 
             if Txn.changes(txn) != 1, do: raise(TransitionRace)
             revoked_assignment = fetch_assignment!(txn, assignment_id)
+
+            CompletionEscalation.open_terminal_in_txn(txn, revoked_assignment, "revocation", %{
+              id: revocation_id,
+              by_user: closed_user,
+              by_session: closed_session
+            })
+
             Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
 
             liveness_trigger =
@@ -1884,7 +1991,7 @@ defmodule Tightbeam.Assignments do
   defp columns do
     "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>
       "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId" <>
-      ", workItemId, reviewsAssignmentId, holderHarness, holderProvider, " <>
+      ", workItemId, reviewsAssignmentId, completionReportToSessionKey, holderHarness, holderProvider, " <>
       "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = assignments.id), " <>
       "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END), " <>
       "COALESCE((SELECT priority FROM assignment_priorities WHERE assignmentId=assignments.id), " <>
@@ -1909,6 +2016,7 @@ defmodule Tightbeam.Assignments do
          closing_attest_id,
          work_item_id,
          reviews_assignment_id,
+         completion_report_to_session_key,
          holder_harness,
          holder_provider,
          effect_kind,
@@ -1931,12 +2039,48 @@ defmodule Tightbeam.Assignments do
       closingAttestId: closing_attest_id,
       workItemId: work_item_id,
       reviewsAssignmentId: reviews_assignment_id,
+      reportToSessionKey: completion_report_to_session_key,
       holderHarness: holder_harness,
       holderProvider: holder_provider,
       effectKind: effect_kind,
       priority: priority
     }
   end
+
+  defp valid_report_to(_db, _holder_key, nil), do: :ok
+
+  defp valid_report_to(db, holder_key, report_to) when is_binary(report_to) and report_to != "" do
+    case DB.query(
+           db,
+           """
+           SELECT 1
+           FROM sessions holder
+           JOIN sessions target ON target.sessionKey=?2
+           WHERE holder.sessionKey=?1
+             AND target.state='active'
+             AND target.ownerUserId=holder.ownerUserId
+           """,
+           [holder_key, report_to]
+         ) do
+      {:ok, [[1]]} -> :ok
+      _ -> invalid_report_to(report_to)
+    end
+  end
+
+  defp valid_report_to(_db, _holder_key, report_to), do: invalid_report_to(report_to)
+
+  defp valid_report_to_in_txn?(_txn, nil, _holder_owner), do: true
+
+  defp valid_report_to_in_txn?(txn, report_to, holder_owner) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active' AND ownerUserId=?2",
+      [report_to, holder_owner]
+    ) == [[1]]
+  end
+
+  defp invalid_report_to(report_to),
+    do: %{code: "invalid_report_to", reportToSessionKey: report_to}
 
   defp inherited_priority_in_txn(txn, work_item_id) do
     case Txn.q(
