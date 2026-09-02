@@ -64,6 +64,13 @@ defmodule Tightbeam.Supervision do
   """
 
   @failure_patrol_ddl """
+  CREATE TABLE IF NOT EXISTS patrol_failure_activation (
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    firstTurnSeq INTEGER NOT NULL CHECK (firstTurnSeq > 0),
+    activatedAt INTEGER NOT NULL,
+    principal TEXT NOT NULL CHECK (principal = 'process:tightbeam')
+  );
+
   CREATE TABLE IF NOT EXISTS patrol_terminal_classifications (
     turnSeq INTEGER PRIMARY KEY REFERENCES turns(seq),
     sessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
@@ -154,7 +161,10 @@ defmodule Tightbeam.Supervision do
   @spec classify_terminal(DB.server(), pos_integer()) :: :ok
   def classify_terminal(db \\ DB, turn_seq) when is_integer(turn_seq) and turn_seq > 0 do
     {:ok, result} =
-      DB.transaction(db, fn txn -> classify_terminal_in_txn(txn, turn_seq) end)
+      DB.transaction(db, fn txn ->
+        activate_failure_patrol_in_txn(txn, turn_seq)
+        classify_terminal_in_txn(txn, turn_seq)
+      end)
 
     case result do
       {:route, escalation_id} -> Bubble.recognize_patrol_escalation(db, escalation_id)
@@ -244,19 +254,27 @@ defmodule Tightbeam.Supervision do
   end
 
   defp classify_terminal_in_txn(txn, turn_seq) do
-    case Txn.q(txn, "SELECT 1 FROM patrol_terminal_classifications WHERE turnSeq=?1", [turn_seq]) do
-      [[1]] ->
-        case Txn.q(
-               txn,
-               "SELECT escalationId FROM patrol_failure_streaks WHERE latestTurnSeq=?1 AND thresholdState='escalated'",
-               [turn_seq]
-             ) do
-          [[escalation_id]] -> {:route, escalation_id}
-          [] -> :duplicate
+    case Txn.q(txn, "SELECT firstTurnSeq FROM patrol_failure_activation WHERE id=0") do
+      [[first_turn_seq]] when turn_seq >= first_turn_seq ->
+        case Txn.q(txn, "SELECT 1 FROM patrol_terminal_classifications WHERE turnSeq=?1", [
+               turn_seq
+             ]) do
+          [[1]] ->
+            case Txn.q(
+                   txn,
+                   "SELECT escalationId FROM patrol_failure_streaks WHERE latestTurnSeq=?1 AND thresholdState='escalated'",
+                   [turn_seq]
+                 ) do
+              [[escalation_id]] -> {:route, escalation_id}
+              [] -> :duplicate
+            end
+
+          [] ->
+            classify_new_terminal_in_txn(txn, turn_seq)
         end
 
-      [] ->
-        classify_new_terminal_in_txn(txn, turn_seq)
+      _ ->
+        :pre_activation
     end
   end
 
@@ -1508,6 +1526,7 @@ defmodule Tightbeam.Supervision do
       delivery_opts: Keyword.take(opts, [:conn_registry, :lane_manager])
     }
 
+    :ok = activate_failure_patrol(state.db)
     if Keyword.get(opts, :recover, true), do: recover_liveness(state)
     schedule_sweep(state.sweep_ms)
     {:ok, state, {:continue, :initial_sweep}}
@@ -3454,13 +3473,47 @@ defmodule Tightbeam.Supervision do
         """
         SELECT t.seq
         FROM turns t
+        JOIN patrol_failure_activation a ON a.id=0
         LEFT JOIN patrol_terminal_classifications c ON c.turnSeq=t.seq
-        WHERE t.endedAt IS NOT NULL AND c.turnSeq IS NULL
+        WHERE t.seq >= a.firstTurnSeq
+          AND t.endedAt IS NOT NULL AND c.turnSeq IS NULL
         ORDER BY t.seq
         """
       )
 
     Enum.each(rows, fn [turn_seq] -> classify_terminal(db, turn_seq) end)
+  end
+
+  defp activate_failure_patrol(db) do
+    activated_at = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT OR IGNORE INTO patrol_failure_activation
+          (id, firstTurnSeq, activatedAt, principal)
+        SELECT 0, COALESCE(MAX(seq), 0) + 1, ?1, 'process:tightbeam'
+        FROM turns
+        """,
+        [activated_at]
+      )
+
+    :ok
+  end
+
+  defp activate_failure_patrol_in_txn(txn, first_turn_seq) do
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO patrol_failure_activation
+        (id, firstTurnSeq, activatedAt, principal)
+      VALUES (0, ?1, ?2, 'process:tightbeam')
+      """,
+      [first_turn_seq, System.system_time(:millisecond)]
+    )
+
+    :ok
   end
 
   defp route_pending_failure_escalations(db) do
