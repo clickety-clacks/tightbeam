@@ -1518,9 +1518,111 @@ mod tests {
         POST_STOP_FAULT.with(|fault| fault.set(PostStopFault::Disarmed));
         CAPTURE_STARTTIME_FAULT.with(|fault| fault.set(false));
 
+        // The durable capture reason must reach the COMMAND error, not just the generic prefix,
+        // so a regression that drops the reason while keeping the prefix is caught.
+        let error = match verdict {
+            Err(reason) => reason,
+            Ok(code) => {
+                panic!(
+                    "an untokenable stopped member must not return cleanup success, got Ok({code})"
+                )
+            }
+        };
         assert!(
-            matches!(verdict, Err(ref reason) if reason.contains("harness cleanup incomplete")),
-            "an untokenable stopped member must surface as a loud incomplete cleanup, got {verdict:?}"
+            error.contains("harness cleanup incomplete"),
+            "verdict must be a loud incomplete cleanup, got: {error}"
+        );
+        assert!(
+            error.contains("start time could not be read at capture"),
+            "the durable capture reason must reach the command error, got: {error}"
+        );
+        // `_guard` SIGKILLs and reaps the stranded child at end of scope.
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_unenumerable_stopped_group_makes_the_sweep_loudly_incomplete() {
+        // F1 round-four control (snapshot path): if the initial capture cannot ENUMERATE the
+        // stopped group (process table unreadable), no member gets a birth token; once identity
+        // later fails the bare pgid must not be signalled, so the whole group may be stranded.
+        // That must be recorded LOUDLY and the durable reason must reach the command error. We
+        // arm a persistent identity fault (so the loop cannot recapture) AND a snapshot-capture
+        // fault, then assert the sweep is incomplete with the enumerate reason and that
+        // kill_harness_tree's error carries that exact reason. Reverting the snapshot-error
+        // recording leaves the sweep not incomplete — red.
+        let child = fork_owned_session_child();
+        let pgid = child;
+        let boot = boot_identity().unwrap();
+        let launch = "unenumerable-group-launch";
+        let path = test_path("unenumerable-group");
+        fs::write(&path, format!("{pgid}\t{pgid}\t{boot}\t{launch}")).unwrap();
+        // The group is deliberately left uncaptured and, under the persistent fault,
+        // unsignalled; the guard SIGKILLs and reaps the stranded child at end of scope.
+        let _guard = StoppedChildGuard {
+            pid: child,
+            path: path.clone(),
+            armed: true,
+        };
+
+        let target = HarnessTarget {
+            pgid,
+            identity_path: path.to_string_lossy().into_owned(),
+            boot_identity: boot,
+            launch_id: launch.into(),
+        };
+
+        POST_STOP_FAULT.with(|fault| fault.set(PostStopFault::ArmedPersistent));
+        CAPTURE_SNAPSHOT_FAULT.with(|fault| fault.set(true));
+        let freeze = freeze_harness_tree(&target);
+        let sweep = match freeze {
+            Ok(sweep) => sweep,
+            Err(reason) => {
+                POST_STOP_FAULT.with(|fault| fault.set(PostStopFault::Disarmed));
+                CAPTURE_SNAPSHOT_FAULT.with(|fault| fault.set(false));
+                panic!(
+                    "freeze must record the snapshot capture failure and return Ok, got Err: {reason}"
+                );
+            }
+        };
+        // An unenumerable group binds no birth tokens.
+        assert!(
+            sweep.frozen.is_empty(),
+            "an unenumerable group must capture no members, got {:?}",
+            sweep.frozen
+        );
+        assert!(
+            sweep.incomplete,
+            "an unenumerable stopped group must mark the sweep incomplete"
+        );
+        assert!(
+            sweep
+                .failures
+                .iter()
+                .any(|reason| reason.contains("could not be enumerated for capture")),
+            "the enumeration failure must be recorded, got {:?}",
+            sweep.failures
+        );
+
+        let verdict = kill_harness_tree(&target, sweep);
+        POST_STOP_FAULT.with(|fault| fault.set(PostStopFault::Disarmed));
+        CAPTURE_SNAPSHOT_FAULT.with(|fault| fault.set(false));
+
+        // The durable enumeration reason must reach the command error, not just the prefix.
+        let error = match verdict {
+            Err(reason) => reason,
+            Ok(code) => {
+                panic!(
+                    "an unenumerable stopped group must not return cleanup success, got Ok({code})"
+                )
+            }
+        };
+        assert!(
+            error.contains("harness cleanup incomplete"),
+            "verdict must be a loud incomplete cleanup, got: {error}"
+        );
+        assert!(
+            error.contains("could not be enumerated for capture"),
+            "the durable enumeration reason must reach the command error, got: {error}"
         );
         // `_guard` SIGKILLs and reaps the stranded child at end of scope.
     }
