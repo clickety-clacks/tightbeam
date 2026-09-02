@@ -1877,6 +1877,7 @@ defmodule Tightbeam.Escalation do
     superseded_request_in_txn: "operator",
     ask: "agent",
     raw_by_id: "any",
+    raw_by_id_in_txn: "any",
     raw_by_id_in_txn!: "any",
     resolve: "statute",
     rule: "any",
