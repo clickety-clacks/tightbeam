@@ -1089,11 +1089,15 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   defp shuffle_json_maps(value), do: value
 
   defp get(ctx, path, bearer \\ nil, headers \\ []) do
+    get(ctx, path, bearer, headers, Router.init(ctx.opts))
+  end
+
+  defp get(ctx, path, bearer, headers, router_opts) do
     Enum.reduce(headers, conn(:get, path), fn {name, value}, conn ->
       put_req_header(conn, name, value)
     end)
     |> put_req_header("authorization", "Bearer #{bearer || ctx.token}")
-    |> Router.call(Router.init(ctx.opts))
+    |> Router.call(router_opts)
   end
 
   defp traced_get(ctx, path, bearer) do
@@ -1301,6 +1305,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   defp measure_same_404_pair(ctx, row, bearer) do
     seed = :erlang.phash2(row.resource, 1_000_000) + 1
     :rand.seed(:exsss, {seed, seed + 17, seed + 101})
+    router_opts = Router.init(ctx.opts)
 
     cohorts =
       Enum.flat_map(1..10_000, fn _pair ->
@@ -1314,7 +1319,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       |> Enum.reduce(%{forbidden: [], unknown: []}, fn cohort, samples ->
         path = if cohort == :forbidden, do: row.path, else: unknown_path(row)
         started_at = System.monotonic_time(:nanosecond)
-        response = get(ctx, path, bearer)
+        response = get(ctx, path, bearer, [], router_opts)
         elapsed = System.monotonic_time(:nanosecond) - started_at
         assert_error(response, 404, row.resource, "not_found")
         Map.update!(samples, cohort, &[elapsed | &1])
