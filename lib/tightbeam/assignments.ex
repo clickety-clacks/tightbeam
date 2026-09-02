@@ -17,6 +17,7 @@ defmodule Tightbeam.Assignments do
     Placement,
     Projection,
     Productions.CompletionEscalation,
+    RailRemedy,
     Supervision,
     Wakes
   }
@@ -709,15 +710,15 @@ defmodule Tightbeam.Assignments do
         requester_id: "tightbeam:retirement"
       })
 
-      EffortCheckin.cancel_in_txn(
-        txn,
-        assignment_id,
+      disposition =
         assignment_disposition_command(
           assignment_id,
           "tightbeam:retirement",
           liveness_trigger
         )
-      )
+
+      RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+      EffortCheckin.cancel_in_txn(txn, assignment_id, disposition)
     end)
 
     assignments
@@ -2854,11 +2855,11 @@ defmodule Tightbeam.Assignments do
       requester_id: "tightbeam:assignments"
     })
 
-    EffortCheckin.cancel_in_txn(
-      txn,
-      assignment.id,
+    disposition =
       assignment_disposition_command(assignment.id, "tightbeam:assignments", liveness_trigger)
-    )
+
+    RailRemedy.dispose_assignment_in_txn(txn, assignment.id, disposition)
+    EffortCheckin.cancel_in_txn(txn, assignment.id, disposition)
 
     %{assignment: closed_assignment, attest: attest}
   end
@@ -3213,15 +3214,15 @@ defmodule Tightbeam.Assignments do
       requester_id: "tightbeam:assignments"
     })
 
-    EffortCheckin.cancel_in_txn(
-      txn,
-      assignment_id,
+    disposition =
       assignment_disposition_command(
         assignment_id,
         "tightbeam:assignments",
         liveness_trigger
       )
-    )
+
+    RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+    EffortCheckin.cancel_in_txn(txn, assignment_id, disposition)
 
     append_assignment_marker(txn, revoked_assignment, :revoked)
     revoked_assignment
