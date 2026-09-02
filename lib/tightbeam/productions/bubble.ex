@@ -65,7 +65,7 @@ defmodule Tightbeam.Productions.Bubble do
     end
   end
 
-  @doc """Route one durable patrol threshold through the capable-ancestor climb."""
+  @doc "Route one durable patrol threshold through the capable-ancestor climb."
   @spec recognize_patrol_escalation(DB.server(), String.t()) :: :ok
   def recognize_patrol_escalation(db, escalation_id) when is_binary(escalation_id) do
     case Supervision.failure_escalation(db, escalation_id) do

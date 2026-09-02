@@ -28,7 +28,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)"
       )
 
     main = session(db, Org.personal_session_key("flynn"), nil, true)
@@ -151,11 +151,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
 
     {:ok, notice} = Ledger.claim_next(ctx.db, ctx.parent.session_key, "notice-test")
 
-    assert :ok =
-             Ledger.finish(ctx.db, notice.seq, "failed", "parent could not run",
-               owner_lease: notice.owner_lease,
-               cause: "test"
-             )
+    assert :ok = Ledger.finish(ctx.db, notice.seq, "failed", "parent could not run")
 
     assert :ok = Supervision.classify_terminal(ctx.db, notice.seq)
     assert :ok = Tightbeam.Productions.Bubble.recognize_terminal(ctx.db, notice.seq)
@@ -257,13 +253,9 @@ defmodule Tightbeam.FailedTurnIntentTest do
         request_ref: request_ref
       })
 
-    {:ok, turn} = Ledger.claim_next(db, session_key, "intent-test")
+    {:ok, _turn} = Ledger.claim_next(db, session_key, "intent-test")
 
-    assert :ok =
-             Ledger.finish(db, seq, status, error,
-               owner_lease: turn.owner_lease,
-               cause: "test"
-             )
+    assert :ok = Ledger.finish(db, seq, status, error)
 
     {:ok, _} = DB.query(db, "UPDATE turns SET endedAt=10 WHERE seq=?1", [seq])
     seq
