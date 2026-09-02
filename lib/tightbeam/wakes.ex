@@ -477,7 +477,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp retryable_prompt_wake?(wake, turn) do
-    wake.consumer == "prompt" and not wake.digest and is_nil(wake.assignment_id) and
+    wake.consumer == "prompt" and not wake.digest and
       not String.starts_with?(turn.request_ref || "", "bubble:")
   end
 
@@ -577,8 +577,8 @@ defmodule Tightbeam.Wakes do
          creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt,
          targetGate, class, classElection, deliveryRule, digest, summon)
       VALUES (?1, ?2, ?3, ?4, ?5, 'prompt', ?6, 'pending', ?7, NULL,
-              ?8, ?9, ?10, NULL, NULL, NULL, NULL, ?11, ?12, ?13, NULL, NULL,
-              ?14, ?15, ?16, ?17, 0, ?18)
+              ?8, ?9, ?10, NULL, NULL, NULL, NULL, ?11, ?12, ?13, ?14, NULL,
+              ?15, ?16, ?17, ?18, 0, ?19)
       """,
       [
         retry_wake_id,
@@ -594,6 +594,7 @@ defmodule Tightbeam.Wakes do
         wake.creator_session_key,
         if(wake.rumination, do: 1, else: 0),
         wake.work_item_id,
+        wake.assignment_id,
         wake.target_gate,
         wake.class,
         wake.class_election,
