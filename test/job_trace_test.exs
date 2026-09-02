@@ -334,6 +334,15 @@ defmodule Tightbeam.JobTraceTest do
         "effort_generation" ->
           ~w(assignmentId at evidence id state type)a
 
+        "completion_escalation" ->
+          ~w(actingPrincipal assignmentId at childSessionKey closingAttestId completionId
+             causeId causeKind causePrincipal currentRecipient currentStatus decision id
+             outcome phase recipientGeneration recipientReissueCount recipientReissueLimit
+             revocationId supersededByAssignmentId supersededReason type workItemId)a
+
+        "completion_escalation_event" ->
+          ~w(at completionId detail id kind type)a
+
         # job-forensics-v2 §3 — pinned EXACTLY: every key always present,
         # nullable where the spec marks it, so a consumer never has to
         # distinguish absent from null.
