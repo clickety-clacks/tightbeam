@@ -35,6 +35,15 @@ defmodule Tightbeam.FailedTurnIntentTest do
     parent = session(db, "parent", main.session_key)
     child = session(db, "child", parent.session_key)
 
+    supervision = :"failed_intent_supervision_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Supervision,
+       db: db, handlers: %{}, prod_limit: 3, sweep_ms: 60_000, recover: false, name: supervision}
+    )
+
+    _ = :sys.get_state(supervision)
+
     %{db: db, parent: parent, child: child}
   end
 
@@ -111,6 +120,58 @@ defmodule Tightbeam.FailedTurnIntentTest do
     assert :ok = Supervision.classify_terminal(ctx.db, seq)
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wake_retry_attempts")
+  end
+
+  test "two boot sweeps leave predecessor terminal history unclassified" do
+    db = :"legacy_failed_intent_db_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: db,
+      start: {DB, :start_link, [[path: ":memory:", name: db]]}
+    })
+
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('legacy-owner', 1, 'admin_add', 1)"
+      )
+
+    legacy = session(db, Org.personal_session_key("legacy-owner"), nil, true)
+    legacy_seq = terminal!(db, legacy.session_key, "failed", "provider rate limit")
+
+    assert {:ok, []} = DB.query(db, "SELECT firstTurnSeq FROM patrol_failure_activation")
+
+    supervision = :"legacy_failed_intent_supervision_#{System.unique_integer([:positive])}"
+
+    start_supervised!(%{
+      id: supervision,
+      start:
+        {Supervision, :start_link,
+         [
+           [
+             db: db,
+             handlers: %{},
+             prod_limit: 3,
+             sweep_ms: 60_000,
+             recover: false,
+             name: supervision
+           ]
+         ]}
+    })
+
+    _ = :sys.get_state(supervision)
+    Supervision.request_sweep(supervision)
+    _ = :sys.get_state(supervision)
+
+    assert {:ok, [[first_turn_seq]]} =
+             DB.query(db, "SELECT firstTurnSeq FROM patrol_failure_activation WHERE id=0")
+
+    assert first_turn_seq == legacy_seq + 1
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM patrol_terminal_classifications")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM patrol_failure_streaks")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM patrol_failure_escalations")
   end
 
   test "six consecutive ordinary failures route one patrol cause to the parent", ctx do
