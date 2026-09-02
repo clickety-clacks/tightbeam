@@ -169,7 +169,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
     legacy = session(db, Org.personal_session_key("legacy-owner"), nil, true)
     legacy_seq = terminal!(db, legacy.session_key, "failed", "provider rate limit")
 
-    assert {:ok, []} = DB.query(db, "SELECT firstTurnSeq FROM patrol_failure_activation")
+    assert {:ok, []} = DB.query(db, "SELECT firstTurnSeq FROM patrol_failure_boundary")
 
     supervision = :"legacy_failed_intent_supervision_#{System.unique_integer([:positive])}"
 
@@ -194,7 +194,7 @@ defmodule Tightbeam.FailedTurnIntentTest do
     _ = :sys.get_state(supervision)
 
     assert {:ok, [[first_turn_seq]]} =
-             DB.query(db, "SELECT firstTurnSeq FROM patrol_failure_activation WHERE id=0")
+             DB.query(db, "SELECT firstTurnSeq FROM patrol_failure_boundary WHERE id=0")
 
     assert first_turn_seq == legacy_seq + 1
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM patrol_terminal_classifications")
