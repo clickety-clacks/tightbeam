@@ -122,6 +122,34 @@ defmodule Tightbeam.FailedTurnIntentTest do
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wake_retry_attempts")
   end
 
+  test "an assignment-bound rate-limit retry preserves work lineage", ctx do
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.child.session_key,
+        origin: "agent:sender",
+        prompt: "continue assigned work",
+        due_at: 1,
+        work_item_id: "wi_repro",
+        assignment_id: "asg_repro"
+      })
+
+    seq = terminal!(ctx.db, ctx.child.session_key, "failed", "provider rate limit", wake.wake_id)
+
+    assert :ok = Supervision.classify_terminal(ctx.db, seq)
+
+    assert {:ok, [["wi_repro", "asg_repro"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT w.work_item_id, w.assignmentId
+               FROM wake_retry_attempts r
+               JOIN wakes w ON w.wakeId=r.retryWakeId
+               WHERE r.wakeId=?1
+               """,
+               [wake.wake_id]
+             )
+  end
+
   test "two boot sweeps leave predecessor terminal history unclassified" do
     db = :"legacy_failed_intent_db_#{System.unique_integer([:positive])}"
 
