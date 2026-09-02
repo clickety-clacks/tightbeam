@@ -31,7 +31,8 @@ defmodule Tightbeam.Supervision do
     RailEpisodes,
     RailRemedy,
     Rules,
-    Wakes
+    Wakes,
+    Productions.Bubble
   }
 
   alias Tightbeam.DB.Txn
@@ -62,6 +63,62 @@ defmodule Tightbeam.Supervision do
   )
   """
 
+  @failure_patrol_ddl """
+  CREATE TABLE IF NOT EXISTS patrol_terminal_classifications (
+    turnSeq INTEGER PRIMARY KEY REFERENCES turns(seq),
+    sessionKey TEXT NOT NULL REFERENCES sessions(sessionKey),
+    classification TEXT NOT NULL CHECK (classification IN (
+      'delivered','canceled','turn_failed',
+      'bubble_notice_delivered','bubble_notice_ignored'
+    )),
+    failureClass TEXT,
+    streakGeneration INTEGER,
+    streakCount INTEGER,
+    classifiedAt INTEGER NOT NULL,
+    principal TEXT NOT NULL CHECK (principal = 'process:tightbeam')
+  );
+  CREATE INDEX IF NOT EXISTS patrol_classifications_session
+    ON patrol_terminal_classifications (sessionKey, turnSeq);
+
+  CREATE TABLE IF NOT EXISTS patrol_failure_streaks (
+    sessionKey TEXT PRIMARY KEY REFERENCES sessions(sessionKey),
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    failureCount INTEGER NOT NULL CHECK (failureCount >= 0),
+    firstTurnSeq INTEGER REFERENCES turns(seq),
+    latestTurnSeq INTEGER REFERENCES turns(seq),
+    latestAt INTEGER,
+    thresholdState TEXT NOT NULL CHECK (thresholdState IN ('active','escalated')),
+    escalationId TEXT UNIQUE,
+    ownerUserId TEXT NOT NULL,
+    cause TEXT NOT NULL,
+    principal TEXT NOT NULL CHECK (principal = 'process:tightbeam'),
+    CHECK ((failureCount = 0) = (firstTurnSeq IS NULL)),
+    CHECK ((thresholdState = 'escalated') = (escalationId IS NOT NULL))
+  );
+
+  CREATE TABLE IF NOT EXISTS patrol_failure_escalations (
+    id TEXT PRIMARY KEY,
+    sessionKey TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    firstTurnSeq INTEGER NOT NULL REFERENCES turns(seq),
+    thresholdTurnSeq INTEGER NOT NULL UNIQUE REFERENCES turns(seq),
+    ownerUserId TEXT NOT NULL,
+    failureClass TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending'
+      CHECK (state IN ('pending','admitted','resolved','owner_alerted','record_only')),
+    firstRecipient TEXT,
+    createdAt INTEGER NOT NULL,
+    updatedAt INTEGER NOT NULL,
+    cause TEXT NOT NULL CHECK (cause = 'consecutive_turn_failures'),
+    principal TEXT NOT NULL CHECK (principal = 'process:tightbeam'),
+    UNIQUE (sessionKey, generation)
+  );
+  CREATE INDEX IF NOT EXISTS patrol_failure_escalations_pending
+    ON patrol_failure_escalations (state, thresholdTurnSeq);
+  """
+
+  @failure_threshold 6
+
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
@@ -84,6 +141,350 @@ defmodule Tightbeam.Supervision do
   def ensure_schema(db \\ DB) do
     :ok = DB.execute(db, @prods_ddl)
     :ok = DB.execute(db, @watermarks_ddl)
+    :ok = DB.execute(db, @failure_patrol_ddl)
+  end
+
+  @doc """
+  Classify one committed terminal for failed-turn intent conservation.
+
+  This is the sole patrol mutation seam. It is safe under callback/sweep
+  replay because `turnSeq` is unique and the database owner serializes the
+  state transition.
+  """
+  @spec classify_terminal(DB.server(), pos_integer()) :: :ok
+  def classify_terminal(db \\ DB, turn_seq) when is_integer(turn_seq) and turn_seq > 0 do
+    {:ok, result} =
+      DB.transaction(db, fn txn -> classify_terminal_in_txn(txn, turn_seq) end)
+
+    case result do
+      {:route, escalation_id} -> Bubble.recognize_patrol_escalation(db, escalation_id)
+      _ -> :ok
+    end
+
+    :ok
+  end
+
+  @doc false
+  def pending_failure_escalations(db \\ DB) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id FROM patrol_failure_escalations
+        WHERE state IN ('pending','admitted')
+        ORDER BY thresholdTurnSeq
+        """
+      )
+
+    Enum.map(rows, &hd/1)
+  end
+
+  @doc false
+  def failure_escalation(db \\ DB, escalation_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, sessionKey, generation, firstTurnSeq, thresholdTurnSeq,
+               ownerUserId, failureClass, state, firstRecipient, createdAt, updatedAt
+        FROM patrol_failure_escalations WHERE id=?1
+        """,
+        [escalation_id]
+      )
+
+    case rows do
+      [
+        [
+          id,
+          session_key,
+          generation,
+          first_seq,
+          threshold_seq,
+          owner,
+          failure_class,
+          state,
+          first_recipient,
+          created_at,
+          updated_at
+        ]
+      ] ->
+        %{
+          id: id,
+          session_key: session_key,
+          generation: generation,
+          first_turn_seq: first_seq,
+          threshold_turn_seq: threshold_seq,
+          owner_user_id: owner,
+          failure_class: failure_class,
+          state: state,
+          first_recipient: first_recipient,
+          created_at: created_at,
+          updated_at: updated_at
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  @doc false
+  def update_failure_escalation_route_in_txn(txn, escalation_id, state, recipient \\ nil)
+      when state in ~w(admitted resolved owner_alerted record_only) do
+    Txn.q(
+      txn,
+      """
+      UPDATE patrol_failure_escalations
+      SET state=?2, firstRecipient=COALESCE(firstRecipient, ?3), updatedAt=?4
+      WHERE id=?1 AND state IN ('pending','admitted')
+      """,
+      [escalation_id, state, recipient, System.system_time(:millisecond)]
+    )
+
+    :ok
+  end
+
+  defp classify_terminal_in_txn(txn, turn_seq) do
+    case Txn.q(txn, "SELECT 1 FROM patrol_terminal_classifications WHERE turnSeq=?1", [turn_seq]) do
+      [[1]] ->
+        case Txn.q(
+               txn,
+               "SELECT escalationId FROM patrol_failure_streaks WHERE latestTurnSeq=?1 AND thresholdState='escalated'",
+               [turn_seq]
+             ) do
+          [[escalation_id]] -> {:route, escalation_id}
+          [] -> :duplicate
+        end
+
+      [] ->
+        classify_new_terminal_in_txn(txn, turn_seq)
+    end
+  end
+
+  defp classify_new_terminal_in_txn(txn, turn_seq) do
+    case Txn.q(
+           txn,
+           """
+           SELECT t.seq, t.sessionKey, t.status, t.error, t.wakeId, t.requestRef,
+                  t.prompt, t.endedAt, s.ownerUserId
+           FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
+           WHERE t.seq=?1 AND t.endedAt IS NOT NULL
+           """,
+           [turn_seq]
+         ) do
+      [[seq, session_key, status, error, wake_id, request_ref, prompt, ended_at, owner]] ->
+        notice? = is_binary(request_ref) and String.starts_with?(request_ref, "bubble:")
+        failure_class = terminal_failure_class(status, error)
+
+        turn = %{
+          seq: seq,
+          session_key: session_key,
+          status: status,
+          error: error,
+          wake_id: wake_id,
+          request_ref: request_ref,
+          prompt: prompt,
+          ended_at: ended_at
+        }
+
+        _retry = Wakes.preserve_failed_intent_in_txn(txn, turn, failure_class)
+
+        {classification, generation, count, escalation_id} =
+          classify_patrol_state_in_txn(
+            txn,
+            turn,
+            owner,
+            notice?,
+            failure_class
+          )
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO patrol_terminal_classifications
+            (turnSeq, sessionKey, classification, failureClass, streakGeneration,
+             streakCount, classifiedAt, principal)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'process:tightbeam')
+          """,
+          [seq, session_key, classification, failure_class, generation, count, ended_at]
+        )
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "patrol_terminal_classified",
+          session_key,
+          "turnSeq=#{seq} classification=#{classification} failureClass=#{failure_class || "none"} streakGeneration=#{generation || 0} streakCount=#{count || 0} principal=process:tightbeam"
+        )
+
+        if is_binary(escalation_id), do: {:route, escalation_id}, else: :classified
+
+      [] ->
+        :not_terminal
+    end
+  end
+
+  defp classify_patrol_state_in_txn(txn, turn, owner, true, _failure_class) do
+    if turn.status == "delivered" do
+      {generation, count} = reset_failure_streak_in_txn(txn, turn, owner, "delivered")
+      {"bubble_notice_delivered", generation, count, nil}
+    else
+      {"bubble_notice_ignored", nil, nil, nil}
+    end
+  end
+
+  defp classify_patrol_state_in_txn(txn, turn, owner, false, failure_class)
+       when turn.status in ["failed", "failed_unknown"] do
+    {generation, count, escalation_id} =
+      increment_failure_streak_in_txn(txn, turn, owner, failure_class)
+
+    {"turn_failed", generation, count, escalation_id}
+  end
+
+  defp classify_patrol_state_in_txn(txn, turn, owner, false, _failure_class) do
+    {generation, count} = reset_failure_streak_in_txn(txn, turn, owner, turn.status)
+    {turn.status, generation, count, nil}
+  end
+
+  defp terminal_failure_class(status, error) when status in ["failed", "failed_unknown"] do
+    HarnessHealth.classify_turn_failure(error) || "unclassified"
+  end
+
+  defp terminal_failure_class(_status, _error), do: nil
+
+  defp increment_failure_streak_in_txn(txn, turn, owner, failure_class) do
+    {generation, count, first_seq, prior_escalation_id} =
+      case Txn.q(
+             txn,
+             """
+             SELECT generation, failureCount, firstTurnSeq, thresholdState, escalationId
+             FROM patrol_failure_streaks WHERE sessionKey=?1
+             """,
+             [turn.session_key]
+           ) do
+        [[generation, count, first_seq, state, prior_escalation_id]] ->
+          {generation, count + 1, first_seq || turn.seq,
+           if(state == "escalated", do: prior_escalation_id, else: nil)}
+
+        [] ->
+          {1, 1, turn.seq, nil}
+      end
+
+    escalation_id =
+      cond do
+        is_binary(prior_escalation_id) ->
+          prior_escalation_id
+
+        count == @failure_threshold ->
+          patrol_escalation_id(turn.session_key, generation, turn.seq)
+
+        true ->
+          nil
+      end
+
+    threshold_state = if is_binary(escalation_id), do: "escalated", else: "active"
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO patrol_failure_streaks
+        (sessionKey, generation, failureCount, firstTurnSeq, latestTurnSeq,
+         latestAt, thresholdState, escalationId, ownerUserId, cause, principal)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+              'consecutive_turn_failures', 'process:tightbeam')
+      ON CONFLICT(sessionKey) DO UPDATE SET
+        generation=excluded.generation,
+        failureCount=excluded.failureCount,
+        firstTurnSeq=excluded.firstTurnSeq,
+        latestTurnSeq=excluded.latestTurnSeq,
+        latestAt=excluded.latestAt,
+        thresholdState=excluded.thresholdState,
+        escalationId=COALESCE(patrol_failure_streaks.escalationId, excluded.escalationId),
+        ownerUserId=excluded.ownerUserId,
+        cause=excluded.cause,
+        principal=excluded.principal
+      """,
+      [
+        turn.session_key,
+        generation,
+        count,
+        first_seq,
+        turn.seq,
+        turn.ended_at,
+        threshold_state,
+        escalation_id,
+        owner
+      ]
+    )
+
+    if is_binary(escalation_id) and count == @failure_threshold do
+      now = turn.ended_at || System.system_time(:millisecond)
+
+      Txn.q(
+        txn,
+        """
+        INSERT OR IGNORE INTO patrol_failure_escalations
+          (id, sessionKey, generation, firstTurnSeq, thresholdTurnSeq,
+           ownerUserId, failureClass, state, firstRecipient, createdAt,
+           updatedAt, cause, principal)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', NULL, ?8, ?8,
+                'consecutive_turn_failures', 'process:tightbeam')
+        """,
+        [
+          escalation_id,
+          turn.session_key,
+          generation,
+          first_seq,
+          turn.seq,
+          owner,
+          failure_class,
+          now
+        ]
+      )
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        "patrol_failure_threshold",
+        turn.session_key,
+        "escalationId=#{escalation_id} generation=#{generation} firstTurnSeq=#{first_seq} thresholdTurnSeq=#{turn.seq} count=#{count} failureClass=#{failure_class} cause=consecutive_turn_failures principal=process:tightbeam"
+      )
+    end
+
+    {generation, count, escalation_id}
+  end
+
+  defp reset_failure_streak_in_txn(txn, turn, owner, cause) do
+    case Txn.q(
+           txn,
+           "SELECT generation, failureCount FROM patrol_failure_streaks WHERE sessionKey=?1",
+           [turn.session_key]
+         ) do
+      [[generation, count]] when count > 0 ->
+        next_generation = generation + 1
+
+        Txn.q(
+          txn,
+          """
+          UPDATE patrol_failure_streaks
+          SET generation=?2, failureCount=0, firstTurnSeq=NULL, latestTurnSeq=?3,
+              latestAt=?4, thresholdState='active', escalationId=NULL,
+              ownerUserId=?5, cause=?6, principal='process:tightbeam'
+          WHERE sessionKey=?1
+          """,
+          [turn.session_key, next_generation, turn.seq, turn.ended_at, owner, cause]
+        )
+
+        {next_generation, 0}
+
+      [[generation, 0]] ->
+        {generation, 0}
+
+      [] ->
+        {nil, 0}
+    end
+  end
+
+  defp patrol_escalation_id(session_key, generation, threshold_seq) do
+    digest = :crypto.hash(:sha256, "#{session_key}:#{generation}:#{threshold_seq}")
+    "pfe_" <> Base.encode16(digest, case: :lower)
   end
 
   @doc false
@@ -995,6 +1396,8 @@ defmodule Tightbeam.Supervision do
   @impl true
   def handle_cast({:terminal, session_key, terminal_seq}, state) do
     safe_evaluate(state, session_key, fn ->
+      :ok = classify_terminal(state.db, terminal_seq)
+
       evaluate_with_interval(
         state.db,
         state.handlers,
@@ -2754,6 +3157,8 @@ defmodule Tightbeam.Supervision do
   end
 
   defp sweep(%{sweep_ms: interval} = state) when is_integer(interval) and interval > 0 do
+    sweep_unclassified_terminals(state.db)
+    route_pending_failure_escalations(state.db)
     terminal_rebases = sweep_new_terminals(state)
     liveness_cycle(state, terminal_rebases)
 
@@ -2785,6 +3190,28 @@ defmodule Tightbeam.Supervision do
   end
 
   defp sweep(state), do: legacy_sweep(state)
+
+  defp sweep_unclassified_terminals(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT t.seq
+        FROM turns t
+        LEFT JOIN patrol_terminal_classifications c ON c.turnSeq=t.seq
+        WHERE t.endedAt IS NOT NULL AND c.turnSeq IS NULL
+        ORDER BY t.seq
+        """
+      )
+
+    Enum.each(rows, fn [turn_seq] -> classify_terminal(db, turn_seq) end)
+  end
+
+  defp route_pending_failure_escalations(db) do
+    Enum.each(pending_failure_escalations(db), fn escalation_id ->
+      Bubble.recognize_patrol_escalation(db, escalation_id)
+    end)
+  end
 
   defp sweep_new_terminals(state) do
     open_holders =
