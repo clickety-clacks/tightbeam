@@ -291,7 +291,7 @@ fn openat_file(
     flags: libc::c_int,
     mode: libc::mode_t,
 ) -> Result<File, InitError> {
-    let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, mode) };
+    let fd = unsafe { libc::openat(dirfd, name.as_ptr(), flags, mode as libc::c_uint) };
     if fd < 0 {
         return Err(InitError::Unsupported);
     }
@@ -562,7 +562,7 @@ fn validate_metadata(
     } else {
         libc::S_IFREG
     };
-    if file_type(metadata.mode()) != expected_type
+    if file_type(metadata.mode() as libc::mode_t) != expected_type as libc::mode_t
         || metadata.uid() != owner
         || (metadata.mode() & 0o7777) != mode
     {
