@@ -156,4 +156,101 @@ defmodule Tightbeam.ExecDesksTest do
     assert {:ok, [[1]]} =
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [worker.session_key])
   end
+
+  test "annotations cite a durable row and parent escalation uses the effective-parent resolver",
+       %{
+         db: db,
+         worker: worker
+       } do
+    child =
+      Org.create(db, %{
+        session_key: "child",
+        display_name: "Child",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: Model.new("fixture"),
+        operational_parent: worker.session_key
+      })
+
+    wake =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:one",
+        prompt: "one",
+        due_at: 1
+      })
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+
+               assert ExecDesks.effective_parent_in_txn(txn, child.session_key) ==
+                        worker.session_key
+
+               ExecDesks.annotate_in_txn(
+                 txn,
+                 %{wake_id: wake.wake_id},
+                 worker.session_key,
+                 "exec_one",
+                 "assignment",
+                 "asg_closed",
+                 2
+               )
+             end)
+
+    worker_key = worker.session_key
+
+    assert {:ok, [[^worker_key, "exec_one", "assignment", "asg_closed"]]} =
+             DB.query(
+               db,
+               "SELECT workerSessionKey, execId, citedKind, citedId FROM exec_desk_annotations"
+             )
+  end
+
+  test "failed delivery leaves the BUNDLE open for replay", %{db: db, worker: worker} do
+    w1 =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:one",
+        prompt: "one",
+        due_at: 1
+      })
+
+    w2 =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:two",
+        prompt: "two",
+        due_at: 1
+      })
+
+    assert {:ok, :invalid_reply_reference} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+
+               bundle_id =
+                 ExecDesks.open_bundle_in_txn(
+                   txn,
+                   worker.session_key,
+                   [w1.wake_id, w2.wake_id],
+                   2
+                 )
+
+               ExecDesks.deliver_bundle_in_txn(
+                 txn,
+                 bundle_id,
+                 worker.session_key,
+                 "agent:exec",
+                 "bundle",
+                 3,
+                 reply_to_llm_visible_message_id: "missing"
+               )
+             end)
+
+    assert {:ok, [["open"]]} = DB.query(db, "SELECT state FROM exec_desk_bundles")
+  end
 end
