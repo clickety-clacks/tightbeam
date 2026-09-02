@@ -672,6 +672,9 @@ defmodule Tightbeam.Org do
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND w.targetGate=1
         AND (w.sessionKey=?1 OR r.boundSessionKey=?1)
+        AND NOT EXISTS (
+          SELECT 1 FROM completion_escalation_wakes cew WHERE cew.wakeId=w.wakeId
+        )
       ORDER BY w.createdAt, w.wakeId
       """,
       [session_key]
@@ -1214,6 +1217,31 @@ defmodule Tightbeam.Org do
   """
   @spec personal_session_key(String.t()) :: String.t()
   def personal_session_key(user_id), do: "agent:main:clawline:#{user_id}:main"
+
+  @doc "Read the 0.1.9 line's exact parent carrier without writing or rerouting it."
+  @spec effective_parent_in_txn(Txn.t(), String.t()) :: %{
+          session_key: String.t(),
+          source: :explicit | :owner_main,
+          owner_user_id: String.t()
+        }
+  def effective_parent_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey=?1", [
+           session_key
+         ]) do
+      [[owner_user_id, nil]] ->
+        %{
+          session_key: personal_session_key(owner_user_id),
+          source: :owner_main,
+          owner_user_id: owner_user_id
+        }
+
+      [[owner_user_id, parent]] ->
+        %{session_key: parent, source: :explicit, owner_user_id: owner_user_id}
+
+      [] ->
+        raise ArgumentError, "unknown session: #{session_key}"
+    end
+  end
 
   @doc "A fresh custom-session key for a user (personal key + random suffix)."
   @spec custom_session_key(String.t()) :: String.t()
