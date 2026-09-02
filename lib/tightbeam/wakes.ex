@@ -1614,6 +1614,15 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc false
+  @spec get_in_txn(Txn.t(), String.t() | nil) :: wake() | nil
+  def get_in_txn(%Txn{} = txn, wake_id) do
+    case Txn.q(txn, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id]) do
+      [row] -> to_wake(row)
+      [] -> nil
+    end
+  end
+
   @doc """
   Recent digest carriers targeting a session, regardless of pending state (O5
   follow-up; F9, Sol xhigh review). `list_pending/1` is scoped to PENDING

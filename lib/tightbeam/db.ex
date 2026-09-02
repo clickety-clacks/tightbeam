@@ -112,13 +112,30 @@ defmodule Tightbeam.DB do
     process — never hold one outside the callback. Errors RAISE (rolling the
     transaction back) rather than returning tuples.
     """
-    @type t :: %__MODULE__{conn: reference(), outbox: reference()}
-    defstruct [:conn, :outbox]
+    @type t :: %__MODULE__{conn: reference(), outbox: reference(), query_trace: term()}
+    defstruct [:conn, :outbox, :query_trace]
+
+    @doc false
+    def observe_queries(%__MODULE__{} = txn, trace), do: %{txn | query_trace: trace}
 
     @doc "Run one SQL statement inside the transaction; returns rows (positional lists)."
     @spec q(t(), String.t(), [term()]) :: [Tightbeam.DB.row()]
-    def q(%__MODULE__{conn: conn}, sql, params \\ []),
-      do: Tightbeam.DB.run_query(conn, sql, params)
+    def q(%__MODULE__{conn: conn, query_trace: trace}, sql, params \\ []) do
+      trace_query(trace, sql, params)
+      Tightbeam.DB.run_query(conn, sql, params)
+    end
+
+    defp trace_query(nil, _sql, _params), do: :ok
+
+    defp trace_query(pid, sql, params) when is_pid(pid) do
+      send(pid, {:core_detail_trace, {:sql_query, sql, params}})
+      :ok
+    end
+
+    defp trace_query(trace, sql, params) when is_function(trace, 1) do
+      trace.({:sql_query, sql, params})
+      :ok
+    end
 
     @doc "Execute a statement without results inside the transaction."
     @spec exec(t(), String.t()) :: :ok

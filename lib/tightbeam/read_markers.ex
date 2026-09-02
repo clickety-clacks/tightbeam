@@ -31,6 +31,10 @@ defmodule Tightbeam.ReadMarkers do
     end
   end
 
+  @doc false
+  def get_in_txn(%Txn{} = txn, user_id, scope_key),
+    do: current_in_txn(txn, user_id, scope_key)
+
   def set(db \\ DB, user_id, scope_key, marker, opts \\ []) do
     expected? = Keyword.get(opts, :expected?, false)
     expected = Keyword.get(opts, :expected)

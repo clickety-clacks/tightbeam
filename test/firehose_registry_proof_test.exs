@@ -22,7 +22,7 @@ defmodule Tightbeam.Firehose.RegistryProofTest do
     {~w(device.approved device.denied device.revoked), "devices", "upsert", ["deviceId"],
      :device},
     {~w(artifact.recorded), "artifacts", "upsert", ["artifactId"], :artifact},
-    {~w(read_marker.updated), "read-markers", "upsert", ["scopeKey"], :read_marker},
+    {~w(read_marker.updated), "read-markers", "upsert", ["userId", "scopeKey"], :read_marker},
     {~w(message.created), "messages", "upsert", ["messageId", "sessionKey"], :message},
     {~w(condition_fact.filed), "condition-facts", "upsert", ["factId"], :condition_fact},
     {~w(critical_lease.updated), "critical-state", "upsert", ["sessionKey"], :critical_state},
