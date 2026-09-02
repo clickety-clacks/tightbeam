@@ -1510,6 +1510,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       operator_withdraw: "operator",
       superseded_request_in_txn: "operator",
       raw_by_id: "any",
+      raw_by_id_in_txn: "any",
       raw_by_id_in_txn!: "any",
       resolve: "statute",
       rule: "any",
@@ -1578,6 +1579,7 @@ defmodule Tightbeam.CoordinationFabricTest do
       operator_withdraw: 2,
       superseded_request_in_txn: 4,
       raw_by_id: 2,
+      raw_by_id_in_txn: 2,
       raw_by_id_in_txn!: 2,
       resolve: 3,
       rule: 3,
@@ -1691,8 +1693,10 @@ defmodule Tightbeam.CoordinationFabricTest do
       statute_name_for_ruling: [{"lib/tightbeam/dispatch.ex", "ruling_statute/2"}],
       raw_by_id: [
         {"lib/tightbeam/effort_checkin.ex", "request_row/2"},
-        {"lib/tightbeam/gateway.ex", "handler_specs/1"}
+        {"lib/tightbeam/gateway.ex", "handler_specs/1"},
+        {"lib/tightbeam/state_resources.ex", "query_decision_request/2"}
       ],
+      raw_by_id_in_txn: [{"lib/tightbeam/state_resources.ex", "query_decision_request/2"}],
       raw_by_id_in_txn!: [{"lib/tightbeam/effort_checkin.ex", "request_for_id/2"}],
       migrate_terminal_operator_decision_v1_in_txn: [
         {"lib/tightbeam/schema.ex", "upgrade_terminal_operator_decision_v1/1"}
