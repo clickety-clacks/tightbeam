@@ -183,12 +183,118 @@ defmodule Tightbeam.ToplinesSchemaTest do
     assert snapshot(db) == before
   end
 
+  test "the exact prior Concern shape migrates current tags atomically and restart is a no-op" do
+    db = activated_db!()
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO toplines
+                 (id, ownerUserId, title, state, createdActorKind, createdActorRef,
+                  createdAt, updatedAt, closedAt)
+               VALUES ('tl_migrate', 'mike', 'Intent', 'open', 'user', 'mike', 1, 1, NULL)
+               """
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO topline_work_memberships
+                 (id, toplineId, workItemId, ownerUserId, linkReason,
+                  linkedActorKind, linkedActorRef, linkedAt)
+               VALUES ('tlm_migrate', 'tl_migrate', 'wi_one', 'mike', 'member',
+                       'user', 'mike', 2)
+               """
+             )
+
+    install_legacy_concern_shape!(db)
+
+    legacy_index =
+      Enum.find(
+        ToplinesSchema.__legacy_concern_manifest__(),
+        &(&1.name == "topline_concern_refs_active_pair")
+      )
+
+    :ok = DB.execute(db, "DROP INDEX topline_concern_refs_active_pair")
+    :ok = DB.execute(db, String.replace(legacy_index.sql, "membershipId)", "membershipId DESC)"))
+    malformed = snapshot(db)
+
+    assert {:error, %{code: "schema_shape_mismatch"}} = ToplinesSchema.activate(db, 2)
+    assert snapshot(db) == malformed
+
+    :ok = DB.execute(db, "DROP INDEX topline_concern_refs_active_pair")
+    :ok = DB.execute(db, legacy_index.sql)
+    before = snapshot(db)
+
+    assert_raise RuntimeError, ~r/activation interrupted/, fn ->
+      ToplinesSchema.activate(db, 2, interrupt_after: :during_concern_migration)
+    end
+
+    assert snapshot(db) == before
+    assert :ok = ToplinesSchema.activate(db, 3)
+
+    assert {:ok, [["tl_migrate", "tlc_migrate", "wi_one", "risk", "user", "mike", 4]]} =
+             DB.query(
+               db,
+               """
+               SELECT toplineId, concernId, workItemId, tagReason,
+                      taggedActorKind, taggedActorRef, taggedAt
+               FROM topline_concern_refs
+               """
+             )
+
+    assert {:ok, [["concern_created"], ["concern_work_tagged"]]} =
+             DB.query(db, "SELECT kind FROM topline_events ORDER BY seq")
+
+    migrated = snapshot(db)
+    assert :ok = ToplinesSchema.activate(db, 999)
+    assert snapshot(db) == migrated
+  end
+
   defp base_db! do
     db = :"toplines_schema_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db}, id: db)
 
     seed_base_schema!(db)
     db
+  end
+
+  defp install_legacy_concern_shape!(db) do
+    :ok =
+      DB.execute(
+        db,
+        """
+        DROP TABLE topline_events;
+        DROP TABLE topline_concern_refs;
+        DROP TABLE topline_concerns;
+        DROP TABLE topline_idempotency;
+        """
+      )
+
+    Enum.each(ToplinesSchema.__legacy_concern_manifest__(), fn object ->
+      :ok = DB.execute(db, object.sql)
+    end)
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO topline_concerns VALUES
+          ('tlc_migrate','tl_migrate','Risk','resolved','user','mike',3,5,
+           'old lifecycle','user','mike',5);
+        INSERT INTO topline_concern_refs VALUES
+          ('tlcr_migrate','tl_migrate','tlc_migrate','tlm_migrate','risk',
+           'user','mike',4,NULL,NULL,NULL,NULL);
+        INSERT INTO topline_events VALUES
+          ('tl_migrate',1,'concern_created',NULL,'tlc_migrate',NULL,
+           'user','mike',NULL,3,'{"title":"Risk"}');
+        INSERT INTO topline_events VALUES
+          ('tl_migrate',2,'concern_work_linked','tlm_migrate','tlc_migrate','tlcr_migrate',
+           'user','mike','risk',4,'{"membershipId":"tlm_migrate","linkReason":"risk"}');
+        """
+      )
   end
 
   defp seed_base_schema!(db) do
@@ -247,6 +353,12 @@ defmodule Tightbeam.ToplinesSchemaTest do
   defp alter_object!(db, %{type: "index", name: name, sql: sql}) do
     :ok = DB.execute(db, "DROP INDEX #{name}")
     altered = String.replace(sql, ")", " DESC)", global: false)
+    :ok = DB.execute(db, altered)
+  end
+
+  defp alter_object!(db, %{type: "trigger", name: name, sql: sql}) do
+    :ok = DB.execute(db, "DROP TRIGGER #{name}")
+    altered = String.replace(sql, "BEFORE INSERT", "BEFORE UPDATE", global: false)
     :ok = DB.execute(db, altered)
   end
 

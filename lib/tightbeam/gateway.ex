@@ -1121,15 +1121,6 @@ defmodule Tightbeam.Gateway do
       {"topline-concern-create", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-concern-create", call)
       end,
-      {"topline-concern-update", []} => fn call ->
-        Tightbeam.Toplines.__handle__(db, "topline-concern-update", call)
-      end,
-      {"topline-concern-resolve", []} => fn call ->
-        Tightbeam.Toplines.__handle__(db, "topline-concern-resolve", call)
-      end,
-      {"topline-concern-reopen", []} => fn call ->
-        Tightbeam.Toplines.__handle__(db, "topline-concern-reopen", call)
-      end,
       {"topline-concern-link-work", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-concern-link-work", call)
       end,
