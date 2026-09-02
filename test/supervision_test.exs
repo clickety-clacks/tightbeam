@@ -678,6 +678,45 @@ defmodule Tightbeam.SupervisionTest do
     refute second.wake_id in [first_id, third_id]
   end
 
+  test "a verdict and accepted checkpoint retain both receipts and the checkpoint horizon", ctx do
+    attach_work_item!(ctx.db, "asg_1", "wi_checkpoint")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 60_000)
+
+    {checkpoint, seq} =
+      schedule_checkpoint_via_gateway!(ctx, "resume after the verdict", 180_000)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id,assignmentId,kind,verdictKind,byUser,ts) VALUES ('att_checkpoint_verdict','asg_1','verdict','verified','flynn',?1)",
+        [System.system_time(:millisecond)]
+      )
+
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert {:ok,
+            [
+              ["verdict", "att_checkpoint_verdict", nil],
+              ["checkpoint", checkpoint_id, checkpoint_due_at]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,expiresAt FROM supervision_liveness_receipts ORDER BY receiptId"
+             )
+
+    assert checkpoint_id == checkpoint.wake_id
+    assert checkpoint_due_at == checkpoint.due_at
+
+    assert %{
+             supervisionGeneration: 2,
+             supervisionDueAt: ^checkpoint_due_at,
+             supervisionBasisKind: "liveness_receipt"
+           } = Supervision.prod_state(ctx.db, "asg_1")
+
+    assert Wakes.get(ctx.db, checkpoint.wake_id).state == "pending"
+    assert Wakes.list_pending(ctx.db) == [checkpoint]
+  end
+
   test "vague progress and unbound, unrelated, or expired wakes are not receipts", ctx do
     assignment(ctx.db, "asg_other", "holder", "other work", 2)
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)

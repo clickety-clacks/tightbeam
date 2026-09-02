@@ -2609,7 +2609,7 @@ defmodule Tightbeam.Supervision do
       [assignment_id, artifact_max, attest_max, event_max, wake_max]
     )
 
-    receipts = if effects == [], do: List.wrap(checkpoint), else: effects
+    receipts = effects ++ List.wrap(checkpoint)
 
     case receipts do
       [] ->
@@ -2776,24 +2776,12 @@ defmodule Tightbeam.Supervision do
   end
 
   defp checkpoint_receipt_in_txn(
-         _txn,
-         _assignment_id,
-         _holder,
-         _cursor,
-         _maximum,
-         effects,
-         _evaluation_clock
-       )
-       when effects != [],
-       do: nil
-
-  defp checkpoint_receipt_in_txn(
          txn,
          assignment_id,
          holder,
          cursor,
          maximum,
-         [],
+         effects,
          evaluation_clock
        ) do
     latest_kind =
@@ -2809,7 +2797,7 @@ defmodule Tightbeam.Supervision do
         [] -> nil
       end
 
-    if latest_kind == "checkpoint" do
+    if latest_kind == "checkpoint" and effects == [] do
       nil
     else
       case Txn.q(
@@ -2837,12 +2825,26 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp receipt_due_at([%{kind: "checkpoint", expires_at: due_at}], _accepted_at, _interval),
-    do: due_at
-
   defp receipt_due_at(rows, accepted_at, interval) do
-    latest_source = rows |> Enum.map(& &1.at) |> Enum.max()
-    max(accepted_at, latest_source) + interval
+    effect_due_at =
+      rows
+      |> Enum.reject(&(&1.kind == "checkpoint"))
+      |> case do
+        [] ->
+          accepted_at
+
+        effects ->
+          latest_source = effects |> Enum.map(& &1.at) |> Enum.max()
+          max(accepted_at, latest_source) + interval
+      end
+
+    checkpoint_due_at =
+      rows
+      |> Enum.filter(&(&1.kind == "checkpoint"))
+      |> Enum.map(& &1.expires_at)
+      |> Enum.max(fn -> accepted_at end)
+
+    max(effect_due_at, checkpoint_due_at)
   end
 
   defp claim_due_in_txn(txn, evaluation_clock, rebased, n) do
