@@ -131,6 +131,22 @@ defmodule Tightbeam.Wire.Router do
       detail: true
     }
   }
+
+  @core_detail_specs %{
+    work_items: %{resource: "work items", query: :query_work_item, serializer: :work_item},
+    assignments: %{resource: "assignments", query: :query_assignment, serializer: :assignment},
+    wakes: %{resource: "wakes", query: :query_wake, serializer: :wake},
+    turns: %{resource: "turns", query: :query_turn_by_seq, serializer: :turn},
+    decision_requests: %{
+      resource: "decision requests",
+      query: :query_decision_request,
+      serializer: :decision_request
+    },
+    sessions: %{resource: "sessions", query: :query_session, serializer: :session},
+    devices: %{resource: "devices", query: :query_device, serializer: :device},
+    artifacts: %{resource: "artifacts", query: :query_artifact, serializer: :artifact},
+    read_markers: %{resource: "read markers", query: :query_read_marker, serializer: :read_marker}
+  }
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
                     pass: ["*/*"]
@@ -326,6 +342,42 @@ defmodule Tightbeam.Wire.Router do
     state_detail(conn, Map.fetch!(@state_read_specs, :kungfu), name)
   end
 
+  get "/api/assignments/:assignment_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :assignments), assignment_id)
+  end
+
+  get "/api/wakes/:wake_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :wakes), wake_id)
+  end
+
+  get "/api/turns/:turn_seq" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :turns), turn_seq)
+  end
+
+  get "/api/decision-requests/:decision_request_id" do
+    core_detail(
+      conn,
+      Map.fetch!(@core_detail_specs, :decision_requests),
+      decision_request_id
+    )
+  end
+
+  get "/api/sessions/:session_key" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :sessions), session_key)
+  end
+
+  get "/api/devices/:device_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :devices), device_id)
+  end
+
+  get "/api/artifacts/:artifact_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :artifacts), artifact_id)
+  end
+
+  get "/api/read-markers/:scope_key" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :read_markers), scope_key)
+  end
+
   post "/api/streams" do
     with {:ok, device} <- device_auth(conn),
          {:ok, body, conn} <- read_json(conn),
@@ -460,16 +512,8 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
-  get "/api/work-items/:id" do
-    with {:ok, device} <- device_auth(conn),
-         detail when not is_nil(detail) <- WorkState.item_detail(db(conn), id),
-         true <- visible_item_detail?(detail, device, conn) do
-      json(conn, 200, detail)
-    else
-      nil -> error(conn, 404, "unknown_work_item")
-      false -> error(conn, 404, "unknown_work_item")
-      {:error, status, code, message} -> error(conn, status, code, message)
-    end
+  get "/api/work-items/:work_item_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :work_items), work_item_id)
   end
 
   post "/api/session-control" do
@@ -603,6 +647,148 @@ defmodule Tightbeam.Wire.Router do
     _error in [ArgumentError, KeyError, MatchError] ->
       state_error(conn, spec.resource, 500, "projection_invalid", nil)
   end
+
+  defp core_detail(conn, spec, raw_key) do
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <-
+           core_detail_operation(conn, spec.resource, :bearer_auth, fn ->
+             state_bearer_auth(conn)
+           end),
+         {:ok, query} <-
+           core_detail_operation(conn, spec.resource, :query_decode, fn ->
+             decode_state_query(conn)
+           end),
+         {:ok, principal} <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :principal_resolution,
+             fn -> state_principal(auth, query, conn) end
+           ),
+         :ok <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :request_validation,
+             fn -> state_detail_request(query) end
+           ),
+         {:ok, key} <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :key_decode,
+             fn -> core_detail_key(spec.resource, raw_key) end
+           ),
+         :ok <- core_detail_probe(conn, spec.resource, :lookup),
+         row <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :row_lookup,
+             fn ->
+               core_detail_row(conn, spec, key, core_detail_trace_principal(conn, principal))
+             end
+           ),
+         true <- not is_nil(row),
+         :ok <- core_detail_probe(conn, spec.resource, :schema),
+         :ok <- core_detail_probe(conn, spec.resource, :serializer),
+         item <- core_detail_serialize(conn, spec, row),
+         :ok <- core_detail_probe(conn, spec.resource, :encoder),
+         item_bytes <- core_detail_encode(conn, spec.resource, item),
+         :ok <- core_detail_probe(conn, spec.resource, :envelope) do
+      core_detail_trace(conn, {:envelope, spec.resource})
+      state_send(conn, 200, state_detail_envelope(spec.resource, item_bytes))
+    else
+      false ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, :not_found} ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp core_detail_serialize(conn, spec, row) do
+    core_detail_trace(conn, {:serializer, spec.resource, spec.serializer})
+    apply(StateResources, spec.serializer, [row])
+  end
+
+  defp core_detail_encode(conn, resource, item) do
+    core_detail_trace(conn, {:ordered_item_encoder, resource})
+    StateResources.encode_item(resource, item, state_catalog(conn))
+  end
+
+  defp core_detail_trace_principal(conn, principal) do
+    Map.put(principal, :core_detail_trace, deps(conn)[:core_detail_trace])
+  end
+
+  defp core_detail_trace(conn, event) do
+    case deps(conn)[:core_detail_trace] do
+      nil -> :ok
+      pid when is_pid(pid) -> send(pid, {:core_detail_trace, event})
+      trace when is_function(trace, 1) -> trace.(event)
+    end
+
+    :ok
+  end
+
+  defp core_detail_operation(conn, resource, operation, fun) when is_function(fun, 0) do
+    core_detail_trace(conn, {:operation, resource, operation})
+    fun.()
+  end
+
+  defp core_detail_probe(conn, resource, stage) do
+    core_detail_trace(conn, {:probe_stage, resource, stage})
+
+    case deps(conn)[:core_detail_probe] do
+      nil -> :ok
+      probe when is_function(probe, 2) -> probe.(resource, stage)
+    end
+  end
+
+  defp core_detail_row(conn, %{query: query, resource: resource}, key, principal)
+       when resource in ["work items", "assignments"] do
+    core_detail_trace(conn, {:shared_lookup, resource, query})
+
+    call = %{
+      principal: core_detail_principal(principal),
+      rest_principal: principal,
+      params: %{}
+    }
+
+    apply(StateResources, query, [db(conn), key, call])
+  end
+
+  defp core_detail_row(conn, %{query: query, resource: "read markers"}, scope_key, principal) do
+    core_detail_trace(conn, {:shared_lookup, "read markers", query})
+    apply(StateResources, query, [db(conn), %{key: scope_key, principal: principal}, %{}])
+  end
+
+  defp core_detail_row(conn, %{query: query, resource: resource}, key, principal) do
+    core_detail_trace(conn, {:shared_lookup, resource, query})
+    apply(StateResources, query, [db(conn), %{key: key, principal: principal}])
+  end
+
+  defp core_detail_principal(%{kind: "user", id: id}), do: {:user, id}
+  defp core_detail_principal(%{kind: "session", id: id}), do: {:session, id}
+
+  defp core_detail_key("turns", raw_key) do
+    case Integer.parse(raw_key) do
+      {seq, ""} when seq > 0 and seq <= 9_223_372_036_854_775_807 ->
+        if raw_key == Integer.to_string(seq), do: {:ok, seq}, else: {:error, :not_found}
+
+      _ ->
+        {:error, :not_found}
+    end
+  end
+
+  defp core_detail_key(_resource, raw_key) when is_binary(raw_key), do: {:ok, raw_key}
 
   defp state_identity_detail_item(conn, spec, id, principal) do
     seam = state_seam!(spec)
@@ -1588,17 +1774,6 @@ defmodule Tightbeam.Wire.Router do
 
   defp visible_assignment_detail?(detail, device, conn) do
     Org.get(db(conn), detail.assignment.holderKey).owner_user_id == device.user_id
-  end
-
-  defp visible_item_detail?(_detail, %{is_admin: true}, _conn), do: true
-
-  defp visible_item_detail?(detail, device, conn) do
-    # Owner path (observability-v1 amendment): the owner sees its item even
-    # with no assignments; otherwise fall back to assignment-holder ownership.
-    detail.workItem.ownerUserId == device.user_id or
-      Enum.any?(detail.assignments, fn assignment ->
-        Org.get(db(conn), assignment.holderKey).owner_user_id == device.user_id
-      end)
   end
 
   defp work_status_filter(nil), do: {:ok, nil}

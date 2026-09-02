@@ -102,8 +102,22 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
-    Txn.handoff(txn, hub(call), {:accepted, nil, call, result})
+    Txn.handoff(txn, hub(call), {:accepted, nil, call, canonical_in_txn(txn, call, result)})
   end
+
+  defp canonical_in_txn(txn, %{verb: verb} = call, result)
+       when verb in ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail) do
+    id = result[:id] || result["id"] || call.params[:work_item_id]
+    StateResources.query_work_item(txn, id, call) || result
+  end
+
+  defp canonical_in_txn(txn, %{verb: verb} = call, result)
+       when verb in ~w(assign dispatch reopen-assignment revoke-assignment) do
+    id = result[:id] || result["id"] || result[:assignment_id] || call.params[:assignment_id]
+    StateResources.query_assignment(txn, id, call) || result
+  end
+
+  defp canonical_in_txn(_txn, _call, result), do: result
 
   @spec maybe_accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def maybe_accepted_in_txn(%Txn{} = txn, %{firehose_in_txn: true} = call, result),
@@ -382,7 +396,7 @@ defmodule Tightbeam.Firehose.Publisher do
         Map.put_new(
           resolved,
           primary_ref,
-          projection[primary_ref] || projection["id"]
+          projection_primary_ref(projection, primary_ref)
         )
       end)
       |> Map.reject(fn {_key, value} -> is_nil(value) end)
@@ -398,6 +412,12 @@ defmodule Tightbeam.Firehose.Publisher do
       "payload" => projection
     }
   end
+
+  defp projection_primary_ref(projection, "turnSeq"),
+    do: projection["turnSeq"] || projection["seq"]
+
+  defp projection_primary_ref(projection, primary_ref),
+    do: projection[primary_ref] || projection["id"]
 
   @spec state_notice(map(), term()) :: map() | nil
   def state_notice(call, result), do: state_notice(nil, call, result)

@@ -816,14 +816,16 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert %{
              "class" => "turn.started",
-             "payload" => %{"status" => "running", "turnSeq" => ^seq}
+             "payload" => %{"status" => "running", "seq" => ^seq},
+             "refs" => %{"turnSeq" => ^seq}
            } = receive_notice()
 
     assert :ok = Ledger.finish(db, seq, "delivered", nil, owner_lease: owner_lease)
 
     assert %{
              "class" => "turn.ended",
-             "payload" => %{"status" => "delivered", "turnSeq" => ^seq}
+             "payload" => %{"status" => "delivered", "seq" => ^seq},
+             "refs" => %{"turnSeq" => ^seq}
            } = receive_notice()
 
     assert %{

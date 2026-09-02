@@ -377,7 +377,29 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
 
   def snapshot(%__MODULE__{} = fixture) do
     %{"result" => %{"workItems" => items}} = dispatch(fixture, "work-item-list", %{})
-    Map.new(items, &{&1["id"], Tightbeam.StateResources.work_item(&1)})
+
+    Map.new(items, fn item ->
+      id = item["id"]
+      {id, work_item_detail(fixture, id)}
+    end)
+  end
+
+  defp work_item_detail(fixture, id) do
+    url = ~c"http://127.0.0.1:#{fixture.port}/api/work-items/#{id}"
+
+    {:ok, {{_version, 200, _reason}, _headers, response}} =
+      :httpc.request(
+        :get,
+        {url,
+         [
+           {~c"authorization", String.to_charlist("Bearer #{fixture.device.token}")}
+         ]},
+        [{:timeout, 2_000}],
+        body_format: :binary
+      )
+
+    %{"item" => item} = JSON.decode!(response)
+    item
   end
 
   defp recv_close_until(ws, deadline) do

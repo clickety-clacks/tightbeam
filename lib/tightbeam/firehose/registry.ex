@@ -264,6 +264,7 @@ defmodule Tightbeam.Firehose.Registry do
         end)
         |> Map.update!("read_marker.updated", fn row ->
           Map.merge(row, %{
+            primary_refs: ["userId", "scopeKey"],
             query: :query_read_marker,
             visibility: :visible?,
             rebuild: true,
