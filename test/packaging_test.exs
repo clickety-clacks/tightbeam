@@ -28,8 +28,13 @@ defmodule Tightbeam.PackagingTest do
     #      standard CREDENTIALS_DIRECTORY systemd sets, not a lookalike.
     credential_name =
       case Regex.run(~r/Path\.join\(directory, "([^"]+)"\)/, File.read!(@importer)) do
-        [_, name] -> name
-        _ -> flunk("could not find the daemon credential filename in credentials.ex; the anti-drift anchor moved")
+        [_, name] ->
+          name
+
+        _ ->
+          flunk(
+            "could not find the daemon credential filename in credentials.ex; the anti-drift anchor moved"
+          )
       end
 
     runtime_credential_env_vars =
@@ -50,8 +55,13 @@ defmodule Tightbeam.PackagingTest do
 
       documented_dir_env =
         case Regex.run(~r/\$([A-Za-z0-9_]+)\/#{Regex.escape(credential_name)}/, body) do
-          [_, env] -> env
-          _ -> flunk("#{Path.relative_to(doc, @repo_root)} must document the $<dir>/#{credential_name} delivery path")
+          [_, env] ->
+            env
+
+          _ ->
+            flunk(
+              "#{Path.relative_to(doc, @repo_root)} must document the $<dir>/#{credential_name} delivery path"
+            )
         end
 
       assert documented_dir_env in runtime_credential_env_vars,
