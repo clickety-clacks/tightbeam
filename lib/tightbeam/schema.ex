@@ -24,6 +24,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Roles,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
+    Tightbeam.Productions.CompletionEscalation,
     Tightbeam.CommandExecutions,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
@@ -40,7 +41,7 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "identity-universal-root-render-v1-019"
+  @shape "identity-universal-root-render-v1-019-completion-escalation-v16"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -364,7 +365,7 @@ defmodule Tightbeam.Schema do
         causalSourceKind TEXT NOT NULL CHECK (causalSourceKind IN (
           'verb_call','wake','progress_attest','condition_fact','assignment_transition',
           'work_item_transition','decision_request','monitor_generation','routing_bracket',
-          'session_transition','scheduler_delivery'
+          'session_transition','scheduler_delivery','completion_transition'
         )),
         causalSourceId TEXT NOT NULL,
         outcomeKind TEXT NOT NULL CHECK (
@@ -373,7 +374,7 @@ defmodule Tightbeam.Schema do
         replacementWakeId TEXT REFERENCES wakes(wakeId) DEFERRABLE INITIALLY DEFERRED,
         dispositionKind TEXT CHECK (dispositionKind IN (
           'assignment_transition','work_item_transition',
-          'decision_request_transition','monitor_generation_transition'
+          'decision_request_transition','monitor_generation_transition','completion_transition'
         )),
         dispositionId TEXT,
         primaryWorkKind TEXT CHECK (primaryWorkKind IN ('assignment','work_item')),
@@ -444,6 +445,16 @@ defmodule Tightbeam.Schema do
             (requesterId = 'tightbeam:assignments' AND
              reasonKind = 'obligation_disposed' AND causalSourceKind = 'assignment_transition' AND
              outcomeKind = 'disposition')
+            OR
+            (requesterId = 'tightbeam:completion-escalation' AND
+             ((reasonKind = 'superseded' AND causalSourceKind = 'wake' AND
+               outcomeKind = 'replacement')
+              OR
+              (reasonKind = 'obligation_disposed' AND
+               causalSourceKind = 'completion_transition' AND outcomeKind = 'disposition')
+              OR
+              (reasonKind = 'target_unresolvable' AND
+               causalSourceKind = 'scheduler_delivery' AND outcomeKind = 'no_replacement')))
             OR
             (requesterId = 'tightbeam:effort-checkin' AND
              ((reasonKind = 'superseded' AND

@@ -99,6 +99,7 @@ defmodule Tightbeam.Gateway do
 
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Productions.CompletionEscalation
   alias Tightbeam.Wire.Payloads
   require Logger
 
@@ -300,7 +301,8 @@ defmodule Tightbeam.Gateway do
          deliver: deliver,
          internal_consumers: %{
            "effort_probe" => &EffortCheckin.probe(db, config, &1),
-           "effort_deadline" => &EffortCheckin.deadline(db, config, &1)
+           "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
+           "completion_disposition_deadline" => &CompletionEscalation.reissue(db, &1)
          },
          tick_ms: config.wake_tick_ms,
          name: Tightbeam.WakeScheduler},
@@ -1039,6 +1041,8 @@ defmodule Tightbeam.Gateway do
         )
       end,
       "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
+      "completion-notices" => fn call -> CompletionEscalation.notices(db, call) end,
+      "completion-disposition" => fn call -> completion_disposition_result(config, db, call) end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
       "critical" => fn call -> critical_result(config, db, call) end,
@@ -1092,9 +1096,28 @@ defmodule Tightbeam.Gateway do
           | {:conflict, map()}
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
-    case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-      nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
-      duplicate -> duplicate
+    case completion_delivery_admission(txn, session_key, opts) do
+      :skip ->
+        :skipped
+
+      :continue ->
+        case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
+          nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+          duplicate -> duplicate
+        end
+    end
+  end
+
+  defp completion_delivery_admission(txn, session_key, opts) do
+    case opts[:wake_id] do
+      wake_id when is_binary(wake_id) ->
+        case CompletionEscalation.admit_delivery_in_txn(txn, wake_id, session_key) do
+          :skip -> :skip
+          result when result in [:ordinary, :deliver] -> :continue
+        end
+
+      _ ->
+        :continue
     end
   end
 
@@ -6028,6 +6051,228 @@ defmodule Tightbeam.Gateway do
     tier
   end
 
+  defp completion_disposition_result(config, db, call) do
+    completion_id = call.params[:completion_id]
+    decision = call.params[:decision]
+    principal = call[:principal]
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        case CompletionEscalation.preflight_disposition_in_txn(
+               txn,
+               completion_id,
+               decision,
+               principal
+             ) do
+          {:error, error} ->
+            {:response, error}
+
+          {:replay, _row} ->
+            {:completion, completion_id}
+
+          {:action, row} ->
+            case pending_retire_intents_in_txn(txn, row.child_session_key, row.owner_user_id) do
+              [] ->
+                completion_action_in_txn(config, txn, row, decision, principal)
+
+              deferred ->
+                {:response,
+                 %{
+                   code: "retire_deferred",
+                   completionId: row.id,
+                   requestStatus: "open",
+                   deferred: deferred
+                 }}
+            end
+        end
+      end)
+
+    case result do
+      {:response, response} -> response
+      {:completion, id} -> CompletionEscalation.get(db, id)
+      {:retired, owner, retired} -> complete_completion_retire(config, db, owner, retired)
+    end
+  end
+
+  defp completion_action_in_txn(_config, txn, row, "retain", principal) do
+    CompletionEscalation.retain_in_txn(txn, row.id, principal)
+    {:completion, row.id}
+  end
+
+  defp completion_action_in_txn(_config, txn, row, "park", principal),
+    do: {:response, CompletionEscalation.park_unavailable_in_txn(txn, row.id, principal)}
+
+  defp completion_action_in_txn(config, txn, row, "retire", principal) do
+    case retirement_actor_in_txn(txn, principal) do
+      nil ->
+        {:response, %{code: "principal_not_allowed"}}
+
+      %{owner: owner, serialized: serialized} ->
+        case Txn.q(txn, "SELECT isBuiltIn FROM sessions WHERE sessionKey=?1", [
+               row.child_session_key
+             ]) do
+          [[1]] ->
+            {:response,
+             %{
+               code: "denied",
+               message:
+                 "main sessions are permanent — they are the fallback for roles and user references"
+             }}
+
+          [[0]] ->
+            result =
+              retire_cascade_in_txn(
+                txn,
+                row.child_session_key,
+                owner,
+                serialized,
+                principal,
+                Map.fetch!(config, :wake_tick_ms),
+                "retired: session retired before execution",
+                schedule_intents: false
+              )
+
+            if result.deferred == [],
+              do: {:retired, owner, result},
+              else:
+                {:response,
+                 CompletionEscalation.retire_deferred_in_txn(
+                   txn,
+                   row.id,
+                   principal,
+                   result.deferred
+                 )}
+
+          _ ->
+            {:response, %{code: "child_not_active"}}
+        end
+    end
+  end
+
+  defp complete_completion_retire(config, db, owner, result) do
+    Enum.each(result.retired, fn retired ->
+      broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
+      Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+
+      Enum.each(retired.assignments, fn assignment ->
+        emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+      end)
+    end)
+
+    reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+    child = result.retired |> List.last() |> Map.fetch!(:session_key)
+
+    case DB.query(
+           db,
+           "SELECT id FROM completion_escalations WHERE childSessionKey=?1 AND decision='retire' ORDER BY actedAt DESC LIMIT 1",
+           [child]
+         ) do
+      {:ok, [[id]]} -> CompletionEscalation.get(db, id)
+      _ -> %{code: "unknown_completion"}
+    end
+  end
+
+  defp pending_retire_intents_in_txn(txn, root_key, owner) do
+    rows =
+      Txn.q(txn, "SELECT sessionKey,spawnedBy,ownerUserId FROM sessions WHERE state='active'")
+
+    by_key = Map.new(rows, fn [key, parent, row_owner] -> {key, {parent, row_owner}} end)
+    children = Enum.group_by(rows, &Enum.at(&1, 1))
+
+    children
+    |> walk_owned_subtree(root_key, owner)
+    |> Enum.uniq()
+    |> Enum.flat_map(fn member ->
+      owned_ancestors(by_key, member, owner)
+      |> Enum.map(&{retire_intent_wake_id(&1, member), member})
+    end)
+    |> Enum.flat_map(fn {wake_id, member} ->
+      case Txn.q(txn, "SELECT dueAt FROM wakes WHERE wakeId=?1 AND state='pending'", [wake_id]) do
+        [[due_at]] ->
+          [%{session_key: member, until: due_at, reason: "pending generic-retire intent"}]
+
+        [] ->
+          []
+      end
+    end)
+    |> Enum.uniq_by(& &1.session_key)
+    |> Enum.sort_by(& &1.session_key)
+  end
+
+  defp walk_owned_subtree(children, root_key, owner) do
+    case Enum.find(Map.get(children, parent_of(children, root_key), []), &(hd(&1) == root_key)) do
+      [^root_key, _parent, ^owner] ->
+        descendants =
+          children
+          |> Map.get(root_key, [])
+          |> Enum.flat_map(fn
+            [^root_key, _parent, _row_owner] -> []
+            [child, _parent, ^owner] -> walk_owned_subtree(children, child, owner)
+            _foreign -> []
+          end)
+
+        [root_key | descendants]
+
+      _ ->
+        []
+    end
+  end
+
+  defp parent_of(children, key) do
+    Enum.find_value(children, fn {parent, rows} ->
+      if Enum.any?(rows, &(hd(&1) == key)), do: parent
+    end)
+  end
+
+  defp owned_ancestors(by_key, key, owner),
+    do: owned_ancestors(by_key, key, owner, MapSet.new())
+
+  defp owned_ancestors(by_key, key, owner, seen) do
+    if MapSet.member?(seen, key) do
+      []
+    else
+      case Map.get(by_key, key) do
+        {_parent, row_owner} when row_owner != owner -> []
+        {parent, ^owner} -> [key | owned_ancestors(by_key, parent, owner, MapSet.put(seen, key))]
+        nil -> []
+      end
+    end
+  end
+
+  defp retirement_actor_in_txn(txn, {:user, user}) when is_binary(user) and user != "" do
+    case Txn.q(txn, "SELECT 1 FROM users WHERE userId=?1", [user]) do
+      [[1]] -> %{owner: user, serialized: "user:#{user}"}
+      _ -> nil
+    end
+  end
+
+  defp retirement_actor_in_txn(txn, {:session, session_key})
+       when is_binary(session_key) and session_key != "" do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[owner]] -> %{owner: owner, serialized: "session:#{session_key}"}
+      _ -> nil
+    end
+  end
+
+  defp retirement_actor_in_txn(_txn, _principal), do: nil
+
+  defp retirement_owner(db, {:user, user}) when is_binary(user) and user != "" do
+    case DB.query(db, "SELECT 1 FROM users WHERE userId=?1", [user]) do
+      {:ok, [[1]]} -> user
+      _ -> nil
+    end
+  end
+
+  defp retirement_owner(db, {:session, session_key})
+       when is_binary(session_key) and session_key != "" do
+    case DB.query(db, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      {:ok, [[owner]]} -> owner
+      _ -> nil
+    end
+  end
+
+  defp retirement_owner(_db, _principal), do: nil
+
   defp retire_result(config, db, call) do
     p = call.params
     # Resolve the caller's owner, do not string-strip the origin: an agent's
@@ -6037,10 +6282,16 @@ defmodule Tightbeam.Gateway do
     # `resolve_caller/2` handles all three origin classes and yields a nil owner
     # for a process, which cannot match a NOT NULL ownerUserId, so unknown and
     # process callers keep getting `not_found`.
-    owner = resolve_caller(db, call.origin)[:owner_user_id]
-    prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
+    owner = retirement_owner(db, call[:principal])
+
+    prior =
+      if not is_nil(owner) and p[:idempotency_key],
+        do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do
+      is_nil(owner) ->
+        %{code: "not_found"}
+
       prior && prior.session_key == call.session_key ->
         %{
           deleted_session_key: call.session_key,
@@ -6070,8 +6321,10 @@ defmodule Tightbeam.Gateway do
                       session.session_key,
                       owner,
                       call.origin,
+                      call.principal,
                       Map.fetch!(config, :wake_tick_ms),
-                      "retired: session retired before execution"
+                      "retired: session retired before execution",
+                      schedule_intents: true
                     )
 
                   if result.retired != [] and p[:idempotency_key] do
@@ -6184,9 +6437,11 @@ defmodule Tightbeam.Gateway do
          txn,
          root_key,
          owner,
-         principal,
+         serialized_principal,
+         typed_principal,
          supervision_interval_ms,
-         drain_reason
+         drain_reason,
+         opts
        ) do
     # Invariant: this spawnedBy walk visits each active member of the target's
     # transitive subtree exactly once, parent-last. This is the lifecycle
@@ -6210,7 +6465,8 @@ defmodule Tightbeam.Gateway do
               txn,
               member.session_key,
               owner,
-              principal,
+              serialized_principal,
+              typed_principal,
               supervision_interval_ms,
               drain_reason
             )
@@ -6226,7 +6482,7 @@ defmodule Tightbeam.Gateway do
         Enum.map(subtree, fn member ->
           direct = Enum.find(leased, &(&1.session_key == member.session_key))
 
-          if direct do
+          if not is_nil(direct) and Keyword.get(opts, :schedule_intents, true) do
             schedule_retire_intent_in_txn(txn, root_key, member.session_key, owner, direct)
           end
 
@@ -6269,12 +6525,16 @@ defmodule Tightbeam.Gateway do
          txn,
          session_key,
          owner,
-         principal,
+         serialized_principal,
+         typed_principal,
          supervision_interval_ms,
          drain_reason
        ) do
-    assignments = Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, principal)
-    Org.retire_in_txn(txn, session_key, principal, supervision_interval_ms)
+    assignments =
+      Assignments.interrupt_for_retire_in_txn(txn, session_key, owner, serialized_principal)
+
+    CompletionEscalation.acknowledge_retire_in_txn(txn, session_key, typed_principal)
+    Org.retire_in_txn(txn, session_key, serialized_principal, supervision_interval_ms)
     Ledger.drain_queued_for_retire_in_txn(txn, session_key, drain_reason)
     assignments
   end

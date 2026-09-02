@@ -313,6 +313,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             reviews,
             effect_kind,
             files,
+            report_to,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -338,6 +339,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     serde_json::to_string(value).expect("strings are JSON serializable")
                 ));
             }
+            if let Some(value) = report_to {
+                params.push(string_field("reportToSessionKey", value));
+            }
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
@@ -349,6 +353,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             workdir_root,
             brief,
             idempotency_key,
+            report_to,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
@@ -365,6 +370,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
+            }
+            if let Some(value) = report_to {
+                params.push(string_field("reportToSessionKey", value));
             }
             Ok(request(
                 identity,
@@ -728,6 +736,30 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 .unwrap_or_default();
             Ok(request(identity, "assignments", fields, params))
         }
+        Command::CompletionNotices {
+            identity,
+            status,
+            session_key,
+        } => {
+            let mut params = vec![string_field("status", status)];
+            if let Some(value) = session_key {
+                params.push(string_field("sessionKey", value));
+            }
+            Ok(request(identity, "completion-notices", vec![], params))
+        }
+        Command::CompletionDisposition {
+            identity,
+            completion_id,
+            decision,
+        } => Ok(request(
+            identity,
+            "completion-disposition",
+            vec![],
+            vec![
+                string_field("completionId", completion_id),
+                string_field("decision", decision),
+            ],
+        )),
         Command::CancelWake { identity, wake_id } => Ok(request(
             identity,
             "wake",
@@ -1566,6 +1598,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Attest { identity, .. }
         | Command::Attests { identity, .. }
         | Command::Assignments { identity, .. }
+        | Command::CompletionNotices { identity, .. }
+        | Command::CompletionDisposition { identity, .. }
         | Command::CancelWake { identity, .. }
         | Command::IdentityEdit { identity, .. }
         | Command::IdentityStatus { identity, .. }
