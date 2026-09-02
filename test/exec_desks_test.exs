@@ -157,6 +157,102 @@ defmodule Tightbeam.ExecDesksTest do
              DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [worker.session_key])
   end
 
+  test "an enabled exec atomically admits its source wake before a worker turn", %{
+    db: db,
+    worker: worker
+  } do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:one",
+        prompt: "one",
+        due_at: 1
+      })
+
+    worker_key = worker.session_key
+
+    assert {:ok, {:appended, ^worker_key, _message, _opts}} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+
+               ExecDesks.deliver_source_wake_in_txn(
+                 txn,
+                 wake.wake_id,
+                 worker.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 []
+               )
+             end)
+
+    assert {:ok, [["fired"]]} =
+             DB.query(db, "SELECT state FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+  end
+
+  test "an unbound worker keeps its source wake pending for the ordinary delivery path", %{
+    db: db,
+    worker: worker
+  } do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:one",
+        prompt: "one",
+        due_at: 1
+      })
+
+    assert {:ok, :not_elected} =
+             DB.transaction(db, fn txn ->
+               ExecDesks.deliver_source_wake_in_txn(
+                 txn,
+                 wake.wake_id,
+                 worker.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 []
+               )
+             end)
+
+    assert {:ok, [["pending"]]} =
+             DB.query(db, "SELECT state FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+  end
+
+  test "a rejected exec delivery leaves its source wake pending", %{db: db, worker: worker} do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:one",
+        prompt: "one",
+        due_at: 1
+      })
+
+    assert {:error, %ArgumentError{}} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+
+               ExecDesks.deliver_source_wake_in_txn(
+                 txn,
+                 wake.wake_id,
+                 worker.session_key,
+                 wake.origin,
+                 wake.prompt,
+                 reply_to_llm_visible_message_id: "missing"
+               )
+             end)
+
+    assert {:ok, [["pending"]]} =
+             DB.query(db, "SELECT state FROM wakes WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, [[0]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake.wake_id])
+  end
+
   test "annotations cite a durable row and parent escalation uses the effective-parent resolver",
        %{
          db: db,

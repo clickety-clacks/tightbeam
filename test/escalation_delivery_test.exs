@@ -19,6 +19,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     DB,
     EffortCheckin,
     Escalation,
+    ExecDesks,
     Gateway,
     Org,
     Placement,
@@ -269,6 +270,27 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake.wake_id]) == 1
   end
 
+  test "an enabled exec admits a prompt wake through Gateway's production Wakes child", ctx do
+    assert {:decision_pending, _id} =
+             Escalation.escalate(ctx.db, statute_call(), statute(), escalation_ctx())
+
+    [wake] = notification_wakes(ctx.db)
+    owner_session = Org.personal_session_key("flynn")
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               ExecDesks.bind_in_txn(txn, owner_session, "exec_owner", true, 1)
+             end)
+
+    # `drain!/1` starts the exact Wakes child returned by
+    # Gateway.children_after_preflight/1. Its prompt callback must admit the
+    # source wake and worker turn in one transaction before Wakes observes it.
+    drain!(ctx)
+
+    assert Wakes.get(ctx.db, wake.wake_id).state == "fired"
+    assert count(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake.wake_id]) == 1
+  end
+
   ## Proof 6 — exactly one initial delivery, and the dedupe backstop
 
   test "proof 6: one delivery commits message, turn and fired-mark; the backstop dedupes", ctx do
@@ -468,8 +490,11 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # Every turn-bearing delivery sink, keyed by enclosing definition with its
     # exact call count: a new site changes the map and fails.
     assert sink_sites() == %{
+             # The scheduler closure delegates its prompt wakes to this one
+             # Gateway acceptance seam. It preserves ordinary delivery while an
+             # enabled exec commits its source wake and turn together.
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
-              "children_after_preflight/1"} => 2,
+              "deliver_wake_through_exec/4"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handler_specs/1"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
               "execute_assignment_repair/6"} => 1,
@@ -490,6 +515,12 @@ defmodule Tightbeam.EscalationDeliveryTest do
              {"lib/tightbeam/assignments.ex", "Gateway.deliver_prompt_in_txn/5",
               "open_dispatch_result/2"} => 1,
              {"lib/tightbeam/wakes.ex", "Gateway.deliver_prompt_in_txn/5", "fire_in_txn/2"} => 1,
+             # Exec Desks owns the only two additional transaction-local turn
+             # callers: a multi-source BUNDLE and one admitted source wake.
+             {"lib/tightbeam/exec_desks.ex", "Gateway.deliver_prompt_in_txn/5",
+              "deliver_bundle_in_txn/7"} => 1,
+             {"lib/tightbeam/exec_desks.ex", "Gateway.deliver_prompt_in_txn/5",
+              "deliver_source_wake_in_txn/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "deliver_prompt/4"} =>
                1,
              # `deliver_prompt_in_txn/5` declines undeliverable addresses BEFORE

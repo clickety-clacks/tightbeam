@@ -9,7 +9,7 @@ defmodule Tightbeam.ExecDesks do
   credential-selection decisions they need to make their own transaction atomic.
   """
 
-  alias Tightbeam.{DB, Gateway, Id, Org}
+  alias Tightbeam.{DB, Gateway, Id, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @policy_revision "exec-desks-v1"
@@ -188,6 +188,47 @@ defmodule Tightbeam.ExecDesks do
     end
   end
 
+  @doc """
+  Admit one pending source wake through an elected exec before its worker turn.
+
+  The source wake and worker turn commit together. Callers retain the ordinary
+  Gateway path when no binding is enabled; any non-delivery rolls this
+  transaction back so the source wake stays pending for retry.
+  """
+  @spec deliver_source_wake_in_txn(
+          Txn.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          keyword()
+        ) :: :not_elected | tuple()
+  def deliver_source_wake_in_txn(%Txn{} = txn, wake_id, worker, origin, prompt, opts)
+      when is_binary(wake_id) and is_binary(worker) and is_binary(origin) and is_binary(prompt) and
+             is_list(opts) do
+    if enabled_in_txn?(txn, worker) do
+      delivery_opts =
+        opts
+        |> Keyword.put(:wake_id, wake_id)
+        |> Keyword.delete(:fire_wake_in_txn)
+
+      case Gateway.deliver_prompt_in_txn(txn, worker, origin, prompt, delivery_opts) do
+        {:appended, ^worker, _message, _opts} = delivery ->
+          fire_source_wake_in_txn(txn, wake_id)
+          delivery
+
+        {:duplicate, _message} = delivery ->
+          fire_source_wake_in_txn(txn, wake_id)
+          delivery
+
+        other ->
+          raise ArgumentError, "exec source wake delivery did not commit: #{inspect(other)}"
+      end
+    else
+      :not_elected
+    end
+  end
+
   @doc "Resolve a policy-selected parent in the same owner transaction as its send."
   @spec effective_parent_in_txn(Txn.t(), String.t()) :: String.t()
   def effective_parent_in_txn(%Txn{} = txn, worker),
@@ -266,6 +307,20 @@ defmodule Tightbeam.ExecDesks do
       "SELECT 1 FROM exec_desk_bundles WHERE bundleId=?1 AND workerSessionKey=?2 AND state='open'",
       [bundle_id, worker]
     ) != []
+  end
+
+  defp fire_source_wake_in_txn(txn, wake_id) do
+    Txn.q(
+      txn,
+      "UPDATE wakes SET state='fired', firedAt=?2 WHERE wakeId=?1 AND state='pending'",
+      [wake_id, System.system_time(:millisecond)]
+    )
+
+    if Txn.changes(txn) == 1 do
+      Wakes.publish_change_in_txn(txn, "wake.fired", wake_id)
+    else
+      raise ArgumentError, "exec source wake is not pending"
+    end
   end
 
   defp validate_bundle_members!(txn, worker, wake_ids) do

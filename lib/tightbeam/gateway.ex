@@ -73,6 +73,7 @@ defmodule Tightbeam.Gateway do
     Devices,
     EffortCheckin,
     Escalation,
+    ExecDesks,
     EventLog,
     Harness,
     HarnessHealth,
@@ -256,13 +257,11 @@ defmodule Tightbeam.Gateway do
         role when is_binary(role) ->
           case Roles.resolve(db, role) do
             {:ok, session_key, fallback} ->
-              deliver_prompt(
+              deliver_wake_through_exec(
+                db,
+                wake,
                 session_key,
-                wake.origin,
-                wake.prompt,
                 [
-                  db: db,
-                  wake_id: wake.wake_id,
                   sender: wake.origin,
                   principal: wake_delivery_principal(wake),
                   role_ref: role,
@@ -280,13 +279,11 @@ defmodule Tightbeam.Gateway do
           end
 
         nil ->
-          deliver_prompt(
+          deliver_wake_through_exec(
+            db,
+            wake,
             wake.session_key,
-            wake.origin,
-            wake.prompt,
             [
-              db: db,
-              wake_id: wake.wake_id,
               sender: wake.origin,
               principal: wake_delivery_principal(wake),
               # targetGate = 0 (decision notifications) delivers to the recorded
@@ -348,6 +345,33 @@ defmodule Tightbeam.Gateway do
          name: Tightbeam.LaneManager},
         {Bandit, plug: {Tightbeam.Wire.Router, router_deps}, port: config.port}
       ]
+  end
+
+  defp deliver_wake_through_exec(db, wake, session_key, opts) do
+    case DB.transaction(db, fn txn ->
+           ExecDesks.deliver_source_wake_in_txn(
+             txn,
+             wake.wake_id,
+             session_key,
+             wake.origin,
+             wake.prompt,
+             opts
+           )
+         end) do
+      {:ok, :not_elected} ->
+        deliver_prompt(
+          session_key,
+          wake.origin,
+          wake.prompt,
+          [db: db, wake_id: wake.wake_id] ++ opts
+        )
+
+      {:ok, delivery} ->
+        complete_delivery(db, delivery)
+
+      {:error, error} ->
+        raise error
+    end
   end
 
   @doc """
