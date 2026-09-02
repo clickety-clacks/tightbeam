@@ -5,6 +5,8 @@ skills = ["worktree-session", "recon-first-investigation", "recon-lifecycle", "b
 text = """
 #include "golden-rule.md"
 
+#include "scope-and-architecture.md"
+
 #include "wisdom-core.md"
 
 #include "engineering-tenets.md"
