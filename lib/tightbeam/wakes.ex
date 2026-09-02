@@ -2751,51 +2751,62 @@ defmodule Tightbeam.Wakes do
   end
 
   defp dispose_closed_remedy(db, %{origin: "remedy:" <> _} = wake) do
-    transaction!(db, fn txn ->
-      assignment_id = remedy_assignment_id_in_txn(txn, wake)
+    case closed_remedy_assignment(db, wake) do
+      {:closed, assignment_id} ->
+        transaction!(db, fn txn ->
+          case Txn.q(txn, "SELECT state, workItemId FROM assignments WHERE id = ?1", [
+                 assignment_id
+               ]) do
+            [["closed", work_item_id]] ->
+              liveness_trigger =
+                if is_binary(wake.assignment_id),
+                  do: disposition_liveness_trigger!(txn, work_item_id)
 
-      case Txn.q(txn, "SELECT state, workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
-        [["closed", work_item_id]] ->
-          liveness_trigger =
-            if is_binary(wake.assignment_id),
-              do: disposition_liveness_trigger!(txn, work_item_id)
+              outcome = %{
+                kind: "disposition",
+                disposition_kind: "assignment_transition",
+                disposition_id: assignment_id
+              }
 
-          outcome = %{
-            kind: "disposition",
-            disposition_kind: "assignment_transition",
-            disposition_id: assignment_id
-          }
+              cancellation = %{
+                wake_id: wake.wake_id,
+                requester: %{kind: "process", id: "tightbeam:assignments"},
+                reason_kind: "obligation_disposed",
+                causal_source: %{kind: "assignment_transition", id: assignment_id},
+                outcome:
+                  if(is_map(liveness_trigger),
+                    do: Map.put(outcome, :liveness_trigger, liveness_trigger),
+                    else: outcome
+                  )
+              }
 
-          cancellation = %{
-            wake_id: wake.wake_id,
-            requester: %{kind: "process", id: "tightbeam:assignments"},
-            reason_kind: "obligation_disposed",
-            causal_source: %{kind: "assignment_transition", id: assignment_id},
-            outcome:
-              if(is_map(liveness_trigger),
-                do: Map.put(outcome, :liveness_trigger, liveness_trigger),
-                else: outcome
-              )
-          }
+              Tightbeam.RailRemedy.dispose_assignment_in_txn(txn, assignment_id, cancellation)
+              true
 
-          Tightbeam.RailRemedy.dispose_assignment_in_txn(txn, assignment_id, cancellation)
-          true
+            _ ->
+              false
+          end
+        end)
 
-        _ ->
-          false
-      end
-    end)
+      :not_closed ->
+        false
+    end
   end
 
   defp dispose_closed_remedy(_db, _wake), do: false
 
-  defp remedy_assignment_id_in_txn(_txn, %{assignment_id: assignment_id})
-       when is_binary(assignment_id),
-       do: assignment_id
+  defp closed_remedy_assignment(db, %{assignment_id: assignment_id})
+       when is_binary(assignment_id) do
+    case DB.query(db, "SELECT state FROM assignments WHERE id = ?1", [assignment_id]) do
+      {:ok, [["closed"]]} -> {:closed, assignment_id}
+      {:ok, _} -> :not_closed
+      {:error, error} -> raise error
+    end
+  end
 
-  defp remedy_assignment_id_in_txn(txn, %{wake_id: wake_id, origin: origin}) do
-    case Txn.q(
-           txn,
+  defp closed_remedy_assignment(db, %{wake_id: wake_id, origin: origin}) do
+    case DB.query(
+           db,
            """
            SELECT episode.subject
            FROM rail_remedy_episodes episode
@@ -2814,13 +2825,15 @@ defmodule Tightbeam.Wakes do
                 'rail-rewake:' || episode.statute || ':' || episode.subject || ':'
             )
            WHERE ?2 = 'remedy:' || episode.statute
+             AND assignment.state = 'closed'
            ORDER BY episode.openedAt DESC, episode.subject
            LIMIT 1
            """,
            [wake_id, origin]
          ) do
-      [[assignment_id]] -> assignment_id
-      [] -> nil
+      {:ok, [[assignment_id]]} -> {:closed, assignment_id}
+      {:ok, []} -> :not_closed
+      {:error, error} -> raise error
     end
   end
 

@@ -1679,15 +1679,14 @@ defmodule Tightbeam.Gateway do
           | :invalid_reply_reference
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
-    case completion_delivery_admission(txn, session_key, opts) do
-      :skip ->
-        :skipped
-
-      :continue ->
-        case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-          nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
-          duplicate -> duplicate
-        end
+    with :continue <- completion_delivery_admission(txn, session_key, opts),
+         :continue <- remedy_wake_delivery_admission_in_txn(txn, opts[:wake_id]) do
+      case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
+        nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+        duplicate -> duplicate
+      end
+    else
+      :skip -> :skipped
     end
   end
 
@@ -1701,6 +1700,59 @@ defmodule Tightbeam.Gateway do
 
       _ ->
         :continue
+    end
+  end
+
+  defp remedy_wake_delivery_admission_in_txn(_txn, wake_id) when not is_binary(wake_id),
+    do: :continue
+
+  defp remedy_wake_delivery_admission_in_txn(txn, wake_id) do
+    case DB.Txn.q(txn, "SELECT origin, assignmentId FROM wakes WHERE wakeId = ?1", [wake_id]) do
+      [["remedy:" <> _ = origin, assignment_id]] ->
+        case assignment_id || legacy_remedy_assignment_id_in_txn(txn, wake_id, origin) do
+          nil ->
+            :continue
+
+          assignment_id ->
+            case DB.Txn.q(txn, "SELECT state FROM assignments WHERE id = ?1", [assignment_id]) do
+              [["open"]] -> :continue
+              _ -> :skip
+            end
+        end
+
+      _ ->
+        :continue
+    end
+  end
+
+  defp legacy_remedy_assignment_id_in_txn(txn, wake_id, origin) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT episode.subject
+           FROM rail_remedy_episodes episode
+           JOIN assignments assignment ON assignment.id = episode.subject
+           JOIN wire_idempotency idem
+             ON idem.ownerUserId = ?2
+            AND idem.operation = 'wake'
+            AND idem.sessionKey = ?1
+            AND (
+              substr(idem.idempotencyKey, 1,
+                length('rail-dispatch:' || episode.statute || ':' || episode.subject || ':')) =
+                'rail-dispatch:' || episode.statute || ':' || episode.subject || ':'
+              OR
+              substr(idem.idempotencyKey, 1,
+                length('rail-rewake:' || episode.statute || ':' || episode.subject || ':')) =
+                'rail-rewake:' || episode.statute || ':' || episode.subject || ':'
+            )
+           WHERE ?2 = 'remedy:' || episode.statute
+           ORDER BY episode.openedAt DESC, episode.subject
+           LIMIT 1
+           """,
+           [wake_id, origin]
+         ) do
+      [[assignment_id]] -> assignment_id
+      [] -> nil
     end
   end
 

@@ -678,6 +678,28 @@ defmodule Tightbeam.RailRemedyTest do
              )
   end
 
+  test "a stale due row cannot deliver after its assignment closes", ctx do
+    assignment = assignment(ctx, "close after scheduler read")
+    put_rules(ctx, wake_gate())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    wake_id = fire_wake_remedy(ctx, assignment.id)
+    assignment_id = assignment.id
+
+    wake = Wakes.get(ctx.db, wake_id)
+    assert %{state: "pending", assignment_id: ^assignment_id} = wake
+    assert %{state: "closed", outcome: "revoked"} = revoke(ctx, assignment.id)
+
+    assert :skipped =
+             Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               sender: wake.origin
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake_id])
+  end
+
   test "closed reopen and dead-live replacement bump occurrence and wire key", ctx do
     assignment = assignment(ctx, "terminal")
     load_review_gate(ctx)
