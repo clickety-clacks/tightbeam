@@ -17,6 +17,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Escalation,
     Tightbeam.Wakes,
     Tightbeam.NoticeBatcher,
+    Tightbeam.ExecDesks,
     Tightbeam.Projection,
     Tightbeam.Org,
     Tightbeam.ColdStart,
