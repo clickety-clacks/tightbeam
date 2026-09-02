@@ -382,7 +382,7 @@ defmodule Tightbeam.Firehose.Publisher do
         Map.put_new(
           resolved,
           primary_ref,
-          projection[primary_ref] || projection["id"]
+          projection_primary_ref(projection, primary_ref)
         )
       end)
       |> Map.reject(fn {_key, value} -> is_nil(value) end)
@@ -398,6 +398,12 @@ defmodule Tightbeam.Firehose.Publisher do
       "payload" => projection
     }
   end
+
+  defp projection_primary_ref(projection, "turnSeq"),
+    do: projection["turnSeq"] || projection["seq"]
+
+  defp projection_primary_ref(projection, primary_ref),
+    do: projection[primary_ref] || projection["id"]
 
   @spec state_notice(map(), term()) :: map() | nil
   def state_notice(call, result), do: state_notice(nil, call, result)

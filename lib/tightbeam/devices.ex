@@ -375,6 +375,22 @@ defmodule Tightbeam.Devices do
   end
 
   @doc false
+  def detail_in_txn(%Txn{} = txn, device_id) do
+    device = get_device_in_txn(txn, device_id)
+
+    row_version =
+      case Txn.q(txn, "SELECT rowVersion FROM device_versions WHERE deviceId = ?1", [device_id]) do
+        [[version]] -> version
+        [] -> nil
+      end
+
+    case device do
+      nil -> nil
+      device -> Map.put(device, :row_version, row_version || device.created_at)
+    end
+  end
+
+  @doc false
   def get_device_by_token_in_txn(%Txn{} = txn, token) do
     case select_device(txn, "d.token = ?1 AND d.status = 'allowlisted'", [token]) do
       [row] -> to_device(row)

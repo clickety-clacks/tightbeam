@@ -1909,6 +1909,15 @@ defmodule Tightbeam.Escalation do
   @spec raw_by_id_in_txn!(Txn.t(), String.t()) :: map()
   def raw_by_id_in_txn!(txn, id), do: request_in_txn(txn, id)
 
+  @doc false
+  @spec raw_by_id_in_txn(Txn.t(), String.t() | nil) :: map() | nil
+  def raw_by_id_in_txn(txn, id) do
+    case Txn.q(txn, "SELECT #{@request_columns} FROM decision_requests WHERE id = ?1", [id]) do
+      [row] -> request_from_row(row)
+      [] -> nil
+    end
+  end
+
   @doc "EFFORT ONLY: the open effort request currently carrying this deadline wake."
   @spec effort_open_by_deadline_wake_in_txn(Txn.t(), String.t()) :: map() | nil
   def effort_open_by_deadline_wake_in_txn(txn, wake_id) do
