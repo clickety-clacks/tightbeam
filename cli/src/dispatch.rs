@@ -1097,6 +1097,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     );
                 }
                 return Ok(RequestSpec {
+                    method: "POST",
                     path: "/agent/terminal",
                     body_json: object(vec![
                         string_field("assignmentId", assignment_id),

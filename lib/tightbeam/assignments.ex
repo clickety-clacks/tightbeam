@@ -2649,7 +2649,7 @@ defmodule Tightbeam.Assignments do
             end
 
           true ->
-            with :ok <- valid_kind(call.params[:kind]),
+            with :ok <- valid_lifecycle_kind(call),
                  :ok <- valid_note(call.params[:note]),
                  :ok <- valid_cannot_proceed_reason(call.params),
                  :ok <- absent_verdict_kind(call.params[:verdict_kind]),
@@ -2706,14 +2706,19 @@ defmodule Tightbeam.Assignments do
        do: cannot_proceed_in_txn(txn, call, assignment, attest)
 
   defp apply_lifecycle_attest(txn, call, assignment, attest, holder) do
+    outcome =
+      if call[:terminal_surrender] == true and call.params.kind == "surrender",
+        do: "surrendered",
+        else: "completed"
+
     Txn.q(
       txn,
       """
-      UPDATE assignments SET state = 'closed', outcome = 'completed', closedAt = ?2,
-        closedBySession = ?3, closingAttestId = ?4
+      UPDATE assignments SET state = 'closed', outcome = ?2, closedAt = ?3,
+        closedBySession = ?4, closingAttestId = ?5
       WHERE id = ?1 AND state = 'open'
       """,
-      [assignment.id, attest.ts, holder, attest.id]
+      [assignment.id, outcome, attest.ts, holder, attest.id]
     )
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -3703,6 +3708,12 @@ defmodule Tightbeam.Assignments do
 
   defp valid_kind(_),
     do: error("invalid_kind", "kind must be progress, completion, or cannot-proceed")
+
+  # Main retired generic surrender filing. The terminal seam remains the sole
+  # compatibility escape hatch, so only its fixed, internally marked call may
+  # introduce a new surrender outcome.
+  defp valid_lifecycle_kind(%{terminal_surrender: true, params: %{kind: "surrender"}}), do: :ok
+  defp valid_lifecycle_kind(call), do: valid_kind(call.params[:kind])
 
   defp valid_release_tuple_for_kind(%{kind: "cannot-proceed"} = params),
     do: valid_release_tuple(params)
