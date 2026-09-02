@@ -5,6 +5,8 @@ skills = ["drafting-requirements", "spec-homing", "spec-handoff", "tightbeam-law
 text = """
 #include "golden-rule.md"
 
+#include "scope-and-architecture.md"
+
 #include "wisdom-core.md"
 
 #include "wisdom-meta.md"
