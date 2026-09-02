@@ -116,6 +116,7 @@ defmodule Tightbeam.ExecDesks do
       when is_binary(worker) and is_list(wake_ids) and is_integer(at) and at >= 0 do
     case {binding_in_txn(txn, worker), wake_ids} do
       {%{enabled: true, exec_id: exec_id}, [_, _ | _]} ->
+        validate_bundle_members!(txn, worker, wake_ids)
         bundle_id = "b_" <> Id.uuid4()
 
         Txn.q(
@@ -206,6 +207,8 @@ defmodule Tightbeam.ExecDesks do
       when is_binary(worker) and is_binary(exec_id) and is_binary(cited_kind) and cited_kind != "" and
              is_binary(cited_id) and cited_id != "" and is_integer(at) and at >= 0 do
     {wake_id, bundle_id} = annotation_target!(target)
+    validate_annotation_binding!(txn, worker, exec_id)
+    validate_annotation_target!(txn, worker, wake_id, bundle_id)
 
     Txn.q(
       txn,
@@ -263,5 +266,44 @@ defmodule Tightbeam.ExecDesks do
       "SELECT 1 FROM exec_desk_bundles WHERE bundleId=?1 AND workerSessionKey=?2 AND state='open'",
       [bundle_id, worker]
     ) != []
+  end
+
+  defp validate_bundle_members!(txn, worker, wake_ids) do
+    if Enum.uniq(wake_ids) != wake_ids do
+      raise ArgumentError, "a BUNDLE cannot contain a source wake twice"
+    end
+
+    Enum.each(wake_ids, fn wake_id ->
+      case Txn.q(
+             txn,
+             "SELECT 1 FROM wakes WHERE wakeId=?1 AND sessionKey=?2 AND state='pending'",
+             [wake_id, worker]
+           ) do
+        [[1]] -> :ok
+        _ -> raise ArgumentError, "BUNDLE source wake is not pending for this worker"
+      end
+    end)
+  end
+
+  defp validate_annotation_binding!(txn, worker, exec_id) do
+    case binding_in_txn(txn, worker) do
+      %{enabled: true, exec_id: ^exec_id} -> :ok
+      _ -> raise ArgumentError, "an enabled matching exec binding is required for ANNOTATE"
+    end
+  end
+
+  defp validate_annotation_target!(txn, worker, wake_id, nil) do
+    case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1 AND sessionKey=?2", [wake_id, worker]) do
+      [[1]] -> :ok
+      _ -> raise ArgumentError, "annotation wake is not owned by this worker"
+    end
+  end
+
+  defp validate_annotation_target!(txn, worker, nil, bundle_id) do
+    if open_bundle_for_worker_in_txn(txn, bundle_id, worker) do
+      :ok
+    else
+      raise ArgumentError, "annotation BUNDLE is not open for this worker"
+    end
   end
 end

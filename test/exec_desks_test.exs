@@ -253,4 +253,63 @@ defmodule Tightbeam.ExecDesksTest do
 
     assert {:ok, [["open"]]} = DB.query(db, "SELECT state FROM exec_desk_bundles")
   end
+
+  test "refuses cross-worker BUNDLE members and ANNOTATE attribution", %{db: db, worker: worker} do
+    other =
+      Org.create(db, %{
+        session_key: "other",
+        display_name: "Other",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "fixture",
+        provider: "fixture_provider",
+        model: Model.new("fixture")
+      })
+
+    own_wake =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:one",
+        prompt: "one",
+        due_at: 1
+      })
+
+    other_wake =
+      Wakes.schedule(db, %{
+        session_key: other.session_key,
+        origin: "agent:two",
+        prompt: "two",
+        due_at: 1
+      })
+
+    assert {:error, %ArgumentError{message: "BUNDLE source wake is not pending for this worker"}} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+
+               ExecDesks.open_bundle_in_txn(
+                 txn,
+                 worker.session_key,
+                 [own_wake.wake_id, other_wake.wake_id],
+                 2
+               )
+             end)
+
+    assert {:error,
+            %ArgumentError{message: "an enabled matching exec binding is required for ANNOTATE"}} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+
+               ExecDesks.annotate_in_txn(
+                 txn,
+                 %{wake_id: own_wake.wake_id},
+                 worker.session_key,
+                 "other_exec",
+                 "assignment",
+                 "asg_closed",
+                 2
+               )
+             end)
+  end
 end
