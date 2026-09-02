@@ -64,7 +64,7 @@ defmodule Tightbeam.Supervision do
   """
 
   @failure_patrol_ddl """
-  CREATE TABLE IF NOT EXISTS patrol_failure_activation (
+  CREATE TABLE IF NOT EXISTS patrol_failure_boundary (
     id INTEGER PRIMARY KEY CHECK (id = 0),
     firstTurnSeq INTEGER NOT NULL CHECK (firstTurnSeq > 0),
     activatedAt INTEGER NOT NULL,
@@ -254,7 +254,7 @@ defmodule Tightbeam.Supervision do
   end
 
   defp classify_terminal_in_txn(txn, turn_seq) do
-    case Txn.q(txn, "SELECT firstTurnSeq FROM patrol_failure_activation WHERE id=0") do
+    case Txn.q(txn, "SELECT firstTurnSeq FROM patrol_failure_boundary WHERE id=0") do
       [[first_turn_seq]] when turn_seq >= first_turn_seq ->
         case Txn.q(txn, "SELECT 1 FROM patrol_terminal_classifications WHERE turnSeq=?1", [
                turn_seq
@@ -3288,7 +3288,7 @@ defmodule Tightbeam.Supervision do
         """
         SELECT t.seq
         FROM turns t
-        JOIN patrol_failure_activation a ON a.id=0
+        JOIN patrol_failure_boundary a ON a.id=0
         LEFT JOIN patrol_terminal_classifications c ON c.turnSeq=t.seq
         WHERE t.seq >= a.firstTurnSeq
           AND t.endedAt IS NOT NULL AND c.turnSeq IS NULL
@@ -3306,7 +3306,7 @@ defmodule Tightbeam.Supervision do
       DB.query(
         db,
         """
-        INSERT OR IGNORE INTO patrol_failure_activation
+        INSERT OR IGNORE INTO patrol_failure_boundary
           (id, firstTurnSeq, activatedAt, principal)
         SELECT 0, COALESCE(MAX(seq), 0) + 1, ?1, 'process:tightbeam'
         FROM turns
@@ -3321,7 +3321,7 @@ defmodule Tightbeam.Supervision do
     Txn.q(
       txn,
       """
-      INSERT OR IGNORE INTO patrol_failure_activation
+      INSERT OR IGNORE INTO patrol_failure_boundary
         (id, firstTurnSeq, activatedAt, principal)
       VALUES (0, ?1, ?2, 'process:tightbeam')
       """,
