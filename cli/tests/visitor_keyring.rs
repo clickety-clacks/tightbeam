@@ -2,18 +2,22 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+static NEXT_BASE_DIR_ID: AtomicU64 = AtomicU64::new(0);
+
 fn base_dir() -> PathBuf {
     std::env::temp_dir().join(format!(
-        "tightbeam-visitor-keyring-cli-{}-{}",
+        "tightbeam-visitor-keyring-cli-{}-{}-{}",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        NEXT_BASE_DIR_ID.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
