@@ -945,6 +945,72 @@ mod tests {
     }
 
     #[test]
+    fn an_incomplete_sweep_is_a_loud_failure_even_when_the_recorded_kill_succeeds() {
+        // Blocker 3 negative control: a recorded-group SIGKILL that succeeds must NOT read
+        // as success while the freeze never proved it saw the whole tree. We drive the real
+        // kill_harness_tree with an owned session-leader child (killing it is safe) and an
+        // injected `incomplete: true` sweep, then assert the loud "harness cleanup
+        // incomplete" refusal. Reverting the fail-loud fence turns this red.
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe failed");
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            // Own session + group, announce readiness, then hold still to be killed. The
+            // bounded sleep is a safety net so a bug here cannot wedge the suite.
+            unsafe {
+                libc::setsid();
+                libc::write(write_fd, b"x".as_ptr() as *const libc::c_void, 1);
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+
+        // Parent: wait for the child to finish setsid before trusting its pgid.
+        unsafe { libc::close(write_fd) };
+        let mut ready = [0u8; 1];
+        assert_eq!(
+            unsafe { libc::read(read_fd, ready.as_mut_ptr() as *mut libc::c_void, 1) },
+            1,
+            "child never signalled readiness"
+        );
+        unsafe { libc::close(read_fd) };
+
+        // After setsid the child leads its own group: pgid == pid == child.
+        let pgid = child;
+        let boot = boot_identity().unwrap();
+        let launch = "incomplete-sweep-launch";
+        let path = test_path("incomplete-sweep");
+        fs::write(&path, format!("{pgid}\t{pgid}\t{boot}\t{launch}")).unwrap();
+
+        let target = HarnessTarget {
+            pgid,
+            identity_path: path.to_string_lossy().into_owned(),
+            boot_identity: boot,
+            launch_id: launch.into(),
+        };
+        let sweep = Sweep {
+            frozen: BTreeSet::new(),
+            groups: BTreeSet::new(),
+            incomplete: true,
+        };
+
+        let verdict = kill_harness_tree(&target, sweep);
+
+        // The child's group was SIGKILLed by the call above; reap it.
+        let mut status = 0;
+        unsafe { libc::waitpid(child, &mut status, 0) };
+        fs::remove_file(&path).ok();
+
+        assert!(
+            matches!(verdict, Err(ref reason) if reason.contains("harness cleanup incomplete")),
+            "incomplete cleanup must be a loud failure, got {verdict:?}"
+        );
+    }
+
+    #[test]
     fn session_exec_refuses_a_pre_existing_identity_file() {
         let path = test_path("existing");
         fs::write(&path, "existing identity").unwrap();
