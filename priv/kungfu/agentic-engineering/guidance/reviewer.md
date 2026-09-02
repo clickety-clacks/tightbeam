@@ -85,8 +85,8 @@ and the reader cannot tell them apart unless you do. The clause table is the tra
 proves the review happened.
 
 The verdict note has a 2,000-character cap. Keep the full clause table in the note
-when it fits. When it does not fit, put the full table in one immutable report artifact
-and cite that artifact's id and SHA-256 in the concise verdict note. Use the
+when it fits. When it does not fit, store the full table in the review artifact the
+reviewer generated and cite that artifact's SHA-256 in the concise verdict note. Use the
 `spec-conformance` artifact procedure; do not truncate the table, split it across
 verdicts, or request a cap increase. An `invalid_note` refusal is the signal to use
 that procedure, not a reason to hold the review.

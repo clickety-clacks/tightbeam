@@ -258,16 +258,18 @@ defmodule Tightbeam.ArchetypesTest do
       )
 
     assert reviewer.guidance =~ "The verdict note has a 2,000-character cap"
-    assert reviewer.guidance =~ "one immutable report artifact"
-    assert reviewer.guidance =~ "artifact's id and SHA-256"
+    assert reviewer.guidance =~ ~r/review artifact the\s+reviewer\s+generated/
+    assert reviewer.guidance =~ "artifact's SHA-256"
+    refute reviewer.guidance =~ "one immutable report artifact"
     assert reviewer.guidance =~ "do not truncate the table"
     assert reviewer.guidance =~ "or request a cap increase"
 
     conformance = reviewer.skills["spec-conformance"]
-    assert conformance =~ "tightbeam artifact-record --kind report"
-    assert conformance =~ "--sha256 <hex>"
+    assert conformance =~ ~r/review artifact the\s+reviewer\s+generated/
+    assert conformance =~ "calculate that artifact's SHA-256"
+    refute conformance =~ "tightbeam artifact-record --kind report"
     assert conformance =~ "invalid_note"
-    assert conformance =~ "clause-table artifact id; sha256"
+    assert conformance =~ "review artifact sha256"
   end
 
   # Every archetype x both harnesses, and each `snapshot_at!` is a chain of

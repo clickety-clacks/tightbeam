@@ -30,15 +30,13 @@ is a rubber stamp.
 4. Check the exclusions: behavior inside a named non-goal is an unrequested addition
    and a finding.
 5. Keep the full clause table in the verdict note when the note fits the 2,000-character
-   cap. When it does not fit, write the full table to one report file, calculate its
-   SHA-256, and record that exact file as one immutable report artifact:
-   `sha256sum <report>` then
-   `tightbeam artifact-record --kind report --title "review clause table" --path <report> --work-item <workItemId> --sha256 <hex>`.
-   Cite the returned artifact id and the same SHA-256 in a concise verdict note. Do not
+   cap. When it does not fit, store the full table in the review artifact the reviewer
+   generated and calculate that artifact's SHA-256. Cite the SHA-256 in a concise verdict
+   note. Do not
    truncate the table, split it across verdicts, or request a cap increase. If an
    oversized note receives `invalid_note`, use this artifact remedy instead of retrying
    the oversized note. When every clause is satisfied or out-of-scope, file
-   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<basis; clause-table artifact id; sha256>"`;
+   `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<basis; review artifact sha256>"`;
    when any clause is unsatisfied or unproven, file the same evidence with
    `--verdict changes-requested`.
 6. When a clause is too vague to classify, the spec has a hole. Wake the spec-writer
