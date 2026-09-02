@@ -254,6 +254,58 @@ defmodule Tightbeam.ExecDesksTest do
     assert {:ok, [["open"]]} = DB.query(db, "SELECT state FROM exec_desk_bundles")
   end
 
+  test "an open BUNDLE annotation retains worker and exec attribution", %{db: db, worker: worker} do
+    w1 =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:one",
+        prompt: "one",
+        due_at: 1
+      })
+
+    w2 =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:two",
+        prompt: "two",
+        due_at: 1
+      })
+
+    assert {:ok, bundle_id} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+
+               bundle_id =
+                 ExecDesks.open_bundle_in_txn(
+                   txn,
+                   worker.session_key,
+                   [w1.wake_id, w2.wake_id],
+                   2
+                 )
+
+               :ok =
+                 ExecDesks.annotate_in_txn(
+                   txn,
+                   %{bundle_id: bundle_id},
+                   worker.session_key,
+                   "exec_one",
+                   "assignment",
+                   "asg_closed",
+                   3
+                 )
+
+               bundle_id
+             end)
+
+    worker_key = worker.session_key
+
+    assert {:ok, [[^bundle_id, ^worker_key, "exec_one", "assignment", "asg_closed"]]} =
+             DB.query(
+               db,
+               "SELECT bundleId, workerSessionKey, execId, citedKind, citedId FROM exec_desk_annotations"
+             )
+  end
+
   test "refuses cross-worker BUNDLE members and ANNOTATE attribution", %{db: db, worker: worker} do
     other =
       Org.create(db, %{
@@ -306,6 +358,21 @@ defmodule Tightbeam.ExecDesksTest do
                  %{wake_id: own_wake.wake_id},
                  worker.session_key,
                  "other_exec",
+                 "assignment",
+                 "asg_closed",
+                 2
+               )
+             end)
+
+    assert {:error, %ArgumentError{message: "annotation wake is not owned by this worker"}} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+
+               ExecDesks.annotate_in_txn(
+                 txn,
+                 %{wake_id: other_wake.wake_id},
+                 worker.session_key,
+                 "exec_one",
                  "assignment",
                  "asg_closed",
                  2
