@@ -9,7 +9,7 @@ defmodule Tightbeam.ExecDesks do
   credential-selection decisions they need to make their own transaction atomic.
   """
 
-  alias Tightbeam.{DB, Id, Org}
+  alias Tightbeam.{DB, Gateway, Id, Org}
   alias Tightbeam.DB.Txn
 
   @policy_revision "exec-desks-v1"
@@ -171,6 +171,22 @@ defmodule Tightbeam.ExecDesks do
     if Txn.changes(txn) == 1, do: :ok, else: raise(ArgumentError, "BUNDLE is not open")
   end
 
+  @doc "Append the worker delivery and terminalize the BUNDLE in one caller-owned transaction."
+  def deliver_bundle_in_txn(txn, bundle_id, worker, origin, prompt, at, opts \\ []) do
+    if open_bundle_for_worker_in_txn(txn, bundle_id, worker) do
+      case Gateway.deliver_prompt_in_txn(txn, worker, origin, prompt, opts) do
+        {:appended, ^worker, _message, _opts} = delivery ->
+          :ok = terminalize_bundle_in_txn(txn, bundle_id, :delivered, nil, at)
+          delivery
+
+        other ->
+          other
+      end
+    else
+      raise ArgumentError, "BUNDLE is not open for this worker"
+    end
+  end
+
   @doc "Resolve a policy-selected parent in the same owner transaction as its send."
   @spec effective_parent_in_txn(Txn.t(), String.t()) :: String.t()
   def effective_parent_in_txn(%Txn{} = txn, worker),
@@ -239,5 +255,13 @@ defmodule Tightbeam.ExecDesks do
       [[exec_id, 1]] -> %{exec_id: exec_id, enabled: true}
       _ -> nil
     end
+  end
+
+  defp open_bundle_for_worker_in_txn(txn, bundle_id, worker) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM exec_desk_bundles WHERE bundleId=?1 AND workerSessionKey=?2 AND state='open'",
+      [bundle_id, worker]
+    ) != []
   end
 end

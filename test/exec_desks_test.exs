@@ -110,4 +110,50 @@ defmodule Tightbeam.ExecDesksTest do
                w2.wake_id
              ])
   end
+
+  test "BUNDLE delivery and its terminal outcome commit together", %{db: db, worker: worker} do
+    w1 =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:one",
+        prompt: "one",
+        due_at: 1
+      })
+
+    w2 =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:two",
+        prompt: "two",
+        due_at: 1
+      })
+
+    assert {:ok, {:appended, _worker, _message, _opts}} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+
+               bundle_id =
+                 ExecDesks.open_bundle_in_txn(
+                   txn,
+                   worker.session_key,
+                   [w1.wake_id, w2.wake_id],
+                   2
+                 )
+
+               ExecDesks.deliver_bundle_in_txn(
+                 txn,
+                 bundle_id,
+                 worker.session_key,
+                 "agent:exec",
+                 "bundle",
+                 3
+               )
+             end)
+
+    assert {:ok, [["delivered", 3]]} =
+             DB.query(db, "SELECT state, terminalAt FROM exec_desk_bundles")
+
+    assert {:ok, [[1]]} =
+             DB.query(db, "SELECT COUNT(*) FROM turns WHERE sessionKey=?1", [worker.session_key])
+  end
 end
