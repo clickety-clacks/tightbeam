@@ -5365,9 +5365,7 @@ defmodule Tightbeam.Gateway do
          condition_kind,
          condition_scope
        ) do
-    p = call.params
-
-    case revalidate_supervision_delivery_in_txn(txn, call) do
+    case revalidate_wake_delivery_in_txn(txn, call) do
       :ready ->
         schedule_validated_wake_row_in_txn(
           txn,
@@ -5378,10 +5376,37 @@ defmodule Tightbeam.Gateway do
           condition_scope
         )
 
-      reason when reason in [:suppressed, :stale] ->
-        %{suppressed: true, reason: reason, assignment_id: p[:assignment_id]}
+      reason when reason in [:assignment_not_open, :suppressed, :stale] ->
+        %{
+          suppressed: true,
+          reason: reason,
+          assignment_id: wake_assignment_id_in_txn(txn, call)
+        }
     end
   end
+
+  defp revalidate_wake_delivery_in_txn(txn, call) do
+    with :ready <- revalidate_remedy_assignment_in_txn(txn, call),
+         :ready <- revalidate_supervision_delivery_in_txn(txn, call) do
+      :ready
+    end
+  end
+
+  defp revalidate_remedy_assignment_in_txn(
+         txn,
+         %{
+           principal: {:remedy, %{action: "wake"}},
+           bound_assignment_id: assignment_id
+         }
+       )
+       when is_binary(assignment_id) do
+    case DB.Txn.q(txn, "SELECT state FROM assignments WHERE id = ?1", [assignment_id]) do
+      [["open"]] -> :ready
+      _ -> :assignment_not_open
+    end
+  end
+
+  defp revalidate_remedy_assignment_in_txn(_txn, _call), do: :ready
 
   defp schedule_validated_wake_row_in_txn(
          txn,

@@ -25,7 +25,7 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway, NoticeBatcher}
+  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway, NoticeBatcher, Supervision}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -2459,23 +2459,27 @@ defmodule Tightbeam.Wakes do
       if wake.digest, do: NoticeBatcher.delivery_attempted(db, wake.wake_id)
 
       delivery =
-        case wake.consumer do
-          "prompt" ->
-            if suppressed_by_recognition?(db, wake) do
-              :retry
-            else
-              attempt_delivery(fn -> deliver.(wake) end)
-            end
+        if dispose_closed_remedy(db, wake) do
+          :disposed
+        else
+          case wake.consumer do
+            "prompt" ->
+              if suppressed_by_recognition?(db, wake) do
+                :retry
+              else
+                attempt_delivery(fn -> deliver.(wake) end)
+              end
 
-          consumer ->
-            case Map.fetch(consumers, consumer) do
-              {:ok, internal_consumer} ->
-                attempt_internal_delivery(db, wake, internal_consumer)
+            consumer ->
+              case Map.fetch(consumers, consumer) do
+                {:ok, internal_consumer} ->
+                  attempt_internal_delivery(db, wake, internal_consumer)
 
-              :error ->
-                undeliverable(db, wake, "unknown internal consumer #{inspect(consumer)}")
-                false
-            end
+                :error ->
+                  undeliverable(db, wake, "unknown internal consumer #{inspect(consumer)}")
+                  false
+              end
+          end
         end
 
       case {wake.consumer, delivery} do
@@ -2494,6 +2498,96 @@ defmodule Tightbeam.Wakes do
 
     evaluate_conditions(state, :tick)
     :ok
+  end
+
+  defp dispose_closed_remedy(db, %{origin: "remedy:" <> _} = wake) do
+    transaction!(db, fn txn ->
+      assignment_id = remedy_assignment_id_in_txn(txn, wake)
+
+      case Txn.q(txn, "SELECT state, workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
+        [["closed", work_item_id]] ->
+          liveness_trigger =
+            if is_binary(wake.assignment_id),
+              do: disposition_liveness_trigger!(txn, work_item_id)
+
+          outcome = %{
+            kind: "disposition",
+            disposition_kind: "assignment_transition",
+            disposition_id: assignment_id
+          }
+
+          cancellation = %{
+            wake_id: wake.wake_id,
+            requester: %{kind: "process", id: "tightbeam:assignments"},
+            reason_kind: "obligation_disposed",
+            causal_source: %{kind: "assignment_transition", id: assignment_id},
+            outcome:
+              if(is_map(liveness_trigger),
+                do: Map.put(outcome, :liveness_trigger, liveness_trigger),
+                else: outcome
+              )
+          }
+
+          Tightbeam.RailRemedy.dispose_assignment_in_txn(txn, assignment_id, cancellation)
+          true
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  defp dispose_closed_remedy(_db, _wake), do: false
+
+  defp remedy_assignment_id_in_txn(_txn, %{assignment_id: assignment_id})
+       when is_binary(assignment_id),
+       do: assignment_id
+
+  defp remedy_assignment_id_in_txn(txn, %{wake_id: wake_id, origin: origin}) do
+    case Txn.q(
+           txn,
+           """
+           SELECT episode.subject
+           FROM rail_remedy_episodes episode
+           JOIN assignments assignment ON assignment.id = episode.subject
+           JOIN wire_idempotency idem
+             ON idem.ownerUserId = ?2
+            AND idem.operation = 'wake'
+            AND idem.sessionKey = ?1
+            AND (
+              substr(idem.idempotencyKey, 1,
+                length('rail-dispatch:' || episode.statute || ':' || episode.subject || ':')) =
+                'rail-dispatch:' || episode.statute || ':' || episode.subject || ':'
+              OR
+              substr(idem.idempotencyKey, 1,
+                length('rail-rewake:' || episode.statute || ':' || episode.subject || ':')) =
+                'rail-rewake:' || episode.statute || ':' || episode.subject || ':'
+            )
+           WHERE ?2 = 'remedy:' || episode.statute
+           ORDER BY episode.openedAt DESC, episode.subject
+           LIMIT 1
+           """,
+           [wake_id, origin]
+         ) do
+      [[assignment_id]] -> assignment_id
+      [] -> nil
+    end
+  end
+
+  defp disposition_liveness_trigger!(_txn, nil), do: nil
+
+  defp disposition_liveness_trigger!(txn, work_item_id) do
+    case Txn.q(txn, "SELECT state FROM work_items WHERE id = ?1", [work_item_id]) do
+      [["open"]] ->
+        case Supervision.liveness_trigger_in_txn(txn, {:work_item, work_item_id}) do
+          {:ok, trigger} -> trigger
+          :none -> raise "open work item #{work_item_id} has no liveness trigger"
+          {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+        end
+
+      [[_terminal]] ->
+        nil
+    end
   end
 
   # THE PRODDER'S TRUE ACT TIME (spec production-machine-v1 §The prod
