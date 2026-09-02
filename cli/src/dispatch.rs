@@ -2461,50 +2461,9 @@ mod tests {
             ),
             (
                 &[
-                    "topline-concern-update",
-                    "tlc_1",
-                    "--title",
-                    "Risk",
-                    "--reason",
-                    "why",
-                    "--key",
-                    "k",
-                    "--as-user",
-                    "flynn",
-                ][..],
-                r#"{"asUser":"flynn","verb":"topline-concern-update","params":{"concernId":"tlc_1","title":"Risk","reason":"why","idempotencyKey":"k"}}"#,
-            ),
-            (
-                &[
-                    "topline-concern-resolve",
-                    "tlc_1",
-                    "--reason",
-                    "why",
-                    "--key",
-                    "k",
-                    "--as-user",
-                    "flynn",
-                ][..],
-                r#"{"asUser":"flynn","verb":"topline-concern-resolve","params":{"concernId":"tlc_1","reason":"why","idempotencyKey":"k"}}"#,
-            ),
-            (
-                &[
-                    "topline-concern-reopen",
-                    "tlc_1",
-                    "--reason",
-                    "why",
-                    "--key",
-                    "k",
-                    "--as-user",
-                    "flynn",
-                ][..],
-                r#"{"asUser":"flynn","verb":"topline-concern-reopen","params":{"concernId":"tlc_1","reason":"why","idempotencyKey":"k"}}"#,
-            ),
-            (
-                &[
                     "topline-concern-link-work",
                     "tlc_1",
-                    "tlm_1",
+                    "wi_1",
                     "--reason",
                     "why",
                     "--key",
@@ -2512,12 +2471,13 @@ mod tests {
                     "--as-user",
                     "flynn",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-concern-link-work","params":{"concernId":"tlc_1","membershipId":"tlm_1","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"flynn","verb":"topline-concern-link-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
             ),
             (
                 &[
                     "topline-concern-unlink-work",
-                    "tlcr_1",
+                    "tlc_1",
+                    "wi_1",
                     "--reason",
                     "why",
                     "--key",
@@ -2525,7 +2485,7 @@ mod tests {
                     "--as-user",
                     "flynn",
                 ][..],
-                r#"{"asUser":"flynn","verb":"topline-concern-unlink-work","params":{"concernRefId":"tlcr_1","reason":"why","idempotencyKey":"k"}}"#,
+                r#"{"asUser":"flynn","verb":"topline-concern-unlink-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
             ),
         ] {
             assert_eq!(body(argv), expected);

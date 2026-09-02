@@ -570,11 +570,8 @@ COMMANDS:
   topline-link-work <toplineId> <workItemId> --reason <text> --key <idempotencyKey>
   topline-unlink-work <membershipId> --reason <text> --key <idempotencyKey>
   topline-concern-create <toplineId> --title <text> --key <idempotencyKey>
-  topline-concern-update <concernId> --title <text> --reason <text> --key <idempotencyKey>
-  topline-concern-resolve <concernId> --reason <text> --key <idempotencyKey>
-  topline-concern-reopen <concernId> --reason <text> --key <idempotencyKey>
-  topline-concern-link-work <concernId> <membershipId> --reason <text> --key <idempotencyKey>
-  topline-concern-unlink-work <concernRefId> --reason <text> --key <idempotencyKey>
+  topline-concern-link-work <concernId> <workItemId> --reason <text> --key <idempotencyKey>
+  topline-concern-unlink-work <concernId> <workItemId> --reason <text> --key <idempotencyKey>
   topline-work-leave-unlinked <workItemId> --reason <text> --key <idempotencyKey>
   topline-placement-list [--state pending|resolved|all]
   work-item-icebox <workItemId>
@@ -979,8 +976,6 @@ fn topline_mutation(
         "topline-link-work" => &["reason", "key"][..],
         "topline-unlink-work" => &["reason", "key"][..],
         "topline-concern-create" => &["title", "key"][..],
-        "topline-concern-update" => &["title", "reason", "key"][..],
-        "topline-concern-resolve" | "topline-concern-reopen" => &["reason", "key"][..],
         "topline-concern-link-work" => &["reason", "key"][..],
         "topline-concern-unlink-work" => &["reason", "key"][..],
         "topline-work-leave-unlinked" => &["reason", "key"][..],
@@ -1047,36 +1042,20 @@ fn topline_mutation(
                 key()?,
             ]
         }
-        "topline-concern-update" => {
-            exact(2)?;
-            vec![
-                ("concernId".to_owned(), positional[1].clone()),
-                title()?,
-                reason()?,
-                key()?,
-            ]
-        }
-        "topline-concern-resolve" | "topline-concern-reopen" => {
-            exact(2)?;
-            vec![
-                ("concernId".to_owned(), positional[1].clone()),
-                reason()?,
-                key()?,
-            ]
-        }
         "topline-concern-link-work" => {
             exact(3)?;
             vec![
                 ("concernId".to_owned(), positional[1].clone()),
-                ("membershipId".to_owned(), positional[2].clone()),
+                ("workItemId".to_owned(), positional[2].clone()),
                 reason()?,
                 key()?,
             ]
         }
         "topline-concern-unlink-work" => {
-            exact(2)?;
+            exact(3)?;
             vec![
-                ("concernRefId".to_owned(), positional[1].clone()),
+                ("concernId".to_owned(), positional[1].clone()),
+                ("workItemId".to_owned(), positional[2].clone()),
                 reason()?,
                 key()?,
             ]
@@ -1793,9 +1772,6 @@ fn parse_with_optional_catalog(
         | "topline-link-work"
         | "topline-unlink-work"
         | "topline-concern-create"
-        | "topline-concern-update"
-        | "topline-concern-resolve"
-        | "topline-concern-reopen"
         | "topline-concern-link-work"
         | "topline-concern-unlink-work"
         | "topline-work-leave-unlinked") => topline_mutation(verb, &parsed.positional, flags),
@@ -2024,7 +2000,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-update, topline-concern-resolve, topline-concern-reopen, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2990,9 +2966,6 @@ mod tests {
                 "topline-link-work",
                 "topline-unlink-work",
                 "topline-concern-create",
-                "topline-concern-update",
-                "topline-concern-resolve",
-                "topline-concern-reopen",
                 "topline-concern-link-work",
                 "topline-concern-unlink-work",
                 "topline-work-leave-unlinked",
@@ -3542,7 +3515,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-update, topline-concern-resolve, topline-concern-reopen, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 
