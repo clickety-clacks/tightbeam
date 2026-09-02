@@ -1506,6 +1506,41 @@ defmodule Tightbeam.ModelCatalogTest do
   # Task #41. The catalog must not advertise a model the adapter will refuse, and no
   # substitution may be smuggled in at the only place a mapping could live.
   describe "claude selectable-model pin" do
+    test "keeps Fable 5.1 default and 1m vendor identities", ctx do
+      fetch = fn "/v1/models?limit=100", _headers ->
+        {:ok,
+         JSON.encode!(%{
+           "data" => [
+             context_variant_model("claude-fable-5-1"),
+             context_variant_model("claude-fable-5-1[1m]"),
+             context_variant_model("claude-sonnet-4-6")
+           ]
+         })}
+      end
+
+      catalog =
+        start_catalog(ctx,
+          claude_fetch: fetch,
+          claude_selectable_models: Tightbeam.Harness.Claude.adapter_selectable_models()
+        )
+
+      await_fresh(catalog, "claude")
+      {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
+
+      assert Enum.map(claude, &{&1.family, &1.context}) == [
+               {"claude-fable-5-1", nil},
+               {"claude-fable-5-1", "1m"}
+             ]
+
+      assert {:ok, %{entry: %{family: "claude-fable-5-1", context: "1m"}}} =
+               ModelCatalog.route(
+                 @host,
+                 "claude",
+                 Model.new("claude-fable-5-1", context: "1m", effort: "high"),
+                 catalog
+               )
+    end
+
     test "withholds models the adapter refuses and keeps the ones it accepts", ctx do
       catalog =
         start_catalog(ctx,
