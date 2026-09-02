@@ -172,6 +172,33 @@ enum PostStopFault {
 thread_local! {
     static POST_STOP_FAULT: std::cell::Cell<PostStopFault> =
         const { std::cell::Cell::new(PostStopFault::Disarmed) };
+    /// Forces the next initial-capture snapshot to fail, for the uncaptured-member control.
+    static CAPTURE_SNAPSHOT_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Forces the next initial-capture start-time read to fail non-ESRCH, for the same control.
+    static CAPTURE_STARTTIME_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enumerate the process table for the initial member capture. A test seam can force this to
+/// fail so the control can prove an unenumerable group is recorded loudly, not dropped.
+fn capture_group_snapshot() -> Result<Snapshot, String> {
+    #[cfg(test)]
+    if CAPTURE_SNAPSHOT_FAULT.with(|fault| fault.replace(false)) {
+        return Err("injected initial-capture snapshot fault".into());
+    }
+    Snapshot::capture()
+}
+
+/// Read a member's start time for the initial capture. A test seam can force one non-ESRCH
+/// failure so the control can prove an untokenable stopped member is recorded loudly.
+fn capture_member_start_time(pid: libc::pid_t) -> io::Result<ProcessStartTime> {
+    #[cfg(test)]
+    if CAPTURE_STARTTIME_FAULT.with(|fault| fault.replace(false)) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected initial-capture start-time fault",
+        ));
+    }
+    read_process_start_time(pid)
 }
 
 impl HarnessTarget {
@@ -512,18 +539,43 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
         // doubt, the bare pgid must never be signalled (it may have been reused), but a captured
         // member whose birth token still matches is provably the process we stopped. Reading is
         // safe without a fresh revalidation — the group was just verified and is now held still.
-        if let Ok(snapshot) = Snapshot::capture() {
-            for pid in snapshot.group_tree(pgid) {
-                if pid == me || snapshot.pgid_of(pid) != Some(pgid) {
-                    continue;
+        //
+        // A member this step cannot bind a token to has no authority for later disposal AND
+        // cannot be reached by a bare-pgid signal once identity fails, so it may be stranded
+        // stopped. That is unrecoverable, not accommodatable: record it LOUDLY (incomplete +
+        // reason) so the sweep refuses rather than silently dropping the gap.
+        match capture_group_snapshot() {
+            Ok(snapshot) => {
+                for pid in snapshot.group_tree(pgid) {
+                    if pid == me || snapshot.pgid_of(pid) != Some(pgid) {
+                        continue;
+                    }
+                    match capture_member_start_time(pid) {
+                        Ok(start_time) => {
+                            sweep.frozen.insert(ProcessInstance {
+                                pid,
+                                pgid,
+                                start_time,
+                            });
+                        }
+                        // Already gone — nothing of ours is stopped at this pid.
+                        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+                        Err(error) => {
+                            sweep.incomplete = true;
+                            sweep.failures.push(format!(
+                                "stopped member {pid} start time could not be read at capture, \
+                                 leaving no birth token for disposal: {error}"
+                            ));
+                        }
+                    }
                 }
-                if let Ok(start_time) = read_process_start_time(pid) {
-                    sweep.frozen.insert(ProcessInstance {
-                        pid,
-                        pgid,
-                        start_time,
-                    });
-                }
+            }
+            Err(reason) => {
+                sweep.incomplete = true;
+                sweep.failures.push(format!(
+                    "recorded group members could not be enumerated for capture, leaving no birth \
+                     tokens for disposal: {reason}"
+                ));
             }
         }
     }
@@ -1395,6 +1447,82 @@ mod tests {
                     && reason.contains("bare group left unsignalled")),
             "verdict must be a loud incomplete cleanup that left the bare pgid unsignalled, got {verdict:?}"
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_uncaptured_stopped_member_makes_the_sweep_loudly_incomplete() {
+        // F1 round-three control: if the initial capture cannot bind a birth token to a
+        // group-stopped member (process table unreadable, or a non-ESRCH start-time read), that
+        // member has no authority for terminal disposal and — once identity fails — cannot be
+        // reached by a bare pgid either. That gap is unrecoverable, so it must be recorded
+        // LOUDLY, never dropped. We arm a persistent identity fault (so the loop cannot
+        // recapture) AND a capture start-time fault, then assert the member is absent from
+        // frozen, the sweep is incomplete with a recorded capture reason, and the verdict is a
+        // loud incomplete cleanup. Reverting the capture-error recording (silent drop) leaves
+        // the sweep not incomplete — red.
+        let child = fork_owned_session_child();
+        let pgid = child;
+        let boot = boot_identity().unwrap();
+        let launch = "uncaptured-member-launch";
+        let path = test_path("uncaptured-member");
+        fs::write(&path, format!("{pgid}\t{pgid}\t{boot}\t{launch}")).unwrap();
+        // The member is deliberately left uncaptured and, under the persistent fault,
+        // unsignalled; the guard SIGKILLs and reaps the stranded child at end of scope.
+        let _guard = StoppedChildGuard {
+            pid: child,
+            path: path.clone(),
+            armed: true,
+        };
+
+        let target = HarnessTarget {
+            pgid,
+            identity_path: path.to_string_lossy().into_owned(),
+            boot_identity: boot,
+            launch_id: launch.into(),
+        };
+
+        POST_STOP_FAULT.with(|fault| fault.set(PostStopFault::ArmedPersistent));
+        CAPTURE_STARTTIME_FAULT.with(|fault| fault.set(true));
+        let freeze = freeze_harness_tree(&target);
+        let sweep = match freeze {
+            Ok(sweep) => sweep,
+            Err(reason) => {
+                POST_STOP_FAULT.with(|fault| fault.set(PostStopFault::Disarmed));
+                CAPTURE_STARTTIME_FAULT.with(|fault| fault.set(false));
+                panic!("freeze must record the capture failure and return Ok, got Err: {reason}");
+            }
+        };
+        // The member could not be tokened, so it is absent from frozen but recorded loudly.
+        assert!(
+            !sweep.frozen.iter().any(|instance| instance.pid == child),
+            "the untokenable member must not be captured, got {:?}",
+            sweep.frozen
+        );
+        assert!(
+            sweep.incomplete,
+            "an uncaptured stopped member must mark the sweep incomplete"
+        );
+        assert!(
+            sweep
+                .failures
+                .iter()
+                .any(|reason| reason.contains("start time could not be read at capture")),
+            "the capture failure must be recorded, got {:?}",
+            sweep.failures
+        );
+
+        // Identity still fails at the kill phase, so the bare pgid stays unsignalled; the member
+        // is stranded but the verdict is a loud incomplete cleanup, never a silent success.
+        let verdict = kill_harness_tree(&target, sweep);
+        POST_STOP_FAULT.with(|fault| fault.set(PostStopFault::Disarmed));
+        CAPTURE_STARTTIME_FAULT.with(|fault| fault.set(false));
+
+        assert!(
+            matches!(verdict, Err(ref reason) if reason.contains("harness cleanup incomplete")),
+            "an untokenable stopped member must surface as a loud incomplete cleanup, got {verdict:?}"
+        );
+        // `_guard` SIGKILLs and reaps the stranded child at end of scope.
     }
 
     #[test]
