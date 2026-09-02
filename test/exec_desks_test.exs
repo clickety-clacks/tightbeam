@@ -1,7 +1,7 @@
 defmodule Tightbeam.ExecDesksTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, ExecDesks, Model, Org}
+  alias Tightbeam.{DB, ExecDesks, Model, Org, Wakes}
 
   setup do
     db = :"exec_desks_#{System.unique_integer([:positive])}"
@@ -60,5 +60,54 @@ defmodule Tightbeam.ExecDesksTest do
              ExecDesks.ringdown(candidates, fn %{provider: provider} ->
                if provider == :second, do: {:ok, :answer}, else: {:error, :unused}
              end)
+  end
+
+  test "an enabled exec writes an ordered BUNDLE and preserves source wakes", %{
+    db: db,
+    worker: worker
+  } do
+    w1 =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:one",
+        prompt: "one",
+        due_at: 1
+      })
+
+    w2 =
+      Wakes.schedule(db, %{
+        session_key: worker.session_key,
+        origin: "agent:two",
+        prompt: "two",
+        due_at: 1
+      })
+
+    assert {:ok, bundle_id} =
+             DB.transaction(db, fn txn ->
+               :ok = ExecDesks.bind_in_txn(txn, worker.session_key, "exec_one", true, 1)
+               ExecDesks.open_bundle_in_txn(txn, worker.session_key, [w1.wake_id, w2.wake_id], 2)
+             end)
+
+    wake_one = w1.wake_id
+    wake_two = w2.wake_id
+
+    assert {:ok, [[^wake_one, 1], [^wake_two, 2]]} =
+             DB.query(
+               db,
+               "SELECT wakeId, ordinal FROM exec_desk_bundle_members WHERE bundleId=?1 ORDER BY ordinal",
+               [bundle_id]
+             )
+
+    assert {:ok, :ok} =
+             DB.transaction(
+               db,
+               &ExecDesks.terminalize_bundle_in_txn(&1, bundle_id, :delivered, nil, 3)
+             )
+
+    assert {:ok, [["pending"], ["pending"]]} =
+             DB.query(db, "SELECT state FROM wakes WHERE wakeId IN (?1, ?2) ORDER BY wakeId", [
+               w1.wake_id,
+               w2.wake_id
+             ])
   end
 end

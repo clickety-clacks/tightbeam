@@ -2,11 +2,11 @@ defmodule Tightbeam.ExecDesks do
   @moduledoc """
   The deterministic, off-by-default shell for a worker's inbound exec.
 
-  This module deliberately has no provider client and no NOTE writer.  The
-  exec is only a policy consumer: it records an elected binding, preserves the
-  source wake identity, and gives callers the bounded timing, grouping,
-  citation, escalation, and credential-selection decisions they need to make
-  their own transaction atomic.
+  This module deliberately has no provider client. The future NOTE surface has
+  one explicit seam: it is not reachable from this deterministic shell. The
+  exec records an elected binding, preserves source wake identity, and gives
+  callers the bounded timing, grouping, citation, escalation, and
+  credential-selection decisions they need to make their own transaction atomic.
   """
 
   alias Tightbeam.{DB, Id, Org}
@@ -110,6 +110,67 @@ defmodule Tightbeam.ExecDesks do
   def group([source]), do: {:direct, source}
   def group([first, second | rest]), do: {:bundle, [first, second | rest]}
 
+  @doc "Persist an ordered BUNDLE only after the binding elected this worker's exec."
+  @spec open_bundle_in_txn(Txn.t(), String.t(), [String.t()], non_neg_integer()) :: String.t()
+  def open_bundle_in_txn(%Txn{} = txn, worker, wake_ids, at)
+      when is_binary(worker) and is_list(wake_ids) and is_integer(at) and at >= 0 do
+    case {binding_in_txn(txn, worker), wake_ids} do
+      {%{enabled: true, exec_id: exec_id}, [_, _ | _]} ->
+        bundle_id = "b_" <> Id.uuid4()
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO exec_desk_bundles
+            (bundleId, workerSessionKey, execId, policyRevision, state, createdAt)
+          VALUES (?1, ?2, ?3, ?4, 'open', ?5)
+          """,
+          [bundle_id, worker, exec_id, @policy_revision, at]
+        )
+
+        wake_ids
+        |> Enum.with_index(1)
+        |> Enum.each(fn {wake_id, ordinal} ->
+          Txn.q(
+            txn,
+            "INSERT INTO exec_desk_bundle_members (bundleId, wakeId, ordinal) VALUES (?1, ?2, ?3)",
+            [bundle_id, wake_id, ordinal]
+          )
+        end)
+
+        bundle_id
+
+      {_binding, [_]} ->
+        raise ArgumentError, "a BUNDLE requires more than one source wake"
+
+      {_binding, _} ->
+        raise ArgumentError, "an enabled exec binding is required for a BUNDLE"
+    end
+  end
+
+  @doc "Terminal bundle state is named; source members are never deleted or rewritten."
+  @spec terminalize_bundle_in_txn(
+          Txn.t(),
+          String.t(),
+          :delivered | :expired,
+          String.t() | nil,
+          non_neg_integer()
+        ) :: :ok
+  def terminalize_bundle_in_txn(%Txn{} = txn, bundle_id, state, cause, at)
+      when is_binary(bundle_id) and state in [:delivered, :expired] and
+             (is_binary(cause) or is_nil(cause)) and is_integer(at) and at >= 0 do
+    Txn.q(
+      txn,
+      """
+      UPDATE exec_desk_bundles SET state=?2, terminalAt=?3, terminalCause=?4
+      WHERE bundleId=?1 AND state='open'
+      """,
+      [bundle_id, Atom.to_string(state), at, cause]
+    )
+
+    if Txn.changes(txn) == 1, do: :ok, else: raise(ArgumentError, "BUNDLE is not open")
+  end
+
   @doc "Resolve a policy-selected parent in the same owner transaction as its send."
   @spec effective_parent_in_txn(Txn.t(), String.t()) :: String.t()
   def effective_parent_in_txn(%Txn{} = txn, worker),
@@ -168,4 +229,15 @@ defmodule Tightbeam.ExecDesks do
 
   defp annotation_target!(_),
     do: raise(ArgumentError, "annotation target must name one wake or BUNDLE")
+
+  defp binding_in_txn(txn, worker) do
+    case Txn.q(
+           txn,
+           "SELECT execId, enabled FROM exec_desk_bindings WHERE workerSessionKey=?1 AND policyRevision=?2",
+           [worker, @policy_revision]
+         ) do
+      [[exec_id, 1]] -> %{exec_id: exec_id, enabled: true}
+      _ -> nil
+    end
+  end
 end
