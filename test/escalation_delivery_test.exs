@@ -522,6 +522,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
              # ancestor, deduped by deterministic wakeId.
              {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt/4",
               "enqueue_notice/4"} => 1,
+             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
+              "route_patrol_escalation/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
               "notify_stranded_ancestor/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
