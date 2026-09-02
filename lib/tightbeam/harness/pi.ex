@@ -28,12 +28,12 @@ defmodule Tightbeam.Harness.Pi do
     },
     {
       "  async closeSession(params) {\n    this.sessions.close(params.sessionId);\n    return {};\n  }\n  async listSessions(params) {",
-      "  async closeSession(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (session) await session.cancel();\n    this.sessions.close(params.sessionId);\n    return {};\n  }\n  async listSessions(params) {",
+      "  async closeSession(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    try {\n      if (session) await session.cancel();\n    } finally {\n      this.sessions.close(params.sessionId);\n    }\n    return {};\n  }\n  async listSessions(params) {",
       [optional: true]
     },
     {
       "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async listSessions(params) {",
-      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async closeSession(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (session) await session.cancel();\n    this.sessions.close(params.sessionId);\n    return {};\n  }\n  async listSessions(params) {"
+      "  async cancel(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    if (!session) return;\n    await session.cancel();\n  }\n  async closeSession(params) {\n    const session = this.sessions.maybeGet(params.sessionId);\n    try {\n      if (session) await session.cancel();\n    } finally {\n      this.sessions.close(params.sessionId);\n    }\n    return {};\n  }\n  async listSessions(params) {"
     }
   ]
   @credential_file "auth.json"

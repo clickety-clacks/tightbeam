@@ -10,6 +10,19 @@ defmodule Tightbeam.HarnessPiTest do
     }
   """
 
+  # Negative control for blocker 1: the pre-fix sequential await-then-close body.
+  # When cancellation rejects, the await throws before close runs, so the session
+  # is retained and close is never called. Reverting the pi.ex fix reproduces this
+  # body and turns the positive rejection test below red.
+  @sequential_close_session """
+    async closeSession(params) {
+      const session = this.sessions.maybeGet(params.sessionId);
+      if (session) await session.cancel();
+      this.sessions.close(params.sessionId);
+      return {};
+    }
+  """
+
   test "adapter patch adds abort-on-close lifecycle and preserves concurrent sessions idempotently" do
     patched = Pi.patch_adapter_source(pristine_adapter_fixture())
 
@@ -26,7 +39,7 @@ defmodule Tightbeam.HarnessPiTest do
       pristine_adapter_fixture()
       |> Pi.patch_adapter_source()
       |> String.replace(
-        "    const session = this.sessions.maybeGet(params.sessionId);\n    if (session) await session.cancel();\n    this.sessions.close(params.sessionId);",
+        "    const session = this.sessions.maybeGet(params.sessionId);\n    try {\n      if (session) await session.cancel();\n    } finally {\n      this.sessions.close(params.sessionId);\n    }",
         "    this.sessions.close(params.sessionId);",
         global: false
       )
@@ -72,6 +85,32 @@ defmodule Tightbeam.HarnessPiTest do
              "stopReason" => "end_turn",
              "trace" => ["dispose"]
            }
+  end
+
+  test "patched closeSession closes the session in finally even when cancellation rejects" do
+    patched_close_session =
+      pristine_adapter_fixture()
+      |> Pi.patch_adapter_source()
+      |> close_session_source()
+
+    result = cancel_rejection_contract(patched_close_session)
+
+    # Close runs exactly once in the finally path, so the session is gone...
+    assert result["closeCalls"] == 1
+    assert result["sessionClosed"] == true
+    # ...and the cancellation failure is still observable, not a false success.
+    assert result["cancelRejected"] == true
+    assert result["cancelError"] =~ "injected abort failure"
+  end
+
+  test "sequential await-then-close body strands the session when cancellation rejects" do
+    result = cancel_rejection_contract(@sequential_close_session)
+
+    # Negative control: the await throws before close, so close never runs and the
+    # session is retained. This is the failure the finally-based fix eliminates.
+    assert result["closeCalls"] == 0
+    assert result["sessionClosed"] == false
+    assert result["cancelRejected"] == true
   end
 
   test "projected extension injects served identity and blocks compiled rails before execution" do
@@ -286,6 +325,24 @@ defmodule Tightbeam.HarnessPiTest do
       """
       import { runCloseContract } from #{JSON.encode!(fixture)};
       const result = await runCloseContract(#{JSON.encode!(close_session_source)});
+      process.stdout.write(JSON.stringify(result));
+      """
+    )
+
+    {output, 0} = System.cmd("node", [runner], cd: root, stderr_to_stdout: true)
+    JSON.decode!(output)
+  end
+
+  defp cancel_rejection_contract(close_session_source) do
+    root = tmp_dir!("pi-cancel-rejection")
+    runner = Path.join(root, "runner.mjs")
+    fixture = Path.expand("fixtures/pi_acp/0.0.33-close-contract.mjs", __DIR__)
+
+    File.write!(
+      runner,
+      """
+      import { runCancelRejectionContract } from #{JSON.encode!(fixture)};
+      const result = await runCancelRejectionContract(#{JSON.encode!(close_session_source)});
       process.stdout.write(JSON.stringify(result));
       """
     )

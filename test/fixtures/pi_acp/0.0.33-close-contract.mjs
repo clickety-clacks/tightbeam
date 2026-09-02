@@ -9,14 +9,20 @@ export const release = {
 };
 
 class PiRpcProcess {
-  constructor(trace) {
+  constructor(trace, options = {}) {
     this.trace = trace;
     this.requests = [];
+    // When set, an abort request returns success:false, driving the verbatim
+    // PiRpcProcess.abort contract below to throw — i.e. session.cancel() rejects.
+    this.failAbort = Boolean(options.failAbort);
   }
 
   async request(message) {
     this.requests.push(message);
     this.trace.push(`request:${message.type}`);
+    if (this.failAbort && message.type === "abort") {
+      return { success: false, error: "injected abort failure" };
+    }
     return { success: true };
   }
 
@@ -156,5 +162,51 @@ export async function runCloseContract(closeSessionSource) {
     settlements,
     stopReason,
     sessionClosed: !agent.sessions.sessions.has("sess-1"),
+  };
+}
+
+// Blocker 1 regression contract: session.cancel() rejects during closeSession.
+// The patched handler must still close the session (finally) and let the
+// cancellation failure surface, not swallow it into a false success. The old
+// sequential await-then-close body leaves the session open with zero close calls.
+export async function runCancelRejectionContract(closeSessionSource) {
+  const Agent = new Function(
+    "SessionManager",
+    `return class Agent {
+      constructor() { this.sessions = new SessionManager(); }
+      ${closeSessionSource}
+    }`,
+  )(SessionManager);
+
+  const trace = [];
+  const proc = new PiRpcProcess(trace, { failAbort: true });
+  const session = new PiAcpSession(proc, []);
+  const agent = new Agent();
+  agent.sessions.sessions.set("sess-1", session);
+
+  // Count real close invocations without altering close semantics.
+  let closeCalls = 0;
+  const realClose = agent.sessions.close.bind(agent.sessions);
+  agent.sessions.close = (sessionId) => {
+    closeCalls += 1;
+    return realClose(sessionId);
+  };
+
+  let cancelRejected = false;
+  let cancelError = null;
+  try {
+    await agent.closeSession({ sessionId: "sess-1" });
+  } catch (err) {
+    cancelRejected = true;
+    cancelError = String(err && err.message ? err.message : err);
+  }
+
+  return {
+    release,
+    closeCalls,
+    sessionClosed: !agent.sessions.sessions.has("sess-1"),
+    cancelRejected,
+    cancelError,
+    trace,
   };
 }
