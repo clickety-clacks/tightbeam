@@ -41,8 +41,8 @@ defmodule Tightbeam.StateResources do
   """
 
   @turn_select """
-  SELECT t.seq, t.sessionKey, t.messageId, t.wakeId, t.origin, t.roleRef,
-         t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
+  SELECT t.seq, t.sessionKey, t.messageId, t.wakeId, t.origin, t.prompt,
+         t.roleRef, t.roleFallback, t.assignmentId, t.jobRef, t.model, t.thinkingLevel,
          t.modelContext, t.harness, t.replyAttention, t.status, t.owner,
          t.adapterGen, t.requestRef, t.error, t.createdAt, t.startedAt,
          t.endedAt, t.publishedAt
@@ -60,7 +60,6 @@ defmodule Tightbeam.StateResources do
   alias Tightbeam.{
     AdminProjection,
     Artifacts,
-    Assignments,
     DB,
     Devices,
     Harness,
@@ -68,8 +67,8 @@ defmodule Tightbeam.StateResources do
     ModelCatalog,
     Org,
     ReadMarkers,
-    Wakes,
-    WorkItems
+    StateVisibility,
+    Wakes
   }
 
   alias Tightbeam.DB.Txn
@@ -169,7 +168,7 @@ defmodule Tightbeam.StateResources do
         ~w(lineageRung effortGeneration raisedAt deadlineAt ruledAt consumedAt withdrawnAt answeredAt rowVersion),
       booleans: [],
       nullable:
-        ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context)
+        ~w(raiserId raiserSessionKey ownerUserId assignmentId expecterSessionKey expecterUserId deadlineWakeId deadlineAt statuteName decision rationale ruledBy ruledAt consumedAt withdrawnBy withdrawnReason withdrawnAt askedOfRole answer answeredBy answeredAt context)
     },
     "sessions" => %{
       strings:
@@ -351,25 +350,91 @@ defmodule Tightbeam.StateResources do
     {"kungfu", "status"} => ~w(available installed)
   }
 
-  @assignment_query_fields @item_field_order["assignments"] --
-                             ~w(files derivedStatus rowVersion)
-
   def query_work_item(db, id, call) do
-    case WorkItems.__handle__(db, "work-item-get", %{call | params: %{work_item_id: id}}) do
-      %{workItem: row} -> row
-      %{"workItem" => row} -> row
-      _ -> nil
+    {principal_kind, principal_id, is_admin} = detail_principal(call)
+
+    case query(
+           db,
+           """
+           SELECT wi.id, wi.title, wi.specRefName, wi.specRefSha256, wi.isBug,
+                  wi.ownerUserId, wi.state, wi.failReason, wi.routingWakeId,
+                  wi.slateWakeId, wi.createdByUser, wi.createdBySession,
+                  wi.createdInTurnSeq, wi.createdContextKnown, wi.createdAt,
+                  COALESCE(v.rowVersion, wi.createdAt)
+           FROM work_items AS wi
+           LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
+           WHERE wi.id = ?1 AND (
+             ?2 = 1 OR
+             (?3 = 'user' AND wi.ownerUserId = ?4) OR
+             (?3 = 'session' AND (
+               wi.createdBySession = ?4 OR EXISTS (
+                 SELECT 1 FROM assignments AS held
+                 WHERE held.workItemId = wi.id AND held.holderKey = ?4
+               )
+             ))
+           )
+           """,
+           [id, bool_int(is_admin), principal_kind, principal_id]
+         ) do
+      [row] -> work_item_query_row(row)
+      [] -> nil
     end
   end
 
   def query_assignment(db, id, call) do
-    case Assignments.__handle__(db, "assignment-get", %{call | params: %{assignment_id: id}}) do
-      %{id: ^id} = row -> assignment_query_item(db, id, row)
-      %{"id" => ^id} = row -> assignment_query_item(db, id, row)
-      %{assignment: row} -> assignment_query_item(db, id, row)
-      %{"assignment" => row} -> assignment_query_item(db, id, row)
-      _ -> nil
+    {principal_kind, principal_id, is_admin} = detail_principal(call)
+
+    case query(
+           db,
+           """
+           SELECT a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
+                  a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
+                  a.closedAt, a.closedByUser, a.closedBySession, a.closingAttestId,
+                  a.workItemId, a.reviewsAssignmentId, a.holderHarness, a.holderProvider,
+                  COALESCE(
+                    (SELECT json_group_array(path) FROM (
+                      SELECT path FROM assignment_files
+                      WHERE assignmentId = a.id ORDER BY path
+                    )),
+                    '[]'
+                  ),
+                  COALESCE(
+                    (SELECT effectKind FROM assignment_effects WHERE assignmentId = a.id),
+                    CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END
+                  ),
+                  CASE
+                    WHEN a.state = 'closed' AND a.outcome IN ('surrendered','revoked') THEN 'abandoned'
+                    WHEN a.state = 'closed' AND a.outcome = 'completed' AND EXISTS (
+                      SELECT 1 FROM attests AS verdict
+                      WHERE verdict.assignmentId = a.id AND verdict.kind = 'verdict'
+                        AND verdict.verdictKind = 'verified'
+                    ) THEN 'verified'
+                    WHEN a.state = 'closed' AND a.outcome = 'completed' THEN 'claims-done'
+                    WHEN a.state = 'open' AND (
+                      SELECT state FROM sessions WHERE sessionKey = a.holderKey
+                    ) = 'retired' THEN 'stranded'
+                    WHEN a.state = 'open' AND NOT EXISTS (
+                      SELECT 1 FROM attests AS filed WHERE filed.assignmentId = a.id
+                    ) THEN 'open'
+                    ELSE 'active'
+                  END
+           FROM assignments AS a
+           LEFT JOIN work_items AS wi ON wi.id = a.workItemId
+           WHERE a.id = ?1 AND (
+             ?2 = 1 OR
+             (?3 = 'session' AND (a.holderKey = ?4 OR a.openedBySession = ?4)) OR
+             (?3 = 'user' AND (wi.ownerUserId = ?4 OR a.openedByUser = ?4))
+           )
+           """,
+           [id, bool_int(is_admin), principal_kind, principal_id]
+         ) do
+      [row] -> assignment_query_row(row)
+      [] -> nil
     end
+  end
+
+  def query_wake(db, %{key: id, principal: principal}) do
+    detail_selection(db, "wakes", principal, &Wakes.get_in_txn(&1, id))
   end
 
   def query_wake(db, id), do: Wakes.get(db, id)
@@ -462,12 +527,155 @@ defmodule Tightbeam.StateResources do
     }
   end
 
-  defp assignment_query_item(db, id, row) do
-    Map.new(@assignment_query_fields, fn field ->
-      {field, value(row, String.to_existing_atom(field))}
+  def query_decision_request(db, %{key: id, principal: principal}) do
+    detail_selection(db, "decision requests", principal, fn txn ->
+      txn
+      |> Tightbeam.Escalation.raw_by_id_in_txn(id)
+      |> decision_request_query_row()
     end)
-    |> Map.put("files", Assignments.declared_files(db, id))
-    |> Map.put("derivedStatus", Tightbeam.WorkState.status(db, id))
+  end
+
+  def query_decision_request(db, id) do
+    db |> Tightbeam.Escalation.raw_by_id(id) |> decision_request_query_row()
+  end
+
+  defp decision_request_query_row(nil), do: nil
+
+  defp decision_request_query_row(row) do
+    row
+    |> Map.drop([
+      :action_key,
+      :ruled_via_session_key,
+      :ruled_via_principal,
+      :ruled_via_session_state,
+      :ruling_fact_id,
+      :park_wake_id,
+      :returned_by,
+      :return_reason,
+      :returned_at
+    ])
+    |> Map.put(:row_version, decision_request_version(row))
+  end
+
+  defp decision_request_version(row) do
+    [
+      row.answered_at,
+      row.withdrawn_at,
+      row.consumed_at,
+      row.ruled_at,
+      row.raised_at
+    ]
+    |> Enum.filter(&is_integer/1)
+    |> Enum.max()
+  end
+
+  defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
+    do: {kind, id, is_admin}
+
+  defp detail_principal(%{principal: {:user, id}}), do: {"user", id, false}
+  defp detail_principal(%{principal: {:session, id}}), do: {"session", id, false}
+  defp detail_principal(%{principal: {:remedy, %{owner: id}}}), do: {"user", id, false}
+
+  defp work_item_query_row([
+         id,
+         title,
+         spec_ref_name,
+         spec_ref_sha256,
+         is_bug,
+         owner_user_id,
+         state,
+         fail_reason,
+         routing_wake_id,
+         slate_wake_id,
+         created_by_user,
+         created_by_session,
+         created_in_turn_seq,
+         created_context_known,
+         created_at,
+         row_version
+       ]) do
+    %{
+      id: id,
+      title: title,
+      spec_ref_name: spec_ref_name,
+      spec_ref_sha256: spec_ref_sha256,
+      is_bug: is_bug == 1,
+      owner_user_id: owner_user_id,
+      state: state,
+      fail_reason: fail_reason,
+      routing_wake_id: routing_wake_id,
+      slate_wake_id: slate_wake_id,
+      created_by_user: created_by_user,
+      created_by_session: created_by_session,
+      created_in_turn_seq: created_in_turn_seq,
+      created_context_known: created_context_known == 1,
+      created_at: created_at,
+      row_version: row_version
+    }
+  end
+
+  defp assignment_query_row([
+         id,
+         subject,
+         holder_key,
+         holder_role,
+         holder_fallback,
+         opened_by_user,
+         opened_by_session,
+         opened_at,
+         state,
+         outcome,
+         closed_at,
+         closed_by_user,
+         closed_by_session,
+         closing_attest_id,
+         work_item_id,
+         reviews_assignment_id,
+         holder_harness,
+         holder_provider,
+         files,
+         effect_kind,
+         derived_status
+       ]) do
+    %{
+      id: id,
+      subject: subject,
+      holder_key: holder_key,
+      holder_role: holder_role,
+      holder_fallback: holder_fallback == 1,
+      opened_by_user: opened_by_user,
+      opened_by_session: opened_by_session,
+      opened_at: opened_at,
+      state: state,
+      outcome: outcome,
+      closed_at: closed_at,
+      closed_by_user: closed_by_user,
+      closed_by_session: closed_by_session,
+      closing_attest_id: closing_attest_id,
+      work_item_id: work_item_id,
+      reviews_assignment_id: reviews_assignment_id,
+      holder_harness: holder_harness,
+      holder_provider: holder_provider,
+      files: JSON.decode!(files),
+      effect_kind: effect_kind,
+      derived_status: derived_status
+    }
+  end
+
+  defp bool_int(true), do: 1
+  defp bool_int(false), do: 0
+
+  defp detail_selection(db, resource, principal, lookup) do
+    case DB.transaction(db, fn txn ->
+           row = lookup.(txn)
+
+           if StateVisibility.core_detail_visible?(txn, resource, row, principal),
+             do: row,
+             else: nil
+         end) do
+      {:ok, row} -> row
+      {:error, error} -> raise error
+    end
   end
 
   def query_role(db, id) do
@@ -488,6 +696,10 @@ defmodule Tightbeam.StateResources do
       {:ok, []} ->
         nil
     end
+  end
+
+  def query_artifact(db, %{key: id, principal: principal}) do
+    detail_selection(db, "artifacts", principal, &Artifacts.get_in_txn(&1, id))
   end
 
   def query_artifact(db, id), do: Artifacts.get(db, id)
@@ -557,6 +769,10 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_message(db, id), do: Tightbeam.Projection.get(db, id)
+
+  def query_device(db, %{key: id, principal: principal}) do
+    detail_selection(db, "devices", principal, &Devices.detail_in_txn(&1, id))
+  end
 
   def query_device(db, id) do
     case Devices.by_id(db, id) do
@@ -876,6 +1092,15 @@ defmodule Tightbeam.StateResources do
 
   @doc false
   def kungfu_names(base_dir), do: Identity.public_kungfu_names(base_dir)
+
+  def query_read_marker(db, %{key: scope_key, principal: principal}, _opts) do
+    user_id = if principal.kind == "user", do: principal.id, else: nil
+
+    detail_selection(db, "read markers", principal, fn txn ->
+      ReadMarkers.get_in_txn(txn, user_id, scope_key)
+    end)
+  end
+
   def query_read_marker(db, user_id, scope_key), do: ReadMarkers.get(db, user_id, scope_key)
   def query_critical_state(db, session_key), do: Tightbeam.CriticalLeases.get(db, session_key)
 
@@ -933,12 +1158,43 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  def query_turn_by_seq(db, %{key: seq, principal: principal}) do
+    detail_selection(db, "turns", principal, &query_turn_in_txn(&1, seq))
+  end
+
+  def query_turn_by_seq(db, seq) do
+    case DB.transaction(db, &query_turn_in_txn(&1, seq)) do
+      {:ok, row} -> row
+      {:error, error} -> raise error
+    end
+  end
+
   def work_item(row), do: public(row)
   def assignment(row), do: public(row)
   def attest(row), do: public(row)
   def wake(row), do: public(row)
   def production(row), do: row |> public() |> correlate("eventId", "seq")
-  def turn(row), do: row |> public() |> correlate("turnSeq", "seq")
+
+  def turn(row) do
+    case value(row, :prompt) do
+      prompt when is_binary(prompt) ->
+        row = public(row)
+
+        role_fallback =
+          case row["roleFallback"] do
+            0 -> nil
+            1 -> "owner"
+            _invalid -> raise ArgumentError, "roleFallback is projection_invalid"
+          end
+
+        row
+        |> Map.put("roleFallback", role_fallback)
+        |> closed_projection("turns")
+
+      _other ->
+        raise ArgumentError, "prompt must be a string"
+    end
+  end
 
   def decision_request(%{status: "ruled"} = row) do
     unless complete_ruled_decision?(row) do
@@ -950,11 +1206,11 @@ defmodule Tightbeam.StateResources do
         row |> Tightbeam.Escalation.terminal_operator_projection() |> public()
 
       _ ->
-        public(row)
+        decision_request_projection(row)
     end
   end
 
-  def decision_request(row), do: public(row)
+  def decision_request(row), do: decision_request_projection(row)
 
   def session(row) do
     reject_public_shape_drift!(row, "sessions")
@@ -1022,7 +1278,14 @@ defmodule Tightbeam.StateResources do
   def critical_state(row), do: public(row)
 
   # Admin authority belongs to the owning user and is not part of the R7 device item.
-  def device(row), do: row |> public() |> Map.delete("isAdmin") |> correlate("deviceId", "id")
+  def device(row) do
+    row = row |> public() |> Map.delete("isAdmin")
+    device_id = row["deviceId"] || row["id"]
+
+    row
+    |> Map.put("deviceId", device_id)
+    |> Map.delete("id")
+  end
 
   @doc "Closed config serializer."
   def config(row) do
@@ -1245,6 +1508,7 @@ defmodule Tightbeam.StateResources do
          message_id,
          wake_id,
          origin,
+         prompt,
          role_ref,
          role_fallback,
          assignment_id,
@@ -1270,15 +1534,16 @@ defmodule Tightbeam.StateResources do
       message_id: message_id,
       wake_id: wake_id,
       origin: origin,
+      prompt: prompt,
       role_ref: role_ref,
-      role_fallback: role_fallback == 1,
+      role_fallback: role_fallback,
       assignment_id: assignment_id,
       job_ref: job_ref,
       model: model,
       thinking_level: thinking_level,
       model_context: model_context,
       harness: harness,
-      reply_attention: reply_attention == 1,
+      reply_attention: reply_attention,
       status: status,
       owner: owner,
       adapter_gen: adapter_gen,
@@ -1297,6 +1562,84 @@ defmodule Tightbeam.StateResources do
       value -> Map.put_new(row, primary, value)
     end
   end
+
+  defp closed_projection(row, resource) do
+    fields = Map.fetch!(@item_field_order, resource)
+    row |> Map.take(fields) |> then(&exact!(resource, &1))
+  end
+
+  defp decision_request_projection(row) do
+    row_version = value(row, :row_version) || decision_request_version(row)
+
+    unless is_integer(row_version) and row_version > 0 do
+      raise ArgumentError, "decision request rowVersion is projection_invalid"
+    end
+
+    row =
+      row
+      |> Map.put(:row_version, row_version)
+      |> public()
+      |> Map.update!("options", &decision_options!/1)
+
+    validate_decision_deadline!(row)
+
+    row =
+      case row["kind"] do
+        kind when kind in ~w(statute agent) ->
+          case {row["lineageRung"], row["effortGeneration"]} do
+            {nil, nil} ->
+              row
+              |> Map.put("lineageRung", 0)
+              |> Map.put("effortGeneration", 0)
+
+            _stored_values ->
+              raise ArgumentError,
+                    "lineageRung and effortGeneration must be null when not applicable"
+          end
+
+        "effort" ->
+          if is_integer(row["lineageRung"]) and is_integer(row["effortGeneration"]) do
+            row
+          else
+            raise ArgumentError,
+                  "lineageRung and effortGeneration must be stored integers for effort"
+          end
+
+        _other_kind ->
+          row
+      end
+
+    closed_projection(row, "decision requests")
+  end
+
+  defp validate_decision_deadline!(%{"kind" => "agent", "deadlineAt" => nil}), do: :ok
+
+  defp validate_decision_deadline!(%{"kind" => kind, "deadlineAt" => deadline_at})
+       when kind in ~w(statute effort) and is_integer(deadline_at) and deadline_at > 0,
+       do: :ok
+
+  defp validate_decision_deadline!(%{"kind" => kind}) when kind in ~w(statute effort agent),
+    do: raise(ArgumentError, "decision request deadlineAt is projection_invalid")
+
+  defp validate_decision_deadline!(_row), do: :ok
+
+  defp decision_options!(nil), do: []
+
+  defp decision_options!(options) when is_list(options) do
+    Enum.map(options, fn
+      label when is_binary(label) ->
+        %{"label" => label}
+
+      %{"label" => label} = option when map_size(option) == 1 and is_binary(label) ->
+        option
+
+      _invalid ->
+        raise ArgumentError, "decision request options are projection_invalid"
+    end)
+  end
+
+  defp decision_options!(_invalid),
+    do: raise(ArgumentError, "decision request options are projection_invalid")
 
   defp exact!(resource, item) do
     expected = Map.fetch!(@item_field_order, resource)

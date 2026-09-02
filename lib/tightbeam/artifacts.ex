@@ -186,6 +186,15 @@ defmodule Tightbeam.Artifacts do
     end
   end
 
+  @doc false
+  @spec get_in_txn(Txn.t(), String.t() | nil) :: map() | nil
+  def get_in_txn(%Txn{} = txn, artifact_id) do
+    case Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [artifact_id]) do
+      [row] -> artifact(row)
+      [] -> nil
+    end
+  end
+
   @doc """
   Distinct artifact kinds a session recorded on a work item.
 

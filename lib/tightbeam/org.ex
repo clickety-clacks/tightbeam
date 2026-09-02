@@ -629,6 +629,15 @@ defmodule Tightbeam.Org do
   end
 
   @doc false
+  @spec owner_user_id_in_txn(Txn.t(), String.t() | nil) :: String.t() | nil
+  def owner_user_id_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
+      [[owner_user_id]] -> owner_user_id
+      [] -> nil
+    end
+  end
+
+  @doc false
   @spec get_legacy_in_txn(Txn.t(), String.t()) :: session() | nil
   def get_legacy_in_txn(%Txn{} = txn, session_key) do
     case Txn.q(txn, legacy_select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
