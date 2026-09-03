@@ -150,9 +150,7 @@ defmodule Tightbeam.DeliverableContract do
   def ensure_schema(db \\ Tightbeam.DB) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
-        if contract_objects_present?(db),
-          do: validate_existing_schema!(db),
-          else: create_and_validate_schema!(db)
+        validate_existing_schema!(db)
 
       {:ok, [[_predecessor]]} ->
         :ok
@@ -165,22 +163,12 @@ defmodule Tightbeam.DeliverableContract do
     end
   end
 
+  @doc false
+  def bootstrap_schema(db \\ Tightbeam.DB), do: create_and_validate_schema!(db)
+
   defp create_and_validate_schema!(db) do
     Enum.each(@ddl, fn ddl -> :ok = DB.execute(db, ddl) end)
     validate_existing_schema!(db)
-  end
-
-  defp contract_objects_present?(db) do
-    placeholders = Enum.map_join(@contract_objects, ",", fn _ -> "?" end)
-
-    case DB.query(
-           db,
-           "SELECT 1 FROM sqlite_master WHERE name IN (#{placeholders}) LIMIT 1",
-           @contract_objects
-         ) do
-      {:ok, []} -> false
-      {:ok, [[1]]} -> true
-    end
   end
 
   defp validate_existing_schema!(db) do
@@ -211,7 +199,7 @@ defmodule Tightbeam.DeliverableContract do
            interrupt!(opts, :after_assignment_backfill)
            backfill_lineage(txn)
            interrupt!(opts, :after_product_lineage_capture)
-           validate_in_txn!(txn, true)
+           validate_in_txn!(txn)
            interrupt!(opts, :after_validation)
            interrupt!(opts, :before_stamp_update)
 
@@ -959,11 +947,11 @@ defmodule Tightbeam.DeliverableContract do
     error in MutationError -> inconsistent!(error.response.message)
   end
 
-  defp validate_in_txn!(txn, verify_product_owners \\ false) do
+  defp validate_in_txn!(txn) do
     validate_hashes!(txn)
     validate_cardinality!(txn)
     validate_bindings!(txn)
-    validate_lineage!(txn, verify_product_owners)
+    validate_lineage!(txn)
     validate_claims_and_closures!(txn)
     :ok
   end
@@ -1131,7 +1119,7 @@ defmodule Tightbeam.DeliverableContract do
     end)
   end
 
-  defp validate_lineage!(txn, verify_product_owners) do
+  defp validate_lineage!(txn) do
     required =
       Txn.q(
         txn,
@@ -1169,17 +1157,6 @@ defmodule Tightbeam.DeliverableContract do
           "SELECT productOwnerSessionKey,distance FROM assignment_product_owner_ancestry WHERE assignmentId=?1 ORDER BY distance",
           [assignment_id]
         )
-
-      if verify_product_owners do
-        expected =
-          chain
-          |> Enum.filter(&(&1.kind == "custom" and &1.archetype == "product-owner"))
-          |> Enum.map(&[&1.key, &1.distance])
-          |> Enum.sort_by(&List.last/1)
-
-        if actual != expected,
-          do: inconsistent!("assignment_product_owner_ancestry #{assignment_id}")
-      end
 
       Enum.each(actual, fn [key, distance] ->
         if expected_by_key[key] != distance,

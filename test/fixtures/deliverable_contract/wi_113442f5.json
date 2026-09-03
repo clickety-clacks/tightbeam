@@ -1,0 +1,139 @@
+{
+  "provenance": {
+    "capturedAt": "2026-08-29T07:18:00Z",
+    "workItemId": "wi_113442f5-22ae-457b-a971-1b620069d490",
+    "commands": [
+      "tightbeam work-item-get wi_113442f5-22ae-457b-a971-1b620069d490",
+      "tightbeam work-item-trace wi_113442f5-22ae-457b-a971-1b620069d490",
+      "tightbeam attests asg_5197376c-70e5-40a4-b2e9-65b5f609a336",
+      "tightbeam attests asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0",
+      "tightbeam attests asg_fec7d7c3-fc78-41d0-8dde-860d48a44a65",
+      "tightbeam attests asg_0b3cc29a-bf12-4296-9064-6f9779884a08"
+    ],
+    "selection": "Exact minimum A16 response fields: full work item; every assignment identity, effect, work-item and review link; full spec subject; terminal/verdict identities; full producer completion note and commit ref; trace assignment rows and terminal timeline."
+  },
+  "workItem": {
+    "createdAt": 1787638374003,
+    "createdBySession": "agent:main:clawline:mike:main s_2be02fca",
+    "createdByUser": null,
+    "failReason": null,
+    "id": "wi_113442f5-22ae-457b-a971-1b620069d490",
+    "isBug": false,
+    "ownerUserId": "mike",
+    "specRefName": "rest-state-api-v1.md",
+    "specRefSha256": "49b86ec874283c523001be7449b1e14aef47ca72932955445638ce6443aad754",
+    "state": "closed",
+    "title": "REST read plane D3 — CLI direct-GET migration and legacy read removal"
+  },
+  "assignments": [
+    {
+      "id": "asg_5197376c-70e5-40a4-b2e9-65b5f609a336",
+      "effectKind": "evidence",
+      "workItemId": "wi_113442f5-22ae-457b-a971-1b620069d490",
+      "reviewsAssignmentId": null,
+      "closingAttestId": "att_7ddf2471-d36f-4882-84f7-fceca6001151",
+      "outcome": "completed",
+      "state": "closed"
+    },
+    {
+      "id": "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0",
+      "effectKind": "policy",
+      "subject": "SPEC D3 — author the CLI direct-REST read migration and legacy-read removal build specification. This work belongs only to wi_113442f5-22ae-457b-a971-1b620069d490. Read your served “Where specs live (mike, 2026-08-21; org-local)” and “Match the wake to what you wait on (mike’s rule, 2026-08-20)” sections. Clone clickety-clacks/tightbeam-specs into your OWN ~/.tightbeam/work/<workspace>; never use/adopt a shared checkout or worktree. Read repo law. Author a build spec on your own branch against canonical REST art_971f45b5 / 8b96e512 / SHA 49b86ec8 and rest-vs-cli-adjudication r2. Inventory each in-product CLI read wrapper and legacy dispatch-read/compatibility alias. Define direct REST GET using the existing bearer plus asUser solely as transport for existing dispatch principal selection, with no new credential, binding, authorization, or tailnet identity. Preserve dispatch writes. Specify shared query/serializer reuse, parity/security/error tests, removal gates, rollback boundaries, and D2 reviewed-clean canonical integration as code-start dependency. Exclude cross-project Clawline/ATC implementation. Push exact spec commit and file artifact/SHA/lint evidence for independent review. Do not review yourself, edit canonical main, implement, merge, deploy, or release. Answer ambiguity from spec/rows; route only unresolved questions to this PO. Preserve failures before one corrected retry.",
+      "workItemId": "wi_113442f5-22ae-457b-a971-1b620069d490",
+      "reviewsAssignmentId": null,
+      "closingAttestId": "att_1ab4c74f-d4a3-4af2-8c61-c467062367e4",
+      "outcome": "completed",
+      "state": "closed"
+    },
+    {
+      "id": "asg_fec7d7c3-fc78-41d0-8dde-860d48a44a65",
+      "effectKind": "review",
+      "workItemId": "wi_113442f5-22ae-457b-a971-1b620069d490",
+      "reviewsAssignmentId": "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0",
+      "closingAttestId": "att_730a0511-ebb1-41e9-8be8-ff52dd78c808",
+      "outcome": "completed",
+      "state": "closed"
+    },
+    {
+      "id": "asg_0b3cc29a-bf12-4296-9064-6f9779884a08",
+      "effectKind": "review",
+      "workItemId": "wi_113442f5-22ae-457b-a971-1b620069d490",
+      "reviewsAssignmentId": "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0",
+      "closingAttestId": "att_ffd11d55-74d9-4ebc-8b64-7f0c882f0b31",
+      "outcome": "completed",
+      "state": "closed"
+    }
+  ],
+  "attests": [
+    {
+      "assignmentId": "asg_5197376c-70e5-40a4-b2e9-65b5f609a336",
+      "id": "att_fe297e82-4b5f-4919-aef2-39dfd3342c9c",
+      "kind": "verdict",
+      "verdictKind": "spirit-approved",
+      "note": "SPIRIT APPROVED. D3 implements the canonical migration clauses: in-product CLI reads use direct REST GET with the existing bearer plus asUser solely transporting the existing dispatch principal; no credential, binding, authorization, or tailnet-identity behavior is added. Dispatch writes remain. Legacy read transport and aliases retire only at the specified parity gates; cross-project clients remain out of scope.",
+      "commitRefs": null
+    },
+    {
+      "assignmentId": "asg_fec7d7c3-fc78-41d0-8dde-860d48a44a65",
+      "id": "att_1bb163f6-c688-4977-944b-e63744913d54",
+      "kind": "verdict",
+      "verdictKind": "changes-requested",
+      "commitRefs": [
+        {
+          "commit": "64408a93190c31ca992af22c28a6726c8687c65f",
+          "repo": "gibson:/home/mike/.tightbeam/work/6d71188ccbbc/tightbeam-specs-review-rest-d3"
+        }
+      ]
+    },
+    {
+      "assignmentId": "asg_0b3cc29a-bf12-4296-9064-6f9779884a08",
+      "id": "att_025eb266-d184-47c2-a000-2c2d898f944c",
+      "kind": "verdict",
+      "verdictKind": "reviewed-clean",
+      "commitRefs": [
+        {
+          "commit": "85ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f",
+          "repo": "gibson:/home/mike/.tightbeam/work/6d71188ccbbc/tightbeam-specs-review-rest-d3-85ae5e"
+        }
+      ]
+    },
+    {
+      "assignmentId": "asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0",
+      "id": "att_1ab4c74f-d4a3-4af2-8c61-c467062367e4",
+      "kind": "completion",
+      "verdictKind": null,
+      "note": "Completed D3 spec authoring and push only. Exact successor commit 85ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f, artifact art_b6dbcd51, file SHA-256 3f097d9e18ab51cfc24f39599113baad98a562a736a28e88c8aebd7a68f1942f. Sole exact-successor review asg_0b3cc29a-bf12-4296-9064-6f9779884a08 filed reviewed-clean verdict att_025eb266-d184-47c2-a000-2c2d898f944c and report art_f24eb46d; prior 64408a9 review history remains immutable changes-requested. The initial short-id verdict read failed with unknown_assignment and was corrected once using the full canonical id. Bytes remain frozen and the remote review branch is exact. D3-R1 code start remains BLOCKED: origin/main does not contain 85ae5ecb, and both reviewed contract closures plus reviewed-clean D2 canonical integration and all ten receipts must land before product code starts. This assignment did not edit canonical main, implement product code, merge, deploy, release, or self-review.",
+      "commitRefs": [
+        {
+          "commit": "85ae5ecb126d54cf7759b4ce37d9459fd7bd0f0f",
+          "repo": "gibson:/home/mike/.tightbeam/work/58b746f82786/tightbeam-specs"
+        }
+      ]
+    }
+  ],
+  "trace": {
+    "workItem": {
+      "failReason": null,
+      "id": "wi_113442f5-22ae-457b-a971-1b620069d490",
+      "ownerUserId": "mike",
+      "state": "closed",
+      "title": "REST read plane D3 — CLI direct-GET migration and legacy read removal"
+    },
+    "assignments": [
+      {"id":"asg_0b3cc29a-bf12-4296-9064-6f9779884a08","reviewsAssignmentId":"asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0","state":"closed"},
+      {"id":"asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0","reviewsAssignmentId":null,"state":"closed"},
+      {"id":"asg_5197376c-70e5-40a4-b2e9-65b5f609a336","reviewsAssignmentId":null,"state":"closed"},
+      {"id":"asg_fec7d7c3-fc78-41d0-8dde-860d48a44a65","reviewsAssignmentId":"asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0","state":"closed"}
+    ],
+    "terminalTimeline": [
+      {"assignmentId":"asg_5197376c-70e5-40a4-b2e9-65b5f609a336","id":"att_fe297e82-4b5f-4919-aef2-39dfd3342c9c","kind":"verdict","type":"attest","verdict":"spirit-approved"},
+      {"assignmentId":"asg_5197376c-70e5-40a4-b2e9-65b5f609a336","id":"att_7ddf2471-d36f-4882-84f7-fceca6001151","kind":"completion","type":"attest","verdict":null},
+      {"assignmentId":"asg_fec7d7c3-fc78-41d0-8dde-860d48a44a65","id":"att_1bb163f6-c688-4977-944b-e63744913d54","kind":"verdict","type":"attest","verdict":"changes-requested"},
+      {"assignmentId":"asg_fec7d7c3-fc78-41d0-8dde-860d48a44a65","id":"att_730a0511-ebb1-41e9-8be8-ff52dd78c808","kind":"completion","type":"attest","verdict":null},
+      {"assignmentId":"asg_0b3cc29a-bf12-4296-9064-6f9779884a08","id":"att_025eb266-d184-47c2-a000-2c2d898f944c","kind":"verdict","type":"attest","verdict":"reviewed-clean"},
+      {"assignmentId":"asg_0b3cc29a-bf12-4296-9064-6f9779884a08","id":"att_ffd11d55-74d9-4ebc-8b64-7f0c882f0b31","kind":"completion","type":"attest","verdict":null},
+      {"assignmentId":"asg_29aeed02-f3bc-421a-99ca-c2bce6f80ec0","id":"att_1ab4c74f-d4a3-4af2-8c61-c467062367e4","kind":"completion","type":"attest","verdict":null},
+      {"assignmentId":null,"id":"ce:12839","kind":"disposition_transition","type":"causal_event"}
+    ]
+  }
+}
