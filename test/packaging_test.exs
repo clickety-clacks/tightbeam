@@ -2,6 +2,7 @@ defmodule Tightbeam.PackagingTest do
   use ExUnit.Case, async: true
 
   @smoke Path.expand("../packaging/version-smoke.sh", __DIR__)
+  @purity Path.expand("../packaging/purity-check.sh", __DIR__)
   @finalize Path.expand("../packaging/finalize-artifact.sh", __DIR__)
 
   test "the extracted artifact refuses a stale gateway version" do
@@ -52,7 +53,56 @@ defmodule Tightbeam.PackagingTest do
     assert output =~ "extracted artifact has no package.json"
   end
 
-  defp artifact_fixture(cli_version, gateway_version, manifest_version \\ "0.1.6") do
+  test "package purity accepts an archive with only product entries" do
+    artifact = artifact_fixture("0.1.6", "0.1.6")
+
+    {output, status} = System.cmd("sh", [@purity, artifact], stderr_to_stdout: true)
+
+    assert status == 0
+    assert output =~ "package purity: clean"
+  end
+
+  test "package purity refuses an AppleDouble sidecar" do
+    artifact = artifact_fixture("0.1.6", "0.1.6", "0.1.6", apple_double: true)
+
+    {output, status} = System.cmd("sh", [@purity, artifact], stderr_to_stdout: true)
+
+    assert status == 1
+    assert output =~ "forbidden AppleDouble entry: tightbeam/._package.json"
+  end
+
+  for {label, header} <- [
+        {"extended attributes", "LIBARCHIVE.xattr.com.apple.provenance"},
+        {"SCHILY extended attributes", "SCHILY.xattr.com.apple.provenance"},
+        {"access control lists", "SCHILY.acl.access"},
+        {"file flags", "SCHILY.fflags"}
+      ] do
+    test "package purity refuses #{label}" do
+      artifact = artifact_fixture("0.1.6", "0.1.6")
+      header = unquote(header)
+      poison_pax_header!(artifact, header)
+
+      {output, status} = System.cmd("sh", [@purity, artifact], stderr_to_stdout: true)
+
+      assert status == 1
+      assert output =~ "forbidden archive metadata header #{header}"
+    end
+  end
+
+  test "a metadata-poisoned temporary artifact never receives the final installable name" do
+    temporary = artifact_fixture("0.1.6", "0.1.6")
+    poison_pax_header!(temporary, "SCHILY.fflags")
+    final = temporary <> ".final.tgz"
+
+    {output, status} =
+      System.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
+
+    assert status == 1
+    assert output =~ "forbidden archive metadata header SCHILY.fflags"
+    refute File.exists?(final)
+  end
+
+  defp artifact_fixture(cli_version, gateway_version, manifest_version \\ "0.1.6", opts \\ []) do
     root = Path.join(System.tmp_dir!(), "tightbeam-package-#{System.unique_integer([:positive])}")
     package = Path.join(root, "tightbeam")
     File.mkdir_p!(Path.join(package, "bin"))
@@ -71,9 +121,57 @@ defmodule Tightbeam.PackagingTest do
       File.write!(Path.join(package, "package.json"), ~s({"version":"#{manifest_version}"}))
     end
 
+    if opts[:apple_double] do
+      File.write!(Path.join(package, "._package.json"), "host metadata")
+    end
+
     artifact = Path.join(root, "artifact.tgz")
-    {_, 0} = System.cmd("tar", ["czf", artifact, "tightbeam"], cd: root)
+
+    script = """
+    import sys
+    import tarfile
+
+    artifact, package = sys.argv[1:]
+    with tarfile.open(artifact, "w:gz") as archive:
+        archive.add(package, arcname="tightbeam")
+    """
+
+    {_, 0} =
+      System.cmd("python3", ["-c", script, artifact, package], stderr_to_stdout: true)
+
     on_exit(fn -> File.rm_rf!(root) end)
     artifact
+  end
+
+  defp poison_pax_header!(artifact, header) do
+    script = """
+    import os
+    import sys
+    import tarfile
+
+    source, header = sys.argv[1:]
+    poisoned = source + ".poisoned"
+    found = False
+
+    with tarfile.open(source, "r:gz") as original:
+        with tarfile.open(poisoned, "w:gz", format=tarfile.PAX_FORMAT) as output:
+            for member in original.getmembers():
+                fileobj = original.extractfile(member) if member.isfile() else None
+                if member.name == "tightbeam/package.json":
+                    member.pax_headers = dict(member.pax_headers)
+                    member.pax_headers[header] = "poison"
+                    found = True
+                output.addfile(member, fileobj)
+
+    if not found:
+        raise RuntimeError("package fixture has no manifest to poison")
+
+    os.replace(poisoned, source)
+    """
+
+    {_, 0} =
+      System.cmd("python3", ["-c", script, artifact, header], stderr_to_stdout: true)
+
+    :ok
   end
 end
