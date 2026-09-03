@@ -233,7 +233,7 @@ defmodule Tightbeam.AssignmentsTest do
              Assignments.__handle__(ctx.db, "assign", raw_call)
   end
 
-  test "same-assignment public cancellation and progress do not re-drive a forced due entitlement",
+  test "same-assignment public cancellation stays inert while each fresh progress rebases once",
        ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "liveness re-drive"))
 
@@ -288,24 +288,26 @@ defmodule Tightbeam.AssignmentsTest do
 
     liveness = start_liveness!(ctx)
 
-    _first = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+    %{attest: %{id: first_attest_id}} =
+      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
     sweep_liveness!(liveness)
 
     assert %{
-             supervisionGeneration: 1,
-             supervisionBasisKind: "assignment_open",
-             supervisionBasisId: assignment_id
+             supervisionGeneration: 2,
+             supervisionBasisKind: "progress",
+             supervisionBasisId: "progress:" <> ^first_attest_id
            } = Supervision.prod_state(ctx.db, assignment.id)
 
-    assert assignment_id == assignment.id
+    %{attest: %{id: second_attest_id}} =
+      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
 
-    _second = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
     sweep_liveness!(liveness)
 
     assert %{
-             supervisionGeneration: 1,
-             supervisionBasisKind: "assignment_open",
-             supervisionBasisId: ^assignment_id
+             supervisionGeneration: 3,
+             supervisionBasisKind: "progress",
+             supervisionBasisId: "progress:" <> ^second_attest_id
            } = Supervision.prod_state(ctx.db, assignment.id)
 
     assert {:ok, _} =
@@ -1073,9 +1075,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert %{code: "invalid_verdict_kind"} = handle(ctx, "attest", malformed)
 
-    _ =
-      attest_call({:session, "other-session"}, review.id, "completion")
-      |> then(&handle(ctx, "attest", &1))
+    _ = complete_linked_child!(ctx, review, producer)
 
     assert %{code: "assignment_closed"} = handle(ctx, "attest", malformed)
   end
@@ -1148,9 +1148,7 @@ defmodule Tightbeam.AssignmentsTest do
              "reviewed-clean"
            ]
 
-    _ =
-      attest_call({:session, "other-session"}, second_review.id, "completion")
-      |> then(&handle(ctx, "attest", &1))
+    _ = complete_linked_child!(ctx, second_review, producer)
 
     assert Assignments.qualifying_review_verdict_kinds(ctx.db, producer.id, "holder") == [
              "reviewed-clean"
@@ -1693,6 +1691,167 @@ defmodule Tightbeam.AssignmentsTest do
          )
 
   defp handle(ctx, verb, call), do: WorkItems.__handle__(ctx.db, verb, %{call | verb: verb})
+
+  defp complete_linked_child!(ctx, child, parent) do
+    now = System.system_time(:millisecond)
+
+    {:ok, %{wake_id: wake_id, turn_seq: turn_seq}} =
+      DB.transaction(ctx.db, fn txn ->
+        [[turn_seq]] =
+          DB.Txn.q(
+            txn,
+            """
+            INSERT INTO turns
+              (sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,startedAt)
+            VALUES (?1,?2,'agent:test-review','review',?3,'running',?4,?4)
+            RETURNING seq
+            """,
+            [child.holderKey, "m_#{Tightbeam.Id.uuid4()}", child.id, now]
+          )
+
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            session_key: parent.holderKey,
+            target_role: nil,
+            origin: "agent:test-review",
+            prompt: "review result",
+            due_at: now,
+            creator_session_key: child.holderKey,
+            reresolve: "lineage",
+            reresolve_seed: parent.holderKey,
+            reresolve_rung: 1,
+            work_item_id: child.workItemId,
+            assignment_id: nil,
+            target_gate: 1
+          })
+
+        _ =
+          Supervision.accept_parent_wake_receipt_in_txn(
+            txn,
+            %{
+              child_id: child.id,
+              child_holder: child.holderKey,
+              parent_id: parent.id,
+              parent_holder: parent.holderKey,
+              turn_seq: turn_seq,
+              wake_id: wake.wake_id
+            },
+            now
+          )
+
+        %{wake_id: wake.wake_id, turn_seq: turn_seq}
+      end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO turns
+          (sessionKey,messageId,wakeId,origin,prompt,status,createdAt)
+        VALUES (?1,?2,?3,'agent:test-review','review result','delivered',?4)
+        """,
+        [parent.holderKey, "m_#{Tightbeam.Id.uuid4()}", wake_id, now]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE wakes SET state='fired',firedAt=?2,firedBy='condition' WHERE wakeId=?1",
+        [wake_id, now]
+      )
+
+    _ =
+      handle(
+        ctx,
+        "attest",
+        attest_call({:session, child.holderKey}, child.id, "progress")
+      )
+
+    result =
+      handle(
+        ctx,
+        "attest",
+        attest_call({:session, child.holderKey}, child.id, "completion")
+      )
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE turns SET status='delivered',endedAt=?2 WHERE seq=?1", [
+        turn_seq,
+        now
+      ])
+
+    result
+  end
+
+  test "non-cooperative terminal child outcomes schedule one exact durable parent wake", ctx do
+    parent = handle(ctx, "assign", assign_call({:session, "holder"}, "parent"))
+
+    child =
+      assign_call({:session, "other-session"}, "child")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], parent.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      attest_call({:session, "other-session"}, child.id, "verdict")
+      |> put_in([:params, :verdict_kind], "reviewed-clean")
+      |> then(&handle(ctx, "attest", &1))
+
+    revoked_child =
+      assign_call({:session, "other-session"}, "revoked child")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], parent.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    _ =
+      handle(ctx, "revoke-assignment", revoke_call({:session, "other-session"}, revoked_child.id))
+
+    assert {:ok, [[wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE origin='process:tightbeam' AND prompt=?1",
+               [
+                 "[terminal child result]\nchild=#{revoked_child.id}\nparent=#{parent.id}\nkind=revoked\nsource=#{revoked_child.id}"
+               ]
+             )
+
+    assert Regex.match?(
+             ~r/^w_[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+             wake_id
+           )
+
+    assert {:ok, :match} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.terminal_child_wake_status_in_txn(txn, wake_id)
+             end)
+
+    interrupted_child =
+      assign_call({:session, "other-session"}, "interrupted child")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], parent.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert {:ok, interrupted} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "other-session",
+                 "other",
+                 "user:other"
+               )
+             end)
+
+    assert Enum.any?(interrupted, &(&1.assignment_id == interrupted_child.id))
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wakes WHERE origin='process:tightbeam' AND prompt=?1",
+               [
+                 "[terminal child result]\nchild=#{interrupted_child.id}\nparent=#{parent.id}\nkind=interrupted-by-retire\nsource=#{interrupted_child.id}"
+               ]
+             )
+  end
 
   defp create_work_item(ctx, title) do
     handle(

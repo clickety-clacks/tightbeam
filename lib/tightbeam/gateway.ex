@@ -653,6 +653,12 @@ defmodule Tightbeam.Gateway do
           is_binary(p[:cancel_wake_id]) ->
             cancel_wake_result(db, call, p.cancel_wake_id)
 
+          p[:parent_wake_receipt_context_forbidden] == true ->
+            %{
+              code: "parent_wake_receipt_context_forbidden",
+              message: "wake assignment context is derived from the authenticated turn"
+            }
+
           not (is_binary(p[:prompt]) and p.prompt != "") ->
             %{code: "invalid", message: "a wake must carry a prompt"}
 
@@ -4315,35 +4321,47 @@ defmodule Tightbeam.Gateway do
 
         result =
           DB.transaction(db, fn txn ->
-            prior =
-              if p[:idempotency_key],
-                do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
+            case terminal_child_wake_in_txn(txn, call, session_key, due_at) do
+              {:handled, result} ->
+                result
 
-            if prior do
-              case DB.Txn.q(txn, select_wake_in_txn_sql(), [prior.session_key]) do
-                [row] -> wake_from_in_txn_row(row)
-                [] -> nil
-              end
-            else
-              wake = schedule_wake_in_txn(txn, call, session_key, due_at)
+              :ordinary ->
+                prior =
+                  if p[:idempotency_key],
+                    do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
 
-              if p[:idempotency_key] && is_binary(wake[:wake_id]) do
-                Idempotency.put_in_txn(txn, %{
-                  owner_user_id: call.origin,
-                  operation: "wake",
-                  idempotency_key: p.idempotency_key,
-                  session_key: wake.wake_id
-                })
-              end
+                if prior do
+                  case DB.Txn.q(txn, select_wake_in_txn_sql(), [prior.session_key]) do
+                    [row] -> wake_from_in_txn_row(row)
+                    [] -> nil
+                  end
+                else
+                  wake = schedule_wake_in_txn(txn, call, session_key, due_at)
 
-              wake
+                  if p[:idempotency_key] && is_binary(wake[:wake_id]) do
+                    Idempotency.put_in_txn(txn, %{
+                      owner_user_id: call.origin,
+                      operation: "wake",
+                      idempotency_key: p.idempotency_key,
+                      session_key: wake.wake_id
+                    })
+                  end
+
+                  wake
+                end
             end
           end)
 
         wake =
           case result do
-            {:ok, wake} -> wake
-            {:error, error} -> raise error
+            {:ok, wake} ->
+              wake
+
+            {:error, %Supervision.ReceiptError{code: code, message: message}} ->
+              %{code: code, message: message}
+
+            {:error, error} ->
+              raise error
           end
 
         if is_binary(wake[:wake_id]) do
@@ -4358,6 +4376,229 @@ defmodule Tightbeam.Gateway do
       _ ->
         %{code: "not_found"}
     end
+  end
+
+  defp terminal_child_wake_in_txn(txn, call, session_key, due_at) do
+    p = call.params
+    keyed? = is_binary(p[:idempotency_key])
+    conditional? = is_binary(p[:condition_kind])
+
+    case terminal_child_context_in_txn(txn, call) do
+      {:error, error} ->
+        {:handled, error}
+
+      :ordinary ->
+        :ordinary
+
+      {:linked, context} ->
+        key =
+          Assignments.terminal_child_wake_id(
+            context.child_id,
+            context.parent_id,
+            "cooperative-receipt",
+            context.child_id
+          )
+
+        cond do
+          conditional? and p[:idempotency_key] == key ->
+            {:handled, parent_wake_retry_conflict()}
+
+          conditional? ->
+            :ordinary
+
+          keyed? and
+              (p.idempotency_key != key or call[:target_kind] != "session" or
+                 session_key != context.parent_holder or not is_nil(call[:target_role]) or
+                 not is_nil(p[:after_ms]) or not is_nil(p[:at]) or
+                 not is_nil(p[:condition_scope])) ->
+            {:handled, parent_wake_retry_conflict()}
+
+          not keyed? and
+              not (call[:target_kind] == "session" and session_key == context.parent_holder and
+                     is_nil(call[:target_role]) and is_nil(p[:after_ms]) and is_nil(p[:at]) and
+                       is_nil(p[:condition_scope])) ->
+            :ordinary
+
+          true ->
+            {:handled, cooperative_parent_wake_in_txn(txn, call, context, key, keyed?, due_at)}
+        end
+    end
+  end
+
+  defp terminal_child_context_in_txn(txn, %{principal: {:session, session_key}}) do
+    turns =
+      Txn.q(
+        txn,
+        "SELECT seq, assignmentId FROM turns WHERE sessionKey=?1 AND status='running'",
+        [session_key]
+      )
+
+    case turns do
+      [] ->
+        :ordinary
+
+      [[_seq, nil]] ->
+        :ordinary
+
+      [[turn_seq, child_id]] ->
+        case Txn.q(
+               txn,
+               """
+               SELECT c.holderKey, c.workItemId, c.reviewsAssignmentId, c.state,
+                      p.holderKey, p.state
+               FROM assignments c
+               LEFT JOIN assignments p ON p.id=c.reviewsAssignmentId
+               WHERE c.id=?1
+               """,
+               [child_id]
+             ) do
+          [[^session_key, _work_item_id, nil, _state, nil, nil]] ->
+            :ordinary
+
+          [[^session_key, _work_item_id, parent_id, _state, nil, nil]]
+          when is_binary(parent_id) ->
+            {:error, %{code: "parent_assignment_missing", message: "linked parent is missing"}}
+
+          [[^session_key, _work_item_id, _parent_id, _state, _holder, "closed"]] ->
+            {:error, %{code: "parent_assignment_closed", message: "linked parent is closed"}}
+
+          [[^session_key, work_item_id, parent_id, "open", parent_holder, "open"]] ->
+            {:linked,
+             %{
+               child_id: child_id,
+               child_holder: session_key,
+               work_item_id: work_item_id,
+               parent_id: parent_id,
+               parent_holder: parent_holder,
+               turn_seq: turn_seq
+             }}
+
+          _ ->
+            :ordinary
+        end
+
+      _ ->
+        :ordinary
+    end
+  end
+
+  defp terminal_child_context_in_txn(_txn, _call), do: :ordinary
+
+  defp cooperative_parent_wake_in_txn(txn, call, context, key, keyed?, due_at) do
+    prior =
+      if keyed?, do: Idempotency.get_in_txn(txn, call.origin, "wake", call.params.idempotency_key)
+
+    if prior do
+      cooperative_parent_wake_replay_in_txn(txn, call, context, prior.session_key)
+    else
+      cooperative_call =
+        call
+        |> Map.put(:terminal_child_cooperative, true)
+        |> put_in([:params, :reresolve], "lineage")
+        |> put_in([:params, :reresolve_seed], context.parent_holder)
+        |> put_in([:params, :reresolve_rung], 1)
+
+      wake = schedule_wake_in_txn(txn, cooperative_call, context.parent_holder, due_at)
+
+      if not is_binary(wake[:wake_id]),
+        do: raise("terminal-child cooperative wake was not scheduled")
+
+      receipt =
+        Supervision.accept_parent_wake_receipt_in_txn(
+          txn,
+          Map.put(context, :wake_id, wake.wake_id),
+          due_at
+        )
+
+      if keyed? do
+        Idempotency.put_in_txn(txn, %{
+          owner_user_id: call.origin,
+          operation: "wake",
+          idempotency_key: key,
+          session_key: wake.wake_id
+        })
+      end
+
+      Map.put(wake, :receipt, receipt)
+    end
+  end
+
+  defp cooperative_parent_wake_replay_in_txn(txn, call, context, wake_id) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT w.wakeId, w.dueAt, w.state, w.class, w.deliveryRule,
+               w.sessionKey, w.targetRole, w.origin, w.prompt, w.consumer,
+               w.creatorSessionKey, w.reresolve, w.reresolveSeed, w.reresolveRung,
+               w.conditionKind, w.conditionScope, w.conditionAfterId, w.rumination,
+               w.work_item_id, w.assignmentId, w.targetGate,
+               s.assignmentId, s.receiptChildTurnSeq, s.receiptAcceptedGeneration,
+               s.receiptCause, s.receiptPrincipal
+        FROM wakes w
+        LEFT JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
+        WHERE w.wakeId=?1
+        """,
+        [wake_id]
+      )
+
+    case rows do
+      [
+        [
+          ^wake_id,
+          due_at,
+          state,
+          class,
+          delivery_rule,
+          parent_holder,
+          nil,
+          origin,
+          prompt,
+          "prompt",
+          child_holder,
+          "lineage",
+          parent_holder,
+          1,
+          nil,
+          nil,
+          nil,
+          0,
+          work_item_id,
+          nil,
+          1,
+          child_id,
+          receipt_turn_seq,
+          accepted_generation,
+          "child_exact_parent_wake_invoked",
+          child_holder
+        ]
+      ]
+      when origin == call.origin and prompt == call.params.prompt and
+             parent_holder == context.parent_holder and child_holder == context.child_holder and
+             work_item_id == context.work_item_id and child_id == context.child_id ->
+        %{
+          wake_id: wake_id,
+          due_at: due_at,
+          state: state,
+          class: class,
+          delivery_rule: delivery_rule,
+          receipt: %{
+            wake_id: wake_id,
+            assignment_id: child_id,
+            receipt_child_turn_seq: receipt_turn_seq,
+            receipt_accepted_generation: accepted_generation,
+            receipt_cause: "child_exact_parent_wake_invoked",
+            receipt_principal: child_holder
+          }
+        }
+
+      _ ->
+        parent_wake_retry_conflict()
+    end
+  end
+
+  defp parent_wake_retry_conflict do
+    %{code: "parent_wake_retry_conflict", message: "parent wake retry conflicts"}
   end
 
   defp schedule_wake_in_txn(txn, call, session_key, due_at) do
@@ -4526,11 +4767,18 @@ defmodule Tightbeam.Gateway do
       class: class,
       delivery_rule: wake[:delivery_rule]
     }
+    |> maybe_put_parent_wake_receipt(wake)
   end
 
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
+    |> maybe_put_parent_wake_receipt(wake)
   end
+
+  defp maybe_put_parent_wake_receipt(response, %{receipt: receipt}),
+    do: Map.put(response, :receipt, receipt)
+
+  defp maybe_put_parent_wake_receipt(response, _wake), do: response
 
   defp valid_reresolve?(p) do
     case {p[:reresolve], p[:reresolve_seed], p[:reresolve_rung]} do

@@ -1798,8 +1798,6 @@ mod tests {
                 "go",
                 "--after",
                 "30s",
-                "--key",
-                "historically-ignored",
                 "--as",
                 "coder"
             ]),
