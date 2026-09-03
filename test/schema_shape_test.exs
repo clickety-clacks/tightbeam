@@ -35,6 +35,7 @@ defmodule Tightbeam.SchemaShapeTest do
   alias Tightbeam.{Assignments, DB, Schema}
 
   @shape "identity-universal-root-render-v1-019-completion-escalation-v16"
+  @completion_escalation_parent_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
   @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
@@ -155,6 +156,21 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     assert "identityRenderContract" in table_columns(db, "sessions")
     assert "identityGuidanceDigest" in table_columns(db, "sessions")
+  end
+
+  test "the exact completion-escalation parent stamp refuses with recreate guidance", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               @completion_escalation_parent_shape
+             ])
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ @completion_escalation_parent_shape
+    assert error.message =~ @shape
+    assert error.message =~ "Move the database aside and let this build recreate it."
+    refute error.message =~ "Keep the database in place"
   end
 
   test "the exact pre-liveness notice stamp resumes without physical-shape inference", %{db: db} do
