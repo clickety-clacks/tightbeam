@@ -66,6 +66,7 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
 
     let _ = harness.kill();
     let _ = harness.wait();
+    reap_detached_group(leader_identity.pgid);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -122,6 +123,7 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
 
     let _ = harness.kill();
     let _ = harness.wait();
+    reap_detached_group(leader_identity.pgid);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -130,6 +132,17 @@ struct Identity {
     pid: libc::pid_t,
     pgid: libc::pid_t,
     boot: String,
+}
+
+/// The harness session launcher forks a `setsid` leader into its own process group. Killing only
+/// the launcher wrapper leaves that detached leader alive under PID 1 — a boot mismatch refuses
+/// before signalling, so `harness-group` never reaps it. Teardown must kill the group the test
+/// created so it does not pollute developer and CI hosts. SIGKILL the recorded group; an
+/// already-gone group (ESRCH) is the success case and is ignored.
+fn reap_detached_group(pgid: libc::pid_t) {
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
 }
 
 fn script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
