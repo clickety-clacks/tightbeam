@@ -40,11 +40,13 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
         .spawn()
         .expect("the harness session launcher must start");
 
+    // Arm teardown the instant the wrapper exists — before `await_identity`, any floor call, or any
+    // assertion — so even a failure to acquire the identity/token still waits the wrapper and clears
+    // the scratch dir without ever signalling an unowned group.
+    let mut session = OwnedSession::arm(harness, &dir);
     let leader_identity = await_identity(&identity_path);
-    // Own teardown from the instant the leader identity is known — before any fallible floor call or
-    // assertion — so every return AND every unwind path waits the wrapper, reaps only the owned
-    // group, and clears the scratch directory.
-    let _session = OwnedSession::own(harness, &leader_identity, &dir);
+    // The leader is live now; adopt it so teardown reaps exactly its birth-verified group.
+    session.adopt(&leader_identity);
 
     let floor_script = script(
         &dir,
@@ -68,7 +70,7 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
         String::from_utf8_lossy(&floor.stderr)
     );
 
-    // Teardown (wrapper wait, owned-group reap, scratch removal) is owned by `_session`'s Drop, so
+    // Teardown (wrapper wait, owned-group reap, scratch removal) is owned by `session`'s Drop, so
     // it runs on this normal return and on any assertion unwind above.
 }
 
@@ -101,11 +103,13 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
         .spawn()
         .expect("the harness session launcher must start");
 
+    // Arm teardown the instant the wrapper exists — before `await_identity`, any floor call, or any
+    // assertion — so even a failure to acquire the identity/token still waits the wrapper and clears
+    // the scratch dir without ever signalling an unowned group.
+    let mut session = OwnedSession::arm(harness, &dir);
     let leader_identity = await_identity(&identity_path);
-    // Own teardown from the instant the leader identity is known — before any fallible floor call or
-    // assertion — so every return AND every unwind path waits the wrapper, reaps only the owned
-    // group, and clears the scratch directory.
-    let _session = OwnedSession::own(harness, &leader_identity, &dir);
+    // The leader is live now; adopt it so teardown reaps exactly its birth-verified group.
+    session.adopt(&leader_identity);
 
     let floor = Command::new(binary)
         .args([
@@ -127,7 +131,7 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
         "stderr must name the boot mismatch"
     );
 
-    // Teardown (wrapper wait, owned-group reap, scratch removal) is owned by `_session`'s Drop, so
+    // Teardown (wrapper wait, owned-group reap, scratch removal) is owned by `session`'s Drop, so
     // it runs on this normal return and on any assertion unwind above.
 }
 
@@ -136,7 +140,6 @@ struct Identity {
     pid: libc::pid_t,
     pgid: libc::pid_t,
     boot: String,
-    starttime: u64,
 }
 
 /// The Linux birth token for a pid: field 22 (`starttime`) of `/proc/<pid>/stat`. `comm` (field 2)
@@ -150,54 +153,76 @@ fn proc_starttime(pid: libc::pid_t) -> Option<u64> {
     after.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// Owns unconditional teardown of one harness-launched session. Constructed the instant the leader
-/// identity is known — BEFORE any fallible floor call or assertion — so a failing assertion that
-/// unwinds still reaps everything the test created. On drop it: (1) kills AND waits the harness-exec
-/// wrapper it owns directly; (2) SIGKILLs the detached leader group ONLY while the captured pid
-/// still leads the captured pgid with the same birth token, so a recycled pgid this test no longer
-/// owns is never signalled; (3) removes the scratch directory. Every path — normal return or panic —
-/// runs all three.
-struct OwnedSession {
-    harness: std::process::Child,
+/// A detached leader this test has birth-verified and may reap: its pid, its recorded pgid, and the
+/// `/proc` starttime captured while it was live.
+struct LeaderToken {
     pid: libc::pid_t,
     pgid: libc::pid_t,
     starttime: u64,
+}
+
+/// Owns unconditional teardown of one harness-launched session. ARMED the instant the wrapper is
+/// spawned — before `await_identity`, any floor call, or any assertion — so that even a failure to
+/// acquire the leader identity or its birth token (an `await_identity` panic, or a leader that never
+/// yields a token) still waits the wrapper and clears the scratch directory, and NEVER signals a
+/// group it has not birth-verified. The detached leader is ADOPTED only once its identity and a live
+/// `/proc` starttime are captured; a leader that is already gone yields no token, so it is correctly
+/// never signalled (there is nothing alive to reap). On drop, on every path — normal return or
+/// panic: (1) kill and wait the owned wrapper; (2) SIGKILL the adopted leader group only while its
+/// captured pid still leads its captured pgid with an unchanged starttime; (3) remove the scratch dir.
+struct OwnedSession {
+    harness: std::process::Child,
     dir: std::path::PathBuf,
+    leader: Option<LeaderToken>,
 }
 
 impl OwnedSession {
-    fn own(harness: std::process::Child, identity: &Identity, dir: &std::path::Path) -> Self {
-        // The birth token is always valid: `await_identity` only returns once it has read a live
-        // starttime for this pid. There is no absent-token state, so teardown can never silently
-        // skip the owned group.
+    /// Take ownership of the wrapper and scratch dir immediately, before any fallible step, with no
+    /// leader yet.
+    fn arm(harness: std::process::Child, dir: &std::path::Path) -> Self {
         OwnedSession {
             harness,
-            pid: identity.pid,
-            pgid: identity.pgid,
-            starttime: identity.starttime,
             dir: dir.to_path_buf(),
+            leader: None,
+        }
+    }
+
+    /// Adopt the detached leader once its identity is known and it is still live. `await_identity`
+    /// has just confirmed the leader wrote its identity, so its `/proc` starttime is readable; a
+    /// `None` here means the leader has already exited, in which case there is nothing to reap and no
+    /// group is ever signalled.
+    fn adopt(&mut self, identity: &Identity) {
+        if let Some(starttime) = proc_starttime(identity.pid) {
+            self.leader = Some(LeaderToken {
+                pid: identity.pid,
+                pgid: identity.pgid,
+                starttime,
+            });
         }
     }
 }
 
 impl Drop for OwnedSession {
     fn drop(&mut self) {
-        // The wrapper is our direct child: kill and reap it on every path, including panic.
+        // The wrapper is our direct child: kill and reap it on every path, including panic — even if
+        // the leader was never adopted.
         let _ = self.harness.kill();
         let _ = self.harness.wait();
 
-        // Signal the detached leader group only while it is provably still the one we captured — the
-        // pid alive, still the leader of the recorded pgid, with an unchanged birth token. A gone or
-        // recycled pid fails this check, so no unowned group is ever SIGKILLed.
-        let owned = proc_starttime(self.pid) == Some(self.starttime)
-            && unsafe { libc::getpgid(self.pid) } == self.pgid;
-        if owned {
-            unsafe {
-                libc::killpg(self.pgid, libc::SIGKILL);
+        // Signal the leader group only if one was adopted and is provably still the one we captured —
+        // pid alive, still leading the recorded pgid, with an unchanged birth token. An unadopted or
+        // gone/recycled leader is never signalled, so no unowned group is ever SIGKILLed.
+        if let Some(leader) = &self.leader {
+            let owned = proc_starttime(leader.pid) == Some(leader.starttime)
+                && unsafe { libc::getpgid(leader.pid) } == leader.pgid;
+            if owned {
+                unsafe {
+                    libc::killpg(leader.pgid, libc::SIGKILL);
+                }
             }
         }
 
-        // Clear the scratch directory on every path, so a failing regression control leaves no debris.
+        // Clear the scratch directory on every path, so a failing control or panic leaves no debris.
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -221,18 +246,12 @@ fn await_identity(path: &std::path::Path) -> Identity {
             let fields: Vec<&str> = text.trim_end().split('\t').collect();
             if let [pid, pgid, boot, _launch] = fields[..] {
                 if let (Ok(pid), Ok(pgid)) = (pid.parse(), pgid.parse()) {
-                    // Capture the birth token in the same loop that confirms the leader is live, so a
-                    // constructed Identity always carries a valid starttime — never an absent one that
-                    // could later make teardown skip the owned group. A momentary /proc miss retries.
-                    if let Some(starttime) = proc_starttime(pid) {
-                        return Identity {
-                            path: path.to_string_lossy().into_owned(),
-                            pid,
-                            pgid,
-                            boot: boot.to_owned(),
-                            starttime,
-                        };
-                    }
+                    return Identity {
+                        path: path.to_string_lossy().into_owned(),
+                        pid,
+                        pgid,
+                        boot: boot.to_owned(),
+                    };
                 }
             }
         }
