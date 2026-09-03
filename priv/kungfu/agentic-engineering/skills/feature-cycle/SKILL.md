@@ -70,9 +70,11 @@ per-feature, but your attention across features is the scarce resource.
    the same candidate. Send ambiguous qualification to your parent. If the row is
    exhausted, the parent records `work-blocked` or surfaces the credential need. Spawn
    the selected reviewer as a fresh session with the capability the effect requires.
-   Same model, provider, or harness remains eligible. Open exactly one linked review
-   card for the change and keep that card through all revisions:
+   Same model, provider, or harness remains eligible. Open one linked review card for
+   the current review round:
    `tightbeam assign --subject "review of <goal>" --role reviewer:<slug> --work-item <id> --reviews <coderAssignmentId>`.
+   A review card ends after its holder files the verdict; do not reuse it for a later
+   review round.
    The `--reviews` link and the verdict by that card's different-session holder are
    what let the substrate compute independence. Harness and provider differences stay
    observable selection evidence; they do not gate completion. A verdict filed
