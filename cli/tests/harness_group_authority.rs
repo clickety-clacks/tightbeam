@@ -6,8 +6,9 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Same-group protection must run before SIGSTOP: a caller inside the recorded group must
@@ -49,7 +50,7 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
     // The leader is live now; adopt it so teardown reaps exactly its birth-verified group.
     assert_eq!(
         session.adopt(&leader_identity),
-        AdoptOutcome::Verified,
+        AdoptOutcome::Adopted,
         "a live leader must adopt as birth-verified"
     );
 
@@ -116,7 +117,7 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
     // The leader is live now; adopt it so teardown reaps exactly its birth-verified group.
     assert_eq!(
         session.adopt(&leader_identity),
-        AdoptOutcome::Verified,
+        AdoptOutcome::Adopted,
         "a live leader must adopt as birth-verified"
     );
 
@@ -145,10 +146,10 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
 }
 
 /// OWN-AT-SPAWN closes the leak class even when the leader is already GONE by the time we look. The
-/// leader here exits immediately, so its `/proc` starttime is never readable for a live process and
-/// `adopt` reports `Gone` — nothing alive to reap. The guard, armed the instant the wrapper is
-/// spawned, must still kill and wait the wrapper and remove the scratch directory, and must NEVER
-/// signal a group it could not birth-verify (the dead leader is never adopted, so no `killpg`).
+/// leader here exits immediately, so `adopt` reports `Gone` — nothing alive to reap. The guard, armed
+/// the instant the wrapper is spawned, must still kill and wait the wrapper and remove the scratch
+/// directory, and must NEVER signal a group it could not birth-verify (the dead leader is never
+/// adopted, so no `killpg`).
 #[test]
 fn gone_leader_leaves_nothing_without_unowned_signal() {
     let dir = std::env::temp_dir().join(format!(
@@ -218,36 +219,78 @@ fn gone_leader_leaves_nothing_without_unowned_signal() {
         "scratch directory must be removed on acquisition failure"
     );
     assert!(
-        unsafe { libc::kill(wrapper_pid, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        is_gone(wrapper_pid),
         "the harness-exec wrapper must be killed and reaped"
     );
 }
 
-/// A LIVE detached leader whose birth token cannot be acquired must be SURFACED — never silently
-/// dropped — and must still be disposed of, without the teardown guard ever signalling a group it
-/// has not birth-verified.
+/// `OwnedSession` must reap the LIVE detached leader ITSELF — on a normal return AND on a panic
+/// unwind — even when the leader's birth token becomes persistently unreadable AFTER adoption, and it
+/// must do so without ever signalling a group it did not birth-verify and without any external reap.
 ///
-/// This forces the hard case named in att_ebbb5be4: a real detached leader has written its identity
-/// and remains LIVE, while `/proc` starttime acquisition is made to fail persistently before
-/// adoption (`POISONED_TOKEN_PID`). The old optional-token `adopt` mapped this to a silent no-op,
-/// leaving the running leader as a PID 1 orphan with no signal and no report. The fixed `adopt`
-/// returns `StrandedLive`, so the caller learns a live leader could not be birth-verified and
-/// disposes of it through authority captured while the leader was provably live — BEFORE the token
-/// acquisition could fail. Teardown itself still issues no `killpg` for an un-birth-verified group.
+/// This is the case named in att_ebbb5be4 and refined by the PO: the guard captures birth-verified
+/// cleanup authority at adoption, BEFORE the fallible token step; a subsequent persistent
+/// `/proc` starttime failure (`poison`) then cannot strip that authority. Teardown reaps the owned
+/// group using the token captured while the leader was live plus a current same-group liveness check —
+/// never a bare pgid, never a gone or reused pid. The harness-exec wrapper is `setsid`-detached from
+/// the leader, so killing the wrapper cannot reap the leader; only this birth-verified `killpg` can.
 #[test]
-fn live_leader_with_persistent_token_failure_is_surfaced_and_reaped_without_unowned_signal() {
+fn owned_session_reaps_live_leader_after_persistent_token_failure_on_return() {
+    let (wrapper_pid, leader) = run_live_leader_persistent_failure(|session| {
+        // Normal return: `session` drops here, at end of the closure, under the active poison.
+        drop(session);
+    });
+    assert!(
+        is_gone(wrapper_pid),
+        "the harness-exec wrapper must be killed and reaped on return"
+    );
+    assert!(
+        group_is_gone(leader.pgid),
+        "OwnedSession must reap the detached leader group itself on return — no external reap"
+    );
+}
+
+#[test]
+fn owned_session_reaps_live_leader_after_persistent_token_failure_on_unwind() {
+    let (wrapper_pid, leader) = run_live_leader_persistent_failure(|session| {
+        // Panic unwind: `session`'s Drop must still reap everything as the stack unwinds.
+        let result = catch_unwind(AssertUnwindSafe(move || {
+            let _owned = session;
+            panic!("forced failure after the birth token became persistently unreadable");
+        }));
+        assert!(
+            result.is_err(),
+            "the forced failure must unwind through Drop"
+        );
+    });
+    assert!(
+        is_gone(wrapper_pid),
+        "the harness-exec wrapper must be killed and reaped on unwind"
+    );
+    assert!(
+        group_is_gone(leader.pgid),
+        "OwnedSession must reap the detached leader group itself on unwind — no external reap"
+    );
+}
+
+/// Shared body for the return/unwind proofs: launch a real detached leader that stays LIVE, arm the
+/// guard, adopt it (capturing birth-verified cleanup BEFORE the fallible step), then make its birth
+/// token PERSISTENTLY unreadable and hand the armed guard to `finish`, which drops it on the path
+/// under test. Returns the wrapper pid and the leader's captured token so the caller can prove
+/// everything is gone. The poison is lifted before returning so the caller's checks read real state.
+fn run_live_leader_persistent_failure(
+    finish: impl FnOnce(OwnedSession),
+) -> (libc::pid_t, LeaderToken) {
     let dir = std::env::temp_dir().join(format!(
-        "tightbeam-harness-group-acqfail-live-{}",
-        std::process::id()
+        "tightbeam-harness-group-acqfail-live-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
     ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
     let binary = env!("CARGO_BIN_EXE_tightbeam");
     let identity_path = dir.join("leader.identity");
-    // The leader stays LIVE for the whole test: its birth token IS readable, but acquisition is
-    // forced to fail persistently below, so this exercises a live leader we cannot birth-verify.
     let leader = script(&dir, "leader.sh", "while :; do sleep 1; done\n");
 
     let harness = Command::new(binary)
@@ -265,62 +308,38 @@ fn live_leader_with_persistent_token_failure_is_surfaced_and_reaped_without_unow
         .spawn()
         .expect("the harness session launcher must start");
 
-    // OWN-AT-SPAWN: the guard owns the wrapper and scratch dir the instant the wrapper exists.
     let mut session = OwnedSession::arm(harness, &dir);
     let wrapper_pid = session.harness.id() as libc::pid_t;
-    let leader_identity = await_identity(&identity_path);
+    let identity = await_identity(&identity_path);
 
-    // Teardown ownership of the LIVE leader is captured HERE — before any token acquisition can fail
-    // — so a later failure can never leak it. This birth-verified authority is exactly what the guard
-    // may not fabricate once the token read fails, and what the test uses for bounded cleanup.
-    let reaper = LeaderToken::capture(&leader_identity)
-        .expect("the live leader must yield a birth token before failure is injected");
+    // Capture birth-verified cleanup authority NOW, while the leader is live and its token is
+    // readable — BEFORE the fallible token step. This is what the guard owns and later reaps.
     assert_eq!(
-        unsafe { libc::kill(reaper.pid, 0) },
-        0,
-        "the detached leader must be live so this is the stranded-live case, not the gone case"
+        session.adopt(&identity),
+        AdoptOutcome::Adopted,
+        "the live leader must adopt as birth-verified before the token failure is injected"
     );
-
-    // Force a PERSISTENT birth-token acquisition failure for this live leader, then adopt.
-    POISONED_TOKEN_PID.store(leader_identity.pid, Ordering::SeqCst);
-    let outcome = session.adopt(&leader_identity);
-    POISONED_TOKEN_PID.store(0, Ordering::SeqCst);
-
-    // The live leader was SURFACED, not silently classified as gone (the old-path bug), and was NOT
-    // birth-verified by the guard, so teardown will issue no group signal for it.
-    assert_eq!(
-        outcome,
-        AdoptOutcome::StrandedLive,
-        "a live leader whose token cannot be read must surface as stranded, never a silent no-op"
-    );
+    let captured = session
+        .leader
+        .as_ref()
+        .expect("adoption must have captured a birth token")
+        .clone();
     assert!(
-        session.leader.is_none(),
-        "an un-birth-verified leader must never be armed for signalling"
+        !is_gone(captured.pid),
+        "the detached leader must be live for this to be the stranded-live case"
     );
 
-    drop(session);
+    // Inject a PERSISTENT birth-token read failure for this live leader. From here on every
+    // `/proc` starttime read for it fails, including the guard's own re-read inside `Drop`.
+    poison(captured.pid);
 
-    // The guard signalled no group (no birth authority), so the live leader is still running — it was
-    // surfaced, not silently leaked. Dispose of it through the birth-verified authority captured while
-    // it was provably live.
-    assert_eq!(
-        unsafe { libc::kill(reaper.pid, 0) },
-        0,
-        "teardown must not have signalled the un-birth-verified leader group"
-    );
-    reaper.reap_if_still_owned();
-    wait_for_group_absence(reaper.pgid);
+    // Drop the guard on the path under test (normal return or panic unwind). Teardown must reap the
+    // owned leader group despite the persistent token failure, using the captured authority.
+    finish(session);
 
-    // Everything is gone: wrapper reaped, scratch removed, leader group reaped.
-    assert!(
-        !dir.exists(),
-        "scratch directory must be removed on persistent acquisition failure"
-    );
-    assert!(
-        unsafe { libc::kill(wrapper_pid, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
-        "the harness-exec wrapper must be killed and reaped"
-    );
+    // Lift the poison so the caller's absence checks read real kernel state.
+    unpoison(captured.pid);
+    (wrapper_pid, captured)
 }
 
 struct Identity {
@@ -333,8 +352,8 @@ struct Identity {
 /// The Linux birth token for a pid: field 22 (`starttime`) of `/proc/<pid>/stat`. `comm` (field 2)
 /// can contain spaces and parentheses, so parse the fields after the final `)`. Two processes that
 /// reuse the same pid cannot share a starttime, so this distinguishes the captured leader from any
-/// later pid/pgid reuse. `None` only means the raw read/parse did not yield a token; callers must
-/// separately decide whether the pid is gone or live-but-unreadable (see `read_birth_token`).
+/// later pid/pgid reuse. `None` only means the raw read/parse did not yield a token; callers resolve
+/// gone-vs-live via `read_birth_token`.
 fn proc_starttime(pid: libc::pid_t) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after = stat.rsplit_once(')')?.1;
@@ -342,24 +361,41 @@ fn proc_starttime(pid: libc::pid_t) -> Option<u64> {
     after.split_whitespace().nth(19)?.parse().ok()
 }
 
-/// Test-only injection of a PERSISTENT birth-token acquisition failure for one live pid. Keyed on pid
-/// so a poisoned leader never disturbs the unrelated leaders of concurrently running tests. This lets
-/// a control keep a leader genuinely LIVE while its `/proc` starttime is treated as unreadable — the
-/// case a real `/proc` read failure on a running process would produce.
-static POISONED_TOKEN_PID: AtomicI32 = AtomicI32::new(0);
+/// Test-only injection of a PERSISTENT birth-token acquisition failure for specific live pids. Keyed
+/// on pid so a poisoned leader never disturbs the unrelated leaders of concurrently running tests,
+/// and held in a set so several tests can each poison their own leader at once. Modelling a real
+/// `/proc` read failure against a still-running process is the only way to force the fail-closed path
+/// while the leader stays live.
+static POISONED_TOKEN_PIDS: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+
+fn poison(pid: libc::pid_t) {
+    POISONED_TOKEN_PIDS.lock().unwrap().push(pid);
+}
+
+fn unpoison(pid: libc::pid_t) {
+    POISONED_TOKEN_PIDS.lock().unwrap().retain(|&p| p != pid);
+}
+
+fn token_read_is_poisoned(pid: libc::pid_t) -> bool {
+    POISONED_TOKEN_PIDS.lock().unwrap().contains(&pid)
+}
+
+/// True iff the pid is gone: `kill(pid, 0)` fails with `ESRCH`.
+fn is_gone(pid: libc::pid_t) -> bool {
+    (unsafe { libc::kill(pid, 0) }) == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
 
 /// The outcome of reading a leader's birth token, distinguishing a process that is GONE (nothing to
-/// reap, no signal needed) from one that is LIVE but whose token could not be read (a fail-closed
-/// condition that must never be silently classified as gone). Mirrors production
-/// `verify_process_instance`, which fails closed on a live pid whose start time cannot be read rather
-/// than silently treating it as absent.
+/// reap) from one that is LIVE but whose token could not be read (a fail-closed condition that must
+/// never be silently classified as gone). Mirrors production `verify_process_instance`, which fails
+/// closed on a live pid whose start time cannot be read rather than silently treating it as absent.
 enum BirthToken {
     /// The leader is live and its birth token was captured: birth authority to reap its group.
     Captured(u64),
     /// The leader is gone (ESRCH): there is nothing alive to reap and no group is ever signalled.
     Gone,
-    /// The leader is still LIVE but its birth token could not be read. Fail closed: it may not be
-    /// signalled (no birth authority) and it must NOT be treated as gone.
+    /// The leader is still LIVE but its birth token could not be read right now.
     Unreadable,
 }
 
@@ -368,45 +404,38 @@ enum BirthToken {
 /// `adopt` silently dropped, leaking the running leader.
 fn read_birth_token(pid: libc::pid_t) -> BirthToken {
     // A poisoned pid stands in for a persistent `/proc` read failure against a still-running process.
-    let token = if POISONED_TOKEN_PID.load(Ordering::SeqCst) == pid {
+    let token = if token_read_is_poisoned(pid) {
         None
     } else {
         proc_starttime(pid)
     };
     match token {
         Some(starttime) => BirthToken::Captured(starttime),
-        None => {
-            // No token. A gone pid is correctly never signalled; a still-live pid must not be
-            // silently classified as gone.
-            let gone = unsafe { libc::kill(pid, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-            if gone {
-                BirthToken::Gone
-            } else {
-                BirthToken::Unreadable
-            }
-        }
+        None if is_gone(pid) => BirthToken::Gone,
+        None => BirthToken::Unreadable,
     }
 }
 
-/// The result of adopting a detached leader for teardown. Marked `#[must_use]` so a live leader that
-/// could not be birth-verified (`StrandedLive`) can never be silently ignored at a call site — the
-/// silent no-op that leaked a running leader is now a compile error, not a latent bug.
+/// The result of adopting a detached leader for teardown. A live leader that could not be
+/// birth-verified AT adoption is surfaced as `StrandedLive` rather than silently dropped, but the
+/// load-bearing guarantee is that teardown ownership is captured here, before any later fallible
+/// token step — so a persistent failure after adoption can never strip it.
 #[must_use]
 #[derive(Debug, PartialEq, Eq)]
 enum AdoptOutcome {
-    /// The leader is live and birth-verified; its group is now armed for reaping by `Drop`.
-    Verified,
-    /// The leader is already gone; there is nothing to reap and no group will be signalled.
+    /// The leader was live and birth-verified; its group is now armed for reaping by `Drop`.
+    Adopted,
+    /// The leader was already gone; there is nothing to reap and no group will be signalled.
     Gone,
-    /// The leader is still LIVE but could not be birth-verified, so it was NOT armed for signalling.
-    /// The caller must dispose of the captured group through authority it already holds; teardown
-    /// will not signal an un-birth-verified group.
+    /// The leader was still LIVE but could not be birth-verified at adoption, so no cleanup authority
+    /// could be captured. Adopt before the fallible token step to avoid this.
     StrandedLive,
 }
 
-/// A detached leader this test has birth-verified and may reap: its pid, its recorded pgid, and the
-/// `/proc` starttime captured while it was live.
+/// Birth-verified reaping authority for one detached leader: its pid, its recorded pgid, and the
+/// `/proc` starttime captured while it was live. Captured once, at adoption, before any fallible
+/// token step; teardown reaps through this even if the token later becomes unreadable.
+#[derive(Clone)]
 struct LeaderToken {
     pid: libc::pid_t,
     pgid: libc::pid_t,
@@ -414,25 +443,27 @@ struct LeaderToken {
 }
 
 impl LeaderToken {
-    /// Capture birth-verified reaping authority for a leader that is live right now, or `None` if its
-    /// token cannot be read. Used to own teardown of a live leader BEFORE any later token acquisition
-    /// can fail — the authority a fail-closed guard may not fabricate afterward.
-    fn capture(identity: &Identity) -> Option<LeaderToken> {
-        proc_starttime(identity.pid).map(|starttime| LeaderToken {
-            pid: identity.pid,
-            pgid: identity.pgid,
-            starttime,
-        })
-    }
-
-    /// SIGKILL the captured group, but only while the captured pid still leads the captured pgid with
-    /// an unchanged birth token — so a reused pid/pgid is never signalled.
+    /// SIGKILL the captured group, but only while the captured pid still leads the captured pgid and
+    /// is provably still the instance we birth-verified at capture:
+    /// - starttime still readable and matching -> the same live instance -> reap;
+    /// - starttime readable but changed -> pid reuse -> never signal;
+    /// - gone (ESRCH) -> nothing to reap -> never signal;
+    /// - starttime unreadable but the pid is alive and still leads the captured pgid -> reap on the
+    ///   authority captured while it was live (a persistent `/proc` failure must not leak a leader we
+    ///   already birth-verified). This is never a bare-pgid signal: it is gated on our captured token
+    ///   for this exact pid plus current same-group membership.
     fn reap_if_still_owned(&self) {
-        let owned = proc_starttime(self.pid) == Some(self.starttime)
-            && unsafe { libc::getpgid(self.pid) } == self.pgid;
-        if owned {
-            unsafe {
-                libc::killpg(self.pgid, libc::SIGKILL);
+        let reap = || unsafe {
+            libc::killpg(self.pgid, libc::SIGKILL);
+        };
+        match read_birth_token(self.pid) {
+            BirthToken::Captured(current) if current == self.starttime => reap(),
+            BirthToken::Captured(_) => {}
+            BirthToken::Gone => {}
+            BirthToken::Unreadable => {
+                if unsafe { libc::getpgid(self.pid) } == self.pgid {
+                    reap();
+                }
             }
         }
     }
@@ -440,15 +471,13 @@ impl LeaderToken {
 
 /// Owns unconditional teardown of one harness-launched session. ARMED the instant the wrapper is
 /// spawned — before `await_identity`, any floor call, or any assertion — so that even a failure to
-/// acquire the leader identity or its birth token (an `await_identity` panic, or a leader whose token
-/// cannot be read) still waits the wrapper and clears the scratch directory, and NEVER signals a
-/// group it has not birth-verified. The detached leader is ADOPTED only once its identity and a live
-/// `/proc` starttime are captured. A leader that is gone yields `AdoptOutcome::Gone` (nothing to
-/// reap); a leader that is still LIVE but whose token cannot be read yields `AdoptOutcome::StrandedLive`
-/// and is deliberately NOT armed for signalling — never silently dropped. On drop, on every path —
-/// normal return or panic: (1) kill and wait the owned wrapper; (2) SIGKILL the adopted leader group
-/// only while its captured pid still leads its captured pgid with an unchanged starttime; (3) remove
-/// the scratch dir.
+/// acquire the leader identity still waits the wrapper and clears the scratch directory, and NEVER
+/// signals a group it has not birth-verified. The detached leader is ADOPTED once its identity and a
+/// live `/proc` starttime are captured; that capture is the birth-verified cleanup authority, taken
+/// BEFORE any later fallible token step, so a persistent token failure after adoption cannot strip
+/// it. On drop, on every path — normal return or panic: (1) reap the owned leader group via
+/// `LeaderToken::reap_if_still_owned`; (2) kill and wait the owned wrapper (which is `setsid`-detached
+/// from the leader, so it cannot reap the leader); (3) remove the scratch dir.
 struct OwnedSession {
     harness: std::process::Child,
     dir: std::path::PathBuf,
@@ -466,11 +495,11 @@ impl OwnedSession {
         }
     }
 
-    /// Adopt the detached leader once its identity is known. `await_identity` has just confirmed the
-    /// leader wrote its identity, so a live leader's `/proc` starttime is readable. The outcome is
-    /// `#[must_use]`: `Gone` means the leader already exited (nothing to reap, no signal);
-    /// `StrandedLive` means the leader is still live but could not be birth-verified, so it is NOT
-    /// armed for signalling and the caller must dispose of it — it is never silently dropped.
+    /// Adopt the detached leader once its identity is known and it is live, capturing its birth token
+    /// as the guard's cleanup authority. The outcome is `#[must_use]`: `Gone` means the leader already
+    /// exited (nothing to reap); `StrandedLive` means the leader is still live but could not be
+    /// birth-verified at this instant, so no authority was captured — adopt before the fallible token
+    /// step to avoid it. `Adopted` means the guard now owns birth-verified teardown of the group.
     fn adopt(&mut self, identity: &Identity) -> AdoptOutcome {
         match read_birth_token(identity.pid) {
             BirthToken::Captured(starttime) => {
@@ -479,7 +508,7 @@ impl OwnedSession {
                     pgid: identity.pgid,
                     starttime,
                 });
-                AdoptOutcome::Verified
+                AdoptOutcome::Adopted
             }
             BirthToken::Gone => AdoptOutcome::Gone,
             BirthToken::Unreadable => AdoptOutcome::StrandedLive,
@@ -489,17 +518,16 @@ impl OwnedSession {
 
 impl Drop for OwnedSession {
     fn drop(&mut self) {
-        // The wrapper is our direct child: kill and reap it on every path, including panic — even if
-        // the leader was never adopted.
-        let _ = self.harness.kill();
-        let _ = self.harness.wait();
-
-        // Signal the leader group only if one was adopted and is provably still the one we captured —
-        // pid alive, still leading the recorded pgid, with an unchanged birth token. An unadopted,
-        // stranded, or gone/recycled leader is never signalled, so no unowned group is ever SIGKILLed.
+        // Reap the owned leader group FIRST, while its captured authority is in hand: the wrapper is
+        // `setsid`-detached from the leader, so killing the wrapper can never reap the leader — only
+        // this birth-verified `killpg` can. An unadopted, gone, or reused leader is never signalled.
         if let Some(leader) = &self.leader {
             leader.reap_if_still_owned();
         }
+
+        // The wrapper is our direct child: kill and reap it on every path, including panic.
+        let _ = self.harness.kill();
+        let _ = self.harness.wait();
 
         // Clear the scratch directory on every path, so a failing control or panic leaves no debris.
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -543,15 +571,15 @@ fn await_identity(path: &std::path::Path) -> Identity {
 /// Poll until no process remains in the group, bounded — proof that a reaped leader group is gone
 /// rather than merely signalled. The detached leader is not our child, so it is reaped by its
 /// subreaper after the SIGKILL; `killpg(pgid, 0)` returns `ESRCH` once the group is empty.
-fn wait_for_group_absence(pgid: libc::pid_t) {
+fn group_is_gone(pgid: libc::pid_t) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         let gone = unsafe { libc::killpg(pgid, 0) } == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
         if gone {
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("process group {pgid} was still present after bounded reap");
+    false
 }
