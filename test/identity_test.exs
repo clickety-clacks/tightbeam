@@ -209,15 +209,23 @@ defmodule Tightbeam.IdentityTest do
   test "shipped kungfu status compares the imported baseline without mutating identity", ctx do
     assert {:ok, _revision} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
     dir = Path.join(ctx.base, "identity")
+
+    removed_receipt = Path.join(dir, "kungfu/retired-kungfu/installed.toml")
+    File.mkdir_p!(Path.dirname(removed_receipt))
+    File.write!(removed_receipt, ~s(name = "retired-kungfu"\npaths = []\n))
+    git!(dir, ["add", "--", "kungfu/retired-kungfu/installed.toml"])
+    git!(dir, ["commit", "-m", "fixture: retain removed kungfu receipt"], "operator")
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", "HEAD"])
+
     before_refs = git!(dir, ["show-ref"])
     before_status = git!(dir, ["status", "--porcelain"])
 
-    assert {:ok, %{current: ["agentic-engineering"], stale: []}} =
+    assert {:ok, %{current: ["agentic-engineering"], stale: ["retired-kungfu"]}} =
              Identity.shipped_kungfu_status(ctx.base)
 
     File.write!(Path.join(ctx.source, "intake.md"), "updated shipped intake\n")
 
-    assert {:ok, %{current: [], stale: ["agentic-engineering"]}} =
+    assert {:ok, %{current: [], stale: ["agentic-engineering", "retired-kungfu"]}} =
              Identity.shipped_kungfu_status(ctx.base)
 
     assert git!(dir, ["show-ref"]) == before_refs

@@ -733,13 +733,15 @@ defmodule Tightbeam.Identity do
       upstream = git_output!(dir, ["rev-parse", @upstream])
       available = MapSet.new(available_bundle_names())
 
-      {current, stale} =
+      {shipped, removed} =
         dir
         |> learned_bundle_names_at(live)
-        |> Enum.filter(&MapSet.member?(available, &1))
-        |> Enum.split_with(&shipped_bundle_current?(dir, live, upstream, &1))
+        |> Enum.split_with(&MapSet.member?(available, &1))
 
-      {:ok, %{current: Enum.sort(current), stale: Enum.sort(stale)}}
+      {current, updated} =
+        Enum.split_with(shipped, &shipped_bundle_current?(dir, live, upstream, &1))
+
+      {:ok, %{current: Enum.sort(current), stale: Enum.sort(updated ++ removed)}}
     else
       {:error, "#{dir} is not an identity repository"}
     end
