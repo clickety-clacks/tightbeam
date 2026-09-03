@@ -445,33 +445,33 @@ defmodule Tightbeam.WorkItems do
               end
 
               # The item keeps its CURRENT state only, and reopen nulls failReason;
-            # work_item_events is a bare doorbell (kind is 'metadata' or
-            # 'composition'), so it records that something changed, never from
-            # what to what. jobRef IS the work-item id here, and a disposition
-            # belongs to no assignment.
+              # work_item_events is a bare doorbell (kind is 'metadata' or
+              # 'composition'), so it records that something changed, never from
+              # what to what. jobRef IS the work-item id here, and a disposition
+              # belongs to no assignment.
               CausalEvents.append_in_txn(txn, %{
-              kind: "disposition_transition",
-              job_ref: id,
-              assignment_id: nil,
-              session_key: nil,
-              detail: %{
-                workItemId: id,
-                fromState: item.state,
-                toState: target,
-                failReason: disposed.failReason
-              }
+                kind: "disposition_transition",
+                job_ref: id,
+                assignment_id: nil,
+                session_key: nil,
+                detail: %{
+                  workItemId: id,
+                  fromState: item.state,
+                  toState: target,
+                  failReason: disposed.failReason
+                }
               })
 
               [[transition_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
 
               if verb != :reopen do
                 cancel_brackets_in_txn(txn, id, %{
-                causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
-                outcome: %{
-                  kind: "disposition",
-                  disposition_kind: "work_item_transition",
-                  disposition_id: to_string(transition_id)
-                }
+                  causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
+                  outcome: %{
+                    kind: "disposition",
+                    disposition_kind: "work_item_transition",
+                    disposition_id: to_string(transition_id)
+                  }
                 })
               end
 
@@ -552,7 +552,8 @@ defmodule Tightbeam.WorkItems do
   def state_for(db, id) do
     case DB.query(db, "SELECT state FROM work_items WHERE id = ?1", [id]) do
       {:ok, [[state]]} -> state
-      {:ok, []} -> nil
+      {:ok, []} ->
+        nil
     end
   end
 
@@ -561,7 +562,8 @@ defmodule Tightbeam.WorkItems do
   def state_in_txn(%Txn{} = txn, id) do
     case Txn.q(txn, "SELECT state FROM work_items WHERE id = ?1", [id]) do
       [[state]] -> state
-      [] -> nil
+      [] ->
+        nil
     end
   end
 

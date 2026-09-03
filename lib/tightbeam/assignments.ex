@@ -6,7 +6,16 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, EventLog, IdPrefix, Org, Placement, Projection, Supervision, Wakes}
+  alias Tightbeam.{
+    EffortCheckin,
+    EventLog,
+    IdPrefix,
+    Org,
+    Placement,
+    Projection,
+    Supervision,
+    Wakes
+  }
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
