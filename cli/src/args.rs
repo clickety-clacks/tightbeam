@@ -1785,7 +1785,10 @@ fn parse_with_optional_catalog(
                     return Err("--key on an immediate wake requires --session".to_owned());
                 }
                 if after_ms.is_some() || at.is_some() {
-                    return Err("--key on an immediate wake cannot be combined with --after or --at".to_owned());
+                    return Err(
+                        "--key on an immediate wake cannot be combined with --after or --at"
+                            .to_owned(),
+                    );
                 }
             }
             if flags.get("class").is_some_and(String::is_empty) {
