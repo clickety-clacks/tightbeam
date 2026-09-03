@@ -2,18 +2,31 @@
 //!
 //! Named classes from att_981d3490: same-group pre-stop, signal-time revalidation failure,
 //! and (in unit tests) PID/PGID reuse plus macOS individual-PID EPERM handling.
+//!
+//! Per ruling att_a96078c0 the test-side cleanup is deliberately NOT a group supervisor: a
+//! privileged cgroup/PID-namespace boundary is unavailable to the test user. Each control launches a
+//! SINGLE-PROCESS detached leader (harness-exec execs one bounded `sleep`, so the session has no child
+//! process tree), captures a `pidfd` for that exact instance after identity, and `OwnedSession::Drop`
+//! SIGKILLs it DIRECTLY through `pidfd_send_signal`. That is reuse-proof (a pidfd is bound to one
+//! instance) and needs no `/proc`; there is no numeric `killpg`. Production harness-group authority is
+//! asserted separately below via the real `harness-group` command — the test cleanup does not re-prove
+//! it.
 
 use std::fs;
+use std::io;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// A bounded lifetime for every single-process leader: long enough to outlive any control, short
+/// enough that an escaped leader self-exits rather than lingering.
+const LEADER_SECONDS: &str = "600";
+
 /// Same-group protection must run before SIGSTOP: a caller inside the recorded group must
-/// not freeze itself and hang forever.
+/// not freeze itself and hang forever. (Production harness-group authority assertion.)
 #[test]
 fn same_group_caller_is_not_frozen_by_the_initial_stop() {
     let dir = std::env::temp_dir().join(format!(
@@ -26,16 +39,13 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
     let binary = env!("CARGO_BIN_EXE_tightbeam");
     let identity_path = dir.join("leader.identity");
 
-    let leader = script(&dir, "leader.sh", "while :; do sleep 1; done\n");
-
-    let harness = spawn_harness(binary, &identity_path, &leader);
+    let harness = spawn_sleep_leader(binary, &identity_path);
 
     // Arm teardown the instant the wrapper exists — before `await_identity`, any floor call, or any
-    // assertion — so even a failure to acquire the identity/token still waits the wrapper and clears
-    // the scratch dir without ever signalling an unowned group.
+    // assertion — so even a failure to acquire the identity still waits the wrapper and clears the
+    // scratch dir without ever signalling anything it did not birth-verify.
     let mut session = OwnedSession::arm(harness, &dir);
     let leader_identity = await_identity(&identity_path);
-    // The leader is live now; adopt it so teardown reaps exactly its birth-verified instance.
     assert_eq!(
         session.adopt(&leader_identity),
         AdoptOutcome::Adopted,
@@ -64,11 +74,12 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
         String::from_utf8_lossy(&floor.stderr)
     );
 
-    // Teardown (owned-instance reap, wrapper wait, scratch removal) is owned by `session`'s Drop, so
-    // it runs on this normal return and on any assertion unwind above.
+    // Teardown (direct pidfd SIGKILL of the leader, wrapper wait, scratch removal) is owned by
+    // `session`'s Drop, so it runs on this normal return and on any assertion unwind above.
 }
 
 /// Identity revalidation at signal time must refuse a boot mismatch before any kill.
+/// (Production harness-group authority assertion.)
 #[test]
 fn signal_time_revalidation_refuses_a_boot_mismatch() {
     let dir = std::env::temp_dir().join(format!(
@@ -80,16 +91,11 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
 
     let binary = env!("CARGO_BIN_EXE_tightbeam");
     let identity_path = dir.join("leader.identity");
-    let leader = script(&dir, "leader.sh", "while :; do sleep 1; done\n");
 
-    let harness = spawn_harness(binary, &identity_path, &leader);
+    let harness = spawn_sleep_leader(binary, &identity_path);
 
-    // Arm teardown the instant the wrapper exists — before `await_identity`, any floor call, or any
-    // assertion — so even a failure to acquire the identity/token still waits the wrapper and clears
-    // the scratch dir without ever signalling an unowned group.
     let mut session = OwnedSession::arm(harness, &dir);
     let leader_identity = await_identity(&identity_path);
-    // The leader is live now; adopt it so teardown reaps exactly its birth-verified instance.
     assert_eq!(
         session.adopt(&leader_identity),
         AdoptOutcome::Adopted,
@@ -115,16 +121,12 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
         String::from_utf8_lossy(&floor.stderr).contains("boot identity"),
         "stderr must name the boot mismatch"
     );
-
-    // Teardown (owned-instance reap, wrapper wait, scratch removal) is owned by `session`'s Drop, so
-    // it runs on this normal return and on any assertion unwind above.
 }
 
-/// OWN-AT-SPAWN closes the leak class even when the leader is already GONE by the time we look. The
-/// leader here exits immediately, so `adopt` reports `Gone` — nothing alive to reap. The guard, armed
-/// the instant the wrapper is spawned, must still kill and wait the wrapper and remove the scratch
-/// directory, and must NEVER signal a group it could not birth-verify (the dead leader is never
-/// adopted, so no `killpg`).
+/// The guard closes the leak class even when the leader is already GONE by the time we look. The
+/// leader here exits immediately, so `adopt` reports `Gone` — nothing to reap. The guard, armed the
+/// instant the wrapper is spawned, must still kill and wait the wrapper and remove the scratch
+/// directory, and must NEVER signal an instance it could not capture.
 #[test]
 fn gone_leader_leaves_nothing_without_unowned_signal() {
     let dir = std::env::temp_dir().join(format!(
@@ -136,12 +138,10 @@ fn gone_leader_leaves_nothing_without_unowned_signal() {
 
     let binary = env!("CARGO_BIN_EXE_tightbeam");
     let identity_path = dir.join("leader.identity");
-    // The leader exits immediately: it is gone before its instance handle can be captured.
-    let leader = script(&dir, "leader.sh", "exit 0\n");
 
-    let harness = spawn_harness(binary, &identity_path, &leader);
+    // A single-process leader that exits immediately.
+    let harness = spawn_leader(binary, &identity_path, &["/bin/true"]);
 
-    // OWN-AT-SPAWN: the guard owns the wrapper and scratch dir the instant the wrapper exists.
     let mut session = OwnedSession::arm(harness, &dir);
     let wrapper_pid = session.harness.id() as libc::pid_t;
 
@@ -156,7 +156,6 @@ fn gone_leader_leaves_nothing_without_unowned_signal() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // The dead leader is never adopted, so teardown will not signal any group.
     assert!(
         session.leader.is_none(),
         "a leader without a live instance handle must never be adopted"
@@ -164,49 +163,44 @@ fn gone_leader_leaves_nothing_without_unowned_signal() {
 
     drop(session);
 
-    // Teardown left nothing: wrapper reaped, scratch removed. No unowned group was signalled because
-    // no leader was ever adopted (asserted above).
     assert!(
         !dir.exists(),
         "scratch directory must be removed on acquisition failure"
     );
     assert!(
-        is_gone(wrapper_pid),
+        wait_gone(wrapper_pid),
         "the harness-exec wrapper must be killed and reaped"
     );
 }
 
 /// `OwnedSession` must reap the LIVE detached leader ITSELF — on a normal return AND on a panic
-/// unwind — even when the leader's `/proc` birth token is persistently unreadable, and it must do so
-/// without ever signalling a group it did not birth-verify and without any external reap.
-///
-/// Authority is a `pidfd` captured at adoption: bound to the exact process instance, so teardown
-/// reaps only while THAT instance is alive, immune to pid/pgid reuse and needing no `/proc` read. The
-/// harness-exec wrapper is `setsid`-detached from the leader, so killing the wrapper cannot reap the
-/// leader; only this instance-exact `killpg` can.
+/// unwind — leaving zero wrapper/leader/PID1/scratch, with no external reap. Authority is a `pidfd`
+/// captured at adoption and SIGKILLed directly: bound to the exact instance, immune to pid reuse, and
+/// needing no `/proc`. The harness-exec wrapper is `setsid`-detached from the leader, so killing the
+/// wrapper cannot reap the leader; only this direct pidfd signal can.
 #[test]
-fn owned_session_reaps_live_leader_after_persistent_token_failure_on_return() {
-    let (wrapper_pid, leader_pgid) = run_live_leader_persistent_failure(|session| {
-        // Normal return: `session` drops here, at end of the closure, under the active poison.
+fn owned_session_reaps_live_leader_on_return() {
+    let (wrapper_pid, leader_pid) = run_live_leader(|session| {
+        // Normal return: `session` drops here, at end of the closure.
         drop(session);
     });
     assert!(
-        is_gone(wrapper_pid),
+        wait_gone(wrapper_pid),
         "the harness-exec wrapper must be killed and reaped on return"
     );
     assert!(
-        group_is_gone(leader_pgid),
-        "OwnedSession must reap the detached leader group itself on return — no external reap"
+        wait_gone(leader_pid),
+        "OwnedSession must reap the detached leader itself on return — no external reap"
     );
 }
 
 #[test]
-fn owned_session_reaps_live_leader_after_persistent_token_failure_on_unwind() {
-    let (wrapper_pid, leader_pgid) = run_live_leader_persistent_failure(|session| {
+fn owned_session_reaps_live_leader_on_unwind() {
+    let (wrapper_pid, leader_pid) = run_live_leader(|session| {
         // Panic unwind: `session`'s Drop must still reap everything as the stack unwinds.
         let result = catch_unwind(AssertUnwindSafe(move || {
             let _owned = session;
-            panic!("forced failure after the birth token became persistently unreadable");
+            panic!("forced failure inside the guarded scope");
         }));
         assert!(
             result.is_err(),
@@ -214,92 +208,79 @@ fn owned_session_reaps_live_leader_after_persistent_token_failure_on_unwind() {
         );
     });
     assert!(
-        is_gone(wrapper_pid),
+        wait_gone(wrapper_pid),
         "the harness-exec wrapper must be killed and reaped on unwind"
     );
     assert!(
-        group_is_gone(leader_pgid),
-        "OwnedSession must reap the detached leader group itself on unwind — no external reap"
+        wait_gone(leader_pid),
+        "OwnedSession must reap the detached leader itself on unwind — no external reap"
     );
 }
 
-/// The pidfd authority must EXCLUDE pid/pgid reuse the numeric approach could not. Here a token
-/// carries the numeric pid/pgid of a LIVE decoy but an instance handle (pidfd) for a DEAD victim,
-/// while the decoy's `/proc` birth token is made unreadable — the exact situation where a stored
-/// starttime plus current numeric pid/pgid cannot tell the decoy apart from the reaped victim. The
-/// pidfd is bound to the victim instance, so teardown must issue NO signal and the live decoy, whose
-/// numbers the token carried, must survive. (A fragile numeric reap would `killpg` the decoy — see the
-/// RED control in the evidence.)
+/// The pidfd authority must EXCLUDE pid reuse that a numeric signal could not. A token carries the
+/// numeric pid of a LIVE decoy but a `pidfd` for a DEAD victim. A DIRECT pidfd SIGKILL must return
+/// `ESRCH` (the victim instance is gone) and leave the live decoy untouched. A numeric fallback would
+/// signal the decoy's pid — see the RED control in the evidence.
 #[test]
-fn a_gone_instance_is_never_signalled_even_when_its_numbers_are_reused() {
+fn a_gone_instance_is_never_signalled_even_when_its_pid_is_reused() {
     let binary = env!("CARGO_BIN_EXE_tightbeam");
 
     // A live decoy leader we must NOT kill.
-    let (decoy_dir, mut decoy_wrapper, decoy) = launch_detached_leader(binary, "decoy");
+    let (decoy_dir, mut decoy_wrapper, decoy) = launch_single_process_leader(binary, "decoy");
     // A victim leader: capture its instance handle, then kill it so the pidfd refers to a GONE instance.
-    let (victim_dir, mut victim_wrapper, victim) = launch_detached_leader(binary, "victim");
+    let (victim_dir, mut victim_wrapper, victim) = launch_single_process_leader(binary, "victim");
     let victim_pidfd = pidfd_open(victim.pid).expect("victim pidfd must open while it is live");
-    unsafe {
-        libc::killpg(victim.pgid, libc::SIGKILL);
-    }
+    // Kill the victim directly through its own pidfd and reap its wrapper.
+    let _ = pidfd_kill(&victim_pidfd);
     let _ = victim_wrapper.kill();
     let _ = victim_wrapper.wait();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while pidfd_instance_alive(&victim_pidfd) && Instant::now() < deadline {
+    while pidfd_kill(&victim_pidfd).is_ok() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        !pidfd_instance_alive(&victim_pidfd),
-        "the victim instance must be gone so its pidfd is a dead handle"
-    );
 
-    // Make the decoy's /proc birth token unreadable: the numeric-plus-starttime approach now has
-    // nothing to distinguish the live decoy from the reaped victim — only the pidfd can.
-    poison(decoy.pid);
-    assert!(
-        matches!(read_birth_token(decoy.pid), BirthToken::Unreadable),
-        "the decoy's /proc token must be unreadable for this to exercise the fail-closed path"
-    );
-
-    // Token: numeric identity = LIVE decoy, instance handle = DEAD victim.
+    // Token: numeric pid = LIVE decoy, instance handle = DEAD victim.
     let token = LeaderToken {
         pid: decoy.pid,
-        pgid: decoy.pgid,
         pidfd: victim_pidfd,
     };
-    token.reap_if_still_owned(); // pidfd(victim) is gone -> NO signal
-    unpoison(decoy.pid);
 
-    // Give any errant signal time to land, then require the decoy to still be alive: the pidfd
-    // excluded the reuse. A fragile numeric reap would have SIGKILLed the decoy's group by now.
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        !is_gone(decoy.pid) && !group_is_gone_fast(decoy.pgid),
-        "the live decoy sharing the token's pid/pgid must survive — pidfd excludes instance reuse"
+    // A direct pidfd SIGKILL targets the captured (dead victim) instance and must report ESRCH; it
+    // cannot reach the decoy that now holds the same numeric pid.
+    let err = token
+        .reap()
+        .expect_err("signalling a dead instance's pidfd must fail");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ESRCH),
+        "a dead pidfd must yield ESRCH, never a signal to a reused pid"
     );
 
-    // Cleanup: reap the decoy group and both wrappers/scratch dirs.
-    unsafe {
-        libc::killpg(decoy.pgid, libc::SIGKILL);
-    }
+    // Give any errant signal time to land, then require the decoy to still be alive.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !is_gone(decoy.pid),
+        "the live decoy sharing the token's pid must survive — pidfd excludes instance reuse"
+    );
+
+    // Cleanup: reap the decoy directly and both wrappers/scratch dirs.
+    let decoy_pidfd = pidfd_open(decoy.pid).expect("decoy pidfd for cleanup");
+    let _ = pidfd_kill(&decoy_pidfd);
     let _ = decoy_wrapper.kill();
     let _ = decoy_wrapper.wait();
     let _ = fs::remove_dir_all(&decoy_dir);
     let _ = fs::remove_dir_all(&victim_dir);
-    assert!(group_is_gone(decoy.pgid), "decoy group must be cleaned up");
+    assert!(wait_gone(decoy.pid), "decoy must be cleaned up");
 }
 
-/// Shared body for the return/unwind proofs: launch a real detached leader that stays LIVE, arm the
-/// guard, adopt it (capturing a pidfd instance handle BEFORE the fallible token step), then make its
-/// `/proc` birth token PERSISTENTLY unreadable and hand the armed guard to `finish`, which drops it on
-/// the path under test. Returns the wrapper pid and the leader's pgid so the caller can prove
-/// everything is gone. The poison is lifted before returning so the caller's checks read real state.
-fn run_live_leader_persistent_failure(
-    finish: impl FnOnce(OwnedSession),
-) -> (libc::pid_t, libc::pid_t) {
+/// Shared body for the return/unwind proofs: launch a real single-process detached leader that stays
+/// LIVE, arm the guard, adopt it (capturing a pidfd instance handle), and hand the armed guard to
+/// `finish`, which drops it on the path under test. Returns the wrapper and leader pids so the caller
+/// can prove both are gone.
+fn run_live_leader(finish: impl FnOnce(OwnedSession)) -> (libc::pid_t, libc::pid_t) {
     let binary = env!("CARGO_BIN_EXE_tightbeam");
     let dir = std::env::temp_dir().join(format!(
-        "tightbeam-harness-group-acqfail-live-{}-{:?}",
+        "tightbeam-harness-group-live-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
@@ -307,40 +288,28 @@ fn run_live_leader_persistent_failure(
     fs::create_dir_all(&dir).unwrap();
 
     let identity_path = dir.join("leader.identity");
-    let leader = script(&dir, "leader.sh", "while :; do sleep 1; done\n");
-    let harness = spawn_harness(binary, &identity_path, &leader);
+    let harness = spawn_sleep_leader(binary, &identity_path);
 
     let mut session = OwnedSession::arm(harness, &dir);
     let wrapper_pid = session.harness.id() as libc::pid_t;
     let identity = await_identity(&identity_path);
 
-    // Capture instance-exact cleanup authority (a pidfd) NOW, while the leader is live — BEFORE the
-    // fallible token step. This is what the guard owns and later reaps.
     assert_eq!(
         session.adopt(&identity),
         AdoptOutcome::Adopted,
-        "the live leader must adopt as birth-verified before the token failure is injected"
+        "the live leader must adopt as birth-verified"
     );
-    let leader_pgid = session
+    let leader_pid = session
         .leader
         .as_ref()
         .expect("adoption captured a leader")
-        .pgid;
-
-    // Inject a PERSISTENT /proc birth-token read failure for this live leader. The pidfd reap does not
-    // read /proc, so this must not affect teardown — that is exactly what these controls prove.
-    poison(identity.pid);
-    assert!(
-        matches!(read_birth_token(identity.pid), BirthToken::Unreadable),
-        "the leader's /proc token must be unreadable while it stays live"
-    );
+        .pid;
 
     // Drop the guard on the path under test (normal return or panic unwind). Teardown must reap the
-    // owned instance despite the persistent token failure, using the pidfd authority.
+    // owned instance directly through its pidfd.
     finish(session);
 
-    unpoison(identity.pid);
-    (wrapper_pid, leader_pgid)
+    (wrapper_pid, leader_pid)
 }
 
 struct Identity {
@@ -350,17 +319,18 @@ struct Identity {
     boot: String,
 }
 
-/// Spawn the harness-exec wrapper for a leader script, detaching stdio.
-fn spawn_harness(binary: &str, identity_path: &std::path::Path, leader: &std::path::Path) -> Child {
+/// Spawn the harness-exec wrapper for a leader command, detaching stdio. `leader_argv` is the exact
+/// program the detached session leader execs — a SINGLE process, no shell/child tree.
+fn spawn_leader(binary: &str, identity_path: &std::path::Path, leader_argv: &[&str]) -> Child {
+    let mut args = vec![
+        "harness-exec",
+        &identity_path.to_str().unwrap(),
+        "leader-launch",
+        "--",
+    ];
+    args.extend_from_slice(leader_argv);
     Command::new(binary)
-        .args([
-            "harness-exec",
-            &identity_path.to_string_lossy(),
-            "leader-launch",
-            "--",
-            "/bin/sh",
-            &leader.to_string_lossy(),
-        ])
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -368,8 +338,13 @@ fn spawn_harness(binary: &str, identity_path: &std::path::Path, leader: &std::pa
         .expect("the harness session launcher must start")
 }
 
-/// Launch a detached leader that stays live and return its scratch dir, wrapper child, and identity.
-fn launch_detached_leader(binary: &str, tag: &str) -> (std::path::PathBuf, Child, Identity) {
+/// Spawn a single-process leader that stays live for the whole control: one bounded `sleep`.
+fn spawn_sleep_leader(binary: &str, identity_path: &std::path::Path) -> Child {
+    spawn_leader(binary, identity_path, &["/bin/sleep", LEADER_SECONDS])
+}
+
+/// Launch a live single-process leader and return its scratch dir, wrapper child, and identity.
+fn launch_single_process_leader(binary: &str, tag: &str) -> (std::path::PathBuf, Child, Identity) {
     let dir = std::env::temp_dir().join(format!(
         "tightbeam-harness-group-{tag}-{}-{:?}",
         std::process::id(),
@@ -378,41 +353,9 @@ fn launch_detached_leader(binary: &str, tag: &str) -> (std::path::PathBuf, Child
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let identity_path = dir.join("leader.identity");
-    let leader = script(&dir, "leader.sh", "while :; do sleep 1; done\n");
-    let harness = spawn_harness(binary, &identity_path, &leader);
+    let harness = spawn_sleep_leader(binary, &identity_path);
     let identity = await_identity(&identity_path);
     (dir, harness, identity)
-}
-
-/// The Linux birth token for a pid: field 22 (`starttime`) of `/proc/<pid>/stat`. `comm` (field 2)
-/// can contain spaces and parentheses, so parse the fields after the final `)`. `None` only means the
-/// raw read/parse did not yield a token; callers resolve gone-vs-live via `read_birth_token`. This is
-/// the legacy `/proc` token the reap path no longer trusts — kept only to establish the "unreadable"
-/// precondition in the controls and to drive the fragile RED.
-fn proc_starttime(pid: libc::pid_t) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after = stat.rsplit_once(')')?.1;
-    // Post-`)` fields begin at `state` (field 3), so `starttime` (field 22) is index 19.
-    after.split_whitespace().nth(19)?.parse().ok()
-}
-
-/// Test-only injection of a PERSISTENT birth-token acquisition failure for specific live pids. Keyed
-/// on pid so a poisoned leader never disturbs the unrelated leaders of concurrently running tests, and
-/// held in a set so several tests can each poison their own leader at once. Modelling a real `/proc`
-/// read failure against a still-running process is how the controls establish that the pidfd reap
-/// survives `/proc` unreadability.
-static POISONED_TOKEN_PIDS: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
-
-fn poison(pid: libc::pid_t) {
-    POISONED_TOKEN_PIDS.lock().unwrap().push(pid);
-}
-
-fn unpoison(pid: libc::pid_t) {
-    POISONED_TOKEN_PIDS.lock().unwrap().retain(|&p| p != pid);
-}
-
-fn token_read_is_poisoned(pid: libc::pid_t) -> bool {
-    POISONED_TOKEN_PIDS.lock().unwrap().contains(&pid)
 }
 
 /// True iff the pid is gone: `kill(pid, 0)` fails with `ESRCH`. Numeric and reuse-prone; used only for
@@ -422,9 +365,22 @@ fn is_gone(pid: libc::pid_t) -> bool {
         && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
+/// Poll until the pid is gone, bounded. A reaped detached leader may briefly linger as a zombie until
+/// its subreaper collects it; this waits that out.
+fn wait_gone(pid: libc::pid_t) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if is_gone(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
 /// Open a pidfd for a pid: a handle bound to that exact process INSTANCE at open time. Unlike a bare
-/// pid/pgid it cannot be silently rebound by reuse, and unlike a `/proc` starttime read it keeps
-/// working when `/proc` is unavailable. `None` if the pid is already gone (or pidfd is unsupported).
+/// pid it cannot be silently rebound by reuse, and unlike a `/proc` read it needs no procfs. `None` if
+/// the pid is already gone (or pidfd is unsupported).
 fn pidfd_open(pid: libc::pid_t) -> Option<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if fd < 0 {
@@ -435,41 +391,22 @@ fn pidfd_open(pid: libc::pid_t) -> Option<OwnedFd> {
     }
 }
 
-/// True iff the EXACT instance the pidfd was opened for is still alive. The null signal (`0`) probes
-/// liveness without delivering anything: `0` if that instance is alive, `-1`/`ESRCH` once it is gone.
-/// Because the pidfd is instance-bound, this can never be fooled by a later process reusing the pid.
-fn pidfd_instance_alive(pidfd: &OwnedFd) -> bool {
+/// SIGKILL the exact instance the pidfd was opened for. Reuse-proof: the pidfd is instance-bound, so a
+/// later process reusing the pid can never be reached. A gone instance yields `Err(ESRCH)`.
+fn pidfd_kill(pidfd: &OwnedFd) -> io::Result<()> {
     let rc = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             pidfd.as_raw_fd(),
-            0,
+            libc::SIGKILL,
             std::ptr::null_mut::<libc::siginfo_t>(),
             0,
         )
     };
-    rc == 0
-}
-
-/// The outcome of reading a leader's `/proc` birth token, distinguishing a process that is GONE from
-/// one that is LIVE but whose token could not be read. Used by the controls to assert the "unreadable"
-/// precondition; the reap path itself relies on the pidfd, not this.
-enum BirthToken {
-    Captured(u64),
-    Gone,
-    Unreadable,
-}
-
-fn read_birth_token(pid: libc::pid_t) -> BirthToken {
-    let token = if token_read_is_poisoned(pid) {
-        None
+    if rc == -1 {
+        Err(io::Error::last_os_error())
     } else {
-        proc_starttime(pid)
-    };
-    match token {
-        Some(starttime) => BirthToken::Captured(starttime),
-        None if is_gone(pid) => BirthToken::Gone,
-        None => BirthToken::Unreadable,
+        Ok(())
     }
 }
 
@@ -477,52 +414,36 @@ fn read_birth_token(pid: libc::pid_t) -> BirthToken {
 #[must_use]
 #[derive(Debug, PartialEq, Eq)]
 enum AdoptOutcome {
-    /// The leader was live and a pidfd instance handle was captured; its group is armed for reaping.
+    /// The leader was live and a pidfd instance handle was captured; it is armed for a direct reap.
     Adopted,
-    /// The leader was already gone; there is nothing to reap and no group will be signalled.
+    /// The leader was already gone; there is nothing to reap and nothing will be signalled.
     Gone,
 }
 
-/// Instance-exact reaping authority for one detached leader: its recorded pid/pgid for the group
-/// signal, plus a `pidfd` bound to the exact process instance captured while it was live. The pidfd is
-/// the authority; the pid/pgid are only the numeric target of the group signal, which is issued solely
-/// while the pidfd proves the captured instance is still alive.
+/// Instance-exact reaping authority for one single-process detached leader: a `pidfd` bound to the
+/// exact instance captured while it was live. The pid is retained only for diagnostics/absence checks;
+/// the pidfd is the sole signalling authority.
 struct LeaderToken {
     pid: libc::pid_t,
-    pgid: libc::pid_t,
     pidfd: OwnedFd,
 }
 
 impl LeaderToken {
-    /// SIGKILL the captured group, but only while the pidfd proves the EXACT instance we adopted is
-    /// still alive. The harness leader ran `setsid`, so it is its own session/group leader with
-    /// `pid == pgid`; while that instance is alive it uniquely owns its process group, so `killpg`
-    /// cannot reach a group formed by a later process that reused the numbers. A gone instance (pidfd
-    /// `ESRCH`) is never signalled. No `/proc` read is involved, so a persistent starttime failure
-    /// cannot strip this authority — and a reused pid/pgid cannot borrow it.
-    fn reap_if_still_owned(&self) {
-        if pidfd_instance_alive(&self.pidfd) {
-            debug_assert_eq!(
-                self.pid, self.pgid,
-                "a harness leader is its own group leader (setsid): pid must equal pgid"
-            );
-            unsafe {
-                libc::killpg(self.pgid, libc::SIGKILL);
-            }
-        }
+    /// SIGKILL the captured instance DIRECTLY through its pidfd — never a numeric pid/pgid signal. A
+    /// gone instance returns `Err(ESRCH)` and nothing else is ever touched.
+    fn reap(&self) -> io::Result<()> {
+        pidfd_kill(&self.pidfd)
     }
 }
 
 /// Owns unconditional teardown of one harness-launched session. ARMED the instant the wrapper is
-/// spawned — before `await_identity`, any floor call, or any assertion — so that even a failure to
-/// acquire the leader identity still waits the wrapper and clears the scratch directory, and NEVER
-/// signals a group it has not birth-verified. The detached leader is ADOPTED once its identity is
-/// known and a `pidfd` for its live instance is captured; that pidfd is the instance-exact cleanup
-/// authority, taken BEFORE any later fallible token step, so a persistent `/proc` token failure — or a
-/// later pid/pgid reuse — can neither strip it nor borrow it. On drop, on every path — normal return
-/// or panic: (1) reap the owned leader group via `LeaderToken::reap_if_still_owned` (only while the
-/// pidfd-verified instance is alive); (2) kill and wait the owned wrapper (which is `setsid`-detached
-/// from the leader, so it cannot reap the leader); (3) remove the scratch dir.
+/// spawned — before `await_identity` or any assertion — so that even a failure to acquire the leader
+/// identity still waits the wrapper and clears the scratch directory, and NEVER signals anything it
+/// did not capture. The single-process detached leader is ADOPTED once its identity is known and a
+/// `pidfd` for its live instance is captured. On drop, on every path — normal return or panic: (1)
+/// SIGKILL the owned leader directly through its pidfd (the wrapper is `setsid`-detached from the
+/// leader, so killing the wrapper cannot reap the leader — only this can); (2) kill and wait the owned
+/// wrapper; (3) remove the scratch dir.
 struct OwnedSession {
     harness: Child,
     dir: std::path::PathBuf,
@@ -541,24 +462,18 @@ impl OwnedSession {
     }
 
     /// Adopt the detached leader once its identity is known and it is live, capturing a `pidfd` for its
-    /// exact instance as the guard's cleanup authority. `Gone` means the leader already exited (nothing
-    /// to reap). If `pidfd_open` fails for a leader that is NOT gone, exact-instance authority is
-    /// unavailable and we refuse loudly rather than fall back to unsafe numeric signalling.
+    /// exact instance. `Gone` means the leader already exited. If `pidfd_open` fails for a leader that
+    /// is NOT gone, exact-instance authority is unavailable and we refuse loudly rather than fall back
+    /// to unsafe numeric signalling.
     fn adopt(&mut self, identity: &Identity) -> AdoptOutcome {
         match pidfd_open(identity.pid) {
-            Some(pidfd) if pidfd_instance_alive(&pidfd) => {
-                assert_eq!(
-                    identity.pid, identity.pgid,
-                    "harness leader must be its own group leader (setsid): pid == pgid"
-                );
+            Some(pidfd) => {
                 self.leader = Some(LeaderToken {
                     pid: identity.pid,
-                    pgid: identity.pgid,
                     pidfd,
                 });
                 AdoptOutcome::Adopted
             }
-            Some(_) => AdoptOutcome::Gone,
             None if is_gone(identity.pid) => AdoptOutcome::Gone,
             None => panic!(
                 "pidfd_open failed for live leader {}: no exact-instance authority — refusing to fall \
@@ -571,11 +486,11 @@ impl OwnedSession {
 
 impl Drop for OwnedSession {
     fn drop(&mut self) {
-        // Reap the owned leader group FIRST, while its instance handle is in hand: the wrapper is
-        // `setsid`-detached from the leader, so killing the wrapper can never reap the leader — only
-        // this instance-exact `killpg` can. An unadopted or gone leader is never signalled.
+        // Reap the owned leader FIRST, directly through its pidfd: the wrapper is `setsid`-detached
+        // from the leader, so killing the wrapper can never reap the leader. A gone leader returns
+        // ESRCH and nothing else is signalled; an unadopted leader is never touched.
         if let Some(leader) = &self.leader {
-            leader.reap_if_still_owned();
+            let _ = leader.reap();
         }
 
         // The wrapper is our direct child: kill and reap it on every path, including panic.
@@ -626,26 +541,4 @@ fn await_identity(path: &std::path::Path) -> Identity {
     }
 
     panic!("{} was never written", path.display());
-}
-
-/// Poll until no process remains in the group, bounded — proof that a reaped leader group is gone
-/// rather than merely signalled. The detached leader is not our child, so it is reaped by its
-/// subreaper after the SIGKILL; `killpg(pgid, 0)` returns `ESRCH` once the group is empty.
-/// Non-blocking check: is the group already empty right now?
-fn group_is_gone_fast(pgid: libc::pid_t) -> bool {
-    (unsafe { libc::killpg(pgid, 0) }) == -1
-        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-}
-
-fn group_is_gone(pgid: libc::pid_t) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let gone = (unsafe { libc::killpg(pgid, 0) }) == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    false
 }
