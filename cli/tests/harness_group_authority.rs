@@ -136,6 +136,7 @@ struct Identity {
     pid: libc::pid_t,
     pgid: libc::pid_t,
     boot: String,
+    starttime: u64,
 }
 
 /// The Linux birth token for a pid: field 22 (`starttime`) of `/proc/<pid>/stat`. `comm` (field 2)
@@ -160,17 +161,20 @@ struct OwnedSession {
     harness: std::process::Child,
     pid: libc::pid_t,
     pgid: libc::pid_t,
-    starttime: Option<u64>,
+    starttime: u64,
     dir: std::path::PathBuf,
 }
 
 impl OwnedSession {
     fn own(harness: std::process::Child, identity: &Identity, dir: &std::path::Path) -> Self {
+        // The birth token is always valid: `await_identity` only returns once it has read a live
+        // starttime for this pid. There is no absent-token state, so teardown can never silently
+        // skip the owned group.
         OwnedSession {
             harness,
             pid: identity.pid,
             pgid: identity.pgid,
-            starttime: proc_starttime(identity.pid),
+            starttime: identity.starttime,
             dir: dir.to_path_buf(),
         }
     }
@@ -185,8 +189,7 @@ impl Drop for OwnedSession {
         // Signal the detached leader group only while it is provably still the one we captured — the
         // pid alive, still the leader of the recorded pgid, with an unchanged birth token. A gone or
         // recycled pid fails this check, so no unowned group is ever SIGKILLed.
-        let owned = self.starttime.is_some()
-            && proc_starttime(self.pid) == self.starttime
+        let owned = proc_starttime(self.pid) == Some(self.starttime)
             && unsafe { libc::getpgid(self.pid) } == self.pgid;
         if owned {
             unsafe {
@@ -218,12 +221,18 @@ fn await_identity(path: &std::path::Path) -> Identity {
             let fields: Vec<&str> = text.trim_end().split('\t').collect();
             if let [pid, pgid, boot, _launch] = fields[..] {
                 if let (Ok(pid), Ok(pgid)) = (pid.parse(), pgid.parse()) {
-                    return Identity {
-                        path: path.to_string_lossy().into_owned(),
-                        pid,
-                        pgid,
-                        boot: boot.to_owned(),
-                    };
+                    // Capture the birth token in the same loop that confirms the leader is live, so a
+                    // constructed Identity always carries a valid starttime — never an absent one that
+                    // could later make teardown skip the owned group. A momentary /proc miss retries.
+                    if let Some(starttime) = proc_starttime(pid) {
+                        return Identity {
+                            path: path.to_string_lossy().into_owned(),
+                            pid,
+                            pgid,
+                            boot: boot.to_owned(),
+                            starttime,
+                        };
+                    }
                 }
             }
         }
