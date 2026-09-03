@@ -29,13 +29,13 @@ A complete bundle ships:
    things nobody can see by looking at the folder.
    - **purpose** — what capability adopting this bundle gives an org, in plain language
      a user would recognize from describing their own work. Not an inventory of the
-     bundle's parts: "turn product ideas and bug reports into shipped software, with
-     tracked work, independent review, and verification" is a purpose; "7 archetypes,
+     bundle's parts: "turn field observations and instrument readings into validated
+     findings, with tracked work, independent review, and verification" is a purpose; "7 archetypes,
      13 guidance fragments" is a contents listing. The general agent matches a user's
      stated goal against this, so write it the way a user would say it.
    - **phrases** — short, natural things a USER would say that mean this bundle would
      help. Written from their side, describing the problem or the wish, never our
-     feature names. THEY MUST DISCRIMINATE: if a bundle from a different domain could
+     capability names. THEY MUST DISCRIMINATE: if a bundle from a different domain could
      honestly claim the same phrase, it is too generic and buys nothing. "I keep losing
      track of what I asked for" fits every bundle ever written; "I want my code reviewed
      before it merges" could only be this one. Test each phrase by asking whether a
