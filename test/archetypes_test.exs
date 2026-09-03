@@ -36,9 +36,9 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert Path.wildcard(Path.join(identity_dir, "guidance/*.md")) ==
              Enum.map(
-               ~w(altitude-statute avasarala comms-discipline delegation-card desk-playbook
-                  directive-vocabulary dispatch-rules exec inception miller office-convention
-                  operating-model role-charter staffing),
+               ~w(avasarala comms-discipline delegation-card desk-playbook
+                  directive-vocabulary dispatch-rules exec miller office-convention operating-model
+                  role-charter staffing),
                &Path.join(identity_dir, "guidance/#{&1}.md")
              )
 
@@ -87,6 +87,39 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert Archetypes.init_identity!(ctx.base_dir) == :noop
     assert {"", 0} = System.cmd("git", ["status", "--short"], cd: identity_dir)
+  end
+
+  test "served neutral identity excludes engineering vocabulary", ctx do
+    assert :initialized = Identity.init!(ctx.base_dir)
+    archetypes = Archetypes.load!(ctx.base_dir)
+
+    forbidden = [
+      {"worktree", ~r/\bworktrees?\b/i},
+      {"branch", ~r/\bbranches?\b/i},
+      {"spec", ~r/\bspecs?\b/i},
+      {"feature", ~r/\bfeatures?\b/i},
+      {"bug", ~r/\bbugs?\b/i},
+      {"product-owner", ~r/\bproduct[- ]owners?\b/i},
+      {"orchestrator", ~r/\borchestrators?\b/i},
+      {"coder", ~r/\bcoders?\b/i}
+    ]
+
+    for role <- ~w(avasarala default exec miller), harness <- [:claude, :codex] do
+      snapshot = Identity.snapshot!(ctx.base_dir, role, harness)
+
+      skill_bodies =
+        Enum.map(archetypes[role].skills, fn skill ->
+          Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
+          |> File.read!()
+        end)
+
+      served = Enum.join([snapshot.guidance | Map.values(snapshot.skills) ++ skill_bodies], "\n")
+
+      for {concept, pattern} <- forbidden do
+        refute Regex.match?(pattern, served),
+               "neutral #{role}/#{harness} guidance contains engineering concept #{concept}"
+      end
+    end
   end
 
   test "the neutral default's elected baseline skills prescribe no bundle archetype before learn" do
@@ -191,6 +224,26 @@ defmodule Tightbeam.ArchetypesTest do
         "product-owner",
         :codex
       )
+
+    identity_dir = Path.join(ctx.base_dir, "identity")
+
+    for fragment <- ~w(inception altitude-statute) do
+      assert File.regular?(Path.join(identity_dir, "guidance/#{fragment}.md"))
+    end
+
+    assert product_owner.guidance =~ "# Inception — how a product is born"
+    assert product_owner.guidance =~ "# The altitude statute (template)"
+
+    orchestrator =
+      Identity.snapshot_at!(
+        ctx.base_dir,
+        Identity.live_revision!(ctx.base_dir),
+        "orchestrator",
+        :codex
+      )
+
+    assert orchestrator.guidance =~ "# The altitude statute (template)"
+    refute orchestrator.guidance =~ "# Inception — how a product is born"
 
     assert Map.keys(product_owner.skills) == [
              "human-communication",

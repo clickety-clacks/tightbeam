@@ -79,7 +79,7 @@ graph. Main is for root-terminal cases, not a routine fallback.
 Attention is the scarcest thing this org has. Tell tightbeam how urgent a message is and it
 shapes WHEN the receiver spends a turn on it — never whether it is recorded:
 
-    tightbeam wake --role owner --prompt "the release build is green" --class fyi
+    tightbeam wake --role owner --prompt "the requested report is ready" --class fyi
 
 - `fyi` — record only. Batched into one digest turn at the receiver's next turn boundary, or
   within 4 hours, whichever comes first.
@@ -119,7 +119,7 @@ exists to catch.
 Take a question back yourself when you no longer need it — nobody else can, and nobody has to
 act for you to move on:
 
-    tightbeam withdraw --request <id> --reason "worked it out from the spec"
+    tightbeam withdraw --request <id> --reason "the recorded requirements answered it"
 
 Answer a question when you hold its complete id and your judgment supplies the answer:
 
@@ -133,7 +133,7 @@ A need that is not a row reaches no one. Never bury "this needs the owner" in an
 or a progress report and consider it raised — prose pages nobody and expires with attention.
 If work depends on an answer, file the ask; if it does not, do not. Never ask what rows
 already answer (status, counts, whether something landed), never ask what your own facts,
-precedent, or your product owner's domain can settle, and never file a second open ask for
+precedent, or the responsible agent's domain can settle, and never file a second open ask for
 the same choice — `--about <assignmentId>` links the work, and one open question per choice
 is the contract. If you hold open questions, read their answers before asking anything new.
 
@@ -171,15 +171,15 @@ a session with an open assignment: its holder must first file completion, or its
 opener must explicitly dispose of the work through the lawful assignment path. Retirement does
 not silently solve unfinished work.
 
-## Before you build what tightbeam already is
+## Before you create what tightbeam already is
 When work — yours or the user's ask — starts to look like one of these, tightbeam (or
 an installed kungfu) already does it: guardrails/checks on agent behavior (rails);
 ticketing or task tracking (work items + assignments); cron jobs, reminders, pollers
 (wakes and condition wakes); running agents on other machines over ssh (assimilation);
 per-agent prompt/config profiles (archetypes); accumulated playbooks and process docs
 (kungfu bundles); dashboards or logs of agent activity (the event stream). The rule:
-NAME the native feature to whoever commissioned the work before building a parallel
-one — once, plainly — then build only if they still want their own. At the start of any
+NAME the native capability to whoever commissioned the work before creating a parallel
+one — once, plainly — then create it only if they still want their own. At the start of any
 conversation with a USER, read each installed kungfu's `kungfu/<name>/capabilities.md`
 — they carry the watch-for signals you cannot recognize unread; they are small by
 design. Work wakes from agents need none of this.
@@ -189,13 +189,13 @@ Work is tracked as durable records, not in chat.
 Treat work items, assignments, attests, artifacts, and decision requests as durable,
 org-readable records. Name a credential by its kind and location when evidence requires it;
 never paste credential bytes into a durable record.
-- A work-item is the durable thread for one feature or bug:
+- A work-item is the durable thread for one intended outcome or repair:
 
-    tightbeam work-item-create --title "voice dictation crash on resume"
+    tightbeam work-item-create --title "restore access to the shared account"
 
 - An assignment is an obligation on that work, held by a session:
 
-    tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
+    tightbeam assign --subject "restore the shared account" --role implementer --work-item <workItemId>
 
 Open the card against a role, never a bare session key. The card records the role it
 was opened against; opened against a session key alone it records none, and
@@ -205,9 +205,9 @@ yet enforce this, so the discipline is yours: `--role`, every time you open one.
 
 - Record what happens against your assignment with attest:
 
-    tightbeam attest <assignmentId> --kind progress   --note "root-caused to a nil token"
-    tightbeam attest <assignmentId> --kind completion --note "fixed; tests green"
-    tightbeam attest <assignmentId> --kind cannot-proceed --note "the exact reason this card cannot move"
+    tightbeam attest <assignmentId> --kind progress   --note "identified the missing authority row"
+    tightbeam attest <assignmentId> --kind completion --note "delivered the requested result"
+    tightbeam attest <assignmentId> --kind cannot-proceed --note "the required approval is absent"
 
 File `cannot-proceed` only when the card cannot move under its current authority. Give the
 exact reason. The card stays open on you, prod pauses only for that card, and one decision
@@ -215,9 +215,9 @@ routes to its opener. When an observable condition can release the block, supply
 release-fact fields; the exact later fact resumes the card. The opener disposes or restaffs
 the work through the lawful assignment path. Custody never transfers silently between holders.
 
-- Record a judgment — a review, a test outcome, the user's decision — as a verdict:
+- Record a judgment — an assessment, a verification outcome, the user's decision — as a verdict:
 
-    tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "…"
+    tightbeam attest <assignmentId> --kind verdict --verdict confirmed --note "…"
 
 These facts are the state of the work. The state is computed from the facts; there is no
 status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
@@ -273,7 +273,7 @@ While you hold an open assignment, leave a valid durable liveness receipt or sch
 continuation wake to yourself before the turn ends. Create a reporting attest or reporting
 wake only for one of these exceptions:
 
-- a new material result or evidence, such as an artifact, test result, frozen commit, or
+- a new material result or evidence, such as an artifact, verification result, frozen revision, or
   completed bounded investigation;
 - an exact new blocker or refusal, with the failed operation and evidence the owner needs;
 - a bounded decision request that states the choice and why work depends on it;
@@ -300,17 +300,11 @@ recorded artifacts, assignment attests, and work-item updates remain the mechani
 channels that keep the liveness bracket moving.
 
 ## Work alongside other agents
-Other agents edit at the same time.
-- A dirty worktree or a mid-flight branch that is not yours is not yours to stash, reset, or
-  clean away, and it is not a blocker to stall on. Reconcile it: identify who or what created
-  it, and either ask that owner to clean it up, or, once you have established it is safe to
-  remove (abandoned, yours, or the owner agrees), remove it yourself.
-- Do your own work in a worktree that is yours to write — by default one you create inside
-  your own workdir, or one handed to you for the job by the agent that assigned it (an
-  orchestrator passing a worktree down to a coder). Either way it lives in a durable
-  assignment workdir — never system temp or your home. A worktree that is merely
-  nearby — a cousin's, or one you found unattended — is not yours to commandeer uninvited
-  (above).
+Other agents work at the same time. Keep your assignment files in the durable workdir that
+the substrate gave you, or in a directory that the assigning agent explicitly handed to
+you. Never use system temp or your home for durable work. Never take over a nearby directory
+merely because it is unattended; it belongs to its recorded owner until that owner or the
+assigning agent transfers it.
 
 ## When a rule stops a command
 A rule can stop a command and name itself. Do not route around it. Take a path that does not
@@ -318,7 +312,7 @@ break the rule, or change what you are building. A rule that repeatedly stops yo
 the approach is wrong.
 
 ## When a decision is the user's
-A decision that belongs to the user — authority, money, scope, a spec hole on a concept the
+A decision that belongs to the user — authority, money, scope, an unresolved requirement the
 work is built on, anything outward-facing or irreversible — goes to the user by the same verb:
 
     tightbeam ask --user <userId> --question "<the choice, its options, and what depends on it>" --about <assignmentId>
@@ -330,7 +324,7 @@ the step that waited. The user's open questions are the one inbox they trust to 
 keep it honest: withdraw an ask the moment events moot it, and never duplicate one.
 
 ## Report so the user can act
-- Support every claim with its source — a file and line, a log line, a specific commit.
+- Support every claim with its source — a file and line, a log line, a specific revision.
 - Report state the user can act on: what changed, what is ready, what remains, who acts next,
   what decision you need.
 - "Done" means the user can try it.
