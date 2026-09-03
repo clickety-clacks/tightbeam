@@ -1252,6 +1252,13 @@ defmodule Tightbeam.JobForensicsTest do
   end
 
   defp dispose(db, verb, id, params \\ %{}) do
+    params =
+      if verb == "work-item-close" and not Map.has_key?(params, :completion_attest_id) do
+        Map.put(params, :completion_attest_id, completion_fixture!(db, id))
+      else
+        params
+      end
+
     WorkItems.__handle__(db, verb, %{
       verb: verb,
       principal: {:user, "flynn"},
@@ -1267,6 +1274,18 @@ defmodule Tightbeam.JobForensicsTest do
       INSERT INTO work_items (id, title, ownerUserId, state, createdByUser, createdAt)
       VALUES ('#{id}', 'Item #{id}', 'flynn', 'open', 'flynn', 1)
       """)
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.create_work_item_in_txn(
+          txn,
+          id,
+          "Item #{id}",
+          1
+        )
+      end)
+
+    :ok
   end
 
   defp assignment(db, id, work_item_id, holder \\ "holder") do
@@ -1275,6 +1294,84 @@ defmodule Tightbeam.JobForensicsTest do
       INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt, state, workItemId)
       VALUES ('#{id}', 'subject #{id}', '#{holder}', 'flynn', 1, 'open', '#{work_item_id}')
       """)
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.bind_assignment_in_txn(
+          txn,
+          %{
+            id: id,
+            subject: "subject #{id}",
+            holderKey: holder,
+            openedAt: 1,
+            workItemId: work_item_id
+          },
+          false
+        )
+      end)
+
+    :ok
+  end
+
+  defp completion_fixture!(db, work_item_id) do
+    case DB.query(
+           db,
+           "SELECT completionAttestId FROM work_item_closures WHERE workItemId=?1",
+           [work_item_id]
+         ) do
+      {:ok, [[attest_id]]} ->
+        attest_id
+
+      {:ok, []} ->
+        create_completion_fixture!(db, work_item_id)
+    end
+  end
+
+  defp create_completion_fixture!(db, work_item_id) do
+    suffix = Tightbeam.Id.uuid4()
+    assignment_id = "asg_" <> suffix
+    attest_id = "att_" <> suffix
+    holder = Org.personal_session_key("flynn")
+    assignment(db, assignment_id, work_item_id, holder)
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        [[deliverable_id]] =
+          Txn.q(
+            txn,
+            "SELECT deliverableId FROM work_item_deliverables WHERE workItemId=?1",
+            [work_item_id]
+          )
+
+        Txn.q(
+          txn,
+          "UPDATE assignment_deliverables SET deliverableId=?2,sourceKind='work_item',sourceWorkItemId=?3 WHERE assignmentId=?1",
+          [assignment_id, deliverable_id, work_item_id]
+        )
+
+        Txn.q(
+          txn,
+          "INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES (?1,?2,'completion',?3,2)",
+          [attest_id, assignment_id, holder]
+        )
+
+        Txn.q(
+          txn,
+          "UPDATE assignments SET state='closed',outcome='completed',closedAt=2,closedBySession=?3,closingAttestId=?2 WHERE id=?1",
+          [assignment_id, attest_id, holder]
+        )
+
+        :ok =
+          Tightbeam.DeliverableContract.record_completion_claim_in_txn(
+            txn,
+            assignment_id,
+            %{id: attest_id, ts: 2}
+          )
+
+        :ok
+      end)
+
+    attest_id
   end
 
   defp attest(db, id, assignment_id, ts \\ nil) do

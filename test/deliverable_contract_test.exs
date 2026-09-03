@@ -6,7 +6,7 @@ defmodule Tightbeam.DeliverableContractTest do
   setup do
     db = :"deliverable_contract_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Tightbeam.Schema.ensure_all(db)
+    :ok = ensure_all_schemas(db)
 
     {:ok, _} =
       DB.query(
@@ -1735,10 +1735,10 @@ defmodule Tightbeam.DeliverableContractTest do
     end
   end
 
-  test "the exact v9-to-v10 upgrade is atomic, deterministic, and validates restart", ctx do
+  test "the exact 0.1.9 contract upgrade is atomic, deterministic, and validates restart", ctx do
     card = create_card(ctx, "Migrated card")
     assignment = assign(ctx, card.id, "Migrated open assignment", false)
-    strip_contract_to_v9!(ctx.db)
+    strip_contract!(ctx.db, "identity-universal-root-render-v1-019")
 
     for fault <- [
           :after_table_creation,
@@ -1751,13 +1751,13 @@ defmodule Tightbeam.DeliverableContractTest do
       assert_raise DeliverableContract.Inconsistent, fn ->
         DeliverableContract.upgrade_v1(
           ctx.db,
-          "coordination-fabric-v1-phase1-v9",
-          "coordination-fabric-v1-phase1-v10",
+          "identity-universal-root-render-v1-019",
+          "completion-deliverable-v1-019",
           fail_at: fault
         )
       end
 
-      assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+      assert {:ok, [["identity-universal-root-render-v1-019"]]} =
                DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
       assert {:ok, []} =
@@ -1772,12 +1772,12 @@ defmodule Tightbeam.DeliverableContractTest do
     assert_raise DeliverableContract.Inconsistent, ~r/partial contract object deliverables/, fn ->
       DeliverableContract.upgrade_v1(
         ctx.db,
-        "coordination-fabric-v1-phase1-v9",
-        "coordination-fabric-v1-phase1-v10"
+        "identity-universal-root-render-v1-019",
+        "completion-deliverable-v1-019"
       )
     end
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v9"]]} =
+    assert {:ok, [["identity-universal-root-render-v1-019"]]} =
              DB.query(ctx.db, "SELECT shape FROM schema_stamp")
 
     :ok = DB.execute(ctx.db, "DROP TABLE deliverables")
@@ -1785,8 +1785,8 @@ defmodule Tightbeam.DeliverableContractTest do
     assert :ok =
              DeliverableContract.upgrade_v1(
                ctx.db,
-               "coordination-fabric-v1-phase1-v9",
-               "coordination-fabric-v1-phase1-v10"
+               "identity-universal-root-render-v1-019",
+               "completion-deliverable-v1-019"
              )
 
     card_hash =
@@ -2098,7 +2098,7 @@ defmodule Tightbeam.DeliverableContractTest do
   end
 
   defp seed_creation_replay_world!(db) do
-    :ok = Tightbeam.Schema.ensure_all(db)
+    :ok = ensure_all_schemas(db)
 
     assert {:ok, _} =
              DB.query(
@@ -2165,18 +2165,19 @@ defmodule Tightbeam.DeliverableContractTest do
     module = Tightbeam.CapturedPhase1V9Schema
 
     unless Code.ensure_loaded?(module) do
-      repo = Path.expand("..", __DIR__)
+      archive =
+        Path.join(__DIR__, "fixtures/deliverable_contract/phase1_v9_lib.tar.gz")
+        |> File.read!()
 
-      {source, 0} =
-        System.cmd(
-          "git",
-          [
-            "show",
-            "724e5c96f9513b37e937dc52eb014ba1ef2d1b5e:lib/tightbeam/schema.ex"
-          ],
-          cd: repo,
-          stderr_to_stdout: true
-        )
+      assert {:ok, entries} = :erl_tar.extract({:binary, archive}, [:memory, :compressed])
+
+      source =
+        Enum.find_value(entries, fn
+          {~c"lib/tightbeam/schema.ex", bytes} -> bytes
+          _ -> nil
+        end)
+
+      assert is_binary(source)
 
       assert :crypto.hash(:sha256, source) |> Base.encode16(case: :lower) ==
                "cbaa8a3f2aabde64e20cb372be343f8d583d08219a6e95d92d73ad7e93de008a"
@@ -2246,7 +2247,9 @@ defmodule Tightbeam.DeliverableContractTest do
     rows
   end
 
-  defp strip_contract_to_v9!(db) do
+  defp strip_contract_to_v9!(db), do: strip_contract!(db, "coordination-fabric-v1-phase1-v9")
+
+  defp strip_contract!(db, shape) do
     for table <- [
           "deliverable_contract_idempotency",
           "work_item_closures",
@@ -2261,10 +2264,7 @@ defmodule Tightbeam.DeliverableContractTest do
     end
 
     {:ok, _} =
-      DB.query(
-        db,
-        "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v9'"
-      )
+      DB.query(db, "UPDATE schema_stamp SET shape=?1", [shape])
 
     :ok
   end

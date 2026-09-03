@@ -103,7 +103,7 @@ defmodule Tightbeam.IdPrefixOperationsTest do
   setup do
     db = :id_prefix_operations_db
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Tightbeam.Schema.ensure_all(db)
+    :ok = ensure_all_schemas(db)
 
     {:ok, _} =
       DB.query(

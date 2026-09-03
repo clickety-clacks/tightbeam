@@ -1140,6 +1140,8 @@ defmodule Tightbeam.GatewayTest do
         "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_recovery', 'boot recovery', 'k1', 'flynn', 1)"
       )
 
+    bind_assignment_deliverable_fixture!(ctx.db, "asg_boot_recovery")
+
     children =
       Gateway.children(
         gateway_config(gateway_children_base!(), ctx.db, 0)
@@ -1691,6 +1693,15 @@ defmodule Tightbeam.GatewayTest do
         UPDATE assignments SET reviewsAssignmentId = 'asg_cycle_a' WHERE id = 'asg_cycle_b';
         """
       )
+
+    for assignment_id <- [
+          "asg_audit_target",
+          "asg_audit_conflict",
+          "asg_cycle_a",
+          "asg_cycle_b"
+        ] do
+      bind_assignment_deliverable_fixture!(ctx.db, assignment_id)
+    end
 
     {:ok, before_rows} =
       DB.query(
@@ -9911,6 +9922,30 @@ defmodule Tightbeam.GatewayTest do
       {:ok, _pid} -> :ok
       {:error, {:already_started, _pid}} -> :ok
     end
+  end
+
+  defp bind_assignment_deliverable_fixture!(db, assignment_id) do
+    {:ok, [[subject, holder_key, opened_at, work_item_id]]} =
+      DB.query(
+        db,
+        "SELECT subject,holderKey,openedAt,workItemId FROM assignments WHERE id=?1",
+        [assignment_id]
+      )
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.bind_assignment_in_txn(
+          txn,
+          %{
+            id: assignment_id,
+            subject: subject,
+            holderKey: holder_key,
+            openedAt: opened_at,
+            workItemId: work_item_id
+          },
+          false
+        )
+      end)
   end
 
   defp assert_process_mailbox(name, minimum, attempts \\ 100)

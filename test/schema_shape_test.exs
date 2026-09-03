@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "identity-universal-root-render-v1-019"
+  @shape "completion-deliverable-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
   @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
@@ -143,6 +143,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    drop_deliverable_contract(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
 
@@ -159,6 +160,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact pre-liveness notice stamp resumes without physical-shape inference", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    drop_deliverable_contract(db)
     drop_liveness_activation(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
@@ -318,6 +320,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "operator-decision migration classifies the complete predecessor census once", %{db: db} do
     :ok = Schema.ensure_all(db)
+    drop_deliverable_contract(db)
 
     :ok =
       DB.execute(db, """
@@ -485,6 +488,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     {:ok, first_pid} = DB.start_link(path: path, name: first)
     assert :ok = Schema.ensure_all(first)
+    drop_deliverable_contract(first)
 
     :ok =
       DB.execute(first, """
@@ -751,6 +755,21 @@ defmodule Tightbeam.SchemaShapeTest do
          NULL,1,'open',NULL,NULL,NULL,NULL,NULL)
       """)
 
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.bind_assignment_in_txn(
+          txn,
+          %{
+            id: "asg_predecessor",
+            subject: "advisory files",
+            holderKey: "holder",
+            openedAt: 1,
+            workItemId: nil
+          },
+          false
+        )
+      end)
+
     :ok =
       DB.execute(db, """
       INSERT INTO assignment_files (assignmentId, path)
@@ -876,6 +895,7 @@ defmodule Tightbeam.SchemaShapeTest do
   test "the exact notice-batching predecessor widens effort cancellation and preserves the stamp",
        %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    drop_deliverable_contract(db)
 
     {:ok, [[current_ddl]]} =
       DB.query(
@@ -1044,6 +1064,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_decision_requests_to_model_identity(db) do
+    drop_deliverable_contract(db)
+
     :ok =
       DB.execute(db, """
       DROP INDEX decision_requests_owner;
@@ -1079,6 +1101,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_wakes_to_terminal_decision(db) do
+    drop_deliverable_contract(db)
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
@@ -1160,6 +1183,23 @@ defmodule Tightbeam.SchemaShapeTest do
 
   defp table_names(db, name) do
     DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name=?1", [name])
+  end
+
+  defp drop_deliverable_contract(db) do
+    for object <- [
+          "deliverable_contract_idempotency",
+          "work_item_closures",
+          "completion_claims",
+          "assignment_product_owner_ancestry",
+          "assignment_product_lineage_captures",
+          "assignment_deliverables",
+          "work_item_deliverables",
+          "deliverables"
+        ] do
+      :ok = DB.execute(db, "DROP TABLE IF EXISTS #{object}")
+    end
+
+    :ok
   end
 
   defp index_count(db, name) do
