@@ -774,7 +774,7 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
-      [row] -> assignment(row)
+      [row] -> assignment(row) |> project_assignment(db)
       [] -> nil
     end
   end
@@ -988,7 +988,7 @@ defmodule Tightbeam.Assignments do
       )
 
     Enum.map(rows, fn row ->
-      assignment = assignment(row)
+      assignment = assignment(row) |> project_assignment(db)
       Map.put(assignment, :files, declared_files(db, assignment.id))
     end)
   end
@@ -1173,7 +1173,15 @@ defmodule Tightbeam.Assignments do
         [assignment_id | range_params] ++ limit_params
       )
 
-    Enum.map(rows, &attest/1)
+    Enum.map(rows, fn row ->
+      filed = attest(row)
+
+      Map.put(
+        filed,
+        :deliverableClaim,
+        Tightbeam.DeliverableContract.attest_claim_projection(db, filed.id)
+      )
+    end)
   end
 
   # Row-value comparison written out longhand rather than `(ts, id) > (?, ?)`:
@@ -1234,7 +1242,7 @@ defmodule Tightbeam.Assignments do
         [work_item_id]
       )
 
-    Enum.map(rows, &assignment/1)
+    Enum.map(rows, &(assignment(&1) |> project_assignment(db)))
   end
 
   @doc "Resolve an assignment's story membership without changing direct ownership readers."
@@ -1328,6 +1336,7 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
+         :ok <- valid_delivers_work_item(call.params),
          {:ok, _files} <- assignment_files(verb, call.params),
          :ok <- valid_report_to(db, call.session_key, call.params[:report_to_session_key]) do
       key = call.params[:idempotency_key]
@@ -1426,6 +1435,7 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, "dispatch"),
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
+         :ok <- valid_delivers_work_item(call.params),
          {:ok, _files} <- assignment_files("dispatch", call.params),
          :ok <- valid_brief(call.params[:brief]),
          :ok <- normalize_root_validation(call.params[:workdir_root]) do
@@ -1490,6 +1500,7 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_supervision_interval(call[:supervision_interval_ms]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
+         :ok <- valid_delivers_work_item(call.params),
          {:ok, files} <- assignment_files(verb, call.params),
          :ok <- valid_report_to(db, call.session_key, call.params[:report_to_session_key]),
          :ok <- extra_validation.() do
@@ -1543,6 +1554,7 @@ defmodule Tightbeam.Assignments do
   rescue
     error in UnknownWorkItem -> error("unknown_work_item", Exception.message(error))
     error in UnknownReviewTarget -> error("unknown_review_target", Exception.message(error))
+    error in Tightbeam.DeliverableContract.MutationError -> error.response
   end
 
   defp finalize_created_assignment(call, assignment, delivery) do
@@ -1593,6 +1605,17 @@ defmodule Tightbeam.Assignments do
 
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
+         :ok <- valid_attest_idempotency(call.params[:kind], call.params[:idempotency_key]) do
+      if call.params[:kind] == "completion" and is_binary(call.params[:idempotency_key]) do
+        keyed_completion_result(db, call)
+      else
+        unkeyed_attest_result(db, call)
+      end
+    end
+  end
+
+  defp unkeyed_attest_result(db, call) do
+    with :ok <- completion_filing_allowed(db, call),
          :ok <- commit_ref_filing_allowed(db, call),
          :ok <- valid_commit_refs(db, call.params[:kind], call.params[:commit_refs]) do
       supplied = call.params[:assignment_id]
@@ -1646,6 +1669,7 @@ defmodule Tightbeam.Assignments do
       # checked is a fact about the check, not a verdict on the attest.
       case result do
         %{assignment: assignment} ->
+          project_completion_markers(db, result)
           Map.put(result, :referents, referents(db, call, assignment, artifact_cursor))
 
         _ ->
@@ -1654,7 +1678,149 @@ defmodule Tightbeam.Assignments do
     end
   rescue
     TransitionRace -> assignment_closed()
+    error in Tightbeam.DeliverableContract.MutationError -> error.response
   end
+
+  defp keyed_completion_result(db, call) do
+    supplied = call.params[:assignment_id]
+
+    case IdPrefix.resolve(db, :assignment, supplied) do
+      {:ok, assignment_id} ->
+        fingerprint =
+          Tightbeam.DeliverableContract.completion_fingerprint(
+            assignment_id,
+            call.params[:note],
+            call.params[:commit_refs]
+          )
+
+        preflight =
+          transaction(db, fn txn ->
+            assignment = fetch_assignment(txn, assignment_id)
+
+            cond do
+              is_nil(assignment) ->
+                error("unknown_assignment", "unknown assignment: #{supplied}")
+
+              call.principal != {:session, assignment.holderKey} ->
+                error("not_holder", "assignment is held by session #{assignment.holderKey}")
+
+              true ->
+                Tightbeam.DeliverableContract.completion_receipt_in_txn(
+                  txn,
+                  call.principal,
+                  call.params.idempotency_key,
+                  fingerprint
+                )
+            end
+          end)
+
+        case preflight do
+          {:replay, response} ->
+            add_referents(db, call, response, artifact_cursor(db))
+
+          :miss ->
+            with :ok <- completion_filing_allowed(db, call),
+                 :ok <- commit_ref_filing_allowed(db, call),
+                 :ok <- valid_commit_refs(db, "completion", call.params[:commit_refs]) do
+              artifact_cursor = artifact_cursor(db)
+
+              result =
+                transaction(db, fn txn ->
+                  resolved_call = put_in(call, [:params, :assignment_id], assignment_id)
+                  assignment = fetch_assignment(txn, assignment_id)
+
+                  cond do
+                    is_nil(assignment) ->
+                      error("unknown_assignment", "unknown assignment: #{supplied}")
+
+                    call.principal != {:session, assignment.holderKey} ->
+                      error("not_holder", "assignment is held by session #{assignment.holderKey}")
+
+                    true ->
+                      case Tightbeam.DeliverableContract.completion_receipt_in_txn(
+                             txn,
+                             call.principal,
+                             call.params.idempotency_key,
+                             fingerprint
+                           ) do
+                        {:replay, response} ->
+                          {:replayed, response}
+
+                        %{code: _} = conflict ->
+                          conflict
+
+                        :miss ->
+                          with :ok <- commit_ref_filing_allowed_in_txn(txn, resolved_call) do
+                            response = attest_in_txn(txn, resolved_call)
+
+                            if is_map(response) and not Map.has_key?(response, :code) do
+                              Tightbeam.DeliverableContract.store_completion_receipt_in_txn(
+                                txn,
+                                call.principal,
+                                call.params.idempotency_key,
+                                fingerprint,
+                                response
+                              )
+
+                              Publisher.maybe_accepted_in_txn(txn, call, response)
+                              {:committed, response}
+                            else
+                              response
+                            end
+                          end
+                      end
+                  end
+                end)
+
+              case result do
+                {:committed, response} ->
+                  project_completion_markers(db, response)
+                  add_referents(db, call, response, artifact_cursor)
+
+                {:replayed, response} ->
+                  add_referents(db, call, response, artifact_cursor)
+
+                other ->
+                  add_referents(db, call, other, artifact_cursor)
+              end
+            end
+
+          other ->
+            other
+        end
+
+      :unknown ->
+        error("unknown_assignment", "unknown assignment: #{supplied}")
+
+      {:ambiguous, error} ->
+        error
+    end
+  rescue
+    TransitionRace -> assignment_closed()
+    error in Tightbeam.DeliverableContract.MutationError -> error.response
+    ArgumentError -> error("invalid_commit_refs", "commitRefs must use repo and commit strings")
+  end
+
+  defp add_referents(db, call, %{assignment: assignment} = result, artifact_cursor) do
+    Map.put(result, :referents, referents(db, call, assignment, artifact_cursor))
+  end
+
+  defp add_referents(_db, _call, result, _artifact_cursor), do: result
+
+  defp project_completion_markers(
+         db,
+         %{assignment: assignment, attest: %{kind: "completion"} = attest}
+       ) do
+    best_effort(fn -> transaction(db, fn txn -> append_attest_marker(txn, attest) end) end)
+
+    best_effort(fn ->
+      transaction(db, fn txn -> append_assignment_marker(txn, assignment, :closed) end)
+    end)
+
+    :ok
+  end
+
+  defp project_completion_markers(_db, _result), do: :ok
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
   # "Artifacts are the referents" — an attest's referents are the artifacts the
@@ -1942,6 +2108,9 @@ defmodule Tightbeam.Assignments do
   rescue
     TransitionRace ->
       error("transition_race", "assignment changed state during the reopen; read it and retry")
+
+    error in Tightbeam.DeliverableContract.MutationError ->
+      error.response
   end
 
   defp reopen_in_txn(txn, call) do
@@ -1998,6 +2167,10 @@ defmodule Tightbeam.Assignments do
         assignment.closingAttestId
       ]
     )
+
+    # A legacy terminal assignment acquires its subordinate binding before
+    # the guarded UPDATE makes it open again.
+    Tightbeam.DeliverableContract.ensure_reopen_binding_in_txn(txn, assignment)
 
     Txn.q(
       txn,
@@ -2196,7 +2369,10 @@ defmodule Tightbeam.Assignments do
           # assignment must be able to answer "why is this open again", not just
           # "database" — this is that answer, in the same list-of-rows shape
           # `attests` already reads via `list_attests/2`.
-          Map.put(assignment(row), :reopenings, list_reopenings(db, assignment_id))
+          row
+          |> assignment()
+          |> project_assignment(db)
+          |> Map.put(:reopenings, list_reopenings(db, assignment_id))
 
         {:ok, []} ->
           error("not_found", "unknown assignment: #{assignment_id}")
@@ -2462,6 +2638,24 @@ defmodule Tightbeam.Assignments do
           )
         end
 
+        case Tightbeam.DeliverableContract.bind_assignment_in_txn(
+               txn,
+               %{
+                 id: id,
+                 subject: call.params.subject,
+                 holderKey: call.session_key,
+                 workItemId: work_item_id,
+                 openedAt: now
+               },
+               Map.get(call.params, :delivers_work_item, false)
+             ) do
+          :ok ->
+            :ok
+
+          contract_error ->
+            raise Tightbeam.DeliverableContract.MutationError, response: contract_error
+        end
+
         assignment = fetch_assignment!(txn, id)
         append_assignment_marker(txn, assignment, :opened)
         assignment
@@ -2615,6 +2809,23 @@ defmodule Tightbeam.Assignments do
        do: cannot_proceed_in_txn(txn, call, assignment, attest)
 
   defp apply_lifecycle_attest(txn, call, assignment, attest, holder) do
+    attest =
+      case Tightbeam.DeliverableContract.record_completion_claim_in_txn(
+             txn,
+             assignment.id,
+             attest
+           ) do
+        :ok ->
+          Map.put(
+            attest,
+            :deliverableClaim,
+            Tightbeam.DeliverableContract.attest_claim_projection_in_txn(txn, attest.id)
+          )
+
+        contract_error ->
+          raise Tightbeam.DeliverableContract.MutationError, response: contract_error
+      end
+
     Txn.q(
       txn,
       """
@@ -3331,19 +3542,33 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
-      [row] -> assignment(row)
+      [row] -> assignment(row) |> project_assignment(db)
       [] -> nil
     end
   end
 
   defp fetch_assignment(txn, id) do
     case Txn.q(txn, "SELECT #{columns()} FROM assignments WHERE id = ?1", [id]) do
-      [row] -> assignment(row)
+      [row] -> assignment(row) |> project_assignment_in_txn(txn)
       [] -> nil
     end
   end
 
   defp fetch_assignment!(txn, id), do: fetch_assignment(txn, id) || raise("missing assignment")
+
+  defp project_assignment(assignment, db) do
+    Map.merge(
+      assignment,
+      Tightbeam.DeliverableContract.assignment_projection(db, assignment.id)
+    )
+  end
+
+  defp project_assignment_in_txn(assignment, txn) do
+    Map.merge(
+      assignment,
+      Tightbeam.DeliverableContract.assignment_projection_in_txn(txn, assignment.id)
+    )
+  end
 
   defp principal_allowed({:process, _}, _verb),
     do: error("process_denied", "process principals cannot use assignment verbs")
@@ -3474,6 +3699,51 @@ defmodule Tightbeam.Assignments do
 
       {_kind, _refs} ->
         :ok
+    end
+  end
+
+  defp completion_filing_allowed(_db, %{params: %{kind: kind}}) when kind != "completion",
+    do: :ok
+
+  defp completion_filing_allowed(db, call) do
+    supplied = call.params[:assignment_id]
+
+    case IdPrefix.resolve(db, :assignment, supplied) do
+      {:ok, assignment_id} ->
+        {:ok, rows} =
+          DB.query(
+            db,
+            """
+            SELECT a.holderKey,a.state,s.state
+            FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+            WHERE a.id=?1
+            """,
+            [assignment_id]
+          )
+
+        case rows do
+          [] ->
+            error("unknown_assignment", "unknown assignment: #{supplied}")
+
+          [[holder, _assignment_state, _session_state]]
+          when call.principal != {:session, holder} ->
+            error("not_holder", "assignment is held by session #{holder}")
+
+          [[_holder, _assignment_state, session_state]] when session_state != "active" ->
+            error("session_retired", "completion requires an active holder session")
+
+          [[_holder, assignment_state, _session_state]] when assignment_state != "open" ->
+            assignment_closed()
+
+          [[_holder, "open", "active"]] ->
+            :ok
+        end
+
+      :unknown ->
+        error("unknown_assignment", "unknown assignment: #{supplied}")
+
+      {:ambiguous, error} ->
+        error
     end
   end
 
@@ -3702,6 +3972,20 @@ defmodule Tightbeam.Assignments do
 
   defp valid_idempotency_key(_),
     do: error("invalid_idempotency_key", "idempotencyKey must be text")
+
+  defp valid_attest_idempotency("completion", key), do: valid_idempotency_key(key)
+  defp valid_attest_idempotency(_kind, nil), do: :ok
+
+  defp valid_attest_idempotency(_kind, _key),
+    do: error("idempotency_key_not_applicable", "idempotencyKey is only valid for completion")
+
+  defp valid_delivers_work_item(params) do
+    case Map.fetch(params, :delivers_work_item) do
+      :error -> :ok
+      {:ok, value} when is_boolean(value) -> :ok
+      {:ok, _value} -> error("invalid_delivers_work_item", "deliversWorkItem must be boolean")
+    end
+  end
 
   defp valid_files(nil), do: {:ok, []}
 

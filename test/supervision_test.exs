@@ -3771,6 +3771,23 @@ defmodule Tightbeam.SupervisionTest do
         "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES (?1, ?2, ?3, 'flynn', ?4)",
         [id, subject, holder, opened_at]
       )
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.bind_assignment_in_txn(
+          txn,
+          %{
+            id: id,
+            subject: subject,
+            holderKey: holder,
+            openedAt: opened_at,
+            workItemId: nil
+          },
+          false
+        )
+      end)
+
+    :ok
   end
 
   defp revoke_assignment!(db, assignment_id, revoked_at) do

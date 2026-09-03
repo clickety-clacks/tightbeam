@@ -1225,6 +1225,21 @@ defmodule Tightbeam.GatewayTest do
         "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_recovery', 'boot recovery', 'k1', 'flynn', 1)"
       )
 
+    {:ok, :ok} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.DeliverableContract.bind_assignment_in_txn(
+          txn,
+          %{
+            id: "asg_boot_recovery",
+            subject: "boot recovery",
+            holderKey: "k1",
+            openedAt: 1,
+            workItemId: nil
+          },
+          false
+        )
+      end)
+
     children =
       Gateway.children(
         gateway_config(gateway_children_base!(), ctx.db, 0)
@@ -1770,6 +1785,15 @@ defmodule Tightbeam.GatewayTest do
         UPDATE assignments SET reviewsAssignmentId = 'asg_cycle_a' WHERE id = 'asg_cycle_b';
         """
       )
+
+    for assignment_id <- [
+          "asg_audit_target",
+          "asg_audit_conflict",
+          "asg_cycle_a",
+          "asg_cycle_b"
+        ] do
+      bind_assignment_deliverable_fixture!(ctx.db, assignment_id)
+    end
 
     {:ok, before_rows} =
       DB.query(
@@ -8721,6 +8745,8 @@ defmodule Tightbeam.GatewayTest do
       VALUES ('wi_process_cause', 'Process cause', 'flynn', 'flynn', 1)
       """)
 
+    create_work_item_deliverable_fixture!(ctx.db, "wi_process_cause")
+
     for assignment_id <- ["asg_codex", "asg_claude", "asg_unknown", "asg_credential_known"] do
       {:ok, _} =
         DB.query(
@@ -8732,6 +8758,8 @@ defmodule Tightbeam.GatewayTest do
           """,
           [assignment_id]
         )
+
+      bind_assignment_deliverable_fixture!(ctx.db, assignment_id)
     end
 
     {:ok, _} =
@@ -8743,6 +8771,8 @@ defmodule Tightbeam.GatewayTest do
         VALUES ('asg_holder_fallback', 'Holder fallback test', 'k1', 'flynn', 1)
         """
       )
+
+    bind_assignment_deliverable_fixture!(ctx.db, "asg_holder_fallback")
 
     base = gateway_children_base!()
 
@@ -9020,6 +9050,9 @@ defmodule Tightbeam.GatewayTest do
         ('asg_process_rollback', 'Process rollback', 'k1', 'flynn', 1,
          'wi_process_rollback');
       """)
+
+    create_work_item_deliverable_fixture!(ctx.db, "wi_process_rollback")
+    bind_assignment_deliverable_fixture!(ctx.db, "asg_process_rollback")
 
     config = %{
       base_dir: gateway_children_base!(),
@@ -11176,6 +11209,45 @@ defmodule Tightbeam.GatewayTest do
       session_key: nil,
       params: %{title: title}
     })
+  end
+
+  defp create_work_item_deliverable_fixture!(db, work_item_id) do
+    {:ok, [[title, created_at]]} =
+      DB.query(db, "SELECT title, createdAt FROM work_items WHERE id=?1", [work_item_id])
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.create_work_item_in_txn(
+          txn,
+          work_item_id,
+          title,
+          created_at
+        )
+      end)
+  end
+
+  defp bind_assignment_deliverable_fixture!(db, assignment_id) do
+    {:ok, [[subject, holder_key, opened_at, work_item_id]]} =
+      DB.query(
+        db,
+        "SELECT subject,holderKey,openedAt,workItemId FROM assignments WHERE id=?1",
+        [assignment_id]
+      )
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.bind_assignment_in_txn(
+          txn,
+          %{
+            id: assignment_id,
+            subject: subject,
+            holderKey: holder_key,
+            openedAt: opened_at,
+            workItemId: work_item_id
+          },
+          false
+        )
+      end)
   end
 
   # A REAL lane for a session, because identity apply now decides its boundary in

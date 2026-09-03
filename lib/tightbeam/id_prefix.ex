@@ -6,6 +6,7 @@ defmodule Tightbeam.IdPrefix do
 
   @types %{
     assignment: %{table: "assignments", column: "id", prefix: "asg_", label: "assignment id"},
+    attest: %{table: "attests", column: "id", prefix: "att_", label: "attest id"},
     work_item: %{table: "work_items", column: "id", prefix: "wi_", label: "work-item id"},
     wake: %{table: "wakes", column: "wakeId", prefix: "w_", label: "wake id"}
   }

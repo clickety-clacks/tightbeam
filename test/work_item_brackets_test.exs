@@ -795,8 +795,77 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   defp dispose(ctx, verb, principal, id, extra \\ %{}) do
+    extra =
+      if verb == "work-item-close" and not Map.has_key?(extra, :completion_attest_id) do
+        Map.put(extra, :completion_attest_id, completion_fixture!(ctx.db, id))
+      else
+        extra
+      end
+
     params = Map.put(extra, :work_item_id, id)
     ctx.handlers[verb].(work_item_call(verb, principal, params))
+  end
+
+  defp completion_fixture!(db, work_item_id) do
+    {:ok, attest_id} =
+      DB.transaction(db, fn txn ->
+        case Txn.q(
+               txn,
+               "SELECT completionAttestId FROM work_item_closures WHERE workItemId=?1",
+               [work_item_id]
+             ) do
+          [[attest_id]] ->
+            attest_id
+
+          [] ->
+            suffix = Tightbeam.Id.uuid4()
+            assignment_id = "asg_" <> suffix
+            attest_id = "att_" <> suffix
+            ts = System.system_time(:millisecond)
+
+            Txn.q(
+              txn,
+              "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'terminal close fixture','holder','flynn',?2,'open',?3)",
+              [assignment_id, ts, work_item_id]
+            )
+
+            :ok =
+              Tightbeam.DeliverableContract.bind_assignment_in_txn(
+                txn,
+                %{
+                  id: assignment_id,
+                  subject: "terminal close fixture",
+                  holderKey: "holder",
+                  openedAt: ts,
+                  workItemId: work_item_id
+                },
+                true
+              )
+
+            Txn.q(
+              txn,
+              "INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES (?1,?2,'completion','holder',?3)",
+              [attest_id, assignment_id, ts]
+            )
+
+            Txn.q(
+              txn,
+              "UPDATE assignments SET state='closed',outcome='completed',closedAt=?2,closedBySession='holder',closingAttestId=?3 WHERE id=?1",
+              [assignment_id, ts, attest_id]
+            )
+
+            :ok =
+              Tightbeam.DeliverableContract.record_completion_claim_in_txn(
+                txn,
+                assignment_id,
+                %{id: attest_id, ts: ts}
+              )
+
+            attest_id
+        end
+      end)
+
+    attest_id
   end
 
   defp get(ctx, id),
