@@ -267,7 +267,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       handlers: %{},
       cli_token: "tbc_core_detail",
       firehose_hub: Hub,
-      cursor_signing: cursor_signing!(base_dir),
       model_catalog: catalog,
       session_status: fn _ -> nil end
     ]

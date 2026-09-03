@@ -915,7 +915,6 @@ defmodule Tightbeam.ExecutionMapTest do
     opts = [
       db: ctx.db,
       base_dir: base_dir,
-      cursor_signing: cursor_signing!(base_dir),
       handlers: %{
         "toplines" => fn call -> ExecutionMap.roster(ctx.db, call) end,
         "topline" => fn call -> ExecutionMap.topline(ctx.db, call) end

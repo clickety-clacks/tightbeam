@@ -42,7 +42,7 @@ defmodule Tightbeam.Wire.Router do
     any asset.
 
   Elixir shape: `use Plug.Router`; deps (handlers table, db, cli_token,
-  cursor_signing provider, session_status fun) arrive via `init_opts` from the
+  session_status fun) arrive via `init_opts` from the
   composition root and ride `conn.private`. Handlers run in the request process
   — fine, because every verb is bounded (long work goes through the Ledger).
   """
@@ -153,26 +153,10 @@ defmodule Tightbeam.Wire.Router do
                   )
 
   @impl Plug
-  def init(opts) do
-    deps = Map.new(opts)
-    _provider = deps |> Map.get(:cursor_signing) |> Tightbeam.CursorSigning.validate!()
-    deps
-  end
-
-  @impl Plug
   def call(conn, opts) do
-    deps = Map.new(opts)
-    conn = Plug.Conn.put_private(conn, :tightbeam_deps, deps)
-
-    case Tightbeam.CursorSigning.admit_request(deps.cursor_signing) do
-      :ok ->
-        super(conn, deps)
-
-      {:error, _reason} ->
-        conn
-        |> Plug.Conn.put_resp_header("cache-control", "no-store")
-        |> error(500, "projection_invalid")
-    end
+    conn
+    |> Plug.Conn.put_private(:tightbeam_deps, Map.new(opts))
+    |> super(opts)
   end
 
   plug(:match)
@@ -578,11 +562,11 @@ defmodule Tightbeam.Wire.Router do
          {:ok, query} <- decode_state_query(conn),
          {:ok, principal} <- state_principal(auth, query, conn),
          {:ok, request} <- state_collection_request(query, spec),
-         {:ok, boundary} <- state_cursor_boundary(request, principal, spec, conn),
+         {:ok, boundary} <- state_cursor_boundary(request, principal, spec),
          seam <- state_seam!(spec),
          visible <- apply(StateVisibility, seam.visibility, [principal.is_admin]),
          rows <- state_collection_rows(conn, spec, seam, request.filters, visible),
-         {page_rows, page} <- state_page(rows, boundary, request, principal, spec, conn),
+         {page_rows, page} <- state_page(rows, boundary, request, principal, spec),
          items <- state_serialize_rows(page_rows, spec) do
       state_send(conn, 200, state_collection_envelope(conn, spec.resource, items, page))
     else
@@ -1067,30 +1051,27 @@ defmodule Tightbeam.Wire.Router do
     |> Base.encode16(case: :lower)
   end
 
-  defp state_cursor_boundary(%{before: nil, after: nil}, _principal, _spec, _conn),
+  defp state_cursor_boundary(%{before: nil, after: nil}, _principal, _spec),
     do: {:ok, :latest}
 
-  defp state_cursor_boundary(%{before: cursor} = request, principal, spec, conn)
+  defp state_cursor_boundary(%{before: cursor} = request, principal, spec)
        when is_binary(cursor) do
-    with {:ok, tuple} <- decode_state_cursor(cursor, "before", request, principal, spec, conn) do
+    with {:ok, tuple} <- decode_state_cursor(cursor, "before", request, principal, spec) do
       {:ok, {:before, tuple}}
     end
   end
 
-  defp state_cursor_boundary(%{after: cursor} = request, principal, spec, conn)
+  defp state_cursor_boundary(%{after: cursor} = request, principal, spec)
        when is_binary(cursor) do
-    with {:ok, tuple} <- decode_state_cursor(cursor, "after", request, principal, spec, conn) do
+    with {:ok, tuple} <- decode_state_cursor(cursor, "after", request, principal, spec) do
       {:ok, {:after, tuple}}
     end
   end
 
-  defp decode_state_cursor(cursor, direction, request, principal, spec, conn) do
+  defp decode_state_cursor(cursor, direction, request, principal, spec) do
     invalid = {:error, 400, "invalid_cursor", nil}
 
-    with [payload_part, signature_part] <- String.split(cursor, ".", parts: 2),
-         {:ok, payload_bytes} <- Base.url_decode64(payload_part, padding: false),
-         {:ok, signature} <- Base.url_decode64(signature_part, padding: false),
-         {:ok, true} <- state_cursor_signature_valid?(payload_bytes, signature, conn),
+    with {:ok, payload_bytes} <- Base.url_decode64(cursor, padding: false),
          {:ok, payload} when is_map(payload) <- JSON.decode(payload_bytes),
          true <- Enum.sort(Map.keys(payload)) == state_cursor_keys(),
          true <- payload["version"] == @state_cursor_version,
@@ -1105,20 +1086,12 @@ defmodule Tightbeam.Wire.Router do
         {:error, 404, "not_found", nil}
       end
     else
-      {:error, 500, "projection_invalid", nil} = error -> error
       _ -> invalid
     end
   end
 
   defp state_cursor_keys do
-    Enum.sort(~w(direction filters principalId principalKind resource route tuple version))
-  end
-
-  defp state_cursor_signature_valid?(payload, signature, conn) do
-    case Tightbeam.CursorSigning.verify(deps(conn).cursor_signing, payload, signature) do
-      {:ok, valid?} -> {:ok, valid?}
-      _error -> {:error, 500, "projection_invalid", nil}
-    end
+    ~w(direction filters principalId principalKind resource route tuple version)
   end
 
   defp state_cursor_tuple_valid?(tuple, order) when is_list(tuple) do
@@ -1168,7 +1141,7 @@ defmodule Tightbeam.Wire.Router do
     row
   end
 
-  defp state_page(rows, boundary, request, principal, spec, conn) do
+  defp state_page(rows, boundary, request, principal, spec) do
     selected =
       case boundary do
         :latest ->
@@ -1203,8 +1176,7 @@ defmodule Tightbeam.Wire.Router do
                 "before",
                 request.filter_fingerprint,
                 principal,
-                spec,
-                conn
+                spec
               ),
             newest_cursor:
               encode_state_cursor(
@@ -1212,8 +1184,7 @@ defmodule Tightbeam.Wire.Router do
                 "after",
                 request.filter_fingerprint,
                 principal,
-                spec,
-                conn
+                spec
               ),
             has_more_before: Enum.any?(rows, &(state_row_tuple(&1, spec.order) < oldest)),
             has_more_after: Enum.any?(rows, &(state_row_tuple(&1, spec.order) > newest))
@@ -1244,27 +1215,24 @@ defmodule Tightbeam.Wire.Router do
     }
   end
 
-  defp encode_state_cursor(tuple, direction, filter_fingerprint, principal, spec, conn) do
-    payload =
-      JSON.encode!(%{
-        "version" => @state_cursor_version,
-        "route" => spec.route,
-        "resource" => spec.resource,
-        "direction" => direction,
-        "filters" => filter_fingerprint,
-        "principalKind" => principal.kind,
-        "principalId" => principal.id,
-        "tuple" => tuple
-      })
+  defp encode_state_cursor(tuple, direction, filter_fingerprint, principal, spec) do
+    payload = %{
+      "version" => @state_cursor_version,
+      "route" => spec.route,
+      "resource" => spec.resource,
+      "direction" => direction,
+      "filters" => filter_fingerprint,
+      "principalKind" => principal.kind,
+      "principalId" => principal.id,
+      "tuple" => tuple
+    }
 
-    signature =
-      case Tightbeam.CursorSigning.sign(deps(conn).cursor_signing, payload) do
-        {:ok, signature} -> signature
-        _error -> raise ArgumentError, "cursor signing unavailable"
-      end
-
-    Base.url_encode64(payload, padding: false) <>
-      "." <> Base.url_encode64(signature, padding: false)
+    state_cursor_keys()
+    |> Enum.map_join(",", fn key ->
+      JSON.encode!(key) <> ":" <> JSON.encode!(Map.fetch!(payload, key))
+    end)
+    |> then(&("{" <> &1 <> "}"))
+    |> Base.url_encode64(padding: false)
   end
 
   defp state_row_tuple(row, order) do

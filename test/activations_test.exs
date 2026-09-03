@@ -708,7 +708,6 @@ defmodule Tightbeam.ActivationsTest do
       )
 
     File.mkdir_p!(root)
-    Tightbeam.CursorSigning.provision!(root)
     path = Path.join(root, "state.db")
     writer = :activation_downgrade_writer
     reader = :activation_downgrade_reader
