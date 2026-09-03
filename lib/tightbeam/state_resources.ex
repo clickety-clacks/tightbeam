@@ -551,8 +551,7 @@ defmodule Tightbeam.StateResources do
   defp decision_request_query_row(nil), do: nil
 
   defp decision_request_query_row(row) do
-    row
-    |> Map.drop([
+    Map.drop(row, [
       :action_key,
       :ruled_via_session_key,
       :ruled_via_principal,
@@ -563,19 +562,6 @@ defmodule Tightbeam.StateResources do
       :return_reason,
       :returned_at
     ])
-    |> Map.put(:row_version, decision_request_version(row))
-  end
-
-  defp decision_request_version(row) do
-    [
-      row.answered_at,
-      row.withdrawn_at,
-      row.consumed_at,
-      row.ruled_at,
-      row.raised_at
-    ]
-    |> Enum.filter(&is_integer/1)
-    |> Enum.max()
   end
 
   defp detail_principal(%{rest_principal: %{kind: kind, id: id, is_admin: is_admin}}),
@@ -1593,7 +1579,7 @@ defmodule Tightbeam.StateResources do
   end
 
   defp decision_request_projection(row) do
-    row_version = value(row, :row_version) || decision_request_version(row)
+    row_version = value(row, :row_version)
 
     unless is_integer(row_version) and row_version > 0 do
       raise ArgumentError, "decision request rowVersion is projection_invalid"

@@ -94,7 +94,10 @@ defmodule Tightbeam.Schema do
   # classification. SQLite cannot widen those existing shapes in place. The
   # reviewed R17 boundary therefore refuses every predecessor and recreates at
   # v15; the older named migration helpers remain explicit test seams only.
-  @shape "coordination-fabric-v1-phase1-v15"
+  # Stored decision-request row versions then advance v15 to v16. Existing
+  # rows start at one, and the table-owned trigger advances only R7 changes.
+  @shape "coordination-fabric-v1-phase1-v16"
+  @decision_request_row_version_previous_shape "coordination-fabric-v1-phase1-v15"
   @completion_previous_shape "coordination-fabric-v1-phase1-v14"
   @cannot_proceed_previous_shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
@@ -1691,6 +1694,51 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  @doc false
+  @spec upgrade_decision_request_row_version_v1(DB.server()) :: :ok
+  def upgrade_decision_request_row_version_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@decision_request_row_version_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_decision_request_row_version_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Escalation.migrate_decision_request_row_version_v1_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @decision_request_row_version_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_decision_request_row_version_v1: stamp race"
+               )
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_decision_request_row_version_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
   defp maybe_interrupt_nullable_effective_parent_migration!(opts, point) do
     if Keyword.get(opts, :fail_at) == point,
       do: raise("forced nullable-effective-parent migration interruption")
@@ -1926,6 +1974,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@decision_request_row_version_previous_shape]]} ->
+        upgrade_decision_request_row_version_v1(db)
+
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
         # written before stamping existed. Those are DIFFERENT, and telling
@@ -1940,7 +1991,9 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration from #{found}. Move this database aside and let it be recreated.
+        There is no migration from #{found}. The only supported upgrade source
+        is #{@decision_request_row_version_previous_shape}.
+        Move this database aside and let it be recreated.
         """
 
       # More than one shape stamped. Nothing writes a second row, so this is a

@@ -83,6 +83,8 @@ defmodule Tightbeam.Escalation do
     returnedBy        TEXT,
     returnReason      TEXT,
     returnedAt        INTEGER,
+    rowVersion        INTEGER NOT NULL DEFAULT 1
+                      CHECK (typeof(rowVersion) = 'integer' AND rowVersion > 0),
     CHECK (
       (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
        AND expecterSessionKey IS NULL AND expecterUserId IS NULL
@@ -218,6 +220,51 @@ defmodule Tightbeam.Escalation do
            ON decision_requests (ownerUserId, raiserId, actionKey)
            WHERE kind = 'operator' AND status = 'open';
 
+         CREATE TRIGGER IF NOT EXISTS decision_requests_r7_row_version
+         AFTER UPDATE OF
+           id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
+           expecterSessionKey, expecterUserId, lineageRung, effortGeneration,
+           deadlineWakeId, raisedAt, deadlineAt, statuteName, question, options,
+           context, status, decision, rationale, ruledBy, ruledAt, consumedAt,
+           withdrawnBy, withdrawnReason, withdrawnAt, askedOfRole, answer,
+           answeredBy, answeredAt
+         ON decision_requests
+         WHEN NEW.id IS NOT OLD.id
+           OR NEW.kind IS NOT OLD.kind
+           OR NEW.raiserId IS NOT OLD.raiserId
+           OR NEW.raiserSessionKey IS NOT OLD.raiserSessionKey
+           OR NEW.ownerUserId IS NOT OLD.ownerUserId
+           OR NEW.assignmentId IS NOT OLD.assignmentId
+           OR NEW.expecterSessionKey IS NOT OLD.expecterSessionKey
+           OR NEW.expecterUserId IS NOT OLD.expecterUserId
+           OR NEW.lineageRung IS NOT OLD.lineageRung
+           OR NEW.effortGeneration IS NOT OLD.effortGeneration
+           OR NEW.deadlineWakeId IS NOT OLD.deadlineWakeId
+           OR NEW.raisedAt IS NOT OLD.raisedAt
+           OR NEW.deadlineAt IS NOT OLD.deadlineAt
+           OR NEW.statuteName IS NOT OLD.statuteName
+           OR NEW.question IS NOT OLD.question
+           OR NEW.options IS NOT OLD.options
+           OR NEW.context IS NOT OLD.context
+           OR NEW.status IS NOT OLD.status
+           OR NEW.decision IS NOT OLD.decision
+           OR NEW.rationale IS NOT OLD.rationale
+           OR NEW.ruledBy IS NOT OLD.ruledBy
+           OR NEW.ruledAt IS NOT OLD.ruledAt
+           OR NEW.consumedAt IS NOT OLD.consumedAt
+           OR NEW.withdrawnBy IS NOT OLD.withdrawnBy
+           OR NEW.withdrawnReason IS NOT OLD.withdrawnReason
+           OR NEW.withdrawnAt IS NOT OLD.withdrawnAt
+           OR NEW.askedOfRole IS NOT OLD.askedOfRole
+           OR NEW.answer IS NOT OLD.answer
+           OR NEW.answeredBy IS NOT OLD.answeredBy
+           OR NEW.answeredAt IS NOT OLD.answeredAt
+         BEGIN
+           UPDATE decision_requests
+           SET rowVersion = OLD.rowVersion + 1
+           WHERE id = NEW.id;
+         END;
+
          CREATE TABLE IF NOT EXISTS decision_request_terminal_epoch (
            id INTEGER PRIMARY KEY CHECK (id = 0),
            schemaVersion TEXT NOT NULL,
@@ -276,7 +323,7 @@ defmodule Tightbeam.Escalation do
            ON escalation_waivers (raiserId, statuteName, revokedAt);
          """
 
-  @request_columns """
+  @request_columns_without_row_version """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
   expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId,
   raisedAt, deadlineAt,
@@ -286,6 +333,8 @@ defmodule Tightbeam.Escalation do
   withdrawnReason, withdrawnAt, askedOfRole, answer, answeredBy, answeredAt,
   returnedBy, returnReason, returnedAt
   """
+
+  @request_columns @request_columns_without_row_version <> ", rowVersion"
 
   @legacy_request_columns """
   id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId,
@@ -381,8 +430,8 @@ defmodule Tightbeam.Escalation do
     Txn.q(
       txn,
       """
-      INSERT INTO decision_requests_ruled_integrity_v1 (#{@request_columns})
-      SELECT #{@request_columns} FROM decision_requests
+      INSERT INTO decision_requests_ruled_integrity_v1 (#{@request_columns_without_row_version})
+      SELECT #{@request_columns_without_row_version} FROM decision_requests
       """
     )
 
@@ -392,6 +441,20 @@ defmodule Tightbeam.Escalation do
       Txn.exec(
         txn,
         "ALTER TABLE decision_requests_ruled_integrity_v1 RENAME TO decision_requests"
+      )
+
+    :ok = Txn.exec(txn, @ddl)
+    :ok
+  end
+
+  @doc false
+  @spec migrate_decision_request_row_version_v1_in_txn(Txn.t()) :: :ok
+  def migrate_decision_request_row_version_v1_in_txn(txn) do
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE decision_requests ADD COLUMN rowVersion INTEGER NOT NULL " <>
+          "DEFAULT 1 CHECK (typeof(rowVersion) = 'integer' AND rowVersion > 0)"
       )
 
     :ok = Txn.exec(txn, @ddl)
@@ -423,9 +486,11 @@ defmodule Tightbeam.Escalation do
 
   defp preflight_ruled_decision_integrity_in_txn(txn) do
     txn
-    |> Txn.q("SELECT #{@request_columns} FROM decision_requests WHERE status = 'ruled'")
+    |> Txn.q(
+      "SELECT #{@request_columns_without_row_version} FROM decision_requests WHERE status = 'ruled'"
+    )
     |> Enum.each(fn row ->
-      request = request_from_row(row)
+      request = request_from_row(row ++ [1])
 
       unless ruled_decision_complete?(request) do
         raise DB.Error,
@@ -1860,6 +1925,7 @@ defmodule Tightbeam.Escalation do
     request_in_txn_optional: "any",
     migrate_terminal_operator_decision_v1_in_txn: "any",
     migrate_ruled_decision_integrity_v1_in_txn: "any",
+    migrate_decision_request_row_version_v1_in_txn: "any",
     preflight_ruled_decision_integrity_in_txn: "any",
     # DELEGATE: no SQL literal of its own — reaches one of the entries above
     # by a local call. `answer/2`/`return_request/2`/`ask/2`/`rule/3`/`waive/3`/`withdraw/2`/
@@ -3203,6 +3269,7 @@ defmodule Tightbeam.Escalation do
       ruled_at: request.ruled_at,
       ruling_fact_id: request.ruling_fact_id,
       consumed_at: request.consumed_at,
+      row_version: request.row_version,
       ruling_attribution: operator_ruling_attribution(request)
     }
   end
@@ -3340,7 +3407,7 @@ defmodule Tightbeam.Escalation do
 
   defp legacy_request_from_row(row) do
     {through_ruled_by, from_ruled_at} = Enum.split(row, 22)
-    request_from_row(through_ruled_by ++ [nil, nil, nil] ++ from_ruled_at)
+    request_from_row(through_ruled_by ++ [nil, nil, nil] ++ from_ruled_at ++ [1])
   end
 
   defp request_from_row([
@@ -3382,7 +3449,8 @@ defmodule Tightbeam.Escalation do
          answered_at,
          returned_by,
          return_reason,
-         returned_at
+         returned_at,
+         row_version
        ]) do
     %{
       id: id,
@@ -3423,7 +3491,8 @@ defmodule Tightbeam.Escalation do
       answered_at: answered_at,
       returned_by: returned_by,
       return_reason: return_reason,
-      returned_at: returned_at
+      returned_at: returned_at,
+      row_version: row_version
     }
   end
 
