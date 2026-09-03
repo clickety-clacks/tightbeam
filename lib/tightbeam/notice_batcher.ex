@@ -1,6 +1,7 @@
 defmodule Tightbeam.NoticeBatcher do
   @moduledoc """
-  Source-preserving delivery batching for eligible non-user `fyi` wakes.
+  Source-preserving delivery batching for eligible V1 `fyi` wakes and
+  sender-marked V2 agent `information` messages.
 
   A wake remains the durable source notice. This module owns every batch,
   member, schedule, cancellation, retry, and recovery transition. The source
@@ -594,11 +595,13 @@ defmodule Tightbeam.NoticeBatcher do
       DB.query(
         db,
         """
-        SELECT memberId, batchId, sourceWakeId, policyRef, recipientAddress,
-               visibilityScope, publicationSeq, policyRevision, senderPrincipal,
-               cause, class, payload, renderedBytes, state, addedAt, canceledAt,
-               cancellationRef
-        FROM notice_batch_members WHERE batchId=?1 ORDER BY publicationSeq
+        SELECT m.memberId, m.batchId, m.sourceWakeId, m.policyRef, m.recipientAddress,
+               m.visibilityScope, m.publicationSeq, m.policyRevision, m.senderPrincipal,
+               m.cause, w.class, m.payload, m.renderedBytes, m.state, m.addedAt, m.canceledAt,
+               m.cancellationRef
+        FROM notice_batch_members m
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        WHERE m.batchId=?1 ORDER BY m.publicationSeq
         """,
         [batch_id]
       )
@@ -685,7 +688,7 @@ defmodule Tightbeam.NoticeBatcher do
       DB.query(
         db,
         """
-        SELECT m.sourceWakeId, m.senderPrincipal, m.cause, m.class,
+        SELECT m.sourceWakeId, m.senderPrincipal, m.cause, w.class,
                m.publicationSeq, m.payload, w.classElection, w.createdAt
         FROM notice_batches b
         JOIN notice_batch_members m ON m.batchId=b.batchId
@@ -734,9 +737,9 @@ defmodule Tightbeam.NoticeBatcher do
     case Txn.q(
            txn,
            """
-           SELECT w.wakeId, w.sessionKey, w.targetRole, w.origin, w.prompt,
+           SELECT w.wakeId, w.sessionKey, w.targetRole, w.origin, w.creatorSessionKey, w.prompt,
                   w.consumer, w.state, w.createdAt, w.work_item_id, w.assignmentId,
-                  w.class, w.digest, p.policyRef, p.recipientAddress,
+                  w.class, w.classElection, w.digest, p.policyRef, p.recipientAddress,
                   p.visibilityScope, p.policyRevision, p.deadlineAt, p.enabled
            FROM wakes w
            JOIN notice_delivery_policies p ON p.sourceWakeId=w.wakeId
@@ -773,8 +776,11 @@ defmodule Tightbeam.NoticeBatcher do
       String.starts_with?(source.origin, "user:") ->
         refusal("user_source_notice", "user-authored notices never batch")
 
-      source.class != "fyi" ->
-        refusal("ineligible_notice_class", "only non-user fyi notices batch in v1")
+      not eligible_class?(source) ->
+        refusal(
+          "ineligible_notice_class",
+          "only non-user v1 fyi notices or sender-marked v2 information messages batch"
+        )
 
       true ->
         :ok
@@ -782,6 +788,22 @@ defmodule Tightbeam.NoticeBatcher do
   end
 
   defp refusal(code, message), do: {:error, %{code: code, message: message}}
+
+  defp eligible_class?(%{class: "fyi"} = source), do: not agent_message?(source)
+
+  defp eligible_class?(%{class: "information", class_election: "sender"} = source),
+    do: agent_message?(source)
+
+  defp eligible_class?(_source), do: false
+
+  defp agent_message?(source) do
+    Tightbeam.Origin.class(Map.get(source, :origin)) == "agent" and
+      agent_session?(Map.get(source, :creator_session_key)) and
+      agent_session?(Map.get(source, :session_key))
+  end
+
+  defp agent_session?("agent:" <> principal) when principal != "", do: true
+  defp agent_session?(_principal), do: false
 
   defp recipient_lane(recipient) do
     target_role = recipient[:target_role]
@@ -1342,10 +1364,12 @@ defmodule Tightbeam.NoticeBatcher do
     Txn.q(
       txn,
       """
-      SELECT sourceWakeId, senderPrincipal, cause, class, publicationSeq, payload
-      FROM notice_batch_members
-      WHERE batchId=?1 AND state='active'
-      ORDER BY publicationSeq
+        SELECT m.sourceWakeId, m.senderPrincipal, m.cause, w.class,
+               m.publicationSeq, m.payload
+        FROM notice_batch_members m
+        JOIN wakes w ON w.wakeId=m.sourceWakeId
+        WHERE m.batchId=?1 AND m.state='active'
+        ORDER BY m.publicationSeq
       """,
       [batch_id]
     )
@@ -1477,6 +1501,7 @@ defmodule Tightbeam.NoticeBatcher do
          session_key,
          target_role,
          origin,
+         creator_session_key,
          prompt,
          consumer,
          state,
@@ -1484,6 +1509,7 @@ defmodule Tightbeam.NoticeBatcher do
          work_item_id,
          assignment_id,
          class,
+         class_election,
          digest,
          policy_ref,
          recipient_address,
@@ -1497,6 +1523,7 @@ defmodule Tightbeam.NoticeBatcher do
       session_key: session_key,
       target_role: target_role,
       origin: origin,
+      creator_session_key: creator_session_key,
       prompt: prompt,
       consumer: consumer,
       state: state,
@@ -1504,6 +1531,7 @@ defmodule Tightbeam.NoticeBatcher do
       work_item_id: work_item_id,
       assignment_id: assignment_id,
       class: class,
+      class_election: class_election,
       digest: digest,
       policy_ref: policy_ref,
       recipient_address: recipient_address,

@@ -52,7 +52,7 @@ defmodule Tightbeam.NoticeBatcherTest do
     assert Wakes.get(db, user.wake_id).state == "fired"
   end
 
-  test "acceptance 3: urgent classes bypass while agent-authored fyi joins the selected lane",
+  test "acceptance 3: agent fyi and urgent classes keep their pre-v2 paths",
        %{db: db} do
     routine = eligible(db)
 
@@ -62,10 +62,71 @@ defmodule Tightbeam.NoticeBatcherTest do
     end
 
     agent_fyi = ordinary(db, "fyi", "pre-v2 agent message")
-    assert [%{batch_id: agent_batch}] = NoticeBatcher.source_refs(db, agent_fyi.wake_id)
-    assert agent_batch == batch_id(db, routine)
+    assert NoticeBatcher.source_refs(db, agent_fyi.wake_id) == []
+    assert agent_fyi.delivery_rule == "turn-boundary-digest r1"
 
-    assert NoticeBatcher.batch(db, batch_id(db, routine)).member_count == 2
+    assert NoticeBatcher.batch(db, batch_id(db, routine)).member_count == 1
+  end
+
+  test "v2: sender-marked agent information joins the fyi envelope without rewriting its source",
+       %{db: db} do
+    seed_session(db, "agent:sender-session", "owner")
+    seed_session(db, "agent:recipient", "owner")
+    Roles.create!(db, "sender", "owner", "agent:sender-session")
+    set_lane_policy(db, [], true)
+    scheduler = start_scheduler(db, fn _wake -> true end)
+
+    information =
+      Gateway.handlers(%{db: db, wake_scheduler: scheduler, wake_tick_ms: 1_000})["wake"].(%{
+        origin: "agent:sender",
+        principal: {:session, "agent:sender-session"},
+        session_key: "agent:recipient",
+        params: %{prompt: "routine agent report", class: "information"}
+      })
+
+    assert [%{batch_id: batch_id}] = NoticeBatcher.source_refs(db, information.wake_id)
+
+    source = Wakes.get(db, information.wake_id)
+    assert source.class == "information"
+    assert source.class_election == "sender"
+    assert source.origin == "agent:sender"
+    assert source.creator_session_key == "agent:sender-session"
+
+    assert [%{class: "information", sender_principal: "agent:sender"}] =
+             NoticeBatcher.members(db, batch_id)
+
+    [carrier_id] = Wakes.materialize_digests(db, information.due_at)
+    carrier = Wakes.get(db, carrier_id)
+    assert carrier.class == "fyi"
+    assert carrier.class_election == "batcher"
+    assert carrier.prompt =~ "class=information"
+  end
+
+  test "v2: missing information marker or sender provenance creates no v1 member", %{db: db} do
+    set_lane_policy(db, [], true)
+
+    unmarked =
+      Wakes.schedule(db, %{
+        session_key: "agent:recipient",
+        origin: "agent:sender",
+        creator_session_key: "agent:sender",
+        prompt: "unmarked agent report",
+        due_at: 0
+      })
+
+    missing_provenance =
+      Wakes.schedule(db, %{
+        session_key: "agent:recipient",
+        origin: "agent:sender",
+        prompt: "unattributed information",
+        due_at: 0,
+        class: "information"
+      })
+
+    assert NoticeBatcher.source_refs(db, unmarked.wake_id) == []
+    assert NoticeBatcher.source_refs(db, missing_provenance.wake_id) == []
+    assert Wakes.get(db, unmarked.wake_id).class == nil
+    assert Wakes.get(db, missing_provenance.wake_id).class == "information"
   end
 
   test "acceptance 4: blocker publication leaves the fyi batch unchanged", %{db: db} do
