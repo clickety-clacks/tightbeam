@@ -16,7 +16,7 @@ defmodule Tightbeam.D1Read do
       resource: "users",
       route: "users.collection",
       filters: ~w(userId),
-      order: ~w(createdAt userId)
+      order: ~w(userId)
     },
     identity: %{
       resource: "identity",
@@ -122,7 +122,7 @@ defmodule Tightbeam.D1Read do
 
   defp rows(:users, db, _base_dir) do
     {:ok, rows} =
-      DB.query(db, "SELECT userId, isAdmin, createdAt FROM users ORDER BY createdAt, userId")
+      DB.query(db, "SELECT userId, isAdmin, createdAt FROM users ORDER BY userId")
 
     Enum.map(rows, fn [user_id, is_admin, created_at] ->
       %{
