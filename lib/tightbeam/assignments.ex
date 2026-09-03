@@ -2860,8 +2860,6 @@ defmodule Tightbeam.Assignments do
       assignment_disposition_command(assignment.id, "tightbeam:assignments", liveness_trigger)
     )
 
-    append_attest_marker(txn, attest)
-    append_assignment_marker(txn, closed_assignment, :closed)
     %{assignment: closed_assignment, attest: attest}
   end
 
