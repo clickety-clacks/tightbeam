@@ -22,8 +22,8 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     revocationId TEXT NULL UNIQUE REFERENCES assignment_revocations(id),
     outcome TEXT NOT NULL CHECK (outcome IN ('completed','revoked')),
     causeBySession TEXT NULL REFERENCES sessions(sessionKey),
-    causeByUser TEXT NULL,
-    ownerUserId TEXT NOT NULL,
+    causeByUser TEXT NULL REFERENCES users(userId),
+    ownerUserId TEXT NOT NULL REFERENCES users(userId),
     rootMainHolder INTEGER NOT NULL CHECK (rootMainHolder IN (0,1)),
     immediateParentSessionKey TEXT NOT NULL,
     parentSessionKey TEXT NOT NULL,
@@ -39,7 +39,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     ),
     generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
     currentRecipientSessionKey TEXT NULL REFERENCES sessions(sessionKey),
-    currentRecipientUserId TEXT NULL,
+    currentRecipientUserId TEXT NULL REFERENCES users(userId),
     recipientGeneration INTEGER NULL CHECK (recipientGeneration >= 0),
     recipientReissueCount INTEGER NULL CHECK (recipientReissueCount >= 0),
     recipientReissueLimit INTEGER NULL CHECK (recipientReissueLimit >= 0),
@@ -52,7 +52,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     ),
     decision TEXT NULL CHECK (decision IN ('retain','park','retire')),
     actedBySession TEXT NULL REFERENCES sessions(sessionKey),
-    actedByUser TEXT NULL,
+    actedByUser TEXT NULL REFERENCES users(userId),
     actedAt INTEGER NULL,
     supersededReason TEXT NULL CHECK (
       supersededReason IN ('new-assignment','child-retired')
@@ -183,7 +183,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
     recipientGeneration INTEGER NULL CHECK (recipientGeneration >= 0),
     recipientReissueCount INTEGER NULL CHECK (recipientReissueCount >= 0),
     recipientSessionKey TEXT NULL REFERENCES sessions(sessionKey),
-    recipientUserId TEXT NULL,
+    recipientUserId TEXT NULL REFERENCES users(userId),
     CHECK (
       kind = 'report-to-notice'
         AND generation = 0
@@ -424,7 +424,7 @@ defmodule Tightbeam.Productions.CompletionEscalation do
       txn,
       "completion_escalation_opened",
       completion_id,
-      "causeKind=#{cause_kind} outcome=#{terminal.outcome} remainingOpenAssignments=#{remaining} principal=#{@process_principal}"
+      nil
     )
 
     record_parent_failure(txn, completion_id, parent, generation)
@@ -993,22 +993,33 @@ defmodule Tightbeam.Productions.CompletionEscalation do
         )
 
       is_binary(current) ->
-        visited = visited_recipient_sessions(txn, row.id) |> MapSet.put(row.child_session_key)
+        case Txn.q(txn, "SELECT ownerUserId,spawnedBy FROM sessions WHERE sessionKey=?1", [
+               current
+             ]) do
+          [[owner, spawned_by]] when owner == row.owner_user_id ->
+            visited =
+              visited_recipient_sessions(txn, row.id) |> MapSet.put(row.child_session_key)
 
-        next_key =
-          case Txn.q(txn, "SELECT spawnedBy FROM sessions WHERE sessionKey=?1", [current]) do
-            [[spawned_by]] -> spawned_by
-            [] -> nil
-          end
+            walk_ancestor(
+              txn,
+              spawned_by,
+              row.child_session_key,
+              row.owner_user_id,
+              visited,
+              row.recipient_generation + 1
+            )
 
-        walk_ancestor(
-          txn,
-          next_key,
-          row.child_session_key,
-          row.owner_user_id,
-          visited,
-          row.recipient_generation + 1
-        )
+          [[_foreign, _spawned_by]] ->
+            recipient_user(
+              row.owner_user_id,
+              row.recipient_generation + 1,
+              0,
+              current
+            )
+
+          [] ->
+            recipient_user(row.owner_user_id, row.recipient_generation + 1, 0)
+        end
 
       true ->
         recipient_user(row.owner_user_id, row.recipient_generation, row.recipient_reissue_count)
