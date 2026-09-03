@@ -185,6 +185,10 @@ pub enum Command {
         /// skew row, never a refusal.
         class: Option<String>,
     },
+    WakeGet {
+        identity: Identity,
+        wake_id: String,
+    },
     Condition {
         identity: Identity,
         kind: String,
@@ -647,6 +651,10 @@ COMMANDS:
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
         tightbeam wake --role owner --when-fact build-finished --when-scope app \
           --fallback-after 2h --prompt "re-read the work and decide" --as-process ci
+
+  wake-get <wakeId>
+      Read one wake's durable delivery state and ordered outcome history. The
+      scheduling principal, target owner, or an admin may read it.
 
   condition --kind <kind> [--scope <scope>] [--key <idempotencyKey>]
       File an observable fact. Matching condition wakes receive the fact as a new
@@ -1795,6 +1803,15 @@ fn parse_with_optional_catalog(
                 class: nonempty(flags, "class"),
             })
         }
+        "wake-get" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam wake-get <wakeId>".to_owned());
+            }
+            Ok(Command::WakeGet {
+                identity: identity(flags)?,
+                wake_id: parsed.positional[1].clone(),
+            })
+        }
         "condition" => {
             if parsed.positional.len() != 1 {
                 return Err(
@@ -2770,7 +2787,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, wake-get, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
         )),
     }
 }
@@ -3799,6 +3816,7 @@ mod tests {
                 "spawn",
                 "tune",
                 "wake",
+                "wake-get",
                 "work-item-close",
                 "work-item-create",
                 "work-item-fail",
@@ -4128,6 +4146,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_wake_get_with_exact_identity() {
+        assert_eq!(
+            parse(strings(&["wake-get", "w_123", "--as", "coder"])),
+            Ok(Command::WakeGet {
+                identity: Identity::Role("coder".to_owned()),
+                wake_id: "w_123".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(strings(&["wake-get", "--as", "coder"])),
+            Err("usage: tightbeam wake-get <wakeId>".to_owned())
+        );
+    }
+
+    #[test]
     fn refuses_invalid_condition_wake_and_fact_shapes_with_specific_messages() {
         for (args, expected) in [
             (
@@ -4423,7 +4456,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, wake-get, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
         );
     }
 

@@ -17,7 +17,7 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.{DB, HarnessHealth, Org, TurnLifecycle}
+  alias Tightbeam.{DB, HarnessHealth, Org, TurnLifecycle, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -648,6 +648,19 @@ defmodule Tightbeam.Ledger do
               principal: "process:tightbeam"
             })
           )
+
+          Wakes.settle_terminal_in_txn(
+            txn,
+            seq,
+            "failed",
+            unclaimable_error(reason),
+            %{
+              failure_class:
+                if(reason == :no_session, do: "could_not_run", else: "carrier_canceled"),
+              wake_cause_kind: "recipient_unclaimable",
+              wake_cause_id: "session:#{session_key}:#{reason}"
+            }
+          )
         end)
 
         Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
@@ -710,6 +723,8 @@ defmodule Tightbeam.Ledger do
         terminal_event(seq, terminal, opts) |> Map.put(:at, now)
       )
 
+      Wakes.settle_terminal_in_txn(txn, seq, terminal, error, opts)
+
       Publisher.turn_in_txn(txn, "turn.ended", seq)
 
       [[session_key]] = Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq = ?1", [seq])
@@ -752,6 +767,12 @@ defmodule Tightbeam.Ledger do
         seq,
         terminal_event(seq, "canceled", Map.new(opts))
       )
+
+      Wakes.settle_terminal_in_txn(txn, seq, "canceled", reason, %{
+        failure_class: "carrier_canceled",
+        wake_cause_kind: "recipient_retired",
+        wake_cause_id: "session:#{session_key}"
+      })
     end)
 
     Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
@@ -790,6 +811,18 @@ defmodule Tightbeam.Ledger do
               cause: "boot-recovery",
               principal: "process:tightbeam"
             })
+          )
+
+          Wakes.settle_terminal_in_txn(
+            txn,
+            seq,
+            "failed_unknown",
+            "interrupted: outcome unknown",
+            %{
+              failure_class: "outcome_unknown",
+              wake_cause_kind: "boot_recovery",
+              wake_cause_id: "turn:#{seq}"
+            }
           )
         end)
 

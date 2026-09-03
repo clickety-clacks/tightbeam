@@ -395,6 +395,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "wake", vec![target], params))
         }
+        Command::WakeGet { identity, wake_id } => Ok(request(
+            identity,
+            "wake-get",
+            vec![],
+            vec![string_field("wakeId", wake_id)],
+        )),
         Command::Condition {
             identity,
             kind,
@@ -2002,6 +2008,7 @@ fn identity_required(cwd: &Path) -> String {
 fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
         Command::Wake { identity, .. }
+        | Command::WakeGet { identity, .. }
         | Command::Condition { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::Artifacts { identity, .. }
@@ -2840,6 +2847,14 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":16}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_wake_get_body() {
+        assert_eq!(
+            body(&["wake-get", "w_123", "--as", "coder"]),
+            r#"{"as":"coder","verb":"wake-get","params":{"wakeId":"w_123"}}"#
         );
     }
 
