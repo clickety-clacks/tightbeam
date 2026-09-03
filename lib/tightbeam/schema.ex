@@ -1940,6 +1940,7 @@ defmodule Tightbeam.Schema do
           @deliverable_contract_previous_shape,
           @shape
         )
+
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
         # written before stamping existed. Those are DIFFERENT, and telling

@@ -132,6 +132,7 @@ defmodule Tightbeam.WorkItems do
 
               put_priority_in_txn(txn, id, priority)
               stamp_version_in_txn(txn, id, created_at)
+
               Tightbeam.DeliverableContract.create_work_item_in_txn(
                 txn,
                 id,
