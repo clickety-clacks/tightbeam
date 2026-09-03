@@ -133,6 +133,39 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "served neutral identity excludes engineering vocabulary", ctx do
+    assert :initialized = Identity.init!(ctx.base_dir)
+    archetypes = Archetypes.load!(ctx.base_dir)
+
+    forbidden = [
+      {"worktree", ~r/\bworktrees?\b/i},
+      {"branch", ~r/\bbranches?\b/i},
+      {"spec", ~r/\bspecs?\b/i},
+      {"feature", ~r/\bfeatures?\b/i},
+      {"bug", ~r/\bbugs?\b/i},
+      {"product-owner", ~r/\bproduct[- ]owners?\b/i},
+      {"orchestrator", ~r/\borchestrators?\b/i},
+      {"coder", ~r/\bcoders?\b/i}
+    ]
+
+    for harness <- [:claude, :codex] do
+      snapshot = Identity.snapshot!(ctx.base_dir, "default", harness)
+
+      skill_bodies =
+        Enum.map(archetypes["default"].skills, fn skill ->
+          Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
+          |> File.read!()
+        end)
+
+      served = Enum.join([snapshot.guidance | Map.values(snapshot.skills) ++ skill_bodies], "\n")
+
+      for {concept, pattern} <- forbidden do
+        refute Regex.match?(pattern, served),
+               "neutral default/#{harness} guidance contains engineering concept #{concept}"
+      end
+    end
+  end
+
   test "the operating manual names the shell as the path to every substrate verb" do
     manual = Archetypes.builtin_fragments()["operating-manual.md"]
     assert manual =~ "shell tool"
