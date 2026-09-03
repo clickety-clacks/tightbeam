@@ -135,6 +135,86 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
     // it runs on this normal return and on any assertion unwind above.
 }
 
+/// OWN-AT-SPAWN closes the leak class even when the leader identity/birth token can never be
+/// acquired. The leader here exits immediately, so its `/proc` starttime is never readable for a live
+/// process — a persistent acquisition failure. The guard, armed the instant the wrapper is spawned,
+/// must still kill and wait the wrapper and remove the scratch directory, and must NEVER signal a
+/// group it could not birth-verify (the dead leader is never adopted, so no `killpg` is issued).
+#[test]
+fn persistent_acquisition_failure_leaves_nothing_without_unowned_signal() {
+    let dir = std::env::temp_dir().join(format!(
+        "tightbeam-harness-group-acqfail-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_tightbeam");
+    let identity_path = dir.join("leader.identity");
+    // The leader exits immediately: its birth token can never be acquired for a live process.
+    let leader = script(&dir, "leader.sh", "exit 0\n");
+
+    let harness = Command::new(binary)
+        .args([
+            "harness-exec",
+            &identity_path.to_string_lossy(),
+            "leader-launch",
+            "--",
+            "/bin/sh",
+            &leader.to_string_lossy(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the harness session launcher must start");
+
+    // OWN-AT-SPAWN: the guard owns the wrapper and scratch dir the instant the wrapper exists.
+    let mut session = OwnedSession::arm(harness, &dir);
+    let wrapper_pid = session.harness.id() as libc::pid_t;
+
+    // Bounded acquisition attempt. Whether or not harness-exec wrote an identity for the already-dead
+    // leader, `adopt` finds no live starttime, so no leader is ever adopted.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Ok(text) = fs::read_to_string(&identity_path) {
+            let fields: Vec<&str> = text.trim_end().split('\t').collect();
+            if let [pid, pgid, boot, _launch] = fields[..] {
+                if let (Ok(pid), Ok(pgid)) = (pid.parse(), pgid.parse()) {
+                    session.adopt(&Identity {
+                        path: identity_path.to_string_lossy().into_owned(),
+                        pid,
+                        pgid,
+                        boot: boot.to_owned(),
+                    });
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // The dead leader is never adopted, so teardown will not signal any group.
+    assert!(
+        session.leader.is_none(),
+        "a leader without a live birth token must never be adopted"
+    );
+
+    drop(session);
+
+    // Teardown left nothing: wrapper reaped, scratch removed. No unowned group was signalled because
+    // no leader was ever adopted (asserted above).
+    assert!(
+        !dir.exists(),
+        "scratch directory must be removed on acquisition failure"
+    );
+    assert!(
+        unsafe { libc::kill(wrapper_pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH),
+        "the harness-exec wrapper must be killed and reaped"
+    );
+}
+
 struct Identity {
     path: String,
     pid: libc::pid_t,
