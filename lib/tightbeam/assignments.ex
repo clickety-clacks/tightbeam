@@ -6,6 +6,7 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
+
   alias Tightbeam.{
     EffortCheckin,
     EventLog,

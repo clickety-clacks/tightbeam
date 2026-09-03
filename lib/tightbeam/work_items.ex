@@ -551,7 +551,9 @@ defmodule Tightbeam.WorkItems do
   @spec state_for(DB.server(), String.t()) :: String.t() | nil
   def state_for(db, id) do
     case DB.query(db, "SELECT state FROM work_items WHERE id = ?1", [id]) do
-      {:ok, [[state]]} -> state
+      {:ok, [[state]]} ->
+        state
+
       {:ok, []} ->
         nil
     end
@@ -561,7 +563,9 @@ defmodule Tightbeam.WorkItems do
   @spec state_in_txn(Txn.t(), String.t()) :: String.t() | nil
   def state_in_txn(%Txn{} = txn, id) do
     case Txn.q(txn, "SELECT state FROM work_items WHERE id = ?1", [id]) do
-      [[state]] -> state
+      [[state]] ->
+        state
+
       [] ->
         nil
     end
@@ -818,7 +822,8 @@ defmodule Tightbeam.WorkItems do
           Tightbeam.DeliverableContract.work_item_projection(db, id)
         )
 
-      {:ok, []} -> nil
+      {:ok, []} ->
+        nil
     end
   end
 
@@ -833,7 +838,8 @@ defmodule Tightbeam.WorkItems do
           Tightbeam.DeliverableContract.work_item_projection_in_txn(txn, id)
         )
 
-      [] -> nil
+      [] ->
+        nil
     end
   end
 
