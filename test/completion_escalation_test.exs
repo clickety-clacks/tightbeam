@@ -1141,29 +1141,75 @@ defmodule Tightbeam.CompletionEscalationTest do
     end
   end
 
-  test "revocation generation schema admits distinct reopened generation identities", ctx do
-    assignment = assign(ctx)
+  test "0.1.9 revocation generations remain null through every reachable lifecycle", ctx do
+    direct_assignment = assign(ctx)
+    assert %{outcome: "revoked"} = revoke(ctx, direct_assignment.id, {:user, "owner"})
+
+    retiring = session(ctx.db, "null-generation-retiring", "owner", ctx.parent.session_key)
+    retired_assignment = assign(ctx, holder: retiring.session_key)
+
+    assert %{deleted_session_key: key} =
+             ctx.handlers["retire"].(%{
+               verb: "retire",
+               origin: "user:owner",
+               principal: {:user, "owner"},
+               session_key: retiring.session_key,
+               params: %{}
+             })
+
+    assert key == retiring.session_key
+
+    expected = Enum.sort([[direct_assignment.id, nil], [retired_assignment.id, nil]])
+
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId,reopeningId FROM assignment_revocation_generations ORDER BY assignmentId"
+             )
+
+    assert rows == expected
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocation_generations WHERE reopeningId IS NOT NULL"
+             )
+
+    guarded_assignment = assign(ctx)
 
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "INSERT INTO assignment_revocations (id,assignmentId,revokedAt,revokedByUser,reason) VALUES ('rev-generation-1',?1,1,'owner','one'),('rev-generation-2',?1,2,'owner','two')",
-               [assignment.id]
+               "INSERT INTO assignment_revocations (id,assignmentId,revokedAt,revokedByUser,reason) VALUES ('unsupported-reopen-revocation',?1,1,'owner','unsupported reopen')",
+               [guarded_assignment.id]
              )
 
-    assert {:ok, _} =
+    assert {:error, %DB.Error{message: message}} =
              DB.query(
                ctx.db,
-               "INSERT INTO assignment_revocation_generations (revocationId,assignmentId,reopeningId) VALUES ('rev-generation-1',?1,'reopen-1'),('rev-generation-2',?1,'reopen-2')",
-               [assignment.id]
+               "INSERT INTO assignment_revocation_generations (revocationId,assignmentId,reopeningId) VALUES ('unsupported-reopen-revocation',?1,'unsupported-reopening')",
+               [guarded_assignment.id]
              )
 
-    assert {:ok, [[2]]} =
-             DB.query(
-               ctx.db,
-               "SELECT count(*) FROM assignment_revocation_generations WHERE assignmentId=?1 AND reopeningId IS NOT NULL",
-               [assignment.id]
-             )
+    assert message =~ "CHECK constraint"
+
+    assignments = Path.expand("../lib/tightbeam/assignments.ex", __DIR__)
+
+    generation_insert_sites =
+      for {ref, body} <- definitions(assignments),
+          sql <- literals(body),
+          Regex.match?(~r/INSERT\s+INTO\s+assignment_revocation_generations/i, sql),
+          do: {ref, String.replace(sql, ~r/\s+/, " ")}
+
+    assert generation_insert_sites |> Enum.map(&elem(&1, 0)) |> Enum.sort() == [
+             "interrupt_for_retire_in_txn/4",
+             "revoke_in_txn/2"
+           ]
+
+    assert Enum.all?(generation_insert_sites, fn {_ref, sql} ->
+             sql =~ "(revocationId, assignmentId, reopeningId)" and
+               sql =~ "VALUES (?1, ?2, NULL)"
+           end)
   end
 
   test "new assignment supersedes the request atomically", ctx do
