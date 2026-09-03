@@ -73,6 +73,7 @@ defmodule Tightbeam.GatewayTest do
     Roles,
     Rules,
     SessionLane,
+    Supervision,
     Wakes,
     WorkItems
   }
@@ -2318,6 +2319,171 @@ defmodule Tightbeam.GatewayTest do
     assert first.wake_id == second.wake_id
     assert first == second
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
+  test "a linked child records and replays one exact parent wake receipt before completion",
+       ctx do
+    create_session(ctx.db, "child-session", "flynn")
+    Roles.create!(ctx.db, "child-holder", "flynn", "child-session")
+    handlers = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))
+
+    common = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      target_role: nil,
+      target_kind: "session",
+      role_fallback: false
+    }
+
+    parent =
+      handlers["assign"].(
+        Map.merge(common, %{
+          verb: "assign",
+          session_key: "k1",
+          params: %{subject: "parent"}
+        })
+      )
+
+    child =
+      handlers["assign"].(
+        Map.merge(common, %{
+          verb: "assign",
+          session_key: "child-session",
+          params: %{subject: "child", reviews_assignment_id: parent.id}
+        })
+      )
+
+    {:ok, [[turn_seq]]} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO turns
+          (sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,startedAt)
+        VALUES ('child-session','m_terminal_child','agent:child-holder','work',?1,'running',1,1)
+        RETURNING seq
+        """,
+        [child.id]
+      )
+
+    key =
+      Assignments.terminal_child_wake_id(
+        child.id,
+        parent.id,
+        "cooperative-receipt",
+        child.id
+      )
+
+    wake_call = %{
+      verb: "wake",
+      origin: "agent:child-holder",
+      principal: {:session, "child-session"},
+      session_key: "k1",
+      target_role: nil,
+      target_kind: "session",
+      params: %{prompt: "parent, review the result", idempotency_key: key, nudge: false}
+    }
+
+    first = handlers["wake"].(wake_call)
+    second = handlers["wake"].(wake_call)
+
+    assert first == second
+    assert first.receipt.receipt_child_turn_seq == turn_seq
+    assert first.receipt.receipt_accepted_generation == 1
+    receipt = first.receipt
+
+    assert {:ok, ^receipt} =
+             DB.transaction(ctx.db, fn txn ->
+               Supervision.accept_parent_wake_receipt_in_txn(
+                 txn,
+                 %{
+                   child_id: child.id,
+                   child_holder: "child-session",
+                   turn_seq: turn_seq,
+                   wake_id: first.wake_id
+                 },
+                 3
+               )
+             end)
+
+    assert {:error, %Supervision.ReceiptError{code: "parent_wake_receipt_conflict"}} =
+             DB.transaction(ctx.db, fn txn ->
+               Supervision.accept_parent_wake_receipt_in_txn(
+                 txn,
+                 %{
+                   child_id: child.id,
+                   child_holder: "child-session",
+                   turn_seq: turn_seq + 1,
+                   wake_id: first.wake_id
+                 },
+                 3
+               )
+             end)
+
+    assert %{code: "parent_wake_retry_conflict"} =
+             handlers["wake"].(put_in(wake_call, [:params, :prompt], "changed prompt"))
+
+    completion = %{
+      verb: "attest",
+      origin: "agent:child-holder",
+      principal: {:session, "child-session"},
+      session_key: nil,
+      params: %{assignment_id: child.id, kind: "completion"}
+    }
+
+    assert %{code: "parent_wake_delivery_missing"} = handlers["attest"].(completion)
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [child.id])
+
+    assert {:ok, [[1, 1, 2]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT COUNT(*) FROM wakes WHERE wakeId=?1),
+                 (SELECT COUNT(*) FROM supervision_liveness_sidecar WHERE wakeId=?1),
+                 (SELECT generation FROM supervision_entitlements WHERE assignmentId=?2)
+               """,
+               [first.wake_id, child.id]
+             )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO turns
+          (sessionKey,messageId,wakeId,origin,prompt,status,createdAt)
+        VALUES ('k1','m_parent_delivery',?1,'agent:child-session','parent, review the result','delivered',2)
+        """,
+        [first.wake_id]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE wakes SET state='fired',firedAt=2,firedBy='internal' WHERE wakeId=?1",
+        [first.wake_id]
+      )
+
+    progress = %{
+      verb: "attest",
+      origin: "agent:child-holder",
+      principal: {:session, "child-session"},
+      session_key: nil,
+      params: %{assignment_id: child.id, kind: "progress", note: "result is ready"}
+    }
+
+    assert %{attest: %{kind: "progress"}} = handlers["attest"].(progress)
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             handlers["attest"].(completion)
+
+    assert {:ok, [[^turn_seq, 1, "child_exact_parent_wake_invoked", "child-session"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT receiptChildTurnSeq,receiptAcceptedGeneration,receiptCause,receiptPrincipal FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [first.wake_id]
+             )
   end
 
   test "process inspect returns exactly its own pending wakes", ctx do
