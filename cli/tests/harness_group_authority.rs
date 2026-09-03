@@ -123,12 +123,14 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
     );
 }
 
-/// The guard closes the leak class even when the leader is already GONE by the time we look. The
-/// leader here exits immediately, so `adopt` reports `Gone` — nothing to reap. The guard, armed the
-/// instant the wrapper is spawned, must still kill and wait the wrapper and remove the scratch
-/// directory, and must NEVER signal an instance it could not capture.
+/// `adopt` must classify a gone leader DETERMINISTICALLY from `pidfd_open`'s own errno, with no numeric
+/// check and no reuse window. Rather than race a real leader's exit, this adopts an UNALLOCATABLE pid
+/// (strictly above `/proc/sys/kernel/pid_max`), which the kernel can never allocate, so `pidfd_open`
+/// always fails with `ESRCH` → `Gone`. Meanwhile an `OwnedSession` already owns a real wrapper and
+/// scratch dir (from a single-process leader that self-exits): the guard must still kill and wait the
+/// wrapper and remove the scratch, and must NEVER signal an instance it could not capture.
 #[test]
-fn gone_leader_leaves_nothing_without_unowned_signal() {
+fn adopt_classifies_an_unallocatable_pid_as_gone_without_signalling() {
     let dir = std::env::temp_dir().join(format!(
         "tightbeam-harness-group-gone-{}",
         std::process::id()
@@ -139,37 +141,36 @@ fn gone_leader_leaves_nothing_without_unowned_signal() {
     let binary = env!("CARGO_BIN_EXE_tightbeam");
     let identity_path = dir.join("leader.identity");
 
-    // A single-process leader that exits immediately.
+    // A real wrapper + scratch dir owned from spawn. The leader self-exits (`/bin/true`), so leaving it
+    // unadopted below cannot leak it.
     let harness = spawn_leader(binary, &identity_path, &["/bin/true"]);
-
     let mut session = OwnedSession::arm(harness, &dir);
     let wrapper_pid = session.harness.id() as libc::pid_t;
 
-    // Make the leader's exit OBSERVABLE before adoption. harness-exec writes the identity just before
-    // `exec`ing the immediate-exit program, so the recorded pid can still be alive when the identity
-    // first becomes readable. Waiting until that exact pid is gone turns this into a deterministic
-    // `Gone` case instead of a race against a leader that may briefly outlive its identity write.
-    let identity = await_identity(&identity_path);
-    assert!(
-        wait_gone(identity.pid),
-        "the immediate-exit leader must become observably gone before adoption"
-    );
+    // Adopt an identity whose pid can never exist. `pidfd_open` fails with `ESRCH` atomically, so this
+    // is a deterministic `Gone` with no live process and no check-to-open reuse race.
+    let gone = unallocatable_pid();
+    let identity = Identity {
+        path: identity_path.to_string_lossy().into_owned(),
+        pid: gone,
+        pgid: gone,
+        boot: String::new(),
+    };
     assert_eq!(
         session.adopt(&identity),
         AdoptOutcome::Gone,
-        "a leader that has already exited must adopt as Gone"
+        "an unallocatable pid must classify as Gone from pidfd_open's ESRCH"
     );
-
     assert!(
         session.leader.is_none(),
-        "a leader without a live instance handle must never be adopted"
+        "a Gone leader must never be armed for signalling"
     );
 
     drop(session);
 
     assert!(
         !dir.exists(),
-        "scratch directory must be removed on acquisition failure"
+        "scratch directory must be removed even when no leader was adopted"
     );
     assert!(
         wait_gone(wrapper_pid),
@@ -393,16 +394,30 @@ fn wait_gone(pid: libc::pid_t) -> bool {
 }
 
 /// Open a pidfd for a pid: a handle bound to that exact process INSTANCE at open time. Unlike a bare
-/// pid it cannot be silently rebound by reuse, and unlike a `/proc` read it needs no procfs. `None` if
-/// the pid is already gone (or pidfd is unsupported).
-fn pidfd_open(pid: libc::pid_t) -> Option<OwnedFd> {
+/// pid it cannot be silently rebound by reuse, and unlike a `/proc` read it needs no procfs. This is a
+/// SINGLE syscall that atomically both checks liveness and binds the instance, so it carries its own
+/// authority — `Err(ESRCH)` iff the pid has no process, without any separate check-then-open window a
+/// reused pid could slip through. The errno is preserved so callers can classify it.
+fn pidfd_open(pid: libc::pid_t) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
     if fd < 0 {
-        None
+        Err(io::Error::last_os_error())
     } else {
         // Safety: `pidfd_open` returned a fresh, owned file descriptor.
-        Some(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
+}
+
+/// A Linux pid strictly greater than `/proc/sys/kernel/pid_max`: the kernel can never allocate it, so
+/// `pidfd_open` on it deterministically fails with `ESRCH`. Used to exercise the `Gone` classification
+/// without a live process or any reuse race.
+fn unallocatable_pid() -> libc::pid_t {
+    let pid_max: i64 = std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(4_194_304);
+    // Stay within pid_t while remaining above pid_max.
+    libc::pid_t::try_from(pid_max + 1).unwrap_or(libc::pid_t::MAX)
 }
 
 /// SIGKILL the exact instance the pidfd was opened for. Reuse-proof: the pidfd is instance-bound, so a
@@ -475,23 +490,25 @@ impl OwnedSession {
         }
     }
 
-    /// Adopt the detached leader once its identity is known and it is live, capturing a `pidfd` for its
-    /// exact instance. `Gone` means the leader already exited. If `pidfd_open` fails for a leader that
-    /// is NOT gone, exact-instance authority is unavailable and we refuse loudly rather than fall back
-    /// to unsafe numeric signalling.
+    /// Adopt the detached leader from a single `pidfd_open`, which atomically both checks liveness and
+    /// binds the exact instance. The classification is the syscall's own errno — no separate numeric
+    /// check that a reused pid could slip through between: a returned pidfd is authority to reap this
+    /// instance (`Adopted`); `ESRCH` means the pid has no process, so there is nothing to reap (`Gone`);
+    /// any other errno means exact-instance authority is unavailable, and we refuse loudly rather than
+    /// fall back to numeric signalling.
     fn adopt(&mut self, identity: &Identity) -> AdoptOutcome {
         match pidfd_open(identity.pid) {
-            Some(pidfd) => {
+            Ok(pidfd) => {
                 self.leader = Some(LeaderToken {
                     pid: identity.pid,
                     pidfd,
                 });
                 AdoptOutcome::Adopted
             }
-            None if is_gone(identity.pid) => AdoptOutcome::Gone,
-            None => panic!(
-                "pidfd_open failed for live leader {}: no exact-instance authority — refusing to fall \
-                 back to numeric signalling",
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => AdoptOutcome::Gone,
+            Err(error) => panic!(
+                "pidfd_open failed for leader {} with {error}: no exact-instance authority — refusing \
+                 to fall back to numeric signalling",
                 identity.pid
             ),
         }
