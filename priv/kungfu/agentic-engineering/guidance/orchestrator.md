@@ -20,7 +20,26 @@ retirement — never a license to invent scope to stay busy.
 Read the rows before you build: the work item, the spec at its canonical path (the
 work item's spec-ref sha256 names the exact ruling text), and any prior assignments'
 attests. Judge the fit first — does this work serve the product, at this scope?
-Reshape or stop what does not fit. A spec arrives with its holes MARKED: open
+Reshape or stop what does not fit.
+
+Then rule the POSTURE, and file it before anything else is staffed. HEAVY: a new
+feature, an architectural modification, or new infrastructure; the full cycle in
+`feature-cycle` (spirit round, spec-writer, spec review, implementation, code review,
+verification papertrail). LIGHT: none of those; an already-adjudicated fix or
+modification, a straightforward bug fix, or an augmentation that stays within the
+existing architecture. Light staffs no spec-writer: the work item's input IS the
+spec, one coder builds an MVP of it, and one review runs at the light bar (pass unless
+something is egregiously wrong). Heavy is the answer when in doubt; light is a
+positive call with stated grounds. File the ruling as a verdict on a card that sits on
+the work item the coder card will use, normally your own slice card, the one you
+hold open for the life of the slice (a posture card you complete early on a bug item
+reads as a completed prior fix to the re-fix rail):
+`tightbeam attest <yourSliceAssignmentId> --kind verdict --verdict posture-light --note "<grounds>"`
+(or `posture-heavy`). The substrate refuses to open a coder card on a work item with
+no posture verdict; the rail checks that you ruled, not that you ruled well. When a
+coder or reviewer later finds a light slice is architectural after all, they file
+`changes-requested` naming why; you re-rule with a new posture verdict (latest wins)
+and staff the spec-writer. A spec arrives with its holes MARKED: open
 questions the product owner ruled non-blocking. Build around a marked hole. An
 UNMARKED hole on a load-bearing concept is a spec defect — send it to the spec-writer;
 do not fill it with your own guess.
@@ -80,9 +99,11 @@ not to track harder.
 ## Every sweep: advance or kill
 Each time you wake to your board, every active goal gets fed or shot — advanced toward
 done, or ended. A goal that has sat since your last sweep with no new fact and no
-answer to a wake is a stall. First read its liveness receipts. A valid receipt ends
-the stall response even when a later alarm claims it is missing; do not rebut the alarm
-with an attest or wake and do not re-staff the work. Otherwise run the unblocking skill.
+answer to a wake is a stall; run the unblocking skill on it. Judge liveness from the
+deliverable, never from the existence of a receipt: ask what changed on the thing being
+built since your last look. A receipt naming what moved answers that. A receipt that
+only reports effort does not, however recent it is, and a stream of them is the
+activity-theater class the unblocking skill names first.
 Read each dispatch's
 FIRST progress attest critically: a wrong direction costs little at the first commit
 and everything at the last. Nothing is allowed to linger half-alive: an item you will
@@ -115,6 +136,23 @@ the same proven outcome is fine; a different outcome is not. A holder's "done" i
 claim — the substrate itself scores a completion as `claims-done` until a verifying
 verdict lands — so verify from rows, never from a worker's self-report.
 
+You do not re-review the review. A reviewer adjudicates MVP fitness against the ask,
+and that disposition is carried in its own guidance; auditing every
+`changes-requested` yourself would put a second judgment on every round and slow the
+flow you exist to protect.
+
+What does reach you is a CONTEST. A producer may dispute one blocking finding on one
+ground: the ask ships without it. You adjudicate that, because the reviewer cannot
+rule on its own finding and the producer cannot overrule it. Read the ask, the
+finding, and the review document. If the producer is right, record it on their card,
+where any session may file a verdict:
+`tightbeam attest <producerAssignmentId> --kind verdict --verdict review-overreach --note "<the finding; the review card id; why the ask ships without it>"`
+(the substrate refuses a verdict on a review card from anyone but its holder, and a
+review card's verdicts are its reviewer's alone). Then wake the reviewer to re-file
+its own verdict with that finding moved to post-MVP. If the reviewer is right, say so
+and send the producer back to the work. Either way it is one ruling on one contested
+finding, not a sweep.
+
 Classify the EFFECT before you commission review; never infer it from the holder's
 role. Exactly one linked independent `reviewed-clean` is required when a card changes
 code or source behavior; authoritative specs, policy, Kung Fu, or rails; a release
@@ -142,8 +180,12 @@ repository's prose defines verification, records the results as a report artifac
 and files the `verified` verdict — green tests and a clean review are not that proof,
 and the substrate blocks a completion that lacks the papertrail.
 
-Keep that one linked review card open across every `changes-requested` revision. The
-same holder reviews each new candidate on it and completes it only after `reviewed-clean`.
+When a producer revises after `changes-requested`, YOU judge whether the revision
+warrants a fresh review, and you commission it deliberately. Real code changes usually
+do, and a cold reviewer is fine or better: a reviewer carrying its own prior findings
+has a stake in them and drifts toward coaching the fix it proposed. A moved base, a
+rebuild onto a green main, and a missing hash in a report are not new code and get no
+new review.
 
 ## Closing the loop: the completion rail
 `completion-requires-review` backstops the evidence shape; it never chooses a model.

@@ -53,6 +53,8 @@ Working the org:
   `reviewer` for adversarial spec or code review, and a `recon` for uncertain facts
   or repeat-failure diagnosis. Use the activity row in `preferred-models.md` to pick
   each session's model. Do not directly staff implementation around the orchestrator.
+  The orchestrator also rules each slice's POSTURE, heavy or light, and files it as a
+  verdict on the work item; you read it from the rows, you do not pre-declare it.
 - When you receive a work item to advance, inspect the visible idle work items for a
   small set that serves the same outcome or touches the same product/system seam.
   Suggest only materially related items, and explicitly file the suggestion for the

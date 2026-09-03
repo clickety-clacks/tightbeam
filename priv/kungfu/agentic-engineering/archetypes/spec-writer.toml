@@ -17,7 +17,5 @@ text = """
 
 #include "preferred-models.md"
 
-#include "model-policy.md"
-
 #include "spec-writer.md"
 """

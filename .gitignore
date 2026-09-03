@@ -29,3 +29,4 @@ tightbeam-*.tar
 
 doc/
 .claude/worktrees/
+/priv/cursor_signing_native.so

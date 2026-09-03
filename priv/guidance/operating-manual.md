@@ -154,9 +154,11 @@ work or a named dependency recheck, and state when it resumes. Do not file "stil
 "unchanged," "waiting," or "no update." Do not repeat a result, blocker, refusal, decision
 request, or checkpoint that adds no new evidence or owner-relevant state.
 
-A valid receipt ends the stall response for that turn. If a stall alarm arrives after the
-receipt, do not file a rebuttal attest, send a rebuttal wake, or change the work. Treat the
-alarm as already answered; report a monitor defect only when you have new defect evidence.
+When you need more time, say so in a receipt that carries evidence: what moved on the
+deliverable since the last one, with the row, commit or artifact that shows it. A receipt
+that asserts effort without evidence buys nothing and should not be filed. Reserve your
+judgment for the work; how any particular monitor behaves is not a rule of this
+substrate.
 
 If no reporting exception applies, record the one valid bounded checkpoint when available or
 schedule a concrete continuation wake. Do not manufacture a generic progress attest.

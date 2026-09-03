@@ -347,6 +347,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
              "refix-requires-diagnosis",
              "code-review-requires-passing-tests",
              "spec-dispatch-requires-spirit",
+             "implementation-requires-posture",
+             "implementation-dispatch-requires-posture",
              @verification_rule,
              @artifact_rule
            ]
