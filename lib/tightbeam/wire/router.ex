@@ -49,13 +49,35 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
-  alias Tightbeam.{Assets, CliCompatibility, Devices, Dispatch, Org, Roles, WorkState}
+  alias Tightbeam.{
+    Assets,
+    CliCompatibility,
+    CursorSigning,
+    D1Read,
+    Devices,
+    Dispatch,
+    Org,
+    Roles,
+    WorkState
+  }
+
   alias Tightbeam.Wire.{Payloads, Socket}
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
   @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend toplines topline harness-processes)
   @max_upload_bytes 32 * 1024 * 1024
+  @d1_default_limit 50
+  @d1_max_limit 500
+  @d1_cursor_version 1
+  @d1_resources %{
+    config: D1Read.spec(:config),
+    host_environment: D1Read.spec(:host_environment),
+    hosts: D1Read.spec(:hosts),
+    users: D1Read.spec(:users),
+    identity: D1Read.spec(:identity),
+    kungfu: D1Read.spec(:kungfu)
+  }
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
                     pass: ["*/*"]
@@ -194,6 +216,52 @@ defmodule Tightbeam.Wire.Router do
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
+  end
+
+  # D1 is a read-only public contract. One maintenance seam owns all six
+  # current-line projections; no route may select or serialize a raw row.
+  get "/api/config" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :config))
+  end
+
+  get "/api/config/:key" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :config), key)
+  end
+
+  get "/api/host-env" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :host_environment))
+  end
+
+  get "/api/hosts" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :hosts))
+  end
+
+  get "/api/hosts/:host" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :hosts), host)
+  end
+
+  get "/api/users" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :users))
+  end
+
+  get "/api/users/:user_id" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :users), user_id)
+  end
+
+  get "/api/identity" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :identity))
+  end
+
+  get "/api/identity/:name" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :identity), name)
+  end
+
+  get "/api/kungfu" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :kungfu))
+  end
+
+  get "/api/kungfu/:name" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :kungfu), name)
   end
 
   post "/api/streams" do
@@ -395,6 +463,365 @@ defmodule Tightbeam.Wire.Router do
   match _ do
     error(conn, 404, "not_found")
   end
+
+  defp d1_collection(conn, spec) do
+    with {:ok, auth} <- d1_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- d1_principal(auth, query, conn),
+         {:ok, request} <- d1_collection_request(query, spec),
+         :ok <- d1_admit_cursor_signing(conn),
+         {:ok, boundary} <- d1_boundary(request, principal, spec, conn) do
+      rows =
+        if D1Read.visible?(d1_resource(spec), principal.is_admin) do
+          D1Read.collection(db(conn), deps(conn).base_dir, d1_resource(spec), request.filters)
+        else
+          []
+        end
+
+      {items, page} = d1_page(rows, boundary, request, principal, spec, conn)
+      d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+    else
+      {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      d1_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d1_detail(conn, spec, id) do
+    with {:ok, auth} <- d1_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- d1_principal(auth, query, conn),
+         :ok <- d1_detail_request(query),
+         :ok <- d1_admit_cursor_signing(conn),
+         true <- D1Read.visible?(d1_resource(spec), principal.is_admin),
+         item when not is_nil(item) <-
+           D1Read.detail(db(conn), deps(conn).base_dir, d1_resource(spec), id) do
+      d1_send(conn, 200, d1_detail_envelope(spec, item))
+    else
+      false -> d1_error(conn, spec.resource, 404, "not_found", nil)
+      nil -> d1_error(conn, spec.resource, 404, "not_found", nil)
+      {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      d1_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d1_bearer_auth(conn) do
+    case Plug.Conn.get_req_header(conn, "authorization") do
+      ["Bearer " <> token] when token != "" ->
+        cond do
+          token == deps(conn).cli_token -> {:ok, :org}
+          session = Org.by_cli_token(db(conn), token) -> {:ok, {:session, session}}
+          device = Devices.by_token(db(conn), token) -> {:ok, {:device, device}}
+          true -> {:error, 401, "auth_failed", nil}
+        end
+
+      _ ->
+        {:error, 401, "auth_failed", nil}
+    end
+  end
+
+  defp d1_principal(:org, %{"asUser" => [user_id]}, conn) when user_id != "" do
+    {:ok, d1_user_principal(user_id, conn)}
+  end
+
+  defp d1_principal(:org, %{"asUser" => [_]}, _conn), do: {:error, 400, "invalid_message", nil}
+  defp d1_principal(:org, %{}, _conn), do: {:error, 400, "invalid_message", nil}
+  defp d1_principal(:org, _query, _conn), do: {:error, 400, "invalid_as_user", nil}
+
+  defp d1_principal({:session, session}, query, _conn) when map_size(query) == 0,
+    do: {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
+
+  defp d1_principal({:session, session}, %{"asUser" => [user_id]}, conn)
+       when user_id == session.owner_user_id and user_id != "" do
+    {:ok, d1_user_principal(user_id, conn)}
+  end
+
+  defp d1_principal({:session, session}, %{"asUser" => [_]}, _conn),
+    do: {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
+
+  defp d1_principal({:session, _session}, _query, _conn),
+    do: {:error, 400, "invalid_as_user", nil}
+
+  defp d1_principal({:device, device}, query, _conn) do
+    if Map.has_key?(query, "asUser") do
+      {:error, 400, "invalid_as_user", nil}
+    else
+      {:ok, %{kind: "user", id: device.user_id, is_admin: device.is_admin}}
+    end
+  end
+
+  defp d1_user_principal(user_id, conn) do
+    is_admin = match?(%{is_admin: true}, Devices.user(db(conn), user_id))
+    %{kind: "user", id: user_id, is_admin: is_admin}
+  end
+
+  defp d1_query(""), do: {:ok, %{}}
+
+  defp d1_query(query_string) do
+    Enum.reduce_while(String.split(query_string, "&", trim: false), {:ok, %{}}, fn part,
+                                                                                   {:ok, query} ->
+      with [key, value] <- String.split(part, "=", parts: 2),
+           false <- Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, key <> value),
+           key <- URI.decode_www_form(key),
+           value <- URI.decode_www_form(value),
+           true <- String.valid?(key) and String.valid?(value) do
+        {:cont, {:ok, Map.update(query, key, [value], &[value | &1])}}
+      else
+        _ -> {:halt, {:error, 400, "malformed_query", nil}}
+      end
+    end)
+  rescue
+    ArgumentError -> {:error, 400, "malformed_query", nil}
+  end
+
+  defp d1_detail_request(query) do
+    if Enum.all?(Map.keys(query), &(&1 == "asUser")),
+      do: :ok,
+      else: {:error, 400, "invalid_filter", nil}
+  end
+
+  defp d1_collection_request(query, spec) do
+    allowed = spec.filters ++ ~w(asUser before after limit)
+
+    with true <- Enum.all?(Map.keys(query), &(&1 in allowed)),
+         {:ok, before} <- d1_single(query, "before"),
+         {:ok, after_cursor} <- d1_single(query, "after"),
+         true <- is_nil(before) or is_nil(after_cursor),
+         {:ok, limit_value} <- d1_single(query, "limit"),
+         {:ok, limit} <- d1_limit(limit_value),
+         {:ok, filters} <- d1_filters(query, spec.filters) do
+      {:ok, %{before: before, after: after_cursor, limit: limit, filters: filters}}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp d1_single(query, key) do
+    case Map.get(query, key, []) do
+      [] -> {:ok, nil}
+      [value] -> {:ok, value}
+      _ -> :error
+    end
+  end
+
+  defp d1_limit(nil), do: {:ok, @d1_default_limit}
+
+  defp d1_limit(value) when is_binary(value) do
+    if value =~ ~r/^[1-9][0-9]*$/ do
+      {:ok, min(String.to_integer(value), @d1_max_limit)}
+    else
+      :error
+    end
+  end
+
+  defp d1_limit(_value), do: :error
+
+  defp d1_filters(query, fields) do
+    fields
+    |> Enum.reduce_while({:ok, %{}}, fn field, {:ok, filters} ->
+      values = Map.get(query, field, [])
+
+      if Enum.all?(values, &d1_filter_value?(field, &1)) do
+        next =
+          if values == [],
+            do: filters,
+            else: Map.put(filters, field, values |> Enum.uniq() |> Enum.sort())
+
+        {:cont, {:ok, next}}
+      else
+        {:halt, :error}
+      end
+    end)
+  end
+
+  defp d1_filter_value?("state", value), do: value in ~w(ready relearn_conflicted)
+  defp d1_filter_value?("status", value), do: value in ~w(available installed)
+  defp d1_filter_value?(_field, value), do: is_binary(value) and value != ""
+
+  defp d1_admit_cursor_signing(conn) do
+    case CursorSigning.admit_request(deps(conn).cursor_signing) do
+      :ok -> :ok
+      _ -> {:error, 503, "cursor_signing_unavailable", nil}
+    end
+  end
+
+  defp d1_boundary(%{before: nil, after: nil}, _principal, _spec, _conn), do: {:ok, :latest}
+
+  defp d1_boundary(%{before: cursor} = request, principal, spec, conn) when is_binary(cursor),
+    do: d1_decode_cursor(cursor, "before", request, principal, spec, conn)
+
+  defp d1_boundary(%{after: cursor} = request, principal, spec, conn) when is_binary(cursor),
+    do: d1_decode_cursor(cursor, "after", request, principal, spec, conn)
+
+  defp d1_decode_cursor(cursor, direction, request, principal, spec, conn) do
+    with [payload_part, signature_part] <- String.split(cursor, ".", parts: 2),
+         {:ok, payload_bytes} <- Base.url_decode64(payload_part, padding: false),
+         {:ok, signature} <- Base.url_decode64(signature_part, padding: false),
+         {:ok, true} <- CursorSigning.verify(deps(conn).cursor_signing, payload_bytes, signature),
+         {:ok, payload} when is_map(payload) <- JSON.decode(payload_bytes),
+         true <- payload["version"] == @d1_cursor_version,
+         true <- payload["route"] == spec.route and payload["resource"] == spec.resource,
+         true <-
+           payload["direction"] == direction and
+             payload["filters"] == d1_filter_fingerprint(request.filters),
+         true <-
+           payload["principalKind"] == principal.kind and payload["principalId"] == principal.id,
+         true <- d1_tuple?(payload["tuple"], d1_resource(spec)) do
+      {:ok, {String.to_atom(direction), payload["tuple"]}}
+    else
+      {:ok, false} -> {:error, 400, "invalid_cursor", nil}
+      _ -> {:error, 400, "invalid_cursor", nil}
+    end
+  end
+
+  defp d1_tuple?(tuple, :users),
+    do:
+      is_list(tuple) and length(tuple) == 2 and is_integer(hd(tuple)) and
+        is_binary(List.last(tuple))
+
+  defp d1_tuple?(tuple, resource),
+    do:
+      is_list(tuple) and length(tuple) == length(D1Read.spec(resource).order) and
+        Enum.all?(tuple, &(is_binary(&1) and &1 != ""))
+
+  defp d1_page(rows, boundary, request, principal, spec, conn) do
+    selected =
+      case boundary do
+        :latest ->
+          Enum.take(rows, -request.limit)
+
+        {:before, tuple} ->
+          rows
+          |> Enum.filter(&(D1Read.tuple(d1_resource(spec), &1) < tuple))
+          |> Enum.take(-request.limit)
+
+        {:after, tuple} ->
+          rows
+          |> Enum.filter(&(D1Read.tuple(d1_resource(spec), &1) > tuple))
+          |> Enum.take(request.limit)
+      end
+
+    tuples = Enum.map(selected, &D1Read.tuple(d1_resource(spec), &1))
+
+    page =
+      case tuples do
+        [] ->
+          d1_empty_page(rows, boundary, spec)
+
+        _ ->
+          oldest = hd(tuples)
+          newest = List.last(tuples)
+
+          %{
+            oldest: d1_cursor(oldest, "before", request.filters, principal, spec, conn),
+            newest: d1_cursor(newest, "after", request.filters, principal, spec, conn),
+            before: Enum.any?(rows, &(D1Read.tuple(d1_resource(spec), &1) < oldest)),
+            after: Enum.any?(rows, &(D1Read.tuple(d1_resource(spec), &1) > newest))
+          }
+      end
+
+    {selected, page}
+  end
+
+  defp d1_empty_page(rows, boundary, spec) do
+    {before_more, after_more} =
+      case boundary do
+        :latest ->
+          {false, false}
+
+        {:before, tuple} ->
+          {false, Enum.any?(rows, &(D1Read.tuple(d1_resource(spec), &1) >= tuple))}
+
+        {:after, tuple} ->
+          {Enum.any?(rows, &(D1Read.tuple(d1_resource(spec), &1) <= tuple)), false}
+      end
+
+    %{oldest: nil, newest: nil, before: before_more, after: after_more}
+  end
+
+  defp d1_cursor(tuple, direction, filters, principal, spec, conn) do
+    payload =
+      JSON.encode!(%{
+        "version" => @d1_cursor_version,
+        "route" => spec.route,
+        "resource" => spec.resource,
+        "direction" => direction,
+        "filters" => d1_filter_fingerprint(filters),
+        "principalKind" => principal.kind,
+        "principalId" => principal.id,
+        "tuple" => tuple
+      })
+
+    {:ok, signature} = CursorSigning.sign(deps(conn).cursor_signing, payload)
+
+    Base.url_encode64(payload, padding: false) <>
+      "." <> Base.url_encode64(signature, padding: false)
+  end
+
+  defp d1_filter_fingerprint(filters),
+    do:
+      filters
+      |> Enum.sort()
+      |> JSON.encode!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+  defp d1_resource(spec),
+    do:
+      Enum.find_value(@d1_resources, fn {resource, candidate} ->
+        if candidate == spec, do: resource
+      end)
+
+  defp d1_collection_envelope(spec, items, page) do
+    encoded_items = Enum.map_join(items, ",", &D1Read.encode(d1_resource(spec), &1))
+
+    "{\"schemaVersion\":1,\"resource\":" <>
+      JSON.encode!(spec.resource) <>
+      ",\"items\":[" <>
+      encoded_items <>
+      "],\"page\":{\"oldestCursor\":" <>
+      JSON.encode!(page.oldest) <>
+      ",\"newestCursor\":" <>
+      JSON.encode!(page.newest) <>
+      ",\"hasMoreBefore\":" <>
+      JSON.encode!(page.before) <> ",\"hasMoreAfter\":" <> JSON.encode!(page.after) <> "}}"
+  end
+
+  defp d1_detail_envelope(spec, item),
+    do:
+      "{\"schemaVersion\":1,\"resource\":" <>
+        JSON.encode!(spec.resource) <>
+        ",\"item\":" <> D1Read.encode(d1_resource(spec), item) <> "}"
+
+  defp d1_send(conn, status, body),
+    do:
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.put_resp_header("cache-control", "no-store")
+      |> Plug.Conn.send_resp(status, body)
+
+  defp d1_error(conn, resource, status, code, nil),
+    do:
+      d1_send(
+        conn,
+        status,
+        "{\"schemaVersion\":1,\"resource\":" <>
+          JSON.encode!(resource) <> ",\"error\":{\"code\":" <> JSON.encode!(code) <> "}}"
+      )
+
+  defp d1_error(conn, resource, status, code, message),
+    do:
+      d1_send(
+        conn,
+        status,
+        "{\"schemaVersion\":1,\"resource\":" <>
+          JSON.encode!(resource) <>
+          ",\"error\":{\"code\":" <>
+          JSON.encode!(code) <> ",\"message\":" <> JSON.encode!(message) <> "}}"
+      )
 
   defp deps(conn), do: conn.private.tightbeam_deps
   defp db(conn), do: deps(conn)[:db] || Tightbeam.DB

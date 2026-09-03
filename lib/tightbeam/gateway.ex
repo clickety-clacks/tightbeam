@@ -65,6 +65,7 @@ defmodule Tightbeam.Gateway do
     Artifacts,
     Assignments,
     ConditionFacts,
+    CursorSigning,
     CriticalLeases,
     Placement,
     DB,
@@ -133,7 +134,10 @@ defmodule Tightbeam.Gateway do
   @spec children(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children(config) do
     preflight!(config)
-    children_after_preflight(config)
+
+    config
+    |> Map.put_new_lazy(:cursor_signing, fn -> CursorSigning.load!(config.base_dir) end)
+    |> children_after_preflight()
   end
 
   @doc false
@@ -141,6 +145,11 @@ defmodule Tightbeam.Gateway do
   def children_after_preflight(config) do
     db = Map.get(config, :db, Tightbeam.DB)
     prod_limit = Map.get(config, :prod_limit, 3)
+
+    cursor_signing =
+      config
+      |> Map.get_lazy(:cursor_signing, fn -> CursorSigning.load!(config.base_dir) end)
+      |> CursorSigning.validate!()
 
     unless is_integer(prod_limit) and prod_limit >= 0 do
       raise ArgumentError, "prod_limit must be an integer >= 0"
@@ -220,6 +229,7 @@ defmodule Tightbeam.Gateway do
       Map.merge(socket_deps, %{
         base_dir: config.base_dir,
         cli_token: cli_token,
+        cursor_signing: cursor_signing,
         session_status: fn session_key -> session_status(session_key, db, config) end,
         adapter_coordinator: Tightbeam.AdapterCoordinator
       })
