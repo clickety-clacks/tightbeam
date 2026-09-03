@@ -73,7 +73,9 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
   test "shipped statute loads through satisfiability and first-attempt bugs proceed", ctx do
     assert Enum.map(ctx.rules, & &1.name) == [
+             "artifact-completion-requires-output",
              "completion-requires-review",
+             "verdict-completion-requires-holder-verdict",
              "refix-requires-diagnosis",
              "code-review-requires-passing-tests",
              "spec-dispatch-requires-spirit",

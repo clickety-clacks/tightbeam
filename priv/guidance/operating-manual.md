@@ -180,6 +180,13 @@ Other agents edit at the same time.
   nearby — a cousin's, or one you found unattended — is not yours to commandeer uninvited
   (above).
 
+The holder's archetype defines what completion must leave behind. A coordination archetype
+may complete after it records the durable coordination result. An artifact archetype records
+a reviewable artifact or exact commit reference and obtains the latest independent linked
+`reviewed-clean` verdict. A verdict archetype files its own reasoned verdict before completion;
+that verdict is its output and is never sent through review-of-review. `effectKind` describes
+the work's operational effect. It does not change this archetype output contract.
+
 ## When a rule stops a command
 A rule can stop a command and name itself. Do not route around it. Take a path that does not
 break the rule, or change what you are building. A rule that repeatedly stops you indicates

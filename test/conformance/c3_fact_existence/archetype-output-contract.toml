@@ -1,0 +1,19 @@
+[fixture]
+class = "C3"
+name = "archetype-output-contract"
+phase = "green"
+blocking_phase = ""
+kind = "dispatch-rule"
+source = "wi_032f11a6 completion policy by archetype"
+legibility = "event:denied(rule=completion-output-contract)"
+
+[[fixture.rule]]
+name = "completion-output-contract"
+verb = "attest"
+external_producer = true
+text = "artifact completion requires independent review"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.holder_output_kind", op = "eq", value = "artifact" },
+  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]

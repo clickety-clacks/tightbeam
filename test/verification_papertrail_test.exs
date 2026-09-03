@@ -134,7 +134,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   test "A1: each remedy wake names its own missing record, in sequence", ctx do
     learn_engineering_rules!(ctx)
     %{work: work} = reviewed_clean_assignment(ctx)
-    completion = attest_call(ctx.holder.session_key, work.id, "completion")
+    completion = provisional_completion_call(ctx.holder.session_key, work.id)
 
     # First denial: the verification verdict is missing.
     assert {:error, %{reason: "remedy_fired", rule: @verification_rule, producer: producer}} =
@@ -171,7 +171,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   test "A2: the complete papertrail passes and the episodes close", ctx do
     learn_engineering_rules!(ctx)
     %{item: item, work: work, review: review} = reviewed_clean_assignment(ctx)
-    completion = attest_call(ctx.holder.session_key, work.id, "completion")
+    completion = provisional_completion_call(ctx.holder.session_key, work.id)
 
     assert {:error, %{rule: @verification_rule}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
@@ -189,7 +189,11 @@ defmodule Tightbeam.VerificationPapertrailTest do
     record_report_artifact(ctx, item.id, ctx.holder.session_key)
 
     assert {:ok, %{assignment: %{state: "closed"}}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call(ctx.holder.session_key, work.id, "completion")
+             )
 
     assert {:ok, [["closed", "completed"]]} =
              DB.query(ctx.db, "SELECT state, outcome FROM assignments WHERE id = ?1", [work.id])
@@ -214,7 +218,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
   test "A3: back-to-back re-attempts rewake the live episode with no new episode", ctx do
     learn_engineering_rules!(ctx)
     %{work: work} = reviewed_clean_assignment(ctx)
-    completion = attest_call(ctx.holder.session_key, work.id, "completion")
+    completion = provisional_completion_call(ctx.holder.session_key, work.id)
 
     assert {:error, %{rule: @verification_rule}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
@@ -343,7 +347,9 @@ defmodule Tightbeam.VerificationPapertrailTest do
     loaded = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     assert Enum.map(loaded, & &1.name) == [
+             "artifact-completion-requires-output",
              "completion-requires-review",
+             "verdict-completion-requires-holder-verdict",
              "refix-requires-diagnosis",
              "code-review-requires-passing-tests",
              "spec-dispatch-requires-spirit",
@@ -390,6 +396,12 @@ defmodule Tightbeam.VerificationPapertrailTest do
       session_key: nil,
       params: params
     }
+  end
+
+  defp provisional_completion_call(session_key, assignment_id) do
+    session_key
+    |> attest_call(assignment_id, "completion")
+    |> put_in([:params, :commit_refs], ["fixture-reviewable-output"])
   end
 
   defp record_report_artifact(ctx, work_item_id, session_key) do

@@ -58,7 +58,8 @@ confidence in it are two different things, and collapsing them hides which one i
 only falsification is, so "the evidence cannot decide this yet" is often the truthful
 answer.
 
-Attest the verdict, wake the requester with it, file your completion (the verdict does
-not close your assignment; the completion does), and end. The lifecycle is in
+Attest the verdict, wake the requester with it, file your completion, and end. Your
+archetype's output is the verdict itself, so it never requires a review-of-review. The
+verdict does not close your assignment; the completion does. The lifecycle is in
 `recon-lifecycle`; the root-cause and regression-provenance method is in
 `recon-first-investigation`.

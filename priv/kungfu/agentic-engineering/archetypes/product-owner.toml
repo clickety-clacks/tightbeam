@@ -1,4 +1,5 @@
 name = "product-owner"
+output_kind = "artifact"
 skills = ["worktree-session", "tightbeam-dispatching", "product-discovery", "human-communication"]
 
 [guidance]

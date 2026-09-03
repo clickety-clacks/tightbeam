@@ -11,6 +11,9 @@ work it reviews (`--reviews <reviewedAssignmentId>`), so that when your verdict 
 a different provider than produced the work, the substrate can witness the independence
 as a fact, not a claim.
 
+Your reasoned verdict is the reviewer's completion output. File it on this review card,
+deliver it to the producer, and then complete the card. Do not commission review-of-review.
+
 1. Read the source-of-truth spec and the work-item yourself — the full history and
    attests (`tightbeam attests <assignmentId>`), not a summary the producer wrote. When
    the work item pins a spec-ref, the sha256 names the exact text the work owes

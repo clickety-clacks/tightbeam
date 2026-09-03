@@ -127,6 +127,9 @@ defmodule Tightbeam.Rules do
     "assignment.verdicts" => {:list, :string},
     "assignment.is_producing_card" => :bool,
     "assignment.effect_kind" => :string,
+    "assignment.holder_output_kind" => :string,
+    "assignment.has_reviewable_artifact" => :bool,
+    "assignment.holder_has_verdict" => :bool,
     "assignment.state" => :string,
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
     "assignment.independent_verdict_kinds" => {:list, :string},
@@ -1195,6 +1198,47 @@ defmodule Tightbeam.Rules do
     with_dependency("$assignment", db, call, cache, fn
       nil, cache -> {nil, cache}
       assignment, cache -> {assignment.effect_kind, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.holder_output_kind", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Tightbeam.Archetypes.output_kind(assignment.holder_archetype) |> Atom.to_string(), cache}
+    end)
+  end
+
+  defp compute_fact("assignment.has_reviewable_artifact", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        recorded =
+          Artifacts.recorded_kinds(db, assignment.work_item_id, assignment.holder_key) != []
+
+        commit_refs = Map.get(call.params, :commit_refs)
+        {recorded or (is_list(commit_refs) and commit_refs != []), cache}
+    end)
+  end
+
+  defp compute_fact("assignment.holder_has_verdict", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        case DB.query(
+               db,
+               "SELECT 1 FROM attests WHERE assignmentId=?1 AND kind='verdict' AND bySession=?2 LIMIT 1",
+               [assignment.id, assignment.holder_key]
+             ) do
+          {:ok, [[1]]} -> {true, cache}
+          {:ok, []} -> {false, cache}
+        end
     end)
   end
 

@@ -1244,6 +1244,7 @@ defmodule Tightbeam.RulesTest do
 
     Roles.create!(ctx.db, "reviewer", "flynn", reviewer.session_key)
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, producer.id, "wi_receipt_remedy")
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -1256,14 +1257,23 @@ defmodule Tightbeam.RulesTest do
 
     assert {:error,
             %{
-              reason: "remedy_blocked",
+              reason: "rule_denied",
               producer: nil,
-              rule: "code-review-requires-passing-tests",
+              rule: "artifact-completion-requires-output",
               ref: producer_id
             }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     assert producer_id == producer.id
     assert review_count(ctx.db, producer.id) == 0
+    record_artifact(ctx, "wi_receipt_remedy", holder.session_key, "report", "in-workspace")
+
+    assert {:error,
+            %{
+              reason: "remedy_blocked",
+              producer: nil,
+              rule: "code-review-requires-passing-tests",
+              ref: ^producer_id
+            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     verdict(
       ctx,
@@ -1334,7 +1344,7 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:deny, %{rule: "completion-requires-review"}} =
+    assert {:deny, %{rule: "artifact-completion-requires-output"}} =
              Rules.evaluate(ctx.db, coder_completion)
 
     assert orchestration.reviewsAssignmentId == nil
@@ -1371,6 +1381,61 @@ defmodule Tightbeam.RulesTest do
 
       assert reviewed == producer.id
     end
+  end
+
+  test "archetype output contracts close coordinators producers and reviewers without review of review",
+       ctx do
+    coordinator = session(ctx.db, "output-coordinator", "flynn", archetype: "orchestrator")
+    producer = session(ctx.db, "output-producer", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "output-reviewer", "reviewer", archetype: "reviewer")
+
+    coordination = assignment(ctx, coordinator.session_key, {:user, "flynn"})
+    produced = assignment(ctx, producer.session_key, {:user, "flynn"})
+    attach_work_item(ctx, produced.id, "wi_output_contract")
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: produced.id)
+
+    put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert coordination.outputKind == "coordination"
+    assert produced.outputKind == "artifact"
+    assert review.outputKind == "verdict"
+
+    assert {:ok, %{assignment: %{state: "closed"}}} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               p3_call("attest", {:session, coordinator.session_key}, %{
+                 assignment_id: coordination.id,
+                 kind: "completion"
+               })
+             )
+
+    review_completion =
+      p3_call("attest", {:session, reviewer.session_key}, %{
+        assignment_id: review.id,
+        kind: "completion"
+      })
+
+    assert {:error, %{rule: "verdict-completion-requires-holder-verdict"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, review_completion)
+
+    verdict(ctx, reviewer.session_key, review.id, "reviewed-clean", "reviewed exact output")
+    assert :ok = Rules.evaluate(ctx.db, review_completion)
+
+    producer_completion =
+      p3_call("attest", {:session, producer.session_key}, %{
+        assignment_id: produced.id,
+        kind: "completion"
+      })
+
+    assert {:deny, %{rule: "artifact-completion-requires-output"}} =
+             Rules.evaluate(ctx.db, producer_completion)
+
+    record_artifact(ctx, "wi_output_contract", producer.session_key, "report", "in-workspace")
+
+    assert {:ok, %{assignment: %{state: "closed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, producer_completion)
   end
 
   defp call(origin \\ "user:flynn") do

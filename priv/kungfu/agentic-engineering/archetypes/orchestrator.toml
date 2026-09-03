@@ -1,4 +1,5 @@
 name = "orchestrator"
+output_kind = "coordination"
 skills = ["worktree-session", "feature-cycle", "work-tracking", "unblocking", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
 
 [guidance]

@@ -159,9 +159,12 @@ When a lane pins an authorized target tip, hold that exact tip until the reviewe
 candidate lands. Unrelated target movement is a hold violation to report. Do not
 reconcile or rebuild on the moved target unless the owner explicitly changes the pin.
 
-The assignment's durable `effectKind` supplies the classification above. A linked
-review card is always `effectKind = review`, so its completion is exempt and cannot
-recursively require review. For unlinked evidence-only work, the holder files a
+The holder archetype supplies the completion output contract. Your coordination output
+does not fabricate an artifact or a review. Artifact-producing holders record reviewable
+evidence and obtain one independent linked clean verdict. Verdict-producing holders file
+their own reasoned verdict; that verdict is the terminal review output and cannot trigger
+review-of-review. `effectKind` remains an orthogonal operational classification. For
+unlinked evidence-only work, the holder files a
 `progress` attest recording
 delivered-not-withdrawn, then its opener revokes the card. Never surrender delivered
 work as abandoned, and never revoke without the delivered row — both make the record

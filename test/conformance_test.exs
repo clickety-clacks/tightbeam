@@ -3447,12 +3447,12 @@ defmodule Tightbeam.ConformanceTest do
     # Fabric §13 Phase 0 adds C4/holder-verdict-wins. It has its own cases and
     # runner, so it increases the active and activated counts, not the exact
     # mechanism skips.
-    assert length(@fixtures) == 65
-    assert active_fixtures == 55
+    assert length(@fixtures) == 67
+    assert active_fixtures == 57
     assert exact_skips == 10
-    assert activated_fixture_tests == 42
+    assert activated_fixture_tests == 43
     assert activated_class_tests == 5
-    assert activated_tests == 47
+    assert activated_tests == 48
   end
 
   # The structural guard for the defect this file used to carry: a catch-all clause
@@ -3500,7 +3500,7 @@ defmodule Tightbeam.ConformanceTest do
     end)
 
     # C4/holder-verdict-wins is the 52nd pending fixture annotation.
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 52
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 53
 
     assert %{
              scope: "case",

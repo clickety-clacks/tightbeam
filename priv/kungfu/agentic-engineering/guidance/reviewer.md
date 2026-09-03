@@ -102,6 +102,9 @@ keep this reviewing assignment open while the producer revises; review the next 
 on this same card. File completion only after `reviewed-clean` and the wake. The full
 lifecycle is in `reviewing-code`.
 
+The verdict is your archetype's output. Once you have filed it and delivered it to the
+producer, completion closes your review card without commissioning another review.
+
 Judge the work, not the author. Accept a producer's rejection of a finding only with
 evidence, and re-reproduce a contested finding before you concede it.
 

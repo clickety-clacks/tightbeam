@@ -11,11 +11,21 @@ defmodule Tightbeam.Archetypes do
   """
 
   @persist_key __MODULE__
+  @shipped_output_kinds %{
+    "default" => :coordination,
+    "orchestrator" => :coordination,
+    "coder" => :artifact,
+    "product-owner" => :artifact,
+    "spec-writer" => :artifact,
+    "reviewer" => :verdict,
+    "recon" => :verdict
+  }
   alias Tightbeam.Identity.Renderer
 
   @typedoc "A validated archetype."
   @type t :: %{
           name: String.t(),
+          output_kind: :coordination | :artifact | :verdict,
           skills: [String.t()],
           where: [String.t()],
           defaults: %{optional(:harness) => atom(), optional(:model) => Tightbeam.Model.t()},
@@ -126,6 +136,17 @@ defmodule Tightbeam.Archetypes do
   def get(name) do
     {archetypes, _fragments} = :persistent_term.get(@persist_key)
     Map.get(archetypes, name)
+  end
+
+  @doc "Return an archetype's completion output contract, failing safe to artifact."
+  @spec output_kind(String.t()) :: :coordination | :artifact | :verdict
+  def output_kind(name) do
+    {archetypes, _fragments} = :persistent_term.get(@persist_key, {%{}, builtin_fragments()})
+
+    case Map.get(archetypes, name) do
+      %{output_kind: kind} when kind in [:coordination, :artifact, :verdict] -> kind
+      _ -> Map.get(@shipped_output_kinds, name, :artifact)
+    end
   end
 
   @doc "Compile an archetype's MCP declarations to the ACP mcpServers shape."
@@ -579,6 +600,7 @@ defmodule Tightbeam.Archetypes do
   def builtin_default do
     %{
       name: "default",
+      output_kind: :coordination,
       skills: [],
       where: [Tightbeam.Placement.local_host_name()],
       defaults: %{},
@@ -595,6 +617,7 @@ defmodule Tightbeam.Archetypes do
     allowed =
       MapSet.new([
         "name",
+        "output_kind",
         "skills",
         "where",
         "defaults",
@@ -621,6 +644,7 @@ defmodule Tightbeam.Archetypes do
 
     where = Map.get(manifest, "where", [Tightbeam.Placement.local_host_name()])
     skills = Map.get(manifest, "skills", [])
+    output_kind = validate_output_kind!(Map.get(manifest, "output_kind", "artifact"), path)
 
     unless is_list(skills) and Enum.all?(skills, &is_binary/1) do
       raise ArgumentError, "archetype skills must be a list of strings: #{path}"
@@ -675,6 +699,7 @@ defmodule Tightbeam.Archetypes do
 
     %{
       name: name,
+      output_kind: output_kind,
       skills: skills,
       where: where,
       model_preferences: model_preferences,
@@ -684,6 +709,14 @@ defmodule Tightbeam.Archetypes do
       mcp: mcp,
       guidance: get_in(manifest, ["guidance", "text"])
     }
+  end
+
+  defp validate_output_kind!(kind, _path) when kind in ~w(coordination artifact verdict),
+    do: String.to_existing_atom(kind)
+
+  defp validate_output_kind!(_kind, path) do
+    raise ArgumentError,
+          "archetype output_kind must be coordination, artifact, or verdict: #{path}"
   end
 
   # A stored preference holds FIELDS, like every other stored selection: a
