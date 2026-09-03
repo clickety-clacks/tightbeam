@@ -25,7 +25,7 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
 
     let leader = script(&dir, "leader.sh", "while :; do sleep 1; done\n");
 
-    let mut harness = Command::new(binary)
+    let harness = Command::new(binary)
         .args([
             "harness-exec",
             &identity_path.to_string_lossy(),
@@ -41,9 +41,10 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
         .expect("the harness session launcher must start");
 
     let leader_identity = await_identity(&identity_path);
-    // Own teardown from the moment the group identity is known, so a failing assertion below still
-    // reaps it on unwind.
-    let _reaper = DetachedGroup(leader_identity.pgid);
+    // Own teardown from the instant the leader identity is known — before any fallible floor call or
+    // assertion — so every return AND every unwind path waits the wrapper, reaps only the owned
+    // group, and clears the scratch directory.
+    let _session = OwnedSession::own(harness, &leader_identity, &dir);
 
     let floor_script = script(
         &dir,
@@ -67,9 +68,8 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
         String::from_utf8_lossy(&floor.stderr)
     );
 
-    let _ = harness.kill();
-    let _ = harness.wait();
-    let _ = fs::remove_dir_all(&dir);
+    // Teardown (wrapper wait, owned-group reap, scratch removal) is owned by `_session`'s Drop, so
+    // it runs on this normal return and on any assertion unwind above.
 }
 
 /// Identity revalidation at signal time must refuse a boot mismatch before any kill.
@@ -86,7 +86,7 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
     let identity_path = dir.join("leader.identity");
     let leader = script(&dir, "leader.sh", "while :; do sleep 1; done\n");
 
-    let mut harness = Command::new(binary)
+    let harness = Command::new(binary)
         .args([
             "harness-exec",
             &identity_path.to_string_lossy(),
@@ -102,9 +102,10 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
         .expect("the harness session launcher must start");
 
     let leader_identity = await_identity(&identity_path);
-    // Own teardown from the moment the group identity is known, so a failing assertion below still
-    // reaps it on unwind.
-    let _reaper = DetachedGroup(leader_identity.pgid);
+    // Own teardown from the instant the leader identity is known — before any fallible floor call or
+    // assertion — so every return AND every unwind path waits the wrapper, reaps only the owned
+    // group, and clears the scratch directory.
+    let _session = OwnedSession::own(harness, &leader_identity, &dir);
 
     let floor = Command::new(binary)
         .args([
@@ -126,9 +127,8 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
         "stderr must name the boot mismatch"
     );
 
-    let _ = harness.kill();
-    let _ = harness.wait();
-    let _ = fs::remove_dir_all(&dir);
+    // Teardown (wrapper wait, owned-group reap, scratch removal) is owned by `_session`'s Drop, so
+    // it runs on this normal return and on any assertion unwind above.
 }
 
 struct Identity {
@@ -138,26 +138,64 @@ struct Identity {
     boot: String,
 }
 
-/// The harness session launcher forks a `setsid` leader into its own process group. Killing only
-/// the launcher wrapper leaves that detached leader alive under PID 1 — a boot mismatch refuses
-/// before signalling, so `harness-group` never reaps it. Teardown must kill the group the test
-/// created so it does not pollute developer and CI hosts. SIGKILL the recorded group; an
-/// already-gone group (ESRCH) is the success case and is ignored.
-fn reap_detached_group(pgid: libc::pid_t) {
-    unsafe {
-        libc::killpg(pgid, libc::SIGKILL);
+/// The Linux birth token for a pid: field 22 (`starttime`) of `/proc/<pid>/stat`. `comm` (field 2)
+/// can contain spaces and parentheses, so parse the fields after the final `)`. Two processes that
+/// reuse the same pid cannot share a starttime, so this distinguishes the captured leader from any
+/// later pid/pgid reuse.
+fn proc_starttime(pid: libc::pid_t) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = stat.rsplit_once(')')?.1;
+    // Post-`)` fields begin at `state` (field 3), so `starttime` (field 22) is index 19.
+    after.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Owns unconditional teardown of one harness-launched session. Constructed the instant the leader
+/// identity is known — BEFORE any fallible floor call or assertion — so a failing assertion that
+/// unwinds still reaps everything the test created. On drop it: (1) kills AND waits the harness-exec
+/// wrapper it owns directly; (2) SIGKILLs the detached leader group ONLY while the captured pid
+/// still leads the captured pgid with the same birth token, so a recycled pgid this test no longer
+/// owns is never signalled; (3) removes the scratch directory. Every path — normal return or panic —
+/// runs all three.
+struct OwnedSession {
+    harness: std::process::Child,
+    pid: libc::pid_t,
+    pgid: libc::pid_t,
+    starttime: Option<u64>,
+    dir: std::path::PathBuf,
+}
+
+impl OwnedSession {
+    fn own(harness: std::process::Child, identity: &Identity, dir: &std::path::Path) -> Self {
+        OwnedSession {
+            harness,
+            pid: identity.pid,
+            pgid: identity.pgid,
+            starttime: proc_starttime(identity.pid),
+            dir: dir.to_path_buf(),
+        }
     }
 }
 
-/// Owns teardown of the detached leader group unconditionally. A test asserts after identity
-/// capture, so a failing assertion unwinds before any explicit teardown line — leaving the leader
-/// alive under PID 1 on the regression path. Holding the group in a drop guard reaps it whether the
-/// test returns normally or panics, so no code path pollutes developer and CI hosts.
-struct DetachedGroup(libc::pid_t);
-
-impl Drop for DetachedGroup {
+impl Drop for OwnedSession {
     fn drop(&mut self) {
-        reap_detached_group(self.0);
+        // The wrapper is our direct child: kill and reap it on every path, including panic.
+        let _ = self.harness.kill();
+        let _ = self.harness.wait();
+
+        // Signal the detached leader group only while it is provably still the one we captured — the
+        // pid alive, still the leader of the recorded pgid, with an unchanged birth token. A gone or
+        // recycled pid fails this check, so no unowned group is ever SIGKILLed.
+        let owned = self.starttime.is_some()
+            && proc_starttime(self.pid) == self.starttime
+            && unsafe { libc::getpgid(self.pid) } == self.pgid;
+        if owned {
+            unsafe {
+                libc::killpg(self.pgid, libc::SIGKILL);
+            }
+        }
+
+        // Clear the scratch directory on every path, so a failing regression control leaves no debris.
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
