@@ -145,11 +145,13 @@ defmodule Tightbeam.Assignments do
   CREATE TABLE IF NOT EXISTS assignment_revocation_generations (
     revocationId TEXT PRIMARY KEY REFERENCES assignment_revocations(id),
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
-    reopeningId TEXT NULL CHECK(reopeningId IS NULL),
-    UNIQUE (assignmentId, reopeningId)
+    reopeningId TEXT NULL
   );
   CREATE UNIQUE INDEX IF NOT EXISTS assignment_revocation_generation_initial
     ON assignment_revocation_generations (assignmentId) WHERE reopeningId IS NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS assignment_revocation_generation_reopened
+    ON assignment_revocation_generations (assignmentId, reopeningId)
+    WHERE reopeningId IS NOT NULL;
 
   CREATE TRIGGER IF NOT EXISTS assignment_revocations_immutable_update
   BEFORE UPDATE ON assignment_revocations
@@ -209,14 +211,39 @@ defmodule Tightbeam.Assignments do
     Enum.each(assignments, fn %{assignment_id: assignment_id, work_item_id: work_item_id} ->
       ts = now()
 
+      {revoked_by_user, revoked_by_session} =
+        retirement_provenance_actor(txn, principal, owner_user_id)
+
+      revocation_id = id("rev_")
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO assignment_revocations
+          (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+        VALUES (?1, ?2, ?3, ?4, ?5, 'holder session retired')
+        """,
+        [revocation_id, assignment_id, ts, revoked_by_user, revoked_by_session]
+      )
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO assignment_revocation_generations
+          (revocationId, assignmentId, reopeningId)
+        VALUES (?1, ?2, NULL)
+        """,
+        [revocation_id, assignment_id]
+      )
+
       Txn.q(
         txn,
         """
         UPDATE assignments SET state='closed', outcome='revoked', closedAt=?2,
-          closedByUser=?3
+          closedByUser=?3, closedBySession=?4
         WHERE id=?1 AND state='open'
         """,
-        [assignment_id, ts, owner_user_id]
+        [assignment_id, ts, revoked_by_user, revoked_by_session]
       )
 
       if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -226,6 +253,14 @@ defmodule Tightbeam.Assignments do
         "INSERT INTO assignment_interruptions (assignmentId, sessionKey, reason, ts) VALUES (?1, ?2, 'interrupted-by-retire', ?3)",
         [assignment_id, session_key, ts]
       )
+
+      revoked_assignment = fetch_assignment!(txn, assignment_id)
+
+      CompletionEscalation.open_terminal_in_txn(txn, revoked_assignment, "revocation", %{
+        id: revocation_id,
+        by_user: revoked_by_user,
+        by_session: revoked_by_session
+      })
 
       append_substrate(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
       Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
@@ -256,6 +291,24 @@ defmodule Tightbeam.Assignments do
 
   def interrupt_for_retire_in_txn(%Txn{}, _session_key, _owner_user_id, _principal) do
     raise ArgumentError, "retirement interruption requires a durable principal"
+  end
+
+  defp retirement_provenance_actor(_txn, "user:" <> owner, owner), do: {owner, nil}
+
+  defp retirement_provenance_actor(txn, "session:" <> session_key, owner)
+       when session_key != "" do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[^owner]] ->
+        {nil, session_key}
+
+      _ ->
+        raise ArgumentError, "retirement interruption requires an owner-matched session principal"
+    end
+  end
+
+  defp retirement_provenance_actor(_txn, principal, _owner) do
+    raise ArgumentError,
+          "retirement interruption requires a representable user or session principal; got #{inspect(principal)}"
   end
 
   @doc "Count open assignments pinned to a holder session."

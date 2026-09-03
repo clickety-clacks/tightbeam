@@ -535,6 +535,7 @@ defmodule Tightbeam.RulesTest do
 
   test "zero rules lets completion close with null verdict filer fields and one verb event",
        ctx do
+    ensure_completion_users(ctx.db)
     holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -1033,6 +1034,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "P3 review and artifact statutes deny before attest and allow after proof", ctx do
+    ensure_completion_users(ctx.db)
     holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "gate-reviewer", "other", archetype: "reviewer")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
@@ -1297,6 +1299,7 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
+    ensure_completion_users(ctx.db)
     coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
     noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
     reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
@@ -1575,5 +1578,15 @@ defmodule Tightbeam.RulesTest do
       provider: Keyword.get(opts, :provider, "anthropic"),
       model: Model.new("fable")
     })
+  end
+
+  defp ensure_completion_users(db) do
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('flynn',0,1),('other',0,1),('reviewer',0,1)"
+      )
+
+    :ok
   end
 end
