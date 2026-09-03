@@ -696,6 +696,14 @@ defmodule Tightbeam.Assignments do
         [assignment_id, session_key, ts]
       )
 
+      schedule_terminal_child_wake_in_txn(
+        txn,
+        fetch_assignment!(txn, assignment_id),
+        "interrupted-by-retire",
+        assignment_id,
+        ts
+      )
+
       append_notice(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
       Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
 
@@ -1654,6 +1662,7 @@ defmodule Tightbeam.Assignments do
     end
   rescue
     TransitionRace -> assignment_closed()
+    error in Supervision.ReceiptError -> %{code: error.code, message: error.message}
   end
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
@@ -2596,9 +2605,40 @@ defmodule Tightbeam.Assignments do
   end
 
   defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
-    attest = insert_attest(txn, call, assignment.id)
-    apply_lifecycle_attest(txn, call, assignment, attest, holder)
+    case validate_terminal_child_parent_in_txn(txn, call, assignment) do
+      :ok ->
+        attest = insert_attest(txn, call, assignment.id)
+        apply_lifecycle_attest(txn, call, assignment, attest, holder)
+
+      error ->
+        error
+    end
   end
+
+  defp validate_terminal_child_parent_in_txn(
+         txn,
+         %{params: %{kind: "completion"}},
+         %{reviewsAssignmentId: parent_id} = assignment
+       )
+       when is_binary(parent_id) do
+    case Txn.q(txn, "SELECT holderKey, state FROM assignments WHERE id=?1", [parent_id]) do
+      [[_parent_holder, "closed"]] ->
+        :ok
+
+      [[parent_holder, "open"]] ->
+        Supervision.consume_terminal_child_completion_in_txn(txn, %{
+          child_id: assignment.id,
+          child_holder: assignment.holderKey,
+          parent_id: parent_id,
+          parent_holder: parent_holder
+        })
+
+      [] ->
+        error("parent_assignment_missing", "linked parent assignment is missing")
+    end
+  end
+
+  defp validate_terminal_child_parent_in_txn(_txn, _call, _assignment), do: :ok
 
   defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest, _holder) do
     append_attest_marker(txn, attest)
@@ -2628,9 +2668,8 @@ defmodule Tightbeam.Assignments do
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     closed_assignment = fetch_assignment!(txn, assignment.id)
 
-    if call.params.kind == "completion" do
-      CompletionEscalation.open_in_txn(txn, closed_assignment, attest)
-    end
+    if call.params.kind == "completion",
+      do: CompletionEscalation.open_in_txn(txn, closed_assignment, attest)
 
     Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
     liveness_trigger = disposition_liveness_trigger!(txn, closed_assignment.workItemId)
@@ -2984,6 +3023,15 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     revoked_assignment = fetch_assignment!(txn, assignment_id)
+
+    schedule_terminal_child_wake_in_txn(
+      txn,
+      revoked_assignment,
+      "revoked",
+      assignment_id,
+      closed_at
+    )
+
     Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
 
     liveness_trigger = disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
@@ -3175,6 +3223,205 @@ defmodule Tightbeam.Assignments do
 
   defp append_notice(txn, session_key, text) do
     best_effort(fn -> Projection.append_substrate_in_txn(txn, session_key, text) end)
+  end
+
+  @terminal_child_namespace <<0x97, 0xBA, 0x04, 0x8B, 0x0D, 0x5F, 0x5D, 0x4D, 0xB2, 0x09, 0x83,
+                              0x05, 0xCA, 0x2A, 0x39, 0xB3>>
+
+  @doc false
+  def terminal_child_wake_status_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT c.id, c.outcome, c.closingAttestId, c.closedAt,
+             p.id, p.holderKey, c.workItemId,
+             EXISTS(
+               SELECT 1 FROM assignment_interruptions i
+               WHERE i.assignmentId=c.id AND i.reason='interrupted-by-retire'
+             )
+      FROM assignments c
+      JOIN assignments p ON p.id=c.reviewsAssignmentId
+      WHERE c.state='closed'
+      ORDER BY c.closedAt, c.id
+      """
+    )
+    |> Enum.reduce_while(:none, fn [
+                                     child_id,
+                                     outcome,
+                                     closing_attest_id,
+                                     closed_at,
+                                     parent_id,
+                                     parent_holder,
+                                     work_item_id,
+                                     interrupted
+                                   ],
+                                   _status ->
+      {kind, source} =
+        cond do
+          interrupted == 1 ->
+            {"interrupted-by-retire", child_id}
+
+          outcome == "revoked" ->
+            {"revoked", child_id}
+
+          outcome == "completed" and is_binary(closing_attest_id) ->
+            {"completed", closing_attest_id}
+
+          true ->
+            {nil, nil}
+        end
+
+      if is_binary(kind) and terminal_child_wake_id(child_id, parent_id, kind, source) == wake_id do
+        status =
+          if terminal_child_wake_matches_in_txn?(
+               txn,
+               wake_id,
+               child_id,
+               parent_id,
+               parent_holder,
+               work_item_id,
+               kind,
+               source,
+               closed_at
+             ),
+             do: :match,
+             else: :conflict
+
+        {:halt, status}
+      else
+        {:cont, :none}
+      end
+    end)
+  end
+
+  def terminal_child_wake_status_in_txn(_txn, _wake_id), do: :none
+
+  defp schedule_terminal_child_wake_in_txn(
+         _txn,
+         %{reviewsAssignmentId: nil},
+         _kind,
+         _source,
+         _due_at
+       ),
+       do: :ok
+
+  defp schedule_terminal_child_wake_in_txn(txn, assignment, kind, source, due_at) do
+    case Txn.q(
+           txn,
+           "SELECT id, holderKey, state FROM assignments WHERE id=?1",
+           [assignment.reviewsAssignmentId]
+         ) do
+      [[parent_id, parent_holder, "open"]] ->
+        wake_id = terminal_child_wake_id(assignment.id, parent_id, kind, source)
+
+        case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) do
+          [] ->
+            Wakes.schedule_in_txn(txn, %{
+              wake_id: wake_id,
+              session_key: parent_holder,
+              target_role: nil,
+              origin: "process:tightbeam",
+              consumer: "prompt",
+              prompt: terminal_child_prompt(assignment.id, parent_id, kind, source),
+              due_at: due_at,
+              sender_scheduled: true,
+              reresolve: "lineage",
+              reresolve_seed: parent_holder,
+              reresolve_rung: 1,
+              work_item_id: assignment.workItemId,
+              assignment_id: nil,
+              target_gate: 1
+            })
+
+            :ok
+
+          [[1]] ->
+            if terminal_child_wake_matches_in_txn?(
+                 txn,
+                 wake_id,
+                 assignment.id,
+                 parent_id,
+                 parent_holder,
+                 assignment.workItemId,
+                 kind,
+                 source,
+                 due_at
+               ) do
+              :ok
+            else
+              raise "terminal_wake_identity_conflict"
+            end
+        end
+
+      [[_parent_id, _parent_holder, _closed_state]] ->
+        :ok
+
+      [] ->
+        :ok
+    end
+  end
+
+  defp terminal_child_wake_matches_in_txn?(
+         txn,
+         wake_id,
+         child_id,
+         parent_id,
+         parent_holder,
+         work_item_id,
+         kind,
+         source,
+         due_at
+       ) do
+    Txn.q(
+      txn,
+      """
+      SELECT 1 FROM wakes
+      WHERE wakeId=?1 AND sessionKey=?2 AND targetRole IS NULL
+        AND origin='process:tightbeam' AND prompt=?3 AND consumer='prompt'
+        AND dueAt=?4 AND reresolve='lineage' AND reresolveSeed=?2
+        AND reresolveRung=1 AND conditionKind IS NULL AND conditionScope IS NULL
+        AND conditionAfterId IS NULL AND creatorSessionKey IS NULL
+        AND rumination=0 AND work_item_id IS ?5 AND assignmentId IS NULL
+        AND targetGate=1
+      """,
+      [
+        wake_id,
+        parent_holder,
+        terminal_child_prompt(child_id, parent_id, kind, source),
+        due_at,
+        work_item_id
+      ]
+    ) == [[1]]
+  end
+
+  @doc false
+  def terminal_child_wake_id(child_id, parent_id, kind, source) do
+    name =
+      "tightbeam-terminal-child-v1\nchild=#{child_id}\nparent=#{parent_id}\nkind=#{kind}\nsource=#{source}"
+
+    "w_" <> uuid5(@terminal_child_namespace, name)
+  end
+
+  defp terminal_child_prompt(child_id, parent_id, kind, source) do
+    "[terminal child result]\nchild=#{child_id}\nparent=#{parent_id}\nkind=#{kind}\nsource=#{source}"
+  end
+
+  defp uuid5(namespace, name) do
+    <<a::48, _::4, b::12, _::2, c::62>> =
+      :crypto.hash(:sha, namespace <> name) |> binary_part(0, 16)
+
+    hex = Base.encode16(<<a::48, 5::4, b::12, 2::2, c::62>>, case: :lower)
+
+    Enum.join(
+      [
+        binary_part(hex, 0, 8),
+        binary_part(hex, 8, 4),
+        binary_part(hex, 12, 4),
+        binary_part(hex, 16, 4),
+        binary_part(hex, 20, 12)
+      ],
+      "-"
+    )
   end
 
   defp revoke_allowed?(txn, {:user, user}, assignment) do

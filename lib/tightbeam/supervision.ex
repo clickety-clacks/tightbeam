@@ -38,6 +38,353 @@ defmodule Tightbeam.Supervision do
 
   require Logger
 
+  defmodule ReceiptError do
+    @moduledoc false
+    defexception [:code, :message]
+  end
+
+  @doc false
+  def accept_parent_wake_receipt_in_txn(
+        %Txn{} = txn,
+        %{child_id: child_id, child_holder: holder, turn_seq: turn_seq, wake_id: wake_id},
+        accepted_at
+      ) do
+    case Txn.q(
+           txn,
+           """
+           SELECT assignmentId, receiptChildTurnSeq, receiptAcceptedGeneration,
+                  receiptCause, receiptPrincipal
+           FROM supervision_liveness_sidecar WHERE wakeId=?1
+           """,
+           [wake_id]
+         ) do
+      [[^child_id, ^turn_seq, generation, "child_exact_parent_wake_invoked", ^holder]] ->
+        %{
+          wake_id: wake_id,
+          assignment_id: child_id,
+          receipt_child_turn_seq: turn_seq,
+          receipt_accepted_generation: generation,
+          receipt_cause: "child_exact_parent_wake_invoked",
+          receipt_principal: holder
+        }
+
+      [[_assignment_id, _turn_seq, _generation, _cause, _principal]] ->
+        receipt_error!("parent_wake_receipt_conflict", "parent wake receipt conflicts")
+
+      [] ->
+        case Txn.q(
+               txn,
+               """
+               SELECT generation, state, supervisionIntervalMs
+               FROM supervision_entitlements WHERE assignmentId=?1
+               """,
+               [child_id]
+             ) do
+          [[generation, state, interval]] when state in ["armed", "claimed"] ->
+            Txn.q(
+              txn,
+              """
+              INSERT INTO supervision_liveness_sidecar
+                (wakeId, assignmentId, receiptChildTurnSeq, receiptAcceptedGeneration,
+                 receiptCause, receiptPrincipal)
+              VALUES (?1, ?2, ?3, ?4, 'child_exact_parent_wake_invoked', ?5)
+              """,
+              [wake_id, child_id, turn_seq, generation, holder]
+            )
+
+            next_generation = generation + 1
+            due_at = accepted_at + interval
+
+            Txn.q(
+              txn,
+              """
+              UPDATE supervision_entitlements
+              SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
+                  claimClock=NULL, basisKind='progress', basisId=?4, terminusAt=NULL,
+                  cause='progress', principal='process:tightbeam', supervisionIntervalMs=?5
+              WHERE assignmentId=?1 AND generation=?6 AND state IN ('armed','claimed')
+              """,
+              [
+                child_id,
+                next_generation,
+                due_at,
+                "parent_wake_receipt:#{wake_id}",
+                interval,
+                generation
+              ]
+            )
+
+            if Txn.changes(txn) != 1,
+              do:
+                receipt_error!("supervision_generation_changed", "supervision generation changed")
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "supervision_entitlement_rebased",
+              child_id,
+              "generation=#{next_generation} basis=parent_wake_receipt:#{wake_id} cause=parent_wake_receipt principal=process:tightbeam"
+            )
+
+            %{
+              wake_id: wake_id,
+              assignment_id: child_id,
+              receipt_child_turn_seq: turn_seq,
+              receipt_accepted_generation: generation,
+              receipt_cause: "child_exact_parent_wake_invoked",
+              receipt_principal: holder
+            }
+
+          _ ->
+            receipt_error!("supervision_generation_changed", "supervision generation changed")
+        end
+    end
+  end
+
+  @doc false
+  def consume_terminal_child_completion_in_txn(
+        %Txn{} = txn,
+        %{
+          child_id: child_id,
+          child_holder: holder,
+          parent_id: parent_id,
+          parent_holder: parent_holder
+        }
+      ) do
+    turn_seq = current_child_turn_seq!(txn, child_id, holder)
+
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT s.wakeId, s.receiptChildTurnSeq, s.receiptAcceptedGeneration,
+               s.receiptCause, s.receiptPrincipal,
+               w.state, w.creatorSessionKey, w.sessionKey, w.targetRole,
+               w.consumer, w.assignmentId, w.reresolve, w.reresolveSeed, w.reresolveRung,
+               EXISTS(SELECT 1 FROM turns d WHERE d.wakeId=w.wakeId)
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId
+        WHERE s.assignmentId=?1 AND s.receiptCause='child_exact_parent_wake_invoked'
+        ORDER BY s.receiptAcceptedGeneration DESC, w.createdAt DESC, w.wakeId DESC
+        """,
+        [child_id]
+      )
+
+    if rows == [],
+      do: receipt_error!("parent_wake_receipt_missing", "parent wake receipt is missing")
+
+    [
+      wake_id,
+      receipt_turn_seq,
+      accepted_generation,
+      cause,
+      principal,
+      wake_state,
+      creator,
+      target,
+      target_role,
+      consumer,
+      wake_assignment_id,
+      reresolve,
+      seed,
+      rung,
+      delivered
+    ] = hd(rows)
+
+    cond do
+      wake_state == "canceled" ->
+        receipt_error!("parent_wake_receipt_canceled", "parent wake receipt was canceled")
+
+      creator != holder ->
+        receipt_error!("parent_wake_receipt_wrong_creator", "parent wake creator does not match")
+
+      target != parent_holder or not is_nil(target_role) ->
+        receipt_error!("parent_wake_receipt_wrong_target", "parent wake target does not match")
+
+      receipt_turn_seq != turn_seq or cause != "child_exact_parent_wake_invoked" or
+        principal != holder or consumer != "prompt" or not is_nil(wake_assignment_id) or
+        reresolve != "lineage" or seed != parent_holder or rung != 1 ->
+        receipt_error!("parent_wake_receipt_unattributed", "parent wake receipt is unattributed")
+
+      true ->
+        [[generation, interval]] =
+          Txn.q(
+            txn,
+            """
+            SELECT generation, supervisionIntervalMs FROM supervision_entitlements
+            WHERE assignmentId=?1 AND state IN ('armed','claimed')
+            """,
+            [child_id]
+          )
+
+        cond do
+          generation != accepted_generation + 1 ->
+            receipt_error!("parent_wake_receipt_stale", "parent wake receipt is stale")
+
+          wake_state != "fired" or delivered != 1 ->
+            receipt_error!("parent_wake_delivery_missing", "parent wake delivery is missing")
+
+          true ->
+            consume_child_completion_evidence!(
+              txn,
+              child_id,
+              holder,
+              parent_id,
+              generation,
+              interval,
+              wake_id
+            )
+        end
+    end
+  end
+
+  defp current_child_turn_seq!(txn, child_id, holder) do
+    case Txn.q(
+           txn,
+           "SELECT seq FROM turns WHERE assignmentId=?1 AND sessionKey=?2 AND status='running'",
+           [child_id, holder]
+         ) do
+      [[seq]] -> seq
+      [] -> receipt_error!("child_turn_missing", "current child turn is missing")
+      _ -> receipt_error!("child_turn_mismatch", "current child turn does not match")
+    end
+  end
+
+  defp consume_child_completion_evidence!(
+         txn,
+         child_id,
+         holder,
+         _parent_id,
+         generation,
+         interval,
+         wake_id
+       ) do
+    [[cursor]] =
+      Txn.q(
+        txn,
+        "SELECT artifactCursor FROM supervision_liveness_receipt_state WHERE assignmentId=?1",
+        [child_id]
+      )
+
+    artifact =
+      case Txn.q(
+             txn,
+             """
+             SELECT a.rowid, a.artifactId, a.createdAt
+             FROM artifacts a
+             JOIN assignments c ON c.id=?1
+             WHERE a.rowid>?2 AND a.workItemId=c.workItemId AND a.createdBySession=?3
+               AND NOT EXISTS (
+                 SELECT 1 FROM assignments sibling
+                 WHERE sibling.id!=c.id AND sibling.holderKey=c.holderKey
+                   AND sibling.workItemId=c.workItemId
+                   AND sibling.openedAt<=a.createdAt
+                   AND (sibling.closedAt IS NULL OR sibling.closedAt>=a.createdAt)
+               )
+             ORDER BY a.rowid LIMIT 1
+             """,
+             [child_id, cursor, holder]
+           ) do
+        [row] -> row
+        [] -> nil
+      end
+
+    progress =
+      if artifact do
+        nil
+      else
+        case Txn.q(
+               txn,
+               """
+               SELECT a.id, a.ts
+               FROM attests a
+               WHERE a.assignmentId=?1 AND a.kind='progress' AND a.bySession=?2
+                 AND NOT EXISTS (
+                   SELECT 1 FROM supervision_progress_absorptions p WHERE p.attestId=a.id
+                 )
+               ORDER BY a.ts, a.id LIMIT 1
+               """,
+               [child_id, holder]
+             ) do
+          [row] -> row
+          [] -> nil
+        end
+      end
+
+    {basis_id, principal} =
+      case {artifact, progress} do
+        {[rowid, artifact_id, _created_at], nil} ->
+          Txn.q(
+            txn,
+            """
+            UPDATE supervision_liveness_receipt_state SET artifactCursor=?2
+            WHERE assignmentId=?1 AND artifactCursor=?3
+            """,
+            [child_id, rowid, cursor]
+          )
+
+          if Txn.changes(txn) != 1,
+            do: receipt_error!("supervision_generation_changed", "supervision generation changed")
+
+          {"artifact:#{rowid}:#{artifact_id}", holder}
+
+        {nil, [attest_id, attest_ts]} ->
+          Txn.q(
+            txn,
+            """
+            INSERT INTO supervision_progress_absorptions
+              (attestId, assignmentId, attestTs, generation, recoveryBaseline, cause, principal)
+            VALUES (?1, ?2, ?3, ?4, 0, 'progress', ?5)
+            """,
+            [attest_id, child_id, attest_ts, generation, holder]
+          )
+
+          {"progress:#{attest_id}", holder}
+
+        {nil, nil} ->
+          receipt_error!(
+            "child_completion_evidence_missing",
+            "child completion evidence is missing"
+          )
+      end
+
+    next_generation = generation + 1
+    accepted_at = now()
+
+    Txn.q(
+      txn,
+      """
+      UPDATE supervision_entitlements
+      SET generation=?2, dueAt=?3, state='armed', lastAttemptGeneration=NULL,
+          claimClock=NULL, basisKind='progress', basisId=?4, terminusAt=NULL,
+          cause='progress', principal=?5, supervisionIntervalMs=?6
+      WHERE assignmentId=?1 AND generation=?7 AND state IN ('armed','claimed')
+      """,
+      [
+        child_id,
+        next_generation,
+        accepted_at + interval,
+        basis_id,
+        principal,
+        interval,
+        generation
+      ]
+    )
+
+    if Txn.changes(txn) != 1,
+      do: receipt_error!("supervision_generation_changed", "supervision generation changed")
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "supervision_entitlement_rebased",
+      child_id,
+      "generation=#{next_generation} basis=#{basis_id} receipt=#{wake_id} cause=child_completion_evidence principal=#{principal}"
+    )
+
+    :ok
+  end
+
+  defp receipt_error!(code, message), do: raise(ReceiptError, code: code, message: message)
+
   @prods_ddl """
   CREATE TABLE IF NOT EXISTS assignment_prods (
     assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
@@ -2577,16 +2924,22 @@ defmodule Tightbeam.Supervision do
 
     [artifact_max, attest_max, event_max, wake_max] = receipt_source_maxima_in_txn(txn)
 
+    artifact_effects =
+      artifact_receipts_in_txn(txn, assignment_id, artifact_cursor, artifact_max)
+
+    progress =
+      if artifact_effects == [] do
+        progress_receipt_in_txn(txn, assignment_id, holder, attest_cursor, attest_max)
+      end
+
     effects =
-      artifact_receipts_in_txn(
-        txn,
-        work_item_id,
-        holder,
-        artifact_cursor,
-        artifact_max
-      ) ++
-        verdict_receipts_in_txn(txn, assignment_id, attest_cursor, attest_max) ++
-        work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max)
+      if artifact_effects == [] and progress do
+        [progress]
+      else
+        artifact_effects ++
+          verdict_receipts_in_txn(txn, assignment_id, attest_cursor, attest_max) ++
+          work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max)
+      end
 
     checkpoint =
       checkpoint_receipt_in_txn(
@@ -2604,10 +2957,24 @@ defmodule Tightbeam.Supervision do
       """
       UPDATE supervision_liveness_receipt_state
       SET artifactCursor=?2, attestCursor=?3, workItemEventCursor=?4, wakeCursor=?5
-      WHERE assignmentId=?1
+      WHERE assignmentId=?1 AND artifactCursor=?6 AND attestCursor=?7
+        AND workItemEventCursor=?8 AND wakeCursor=?9
       """,
-      [assignment_id, artifact_max, attest_max, event_max, wake_max]
+      [
+        assignment_id,
+        artifact_max,
+        attest_max,
+        event_max,
+        wake_max,
+        artifact_cursor,
+        attest_cursor,
+        event_cursor,
+        wake_cursor
+      ]
     )
+
+    if Txn.changes(txn) != 1,
+      do: receipt_error!("supervision_generation_changed", "supervision generation changed")
 
     receipts = if effects == [], do: List.wrap(checkpoint), else: effects
 
@@ -2619,24 +2986,45 @@ defmodule Tightbeam.Supervision do
         next_generation = generation + 1
         accepted_at = evaluation_clock
 
-        Enum.each(rows, fn %{kind: kind, id: id, at: source_at, expires_at: expires_at} ->
-          Txn.q(
-            txn,
-            """
-            INSERT INTO supervision_liveness_receipts
-              (assignmentId, sourceKind, sourceId, sourceAt, acceptedAt, generation, expiresAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            """,
-            [assignment_id, kind, id, source_at, accepted_at, next_generation, expires_at]
-          )
+        Enum.each(rows, fn
+          %{kind: "progress", id: id, at: source_at} ->
+            Txn.q(
+              txn,
+              """
+              INSERT INTO supervision_progress_absorptions
+                (attestId, assignmentId, attestTs, generation, recoveryBaseline, cause, principal)
+              VALUES (?1, ?2, ?3, ?4, 0, 'progress', ?5)
+              """,
+              [id, assignment_id, source_at, generation, holder]
+            )
+
+          %{kind: kind, id: id, at: source_at, expires_at: expires_at} ->
+            Txn.q(
+              txn,
+              """
+              INSERT INTO supervision_liveness_receipts
+                (assignmentId, sourceKind, sourceId, sourceAt, acceptedAt, generation, expiresAt)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+              """,
+              [assignment_id, kind, id, source_at, accepted_at, next_generation, expires_at]
+            )
         end)
 
-        [[basis_id]] =
-          Txn.q(
-            txn,
-            "SELECT MAX(receiptId) FROM supervision_liveness_receipts WHERE assignmentId=?1",
-            [assignment_id]
-          )
+        basis_id =
+          case rows do
+            [%{kind: "progress", id: id}] ->
+              "progress:#{id}"
+
+            _ ->
+              [[receipt_id]] =
+                Txn.q(
+                  txn,
+                  "SELECT MAX(receiptId) FROM supervision_liveness_receipts WHERE assignmentId=?1",
+                  [assignment_id]
+                )
+
+              "receipt:#{receipt_id}"
+          end
 
         [[attest_count]] =
           Txn.q(txn, "SELECT count(*) FROM attests WHERE assignmentId=?1", [assignment_id])
@@ -2673,7 +3061,7 @@ defmodule Tightbeam.Supervision do
             assignment_id,
             next_generation,
             due_at,
-            "receipt:#{basis_id}",
+            basis_id,
             interval,
             generation
           ]
@@ -2685,7 +3073,7 @@ defmodule Tightbeam.Supervision do
           txn,
           "supervision_entitlement_rebased",
           assignment_id,
-          "generation=#{next_generation} basis=liveness_receipt:#{basis_id} sources=#{source_refs} cause=liveness_receipt principal=process:tightbeam"
+          "generation=#{next_generation} basis=#{basis_id} sources=#{source_refs} cause=liveness_receipt principal=process:tightbeam"
         )
 
         :rebased
@@ -2731,18 +3119,47 @@ defmodule Tightbeam.Supervision do
     [artifact_cursor, attest_cursor, event_cursor, wake_cursor]
   end
 
-  defp artifact_receipts_in_txn(txn, work_item_id, holder, cursor, maximum) do
+  defp artifact_receipts_in_txn(txn, assignment_id, cursor, maximum) do
     Txn.q(
       txn,
       """
-      SELECT artifactId, createdAt
-      FROM artifacts
-      WHERE rowid > ?1 AND rowid <= ?2 AND workItemId=?3 AND createdBySession=?4
-      ORDER BY rowid
+      SELECT a.artifactId, a.createdAt
+      FROM artifacts a
+      JOIN assignments c ON c.id=?3
+      WHERE a.rowid > ?1 AND a.rowid <= ?2
+        AND a.workItemId=c.workItemId AND a.createdBySession=c.holderKey
+        AND NOT EXISTS (
+          SELECT 1 FROM assignments sibling
+          WHERE sibling.id!=c.id AND sibling.holderKey=c.holderKey
+            AND sibling.workItemId=c.workItemId
+            AND sibling.openedAt<=a.createdAt
+            AND (sibling.closedAt IS NULL OR sibling.closedAt>=a.createdAt)
+        )
+      ORDER BY a.rowid
       """,
-      [cursor, maximum, work_item_id, holder]
+      [cursor, maximum, assignment_id]
     )
     |> Enum.map(fn [id, at] -> %{kind: "artifact", id: id, at: at, expires_at: nil} end)
+  end
+
+  defp progress_receipt_in_txn(txn, assignment_id, holder, cursor, maximum) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.id, a.ts
+           FROM attests a
+           WHERE a.rowid>?1 AND a.rowid<=?2 AND a.assignmentId=?3
+             AND a.kind='progress' AND a.bySession=?4
+             AND NOT EXISTS (
+               SELECT 1 FROM supervision_progress_absorptions p WHERE p.attestId=a.id
+             )
+           ORDER BY a.ts, a.id LIMIT 1
+           """,
+           [cursor, maximum, assignment_id, holder]
+         ) do
+      [[id, at]] -> %{kind: "progress", id: id, at: at, expires_at: nil}
+      [] -> nil
+    end
   end
 
   defp verdict_receipts_in_txn(txn, assignment_id, cursor, maximum) do

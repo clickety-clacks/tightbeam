@@ -357,7 +357,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert table_columns(db, "supervision_liveness_sidecar") ==
              ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded) ++
-               ["rootTurnSeq"]
+               ~w(rootTurnSeq receiptChildTurnSeq receiptAcceptedGeneration receiptCause receiptPrincipal)
 
     assert table_columns(db, "wake_cancellations") ==
              ~w(wakeId wakeState canceledAt requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind replacementWakeId dispositionKind dispositionId primaryWorkKind primaryWorkId workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)
@@ -367,6 +367,14 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert table_columns(db, "supervision_liveness_migrations") ==
              ~w(migrationId appliedAt affectedRows cause principal)
+
+    assert {:ok, [[applied_at, 0, "release_upgrade", "process:tightbeam"]]} =
+             DB.query(
+               db,
+               "SELECT appliedAt,affectedRows,cause,principal FROM supervision_liveness_migrations WHERE migrationId='terminal_child_receipt_v1'"
+             )
+
+    assert is_integer(applied_at) and applied_at >= 0
 
     assert table_columns(db, "supervision_liveness_receipt_state") ==
              ~w(assignmentId artifactCursor attestCursor workItemEventCursor wakeCursor baselineCause baselinePrincipal)
@@ -1396,6 +1404,8 @@ defmodule Tightbeam.SchemaShapeTest do
   defp remove_controller_root_link(db) do
     {:ok, :ok} =
       DB.foreign_key_rebuild(db, fn txn ->
+        downgrade_terminal_child_receipt!(txn)
+
         DB.Txn.q(
           txn,
           "SELECT type, name FROM sqlite_master WHERE type IN ('index','trigger') AND sql LIKE '%rootTurnSeq%'"
@@ -1412,6 +1422,67 @@ defmodule Tightbeam.SchemaShapeTest do
 
         :ok
       end)
+
+    :ok
+  end
+
+  defp downgrade_terminal_child_receipt!(txn) do
+    columns =
+      DB.Txn.q(txn, "PRAGMA table_info(supervision_liveness_sidecar)")
+      |> Enum.map(&Enum.at(&1, 1))
+
+    if "receiptCause" in columns do
+      v1_objects = Schema.terminal_child_receipt_v1_objects_for_test()
+      replaced_names = MapSet.new(Enum.map(v1_objects, & &1.name))
+
+      dependent =
+        DB.Txn.q(
+          txn,
+          """
+          SELECT type,name,sql FROM sqlite_master
+          WHERE type IN ('index','trigger') AND sql IS NOT NULL
+            AND sql LIKE '%supervision_liveness_sidecar%'
+          ORDER BY type,name
+          """
+        )
+
+      Enum.each(dependent, fn [type, name, _sql] ->
+        :ok = DB.Txn.exec(txn, "DROP #{String.upcase(type)} IF EXISTS #{name}")
+      end)
+
+      :ok =
+        DB.Txn.exec(
+          txn,
+          "ALTER TABLE supervision_liveness_sidecar RENAME TO supervision_liveness_sidecar_terminal_child_v2"
+        )
+
+      [table | v1_triggers] = v1_objects
+      :ok = DB.Txn.exec(txn, table.sql)
+
+      legacy_columns =
+        ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded rootTurnSeq)
+        |> Enum.join(",")
+
+      DB.Txn.q(
+        txn,
+        "INSERT INTO supervision_liveness_sidecar (#{legacy_columns}) SELECT #{legacy_columns} FROM supervision_liveness_sidecar_terminal_child_v2"
+      )
+
+      :ok = DB.Txn.exec(txn, "DROP TABLE supervision_liveness_sidecar_terminal_child_v2")
+
+      Enum.each(dependent, fn [_type, name, sql] ->
+        unless MapSet.member?(replaced_names, name) do
+          :ok = DB.Txn.exec(txn, sql)
+        end
+      end)
+
+      Enum.each(v1_triggers, &DB.Txn.exec(txn, &1.sql))
+
+      DB.Txn.q(
+        txn,
+        "DELETE FROM supervision_liveness_migrations WHERE migrationId='terminal_child_receipt_v1'"
+      )
+    end
 
     :ok
   end

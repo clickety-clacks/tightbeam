@@ -1779,7 +1779,15 @@ fn parse_with_optional_catalog(
             if fallback_after_ms.is_some() && at.is_some() {
                 return Err("--fallback-after and --at are mutually exclusive".to_owned());
             }
-            let idempotency_key = condition_kind.as_ref().and_then(|_| nonempty(flags, "key"));
+            let idempotency_key = nonempty(flags, "key");
+            if idempotency_key.is_some() && condition_kind.is_none() {
+                if !matches!(targets.first(), Some(Target::Session(_))) {
+                    return Err("--key on an immediate wake requires --session".to_owned());
+                }
+                if after_ms.is_some() || at.is_some() {
+                    return Err("--key on an immediate wake cannot be combined with --after or --at".to_owned());
+                }
+            }
             if flags.get("class").is_some_and(String::is_empty) {
                 return Err("--class requires a class name".to_owned());
             }
@@ -4124,6 +4132,56 @@ mod tests {
                 scope: None,
                 idempotency_key: None,
             })
+        );
+    }
+
+    #[test]
+    fn immediate_wake_keys_are_reserved_for_direct_session_receipts() {
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:parent",
+                "--prompt",
+                "review the result",
+                "--key",
+                "w_123",
+                "--as",
+                "child",
+            ])),
+            Ok(Command::Wake {
+                identity: Identity::Role("child".to_owned()),
+                target: Target::Session("agent:parent".to_owned()),
+                prompt: "review the result".to_owned(),
+                after_ms: None,
+                at: None,
+                condition_kind: None,
+                condition_scope: None,
+                idempotency_key: Some("w_123".to_owned()),
+                class: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "wake", "--role", "owner", "--prompt", "review", "--key", "w_123",
+            ])),
+            Err("--key on an immediate wake requires --session".to_owned())
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:parent",
+                "--prompt",
+                "review",
+                "--after",
+                "1m",
+                "--key",
+                "w_123",
+            ])),
+            Err("--key on an immediate wake cannot be combined with --after or --at".to_owned())
         );
     }
 

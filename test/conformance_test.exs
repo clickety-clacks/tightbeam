@@ -3634,6 +3634,15 @@ defmodule Tightbeam.ConformanceSupport do
 
     Enum.each(Map.get(world, "attests", []), fn attest ->
       by = principal(attest["by"])
+      assignment_id = assignments[attest["assignment"]]
+
+      terminal_child_turn =
+        materialize_terminal_child_completion_evidence!(
+          db,
+          assignment_id,
+          attest["kind"],
+          by
+        )
 
       result =
         Assignments.__handle__(db, "attest", %{
@@ -3642,13 +3651,21 @@ defmodule Tightbeam.ConformanceSupport do
           principal: by,
           session_key: nil,
           params: %{
-            assignment_id: assignments[attest["assignment"]],
+            assignment_id: assignment_id,
             kind: attest["kind"],
             verdict_kind: attest["verdict_kind"]
           }
         })
 
       refute Map.has_key?(result, :code), "failed to materialize attest: #{inspect(result)}"
+
+      if terminal_child_turn do
+        {:ok, _} =
+          DB.query(db, "UPDATE turns SET status='delivered',endedAt=?2 WHERE seq=?1", [
+            terminal_child_turn,
+            System.system_time(:millisecond)
+          ])
+      end
     end)
 
     Enum.each(Map.get(world, "stored_attests", []), fn attest ->
@@ -3765,6 +3782,145 @@ defmodule Tightbeam.ConformanceSupport do
       turns: turns
     }
   end
+
+  # Conformance fixtures declare the domain facts needed by the rule under
+  # test. A fixture that closes an open producer's linked review must also
+  # materialize the terminal-child protocol that now makes that world lawful.
+  defp materialize_terminal_child_completion_evidence!(
+         _db,
+         _assignment_id,
+         kind,
+         _principal
+       )
+       when kind != "completion",
+       do: nil
+
+  defp materialize_terminal_child_completion_evidence!(
+         db,
+         assignment_id,
+         "completion",
+         {:session, holder}
+       ) do
+    case DB.query(
+           db,
+           """
+           SELECT c.holderKey,c.reviewsAssignmentId,c.workItemId,p.holderKey,p.state
+           FROM assignments c
+           LEFT JOIN assignments p ON p.id=c.reviewsAssignmentId
+           WHERE c.id=?1
+           """,
+           [assignment_id]
+         ) do
+      {:ok, [[^holder, parent_id, work_item_id, parent_holder, "open"]]}
+      when is_binary(parent_id) ->
+        now = System.system_time(:millisecond)
+        message_suffix = Tightbeam.Id.uuid4()
+
+        {:ok, %{turn_seq: turn_seq, wake_id: wake_id}} =
+          DB.transaction(db, fn txn ->
+            [[turn_seq]] =
+              DB.Txn.q(
+                txn,
+                """
+                INSERT INTO turns
+                  (sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,startedAt)
+                VALUES (?1,?2,?3,'conformance review',?4,'running',?5,?5)
+                RETURNING seq
+                """,
+                [
+                  holder,
+                  "m_terminal_child_#{message_suffix}",
+                  "agent:#{holder}",
+                  assignment_id,
+                  now
+                ]
+              )
+
+            wake =
+              Wakes.schedule_in_txn(txn, %{
+                session_key: parent_holder,
+                target_role: nil,
+                origin: "agent:#{holder}",
+                prompt: "conformance review result",
+                due_at: now,
+                creator_session_key: holder,
+                reresolve: "lineage",
+                reresolve_seed: parent_holder,
+                reresolve_rung: 1,
+                work_item_id: work_item_id,
+                assignment_id: nil,
+                target_gate: 1
+              })
+
+            _receipt =
+              Supervision.accept_parent_wake_receipt_in_txn(
+                txn,
+                %{
+                  child_id: assignment_id,
+                  child_holder: holder,
+                  turn_seq: turn_seq,
+                  wake_id: wake.wake_id
+                },
+                now
+              )
+
+            %{turn_seq: turn_seq, wake_id: wake.wake_id}
+          end)
+
+        {:ok, _} =
+          DB.query(
+            db,
+            """
+            INSERT INTO turns
+              (sessionKey,messageId,wakeId,origin,prompt,status,createdAt)
+            VALUES (?1,?2,?3,?4,'conformance review result','delivered',?5)
+            """,
+            [
+              parent_holder,
+              "m_parent_delivery_#{message_suffix}",
+              wake_id,
+              "agent:#{holder}",
+              now
+            ]
+          )
+
+        {:ok, _} =
+          DB.query(
+            db,
+            "UPDATE wakes SET state='fired',firedAt=?2,firedBy='internal' WHERE wakeId=?1",
+            [wake_id, now]
+          )
+
+        progress =
+          Assignments.__handle__(db, "attest", %{
+            verb: "attest",
+            origin: "agent:#{holder}",
+            principal: {:session, holder},
+            session_key: nil,
+            params: %{
+              assignment_id: assignment_id,
+              kind: "progress",
+              verdict_kind: nil
+            }
+          })
+
+        refute Map.has_key?(progress, :code),
+               "failed to materialize terminal-child progress: #{inspect(progress)}"
+
+        turn_seq
+
+      _ ->
+        nil
+    end
+  end
+
+  defp materialize_terminal_child_completion_evidence!(
+         _db,
+         _assignment_id,
+         "completion",
+         _principal
+       ),
+       do: nil
 
   defp first_user(world), do: world |> Map.get("users", []) |> List.first() |> Map.fetch!("id")
 
