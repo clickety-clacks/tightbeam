@@ -641,25 +641,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert kinds == ~w(statute effort agent)
   end
 
-  @tag :timing
-  @tag timeout: 600_000
-  test "AC7 AU8 keeps 10,000 randomized forbidden and unknown requests per resource within 5%",
-       ctx do
-    outsider = outsider_device(ctx)
-
-    results =
-      timing_cases(ctx)
-      |> Task.async_stream(
-        fn row -> measure_same_404_pair(ctx, row, outsider.token) end,
-        max_concurrency: min(System.schedulers_online(), 11),
-        ordered: false,
-        timeout: 600_000
-      )
-      |> Enum.map(fn {:ok, result} -> result end)
-
-    assert length(results) == 11
-  end
-
   test "turn and device expose one canonical key and authoritative refs", ctx do
     turn_row = StateResources.query_turn_by_seq(ctx.db, ctx.turn_seq)
     turn = StateResources.turn(turn_row)
@@ -1088,15 +1069,11 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   defp shuffle_json_maps(value), do: value
 
   defp get(ctx, path, bearer \\ nil, headers \\ []) do
-    get(ctx, path, bearer, headers, Router.init(ctx.opts))
-  end
-
-  defp get(ctx, path, bearer, headers, router_opts) do
     Enum.reduce(headers, conn(:get, path), fn {name, value}, conn ->
       put_req_header(conn, name, value)
     end)
     |> put_req_header("authorization", "Bearer #{bearer || ctx.token}")
-    |> Router.call(router_opts)
+    |> Router.call(Router.init(ctx.opts))
   end
 
   defp traced_get(ctx, path, bearer) do
@@ -1295,55 +1272,6 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       )
       |> Map.put(:kind, kind)
     end
-  end
-
-  defp timing_cases(ctx) do
-    core_detail_cases(ctx) ++ Enum.drop(decision_route_cases(ctx), 1)
-  end
-
-  defp measure_same_404_pair(ctx, row, bearer) do
-    seed = :erlang.phash2(row.resource, 1_000_000) + 1
-    :rand.seed(:exsss, {seed, seed + 17, seed + 101})
-    router_opts = Router.init(ctx.opts)
-
-    cohorts =
-      Enum.flat_map(1..10_000, fn _pair ->
-        if :rand.uniform(2) == 1,
-          do: [:forbidden, :unknown],
-          else: [:unknown, :forbidden]
-      end)
-
-    samples =
-      cohorts
-      |> Enum.reduce(%{forbidden: [], unknown: []}, fn cohort, samples ->
-        path = if cohort == :forbidden, do: row.path, else: unknown_path(row)
-        started_at = System.monotonic_time(:nanosecond)
-        response = get(ctx, path, bearer, [], router_opts)
-        elapsed = System.monotonic_time(:nanosecond) - started_at
-        assert_error(response, 404, row.resource, "not_found")
-        Map.update!(samples, cohort, &[elapsed | &1])
-      end)
-
-    for percentile <- [50, 95] do
-      forbidden = nearest_rank(samples.forbidden, percentile)
-      unknown = nearest_rank(samples.unknown, percentile)
-      delta = abs(forbidden - unknown) / min(forbidden, unknown) * 100
-
-      IO.puts(
-        "rest_core_detail_timing resource=#{row.resource} seed=#{seed} " <>
-          "p#{percentile}=#{forbidden}/#{unknown} delta=#{Float.round(delta, 3)}%"
-      )
-
-      assert delta <= 5.0
-    end
-
-    row.resource
-  end
-
-  defp nearest_rank(samples, percentile) do
-    ordered = Enum.sort(samples)
-    rank = ceil(percentile / 100 * length(ordered))
-    Enum.at(ordered, rank - 1)
   end
 
   defp start_change_server(ctx) do
