@@ -222,27 +222,29 @@ defmodule Tightbeam.PiProvider.LocalOpenAi do
 
   defp catalog_script(_state, %{api_key: key, endpoint: endpoint}, paths)
        when is_binary(key) and key != "" do
-    path =
+    dir =
       Path.join(
         System.tmp_dir!(),
         "tightbeam-pi-auth-#{System.unique_integer([:positive, :monotonic])}"
       )
 
-    case File.write(path, "Authorization: Bearer #{key}\n", [:binary, :exclusive]) do
-      :ok ->
-        case File.chmod(path, 0o600) do
-          :ok ->
-            script =
-              Support.catalog_curl(models_url(endpoint), ["@#{path}"], "", paths.curl)
+    # The header carries a bearer token, so it must never be world-readable — not even for the
+    # window between create and chmod. `File.write` cannot set the create mode, so a plain
+    # create-then-chmod leaves the file at 0666&~umask until the chmod lands. Writing it inside a
+    # private 0700 directory closes that window: no other user can traverse the directory to open
+    # the file regardless of the file's own transient mode. The directory is empty (holds no
+    # secret) during its own brief pre-chmod window, so narrowing it after mkdir is safe.
+    path = Path.join(dir, "header")
 
-            {:ok, script, fn -> File.rm(path) end}
-
-          {:error, reason} ->
-            File.rm(path)
-            {:error, {:auth_file_failed, reason}}
-        end
-
+    with :ok <- File.mkdir(dir),
+         :ok <- File.chmod(dir, 0o700),
+         :ok <- File.write(path, "Authorization: Bearer #{key}\n", [:binary, :exclusive]),
+         :ok <- File.chmod(path, 0o600) do
+      script = Support.catalog_curl(models_url(endpoint), ["@#{path}"], "", paths.curl)
+      {:ok, script, fn -> File.rm_rf(dir) end}
+    else
       {:error, reason} ->
+        File.rm_rf(dir)
         {:error, {:auth_file_failed, reason}}
     end
   end

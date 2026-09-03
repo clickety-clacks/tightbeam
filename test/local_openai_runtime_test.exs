@@ -102,6 +102,10 @@ defmodule Tightbeam.LocalOpenAiRuntimeTest do
       assert {:ok, %{mode: mode, size: size}} = File.stat(path)
       assert Bitwise.band(mode, 0o777) == 0o600
       assert size > 0
+      # The token is unreadable to other users at every instant, including the create→chmod
+      # window, because its containing directory is private (0700), not just the final file mode.
+      assert {:ok, %{mode: dir_mode}} = File.stat(Path.dirname(path))
+      assert Bitwise.band(dir_mode, 0o777) == 0o700
       send(owner, {:auth_path, path})
       {:ok, %{status: 200, headers: %{}, body: @models_body}}
     end
