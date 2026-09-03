@@ -74,6 +74,7 @@ defmodule Tightbeam.Gateway do
     EventLog,
     Harness,
     HarnessHealth,
+    HarnessProcess,
     Homes,
     Identity,
     Idempotency,
@@ -1038,6 +1039,7 @@ defmodule Tightbeam.Gateway do
           Map.put(call, :on_assignment_change, assignment_change)
         )
       end,
+      "repair-assignment" => fn call -> repair_assignment_result(config, db, call) end,
       "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
       "inspect" => fn call -> inspect_result(config, db, call) end,
       "cancel" => fn call -> cancel_result(db, call) end,
@@ -1055,6 +1057,379 @@ defmodule Tightbeam.Gateway do
       WorkItems.__handle__(db, verb, Map.put(call, :on_work_item_change, item_change))
     end
   end
+
+  defp repair_assignment_result(config, db, call) do
+    p = call.params
+    assignment_id = p[:assignment_id]
+
+    with {:ok, assignment} <- repair_assignment(db, assignment_id),
+         :ok <- repair_authorized(db, call, assignment),
+         {:ok, repair_key, fingerprint} <- repair_request(p),
+         principal = repair_principal(call.principal),
+         {:ok, claim} <-
+           Ledger.begin_assignment_repair(
+             db,
+             assignment.id,
+             repair_key,
+             fingerprint,
+             p[:action],
+             principal
+           ) do
+      case claim do
+        {:replay, result} ->
+          result
+
+        {:in_progress, attempt_id} ->
+          %{
+            ok: false,
+            code: "repair_in_progress",
+            message:
+              "repair attempt #{attempt_id} is already claimed; its outcome must be reconciled before another effect"
+          }
+
+        {:claimed, attempt_id} ->
+          execute_claimed_assignment_repair(
+            config,
+            db,
+            call,
+            assignment,
+            attempt_id
+          )
+      end
+    else
+      {:error, :repair_key_conflict} ->
+        %{
+          ok: false,
+          code: "repair_key_conflict",
+          message: "repair key is already bound to a different request for this assignment"
+        }
+
+      {:error, error} ->
+        %{ok: false, code: "repair_state_failed", message: inspect(error)}
+
+      {:error, code, message} ->
+        %{ok: false, code: code, message: message}
+    end
+  end
+
+  defp repair_request(p) do
+    repair_key = p[:idempotency_key]
+    action = p[:action]
+
+    cond do
+      not is_binary(repair_key) or repair_key == "" ->
+        {:error, "idempotency_key_required", "repair requires --key"}
+
+      action not in ["tune", "restart", "rerun", "resume", "relaunch"] ->
+        {:error, "invalid_request", "repair requires a sanctioned --action"}
+
+      true ->
+        fingerprint =
+          JSON.encode!([
+            action,
+            p[:model],
+            p[:effort],
+            p[:context],
+            p[:outcome],
+            p[:turn_seq]
+          ])
+
+        {:ok, repair_key, fingerprint}
+    end
+  end
+
+  defp execute_claimed_assignment_repair(config, db, call, assignment, attempt_id) do
+    {result, incident} =
+      with {:ok, session} <- repair_holder(db, assignment),
+           {:ok, incident} <- repair_incident(db, assignment, session, call.params[:action]) do
+        {execute_assignment_repair(config, db, call, assignment, session, incident), incident}
+      else
+        {:error, code, message} -> {%{ok: false, code: code, message: message}, nil}
+      end
+
+    case Ledger.finish_assignment_repair(db, attempt_id, result) do
+      :ok ->
+        if incident, do: record_repair_result(db, call, assignment, incident, result)
+        result
+
+      {:error, reason} ->
+        %{
+          ok: false,
+          code: "repair_state_failed",
+          message:
+            "repair effect outcome could not be persisted; attempt #{attempt_id} remains claimed: #{inspect(reason)}"
+        }
+    end
+  end
+
+  defp repair_assignment(db, assignment_id) when is_binary(assignment_id) do
+    case DB.query(
+           db,
+           """
+           SELECT id,subject,holderKey,openedByUser,openedBySession,workItemId,state
+           FROM assignments WHERE id=?1
+           """,
+           [assignment_id]
+         ) do
+      {:ok, [[id, subject, holder, by_user, by_session, work_item, "open"]]} ->
+        {:ok,
+         %{
+           id: id,
+           subject: subject,
+           holder: holder,
+           opened_by_user: by_user,
+           opened_by_session: by_session,
+           work_item_id: work_item
+         }}
+
+      _ ->
+        {:error, "unknown_assignment", "unknown open assignment: #{assignment_id}"}
+    end
+  end
+
+  defp repair_assignment(_db, _assignment_id),
+    do: {:error, "invalid_request", "repair-assignment requires assignmentId"}
+
+  defp repair_authorized(db, call, assignment) do
+    allowed =
+      case call.principal do
+        {:user, user} -> assignment.opened_by_user == user or admin_caller?(db, call)
+        {:session, session} -> assignment.opened_by_session == session or admin_caller?(db, call)
+        _ -> false
+      end
+
+    if allowed,
+      do: :ok,
+      else: {:error, "not_authorized", "assignment repair requires its opener or an admin"}
+  end
+
+  defp repair_holder(db, assignment) do
+    case Org.get(db, assignment.holder) do
+      %{state: "active"} = session -> {:ok, session}
+      _ -> {:error, "holder_unavailable", "assignment holder is not an active session"}
+    end
+  end
+
+  defp repair_incident(db, assignment, session, action) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT i.id,i.failureClass
+        FROM harness_health_incidents i
+        JOIN harness_health_assignments a ON a.incidentId=i.id
+        WHERE a.assignmentId=?1 AND i.harness=?2 AND i.host=?3 AND i.state='open'
+        ORDER BY i.openedAt DESC,i.id DESC
+        """,
+        [assignment.id, session.harness, session.host]
+      )
+
+    case rows do
+      [[id, failure_class] | _] ->
+        guidance = HarnessHealth.get(db, id).repair
+
+        if action == guidance.action do
+          {:ok, %{id: id, failure_class: failure_class, action: action}}
+        else
+          {:error, "wrong_repair",
+           "#{failure_class} requires repair action #{guidance.action}, not #{inspect(action)}"}
+        end
+
+      [] when action == "relaunch" ->
+        {:ok, %{id: nil, failure_class: "never-launched", action: action}}
+
+      [] ->
+        {:error, "no_open_incident",
+         "no open harness incident covers this assignment; use relaunch only for a holder with no turn"}
+    end
+  end
+
+  defp execute_assignment_repair(
+         config,
+         db,
+         call,
+         assignment,
+         session,
+         %{action: "tune"} = incident
+       ) do
+    model = call.params[:model]
+
+    if is_binary(model) and model != "" do
+      tuned =
+        tune_result(
+          config,
+          db,
+          call
+          |> Map.put(:session_key, session.session_key)
+          |> Map.put(
+            :params,
+            %{setting: "set_model", model: model}
+            |> maybe_put(:effort, call.params[:effort])
+            |> maybe_put(:context, call.params[:context])
+          )
+          |> Map.put(:repair_assignment_id, assignment.id)
+        )
+
+      if Map.has_key?(tuned, :code), do: tuned, else: rerun_latest(db, call, assignment, incident)
+    else
+      %{ok: false, code: "model_required", message: "model_unavailable repair requires --model"}
+    end
+  end
+
+  defp execute_assignment_repair(
+         config,
+         db,
+         call,
+         assignment,
+         session,
+         %{action: action} = incident
+       )
+       when action in ["restart", "resume"] do
+    coordinator = Map.get(config, :adapter_coordinator, AdapterCoordinator)
+    key = {Harness.parse!(session.harness).id(), "shared", session.host}
+
+    case AdapterCoordinator.close_adapter(coordinator, key) do
+      :ok ->
+        if incident.failure_class == "rate-limit-dead" do
+          :ok = HarnessProcess.complete_park(db, key)
+        end
+
+        rerun_latest(db, call, assignment, incident)
+
+      {:error, reason} ->
+        %{ok: false, code: "repair_failed", message: inspect(reason)}
+    end
+  end
+
+  defp execute_assignment_repair(
+         _config,
+         db,
+         call,
+         assignment,
+         _session,
+         %{action: "rerun"} = incident
+       ) do
+    if call.params[:outcome] == "not-completed" do
+      rerun_latest(db, call, assignment, incident)
+    else
+      %{
+        ok: false,
+        code: "outcome_reconciliation_required",
+        message: "rerun requires --outcome not-completed; unknown outcomes are never replayed"
+      }
+    end
+  end
+
+  defp execute_assignment_repair(_config, db, call, assignment, _session, %{action: "relaunch"}) do
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT count(*) FROM turns WHERE assignmentId=?1", [assignment.id])
+
+    if count == 0 do
+      case deliver_prompt(assignment.holder, call.origin, assignment.subject,
+             db: db,
+             assignment_id: assignment.id,
+             job_ref: assignment.work_item_id,
+             sender: "assignment repair",
+             conn_registry: Map.get(call, :conn_registry, Tightbeam.ConnRegistry),
+             lane_manager: Map.get(call, :lane_manager, Tightbeam.LaneManager)
+           ) do
+        :appended -> %{ok: true, action: "relaunch", assignmentId: assignment.id}
+        result -> %{ok: false, code: "repair_failed", message: inspect(result)}
+      end
+    else
+      %{
+        ok: false,
+        code: "holder_launched",
+        message: "relaunch is only sanctioned when this assignment has produced no turn"
+      }
+    end
+  end
+
+  defp rerun_latest(db, call, assignment, incident) do
+    source_seq = call.params[:turn_seq]
+
+    source_seq =
+      if is_integer(source_seq) do
+        source_seq
+      else
+        case DB.query(
+               db,
+               """
+               SELECT seq FROM turns
+               WHERE assignmentId=?1 AND status IN ('failed','failed_unknown')
+               ORDER BY seq DESC LIMIT 1
+               """,
+               [assignment.id]
+             ) do
+          {:ok, [[seq]]} -> seq
+          _ -> nil
+        end
+      end
+
+    repair_key = call.params[:idempotency_key]
+
+    cond do
+      not is_integer(source_seq) ->
+        %{ok: false, code: "no_failed_turn", message: "assignment has no terminal failed turn"}
+
+      not is_binary(repair_key) or repair_key == "" ->
+        %{ok: false, code: "idempotency_key_required", message: "repair requires --key"}
+
+      true ->
+        principal = repair_principal(call.principal)
+
+        case Ledger.repair_terminal(db, source_seq, assignment.id, repair_key, principal) do
+          {:ok, {status, attempt_seq, attempt_id}} ->
+            LaneManager.ensure_lane(
+              Map.get(call, :lane_manager, Tightbeam.LaneManager),
+              assignment.holder
+            )
+
+            %{
+              ok: true,
+              action: incident.action,
+              incidentId: incident.id,
+              assignmentId: assignment.id,
+              sourceTurnSeq: source_seq,
+              attemptTurnSeq: attempt_seq,
+              attemptId: attempt_id,
+              dedupe: to_string(status)
+            }
+
+          {:error, reason} ->
+            %{ok: false, code: "repair_failed", message: inspect(reason)}
+        end
+    end
+  end
+
+  defp record_repair_result(db, call, assignment, incident, result) do
+    detail =
+      JSON.encode!(%{
+        assignmentId: assignment.id,
+        incidentId: incident.id,
+        action: incident.action,
+        principal: repair_principal(call.principal),
+        result: result
+      })
+
+    kind =
+      if result[:ok] == true,
+        do: "harness_health_repair_started",
+        else: "harness_health_repair_failed"
+
+    EventLog.lifecycle(db, kind, assignment.id, detail)
+    :ok
+  end
+
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
+
+  defp repair_principal({kind, id})
+       when kind in [:user, :session, :process] and is_binary(id),
+       do: "#{kind}:#{id}"
+
+  defp repair_principal(value) when is_binary(value) and value != "", do: value
+  defp repair_principal(_value), do: "process:tightbeam"
 
   @doc """
   Shared turn-bearing delivery (gateway.ts `deliverPrompt`): ONE transaction
@@ -4710,19 +5085,66 @@ defmodule Tightbeam.Gateway do
 
   defp runtime_tune_session(db, call) do
     session = Org.get(db, call.session_key)
-    caller = resolve_caller(db, call.origin)
+    caller = principal_caller(db, call)
 
     case {session, caller} do
       {%{state: "active"} = active, %{owner_user_id: caller_owner}}
       when not is_nil(caller_owner) ->
-        if caller_owner == active.owner_user_id or admin_origin?(db, call.origin),
-          do: {:ok, active},
-          else: {:error, tune_error("not_found", "session not found")}
+        if caller_owner == active.owner_user_id or admin_caller?(db, call) or
+             repair_tune_authorized?(db, call, active),
+           do: {:ok, active},
+           else: {:error, tune_error("not_found", "session not found")}
 
       _ ->
         {:error, tune_error("not_found", "session not found")}
     end
   end
+
+  defp repair_tune_authorized?(db, %{repair_assignment_id: assignment_id} = call, session) do
+    with {:ok, assignment} <- repair_assignment(db, assignment_id),
+         true <- assignment.holder == session.session_key,
+         :ok <- repair_authorized(db, call, assignment) do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp repair_tune_authorized?(_db, _call, _session), do: false
+
+  # THE CALLER'S IDENTITY IS WHAT THE ROUTER ALREADY PROVED, not a fresh
+  # re-resolution of `call.origin`'s role name (F8, Sol xhigh review). A role
+  # can be REBOUND to a different session between the router's authentication
+  # and this check; `resolve_caller/2` re-reading `"agent:<role>"` at THIS
+  # moment would authorize whoever holds the role NOW for a request the
+  # router authenticated for whoever held it THEN — a TOCTOU an admin
+  # rebinding a role mid-flight could open. The router already resolved that
+  # question once, immutably, into `call.principal` (`{:session, key}`) at
+  # authentication time; using it here instead closes the gap.
+  #
+  # Device calls and `--as-user` CLI calls carry NO session principal (they
+  # were never role-mediated) and are sound as `call.origin` already reads
+  # them — those fall back to the existing resolution, unchanged.
+  defp principal_caller(db, %{principal: {:session, session_key}}) do
+    case Org.get(db, session_key) do
+      %{state: "active"} = caller ->
+        %{owner_user_id: caller.owner_user_id, caller_session: caller}
+
+      _ ->
+        nil
+    end
+  end
+
+  defp principal_caller(db, call), do: resolve_caller(db, call.origin)
+
+  defp admin_caller?(db, %{principal: {:session, session_key}}) do
+    case Org.get(db, session_key) do
+      %{owner_user_id: user_id} -> match?(%{is_admin: true}, Devices.user(db, user_id))
+      _ -> false
+    end
+  end
+
+  defp admin_caller?(db, call), do: admin_origin?(db, call.origin)
 
   defp tune_error(code, message), do: %{ok: false, code: code, message: message}
 
@@ -4921,14 +5343,14 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp at_tune_boundary(config, db, session_key, fun) do
+  defp at_tune_boundary(config, db, session_key, fun, opts \\ []) do
     at_session_turn_boundary(config, session_key, fn ->
       case config[:on_tune_fence] do
         callback when is_function(callback, 0) -> callback.()
         _ -> :ok
       end
 
-      if Ledger.pending_count(db, session_key) > 0,
+      if opts[:allow_queued] != true and Ledger.pending_count(db, session_key) > 0,
         do: {:tune_refused, :turn_in_progress},
         else: fun.()
     end)
@@ -5161,19 +5583,27 @@ defmodule Tightbeam.Gateway do
   # :no_lane can only mean the lane died in the gap, which we treat as busy: retry.
   defp apply_model_change(config, db, call, session, new_ref) do
     with {:ok, routed} <- validate_catalog_model(session.host, session.harness, new_ref, false) do
+      allow_queued = repair_tune_authorized?(db, call, session)
+
       boundary =
-        at_tune_boundary(config, db, session.session_key, fn ->
-          run_session_mutation(session.session_key, fn ->
-            apply_tuned_model(
-              config,
-              db,
-              session,
-              new_ref,
-              routed.provider,
-              call[:principal] || call.origin
-            )
-          end)
-        end)
+        at_tune_boundary(
+          config,
+          db,
+          session.session_key,
+          fn ->
+            run_session_mutation(session.session_key, fn ->
+              apply_tuned_model(
+                config,
+                db,
+                session,
+                new_ref,
+                routed.provider,
+                call[:principal] || call.origin
+              )
+            end)
+          end,
+          allow_queued: allow_queued
+        )
 
       case boundary do
         {:ok, :ok} ->

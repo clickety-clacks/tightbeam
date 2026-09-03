@@ -195,6 +195,10 @@ work waits until the user answers; the answer is recorded as a fact and releases
 File an owner-scoped decision with `operator-ask`. The command returns a decision request id
 (`dr_id`). Quote that dr_id in each related wake.
 
+If `decision-requests --status ruled` omits a decision, rationale, ruling principal, or ruling
+time, record one projection specimen and route the defect. Do not wait, invent a choice, or use
+out-of-band state as authority.
+
 Treat a Main wake about an open request as a delivery opportunity. Do not infer that Main
 must present the request, reply, or take another particular action. Apply the session's
 projected instructions to decide whether and how to act.

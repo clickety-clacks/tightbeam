@@ -581,6 +581,12 @@ defmodule Tightbeam.SchemaShapeTest do
     assert table_columns(db, "harness_health_assignments") ==
              ~w(incidentId assignmentId sessionKey)
 
+    assert table_columns(db, "turn_repair_attempts") ==
+             ~w(id repairKey sourceSeq attemptSeq assignmentId principal createdAt)
+
+    assert table_columns(db, "assignment_repair_attempts") ==
+             ~w(id assignmentId repairKey requestFingerprint action principal state resultJson createdAt completedAt)
+
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     assert :ok = Schema.ensure_all(db)
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM harness_health_incidents")

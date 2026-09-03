@@ -5,6 +5,8 @@ skills = ["recon-first-investigation", "recon-lifecycle", "bug-provenance", "hum
 text = """
 #include "golden-rule.md"
 
+#include "scope-and-architecture.md"
+
 #include "wisdom-core.md"
 
 #include "engineering-tenets.md"
