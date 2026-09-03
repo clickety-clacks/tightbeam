@@ -72,7 +72,11 @@ defmodule Tightbeam.WorkState do
   @spec list(DB.server(), map()) :: %{work: [map()], cursor: non_neg_integer()}
   def list(db, filters) do
     transaction(db, fn txn ->
-      work = txn |> assignment_rows(filters) |> Enum.map(&assignment/1)
+      work =
+        txn
+        |> assignment_rows(filters)
+        |> Enum.map(fn row -> row |> assignment() |> project_assignment(txn) end)
+
       %{work: work, cursor: cursor(txn, "work_state_events")}
     end)
   end
@@ -86,7 +90,7 @@ defmodule Tightbeam.WorkState do
           nil
 
         [row] ->
-          assignment = assignment(row)
+          assignment = row |> assignment() |> project_assignment(txn)
 
           %{
             assignment: assignment,
@@ -107,7 +111,7 @@ defmodule Tightbeam.WorkState do
         txn
         |> item_rows(filters)
         |> Enum.map(fn row ->
-          item = work_item(row)
+          item = row |> work_item() |> project_work_item(txn)
           %{workItem: item, assignments: assignments_for_item(txn, item.id)}
         end)
 
@@ -125,7 +129,7 @@ defmodule Tightbeam.WorkState do
 
         [row] ->
           %{
-            workItem: work_item(row),
+            workItem: row |> work_item() |> project_work_item(txn),
             assignments: assignments_for_item(txn, work_item_id),
             cursor: cursors(txn)
           }
@@ -226,7 +230,7 @@ defmodule Tightbeam.WorkState do
 
   defp assignments_for_item(txn, work_item_id) do
     Txn.q(txn, assignment_query("a.workItemId = ?1"), [work_item_id])
-    |> Enum.map(&assignment/1)
+    |> Enum.map(fn row -> row |> assignment() |> project_assignment(txn) end)
   end
 
   defp assignment_owner(txn, assignment_id) do
@@ -270,7 +274,8 @@ defmodule Tightbeam.WorkState do
         note: note,
         bySession: by_session,
         byUser: by_user,
-        ts: ts
+        ts: ts,
+        deliverableClaim: Tightbeam.DeliverableContract.attest_claim_projection_in_txn(txn, id)
       }
     end)
   end
@@ -408,6 +413,20 @@ defmodule Tightbeam.WorkState do
       priority: priority,
       rowVersion: row_version
     }
+  end
+
+  defp project_assignment(assignment, txn) do
+    Map.merge(
+      assignment,
+      Tightbeam.DeliverableContract.assignment_projection_in_txn(txn, assignment.id)
+    )
+  end
+
+  defp project_work_item(item, txn) do
+    Map.merge(
+      item,
+      Tightbeam.DeliverableContract.work_item_projection_in_txn(txn, item.id)
+    )
   end
 
   defp transaction(db, fun) do

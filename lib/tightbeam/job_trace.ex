@@ -32,14 +32,18 @@ defmodule Tightbeam.JobTrace do
     assignments = assignments(db, item.id)
     assignment_ids = Enum.map(assignments, & &1.id)
 
-    %{
-      workItem: %{
+    work_item =
+      %{
         id: item.id,
         ownerUserId: item.ownerUserId,
         state: item.state,
         failReason: item.failReason,
         title: item.title
-      },
+      }
+      |> Map.merge(Tightbeam.DeliverableContract.work_item_projection(db, item.id))
+
+    %{
+      workItem: work_item,
       assignments: assignments,
       timeline:
         (turn_entries(db, item.id) ++
@@ -96,7 +100,7 @@ defmodule Tightbeam.JobTrace do
       )
 
     Enum.map(rows, fn [id, holder, opened_user, opened_session, state, reviews] ->
-      %{
+      assignment = %{
         id: id,
         holderKey: holder,
         openerRef: opener_ref(opened_user, opened_session),
@@ -104,6 +108,11 @@ defmodule Tightbeam.JobTrace do
         files: assignment_files(db, id),
         reviewsAssignmentId: reviews
       }
+
+      Map.merge(
+        assignment,
+        Tightbeam.DeliverableContract.assignment_projection(db, id)
+      )
     end)
   end
 
@@ -180,7 +189,7 @@ defmodule Tightbeam.JobTrace do
       )
 
     Enum.map(rows, fn [id, assignment_id, kind, verdict, commit_refs, at] ->
-      %{
+      entry = %{
         at: at,
         type: "attest",
         id: id,
@@ -189,6 +198,12 @@ defmodule Tightbeam.JobTrace do
         verdict: verdict,
         commitRefs: decode(commit_refs)
       }
+
+      Map.put(
+        entry,
+        :deliverableClaim,
+        Tightbeam.DeliverableContract.attest_claim_projection(db, id)
+      )
     end)
   end
 

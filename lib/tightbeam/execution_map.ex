@@ -340,6 +340,7 @@ defmodule Tightbeam.ExecutionMap do
       },
       since_progress_ms: world.now - anchor(world, item, set, union)
     }
+    |> Map.merge(Map.fetch!(world.deliverable_projections_by_item, item.id))
   end
 
   defp principal(%{created_by_user: user}) when is_binary(user), do: "user"
@@ -600,6 +601,11 @@ defmodule Tightbeam.ExecutionMap do
     items = visible_items(db, caller)
     items_by_id = Map.new(items, &{&1.id, &1})
 
+    deliverable_projections_by_item =
+      Map.new(items, fn item ->
+        {item.id, Tightbeam.DeliverableContract.work_item_projection(db, item.id)}
+      end)
+
     assignments = all_assignments(db)
     assignments_by_id = Map.new(assignments, &{&1.id, &1})
     resolved = resolve_all(assignments, assignments_by_id)
@@ -616,6 +622,7 @@ defmodule Tightbeam.ExecutionMap do
       cutoff: cutoff,
       items: items,
       items_by_id: items_by_id,
+      deliverable_projections_by_item: deliverable_projections_by_item,
       assignments_by_id: assignments_by_id,
       resolved: resolved,
       by_item: by_item,

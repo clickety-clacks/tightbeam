@@ -24,6 +24,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.Roles,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
+    Tightbeam.DeliverableContract,
     Tightbeam.CommandExecutions,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
@@ -40,7 +41,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "identity-universal-root-render-v1-019"
+  @shape "completion-deliverable-v1-019"
+  @deliverable_contract_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -922,10 +924,14 @@ defmodule Tightbeam.Schema do
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
-    :ok = check_shape(db)
+    shape_state = check_shape(db)
 
     Enum.each(@schema_modules, fn module ->
-      :ok = module.ensure_schema(db)
+      if shape_state == :fresh and module == Tightbeam.DeliverableContract do
+        :ok = Tightbeam.DeliverableContract.bootstrap_schema(db)
+      else
+        :ok = module.ensure_schema(db)
+      end
     end)
 
     activated_at = System.system_time(:millisecond)
@@ -1189,15 +1195,25 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@deliverable_contract_previous_shape]]} ->
+        Tightbeam.DeliverableContract.upgrade_v1(
+          db,
+          @deliverable_contract_previous_shape,
+          @shape
+        )
+
       {:ok, [[@identity_render_stamp_previous_shape]]} ->
-        upgrade_identity_render_stamp_v1(db)
+        :ok = upgrade_identity_render_stamp_v1(db)
+        check_shape(db)
 
       {:ok, [[@effort_request_exit_previous_shape]]} ->
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_identity_render_stamp_v1(db)
+        :ok = upgrade_identity_render_stamp_v1(db)
+        check_shape(db)
 
       {:ok, [[@notice_batching_pre_liveness_shape]]} ->
-        upgrade_identity_render_stamp_v1(db, @notice_batching_pre_liveness_shape)
+        :ok = upgrade_identity_render_stamp_v1(db, @notice_batching_pre_liveness_shape)
+        check_shape(db)
 
       {:ok, [[@terminal_decision_shape]]} ->
         :ok = migrate_notice_batching_v1_019(db, @terminal_decision_shape, true)
@@ -1232,9 +1248,11 @@ defmodule Tightbeam.Schema do
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
-        #{@effort_request_exit_previous_shape} to #{@shape}. It can also migrate
+        #{@effort_request_exit_previous_shape} to #{@deliverable_contract_previous_shape}.
+        It can also migrate
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
-        then #{@shape}.
+        then #{@deliverable_contract_previous_shape}. The deliverable contract
+        then advances that exact predecessor to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1275,7 +1293,7 @@ defmodule Tightbeam.Schema do
            Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityGuidanceDigest TEXT")
 
            Txn.q(txn, "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3", [
-             @shape,
+             @deliverable_contract_previous_shape,
              System.system_time(:millisecond),
              predecessor
            ])
@@ -1731,7 +1749,8 @@ defmodule Tightbeam.Schema do
   defp unstamped(db) do
     case DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'") do
       {:ok, []} ->
-        stamp(db)
+        :ok = stamp(db)
+        :fresh
 
       {:ok, [_ | _]} ->
         raise ShapeError, """

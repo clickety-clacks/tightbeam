@@ -209,7 +209,12 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
        ctx do
     for verb <- ["work-item-close", "work-item-fail", "work-item-icebox"] do
       item = work_item(ctx, true)
-      _prior = completed_fix(ctx, item.id)
+      prior = completed_fix(ctx, item.id)
+
+      params =
+        if verb == "work-item-close",
+          do: %{work_item_id: item.id, completion_attest_id: prior.closingAttestId},
+          else: %{work_item_id: item.id}
 
       # Dispose the item (its prior fix is closed, so zero open assignments).
       assert %{ok: true} =
@@ -218,7 +223,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
                  origin: "user:flynn",
                  principal: {:user, "flynn"},
                  session_key: nil,
-                 params: %{work_item_id: item.id}
+                 params: params
                })
 
       # Dispatching the refix flow against the disposed item is refused by the
@@ -281,9 +286,10 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   end
 
   defp completed_fix(ctx, work_item_id) do
-    assignment = assign(ctx, ctx.holder.session_key, work_item_id, "completed fix")
-    complete(ctx, ctx.holder.session_key, assignment.id)
-    assignment
+    assignment =
+      assign(ctx, ctx.holder.session_key, work_item_id, "completed fix", delivers_work_item: true)
+
+    complete(ctx, ctx.holder.session_key, assignment.id).assignment
   end
 
   defp assign(ctx, holder_key, work_item_id, subject, opts \\ []) do
@@ -298,7 +304,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       params: %{
         subject: subject,
         work_item_id: work_item_id,
-        reviews_assignment_id: opts[:reviews_assignment_id]
+        reviews_assignment_id: opts[:reviews_assignment_id],
+        delivers_work_item: Keyword.get(opts, :delivers_work_item, false)
       }
     })
   end

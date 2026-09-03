@@ -59,7 +59,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     host = Placement.local_host_name()
     parent = session(db, "parent", "h1", host)
-    holder = session(db, "holder", "h2", host, %{spawned_by: "parent"})
+    holder = session(db, "holder", "h1", host, %{spawned_by: "parent"})
     # The extra keys are what `Gateway.children_after_preflight/1` reads: the
     # notification drain uses the REAL prompt-wake child, not a test closure.
     config = %{
@@ -160,7 +160,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert {:error,
             %ArgumentError{message: "retirement interruption requires a durable principal"}} =
              DB.transaction(ctx.db, fn txn ->
-               Assignments.interrupt_for_retire_in_txn(txn, "holder", "h2", nil)
+               Assignments.interrupt_for_retire_in_txn(txn, "holder", "h1", nil)
              end)
 
     assert rows(ctx.db, "SELECT state FROM assignments WHERE id=?1", [retired.id]) == [["open"]]
@@ -170,7 +170,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     {:ok, _} =
       DB.transaction(ctx.db, fn txn ->
-        Assignments.interrupt_for_retire_in_txn(txn, "holder", "h2", "user:h2")
+        Assignments.interrupt_for_retire_in_txn(txn, "holder", "h1", "user:h1")
       end)
 
     assert bracket_state(ctx.db, retired.id) == "canceled"
@@ -1391,8 +1391,8 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert %{ok: true, host: "satellite"} =
              tune.(%{
-               origin: "user:h2",
-               principal: {:user, "h2"},
+               origin: "user:h1",
+               principal: {:user, "h1"},
                session_key: "holder",
                params: %{setting: "set_host", host: "satellite"}
              })
