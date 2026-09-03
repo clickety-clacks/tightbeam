@@ -4321,12 +4321,14 @@ defmodule Tightbeam.ConformanceTest do
     # green too, so it adds no class registration either.
     # The KUNGFU retirement-preservation guard adds one GREEN C1 fixture. It
     # raises the total and active counts only; the mechanism ships with it.
-    assert length(@fixtures) == 72
-    assert active_fixtures == 62
+    # Completion policy by archetype adds the GREEN C3 output-contract fixture
+    # and the GREEN C4 latest-linked-review fixture. Both mechanisms ship here.
+    assert length(@fixtures) == 74
+    assert active_fixtures == 64
     assert exact_skips == 10
-    assert activated_fixture_tests == 43
+    assert activated_fixture_tests == 44
     assert activated_class_tests == 5
-    assert activated_tests == 48
+    assert activated_tests == 49
   end
 
   # The structural guard for the defect this file used to carry: a catch-all clause
@@ -4375,7 +4377,7 @@ defmodule Tightbeam.ConformanceTest do
 
     # 52 since C4/holder-verdict-wins joined the corpus (fabric §13 Phase 0); 53
     # since C4/reopen-assignment-repair joined it (Sol xhigh review, finding 4).
-    assert Enum.count(entries, &(&1.scope == "fixture")) == 53
+    assert Enum.count(entries, &(&1.scope == "fixture")) == 54
 
     assert %{
              scope: "case",

@@ -294,6 +294,13 @@ If no reporting exception applies, record the one valid bounded checkpoint when 
 schedule a concrete continuation wake. Do not manufacture a generic progress attest.
 Completion remains the holder's truthful terminal receipt.
 
+The holder's archetype defines what completion must leave behind. A coordination archetype
+may complete after it records the durable coordination result. An artifact archetype records
+a reviewable artifact or exact commit reference and obtains the latest independent linked
+`reviewed-clean` verdict. A verdict archetype files its own reasoned verdict before completion;
+that verdict is its output and is never sent through review-of-review. `effectKind` describes
+the work's operational effect. It does not change this archetype output contract.
+
 A turn with neither a receipt nor a scheduled continuation is a stall. The substrate checks in
 on the holder and escalates unanswered check-ins to the session that spawned it. Workdir writes,
 recorded artifacts, assignment attests, and work-item updates remain the mechanical effect

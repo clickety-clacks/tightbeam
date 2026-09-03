@@ -18,7 +18,8 @@ defmodule Tightbeam.Assignments do
     Projection,
     Productions.CompletionEscalation,
     Supervision,
-    Wakes
+    Wakes,
+    Archetypes
   }
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
@@ -3863,6 +3864,7 @@ defmodule Tightbeam.Assignments do
       ", workItemId, reviewsAssignmentId, completionReportToSessionKey, holderHarness, holderProvider, " <>
       "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = assignments.id), " <>
       "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END), " <>
+      "(SELECT archetype FROM sessions WHERE sessionKey=assignments.holderKey), " <>
       "COALESCE((SELECT priority FROM assignment_priorities WHERE assignmentId=assignments.id), " <>
       "(SELECT priority FROM work_item_priorities WHERE workItemId=assignments.workItemId), " <>
       "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER))"
@@ -3890,6 +3892,7 @@ defmodule Tightbeam.Assignments do
          holder_harness,
          holder_provider,
          effect_kind,
+         holder_archetype,
          priority
        ]) do
     %{
@@ -3914,6 +3917,7 @@ defmodule Tightbeam.Assignments do
       holderHarness: holder_harness,
       holderProvider: holder_provider,
       effectKind: effect_kind,
+      outputKind: holder_archetype |> Archetypes.output_kind() |> Atom.to_string(),
       priority: priority
     }
   end

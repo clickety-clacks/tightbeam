@@ -1,4 +1,5 @@
 name = "coder"
+output_kind = "artifact"
 skills = ["worktree-session", "committing-and-pushing", "human-communication"]
 
 [guidance]

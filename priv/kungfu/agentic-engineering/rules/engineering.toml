@@ -1,6 +1,19 @@
 # "Pushing the product forwards is the goal of this kung-fu. No rule shall trump this rule. If there is a clear way forward, and that way forward is safe, then no rule, statute, or rail shall block it. If a rule, statute, or rail blocks this, it is necessarily wrong, and should be reported with a decision-request, but this DOES NOT BLOCK WORK. Get it done, and apologize later."
 
-# Flagship enforced loop (roadmap P7): producing effects require one independent review.
+# Artifact-producing archetypes first leave reviewable evidence. A reviewer must never be
+# commissioned for work that has no artifact or exact commit reference to inspect.
+[[rule]]
+name = "artifact-completion-requires-output"
+verb = "attest"
+text = "an artifact-producing archetype must record a reviewable artifact or commit reference before completion"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.holder_output_kind", op = "eq", value = "artifact" },
+  { fact = "assignment.has_reviewable_artifact", op = "eq", value = false },
+]
+edges = ["verb"]
+
+# Flagship enforced loop (roadmap P7): artifact-producing archetypes require one independent review.
 # A holder attesting qualifying completion without a reviewed-clean verdict is not denied — the
 # substrate assigns a reviewer (the remedy), blocks the completion until the review
 # lands, and self-releases. This is the reviewer-loop worked example, enforced.
@@ -13,7 +26,7 @@ edges = ["verb"]
 effect = "remedy"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
+  { fact = "assignment.holder_output_kind", op = "eq", value = "artifact" },
   { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
 [rule.remedy]
@@ -24,6 +37,17 @@ on_rule_denied = "surface"
 [rule.remedy.params]
 subject = "review of assignment {assignment_id}"
 reviews = "{assignment_id}"
+
+[[rule]]
+name = "verdict-completion-requires-holder-verdict"
+verb = "attest"
+text = "a verdict-producing archetype must file its own verdict before completion"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.holder_output_kind", op = "eq", value = "verdict" },
+  { fact = "assignment.holder_has_verdict", op = "eq", value = false },
+]
+edges = ["verb"]
 
 # Re-entry twin of completion-requires-review: after one completed fix on a bug
 # work item, the next implementation dispatch first commissions a dedicated

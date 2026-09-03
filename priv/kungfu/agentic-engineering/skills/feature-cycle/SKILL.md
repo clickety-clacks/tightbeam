@@ -19,6 +19,10 @@ them keep that two-step form.
 Keep only a handful of goals truly in-flight at once (see the kernel); this loop is
 per-feature, but your attention across features is the scarce resource.
 
+Completion follows the holder archetype. Coordinators record the coordination result.
+Producers record reviewable artifacts and obtain one independent clean review. Reviewers
+and recon sessions produce reasoned verdicts; never commission a review of that verdict.
+
 1. **Spec.** Spawn a spec-writer and assign it the spec:
    `tightbeam assign --subject "spec: <feature>" --role spec-writer --work-item <id>`.
    The spec states invariants first, a testable acceptance contract, open questions,

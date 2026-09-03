@@ -12,7 +12,10 @@ verb = "attest"
 text = "linked reviewed-clean from the review card's different-session holder releases completion"
 edges = ["verb", "turn-end"]
 effect = "remedy"
-deny_when = [{ fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] }]
+deny_when = [
+  { fact = "assignment.holder_output_kind", op = "eq", value = "artifact" },
+  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]
 [fixture.rule.remedy]
 action = "assign"
 produces = "reviewed-clean"

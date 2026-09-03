@@ -1,4 +1,5 @@
 name = "<name>-role"
+output_kind = "artifact"
 skills = []
 
 [guidance]

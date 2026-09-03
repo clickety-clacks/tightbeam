@@ -1,4 +1,5 @@
 name = "default"
+output_kind = "coordination"
 skills = ["tightbeam-onboarding"]
 
 [guidance]

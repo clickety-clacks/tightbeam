@@ -252,6 +252,31 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "completion output is an archetype property with an artifact fail-safe" do
+    expected = %{
+      "coder" => :artifact,
+      "orchestrator" => :coordination,
+      "product-owner" => :artifact,
+      "recon" => :verdict,
+      "reviewer" => :verdict,
+      "spec-writer" => :artifact
+    }
+
+    for {name, output_kind} <- expected do
+      path =
+        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/archetypes/#{name}.toml")
+
+      assert Archetypes.parse_manifest!(File.read!(path), path).output_kind == output_kind
+    end
+
+    assert Archetypes.parse_manifest!("name = \"custom\"\n", "custom.toml").output_kind ==
+             :artifact
+
+    assert_raise ArgumentError, ~r/output_kind must be coordination, artifact, or verdict/, fn ->
+      Archetypes.parse_manifest!("name = \"bad\"\noutput_kind = \"review\"\n", "bad.toml")
+    end
+  end
+
   test "the worktree skill preserves dirty repository work before retirement", ctx do
     Identity.init!(ctx.base_dir)
 

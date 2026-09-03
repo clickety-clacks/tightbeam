@@ -1,17 +1,17 @@
 [fixture]
 class = "C4"
-name = "review-link-independence-matrix"
+name = "latest-linked-review"
 phase = "pending"
 blocking_phase = "P3"
 kind = "dispatch-rule"
-source = "p3 §4A; guidance §6:independent-review; orchestrator:independence"
-legibility = "event:denied(rule=coder-completion-needs-independent-review)"
+source = "wi_032f11a6 latest linked review round"
+legibility = "event:denied(rule=latest-linked-review)"
 
 [[fixture.rule]]
-name = "coder-completion-needs-independent-review"
+name = "latest-linked-review"
 verb = "attest"
 external_producer = true
-text = "completion needs a linked reviewed-clean verdict by the review card's different-session holder"
+text = "the latest holder-filed linked review verdict governs artifact completion"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
   { fact = "assignment.holder_output_kind", op = "eq", value = "artifact" },

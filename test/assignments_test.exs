@@ -634,6 +634,7 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert reviewed.reviewsAssignmentId == nil
     assert reviewed.effectKind == "code"
+    assert reviewed.outputKind == "coordination"
     assert reviewed.holderHarness == "claude"
     assert reviewed.holderProvider == "anthropic"
 

@@ -913,6 +913,17 @@ defmodule Tightbeam.CliIntegrationTest do
     repo = Path.expand("..", __DIR__)
     {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
 
+    commit_refs =
+      JSON.encode!([
+        %{
+          "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
+          "commit" => String.trim(commit)
+        }
+      ])
+
+    completion_args =
+      ["attest", work_id, "--kind", "completion", "--commit-refs", commit_refs]
+
     {_receipt, 0} =
       System.cmd(
         ctx.binary,
@@ -973,7 +984,7 @@ defmodule Tightbeam.CliIntegrationTest do
     # A1 first denial: the completion is refused and the wake names the
     # missing verification verdict.
     {denied, denied_status} =
-      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -999,7 +1010,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     # A1 second denial: the artifact statute prods next, naming its own record.
     {denied_again, denied_again_status} =
-      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -1064,7 +1075,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     # A2: the papertrail stands — the completion passes and the episodes close.
     {completed, 0} =
-      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
         stderr_to_stdout: true
       )
