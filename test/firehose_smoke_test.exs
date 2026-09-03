@@ -20,7 +20,11 @@ defmodule Tightbeam.FirehoseSmokeTest do
   authoritative rebuild after every delivery. A5 slow-consumer
   4008/reconnect/rebuild is automated here. `Tightbeam.FirehoseRestartSmokeTest`
   keeps that Card 1 journey in the normal suite and adds automated A5 gateway-kill
-  recovery and A7 external-client restart proof on Linux and macOS CI.
+  recovery and A7 external-client restart proof on Linux and macOS CI. A6's
+  closed core-detail matrix is automated by
+  `Tightbeam.Firehose.CoreDetailA6Test`: every admitted class for the nine
+  canonical core routes compares raw notice payload bytes with raw REST item
+  bytes and proves exact refs, public shape, and structural secret exclusion.
   """
 
   test "acceptance fixture catalog matches its claimed session and preserves overrides" do
