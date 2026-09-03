@@ -9,6 +9,26 @@ defmodule Tightbeam.CredentialsTest do
     %{base: base}
   end
 
+  test "onboard_command names a CLI-valid recovery for every provider" do
+    # local-openai/opencode-go: the underscore atom form and a bare --as-user are rejected by
+    # `tightbeam onboard` (cli/src/args.rs); the remedy must be hyphenated and carry the flags
+    # each provider requires.
+    assert Credentials.onboard_command(:local_openai) ==
+             "tightbeam onboard local-openai --endpoint <endpoint-url> --name <provider-name> --as-user <userId>"
+
+    assert Credentials.onboard_command(:opencode_go) ==
+             "tightbeam onboard opencode-go --api-key --as-user <userId>"
+
+    refute Credentials.onboard_command(:local_openai) =~ "local_openai"
+    refute Credentials.onboard_command(:opencode_go) =~ "opencode_go"
+
+    # Providers whose atom already equals the CLI name and need no extra flags are unchanged.
+    assert Credentials.onboard_command(:anthropic) ==
+             "tightbeam onboard anthropic --as-user <userId>"
+
+    assert Credentials.onboard_command(:openai) == "tightbeam onboard openai --as-user <userId>"
+  end
+
   test "onboarding commits before the credential-present callback and success publication", ctx do
     owner = self()
 

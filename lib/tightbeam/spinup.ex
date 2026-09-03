@@ -253,7 +253,7 @@ defmodule Tightbeam.Spinup do
                       "#{target.host_name}. It does not use or import your normal " <>
                       "#{module.wire_name()} CLI login; Tightbeam keeps its own credential " <>
                       "under #{Path.dirname(auth_dir)}. Run on #{target.host_name}: " <>
-                      "tightbeam onboard #{credential_provider} --as-user <userId>"
+                      Tightbeam.Credentials.onboard_command(credential_provider)
 
                   {{:error, host_unready(message)},
                    "reached; directories ensured; #{adapter_detail}; DENIED: #{message}"}

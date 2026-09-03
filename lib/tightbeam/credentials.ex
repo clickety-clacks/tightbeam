@@ -314,6 +314,24 @@ defmodule Tightbeam.Credentials do
   defp provider_cli_name(:local_openai), do: "local-openai"
   defp provider_cli_name(provider), do: Atom.to_string(provider)
 
+  @doc """
+  A recovery hint must name a command the CLI actually accepts. Atom interpolation emits the
+  underscore form (`local_openai`), which `tightbeam onboard` rejects, and a bare `--as-user`
+  omits the flags a provider requires (`local-openai` needs `--endpoint` and `--name`;
+  `opencode-go` needs a credential source). This renders the hyphenated provider name plus the
+  provider's required flags with operator-supplied placeholders, so the emitted command parses.
+  """
+  def onboard_command(provider) when is_atom(provider) do
+    required =
+      case provider do
+        :local_openai -> " --endpoint <endpoint-url> --name <provider-name>"
+        :opencode_go -> " --api-key"
+        _ -> ""
+      end
+
+    "tightbeam onboard #{provider_cli_name(provider)}#{required} --as-user <userId>"
+  end
+
   # Each answer names the FIELD, not just "invalid": the operator reading this has a file in
   # front of them and needs to know which value went missing.
   defp hollow_oauth(oauth) do
