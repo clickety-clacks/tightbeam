@@ -514,6 +514,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
               "children_after_preflight/1"} => 2,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handlers/1"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
+              "execute_assignment_repair/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "notify_session/4"} => 1,
              # The fault bubble's notice enqueue (production-machine-v1): a
              # substrate-authored turn to the failing session's nearest active
@@ -538,7 +540,9 @@ defmodule Tightbeam.EscalationDeliveryTest do
              # private. Still exactly one turn sink; it simply has a name now.
              {"lib/tightbeam/gateway.ex", "Ledger.enqueue_in_txn/2",
               "append_and_enqueue_in_txn/7"} => 1,
-             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1
+             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1,
+             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "append_repair_attempt/5"} =>
+               1
            }
 
     # `Ledger.enqueue/2` has zero production call sites: the wrapper exists for

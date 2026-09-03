@@ -185,6 +185,17 @@ pub enum Command {
         identity: Identity,
         assignment_id: String,
     },
+    RepairAssignment {
+        identity: Identity,
+        assignment_id: String,
+        action: String,
+        model: Option<String>,
+        effort: Option<String>,
+        context: Option<String>,
+        outcome: Option<String>,
+        turn_seq: Option<String>,
+        idempotency_key: String,
+    },
     WorkItemCreate {
         identity: Identity,
         title: String,
@@ -590,6 +601,9 @@ COMMANDS:
       existing visibility rules.
   revoke-assignment <assignmentId>
       Revoke when the assignment handler already authorizes your principal.
+  repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
+      Repair a failed or never-launched holder without revoking its work.
+      tune also requires --model; rerun requires --outcome not-completed.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
@@ -1423,6 +1437,35 @@ fn parse_with_optional_catalog(
                 assignment_id: parsed.positional[1].clone(),
             })
         }
+        "repair-assignment" => {
+            let usage = "usage: tightbeam repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key> [--model <model> --effort <tier> --context <window>] [--outcome not-completed] [--turn <seq>]";
+            let action = nonempty(flags, "action");
+            let key = nonempty(flags, "key");
+            let allowed = ["tune", "restart", "rerun", "resume", "relaunch"];
+            if parsed.positional.len() != 2
+                || action
+                    .as_ref()
+                    .is_none_or(|value| !allowed.contains(&value.as_str()))
+                || key.is_none()
+            {
+                return Err(usage.to_owned());
+            }
+            if nonempty(flags, "outcome").is_some_and(|value| value != "not-completed") {
+                return Err("--outcome must be not-completed".to_owned());
+            }
+            Ok(Command::RepairAssignment {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                action: action.expect("checked above"),
+                model: nonempty(flags, "model"),
+                effort: nonempty(flags, "effort"),
+                context: nonempty(flags, "context"),
+                outcome: nonempty(flags, "outcome"),
+                turn_seq: nonempty(flags, "turn")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                idempotency_key: key.expect("checked above"),
+            })
+        }
         "work-item-create" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam work-item-create --title <title> [--spec-ref <name> --spec-sha256 <hex>]".to_owned());
@@ -1808,7 +1851,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2751,6 +2794,7 @@ mod tests {
                 "operator-rule",
                 "operator-withdraw",
                 "retire",
+                "repair-assignment",
                 "revoke-assignment",
                 "spawn",
                 "wake",
@@ -3310,7 +3354,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 

@@ -195,6 +195,40 @@ defmodule Tightbeam.HarnessHealthTest do
     assert HarnessHealth.classify_turn_failure(%{"message" => "model not found"}) == nil
   end
 
+  test "captured terminal errors preserve every typed repair class" do
+    assert HarnessHealth.classify_turn_failure(%{"message" => "model unavailable"}) ==
+             "model_unavailable"
+
+    assert HarnessHealth.classify_turn_failure(%{code: "adapter_unavailable"}) ==
+             "adapter_unavailable"
+
+    assert HarnessHealth.classify_turn_failure(:task_crash) == "task_crash"
+
+    assert HarnessHealth.classify_turn_failure("interrupted: outcome unknown") ==
+             "interrupted-outcome-unknown"
+  end
+
+  test "each incident exposes its sanctioned repair route", ctx do
+    [member | _] = ctx.sessions
+
+    expected = %{
+      "adapter_unavailable" => "restart",
+      "model_unavailable" => "tune",
+      "task_crash" => "restart",
+      "interrupted-outcome-unknown" => "rerun"
+    }
+
+    Enum.each(expected, fn {failure_class, action} ->
+      assert {:opened, opened} =
+               HarnessHealth.observe(
+                 ctx.db,
+                 authoritative(member, failure_class, 50, "route-#{failure_class}")
+               )
+
+      assert HarnessHealth.get(ctx.db, opened.id).repair.action == action
+    end)
+  end
+
   test "provider invalidation emits one consolidated auth blocker while rate limiting emits none",
        ctx do
     main_key = ctx.main_session
