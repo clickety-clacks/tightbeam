@@ -670,9 +670,11 @@ defmodule Tightbeam.Identity do
     expected_prior = git_output!(dir, ["rev-parse", @live])
     upstream_prior = git_output!(dir, ["rev-parse", @upstream])
     learned = learned_bundle_names(dir)
+    available = MapSet.new(available_bundle_names())
+    retained = Enum.filter(learned, &MapSet.member?(available, &1))
     names = ["neutral-identity" | learned]
     message = "relearn: #{Enum.join(names, ", ")}"
-    import_upstream!(dir, learned, message)
+    import_upstream!(dir, retained, message)
 
     merge_upstream(dir, message, author, expected_prior, upstream_prior, fn ->
       refresh_receipts!(dir, learned)
@@ -724,7 +726,8 @@ defmodule Tightbeam.Identity do
 
   @doc "Compare learned kungfu's imported baseline with this build's shipped bundles."
   @spec shipped_kungfu_status(String.t()) ::
-          {:ok, %{current: [String.t()], stale: [String.t()]}} | {:error, String.t()}
+          {:ok, %{current: [String.t()], removed: [String.t()], stale: [String.t()]}}
+          | {:error, String.t()}
   def shipped_kungfu_status(base_dir) do
     dir = identity_dir(base_dir)
 
@@ -741,7 +744,12 @@ defmodule Tightbeam.Identity do
       {current, updated} =
         Enum.split_with(shipped, &shipped_bundle_current?(dir, live, upstream, &1))
 
-      {:ok, %{current: Enum.sort(current), stale: Enum.sort(updated ++ removed)}}
+      {:ok,
+       %{
+         current: Enum.sort(current),
+         removed: Enum.sort(removed),
+         stale: Enum.sort(updated ++ removed)
+       }}
     else
       {:error, "#{dir} is not an identity repository"}
     end
@@ -1163,9 +1171,16 @@ defmodule Tightbeam.Identity do
   defp refresh_receipts_for_merge!(_dir, _subject), do: :ok
 
   defp refresh_receipts!(dir, names) do
-    Enum.each(names, fn name ->
+    available = MapSet.new(available_bundle_names())
+    {retained, removed} = Enum.split_with(names, &MapSet.member?(available, &1))
+
+    Enum.each(retained, fn name ->
       write_receipt!(dir, current_bundle_receipt(dir, name))
     end)
+
+    removed_paths = Enum.map(removed, &receipt_path/1)
+    Enum.each(removed_paths, &File.rm!(Path.join(dir, &1)))
+    remove_empty_parent_dirs!(dir, removed_paths)
   end
 
   defp current_bundle_receipt(dir, name) do

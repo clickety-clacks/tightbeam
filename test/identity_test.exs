@@ -220,16 +220,67 @@ defmodule Tightbeam.IdentityTest do
     before_refs = git!(dir, ["show-ref"])
     before_status = git!(dir, ["status", "--porcelain"])
 
-    assert {:ok, %{current: ["agentic-engineering"], stale: ["retired-kungfu"]}} =
+    assert {:ok,
+            %{
+              current: ["agentic-engineering"],
+              removed: ["retired-kungfu"],
+              stale: ["retired-kungfu"]
+            }} =
              Identity.shipped_kungfu_status(ctx.base)
 
     File.write!(Path.join(ctx.source, "intake.md"), "updated shipped intake\n")
 
-    assert {:ok, %{current: [], stale: ["agentic-engineering", "retired-kungfu"]}} =
+    assert {:ok,
+            %{
+              current: [],
+              removed: ["retired-kungfu"],
+              stale: ["agentic-engineering", "retired-kungfu"]
+            }} =
              Identity.shipped_kungfu_status(ctx.base)
 
     assert git!(dir, ["show-ref"]) == before_refs
     assert git!(dir, ["status", "--porcelain"]) == before_status
+  end
+
+  test "relearn removes a receipt whose shipped kungfu bundle no longer exists", ctx do
+    assert {:ok, _revision} = Identity.learn!(ctx.base, "agentic-engineering", "operator")
+    dir = Path.join(ctx.base, "identity")
+    removed_path = Path.join(dir, "guidance/retired.md")
+    removed_receipt = Path.join(dir, "kungfu/retired-kungfu/installed.toml")
+
+    git!(dir, ["switch", "tightbeam/upstream"])
+    File.write!(removed_path, "retired shipped guidance\n")
+    git!(dir, ["add", "--", "guidance/retired.md"])
+    git!(dir, ["commit", "-m", "fixture: ship retired kungfu"], "tightbeam")
+    git!(dir, ["switch", "main"])
+
+    git!(
+      dir,
+      ["merge", "--no-ff", "tightbeam/upstream", "-m", "fixture: learn retired kungfu"],
+      "operator"
+    )
+
+    File.mkdir_p!(Path.dirname(removed_receipt))
+
+    File.write!(
+      removed_receipt,
+      ~s(name = "retired-kungfu"\npaths = ["guidance/retired.md"]\n)
+    )
+
+    git!(dir, ["add", "--", "kungfu/retired-kungfu/installed.toml"])
+    git!(dir, ["commit", "-m", "fixture: retain removed kungfu receipt"], "operator")
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", "HEAD"])
+
+    assert {:ok, %{removed: ["retired-kungfu"], stale: ["retired-kungfu"]}} =
+             Identity.shipped_kungfu_status(ctx.base)
+
+    assert {:ok, revision} = relearn!(ctx.base, "operator")
+    assert revision == Identity.live_revision!(ctx.base)
+    refute File.exists?(removed_path)
+    refute File.exists?(removed_receipt)
+
+    assert {:ok, %{current: ["agentic-engineering"], removed: [], stale: []}} =
+             Identity.shipped_kungfu_status(ctx.base)
   end
 
   test "a manifest with invalid phrases is refused before identity mutation", ctx do

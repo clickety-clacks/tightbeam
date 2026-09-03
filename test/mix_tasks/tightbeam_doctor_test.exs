@@ -4,6 +4,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
   import Tightbeam.TestCase, only: [catalog_reply: 1]
 
   alias Mix.Tasks.Tightbeam.Doctor
+  alias Tightbeam.Identity
 
   setup do
     base_dir =
@@ -353,7 +354,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
       put(
         ctx.inputs,
         :kungfu_status,
-        {:ok, %{current: [], stale: ["agentic-engineering"]}}
+        {:ok, %{current: [], removed: [], stale: ["agentic-engineering"]}}
       )
 
     {0, %{ready: true} = report} = Doctor.evaluate(ctx.catalog, inputs)
@@ -365,6 +366,46 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     assert row.fix =~ "Ask the user"
     assert row.fix =~ "Run tightbeam identity relearn now?"
     assert row.fix =~ "never auto-relearn"
+  end
+
+  test "removed shipped kungfu warns truthfully and the offered relearn succeeds", ctx do
+    base_dir = Path.join(ctx.base_dir, "removed-kungfu")
+    assert :initialized = Identity.init!(base_dir)
+    assert {:ok, candidate} = Identity.learn!(base_dir, "agentic-engineering", "operator")
+    assert {:ok, _revision} = Identity.publish_live!(base_dir, candidate)
+
+    identity_dir = Path.join(base_dir, "identity")
+    removed_receipt = Path.join(identity_dir, "kungfu/retired-kungfu/installed.toml")
+    File.mkdir_p!(Path.dirname(removed_receipt))
+    File.write!(removed_receipt, ~s(name = "retired-kungfu"\npaths = []\n))
+    git!(identity_dir, ["add", "--", "kungfu/retired-kungfu/installed.toml"])
+    git!(identity_dir, ["commit", "-m", "fixture: retain removed kungfu receipt"], "operator")
+    git!(identity_dir, ["update-ref", "refs/heads/tightbeam/live", "HEAD"])
+    before_refs = git!(identity_dir, ["show-ref"])
+    before_status = git!(identity_dir, ["status", "--porcelain"])
+
+    inputs =
+      ctx.inputs
+      |> Keyword.delete(:kungfu_status)
+      |> put(:base_dir, base_dir)
+
+    {0, %{ready: true} = report} = Doctor.evaluate(ctx.catalog, inputs)
+    row = find(report, "shipped_kungfu")
+
+    refute row.ok
+    assert row.level == :warn
+    assert row.detail == "learned kungfu is no longer shipped by this build: retired-kungfu"
+    refute row.detail =~ "updated"
+    refute row.detail =~ "available"
+    assert row.fix =~ "This Tightbeam build no longer ships retired-kungfu."
+    assert row.fix =~ "Run tightbeam identity relearn now?"
+    assert row.fix =~ "never auto-relearn"
+    assert git!(identity_dir, ["show-ref"]) == before_refs
+    assert git!(identity_dir, ["status", "--porcelain"]) == before_status
+
+    assert {:ok, candidate} = Identity.relearn!(base_dir, "operator")
+    assert {:ok, _revision} = Identity.publish_live!(base_dir, candidate)
+    refute File.exists?(removed_receipt)
   end
 
   # AC5, doctor's half: an installed-but-unrunnable harness (on PATH but fails to
@@ -423,5 +464,22 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     |> String.split("\n")
     |> Enum.drop_while(&String.starts_with?(&1, "//"))
     |> Enum.join("\n")
+  end
+
+  defp git!(dir, args, author \\ nil) do
+    env =
+      if author,
+        do: [
+          {"GIT_AUTHOR_NAME", author},
+          {"GIT_AUTHOR_EMAIL", "test@tightbeam.invalid"},
+          {"GIT_COMMITTER_NAME", author},
+          {"GIT_COMMITTER_EMAIL", "test@tightbeam.invalid"}
+        ],
+        else: []
+
+    case System.cmd("git", args, cd: dir, env: env, stderr_to_stdout: true) do
+      {output, 0} -> String.trim_trailing(output)
+      {output, status} -> raise "git failed #{status}: #{output}"
+    end
   end
 end

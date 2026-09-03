@@ -417,6 +417,19 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     check("shipped_kungfu", true, "learned kungfu matches this Tightbeam build", "")
   end
 
+  defp kungfu_check({:ok, %{stale: stale, removed: removed}}) do
+    updated = stale -- removed
+    detail = kungfu_change_detail(updated, removed)
+    offer = kungfu_relearn_offer(updated, removed)
+
+    warning(
+      "shipped_kungfu",
+      detail,
+      "Ask the user: “#{offer} Run tightbeam identity relearn now?” " <>
+        "Run it only after the user says yes; never auto-relearn."
+    )
+  end
+
   defp kungfu_check({:ok, %{stale: stale}}) do
     names = Enum.join(stale, ", ")
 
@@ -435,6 +448,26 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
       "not verified: #{reason}",
       "Repair the identity repository, then run tightbeam doctor again."
     )
+  end
+
+  defp kungfu_change_detail(updated, []),
+    do: "updated shipped kungfu is available for: #{Enum.join(updated, ", ")}"
+
+  defp kungfu_change_detail([], removed),
+    do: "learned kungfu is no longer shipped by this build: #{Enum.join(removed, ", ")}"
+
+  defp kungfu_change_detail(updated, removed) do
+    kungfu_change_detail(updated, []) <> "; " <> kungfu_change_detail([], removed)
+  end
+
+  defp kungfu_relearn_offer(updated, []),
+    do: "Updated Tightbeam kungfu is available for #{Enum.join(updated, ", ")}."
+
+  defp kungfu_relearn_offer([], removed),
+    do: "This Tightbeam build no longer ships #{Enum.join(removed, ", ")}."
+
+  defp kungfu_relearn_offer(updated, removed) do
+    kungfu_relearn_offer(updated, []) <> " " <> kungfu_relearn_offer([], removed)
   end
 
   defp advertised_url_check(url) when is_binary(url) do
