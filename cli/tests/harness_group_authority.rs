@@ -41,6 +41,9 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
         .expect("the harness session launcher must start");
 
     let leader_identity = await_identity(&identity_path);
+    // Own teardown from the moment the group identity is known, so a failing assertion below still
+    // reaps it on unwind.
+    let _reaper = DetachedGroup(leader_identity.pgid);
 
     let floor_script = script(
         &dir,
@@ -66,7 +69,6 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
 
     let _ = harness.kill();
     let _ = harness.wait();
-    reap_detached_group(leader_identity.pgid);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -100,6 +102,9 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
         .expect("the harness session launcher must start");
 
     let leader_identity = await_identity(&identity_path);
+    // Own teardown from the moment the group identity is known, so a failing assertion below still
+    // reaps it on unwind.
+    let _reaper = DetachedGroup(leader_identity.pgid);
 
     let floor = Command::new(binary)
         .args([
@@ -123,7 +128,6 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
 
     let _ = harness.kill();
     let _ = harness.wait();
-    reap_detached_group(leader_identity.pgid);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -142,6 +146,18 @@ struct Identity {
 fn reap_detached_group(pgid: libc::pid_t) {
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
+    }
+}
+
+/// Owns teardown of the detached leader group unconditionally. A test asserts after identity
+/// capture, so a failing assertion unwinds before any explicit teardown line — leaving the leader
+/// alive under PID 1 on the regression path. Holding the group in a drop guard reaps it whether the
+/// test returns normally or panics, so no code path pollutes developer and CI hosts.
+struct DetachedGroup(libc::pid_t);
+
+impl Drop for DetachedGroup {
+    fn drop(&mut self) {
+        reap_detached_group(self.0);
     }
 }
 
