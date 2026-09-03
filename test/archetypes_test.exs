@@ -91,11 +91,10 @@ defmodule Tightbeam.ArchetypesTest do
 
   test "served neutral identity excludes engineering vocabulary", ctx do
     assert :initialized = Identity.init!(ctx.base_dir)
-    archetypes = Archetypes.load!(ctx.base_dir)
 
     forbidden = [
       {"worktree", ~r/\bworktrees?\b/i},
-      {"branch", ~r/\bbranches?\b/i},
+      {"branch", ~r/\bbranch(es)?\b/i},
       {"spec", ~r/\bspecs?\b/i},
       {"feature", ~r/\bfeatures?\b/i},
       {"bug", ~r/\bbugs?\b/i},
@@ -104,16 +103,37 @@ defmodule Tightbeam.ArchetypesTest do
       {"coder", ~r/\bcoders?\b/i}
     ]
 
+    for {concept, pattern} <- forbidden do
+      assert Regex.match?(pattern, concept),
+             "forbidden pattern does not match its singular concept #{concept}"
+    end
+
+    assert Regex.match?(
+             forbidden
+             |> Enum.find_value(fn
+               {"branch", pattern} -> pattern
+               _ -> nil
+             end),
+             "branches"
+           )
+
+    baseline_skill_names = Tightbeam.Homes.baseline_skill_names()
+    assert length(baseline_skill_names) == 9
+
+    baseline_skill_bodies =
+      Enum.map(baseline_skill_names, fn skill ->
+        Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
+        |> File.read!()
+      end)
+
     for role <- ~w(avasarala default exec miller), harness <- [:claude, :codex] do
       snapshot = Identity.snapshot!(ctx.base_dir, role, harness)
 
-      skill_bodies =
-        Enum.map(archetypes[role].skills, fn skill ->
-          Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
-          |> File.read!()
-        end)
-
-      served = Enum.join([snapshot.guidance | Map.values(snapshot.skills) ++ skill_bodies], "\n")
+      served =
+        Enum.join(
+          [snapshot.guidance | Map.values(snapshot.skills) ++ baseline_skill_bodies],
+          "\n"
+        )
 
       for {concept, pattern} <- forbidden do
         refute Regex.match?(pattern, served),

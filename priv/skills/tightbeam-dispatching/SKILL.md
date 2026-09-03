@@ -8,7 +8,7 @@ obligation as a row — `tightbeam assign --subject "..."
 (--session K | --role R) [--work-item <id>]` — and wake the worker
 with a brief of AT MOST ONE SENTENCE plus the references:
 
-    tightbeam wake --role coder:x --prompt \
+    tightbeam wake --session "agent:role:name" --prompt \
       "You hold asg_123 (wi_456): fix the picker titles — read the \
       assignment, its attests, and the work-item from the substrate."
 
