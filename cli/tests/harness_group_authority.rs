@@ -145,16 +145,20 @@ fn gone_leader_leaves_nothing_without_unowned_signal() {
     let mut session = OwnedSession::arm(harness, &dir);
     let wrapper_pid = session.harness.id() as libc::pid_t;
 
-    // Bounded acquisition attempt. Whether or not harness-exec wrote an identity for the already-dead
-    // leader, `adopt` finds it gone, so no leader is ever adopted.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if let Some(identity) = read_identity(&identity_path) {
-            let _outcome = session.adopt(&identity);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // Make the leader's exit OBSERVABLE before adoption. harness-exec writes the identity just before
+    // `exec`ing the immediate-exit program, so the recorded pid can still be alive when the identity
+    // first becomes readable. Waiting until that exact pid is gone turns this into a deterministic
+    // `Gone` case instead of a race against a leader that may briefly outlive its identity write.
+    let identity = await_identity(&identity_path);
+    assert!(
+        wait_gone(identity.pid),
+        "the immediate-exit leader must become observably gone before adoption"
+    );
+    assert_eq!(
+        session.adopt(&identity),
+        AdoptOutcome::Gone,
+        "a leader that has already exited must adopt as Gone"
+    );
 
     assert!(
         session.leader.is_none(),
@@ -225,15 +229,16 @@ fn owned_session_reaps_live_leader_on_unwind() {
 fn a_gone_instance_is_never_signalled_even_when_its_pid_is_reused() {
     let binary = env!("CARGO_BIN_EXE_tightbeam");
 
-    // A live decoy leader we must NOT kill.
-    let (decoy_dir, mut decoy_wrapper, decoy) = launch_single_process_leader(binary, "decoy");
-    // A victim leader: capture its instance handle, then kill it so the pidfd refers to a GONE instance.
-    let (victim_dir, mut victim_wrapper, victim) = launch_single_process_leader(binary, "victim");
-    let victim_pidfd = pidfd_open(victim.pid).expect("victim pidfd must open while it is live");
-    // Kill the victim directly through its own pidfd and reap its wrapper.
-    let _ = pidfd_kill(&victim_pidfd);
-    let _ = victim_wrapper.kill();
-    let _ = victim_wrapper.wait();
+    // Both sessions take teardown ownership at spawn (an `OwnedSession` each), BEFORE any identity
+    // acquisition or assertion below, so a panic anywhere in this control still reaps every wrapper,
+    // leader, and scratch dir on unwind — no manual cleanup, nothing to leak.
+    let (decoy_session, decoy_pid) = launch_owned_leader(binary, "decoy");
+
+    let (victim_session, victim_pid) = launch_owned_leader(binary, "victim");
+    // A pidfd bound to the victim instance, captured while it is live and kept past the victim's death.
+    let victim_pidfd = pidfd_open(victim_pid).expect("victim pidfd must open while it is live");
+    // Reap the victim: its own guard SIGKILLs it directly, waits its wrapper, and removes its scratch.
+    drop(victim_session);
     let deadline = Instant::now() + Duration::from_secs(5);
     while pidfd_kill(&victim_pidfd).is_ok() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
@@ -241,7 +246,7 @@ fn a_gone_instance_is_never_signalled_even_when_its_pid_is_reused() {
 
     // Token: numeric pid = LIVE decoy, instance handle = DEAD victim.
     let token = LeaderToken {
-        pid: decoy.pid,
+        pid: decoy_pid,
         pidfd: victim_pidfd,
     };
 
@@ -259,18 +264,17 @@ fn a_gone_instance_is_never_signalled_even_when_its_pid_is_reused() {
     // Give any errant signal time to land, then require the decoy to still be alive.
     std::thread::sleep(Duration::from_millis(300));
     assert!(
-        !is_gone(decoy.pid),
+        !is_gone(decoy_pid),
         "the live decoy sharing the token's pid must survive — pidfd excludes instance reuse"
     );
 
-    // Cleanup: reap the decoy directly and both wrappers/scratch dirs.
-    let decoy_pidfd = pidfd_open(decoy.pid).expect("decoy pidfd for cleanup");
-    let _ = pidfd_kill(&decoy_pidfd);
-    let _ = decoy_wrapper.kill();
-    let _ = decoy_wrapper.wait();
-    let _ = fs::remove_dir_all(&decoy_dir);
-    let _ = fs::remove_dir_all(&victim_dir);
-    assert!(wait_gone(decoy.pid), "decoy must be cleaned up");
+    // The decoy's guard reaps it (directly, then its wrapper and scratch) here — and equally on any
+    // panic above, since it owned teardown from spawn.
+    drop(decoy_session);
+    assert!(
+        wait_gone(decoy_pid),
+        "the decoy must be reaped by its guard"
+    );
 }
 
 /// Shared body for the return/unwind proofs: launch a real single-process detached leader that stays
@@ -343,8 +347,12 @@ fn spawn_sleep_leader(binary: &str, identity_path: &std::path::Path) -> Child {
     spawn_leader(binary, identity_path, &["/bin/sleep", LEADER_SECONDS])
 }
 
-/// Launch a live single-process leader and return its scratch dir, wrapper child, and identity.
-fn launch_single_process_leader(binary: &str, tag: &str) -> (std::path::PathBuf, Child, Identity) {
+/// Launch a live single-process leader already OWNED by an armed+adopted `OwnedSession`, returning the
+/// guard and the leader pid. Ownership of the wrapper and scratch dir exists from the instant the
+/// wrapper is spawned (before `await_identity`), and the leader is adopted for direct pidfd reaping, so
+/// the caller can perform fallible steps knowing a panic will still reap the wrapper, leader, and
+/// scratch on unwind.
+fn launch_owned_leader(binary: &str, tag: &str) -> (OwnedSession, libc::pid_t) {
     let dir = std::env::temp_dir().join(format!(
         "tightbeam-harness-group-{tag}-{}-{:?}",
         std::process::id(),
@@ -354,8 +362,14 @@ fn launch_single_process_leader(binary: &str, tag: &str) -> (std::path::PathBuf,
     fs::create_dir_all(&dir).unwrap();
     let identity_path = dir.join("leader.identity");
     let harness = spawn_sleep_leader(binary, &identity_path);
+    let mut session = OwnedSession::arm(harness, &dir);
     let identity = await_identity(&identity_path);
-    (dir, harness, identity)
+    assert_eq!(
+        session.adopt(&identity),
+        AdoptOutcome::Adopted,
+        "a live leader must adopt as birth-verified"
+    );
+    (session, identity.pid)
 }
 
 /// True iff the pid is gone: `kill(pid, 0)` fails with `ESRCH`. Numeric and reuse-prone; used only for
