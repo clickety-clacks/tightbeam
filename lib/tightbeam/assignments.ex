@@ -145,13 +145,10 @@ defmodule Tightbeam.Assignments do
   CREATE TABLE IF NOT EXISTS assignment_revocation_generations (
     revocationId TEXT PRIMARY KEY REFERENCES assignment_revocations(id),
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
-    reopeningId TEXT NULL
+    reopeningId TEXT NULL CHECK(reopeningId IS NULL)
   );
   CREATE UNIQUE INDEX IF NOT EXISTS assignment_revocation_generation_initial
     ON assignment_revocation_generations (assignmentId) WHERE reopeningId IS NULL;
-  CREATE UNIQUE INDEX IF NOT EXISTS assignment_revocation_generation_reopened
-    ON assignment_revocation_generations (assignmentId, reopeningId)
-    WHERE reopeningId IS NOT NULL;
 
   CREATE TRIGGER IF NOT EXISTS assignment_revocations_immutable_update
   BEFORE UPDATE ON assignment_revocations
