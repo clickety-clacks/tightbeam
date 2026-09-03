@@ -17,7 +17,7 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, Wakes}
   alias Tightbeam.DB.Txn
 
   require Logger
@@ -334,21 +334,39 @@ defmodule Tightbeam.Ledger do
   def fail_unclaimable(db \\ Tightbeam.DB, session_key, reason) do
     {:ok, seqs} =
       DB.transaction(db, fn txn ->
-        txn
-        |> Txn.q(
-          """
-          UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
-          WHERE sessionKey = ?1 AND status = 'queued'
-            AND NOT EXISTS (
-              SELECT 1 FROM sessions AS s
-              WHERE s.sessionKey = ?1 AND s.state = 'active'
-            )
-          RETURNING seq
-          """,
-          [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
-        )
-        |> Enum.map(&hd/1)
-        |> Enum.sort()
+        seqs =
+          txn
+          |> Txn.q(
+            """
+            UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
+            WHERE sessionKey = ?1 AND status = 'queued'
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions AS s
+                WHERE s.sessionKey = ?1 AND s.state = 'active'
+              )
+            RETURNING seq
+            """,
+            [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
+          )
+          |> Enum.map(&hd/1)
+          |> Enum.sort()
+
+        Enum.each(seqs, fn seq ->
+          Wakes.settle_terminal_in_txn(
+            txn,
+            seq,
+            "failed",
+            unclaimable_error(reason),
+            %{
+              failure_class:
+                if(reason == :no_session, do: "could_not_run", else: "carrier_canceled"),
+              wake_cause_kind: "recipient_unclaimable",
+              wake_cause_id: "session:#{session_key}:#{reason}"
+            }
+          )
+        end)
+
+        seqs
       end)
 
     seqs
@@ -387,7 +405,10 @@ defmodule Tightbeam.Ledger do
       [seq, terminal, now, error]
     )
 
-    Txn.changes(txn) == 1
+    won = Txn.changes(txn) == 1
+
+    if won, do: Wakes.settle_terminal_in_txn(txn, seq, terminal, error)
+    won
   end
 
   @doc """
@@ -415,7 +436,17 @@ defmodule Tightbeam.Ledger do
       [session_key, System.system_time(:millisecond), reason]
     )
 
-    Enum.map(rows, &hd/1)
+    seqs = Enum.map(rows, &hd/1)
+
+    Enum.each(seqs, fn seq ->
+      Wakes.settle_terminal_in_txn(txn, seq, "canceled", reason, %{
+        failure_class: "carrier_canceled",
+        wake_cause_kind: "recipient_retired",
+        wake_cause_id: "session:#{session_key}"
+      })
+    end)
+
+    seqs
   end
 
   @doc """
@@ -441,6 +472,20 @@ defmodule Tightbeam.Ledger do
           """,
           [now]
         )
+
+        Enum.each(seqs, fn seq ->
+          Wakes.settle_terminal_in_txn(
+            txn,
+            seq,
+            "failed_unknown",
+            "interrupted: outcome unknown",
+            %{
+              failure_class: "outcome_unknown",
+              wake_cause_kind: "boot_recovery",
+              wake_cause_id: "turn:#{seq}"
+            }
+          )
+        end)
 
         seqs
       end)

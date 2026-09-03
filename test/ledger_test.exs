@@ -1,7 +1,7 @@
 defmodule Tightbeam.LedgerTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger}
+  alias Tightbeam.{DB, Gateway, Ledger, Wakes}
 
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
@@ -66,6 +66,80 @@ defmodule Tightbeam.LedgerTest do
 
     assert :ok = Ledger.finish(db, t.seq, "delivered")
     assert :already_terminal = Ledger.finish(db, t.seq, "failed")
+  end
+
+  test "a wake carrier commits admission and one durable terminal outcome", %{db: db} do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "user:flynn",
+        prompt: "preserve this intent",
+        due_at: 1
+      })
+
+    assert {:ok, {:appended, "k1", _message, _opts}} =
+             DB.transaction(db, fn txn ->
+               Gateway.deliver_prompt_in_txn(txn, "k1", wake.origin, wake.prompt,
+                 sender: wake.origin,
+                 wake_id: wake.wake_id,
+                 wake_record: wake,
+                 target_gate: wake,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert %{state: "fired", latest_outcome: "admitted", attempt_count: 1} =
+             Wakes.delivery_status(db, wake.wake_id)
+
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "wake-test")
+    assert :ok = Ledger.finish(db, turn.seq, "failed_unknown", "runner disappeared")
+
+    assert %{
+             state: "fired",
+             latest_outcome: "undeliverable",
+             attempt_count: 1,
+             turn_seq: turn_seq,
+             next_retry_at: nil,
+             failure_class: "outcome_unknown",
+             outcomes: outcomes
+           } = Wakes.delivery_status(db, wake.wake_id)
+
+    assert turn_seq == turn.seq
+    assert Enum.map(outcomes, & &1.kind) == ~w(attempt admitted failed undeliverable)
+    assert Enum.all?(outcomes, &(&1.principal == "process:tightbeam"))
+    assert :already_terminal = Ledger.finish(db, turn.seq, "delivered")
+
+    assert Enum.map(Wakes.delivery_status(db, wake.wake_id).outcomes, & &1.kind) ==
+             ~w(attempt admitted failed undeliverable)
+  end
+
+  test "a delivered wake carrier becomes handled exactly once", %{db: db} do
+    wake =
+      Wakes.schedule(db, %{
+        session_key: "k1",
+        origin: "user:flynn",
+        prompt: "finish this intent",
+        due_at: 1
+      })
+
+    assert {:ok, {:appended, "k1", _message, _opts}} =
+             DB.transaction(db, fn txn ->
+               Gateway.deliver_prompt_in_txn(txn, "k1", wake.origin, wake.prompt,
+                 sender: wake.origin,
+                 wake_id: wake.wake_id,
+                 wake_record: wake,
+                 target_gate: wake,
+                 fire_wake_in_txn: true
+               )
+             end)
+
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "wake-test")
+    assert :ok = Ledger.finish(db, turn.seq, "delivered")
+
+    assert %{latest_outcome: "handled", failure_class: nil, outcomes: outcomes} =
+             Wakes.delivery_status(db, wake.wake_id)
+
+    assert Enum.map(outcomes, & &1.kind) == ~w(attempt admitted handled)
   end
 
   test "wakeId dedupe: at-least-once attempts, exactly-once enqueue", %{db: db} do

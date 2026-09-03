@@ -1,7 +1,7 @@
 defmodule Tightbeam.Productions.BubbleTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, HarnessHealth, Ledger, Model, Org}
+  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, HarnessHealth, Ledger, Model, Org, Wakes}
   alias Tightbeam.Productions.Bubble
 
   defmodule LaneDoorbell do
@@ -85,6 +85,32 @@ defmodule Tightbeam.Productions.BubbleTest do
       )
 
     rows
+  end
+
+  test "a failed carrier bubble names the wake whose intent it carried", ctx do
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "user:flynn",
+        prompt: "carry me",
+        due_at: 1
+      })
+
+    assert :appended =
+             Tightbeam.Gateway.deliver_prompt("holder", wake.origin, wake.prompt,
+               db: ctx.db,
+               sender: wake.origin,
+               wake_id: wake.wake_id,
+               wake_record: wake,
+               target_gate: wake,
+               fire_wake_in_txn: true
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "wake-bubble")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed", "adapter rejected the run")
+    assert :ok = Bubble.recognize_terminal(ctx.db, turn.seq)
+    assert [[_seq, _request_ref, _dedupe, _origin, prompt]] = notice_turn(ctx.db, "supervisor")
+    assert prompt =~ "Wake #{wake.wake_id} carried by turn #{turn.seq}"
   end
 
   test "a spawned session's failed turn produces one deduped notice to its parent", ctx do

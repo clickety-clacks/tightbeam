@@ -246,13 +246,18 @@ defmodule Tightbeam.Gateway do
                 [
                   db: db,
                   wake_id: wake.wake_id,
+                  wake_record: wake,
                   sender: wake.origin,
+                  target_gate: wake,
+                  fire_wake_in_txn: true,
                   role_ref: role,
                   role_fallback: fallback
                 ] ++ delivery_config
               )
 
             {:error, %{code: "unknown_role"}} ->
+              Wakes.mark_target_unresolvable(db, wake)
+
               :ok =
                 EventLog.lifecycle(
                   db,
@@ -272,11 +277,12 @@ defmodule Tightbeam.Gateway do
             [
               db: db,
               wake_id: wake.wake_id,
+              wake_record: wake,
               sender: wake.origin,
               # targetGate = 0 (decision notifications) delivers to the recorded
               # sessionKey unconditionally; every other wake keeps its gate.
               target_gate: if(wake.target_gate == 0, do: nil, else: wake),
-              fire_wake_in_txn: wake.origin == "process:tightbeam"
+              fire_wake_in_txn: true
             ] ++ delivery_config
           )
       end
@@ -677,6 +683,7 @@ defmodule Tightbeam.Gateway do
             wake_result(config, db, call)
         end
       end,
+      "wake-get" => fn call -> wake_status_result(db, call) end,
       "condition" => fn call ->
         p = call.params
 
@@ -1116,8 +1123,10 @@ defmodule Tightbeam.Gateway do
 
     case delivery_target(txn, session_key, opts[:target_gate]) do
       nil ->
-        cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key)
-        :skipped
+        case cancel_unavailable_supervision_controller_in_txn(txn, opts, session_key) do
+          :canceled -> :skipped
+          :ordinary -> refuse_undeliverable_turn(txn, session_key, origin, opts)
+        end
 
       {target, role_ref, role_fallback} when not is_nil(target) ->
         if Ledger.enqueueable_in_txn?(txn, target) do
@@ -1185,7 +1194,7 @@ defmodule Tightbeam.Gateway do
         case enqueued do
           {:ok, seq} ->
             settle_supervision_controller_in_txn(txn, opts, target, seq)
-            fire_wake_in_txn(txn, opts)
+            fire_wake_in_txn(txn, opts, seq)
 
             # Nag-by-re-arm: a bracket wake that just fired re-arms its
             # replacement IN this transaction if the item is still holderless
@@ -1212,7 +1221,10 @@ defmodule Tightbeam.Gateway do
   # undeliverable notice every tick — and the loss is named rather than left as
   # a queued row nobody can claim.
   defp refuse_undeliverable_turn(txn, target, origin, opts) do
-    fire_wake_in_txn(txn, opts)
+    case opts[:wake_record] do
+      wake when is_map(wake) -> Wakes.target_unresolvable_in_txn(txn, wake)
+      _ -> :ok
+    end
 
     Logger.error(
       "refusing a turn addressed to #{target}: no session row exists for that key " <>
@@ -1222,13 +1234,9 @@ defmodule Tightbeam.Gateway do
     :skipped
   end
 
-  defp fire_wake_in_txn(txn, opts) do
+  defp fire_wake_in_txn(txn, opts, turn_seq) do
     if opts[:fire_wake_in_txn] == true and is_binary(opts[:wake_id]) do
-      DB.Txn.q(
-        txn,
-        "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
-        [opts[:wake_id], System.system_time(:millisecond)]
-      )
+      Wakes.admit_delivery_in_txn(txn, opts[:wake_id], turn_seq)
     end
   end
 
@@ -3983,6 +3991,30 @@ defmodule Tightbeam.Gateway do
       _ ->
         %{code: "not_found"}
     end
+  end
+
+  defp wake_status_result(db, call) do
+    wake_id = call.params[:wake_id]
+
+    case Wakes.get(db, wake_id) do
+      nil ->
+        %{code: "unknown_wake"}
+
+      wake ->
+        if wake_status_allowed?(db, call, wake) do
+          Wakes.delivery_status(db, wake_id)
+        else
+          %{code: "denied"}
+        end
+    end
+  end
+
+  defp wake_status_allowed?(db, call, wake) do
+    caller = resolve_caller(db, call.origin)
+    target = Org.get(db, wake.session_key)
+
+    admin_origin?(db, call.origin) or call.origin == wake.origin or
+      (is_map(caller) and is_map(target) and caller.owner_user_id == target.owner_user_id)
   end
 
   defp schedule_wake_in_txn(txn, call, session_key, due_at) do

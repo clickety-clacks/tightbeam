@@ -157,7 +157,7 @@ defmodule Tightbeam.Productions.Bubble do
 
   defp enqueue_notice(db, turn, recipient, cause) do
     prompt =
-      "Turn #{turn.cause_seq} in #{cause.session_key} could not run: " <>
+      "#{failure_subject(cause, turn.cause_seq)} could not run: " <>
         "#{cause.error || "reason unrecorded"}. You are the nearest ancestor " <>
         "shown able to run a turn. What to do about it is your judgment."
 
@@ -204,8 +204,8 @@ defmodule Tightbeam.Productions.Bubble do
     message =
       "[no agent can act]\n\nWork owned by you cannot run, and no agent in " <>
         "its lineage could be told: every ancestor's notice turn also " <>
-        "failed. Original failure — turn #{turn.cause_seq} in " <>
-        "#{cause.session_key}: #{cause.error || "reason unrecorded"}. " <>
+        "failed. Original failure — #{String.downcase(failure_subject(cause, turn.cause_seq))}: " <>
+        "#{cause.error || "reason unrecorded"}. " <>
         "Tightbeam will not repeat this alert until a turn is observed to " <>
         "run; any turn delivering clears it."
 
@@ -355,7 +355,7 @@ defmodule Tightbeam.Productions.Bubble do
       DB.query(
         db,
         """
-        SELECT t.sessionKey,t.error,s.harness,s.host
+        SELECT t.sessionKey,t.error,s.harness,s.host,t.wakeId
         FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
         WHERE t.seq=?1
         """,
@@ -363,13 +363,27 @@ defmodule Tightbeam.Productions.Bubble do
       )
 
     case rows do
-      [[session_key, error, harness, host]] ->
-        {:ok, %{session_key: session_key, error: error, harness: harness, host: host}}
+      [[session_key, error, harness, host, wake_id]] ->
+        {:ok,
+         %{
+           session_key: session_key,
+           error: error,
+           harness: harness,
+           host: host,
+           wake_id: wake_id
+         }}
 
       [] ->
         :missing
     end
   end
+
+  defp failure_subject(%{wake_id: wake_id, session_key: session_key}, turn_seq)
+       when is_binary(wake_id),
+       do: "Wake #{wake_id} carried by turn #{turn_seq} in #{session_key}"
+
+  defp failure_subject(%{session_key: session_key}, turn_seq),
+    do: "Turn #{turn_seq} in #{session_key}"
 
   # First ancestor with an ACTIVE session row, walking spawnedBy. A missing
   # or retired rung is climbed past — it can never run a turn, which is the

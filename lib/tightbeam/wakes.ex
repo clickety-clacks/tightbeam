@@ -132,6 +132,52 @@ defmodule Tightbeam.Wakes do
   );
   INSERT OR IGNORE INTO scheduler_state (id, afterFact) VALUES (0, 0);
   CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);
+  CREATE TABLE IF NOT EXISTS wake_delivery_outcomes (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    wakeId       TEXT NOT NULL REFERENCES wakes(wakeId),
+    attemptNo    INTEGER NOT NULL DEFAULT 0 CHECK (attemptNo >= 0),
+    kind         TEXT NOT NULL CHECK
+                   (kind IN ('attempt','admitted','handled','failed','undeliverable')),
+    turnSeq      INTEGER,
+    at           INTEGER NOT NULL CHECK (at >= 0),
+    failureClass TEXT CHECK
+                   (failureClass IN ('could_not_run','run_failed','run_canceled',
+                                     'carrier_canceled','outcome_unknown')),
+    causeKind    TEXT NOT NULL CHECK
+                   (causeKind IN ('scheduler_due','turn_terminal','target_unresolvable',
+                                  'recipient_retired','recipient_unclaimable','boot_recovery',
+                                  'unsafe_failure')),
+    causeId      TEXT NOT NULL CHECK (length(causeId) > 0),
+    principal    TEXT NOT NULL CHECK (principal = 'process:tightbeam'),
+    UNIQUE (wakeId, attemptNo, kind),
+    CHECK (kind NOT IN ('admitted','handled','failed') OR turnSeq IS NOT NULL),
+    CHECK ((kind = 'failed') = (failureClass IS NOT NULL)),
+    CHECK (kind = 'failed' OR failureClass IS NULL)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS wake_delivery_one_final
+    ON wake_delivery_outcomes(wakeId)
+    WHERE kind IN ('handled','undeliverable');
+  CREATE INDEX IF NOT EXISTS wake_delivery_by_wake
+    ON wake_delivery_outcomes(wakeId, id);
+  CREATE TRIGGER IF NOT EXISTS wake_delivery_no_update
+  BEFORE UPDATE ON wake_delivery_outcomes
+  BEGIN
+    SELECT RAISE(ABORT, 'wake_delivery_outcomes is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS wake_delivery_no_delete
+  BEFORE DELETE ON wake_delivery_outcomes
+  BEGIN
+    SELECT RAISE(ABORT, 'wake_delivery_outcomes is append-only');
+  END;
+  CREATE TRIGGER IF NOT EXISTS wake_delivery_no_after_final
+  BEFORE INSERT ON wake_delivery_outcomes
+  WHEN EXISTS (
+    SELECT 1 FROM wake_delivery_outcomes
+    WHERE wakeId=NEW.wakeId AND kind IN ('handled','undeliverable')
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'wake delivery already final');
+  END;
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
@@ -1520,6 +1566,297 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc "Return the durable delivery projection for one wake."
+  @spec delivery_status(db(), String.t()) :: map() | nil
+  def delivery_status(db \\ Tightbeam.DB, wake_id) when is_binary(wake_id) do
+    case get(db, wake_id) do
+      nil ->
+        nil
+
+      wake ->
+        {:ok, rows} =
+          DB.query(
+            db,
+            """
+            SELECT attemptNo,kind,turnSeq,at,failureClass,causeKind,causeId,principal
+            FROM wake_delivery_outcomes WHERE wakeId=?1 ORDER BY id
+            """,
+            [wake_id]
+          )
+
+        outcomes =
+          Enum.map(rows, fn [
+                              attempt_no,
+                              kind,
+                              turn_seq,
+                              at,
+                              failure_class,
+                              cause_kind,
+                              cause_id,
+                              principal
+                            ] ->
+            %{
+              attempt_no: attempt_no,
+              kind: kind,
+              turn_seq: turn_seq,
+              at: at,
+              failure_class: failure_class,
+              cause: %{kind: cause_kind, id: cause_id},
+              principal: principal
+            }
+          end)
+
+        latest = List.last(outcomes)
+
+        %{
+          wake_id: wake_id,
+          state: wake.state,
+          latest_outcome: latest && latest.kind,
+          attempt_count: Enum.count(outcomes, &(&1.kind == "attempt")),
+          turn_seq:
+            outcomes
+            |> Enum.reverse()
+            |> Enum.find_value(& &1.turn_seq),
+          next_retry_at: nil,
+          failure_class:
+            outcomes
+            |> Enum.reverse()
+            |> Enum.find_value(fn outcome ->
+              if outcome.kind == "failed", do: outcome.failure_class
+            end),
+          outcomes: outcomes
+        }
+    end
+  end
+
+  @doc false
+  @spec admit_delivery_in_txn(Txn.t(), String.t(), integer()) :: :ok
+  def admit_delivery_in_txn(%Txn{} = txn, wake_id, turn_seq)
+      when is_binary(wake_id) and is_integer(turn_seq) do
+    case Txn.q(
+           txn,
+           "SELECT consumer,targetGate,state FROM wakes WHERE wakeId=?1",
+           [wake_id]
+         ) do
+      [["prompt", 0, state]] when state in ["pending", "fired"] ->
+        ensure_fired_in_txn(txn, wake_id, state)
+
+      [["prompt", 1, state]] when state in ["pending", "fired"] ->
+        ensure_fired_in_txn(txn, wake_id, state)
+        at = now()
+
+        append_outcome_in_txn(
+          txn,
+          wake_id,
+          "attempt",
+          turn_seq,
+          at,
+          nil,
+          "scheduler_due",
+          "wake:#{wake_id}"
+        )
+
+        append_outcome_in_txn(
+          txn,
+          wake_id,
+          "admitted",
+          turn_seq,
+          at,
+          nil,
+          "scheduler_due",
+          "wake:#{wake_id}"
+        )
+
+        :ok
+
+      [] ->
+        :ok
+
+      _ ->
+        raise "wake admission refused for #{wake_id}"
+    end
+  end
+
+  @doc false
+  @spec settle_terminal_in_txn(Txn.t(), integer(), String.t(), String.t() | nil, map()) :: :ok
+  def settle_terminal_in_txn(%Txn{} = txn, turn_seq, terminal, _error, opts \\ %{}) do
+    if Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wakes'", []) ==
+         [[1]] do
+      case Txn.q(
+             txn,
+             """
+             SELECT t.wakeId,w.targetGate
+             FROM turns t JOIN wakes w ON w.wakeId=t.wakeId
+             WHERE t.seq=?1 AND w.consumer='prompt'
+             """,
+             [turn_seq]
+           ) do
+        [[wake_id, 1]] ->
+          settle_outcome_governed_in_txn(txn, wake_id, turn_seq, terminal, opts)
+
+        _ ->
+          :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  @doc false
+  @spec mark_target_unresolvable(db(), wake()) :: :ok
+  def mark_target_unresolvable(db, wake) do
+    transaction!(db, fn txn -> target_unresolvable_in_txn(txn, wake) end)
+    :ok
+  end
+
+  @doc false
+  @spec target_unresolvable_in_txn(Txn.t(), wake()) :: :ok
+  def target_unresolvable_in_txn(%Txn{} = txn, wake) do
+    if wake.consumer == "prompt" and wake.target_gate == 1 do
+      at = now()
+      state = wake_state_in_txn(txn, wake.wake_id)
+
+      if state == "pending" do
+        true =
+          cancel_in_txn(txn, %{
+            wake_id: wake.wake_id,
+            requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+            reason_kind: "target_unresolvable",
+            causal_source: %{kind: "scheduler_delivery", id: wake.wake_id},
+            outcome: %{kind: "no_replacement"}
+          })
+      end
+
+      append_outcome_in_txn(
+        txn,
+        wake.wake_id,
+        "attempt",
+        nil,
+        at,
+        nil,
+        "target_unresolvable",
+        target_cause(wake)
+      )
+
+      append_outcome_in_txn(
+        txn,
+        wake.wake_id,
+        "undeliverable",
+        nil,
+        at,
+        nil,
+        "target_unresolvable",
+        target_cause(wake)
+      )
+    end
+
+    :ok
+  end
+
+  defp ensure_fired_in_txn(txn, wake_id, "pending") do
+    Txn.q(
+      txn,
+      "UPDATE wakes SET state='fired', firedAt=?2 WHERE wakeId=?1 AND state='pending'",
+      [wake_id, now()]
+    )
+
+    if Txn.changes(txn) != 1, do: raise("wake admission CAS lost for #{wake_id}")
+    publish_change_in_txn(txn, "wake.fired", wake_id)
+    :ok
+  end
+
+  defp ensure_fired_in_txn(_txn, _wake_id, "fired"), do: :ok
+
+  defp settle_outcome_governed_in_txn(txn, wake_id, turn_seq, "delivered", _opts) do
+    append_outcome_in_txn(
+      txn,
+      wake_id,
+      "handled",
+      turn_seq,
+      now(),
+      nil,
+      "turn_terminal",
+      "turn:#{turn_seq}"
+    )
+  end
+
+  defp settle_outcome_governed_in_txn(txn, wake_id, turn_seq, terminal, opts)
+       when terminal in ["failed", "failed_unknown", "canceled"] do
+    failure_class = terminal_failure_class(terminal, opts)
+    cause_kind = terminal_cause_kind(opts)
+    cause_id = terminal_cause_id(opts, turn_seq)
+    at = now()
+
+    append_outcome_in_txn(
+      txn,
+      wake_id,
+      "failed",
+      turn_seq,
+      at,
+      failure_class,
+      cause_kind,
+      cause_id
+    )
+
+    append_outcome_in_txn(
+      txn,
+      wake_id,
+      "undeliverable",
+      turn_seq,
+      at,
+      nil,
+      "unsafe_failure",
+      "turn:#{turn_seq}"
+    )
+  end
+
+  defp append_outcome_in_txn(
+         txn,
+         wake_id,
+         kind,
+         turn_seq,
+         at,
+         failure_class,
+         cause_kind,
+         cause_id
+       ) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO wake_delivery_outcomes
+        (wakeId,attemptNo,kind,turnSeq,at,failureClass,causeKind,causeId,principal)
+      VALUES (?1,0,?2,?3,?4,?5,?6,?7,'process:tightbeam')
+      """,
+      [wake_id, kind, turn_seq, at, failure_class, cause_kind, cause_id]
+    )
+
+    :ok
+  end
+
+  defp wake_state_in_txn(txn, wake_id) do
+    case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]) do
+      [[state]] -> state
+      [] -> nil
+    end
+  end
+
+  defp target_cause(%{target_role: role}) when is_binary(role), do: "role:#{role}"
+  defp target_cause(wake), do: "session:#{wake.session_key}"
+
+  defp terminal_failure_class("failed_unknown", _opts), do: "outcome_unknown"
+  defp terminal_failure_class("canceled", opts), do: Map.get(opts, :failure_class, "run_canceled")
+  defp terminal_failure_class("failed", opts), do: Map.get(opts, :failure_class, "run_failed")
+
+  defp terminal_cause_kind(opts) do
+    case Map.get(opts, :wake_cause_kind) do
+      kind when kind in ["recipient_retired", "recipient_unclaimable", "boot_recovery"] -> kind
+      _ -> "turn_terminal"
+    end
+  end
+
+  defp terminal_cause_id(opts, turn_seq),
+    do: Map.get(opts, :wake_cause_id, "turn:#{turn_seq}")
+
   @doc "All pending wakes, soonest first (inspect filters to owned sessions)."
   @spec list_pending(db()) :: [wake()]
   def list_pending(db \\ Tightbeam.DB) do
@@ -2330,6 +2667,9 @@ defmodule Tightbeam.Wakes do
         {"prompt", {:ok, :skipped}} when wake.digest ->
           NoticeBatcher.delivery_terminal_failure(db, wake.wake_id, :skipped)
 
+        {"prompt", {:ok, :skipped}} ->
+          :ok
+
         {"prompt", {:ok, _result}} ->
           mark_fired(db, wake.wake_id)
           if wake.digest, do: NoticeBatcher.delivery_delivered(db, wake.wake_id)
@@ -2719,8 +3059,10 @@ defmodule Tightbeam.Wakes do
             wake.origin,
             stamp <> "\n\n" <> wake.prompt,
             wake_id: wake.wake_id,
+            wake_record: wake,
             sender: wake.origin,
             target_gate: wake,
+            fire_wake_in_txn: true,
             role_ref: wake.target_role
           )
 

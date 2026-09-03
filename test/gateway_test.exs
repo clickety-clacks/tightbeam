@@ -1620,6 +1620,41 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
   end
 
+  test "wake-get exposes terminal delivery truth only to an authorized caller", ctx do
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "k1",
+        origin: "process:scheduler",
+        prompt: "report my terminal state",
+        due_at: 2_000
+      })
+
+    handler = Gateway.handlers(gateway_config("/tmp", ctx.db, 0))["wake-get"]
+
+    assert %{wake_id: wake_id, state: "pending", latest_outcome: nil, outcomes: []} =
+             handler.(%{
+               origin: "process:scheduler",
+               session_key: nil,
+               params: %{wake_id: wake.wake_id}
+             })
+
+    assert wake_id == wake.wake_id
+
+    assert %{code: "denied"} =
+             handler.(%{
+               origin: "process:other",
+               session_key: nil,
+               params: %{wake_id: wake.wake_id}
+             })
+
+    assert %{code: "unknown_wake"} =
+             handler.(%{
+               origin: "process:scheduler",
+               session_key: nil,
+               params: %{wake_id: "w_missing"}
+             })
+  end
+
   test "process inspect returns exactly its own pending wakes", ctx do
     own =
       Wakes.schedule(ctx.db, %{
@@ -1827,7 +1862,10 @@ defmodule Tightbeam.GatewayTest do
     assert :ok = Roles.rm(ctx.db, "reviewer")
     {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [deleted.wake_id])
     assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, deleted.wake_id).state == "fired"
+    assert Wakes.get(ctx.db, deleted.wake_id).state == "canceled"
+
+    assert %{latest_outcome: "undeliverable", attempt_count: 1, turn_seq: nil} =
+             Wakes.delivery_status(ctx.db, deleted.wake_id)
 
     assert {:ok, [[0]]} =
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [deleted.wake_id])
