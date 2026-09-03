@@ -42,6 +42,7 @@ defmodule Tightbeam.Schema do
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
   @shape "identity-universal-root-render-v1-019-completion-escalation-v16"
+  @completion_escalation_parent_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -1225,6 +1226,17 @@ defmodule Tightbeam.Schema do
       {:ok, [[@model_identity_shape]]} ->
         :ok = migrate_model_identity_v1(db)
         check_shape(db)
+
+      {:ok, [[@completion_escalation_parent_shape]]} ->
+        raise ShapeError, """
+        this Tightbeam database predates completion-escalation storage.
+
+          stamped: #{@completion_escalation_parent_shape}
+          this build: #{@shape}
+
+        No in-place migration is defined for this maintenance-line boundary.
+        Move the database aside and let this build recreate it.
+        """
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one

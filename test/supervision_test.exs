@@ -709,6 +709,12 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT reason FROM assignment_interruptions WHERE assignmentId='asg_1'"
              )
 
+    assert {:ok, [[nil, "holder"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedByUser,revokedBySession FROM assignment_revocations WHERE assignmentId='asg_1'"
+             )
+
     assert {:ok, []} =
              DB.query(
                ctx.db,
