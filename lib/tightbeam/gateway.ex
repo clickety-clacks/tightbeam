@@ -6315,12 +6315,17 @@ defmodule Tightbeam.Gateway do
             if session.state == "active" do
               {:ok, result} =
                 DB.transaction(db, fn txn ->
+                  actor = retirement_actor_in_txn(txn, call.principal)
+
+                  if is_nil(actor) or actor.owner != owner,
+                    do: raise("retirement principal changed during authorization")
+
                   result =
                     retire_cascade_in_txn(
                       txn,
                       session.session_key,
                       owner,
-                      call.origin,
+                      actor.serialized,
                       call.principal,
                       Map.fetch!(config, :wake_tick_ms),
                       "retired: session retired before execution",

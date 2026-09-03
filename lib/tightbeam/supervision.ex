@@ -2043,7 +2043,7 @@ defmodule Tightbeam.Supervision do
           txn,
           session_key,
           owner_user_id,
-          "process:tightbeam"
+          "session:#{session_key}"
         )
       end)
 
