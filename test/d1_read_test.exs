@@ -217,8 +217,12 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert malformed.status == 400
     assert JSON.decode!(malformed.resp_body)["error"]["code"] == "invalid_cursor"
 
+    newest_cursor = first_page["page"]["newestCursor"]
+    assert get(ctx.opts, users_path <> "&after=" <> newest_cursor, ctx.admin.token).status == 200
+
     stale_version =
-      users_payload
+      newest_cursor
+      |> decode_cursor()
       |> Map.put("version", 0)
       |> JSON.encode!()
       |> Base.url_encode64(padding: false)
