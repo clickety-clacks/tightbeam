@@ -57,3 +57,222 @@ defmodule Tightbeam.D1ReadTest do
     assert Enum.all?(users, &(is_boolean(&1["isAdmin"]) and is_integer(&1["rowVersion"])))
   end
 end
+
+defmodule Tightbeam.D1ReadRouteTest do
+  use Tightbeam.TestCase, async: false
+
+  import Plug.Conn
+  import Plug.Test
+
+  alias Tightbeam.{CursorSigning, DB, Devices, Harness, Identity, Org, Placement, Schema}
+  alias Tightbeam.Wire.Router
+
+  setup do
+    base_dir =
+      Path.join(System.tmp_dir!(), "tightbeam-d1-route-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(Path.join(base_dir, "secrets"))
+    :initialized = Identity.init!(base_dir)
+
+    signing_path = Path.join([base_dir, "secrets", "rest-cursor-signing.v1"])
+    File.write!(signing_path, :binary.copy(<<5>>, 32))
+    File.chmod!(signing_path, 0o600)
+    signing = CursorSigning.load!(base_dir)
+
+    db = :"d1_route_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: db})
+    :ok = Schema.ensure_all(db)
+
+    {:paired, admin} =
+      Devices.pair(db, %{device_id: "d1-admin", claimed_name: "admin", platform: nil, model: nil})
+
+    {:pending, _} =
+      Devices.pair(db, %{
+        device_id: "d1-operator",
+        claimed_name: "operator",
+        platform: nil,
+        model: nil
+      })
+
+    operator = Devices.approve(db, "d1-operator", "operator")
+    session = ensure_main_session(db, "admin")
+
+    for user <- ~w(alpha beta zeta) do
+      Devices.add_user(db, user, false)
+    end
+
+    for host <- ~w(alpha beta zeta) do
+      assert {:ok, _host} =
+               Placement.register_host(db, host, %{
+                 ssh: "operator@#{host}",
+                 base_dir: "/tmp/#{host}",
+                 cli_bin: "/tmp/tightbeam",
+                 adapter_bin_dir: "/tmp/adapters"
+               })
+    end
+
+    :ok = Org.put_setting(db, "default-archetype", "default")
+
+    harness = hd(Harness.all()).wire_name()
+
+    assert {:ok, _overlay} =
+             Placement.set_env_overlay(
+               db,
+               "alpha",
+               harness,
+               "D1_TEST_VALUE",
+               "redacted",
+               "user:admin"
+             )
+
+    opts =
+      Router.init(
+        db: db,
+        base_dir: base_dir,
+        handlers: %{},
+        cli_token: "tbc_d1_route",
+        cursor_signing: signing,
+        session_status: fn _ -> nil end
+      )
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    %{db: db, opts: opts, admin: admin, operator: operator, session: session}
+  end
+
+  test "all six D1 routes provide fixed envelopes, ordered bytes, and no-store", ctx do
+    for {path, resource} <- [
+          {"/api/config", "config"},
+          {"/api/host-env", "host environment"},
+          {"/api/hosts", "hosts"},
+          {"/api/users", "users"},
+          {"/api/identity", "identity"},
+          {"/api/kungfu", "kungfu"}
+        ] do
+      response = get(ctx.opts, path, ctx.admin.token)
+      assert response.status == 200, "#{path}: #{response.resp_body}"
+      assert get_resp_header(response, "cache-control") == ["no-store"]
+      assert JSON.decode!(response.resp_body)["resource"] == resource
+      assert JSON.decode!(response.resp_body)["schemaVersion"] == 1
+    end
+
+    users = get(ctx.opts, "/api/users?userId=alpha&userId=beta&userId=zeta", ctx.admin.token)
+
+    assert JSON.decode!(users.resp_body)["items"] |> Enum.map(& &1["userId"]) ==
+             ~w(alpha beta zeta)
+
+    assert get(ctx.opts, "/api/config/default-archetype", ctx.admin.token).status == 200
+    assert get(ctx.opts, "/api/hosts/alpha", ctx.admin.token).status == 200
+    assert get(ctx.opts, "/api/users/alpha", ctx.admin.token).status == 200
+  end
+
+  test "users and session host cursors replay in both directions and enforce their principal",
+       ctx do
+    users_path = "/api/users?userId=alpha&userId=beta&userId=zeta&limit=1"
+    first = get(ctx.opts, users_path, ctx.admin.token)
+    first_page = JSON.decode!(first.resp_body)
+    assert Enum.map(first_page["items"], & &1["userId"]) == ["zeta"]
+
+    users_payload = decode_cursor(first_page["page"]["oldestCursor"])
+
+    assert Enum.sort(Map.keys(users_payload)) ==
+             Enum.sort(
+               ~w(direction filters principalId principalKind resource route tuple version)
+             )
+
+    assert users_payload["tuple"] == ["zeta"]
+
+    previous =
+      get(
+        ctx.opts,
+        users_path <> "&before=" <> first_page["page"]["oldestCursor"],
+        ctx.admin.token
+      )
+
+    previous_page = JSON.decode!(previous.resp_body)
+    assert Enum.map(previous_page["items"], & &1["userId"]) == ["beta"]
+
+    forward =
+      get(
+        ctx.opts,
+        users_path <> "&after=" <> previous_page["page"]["newestCursor"],
+        ctx.admin.token
+      )
+
+    assert Enum.map(JSON.decode!(forward.resp_body)["items"], & &1["userId"]) == ["zeta"]
+
+    cross_principal =
+      get(
+        ctx.opts,
+        users_path <> "&after=" <> first_page["page"]["newestCursor"],
+        ctx.operator.token
+      )
+
+    assert cross_principal.status == 404
+    assert JSON.decode!(cross_principal.resp_body)["error"]["code"] == "not_found"
+
+    hosts_path = "/api/hosts?host=alpha&host=beta&host=zeta&limit=1"
+    hosts = get(ctx.opts, hosts_path, ctx.session.cli_token) |> then(&JSON.decode!(&1.resp_body))
+    assert Enum.map(hosts["items"], & &1["host"]) == ["zeta"]
+
+    hosts_before =
+      get(
+        ctx.opts,
+        hosts_path <> "&before=" <> hosts["page"]["oldestCursor"],
+        ctx.session.cli_token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(hosts_before["items"], & &1["host"]) == ["beta"]
+
+    hosts_after =
+      get(
+        ctx.opts,
+        hosts_path <> "&after=" <> hosts_before["page"]["newestCursor"],
+        ctx.session.cli_token
+      )
+      |> then(&JSON.decode!(&1.resp_body))
+
+    assert Enum.map(hosts_after["items"], & &1["host"]) == ["zeta"]
+  end
+
+  test "D1 preserves auth, visibility, error bytes, and the common not-found floor", ctx do
+    assert get(ctx.opts, "/api/config?asUser=admin", "tbc_d1_route").status == 200
+    assert get(ctx.opts, "/api/hosts?host=alpha", ctx.session.cli_token).status == 200
+    assert get(ctx.opts, "/api/hosts", "bad-token").status == 401
+
+    invalid = get(ctx.opts, "/api/config?unknown=value", ctx.admin.token)
+    assert invalid.status == 400
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
+
+    {hidden_us, hidden} =
+      elapsed_get(ctx.opts, "/api/config/default-archetype", ctx.operator.token)
+
+    {missing_us, missing} = elapsed_get(ctx.opts, "/api/config/missing", ctx.admin.token)
+
+    assert hidden.status == 404
+    assert missing.status == 404
+    assert hidden.resp_body == missing.resp_body
+    assert get_resp_header(hidden, "cache-control") == ["no-store"]
+    assert get_resp_header(missing, "cache-control") == ["no-store"]
+    assert hidden_us >= 3_000
+    assert missing_us >= 3_000
+  end
+
+  defp get(opts, path, bearer) do
+    conn(:get, path)
+    |> put_req_header("authorization", "Bearer #{bearer}")
+    |> Router.call(opts)
+  end
+
+  defp elapsed_get(opts, path, bearer) do
+    started_at = System.monotonic_time(:microsecond)
+    response = get(opts, path, bearer)
+    {System.monotonic_time(:microsecond) - started_at, response}
+  end
+
+  defp decode_cursor(cursor) do
+    [payload, _signature] = String.split(cursor, ".", parts: 2)
+    payload |> Base.url_decode64!(padding: false) |> JSON.decode!()
+  end
+end

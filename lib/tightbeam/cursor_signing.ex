@@ -6,31 +6,35 @@ defmodule Tightbeam.CursorSigning do
   @domain "tightbeam/rest-read-plane-d1/cursor/v1\0"
   @filename "rest-cursor-signing.v1"
 
-  @enforce_keys [:record_path, :state]
-  defstruct [:record_path, :state]
+  @enforce_keys [:record_path, :state, :material_digest]
+  defstruct [:record_path, :state, :material_digest]
 
   @type state :: :healthy | :unprovisioned | :quarantined
-  @type t :: %__MODULE__{record_path: String.t(), state: state()}
+  @type t :: %__MODULE__{
+          record_path: String.t(),
+          state: state(),
+          material_digest: binary() | nil
+        }
 
   @doc "Load the sole D1 cursor-signing material without provisioning it."
   @spec load(String.t()) :: {:ok, t()}
   def load(base_dir) when is_binary(base_dir) do
     base_dir
-    |> Path.join(["secrets", @filename])
+    |> Path.join(Path.join("secrets", @filename))
     |> load_path()
   end
 
   @doc false
   @spec load_path(String.t()) :: {:ok, t()}
   def load_path(path) when is_binary(path) do
-    state =
+    {state, material_digest} =
       case read_material(path) do
-        {:ok, _material} -> :healthy
-        {:error, :enoent} -> :unprovisioned
-        {:error, _reason} -> :quarantined
+        {:ok, material} -> {:healthy, :crypto.hash(:sha256, material)}
+        {:error, :enoent} -> {:unprovisioned, nil}
+        {:error, _reason} -> {:quarantined, nil}
       end
 
-    {:ok, %__MODULE__{record_path: path, state: state}}
+    {:ok, %__MODULE__{record_path: path, state: state, material_digest: material_digest}}
   end
 
   @doc "Load one provider at startup without provisioning or rotating material."
@@ -71,7 +75,7 @@ defmodule Tightbeam.CursorSigning do
   @spec sign(t(), binary()) :: {:ok, binary()} | {:error, atom()}
   def sign(%__MODULE__{} = provider, payload) when is_binary(payload) do
     with :ok <- admit_request(provider),
-         {:ok, material} <- current_material(provider.record_path) do
+         {:ok, material} <- current_material(provider) do
       {:ok, :crypto.mac(:hmac, :sha256, material, @domain <> payload)}
     end
   end
@@ -112,10 +116,15 @@ defmodule Tightbeam.CursorSigning do
     end
   end
 
-  defp current_material(path) do
+  defp current_material(%__MODULE__{record_path: path, material_digest: material_digest}) do
     case read_material(path) do
-      {:ok, material} -> {:ok, material}
-      {:error, _reason} -> {:error, :cursor_signing_quarantined}
+      {:ok, material} ->
+        if :crypto.hash(:sha256, material) == material_digest,
+          do: {:ok, material},
+          else: {:error, :cursor_signing_quarantined}
+
+      {:error, _reason} ->
+        {:error, :cursor_signing_quarantined}
     end
   end
 end

@@ -70,6 +70,7 @@ defmodule Tightbeam.Wire.Router do
   @d1_default_limit 50
   @d1_max_limit 500
   @d1_cursor_version 1
+  @d1_not_found_floor_us 3_000
   @d1_resources %{
     config: D1Read.spec(:config),
     host_environment: D1Read.spec(:host_environment),
@@ -465,6 +466,8 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp d1_collection(conn, spec) do
+    started_at = System.monotonic_time(:microsecond)
+
     with {:ok, auth} <- d1_bearer_auth(conn),
          {:ok, query} <- d1_query(conn.query_string),
          {:ok, principal} <- d1_principal(auth, query, conn),
@@ -481,6 +484,7 @@ defmodule Tightbeam.Wire.Router do
       {items, page} = d1_page(rows, boundary, request, principal, spec, conn)
       d1_send(conn, 200, d1_collection_envelope(spec, items, page))
     else
+      {:error, 404, "not_found", _message} -> d1_not_found(conn, spec.resource, started_at)
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
@@ -489,6 +493,8 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp d1_detail(conn, spec, id) do
+    started_at = System.monotonic_time(:microsecond)
+
     with {:ok, auth} <- d1_bearer_auth(conn),
          {:ok, query} <- d1_query(conn.query_string),
          {:ok, principal} <- d1_principal(auth, query, conn),
@@ -499,8 +505,9 @@ defmodule Tightbeam.Wire.Router do
            D1Read.detail(db(conn), deps(conn).base_dir, d1_resource(spec), id) do
       d1_send(conn, 200, d1_detail_envelope(spec, item))
     else
-      false -> d1_error(conn, spec.resource, 404, "not_found", nil)
-      nil -> d1_error(conn, spec.resource, 404, "not_found", nil)
+      false -> d1_not_found(conn, spec.resource, started_at)
+      nil -> d1_not_found(conn, spec.resource, started_at)
+      {:error, 404, "not_found", _message} -> d1_not_found(conn, spec.resource, started_at)
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
@@ -531,19 +538,21 @@ defmodule Tightbeam.Wire.Router do
   defp d1_principal(:org, %{}, _conn), do: {:error, 400, "invalid_message", nil}
   defp d1_principal(:org, _query, _conn), do: {:error, 400, "invalid_as_user", nil}
 
-  defp d1_principal({:session, session}, query, _conn) when map_size(query) == 0,
-    do: {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
+  defp d1_principal({:session, session}, query, conn) do
+    case Map.get(query, "asUser", []) do
+      [] ->
+        {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
 
-  defp d1_principal({:session, session}, %{"asUser" => [user_id]}, conn)
-       when user_id == session.owner_user_id and user_id != "" do
-    {:ok, d1_user_principal(user_id, conn)}
+      [user_id] when user_id == session.owner_user_id and user_id != "" ->
+        {:ok, d1_user_principal(user_id, conn)}
+
+      [_user_id] ->
+        {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
+
+      _repeated ->
+        {:error, 400, "invalid_as_user", nil}
+    end
   end
-
-  defp d1_principal({:session, session}, %{"asUser" => [_]}, _conn),
-    do: {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
-
-  defp d1_principal({:session, _session}, _query, _conn),
-    do: {:error, 400, "invalid_as_user", nil}
 
   defp d1_principal({:device, device}, query, _conn) do
     if Map.has_key?(query, "asUser") do
@@ -662,25 +671,23 @@ defmodule Tightbeam.Wire.Router do
          {:ok, signature} <- Base.url_decode64(signature_part, padding: false),
          {:ok, true} <- CursorSigning.verify(deps(conn).cursor_signing, payload_bytes, signature),
          {:ok, payload} when is_map(payload) <- JSON.decode(payload_bytes),
+         true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
          true <- payload["version"] == @d1_cursor_version,
          true <- payload["route"] == spec.route and payload["resource"] == spec.resource,
          true <-
            payload["direction"] == direction and
              payload["filters"] == d1_filter_fingerprint(request.filters),
-         true <-
-           payload["principalKind"] == principal.kind and payload["principalId"] == principal.id,
          true <- d1_tuple?(payload["tuple"], d1_resource(spec)) do
-      {:ok, {String.to_atom(direction), payload["tuple"]}}
+      if payload["principalKind"] == principal.kind and payload["principalId"] == principal.id do
+        {:ok, {String.to_atom(direction), payload["tuple"]}}
+      else
+        {:error, 404, "not_found", nil}
+      end
     else
       {:ok, false} -> {:error, 400, "invalid_cursor", nil}
       _ -> {:error, 400, "invalid_cursor", nil}
     end
   end
-
-  defp d1_tuple?(tuple, :users),
-    do:
-      is_list(tuple) and length(tuple) == 2 and is_integer(hd(tuple)) and
-        is_binary(List.last(tuple))
 
   defp d1_tuple?(tuple, resource),
     do:
@@ -761,10 +768,15 @@ defmodule Tightbeam.Wire.Router do
       "." <> Base.url_encode64(signature, padding: false)
   end
 
+  defp d1_cursor_keys do
+    Enum.sort(~w(direction filters principalId principalKind resource route tuple version))
+  end
+
   defp d1_filter_fingerprint(filters),
     do:
       filters
       |> Enum.sort()
+      |> Enum.map(fn {field, values} -> [field, values] end)
       |> JSON.encode!()
       |> then(&:crypto.hash(:sha256, &1))
       |> Base.encode16(case: :lower)
@@ -822,6 +834,27 @@ defmodule Tightbeam.Wire.Router do
           ",\"error\":{\"code\":" <>
           JSON.encode!(code) <> ",\"message\":" <> JSON.encode!(message) <> "}}"
       )
+
+  defp d1_not_found(conn, resource, started_at) do
+    wait_for_d1_not_found_floor(started_at + @d1_not_found_floor_us)
+    d1_error(conn, resource, 404, "not_found", nil)
+  end
+
+  defp wait_for_d1_not_found_floor(deadline) do
+    remaining = deadline - System.monotonic_time(:microsecond)
+
+    cond do
+      remaining > 2_000 ->
+        Process.sleep(div(remaining, 1_000) - 1)
+        wait_for_d1_not_found_floor(deadline)
+
+      remaining > 0 ->
+        wait_for_d1_not_found_floor(deadline)
+
+      true ->
+        :ok
+    end
+  end
 
   defp deps(conn), do: conn.private.tightbeam_deps
   defp db(conn), do: deps(conn)[:db] || Tightbeam.DB

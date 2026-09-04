@@ -35,7 +35,7 @@ defmodule Tightbeam.CursorSigningTest do
     assert {:error, :cursor_signing_quarantined} = CursorSigning.sign(quarantined, "body")
   end
 
-  test "does not retain material and rechecks the durable record before every signature", %{
+  test "does not retain material and rejects durable record mutation before every signature", %{
     path: path
   } do
     File.write!(path, :binary.copy(<<7>>, 32))
@@ -45,6 +45,10 @@ defmodule Tightbeam.CursorSigningTest do
     refute Map.has_key?(provider, :material)
 
     File.write!(path, :binary.copy(<<7>>, 31))
+    assert {:error, :cursor_signing_quarantined} = CursorSigning.sign(provider, "body")
+
+    File.write!(path, :binary.copy(<<8>>, 32))
+    File.chmod!(path, 0o600)
     assert {:error, :cursor_signing_quarantined} = CursorSigning.sign(provider, "body")
   end
 end
