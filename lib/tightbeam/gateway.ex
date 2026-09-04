@@ -133,6 +133,7 @@ defmodule Tightbeam.Gateway do
   @spec children(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children(config) do
     preflight!(config)
+
     children_after_preflight(config)
   end
 
