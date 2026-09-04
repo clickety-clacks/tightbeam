@@ -52,7 +52,6 @@ defmodule Tightbeam.Wire.Router do
   alias Tightbeam.{
     Assets,
     CliCompatibility,
-    CursorSigning,
     D1Read,
     Devices,
     Dispatch,
@@ -70,7 +69,6 @@ defmodule Tightbeam.Wire.Router do
   @d1_default_limit 50
   @d1_max_limit 500
   @d1_cursor_version 1
-  @d1_not_found_floor_us 3_000
   @d1_resources %{
     config: D1Read.spec(:config),
     host_environment: D1Read.spec(:host_environment),
@@ -466,13 +464,10 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp d1_collection(conn, spec) do
-    started_at = System.monotonic_time(:microsecond)
-
     with {:ok, auth} <- d1_bearer_auth(conn),
          {:ok, query} <- d1_query(conn.query_string),
          {:ok, principal} <- d1_principal(auth, query, conn),
          {:ok, request} <- d1_collection_request(query, spec),
-         :ok <- d1_admit_cursor_signing(conn),
          {:ok, boundary} <- d1_boundary(request, principal, spec, conn) do
       rows =
         if D1Read.visible?(d1_resource(spec), principal.is_admin) do
@@ -484,7 +479,6 @@ defmodule Tightbeam.Wire.Router do
       {items, page} = d1_page(rows, boundary, request, principal, spec, conn)
       d1_send(conn, 200, d1_collection_envelope(spec, items, page))
     else
-      {:error, 404, "not_found", _message} -> d1_not_found(conn, spec.resource, started_at)
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
@@ -493,21 +487,17 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp d1_detail(conn, spec, id) do
-    started_at = System.monotonic_time(:microsecond)
-
     with {:ok, auth} <- d1_bearer_auth(conn),
          {:ok, query} <- d1_query(conn.query_string),
          {:ok, principal} <- d1_principal(auth, query, conn),
          :ok <- d1_detail_request(query),
-         :ok <- d1_admit_cursor_signing(conn),
          true <- D1Read.visible?(d1_resource(spec), principal.is_admin),
          item when not is_nil(item) <-
            D1Read.detail(db(conn), deps(conn).base_dir, d1_resource(spec), id) do
       d1_send(conn, 200, d1_detail_envelope(spec, item))
     else
-      false -> d1_not_found(conn, spec.resource, started_at)
-      nil -> d1_not_found(conn, spec.resource, started_at)
-      {:error, 404, "not_found", _message} -> d1_not_found(conn, spec.resource, started_at)
+      false -> d1_error(conn, spec.resource, 404, "not_found", nil)
+      nil -> d1_error(conn, spec.resource, 404, "not_found", nil)
       {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
     end
   rescue
@@ -650,13 +640,6 @@ defmodule Tightbeam.Wire.Router do
   defp d1_filter_value?("status", value), do: value in ~w(available installed)
   defp d1_filter_value?(_field, value), do: is_binary(value) and value != ""
 
-  defp d1_admit_cursor_signing(conn) do
-    case CursorSigning.admit_request(deps(conn).cursor_signing) do
-      :ok -> :ok
-      _ -> {:error, 503, "cursor_signing_unavailable", nil}
-    end
-  end
-
   defp d1_boundary(%{before: nil, after: nil}, _principal, _spec, _conn), do: {:ok, :latest}
 
   defp d1_boundary(%{before: cursor} = request, principal, spec, conn) when is_binary(cursor),
@@ -665,11 +648,8 @@ defmodule Tightbeam.Wire.Router do
   defp d1_boundary(%{after: cursor} = request, principal, spec, conn) when is_binary(cursor),
     do: d1_decode_cursor(cursor, "after", request, principal, spec, conn)
 
-  defp d1_decode_cursor(cursor, direction, request, principal, spec, conn) do
-    with [payload_part, signature_part] <- String.split(cursor, ".", parts: 2),
-         {:ok, payload_bytes} <- Base.url_decode64(payload_part, padding: false),
-         {:ok, signature} <- Base.url_decode64(signature_part, padding: false),
-         {:ok, true} <- CursorSigning.verify(deps(conn).cursor_signing, payload_bytes, signature),
+  defp d1_decode_cursor(cursor, direction, request, principal, spec, _conn) do
+    with {:ok, payload_bytes} <- Base.url_decode64(cursor, padding: false),
          {:ok, payload} when is_map(payload) <- JSON.decode(payload_bytes),
          true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
          true <- payload["version"] == @d1_cursor_version,
@@ -677,14 +657,11 @@ defmodule Tightbeam.Wire.Router do
          true <-
            payload["direction"] == direction and
              payload["filters"] == d1_filter_fingerprint(request.filters),
+         true <-
+           payload["principalKind"] == principal.kind and payload["principalId"] == principal.id,
          true <- d1_tuple?(payload["tuple"], d1_resource(spec)) do
-      if payload["principalKind"] == principal.kind and payload["principalId"] == principal.id do
-        {:ok, {String.to_atom(direction), payload["tuple"]}}
-      else
-        {:error, 404, "not_found", nil}
-      end
+      {:ok, {String.to_atom(direction), payload["tuple"]}}
     else
-      {:ok, false} -> {:error, 400, "invalid_cursor", nil}
       _ -> {:error, 400, "invalid_cursor", nil}
     end
   end
@@ -749,7 +726,7 @@ defmodule Tightbeam.Wire.Router do
     %{oldest: nil, newest: nil, before: before_more, after: after_more}
   end
 
-  defp d1_cursor(tuple, direction, filters, principal, spec, conn) do
+  defp d1_cursor(tuple, direction, filters, principal, spec, _conn) do
     payload =
       JSON.encode!(%{
         "version" => @d1_cursor_version,
@@ -762,10 +739,7 @@ defmodule Tightbeam.Wire.Router do
         "tuple" => tuple
       })
 
-    {:ok, signature} = CursorSigning.sign(deps(conn).cursor_signing, payload)
-
-    Base.url_encode64(payload, padding: false) <>
-      "." <> Base.url_encode64(signature, padding: false)
+    Base.url_encode64(payload, padding: false)
   end
 
   defp d1_cursor_keys do
@@ -834,27 +808,6 @@ defmodule Tightbeam.Wire.Router do
           ",\"error\":{\"code\":" <>
           JSON.encode!(code) <> ",\"message\":" <> JSON.encode!(message) <> "}}"
       )
-
-  defp d1_not_found(conn, resource, started_at) do
-    wait_for_d1_not_found_floor(started_at + @d1_not_found_floor_us)
-    d1_error(conn, resource, 404, "not_found", nil)
-  end
-
-  defp wait_for_d1_not_found_floor(deadline) do
-    remaining = deadline - System.monotonic_time(:microsecond)
-
-    cond do
-      remaining > 2_000 ->
-        Process.sleep(div(remaining, 1_000) - 1)
-        wait_for_d1_not_found_floor(deadline)
-
-      remaining > 0 ->
-        wait_for_d1_not_found_floor(deadline)
-
-      true ->
-        :ok
-    end
-  end
 
   defp deps(conn), do: conn.private.tightbeam_deps
   defp db(conn), do: deps(conn)[:db] || Tightbeam.DB

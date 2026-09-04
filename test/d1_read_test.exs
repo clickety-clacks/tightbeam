@@ -64,20 +64,14 @@ defmodule Tightbeam.D1ReadRouteTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{CursorSigning, DB, Devices, Harness, Identity, Org, Placement, Schema}
+  alias Tightbeam.{DB, Devices, Harness, Identity, Org, Placement, Schema}
   alias Tightbeam.Wire.Router
 
   setup do
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-d1-route-#{System.unique_integer([:positive])}")
 
-    File.mkdir_p!(Path.join(base_dir, "secrets"))
     :initialized = Identity.init!(base_dir)
-
-    signing_path = Path.join([base_dir, "secrets", "rest-cursor-signing.v1"])
-    File.write!(signing_path, :binary.copy(<<5>>, 32))
-    File.chmod!(signing_path, 0o600)
-    signing = CursorSigning.load!(base_dir)
 
     db = :"d1_route_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
@@ -131,7 +125,6 @@ defmodule Tightbeam.D1ReadRouteTest do
         base_dir: base_dir,
         handlers: %{},
         cli_token: "tbc_d1_route",
-        cursor_signing: signing,
         session_status: fn _ -> nil end
       )
 
@@ -166,7 +159,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert get(ctx.opts, "/api/users/alpha", ctx.admin.token).status == 200
   end
 
-  test "users and session host cursors replay in both directions and enforce their principal",
+  test "users and session host cursors replay in both directions with fixed tuple bytes",
        ctx do
     users_path = "/api/users?userId=alpha&userId=beta&userId=zeta&limit=1"
     first = get(ctx.opts, users_path, ctx.admin.token)
@@ -201,15 +194,19 @@ defmodule Tightbeam.D1ReadRouteTest do
 
     assert Enum.map(JSON.decode!(forward.resp_body)["items"], & &1["userId"]) == ["zeta"]
 
-    cross_principal =
+    stale_principal =
       get(
         ctx.opts,
         users_path <> "&after=" <> first_page["page"]["newestCursor"],
         ctx.operator.token
       )
 
-    assert cross_principal.status == 404
-    assert JSON.decode!(cross_principal.resp_body)["error"]["code"] == "not_found"
+    assert stale_principal.status == 400
+    assert JSON.decode!(stale_principal.resp_body)["error"]["code"] == "invalid_cursor"
+
+    malformed = get(ctx.opts, users_path <> "&after=not-a-cursor", ctx.admin.token)
+    assert malformed.status == 400
+    assert JSON.decode!(malformed.resp_body)["error"]["code"] == "invalid_cursor"
 
     hosts_path = "/api/hosts?host=alpha&host=beta&host=zeta&limit=1"
     hosts = get(ctx.opts, hosts_path, ctx.session.cli_token) |> then(&JSON.decode!(&1.resp_body))
@@ -236,7 +233,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert Enum.map(hosts_after["items"], & &1["host"]) == ["zeta"]
   end
 
-  test "D1 preserves auth, visibility, error bytes, and the common not-found floor", ctx do
+  test "D1 preserves auth, visibility, error bytes, and cache", ctx do
     assert get(ctx.opts, "/api/config?asUser=admin", "tbc_d1_route").status == 200
     assert get(ctx.opts, "/api/hosts?host=alpha", ctx.session.cli_token).status == 200
     assert get(ctx.opts, "/api/hosts", "bad-token").status == 401
@@ -245,18 +242,14 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert invalid.status == 400
     assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
 
-    {hidden_us, hidden} =
-      elapsed_get(ctx.opts, "/api/config/default-archetype", ctx.operator.token)
-
-    {missing_us, missing} = elapsed_get(ctx.opts, "/api/config/missing", ctx.admin.token)
+    hidden = get(ctx.opts, "/api/config/default-archetype", ctx.operator.token)
+    missing = get(ctx.opts, "/api/config/missing", ctx.admin.token)
 
     assert hidden.status == 404
     assert missing.status == 404
     assert hidden.resp_body == missing.resp_body
     assert get_resp_header(hidden, "cache-control") == ["no-store"]
     assert get_resp_header(missing, "cache-control") == ["no-store"]
-    assert hidden_us >= 3_000
-    assert missing_us >= 3_000
   end
 
   defp get(opts, path, bearer) do
@@ -265,14 +258,7 @@ defmodule Tightbeam.D1ReadRouteTest do
     |> Router.call(opts)
   end
 
-  defp elapsed_get(opts, path, bearer) do
-    started_at = System.monotonic_time(:microsecond)
-    response = get(opts, path, bearer)
-    {System.monotonic_time(:microsecond) - started_at, response}
-  end
-
   defp decode_cursor(cursor) do
-    [payload, _signature] = String.split(cursor, ".", parts: 2)
-    payload |> Base.url_decode64!(padding: false) |> JSON.decode!()
+    cursor |> Base.url_decode64!(padding: false) |> JSON.decode!()
   end
 end
