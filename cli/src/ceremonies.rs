@@ -135,23 +135,54 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
 {
-    let kind = if provider == "local-openai" || api_key || daemon_credential {
-        "apiKey"
-    } else {
-        "subscription"
-    };
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
             .ok()
             .filter(|name| !name.is_empty()),
         dispatch::provisioned(),
     )?;
+    onboard_for_machine(
+        identity,
+        provider,
+        api_key,
+        daemon_credential,
+        local_endpoint,
+        provider_name,
+        endpoint,
+        machine.as_deref(),
+        send_request,
+        load_harnesses,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn onboard_for_machine<S, H>(
+    identity: &Identity,
+    provider: &str,
+    api_key: bool,
+    daemon_credential: bool,
+    local_endpoint: Option<&str>,
+    provider_name: Option<&str>,
+    endpoint: &Endpoint,
+    machine: Option<&str>,
+    send_request: S,
+    load_harnesses: H,
+) -> Result<(), String>
+where
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+    H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
+{
+    let kind = if provider == "local-openai" || api_key || daemon_credential {
+        "apiKey"
+    } else {
+        "subscription"
+    };
     let begin = dispatch::build_onboard_phase_request(
         identity,
         provider,
         "begin",
         kind,
-        machine.as_deref(),
+        machine,
         None,
         None,
         daemon_credential.then_some("daemonCredential"),
@@ -168,7 +199,7 @@ where
         identity,
         send: &send_request,
         provider,
-        machine: machine.as_deref(),
+        machine,
         owner_user_id: ready.as_ref().and_then(owner_user_id),
     };
     let ready = match ready {
@@ -179,7 +210,7 @@ where
                 identity,
                 provider,
                 kind,
-                machine.as_deref(),
+                machine,
                 None,
                 None,
                 reason,
@@ -195,7 +226,7 @@ where
                 identity,
                 provider,
                 kind,
-                machine.as_deref(),
+                machine,
                 None,
                 None,
                 &reason,
@@ -211,7 +242,7 @@ where
             provider,
             "finish",
             kind,
-            machine.as_deref(),
+            machine,
             Some(lease_id),
             None,
             None,
@@ -232,7 +263,7 @@ where
                 identity,
                 provider,
                 kind,
-                machine.as_deref(),
+                machine,
                 Some(lease_id),
                 None,
                 &reason,
@@ -268,15 +299,14 @@ where
                 "tightbeam onboard local-openai requires --endpoint URL".to_owned()
             })?,
             api_key,
-            machine.as_deref(),
+            machine,
             &ceremony,
         )
         .map_err(StageFailure::from)
     } else if api_key {
-        run_api_key_onboarding(provider, staging, machine.as_deref(), &ceremony)
-            .map_err(StageFailure::from)
+        run_api_key_onboarding(provider, staging, machine, &ceremony).map_err(StageFailure::from)
     } else {
-        run_provider_onboarding(provider, staging, machine.as_deref(), &ceremony)
+        run_provider_onboarding(provider, staging, machine, &ceremony)
     };
 
     if let Err(failure) = staged {
@@ -287,7 +317,7 @@ where
                 identity,
                 provider,
                 kind,
-                machine.as_deref(),
+                machine,
                 Some(lease_id),
                 None,
                 &reason,
@@ -306,7 +336,7 @@ where
             identity,
             provider,
             kind,
-            machine.as_deref(),
+            machine,
             Some(lease_id),
             classified,
             &reason,
@@ -320,7 +350,7 @@ where
         provider,
         "finish",
         kind,
-        machine.as_deref(),
+        machine,
         Some(lease_id),
         None,
         None,
@@ -342,7 +372,7 @@ where
                 identity,
                 provider,
                 kind,
-                machine.as_deref(),
+                machine,
                 Some(lease_id),
                 None,
                 &reason,
@@ -2523,7 +2553,7 @@ mod tests {
         };
         let sent = std::sync::Mutex::new(Vec::new());
 
-        onboard(
+        onboard_for_machine(
             &Identity::User("fixture-user".to_owned()),
             "opencode-go",
             false,
@@ -2531,6 +2561,7 @@ mod tests {
             None,
             None,
             &endpoint,
+            Some("fixture-machine"),
             |_, request, _| {
                 let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
                 sent.lock().unwrap().push(body.clone());

@@ -12,6 +12,11 @@
 //! asserted separately below via the real `harness-group` command — the test cleanup does not re-prove
 //! it.
 
+// This integration test exercises Linux process-instance authority directly: `/proc`
+// start times, pidfds, `setsid`, and `killpg`. Keep the whole test crate Linux-only so the
+// portable CLI test target still compiles on macOS without naming Linux-only libc syscalls.
+#![cfg(target_os = "linux")]
+
 use std::fs;
 use std::io;
 use std::io::Write;
