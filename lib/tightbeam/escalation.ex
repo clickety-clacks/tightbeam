@@ -9,6 +9,7 @@ defmodule Tightbeam.Escalation do
 
   alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   defmodule IntegrityEvidenceConflict do
     @moduledoc false
@@ -562,10 +563,17 @@ defmodule Tightbeam.Escalation do
              {:ok, decision} <- resolve_decision(request, param(call, :decision)) do
           case request.status do
             status when status in ["ruled", "consumed"] and request.decision == decision ->
-              request
+              publish_request_replay(db, call, request)
 
             "open" ->
-              rule_open(db, request, decision, param(call, :rationale), call.origin, opts)
+              rule_open(
+                db,
+                request,
+                decision,
+                param(call, :rationale),
+                call.origin,
+                Keyword.put(opts, :firehose_call, call)
+              )
 
             _ ->
               error("not_open", "decision request is not open")
@@ -685,7 +693,7 @@ defmodule Tightbeam.Escalation do
             error("not_raiser", "raiser required")
 
           request ->
-            withdraw_open(db, request, call.origin, reason)
+            withdraw_open(db, Map.put(request, :firehose_call, call), call.origin, reason)
         end
     end
   end
@@ -951,23 +959,30 @@ defmodule Tightbeam.Escalation do
 
     case operator_open_in_txn(txn, owner_user_id, raiser_id, action_key) do
       nil ->
-        with :ok <- filing_session_owner_in_txn(txn, session_key, owner_user_id),
-             :ok <- linked_assignment_in_txn(txn, ask.assignment_id, owner_user_id),
-             :ok <- superseded_request_in_txn(txn, ask.supersedes, owner_user_id, raiser_id) do
-          insert_operator_request_in_txn(
-            txn,
-            session_key,
-            owner_user_id,
-            raiser_id,
-            action_key,
-            ask,
-            opts
-          )
-        else
-          reason -> reason
-        end
+        result =
+          with :ok <- filing_session_owner_in_txn(txn, session_key, owner_user_id),
+               :ok <- linked_assignment_in_txn(txn, ask.assignment_id, owner_user_id),
+               :ok <- superseded_request_in_txn(txn, ask.supersedes, owner_user_id, raiser_id) do
+            insert_operator_request_in_txn(
+              txn,
+              session_key,
+              owner_user_id,
+              raiser_id,
+              action_key,
+              ask,
+              opts
+            )
+          else
+            reason -> reason
+          end
+
+        if not match?(%{code: _}, result),
+          do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+        result
 
       request ->
+        Publisher.maybe_observed_accepted_in_txn(txn, call)
         request
     end
   end
@@ -1054,51 +1069,60 @@ defmodule Tightbeam.Escalation do
   end
 
   defp operator_rule_in_txn(txn, call, request_id, answer, opts) do
-    case request_in_txn_optional(txn, request_id) do
-      nil ->
-        {error("not_found", "decision request not found"), nil}
+    {result, fact_id} =
+      case request_in_txn_optional(txn, request_id) do
+        nil ->
+          {error("not_found", "decision request not found"), nil}
 
-      %{kind: "statute"} ->
-        {error("invalid", "statute requests use rule"), nil}
+        %{kind: "statute"} ->
+          {error("invalid", "statute requests use rule"), nil}
 
-      %{kind: "effort"} ->
-        {error("invalid", "effort requests use effort-rule"), nil}
+        %{kind: "effort"} ->
+          {error("invalid", "effort requests use effort-rule"), nil}
 
-      request ->
-        with :ok <- operator_owner_authorized(call, request) do
-          case request.status do
-            "ruled" ->
-              replay_operator_ruling_in_txn(txn, call, request, answer)
+        request ->
+          with :ok <- operator_owner_authorized(call, request) do
+            case request.status do
+              "ruled" ->
+                replay_operator_ruling_in_txn(txn, call, request, answer)
 
-            "consumed" ->
-              case validate_terminal_request_in_txn(txn, request) do
-                %{failures: []} ->
-                  {error("not_open", "decision request is not open"), nil}
+              "consumed" ->
+                case validate_terminal_request_in_txn(txn, request) do
+                  %{failures: []} ->
+                    {error("not_open", "decision request is not open"), nil}
 
-                validation ->
-                  {record_integrity_refusal_in_txn(
-                     txn,
-                     request.id,
-                     validation,
-                     :detail,
-                     observer_principal(call)
-                   ), nil}
-              end
+                  validation ->
+                    {record_integrity_refusal_in_txn(
+                       txn,
+                       request.id,
+                       validation,
+                       :detail,
+                       observer_principal(call)
+                     ), nil}
+                end
 
-            "open" ->
-              with {:ok, decision} <- operator_decision(request, answer) do
-                rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
-              else
-                {:error, reason} -> {reason, nil}
-              end
+              "open" ->
+                with {:ok, decision} <- operator_decision(request, answer) do
+                  rule_operator_request_in_txn(txn, call, request, decision, answer, opts)
+                else
+                  {:error, reason} -> {reason, nil}
+                end
 
-            _terminal_or_closed ->
-              {error("not_open", "decision request is not open"), nil}
+              _terminal_or_closed ->
+                {error("not_open", "decision request is not open"), nil}
+            end
+          else
+            {:error, reason} -> {reason, nil}
           end
-        else
-          {:error, reason} -> {reason, nil}
-        end
+      end
+
+    if not match?(%{code: _}, result) do
+      if is_integer(fact_id),
+        do: Publisher.maybe_accepted_in_txn(txn, call, result),
+        else: Publisher.maybe_observed_accepted_in_txn(txn, call)
     end
+
+    {result, fact_id}
   end
 
   defp replay_operator_ruling_in_txn(txn, call, request, answer) do
@@ -1240,6 +1264,7 @@ defmodule Tightbeam.Escalation do
           cond do
             request.status == "withdrawn" and request.withdrawn_by == by and
                 request.withdrawn_reason == reason ->
+              Publisher.maybe_observed_accepted_in_txn(txn, call)
               request
 
             request.status != "open" ->
@@ -1264,7 +1289,9 @@ defmodule Tightbeam.Escalation do
                 "by=#{by} reason=#{reason}"
               )
 
-              request_in_txn(txn, request.id)
+              withdrawn = request_in_txn(txn, request.id)
+              Publisher.maybe_accepted_in_txn(txn, call, withdrawn)
+              withdrawn
           end
         else
           {:error, reason} -> reason
@@ -1522,15 +1549,20 @@ defmodule Tightbeam.Escalation do
             "by=#{origin} decision=#{decision} factId=#{fact_id}"
           )
 
-          {request_in_txn(txn, request.id), fact_id}
+          ruled = request_in_txn(txn, request.id)
+          Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
+          {ruled, fact_id}
         else
           current = request_in_txn(txn, request.id)
 
           # A concurrent-ruler loser filed nothing: it must not nudge (F13 —
           # one post-commit nudge per filed fact, owned by the filer).
-          if current.status == "ruled" and current.decision == decision,
-            do: {current, nil},
-            else: {error("not_open", "decision request is not open"), nil}
+          if current.status == "ruled" and current.decision == decision do
+            Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], current)
+            {current, nil}
+          else
+            {error("not_open", "decision request is not open"), nil}
+          end
         end
       end)
 
@@ -1629,13 +1661,24 @@ defmodule Tightbeam.Escalation do
             "by=#{by} reason=#{reason}"
           )
 
-          request_in_txn(txn, request.id)
+          withdrawn = request_in_txn(txn, request.id)
+          Publisher.maybe_accepted_in_txn(txn, request.firehose_call, withdrawn)
+          withdrawn
         else
           error("not_open", "decision request is not open")
         end
       end)
 
     result
+  end
+
+  defp publish_request_replay(db, call, request) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Publisher.maybe_accepted_in_txn(txn, call, request)
+      end)
+
+    request
   end
 
   defp resolve_decision(_request, decision) when decision in ["allow", "deny"],

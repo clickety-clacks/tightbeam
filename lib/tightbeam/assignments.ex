@@ -5,6 +5,7 @@ defmodule Tightbeam.Assignments do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Harness.Support
   alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
 
@@ -546,16 +547,20 @@ defmodule Tightbeam.Assignments do
           open_dispatch_result(db, call)
         else
           transaction(db, fn txn ->
-            Wakes.schedule_in_txn(txn, %{
-              session_key: caller_session,
-              origin: call.origin,
-              creator_session_key: caller_session,
-              prompt:
-                "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
-              due_at: now(),
-              rumination: true,
-              work_item_id: work_item_id
-            })
+            wake =
+              Wakes.schedule_in_txn(txn, %{
+                session_key: caller_session,
+                origin: call.origin,
+                creator_session_key: caller_session,
+                prompt:
+                  "digest: Ruminate on work-item #{work_item_id} against the whole spec and its spirit before you fan out. Intent you were about to dispatch: subject=#{call.params[:subject]} brief=#{call.params[:brief]}. When you've thought it through, re-issue the dispatch.",
+                due_at: now(),
+                rumination: true,
+                work_item_id: work_item_id
+              })
+
+            Publisher.maybe_observed_accepted_in_txn(txn, call)
+            Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
 
             %{
               rumination_required: true,
@@ -646,14 +651,31 @@ defmodule Tightbeam.Assignments do
 
       result =
         transaction(db, fn txn ->
-          case open_assignment_in_txn(txn, call, owner, key, files, verb) do
-            {:created, assignment} ->
-              created = after_create.(txn, assignment)
-              accept_assignment_in_txn(created, txn, call)
+          result =
+            case open_assignment_in_txn(txn, call, owner, key, files, verb) do
+              {:created, assignment} ->
+                created = after_create.(txn, assignment)
+                accept_assignment_in_txn(created, txn, call)
 
-            other ->
-              other
+              other ->
+                other
+            end
+
+          case result do
+            {:accepted_in_txn, _event_id, {:created, assignment, _delivery}} ->
+              Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+            {:created, assignment, _delivery} ->
+              Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+            {:replayed, assignment} ->
+              Publisher.maybe_accepted_in_txn(txn, call, assignment)
+
+            _ ->
+              :ok
           end
+
+          result
         end)
 
       case result do
@@ -735,7 +757,16 @@ defmodule Tightbeam.Assignments do
       # transaction is deliberate — a registry this cannot read is reported as
       # such, and a failed CHECK never rejects the claim (§Design 5).
       artifact_cursor = artifact_cursor(db)
-      result = transaction(db, fn txn -> attest_in_txn(txn, call) end)
+
+      result =
+        transaction(db, fn txn ->
+          result = attest_in_txn(txn, call)
+
+          if is_map(result) and not Map.has_key?(result, :code),
+            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+          result
+        end)
 
       if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
         {:ok, from} = from
@@ -904,7 +935,16 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, "revoke-assignment") do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
-      result = transaction(db, fn txn -> revoke_in_txn(txn, call) end)
+
+      result =
+        transaction(db, fn txn ->
+          result = revoke_in_txn(txn, call)
+
+          if is_map(result) and not Map.has_key?(result, :code),
+            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+          result
+        end)
 
       if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
         {:ok, from} = from

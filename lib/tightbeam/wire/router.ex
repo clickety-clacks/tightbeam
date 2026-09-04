@@ -60,7 +60,7 @@ defmodule Tightbeam.Wire.Router do
     WorkState
   }
 
-  alias Tightbeam.Wire.{Payloads, Socket}
+  alias Tightbeam.Wire.{ChangeSocket, Payloads, Socket}
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
@@ -101,6 +101,17 @@ defmodule Tightbeam.Wire.Router do
 
   get "/ws" do
     upgrade_socket(conn)
+  end
+
+  get "/ws/changes" do
+    conn = Plug.Conn.fetch_query_params(conn)
+
+    if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] and
+         conn.query_params["protocolVersion"] == "1" do
+      WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn), max_frame_size: 2 * 1024 * 1024)
+    else
+      error(conn, 426, "unsupported_protocol_version")
+    end
   end
 
   defp upgrade_socket(conn) do

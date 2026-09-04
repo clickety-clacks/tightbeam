@@ -25,6 +25,8 @@ defmodule Tightbeam.Artifacts do
   """
 
   alias Tightbeam.{DB, TurnObservations}
+  alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @outside_workspace "artifact origin is outside its session workspace"
 
@@ -88,34 +90,45 @@ defmodule Tightbeam.Artifacts do
         {recorded_message_id, evidence} = turn_evidence(db, session_key)
         now = now()
 
-        {:ok, _} =
-          DB.query(
-            db,
-            """
-            INSERT INTO artifacts
-              (artifactId, kind, title, description, createdBySession, workItemId,
-               parentSession, originPath, contentSha256, recordedMessageId,
-               recordedTurnEvidence, state, home, createdAt, updatedAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                    'in-workspace', NULL, ?12, ?12)
-            """,
-            [
-              artifact_id,
-              call.params.kind,
-              call.params.title,
-              call.params[:description],
-              session_key,
-              work_item_id,
-              parent_session,
-              call.params.origin_path,
-              call.params[:content_sha256],
-              recorded_message_id,
-              evidence,
-              now
-            ]
-          )
+        {:ok, artifact} =
+          DB.transaction(db, fn txn ->
+            Txn.q(
+              txn,
+              """
+              INSERT INTO artifacts
+                (artifactId, kind, title, description, createdBySession, workItemId,
+                 parentSession, originPath, contentSha256, recordedMessageId,
+                 recordedTurnEvidence, state, home, createdAt, updatedAt)
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                      'in-workspace', NULL, ?12, ?12)
+              """,
+              [
+                artifact_id,
+                call.params.kind,
+                call.params.title,
+                call.params[:description],
+                session_key,
+                work_item_id,
+                parent_session,
+                call.params.origin_path,
+                call.params[:content_sha256],
+                recorded_message_id,
+                evidence,
+                now
+              ]
+            )
 
-        get(db, artifact_id)
+            [row] =
+              Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [
+                artifact_id
+              ])
+
+            artifact = artifact(row)
+            Publisher.maybe_accepted_in_txn(txn, call, artifact)
+            artifact
+          end)
+
+        artifact
 
       {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->
         %{code: "invalid", message: "artifact-record requires provenance edges"}
