@@ -2712,7 +2712,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     # The unaffected case: a second assignment on the same item stays open, so
     # its owned probe never cancels and its generation never retires.
-    _open_holder = session(ctx.db, "holderB", "h2", host, %{spawned_by: "parent"})
+    _open_holder = session(ctx.db, "holderB", "h1", host, %{spawned_by: "parent"})
     init_workspace(Placement.workdir_path(ctx.config, _open_holder))
     open = dispatch_for_item(ctx, {:session, "parent"}, "holderB", "A8 open", item.id)
 
