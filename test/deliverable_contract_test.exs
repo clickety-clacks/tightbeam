@@ -198,7 +198,7 @@ defmodule Tightbeam.DeliverableContractTest do
              "def store_completion_receipt_in_txn(txn, principal, key, fingerprint, response)"
 
     assert integrated_assignments =~
-             "CompletionEscalation.open_in_txn(txn, closed_assignment, attest)"
+             ~s|CompletionEscalation.open_terminal_in_txn(txn, closed_assignment, "attest", attest)|
 
     # The integration target installs the reviewed completion-escalation rail.
     # Its own rollback matrix exercises the real producer in the same completion

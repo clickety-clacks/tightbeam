@@ -110,9 +110,15 @@ defmodule Tightbeam.Schema do
   # The effort-generator-retirement rebuild adds the four nullable retirement
   # fields and the all-or-none retirement CHECK on `effort_checkin_generations`,
   # plus the `effort_checkin_wake_ownership` relation, advancing the exact v17
-  # predecessor transactionally to v18 — the current one-step boot arm. The
-  # reading is the stamp itself, never a boot-path inference about the shape.
-  @shape "coordination-fabric-v1-phase1-v18"
+  # predecessor transactionally to the fixed v18 completion predecessor. It is
+  # now a frozen seam: the function remains public, but boot no longer wires it.
+  #
+  # The terminal empty-epoch and bounded-recipient revision changes the
+  # completion-owned tables again. Its v18 predecessor is the current one-step
+  # boot arm; only empty completion-owned tables can advance transactionally to
+  # v19, and a populated table is refused with its exact row count.
+  @shape "coordination-fabric-v1-phase1-v19"
+  @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
   @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
   @premise_gate_previous_shape "coordination-fabric-v1-phase1-v16"
   @premise_gate_label "incompatible_premise_gate_v1"
@@ -1959,7 +1965,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @effort_generator_retirement_previous_shape,
-             @shape,
+             @completion_escalation_previous_shape,
              migration_time
            ])
 
@@ -2238,8 +2244,16 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
-      {:ok, [[@effort_generator_retirement_previous_shape]]} ->
-        upgrade_effort_generator_retirement_v1(db)
+      {:ok, [[@completion_escalation_previous_shape]]} ->
+        raise ShapeError, """
+        this Tightbeam database predates terminal empty-epoch completion escalation.
+
+          stamped: #{@completion_escalation_previous_shape}
+          this build: #{@shape}
+
+        No in-place migration is defined for this boundary.
+        Move the database aside and let this build recreate it.
+        """
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -2255,8 +2269,8 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration from #{found}. The only supported upgrade source
-        is #{@effort_generator_retirement_previous_shape}.
+        There is no migration from #{found}. The exact completion predecessor
+        #{@completion_escalation_previous_shape} also requires recreation.
         Move this database aside and let it be recreated.
         """
 

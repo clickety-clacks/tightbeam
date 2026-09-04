@@ -370,19 +370,20 @@ defmodule Tightbeam.JobTraceTest do
           ~w(assignmentId at evidence id state type
              retiredAt retiredOutcome retiredCause retiredPrincipal)a
 
+        "completion_escalation" ->
+          ~w(actingPrincipal assignmentId at childSessionKey closingAttestId completionId
+             causeId causeKind causePrincipal currentRecipient currentStatus decision id
+             outcome phase recipientGeneration recipientReissueCount recipientReissueLimit
+             revocationId supersededByAssignmentId supersededReason type workItemId)a
+
+        "completion_escalation_event" ->
+          ~w(at completionId detail id kind type)a
+
         # job-forensics-v2 §3 — pinned EXACTLY: every key always present,
         # nullable where the spec marks it, so a consumer never has to
         # distinguish absent from null.
         "causal_event" ->
           ~w(assignmentId at detail id jobRef kind seqTiebreak sessionKey type)a
-
-        "completion_escalation" ->
-          ~w(actingPrincipal assignmentId at childSessionKey closingAttestId completionId
-             causePrincipal currentStatus decision id phase supersededByAssignmentId
-             supersededReason type workItemId)a
-
-        "completion_escalation_event" ->
-          ~w(at completionId detail id kind type)a
 
         "wake_canceled" ->
           ~w(assignmentId at id reason seqTiebreak type effortRole)a

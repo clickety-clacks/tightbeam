@@ -34,12 +34,27 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v18"
+  @shape "coordination-fabric-v1-phase1-v19"
+  @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
+  @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     %{db: name}
+  end
+
+  test "the exact v18 completion predecessor refuses through boot dispatch", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               @completion_escalation_previous_shape
+             ])
+
+    assert_raise Tightbeam.Schema.ShapeError,
+                 ~r/predates terminal empty-epoch completion escalation.*stamped: coordination-fabric-v1-phase1-v18.*this build: coordination-fabric-v1-phase1-v19.*Move the database aside/s,
+                 fn -> Schema.ensure_all(db) end
   end
 
   test "a fresh database is created and stamped", %{db: db} do
@@ -451,7 +466,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.upgrade_premise_gate_v1(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v17"]]} =
+    assert {:ok, [[@effort_generator_retirement_previous_shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert premise_gate_objects(db) == Enum.sort(premise_gate_object_names())
@@ -520,12 +535,11 @@ defmodule Tightbeam.SchemaShapeTest do
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v16'")
 
     # v16 is no longer wired into boot dispatch: `check_shape` accepts only the
-    # v17 predecessor now, so a v16 stamp is migrated through the explicit seam,
-    # which stamps the frozen v17 successor. The boot-dispatch proof for the live
-    # wire moved to the v17 -> v18 test below.
+    # v18 predecessor now, so a v16 stamp is migrated through the explicit seam,
+    # which stamps the frozen v17 successor.
     assert :ok = Schema.upgrade_premise_gate_v1(db)
 
-    assert {:ok, [["coordination-fabric-v1-phase1-v17"]]} =
+    assert {:ok, [[@effort_generator_retirement_previous_shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert premise_gate_objects(db) == Enum.sort(premise_gate_object_names())
@@ -682,7 +696,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v14"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v18"
+    assert error.message =~ "this build: #{@shape}"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 
@@ -807,17 +821,16 @@ defmodule Tightbeam.SchemaShapeTest do
              )
   end
 
-  test "the exact v17 predecessor gains effort generator retirement through boot dispatch",
+  test "the exact v17 predecessor gains effort generator retirement through the migration seam",
        %{db: db} do
     setup_v17_effort_db(db)
 
-    # The boot path itself, not the explicit seam: `ensure_all` -> `check_shape`
-    # must dispatch the exact v17 stamp into the migration and advance it to v18.
-    # This is the only proof the live wire is real; the seam test can pass while
-    # boot still refuses.
-    assert :ok = Schema.ensure_all(db)
+    # The displaced migration remains a public, exact seam and stamps its fixed
+    # v18 successor. Boot now wires only the immediate v18 predecessor to v19.
+    assert :ok = Schema.upgrade_effort_generator_retirement_v1(db)
 
-    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[@completion_escalation_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
 
     # The migration ran under boot: typed ownership now exists for exactly the
     # two structurally-referenced effort wakes.
@@ -832,10 +845,6 @@ defmodule Tightbeam.SchemaShapeTest do
              )
 
     assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
-
-    # Idempotent: booting again on the freshly migrated shape is a clean accept.
-    assert :ok = Schema.ensure_all(db)
-    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   test "the historical migration helpers preserve their exact v4 to v6 contract", %{db: db} do

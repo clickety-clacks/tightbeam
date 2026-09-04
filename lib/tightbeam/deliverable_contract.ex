@@ -9,7 +9,8 @@ defmodule Tightbeam.DeliverableContract do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  @shape "coordination-fabric-v1-phase1-v18"
+  @shape "coordination-fabric-v1-phase1-v19"
+  @previous_shape "coordination-fabric-v1-phase1-v18"
 
   defmodule Inconsistent do
     @moduledoc false
@@ -149,7 +150,7 @@ defmodule Tightbeam.DeliverableContract do
   @doc "Create the companion schema and validate all existing contract rows."
   def ensure_schema(db \\ Tightbeam.DB) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[@shape]]} ->
+      {:ok, [[shape]]} when shape in [@previous_shape, @shape] ->
         validate_existing_schema!(db)
 
       {:ok, [[_predecessor]]} ->
