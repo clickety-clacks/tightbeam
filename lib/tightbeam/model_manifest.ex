@@ -343,7 +343,7 @@ defmodule Tightbeam.ModelManifest do
 
       with :ok <- valid_profile(model, profiles, path),
            :ok <- valid_status(model, path),
-           :ok <- valid_version_gate(get_in(model, ["adapter", "claudeCode"]), path) do
+           :ok <- valid_model_adapter(model, path) do
         {:cont, :ok}
       else
         {:error, _reason} = error -> {:halt, error}
@@ -361,6 +361,19 @@ defmodule Tightbeam.ModelManifest do
 
   defp valid_status(%{"status" => status}, _path) when status in ["current", "legacy"], do: :ok
   defp valid_status(_model, path), do: invalid_reason(path <> ".status", :invalid)
+
+  defp valid_model_adapter(model, path) do
+    case Map.fetch(model, "adapter") do
+      :error ->
+        :ok
+
+      {:ok, adapter} when is_map(adapter) ->
+        valid_version_gate(Map.get(adapter, "claudeCode"), path)
+
+      {:ok, _adapter} ->
+        invalid_reason(path <> ".adapter", :wrong_shape)
+    end
+  end
 
   defp valid_version_gate(nil, _path), do: :ok
 
