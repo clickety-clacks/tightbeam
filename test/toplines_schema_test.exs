@@ -183,7 +183,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
     assert snapshot(db) == before
   end
 
-  test "the exact prior Concern shape migrates current tags atomically and restart is a no-op" do
+  test "the exact prior Concern shape refuses without changing schema or rows" do
     db = activated_db!()
 
     assert {:ok, []} =
@@ -211,46 +211,10 @@ defmodule Tightbeam.ToplinesSchemaTest do
 
     install_legacy_concern_shape!(db)
 
-    legacy_index =
-      Enum.find(
-        ToplinesSchema.__legacy_concern_manifest__(),
-        &(&1.name == "topline_concern_refs_active_pair")
-      )
-
-    :ok = DB.execute(db, "DROP INDEX topline_concern_refs_active_pair")
-    :ok = DB.execute(db, String.replace(legacy_index.sql, "membershipId)", "membershipId DESC)"))
-    malformed = snapshot(db)
-
-    assert {:error, %{code: "schema_shape_mismatch"}} = ToplinesSchema.activate(db, 2)
-    assert snapshot(db) == malformed
-
-    :ok = DB.execute(db, "DROP INDEX topline_concern_refs_active_pair")
-    :ok = DB.execute(db, legacy_index.sql)
     before = snapshot(db)
 
-    assert_raise RuntimeError, ~r/activation interrupted/, fn ->
-      ToplinesSchema.activate(db, 2, interrupt_after: :during_concern_migration)
-    end
-
+    assert {:error, %{code: "schema_shape_mismatch"}} = ToplinesSchema.activate(db, 2)
     assert snapshot(db) == before
-    assert :ok = ToplinesSchema.activate(db, 3)
-
-    assert {:ok, [["tl_migrate", "tlc_migrate", "wi_one", "risk", "user", "mike", 4]]} =
-             DB.query(
-               db,
-               """
-               SELECT toplineId, concernId, workItemId, tagReason,
-                      taggedActorKind, taggedActorRef, taggedAt
-               FROM topline_concern_refs
-               """
-             )
-
-    assert {:ok, [["concern_created"], ["concern_work_tagged"]]} =
-             DB.query(db, "SELECT kind FROM topline_events ORDER BY seq")
-
-    migrated = snapshot(db)
-    assert :ok = ToplinesSchema.activate(db, 999)
-    assert snapshot(db) == migrated
   end
 
   defp base_db! do
@@ -259,6 +223,195 @@ defmodule Tightbeam.ToplinesSchemaTest do
 
     seed_base_schema!(db)
     db
+  end
+
+  defp legacy_concern_objects do
+    [
+      %{
+        type: "table",
+        name: "topline_concerns",
+        sql:
+          String.trim("""
+          CREATE TABLE topline_concerns (
+            id                TEXT PRIMARY KEY CHECK (substr(id, 1, 4) = 'tlc_'),
+            toplineId         TEXT NOT NULL REFERENCES toplines(id),
+            title             ANY NOT NULL,
+            state             TEXT NOT NULL CHECK (state IN ('open','resolved')),
+            createdActorKind  TEXT NOT NULL CHECK (createdActorKind IN ('user','session')),
+            createdActorRef   TEXT NOT NULL CHECK (length(trim(createdActorRef)) > 0),
+            createdAt         INTEGER NOT NULL,
+            updatedAt         INTEGER NOT NULL,
+            resolveReason     TEXT,
+            resolvedActorKind TEXT,
+            resolvedActorRef  TEXT,
+            resolvedAt        INTEGER,
+            CHECK (typeof(title) = 'text'),
+            CHECK (tightbeam_canonical_title(title) IS NOT NULL),
+            CHECK (title = tightbeam_canonical_title(title)),
+            CHECK (tightbeam_unicode_scalar_length(title) BETWEEN 1 AND 2000),
+            CHECK (typeof(createdAt) = 'integer'),
+            CHECK (typeof(updatedAt) = 'integer' AND updatedAt >= createdAt),
+            CHECK (
+              (state = 'open' AND resolveReason IS NULL AND resolvedActorKind IS NULL AND
+               resolvedActorRef IS NULL AND resolvedAt IS NULL) OR
+              (state = 'resolved' AND resolveReason IS NOT NULL AND
+               length(trim(resolveReason)) BETWEEN 1 AND 4000 AND
+               resolvedActorKind IS NOT NULL AND resolvedActorKind IN ('user','session') AND
+               resolvedActorRef IS NOT NULL AND length(trim(resolvedActorRef)) > 0 AND
+               typeof(resolvedAt) = 'integer' AND resolvedAt >= createdAt)
+            )
+          )
+          """)
+      },
+      %{
+        type: "index",
+        name: "topline_concerns_id_topline",
+        sql: "CREATE UNIQUE INDEX topline_concerns_id_topline ON topline_concerns (id, toplineId)"
+      },
+      %{
+        type: "table",
+        name: "topline_concern_refs",
+        sql:
+          String.trim("""
+          CREATE TABLE topline_concern_refs (
+            id                TEXT PRIMARY KEY CHECK (substr(id, 1, 5) = 'tlcr_'),
+            toplineId         TEXT NOT NULL,
+            concernId         TEXT NOT NULL,
+            membershipId      TEXT NOT NULL,
+            linkReason        TEXT NOT NULL CHECK (length(trim(linkReason)) BETWEEN 1 AND 4000),
+            linkedActorKind   TEXT NOT NULL CHECK (linkedActorKind IN ('user','session')),
+            linkedActorRef    TEXT NOT NULL CHECK (length(trim(linkedActorRef)) > 0),
+            linkedAt          INTEGER NOT NULL CHECK (typeof(linkedAt) = 'integer'),
+            unlinkReason      TEXT,
+            unlinkedActorKind TEXT,
+            unlinkedActorRef  TEXT,
+            unlinkedAt        INTEGER,
+            FOREIGN KEY (concernId, toplineId) REFERENCES topline_concerns(id, toplineId),
+            FOREIGN KEY (membershipId, toplineId)
+              REFERENCES topline_work_memberships(id, toplineId),
+            CHECK (
+              (unlinkedAt IS NULL AND unlinkReason IS NULL AND
+               unlinkedActorKind IS NULL AND unlinkedActorRef IS NULL) OR
+              (typeof(unlinkedAt) = 'integer' AND unlinkedAt >= linkedAt AND
+               unlinkReason IS NOT NULL AND
+               length(trim(unlinkReason)) BETWEEN 1 AND 4000 AND
+               unlinkedActorKind IS NOT NULL AND unlinkedActorKind IN ('user','session') AND
+               unlinkedActorRef IS NOT NULL AND length(trim(unlinkedActorRef)) > 0)
+            )
+          )
+          """)
+      },
+      %{
+        type: "index",
+        name: "topline_concern_refs_active_pair",
+        sql:
+          "CREATE UNIQUE INDEX topline_concern_refs_active_pair ON topline_concern_refs (concernId, membershipId) WHERE unlinkedAt IS NULL"
+      },
+      %{
+        type: "index",
+        name: "topline_concern_refs_id_tuple",
+        sql:
+          "CREATE UNIQUE INDEX topline_concern_refs_id_tuple ON topline_concern_refs (id, toplineId, concernId, membershipId)"
+      },
+      %{
+        type: "table",
+        name: "topline_events",
+        sql:
+          String.trim("""
+          CREATE TABLE topline_events (
+            toplineId          TEXT NOT NULL REFERENCES toplines(id),
+            seq                 INTEGER NOT NULL CHECK (typeof(seq) = 'integer' AND seq >= 1),
+            kind                TEXT NOT NULL CHECK (kind IN (
+              'topline_created','topline_renamed','topline_closed','topline_reopened',
+              'work_linked','work_unlinked','concern_created','concern_renamed',
+              'concern_resolved','concern_reopened','concern_work_linked',
+              'concern_work_unlinked'
+            )),
+            membershipId       TEXT,
+            concernId          TEXT,
+            concernReferenceId TEXT,
+            actorKind           TEXT NOT NULL CHECK (actorKind IN ('user','session')),
+            actorRef            TEXT NOT NULL CHECK (length(trim(actorRef)) > 0),
+            reason              TEXT,
+            eventAt             INTEGER NOT NULL CHECK (typeof(eventAt) = 'integer'),
+            detail              TEXT NOT NULL CHECK (json_valid(detail) AND json_type(detail) = 'object'),
+            PRIMARY KEY (toplineId, seq),
+            FOREIGN KEY (membershipId, toplineId)
+              REFERENCES topline_work_memberships(id, toplineId),
+            FOREIGN KEY (concernId, toplineId) REFERENCES topline_concerns(id, toplineId),
+            FOREIGN KEY (concernReferenceId, toplineId, concernId, membershipId)
+              REFERENCES topline_concern_refs(id, toplineId, concernId, membershipId),
+            CHECK (
+              (kind IN ('topline_created','topline_renamed','topline_closed','topline_reopened') AND
+               membershipId IS NULL AND concernId IS NULL AND concernReferenceId IS NULL) OR
+              (kind IN ('work_linked','work_unlinked') AND membershipId IS NOT NULL AND
+               concernId IS NULL AND concernReferenceId IS NULL) OR
+              (kind IN ('concern_created','concern_renamed','concern_resolved','concern_reopened') AND
+               membershipId IS NULL AND concernId IS NOT NULL AND concernReferenceId IS NULL) OR
+              (kind IN ('concern_work_linked','concern_work_unlinked') AND
+               membershipId IS NOT NULL AND concernId IS NOT NULL AND concernReferenceId IS NOT NULL)
+            ),
+            CHECK (
+              (kind IN ('topline_created','concern_created') AND reason IS NULL) OR
+              (kind NOT IN ('topline_created','concern_created') AND
+               reason IS NOT NULL AND
+               length(trim(reason)) BETWEEN 1 AND 4000)
+            ),
+            CHECK (
+              COALESCE((kind IN ('topline_created','concern_created') AND
+               json_type(detail, '$.title') = 'text' AND json_remove(detail, '$.title') = '{}') OR
+              (kind IN ('topline_renamed','concern_renamed') AND
+               json_type(detail, '$.fromTitle') = 'text' AND
+               json_type(detail, '$.toTitle') = 'text' AND
+               json_remove(detail, '$.fromTitle', '$.toTitle') = '{}') OR
+              (kind IN ('topline_closed','topline_reopened','concern_resolved','concern_reopened') AND
+               json_type(detail, '$.fromState') = 'text' AND
+               json_type(detail, '$.toState') = 'text' AND
+               json_remove(detail, '$.fromState', '$.toState') = '{}') OR
+              (kind = 'work_linked' AND json_type(detail, '$.workItemId') = 'text' AND
+               json_type(detail, '$.linkReason') = 'text' AND
+               json_remove(detail, '$.workItemId', '$.linkReason') = '{}') OR
+              (kind = 'work_unlinked' AND json_type(detail, '$.workItemId') = 'text' AND
+               json_type(detail, '$.unlinkReason') = 'text' AND
+               json_remove(detail, '$.workItemId', '$.unlinkReason') = '{}') OR
+              (kind = 'concern_work_linked' AND json_type(detail, '$.membershipId') = 'text' AND
+               json_type(detail, '$.linkReason') = 'text' AND
+               json_remove(detail, '$.membershipId', '$.linkReason') = '{}') OR
+              (kind = 'concern_work_unlinked' AND
+               json_type(detail, '$.membershipId') = 'text' AND
+               json_type(detail, '$.unlinkReason') = 'text' AND
+               json_extract(detail, '$.cause') IN ('explicit','membership_unlinked') AND
+               json_remove(detail, '$.membershipId', '$.unlinkReason', '$.cause') = '{}'), 0)
+            )
+          )
+          """)
+      },
+      %{
+        type: "table",
+        name: "topline_idempotency",
+        sql:
+          String.trim("""
+          CREATE TABLE topline_idempotency (
+            callerUserId       TEXT NOT NULL REFERENCES users(userId),
+            operation          TEXT NOT NULL CHECK (operation IN (
+              'topline-create','topline-update','topline-close','topline-reopen',
+              'topline-link-work','topline-unlink-work','topline-concern-create',
+              'topline-concern-update','topline-concern-resolve','topline-concern-reopen',
+              'topline-concern-link-work','topline-concern-unlink-work',
+              'topline-work-leave-unlinked'
+            )),
+            idempotencyKey     TEXT NOT NULL CHECK (length(trim(idempotencyKey)) BETWEEN 1 AND 200),
+            requestFingerprint TEXT NOT NULL CHECK (
+              length(requestFingerprint) = 64 AND requestFingerprint NOT GLOB '*[^0-9a-f]*'
+            ),
+            canonicalResponse  TEXT NOT NULL CHECK (
+              json_valid(canonicalResponse) AND json_type(canonicalResponse) = 'object'
+            ),
+            PRIMARY KEY (callerUserId, operation, idempotencyKey)
+          )
+          """)
+      }
+    ]
   end
 
   defp install_legacy_concern_shape!(db) do
@@ -273,7 +426,7 @@ defmodule Tightbeam.ToplinesSchemaTest do
         """
       )
 
-    Enum.each(ToplinesSchema.__legacy_concern_manifest__(), fn object ->
+    Enum.each(legacy_concern_objects(), fn object ->
       :ok = DB.execute(db, object.sql)
     end)
 
