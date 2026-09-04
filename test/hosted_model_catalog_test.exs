@@ -1,7 +1,7 @@
 defmodule Tightbeam.HostedModelCatalogTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Model, ModelCatalog, Placement, Unroutable}
+  alias Tightbeam.{Model, ModelCatalog, ModelManifest, Placement, Unroutable}
 
   @host "manifest-host"
 
@@ -105,7 +105,73 @@ defmodule Tightbeam.HostedModelCatalogTest do
     assert Unroutable.message(refusal) =~ "rejected"
   end
 
-  defp start_catalog(ctx, version, credential_status \\ fn _provider, _host -> :onboarded end) do
+  test "a malformed profile refresh preserves last-good catalog entries across restart", ctx do
+    valid = JSON.encode!(ctx.document)
+
+    malformed =
+      ctx.document
+      |> put_in(["providers", "claude", "profiles", "fable-5"], "not-a-map")
+      |> JSON.encode!()
+
+    {:ok, results} = Agent.start_link(fn -> [{:ok, valid}, {:ok, malformed}] end)
+
+    fetch = fn _url, _timeout ->
+      Agent.get_and_update(results, fn [result | remaining] -> {result, remaining} end)
+    end
+
+    manifest = unique_name(:manifest)
+    start_manifest(ctx, manifest, fetch)
+    await(fn -> ModelManifest.get(manifest).health == :fresh end)
+
+    catalog = start_catalog(ctx, "2.1.257", model_manifest: manifest)
+    await_health(catalog, :fresh)
+    {entries, :fresh} = ModelCatalog.get(@host, "claude", catalog)
+    assert Enum.any?(entries, &(&1.family == "claude-sonnet-5"))
+    snapshot = ModelManifest.get(manifest)
+
+    send(manifest, :refresh_due)
+    await(fn -> ModelManifest.get(manifest).health == :stale end)
+
+    assert Process.alive?(Process.whereis(manifest))
+    assert ModelManifest.get(manifest).document == snapshot.document
+
+    assert {:error, {:invalid_field, "providers.claude.profiles.fable-5", :wrong_shape}} =
+             ModelManifest.validate(malformed)
+
+    ModelCatalog.credential_present(@host, :anthropic, catalog)
+    await(fn -> ModelCatalog.manifest_health(@host, "claude", catalog) == :stale end)
+    assert {^entries, _health} = ModelCatalog.get(@host, "claude", catalog)
+
+    stop_supervised!(manifest)
+
+    restarted_manifest = unique_name(:manifest)
+    start_manifest(ctx, restarted_manifest, fn _url, _timeout -> {:error, :offline} end)
+
+    assert %{source: :disk, health: :stale, document: document} =
+             ModelManifest.get(restarted_manifest)
+
+    assert document == snapshot.document
+
+    restarted_catalog =
+      start_catalog(ctx, "2.1.257", model_manifest: restarted_manifest)
+
+    await_health(restarted_catalog, :fresh)
+    {restarted_entries, :fresh} = ModelCatalog.get(@host, "claude", restarted_catalog)
+    assert restarted_entries == entries
+    assert Enum.any?(restarted_entries, &(&1.family == "claude-sonnet-5"))
+  end
+
+  defp start_catalog(ctx, version, credential_status_or_opts \\ [])
+
+  defp start_catalog(ctx, version, opts) when is_list(opts) do
+    start_catalog(ctx, version, fn _provider, _host -> :onboarded end, opts)
+  end
+
+  defp start_catalog(ctx, version, credential_status) when is_function(credential_status, 2) do
+    start_catalog(ctx, version, credential_status, [])
+  end
+
+  defp start_catalog(ctx, version, credential_status, opts) do
     name = String.to_atom("hosted_catalog_#{System.unique_integer([:positive])}")
     snapshot = %{document: ctx.document, source: :bundled, health: :fresh}
 
@@ -121,9 +187,26 @@ defmodule Tightbeam.HostedModelCatalogTest do
              hosts: fn -> %{@host => %{base_dir: ctx.base, ssh: nil}} end,
              credential_status: credential_status,
              credential_kind: :subscription,
-             model_manifest: fn -> snapshot end,
+             model_manifest: Keyword.get(opts, :model_manifest, fn -> snapshot end),
              claude_code_version: version,
              sh: fn _command -> {"unavailable", 1} end
+           ]
+         ]}
+    })
+  end
+
+  defp start_manifest(ctx, name, fetch) do
+    start_supervised!(%{
+      id: name,
+      start:
+        {ModelManifest, :start_link,
+         [
+           [
+             name: name,
+             base_dir: ctx.base,
+             bundled_path: Application.app_dir(:tightbeam, "priv/model-manifest.json"),
+             fetch: fetch,
+             ttl_ms: :timer.hours(1)
            ]
          ]}
     })
@@ -150,4 +233,7 @@ defmodule Tightbeam.HostedModelCatalogTest do
       await(fun, attempts - 1)
     end
   end
+
+  defp unique_name(label),
+    do: String.to_atom("hosted_#{label}_#{System.unique_integer([:positive])}")
 end
