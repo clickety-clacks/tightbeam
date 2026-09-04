@@ -3347,7 +3347,8 @@ defmodule Tightbeam.Supervision do
         assignment_id,
         generation,
         interval,
-        evaluation_clock
+        evaluation_clock,
+        state
       )
     else
       :duplicate
@@ -3359,7 +3360,8 @@ defmodule Tightbeam.Supervision do
          assignment_id,
          generation,
          interval,
-         evaluation_clock
+         evaluation_clock,
+         state
        ) do
     [[holder, work_item_id]] =
       Txn.q(
@@ -3388,7 +3390,14 @@ defmodule Tightbeam.Supervision do
         artifact_cursor,
         artifact_max
       ) ++
-        attest_receipts_in_txn(txn, assignment_id, generation, attest_cursor, attest_max) ++
+        attest_receipts_in_txn(
+          txn,
+          assignment_id,
+          generation,
+          state,
+          attest_cursor,
+          attest_max
+        ) ++
         work_item_receipts_in_txn(txn, work_item_id, event_cursor, event_max)
 
     checkpoint =
@@ -3569,7 +3578,7 @@ defmodule Tightbeam.Supervision do
     |> Enum.map(fn [id, at] -> %{kind: "artifact", id: id, at: at, expires_at: nil} end)
   end
 
-  defp attest_receipts_in_txn(txn, assignment_id, generation, cursor, maximum) do
+  defp attest_receipts_in_txn(txn, assignment_id, generation, state, cursor, maximum) do
     Txn.q(
       txn,
       """
@@ -3579,7 +3588,8 @@ defmodule Tightbeam.Supervision do
         AND (
           kind='verdict'
           OR (
-            kind='progress'
+            ?5 != 'terminus'
+            AND kind='progress'
             AND NOT EXISTS (
               SELECT 1
               FROM wake_cancellations
@@ -3597,7 +3607,7 @@ defmodule Tightbeam.Supervision do
         )
       ORDER BY rowid
       """,
-      [cursor, maximum, assignment_id, "#{assignment_id}##{generation}"]
+      [cursor, maximum, assignment_id, "#{assignment_id}##{generation}", state]
     )
     |> Enum.map(fn [id, kind, at] -> %{kind: kind, id: id, at: at, expires_at: nil} end)
   end
