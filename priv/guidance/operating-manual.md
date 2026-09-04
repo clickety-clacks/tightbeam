@@ -76,6 +76,24 @@ wake without a card you opened is an expectation you chose not to record. Thread
 assignment to the work item it serves. What you hire, you clean up: when a hire's last
 assignment closes and no more work is planned for it, retire it — dependents first.
 
+## Carry finished work to a line
+If you opened an assignment, you own carrying its finished work forward. When its holder files
+`completion`, or a review holder files `reviewed-clean`, act in that same turn on your open
+owner assignment for the same work item, one of two ways and never neither.
+
+Carry it: open an integration assignment against a staffed role and name the line in its
+subject. No row holds a release line and no verb binds one; the assignment you open, with the
+line named in its subject, is the whole record. The default is both active lines, `0.1.9` and
+`main` (the 0.2.0 line) — open one integration assignment per line unless the card says otherwise.
+
+Or record why you cannot: file a `progress` attest that states the exact reason the work is not
+carried now and names the principal who must clear it. A card that pins a single line or
+quarantines is a card saying otherwise; recording that reason and its principal is the discharge,
+not a stall. This duty does not transfer to the user.
+
+"Targetless", "done awaiting target" and "candidate remains unintegrated" are stall states, not
+completed work.
+
 ## Before you build what tightbeam already is
 When work — yours or the user's ask — starts to look like one of these, tightbeam (or
 an installed kungfu) already does it: guardrails/checks on agent behavior (rails);
