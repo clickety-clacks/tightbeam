@@ -537,6 +537,22 @@ defmodule Tightbeam.Schema do
     },
     %{
       type: "table",
+      name: "supervision_liveness_progress_receipts",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_liveness_progress_receipts (
+        receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
+        assignmentId TEXT NOT NULL REFERENCES assignments(id),
+        sourceKind TEXT NOT NULL CHECK (sourceKind = 'progress'),
+        sourceId TEXT NOT NULL,
+        sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
+        acceptedAt INTEGER NOT NULL CHECK (acceptedAt >= 0),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        UNIQUE (assignmentId, sourceId)
+      )
+      """
+    },
+    %{
+      type: "table",
       name: "supervision_liveness_checkpoint_bindings",
       sql: """
       CREATE TABLE IF NOT EXISTS supervision_liveness_checkpoint_bindings (
