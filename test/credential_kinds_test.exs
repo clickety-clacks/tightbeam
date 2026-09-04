@@ -228,41 +228,31 @@ defmodule Tightbeam.CredentialKindsTest do
   # ------------------------------------------------------------------
 
   describe "catalog derivation dispatches on kind" do
-    @claude_body JSON.encode!(%{
-                   "data" => [
-                     %{
-                       "id" => "claude-sonnet-5",
-                       "display_name" => "Sonnet 5",
-                       "max_input_tokens" => 200_000,
-                       "capabilities" => %{"effort" => %{"low" => %{"supported" => true}}}
-                     }
-                   ]
-                 })
-
-    test "an api-key claude host sends x-api-key on the same route", ctx do
+    test "an api-key claude host derives its offered set without a provider fetch", ctx do
       stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-catalog")
       owner = self()
 
-      fetch = fn path, headers ->
-        send(owner, {:claude_probe, path, Enum.map(headers, fn {n, _v} -> to_string(n) end)})
-        {:ok, @claude_body}
+      fetch = fn _path, _headers ->
+        send(owner, :unexpected_claude_models_fetch)
+        {:error, :must_not_fetch}
       end
 
-      assert {:ok, [entry]} =
+      assert {:ok, entries, %{manifest_health: :fresh}} =
                Claude.fetch_catalog(%{
                  base_dir: ctx.base,
                  credential_kind: :api_key,
-                 options: %{claude_fetch: fetch, claude_selectable_models: :all}
+                 options: %{
+                   claude_fetch: fetch,
+                   model_manifest: Map.put(Tightbeam.ModelManifest.get(), :health, :fresh),
+                   claude_code_version: "2.1.257"
+                 }
                })
 
-      assert {entry.family, entry.context, entry.efforts} == {"claude-sonnet-5", nil, ["low"]}
-      assert_receive {:claude_probe, path, names}
-      assert path =~ "/v1/models"
-      assert "x-api-key" in names
-      refute "authorization" in names
+      assert Enum.any?(entries, &(&1.family == "claude-sonnet-5"))
+      refute_receive :unexpected_claude_models_fetch
     end
 
-    test "a subscription claude host still sends a bearer token", ctx do
+    test "a subscription claude host derives the same manifest offered set", ctx do
       stage!(
         ctx.base,
         "claude",
@@ -272,25 +262,24 @@ defmodule Tightbeam.CredentialKindsTest do
 
       owner = self()
 
-      fetch = fn _path, headers ->
-        send(
-          owner,
-          {:claude_probe, Enum.map(headers, fn {n, v} -> {to_string(n), to_string(v)} end)}
-        )
-
-        {:ok, @claude_body}
+      fetch = fn _path, _headers ->
+        send(owner, :unexpected_claude_models_fetch)
+        {:error, :must_not_fetch}
       end
 
-      assert {:ok, [_entry]} =
+      assert {:ok, entries, %{manifest_health: :fresh}} =
                Claude.fetch_catalog(%{
                  base_dir: ctx.base,
                  credential_kind: :subscription,
-                 options: %{claude_fetch: fetch, claude_selectable_models: :all}
+                 options: %{
+                   claude_fetch: fetch,
+                   model_manifest: Map.put(Tightbeam.ModelManifest.get(), :health, :fresh),
+                   claude_code_version: "2.1.257"
+                 }
                })
 
-      assert_receive {:claude_probe, headers}
-      assert {"authorization", "Bearer sk-ant-oat01-catalog"} in headers
-      refute Enum.any?(headers, fn {name, _} -> name == "x-api-key" end)
+      assert Enum.any?(entries, &(&1.family == "claude-sonnet-5"))
+      refute_receive :unexpected_claude_models_fetch
     end
 
     test "an api-key codex host reads the platform route, not the account route", ctx do

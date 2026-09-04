@@ -94,8 +94,10 @@ defmodule Tightbeam.Harness do
   @callback classify_auth_event(map()) :: :terminal | :transient | :unknown
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
-  @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
-  @optional_callbacks warm_home: 2
+  @callback fetch_catalog(map()) ::
+              {:ok, [map()]} | {:ok, [map()], map()} | {:error, term()}
+  @callback unknown_model_passthrough?() :: boolean()
+  @optional_callbacks warm_home: 2, unknown_model_passthrough?: 0
 
   @callback conformance_vectors() :: %{
               required(String.t()) => [
