@@ -2202,11 +2202,21 @@ defmodule Tightbeam.Supervision do
           AND s.wakeKind IN ('prod', 'escalation')
           AND (s.chargedGeneration >=
                  (SELECT MAX(generation)
-                  FROM supervision_liveness_receipts
-                  WHERE assignmentId = ?1)
+                  FROM (SELECT generation
+                        FROM supervision_liveness_receipts
+                        WHERE assignmentId = ?1
+                        UNION ALL
+                        SELECT generation
+                        FROM supervision_liveness_progress_receipts
+                        WHERE assignmentId = ?1))
                  OR NOT EXISTS (SELECT 1
-                                FROM supervision_liveness_receipts
-                                WHERE assignmentId = ?1))
+                                FROM (SELECT generation
+                                      FROM supervision_liveness_receipts
+                                      WHERE assignmentId = ?1
+                                      UNION ALL
+                                      SELECT generation
+                                      FROM supervision_liveness_progress_receipts
+                                      WHERE assignmentId = ?1)))
           AND ((t.wakeId IS NOT NULL AND
                 t.status NOT IN ('failed', 'failed_unknown', 'canceled'))
                OR s.transferEvidenceId IS NOT NULL)

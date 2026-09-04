@@ -394,6 +394,52 @@ defmodule Tightbeam.SupervisionTest do
     assert %{stalledAt: nil} = Supervision.prod_state(ctx.db, "asg_1")
   end
 
+  test "a progress receipt starts a fresh heard-prod epoch", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    seq1 = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
+    assert [wake] = Wakes.list_pending(ctx.db)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO turns (sessionKey, messageId, origin, prompt, status, wakeId, createdAt, endedAt)
+        VALUES ('holder', 'm_progress_reset_1', 'process:tightbeam', 'prod', 'delivered', ?1, 1, 1)
+        """,
+        [wake.wake_id]
+      )
+
+    settle_supervision_wake!(ctx.db, wake.wake_id)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_progress_epoch','asg_1','progress','material progress','holder',2)"
+      )
+
+    seq2 = terminal!(ctx.db, "holder")
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
+
+    assert {:ok, [["progress", "att_progress_epoch", 3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_progress_receipts"
+             )
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
+
+    seq3 = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
+    assert %{stalledAt: nil} = Supervision.prod_state(ctx.db, "asg_1")
+  end
+
   # THE LEGACY-TRANSFER REGRESSION (Sol confirmation round). Retirement-era
   # sidecar rows carry transfer evidence but a NULL chargedGeneration. Before
   # any receipt exists they are real heard evidence (NULL fails >= silently);
