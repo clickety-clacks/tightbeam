@@ -48,8 +48,8 @@ defmodule Tightbeam.SubagentMarkersTest do
       scheduler: scheduler,
       codex: codex,
       claude: claude,
-      codex_fixture: fixture("codex-acp-1.1.4.jsonc"),
-      claude_fixture: fixture("claude-agent-acp-0.59.0.jsonc")
+      codex_fixture: fixture("codex-acp-1.8.0.jsonc"),
+      claude_fixture: fixture("claude-agent-acp-0.73.0.jsonc")
     }
   end
 
@@ -57,20 +57,17 @@ defmodule Tightbeam.SubagentMarkersTest do
        ctx do
     fixture = ctx.codex_fixture
     assert fixture["version"] == Tightbeam.Harness.Codex.adapter_version()
-    assert fixture["semantic"]["spawn_operation_terminal"] =~ "child thread remains"
-    assert fixture["semantic"]["child_termination_terminal"] =~ "entering idle"
+    assert fixture["semantic"]["spawn_operation_terminal"] =~ "child session remains"
+    assert fixture["semantic"]["child_termination_terminal"] =~ "terminal state"
 
     start = consume(ctx, :codex, "sid-codex", fixture["live_started"])
     assert start.appended
     assert :skip = consume(ctx, :codex, "sid-codex", fixture["live_interacted"])
 
-    completed_spawn =
-      consume(ctx, :codex, "sid-codex", fixture["spawn_operation_terminal"])
+    assert :skip =
+             consume(ctx, :codex, "sid-codex", fixture["spawn_operation_terminal"])
 
-    refute completed_spawn.appended
-    assert completed_spawn.kind == "subagent_start"
-
-    stop = consume(ctx, :codex, "sid-codex", fixture["patched_termination"])
+    stop = consume(ctx, :codex, "sid-codex", fixture["native_termination"])
     assert stop.appended
     assert stop.principal == ctx.codex.session_key
     assert stop.subagent_ref == start.subagent_ref
@@ -84,18 +81,18 @@ defmodule Tightbeam.SubagentMarkersTest do
            ]
   end
 
-  test "proof 4: claude fixture ignores spawn completion and stops at live task settlement",
+  test "proof 4: claude fixture ignores spawn completion and stops at native settlement",
        ctx do
     fixture = ctx.claude_fixture
-    assert fixture["version"] == "0.59.0"
-    assert fixture["semantic"]["spawn_operation_terminal"] =~ "liveBackgroundTasks"
-    assert fixture["semantic"]["child_termination_terminal"] =~ "settlement"
+    assert fixture["version"] == Tightbeam.Harness.Claude.adapter_version()
+    assert fixture["semantic"]["spawn_operation_terminal"] =~ "child session remains"
+    assert fixture["semantic"]["child_termination_terminal"] =~ "terminal state"
 
     start = consume(ctx, :claude, "sid-claude", fixture["live_agent_started"])
     assert start.appended
     assert :skip = consume(ctx, :claude, "sid-claude", fixture["spawn_operation_terminal"])
 
-    stop = consume(ctx, :claude, "sid-claude", fixture["patched_termination"])
+    stop = consume(ctx, :claude, "sid-claude", fixture["native_termination"])
     assert stop.appended
     assert stop.principal == ctx.claude.session_key
     assert stop.subagent_ref == start.subagent_ref
@@ -112,14 +109,14 @@ defmodule Tightbeam.SubagentMarkersTest do
       consume(ctx, :codex, "sid-codex", ctx.codex_fixture["live_started"])
 
     condition_wake =
-      register_wake(ctx, ctx.codex, "call-codex-1",
+      register_wake(ctx, ctx.codex, "thread-child-1",
         after_ms: 60_000,
         idempotency_key: "condition"
       )
 
     assert Wakes.get(ctx.db, condition_wake.wake_id).condition_scope == start.subagent_ref
 
-    consume(ctx, :codex, "sid-codex", ctx.codex_fixture["patched_termination"])
+    consume(ctx, :codex, "sid-codex", ctx.codex_fixture["native_termination"])
 
     assert %{state: "fired", fired_by: "condition"} =
              Wakes.get(ctx.db, condition_wake.wake_id)
@@ -133,7 +130,7 @@ defmodule Tightbeam.SubagentMarkersTest do
       )
 
     fallback_wake =
-      register_wake(ctx, ctx.claude, "call-claude-1",
+      register_wake(ctx, ctx.claude, "task-child-1",
         after_ms: 0,
         idempotency_key: "fallback",
         nudge: false
@@ -150,7 +147,7 @@ defmodule Tightbeam.SubagentMarkersTest do
 
   test "proof 2 stop-wins order returns subagent_already_stopped and inserts no wake", ctx do
     start = consume(ctx, :codex, "sid-codex", ctx.codex_fixture["live_started"])
-    stop = consume(ctx, :codex, "sid-codex", ctx.codex_fixture["patched_termination"])
+    stop = consume(ctx, :codex, "sid-codex", ctx.codex_fixture["native_termination"])
     assert stop.subagent_ref == start.subagent_ref
 
     {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
@@ -159,7 +156,7 @@ defmodule Tightbeam.SubagentMarkersTest do
              code: "subagent_already_stopped",
              subagent_ref: subagent_ref
            } =
-             register_wake(ctx, ctx.codex, "call-codex-1",
+             register_wake(ctx, ctx.codex, "thread-child-1",
                after_ms: 0,
                idempotency_key: "stop-wins"
              )
@@ -172,7 +169,7 @@ defmodule Tightbeam.SubagentMarkersTest do
     assert turn_count(ctx.db) == 0
   end
 
-  test "proof 2 colliding toolCallIds stay isolated by source session", ctx do
+  test "proof 2 colliding adapter handles stay isolated by source session", ctx do
     second =
       create_parent(ctx.db, "parent-codex-two", "codex", "openai", "sid-codex-two")
 
@@ -185,15 +182,15 @@ defmodule Tightbeam.SubagentMarkersTest do
     refute first_start.source_event_ref == second_start.source_event_ref
 
     wake =
-      register_wake(ctx, ctx.codex, "call-codex-1",
+      register_wake(ctx, ctx.codex, "thread-child-1",
         after_ms: 60_000,
         idempotency_key: "collision"
       )
 
-    consume(ctx, :codex, "sid-codex-two", ctx.codex_fixture["patched_termination"])
+    consume(ctx, :codex, "sid-codex-two", ctx.codex_fixture["native_termination"])
     assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
 
-    consume(ctx, :codex, "sid-codex", ctx.codex_fixture["patched_termination"])
+    consume(ctx, :codex, "sid-codex", ctx.codex_fixture["native_termination"])
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
 
     assert Enum.count(SubagentMarkers.list(ctx.db), &(&1.principal == second.session_key)) == 2
@@ -209,7 +206,7 @@ defmodule Tightbeam.SubagentMarkersTest do
              })
 
     start = consume(ctx, :codex, "sid-codex", ctx.codex_fixture["live_started"])
-    stop = consume(ctx, :codex, "sid-codex", ctx.codex_fixture["patched_termination"])
+    stop = consume(ctx, :codex, "sid-codex", ctx.codex_fixture["native_termination"])
     assert stop.subagent_ref == start.subagent_ref
 
     assert %{kind: "subagent_stop", scope: scope, origin: "process:tightbeam"} =
@@ -219,12 +216,12 @@ defmodule Tightbeam.SubagentMarkersTest do
   end
 
   test "proof 2 load replay reconstructs START only", ctx do
-    replay = ctx.codex_fixture["load_replay_completed_started"]
+    replay = ctx.codex_fixture["load_replay_started"]
     start = consume(ctx, :codex, "sid-codex", replay)
     assert start.kind == "subagent_start"
 
     wake =
-      register_wake(ctx, ctx.codex, "call-codex-replayed",
+      register_wake(ctx, ctx.codex, "thread-child-replayed",
         after_ms: 60_000,
         idempotency_key: "replay"
       )
@@ -246,7 +243,7 @@ defmodule Tightbeam.SubagentMarkersTest do
     )
   end
 
-  defp register_wake(ctx, session, tool_call_id, opts) do
+  defp register_wake(ctx, session, source_handle, opts) do
     handler = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})["wake"]
 
     handler.(%{
@@ -257,7 +254,7 @@ defmodule Tightbeam.SubagentMarkersTest do
         prompt: "continue after child",
         after_ms: Keyword.fetch!(opts, :after_ms),
         condition_kind: "subagent_stop",
-        condition_scope: tool_call_id,
+        condition_scope: source_handle,
         idempotency_key: Keyword.fetch!(opts, :idempotency_key),
         nudge: Keyword.get(opts, :nudge)
       }
