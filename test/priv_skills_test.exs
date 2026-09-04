@@ -22,4 +22,17 @@ defmodule Tightbeam.PrivSkillsTest do
       assert File.read!(path) != "", "empty shipped baseline skill: #{path}"
     end
   end
+
+  test "neutral guidance skills use domain-neutral role examples" do
+    authoring =
+      Application.app_dir(:tightbeam, "priv/skills/tightbeam-guidance-authoring/SKILL.md")
+      |> File.read!()
+
+    cultivation =
+      Application.app_dir(:tightbeam, "priv/skills/tightbeam-archetype-cultivation/SKILL.md")
+      |> File.read!()
+
+    refute authoring =~ ~r/\b(spec|spec-writer|coder|reviewer)\b/i
+    refute cultivation =~ ~r/\b(spec|product[- ]owner)\b/i
+  end
 end

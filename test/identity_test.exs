@@ -43,7 +43,6 @@ defmodule Tightbeam.IdentityTest do
                "archetypes/default.toml",
                "archetypes/exec.toml",
                "archetypes/miller.toml",
-               "guidance/altitude-statute.md",
                "guidance/avasarala.md",
                "guidance/comms-discipline.md",
                "guidance/delegation-card.md",
@@ -51,7 +50,6 @@ defmodule Tightbeam.IdentityTest do
                "guidance/directive-vocabulary.md",
                "guidance/dispatch-rules.md",
                "guidance/exec.md",
-               "guidance/inception.md",
                "guidance/miller.md",
                "guidance/office-convention.md",
                "guidance/operating-model.md",
@@ -101,7 +99,7 @@ defmodule Tightbeam.IdentityTest do
              "batch, schedule, and deliver to its principal within §7's ceilings; summon"
 
     assert card =~ "MUST NOT: file verdicts on substance"
-    assert card =~ "accept or reject work; make product judgments;"
+    assert card =~ "accept or reject work; make substantive judgments;"
     assert card =~ ~s(Its only "no" is "later")
     assert card =~ "the prodder bounds starvation across its watermark"
 
@@ -114,7 +112,7 @@ defmodule Tightbeam.IdentityTest do
     # The r5 additions are §6 verb law too: the D2 spawn clause and the D3
     # containment compilation are load-bearing the same way the lists are.
     assert card =~ "DIRECTED EXECUTION of its principal's recorded decision"
-    assert card =~ "hold or RECEIVE\n    implementation cards"
+    assert card =~ "hold or RECEIVE\n    substance cards"
     assert card =~ "file\n    completions off the delegation card"
     assert card =~ "spawn uncited"
   end
@@ -411,6 +409,63 @@ defmodule Tightbeam.IdentityTest do
 
     assert :noop = Identity.init!(base)
     refute File.exists?(Path.join(identity_dir, "guidance/model-policy.md"))
+  end
+
+  test "relearn transfers engineering guidance ownership without changing projections", ctx do
+    shipped_seed = Path.expand("priv/seed")
+    shipped_bundle = Path.expand("priv/kungfu/agentic-engineering")
+    legacy_seed = Path.join(ctx.root, "legacy-neutral-seed")
+    legacy_bundle = Path.join(ctx.root, "legacy-agentic-engineering-ownership")
+    File.cp_r!(shipped_seed, legacy_seed)
+    File.cp_r!(shipped_bundle, legacy_bundle)
+
+    for fragment <- ~w(inception altitude-statute) do
+      source = Path.join([shipped_bundle, "guidance", "#{fragment}.md"])
+      File.cp!(source, Path.join([legacy_seed, "guidance", "#{fragment}.md"]))
+      File.rm!(Path.join([legacy_bundle, "guidance", "#{fragment}.md"]))
+    end
+
+    previous_seed = Application.get_env(:tightbeam, :identity_seed_dir)
+
+    on_exit(fn ->
+      if previous_seed,
+        do: Application.put_env(:tightbeam, :identity_seed_dir, previous_seed),
+        else: Application.delete_env(:tightbeam, :identity_seed_dir)
+    end)
+
+    Application.put_env(:tightbeam, :identity_seed_dir, legacy_seed)
+    Application.put_env(:tightbeam, :identity_source_dir, legacy_bundle)
+
+    assert :initialized = Identity.init!(ctx.base)
+    assert {:ok, legacy_revision} = learn!(ctx.base, "agentic-engineering", "operator")
+
+    legacy_product_owner =
+      Identity.snapshot_at!(ctx.base, legacy_revision, "product-owner", :codex)
+
+    legacy_orchestrator = Identity.snapshot_at!(ctx.base, legacy_revision, "orchestrator", :codex)
+
+    Application.put_env(:tightbeam, :identity_seed_dir, shipped_seed)
+    Application.put_env(:tightbeam, :identity_source_dir, shipped_bundle)
+
+    assert {:ok, revision} = relearn!(ctx.base, "operator")
+    current_product_owner = Identity.snapshot_at!(ctx.base, revision, "product-owner", :codex)
+    current_orchestrator = Identity.snapshot_at!(ctx.base, revision, "orchestrator", :codex)
+
+    assert Map.drop(current_product_owner, [:revision]) ==
+             Map.drop(legacy_product_owner, [:revision])
+
+    assert Map.drop(current_orchestrator, [:revision]) ==
+             Map.drop(legacy_orchestrator, [:revision])
+
+    receipt =
+      ctx.base
+      |> Path.join("identity/kungfu/agentic-engineering/installed.toml")
+      |> File.read!()
+      |> Toml.decode!()
+
+    for fragment <- ~w(inception altitude-statute) do
+      assert "guidance/#{fragment}.md" in receipt["paths"]
+    end
   end
 
   test "pinned snapshots compose manifests and activity tables from one revision", ctx do
