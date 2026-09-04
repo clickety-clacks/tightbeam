@@ -38,7 +38,8 @@ defmodule Tightbeam.Schema do
     Tightbeam.HarnessProcess,
     Tightbeam.AdminProjection,
     Tightbeam.HarnessHealth,
-    Tightbeam.Toplines
+    Tightbeam.Toplines,
+    Tightbeam.Premises
   ]
 
   # The shape this build writes. Bump it when a production table changes in a
@@ -97,8 +98,20 @@ defmodule Tightbeam.Schema do
   # v15; the older named migration helpers remain explicit test seams only.
   # The deliverable contract adds companion tables and advances the exact v15
   # predecessor transactionally to v16.
-  @shape "coordination-fabric-v1-phase1-v16"
-  @deliverable_contract_previous_shape "coordination-fabric-v1-phase1-v15"
+  #
+  # The strict false-premise park gate adds three NEW tables — `premise_claims`,
+  # `premise_checks`, `park_premises` — and widens nothing that already exists.
+  # That is the one case SQLite can carry forward in place, so v16 is the one
+  # exact predecessor `upgrade_premise_gate_v1/1` accepts, and v17 is what this
+  # build writes. A v16 database is migrated in place on boot: `check_shape`
+  # dispatches the exact v16 stamp to `upgrade_premise_gate_v1/1`, which creates
+  # the three tables and advances the stamp transactionally — the same one-step
+  # ladder every lane walks (its immediate predecessor, nothing older). Every
+  # non-predecessor shape, v15 included, is still refused by name; the reading
+  # is the stamp itself, never a boot-path inference about the shape.
+  @shape "coordination-fabric-v1-phase1-v17"
+  @premise_gate_previous_shape "coordination-fabric-v1-phase1-v16"
+  @premise_gate_label "incompatible_premise_gate_v1"
   @completion_previous_shape "coordination-fabric-v1-phase1-v14"
   @cannot_proceed_previous_shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
@@ -1715,6 +1728,80 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  @doc """
+  Move a `coordination-fabric-v1-phase1-v16` database to v17 by activating the
+  strict false-premise park gate.
+
+  Purely additive: three new tables and their indexes and immutability
+  triggers. No existing table is rebuilt, no CHECK widened, no NOT NULL
+  relaxed, and no row is read, rewritten, or reclassified — historical parks
+  stay `legacy-untyped` by having no `park_premises` rows, never by anything
+  this migration writes.
+
+  All-or-nothing on the owned set. A database carrying SOME of these objects is
+  a shape this build has no reading for, so it is refused by name rather than
+  repaired by inference.
+  """
+  @spec upgrade_premise_gate_v1(DB.server()) :: :ok
+  def upgrade_premise_gate_v1(db) do
+    migration_time = System.system_time(:millisecond)
+    objects = Tightbeam.Premises.owned_objects()
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@premise_gate_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "#{@premise_gate_label}: predecessor stamp #{inspect(rows)}"
+           end
+
+           present = Enum.filter(objects, &owned_object_present?(txn, &1, @premise_gate_label))
+
+           case length(present) do
+             0 ->
+               Enum.each(objects, fn object ->
+                 :ok = Txn.exec(txn, object.sql)
+                 validate_owned_object!(txn, object, @premise_gate_label)
+               end)
+
+             count when count == length(objects) ->
+               Enum.each(present, &validate_owned_object!(txn, &1, @premise_gate_label))
+
+             _count ->
+               missing =
+                 objects
+                 |> Kernel.--(present)
+                 |> Enum.map_join(", ", & &1.name)
+
+               raise ShapeError,
+                 message: "#{@premise_gate_label}: incomplete additive shape; missing #{missing}"
+           end
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @premise_gate_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "#{@premise_gate_label}: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "#{@premise_gate_label}: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
   defp maybe_interrupt_nullable_effective_parent_migration!(opts, point) do
     if Keyword.get(opts, :fail_at) == point,
       do: raise("forced nullable-effective-parent migration interruption")
@@ -1869,7 +1956,12 @@ defmodule Tightbeam.Schema do
     incompatible_supervision_liveness!("activation epoch must be a nonnegative integer")
   end
 
-  defp owned_object_present?(txn, %{type: type, name: name}) do
+  # The `label` names WHICH activation is refusing. Owned-object validation is
+  # shared, but a refusal that names the wrong shape sends its reader to the
+  # wrong subsystem, so every caller passes its own.
+  defp owned_object_present?(txn, object, label \\ "incompatible_supervision_liveness_v1")
+
+  defp owned_object_present?(txn, %{type: type, name: name}, label) do
     case Txn.q(
            txn,
            "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2",
@@ -1877,11 +1969,13 @@ defmodule Tightbeam.Schema do
          ) do
       [] -> false
       [[1]] -> true
-      _rows -> incompatible_supervision_liveness!("duplicate owned object #{name}")
+      _rows -> incompatible_owned_object!(label, "duplicate owned object #{name}")
     end
   end
 
-  defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}) do
+  defp validate_owned_object!(txn, object, label \\ "incompatible_supervision_liveness_v1")
+
+  defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}, label) do
     case Txn.q(
            txn,
            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
@@ -1891,15 +1985,19 @@ defmodule Tightbeam.Schema do
         if normalize_schema_sql(actual_sql) == normalize_schema_sql(expected_sql) do
           :ok
         else
-          incompatible_supervision_liveness!("malformed owned object #{name}")
+          incompatible_owned_object!(label, "malformed owned object #{name}")
         end
 
       [] ->
-        incompatible_supervision_liveness!("missing owned object #{name}")
+        incompatible_owned_object!(label, "missing owned object #{name}")
 
       _rows ->
-        incompatible_supervision_liveness!("duplicate owned object #{name}")
+        incompatible_owned_object!(label, "duplicate owned object #{name}")
     end
+  end
+
+  defp incompatible_owned_object!(label, detail) do
+    raise ShapeError, message: "#{label}: #{detail}"
   end
 
   defp normalize_schema_sql(sql) do
@@ -1950,12 +2048,8 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
-      {:ok, [[@deliverable_contract_previous_shape]]} ->
-        Tightbeam.DeliverableContract.upgrade_v1(
-          db,
-          @deliverable_contract_previous_shape,
-          @shape
-        )
+      {:ok, [[@premise_gate_previous_shape]]} ->
+        upgrade_premise_gate_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1972,7 +2066,7 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         There is no migration from #{found}. The only supported upgrade source
-        is #{@deliverable_contract_previous_shape}.
+        is #{@premise_gate_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
