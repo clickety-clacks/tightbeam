@@ -3342,7 +3342,14 @@ mod tests {
     fn attest_help_names_completion_idempotency_key() {
         let entry = render_command_help(None, "attest").unwrap();
         assert!(entry.contains("[--key <idempotencyKey>]"));
-        assert!(entry.contains("A key\n      is valid only for completion."));
+        // Match the sentence, not where the renderer happened to wrap it: this
+        // assertion baked in a line break and the cannot-proceed sentence
+        // landing above it reflowed the paragraph.
+        let flowed = entry.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flowed.contains("A key is valid only for completion."),
+            "{entry}"
+        );
     }
 
     #[test]
