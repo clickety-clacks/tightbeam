@@ -298,7 +298,15 @@ defmodule Tightbeam.ModelManifest do
   defp validate_provider(name, _provider),
     do: invalid_reason("providers.#{name}", :wrong_shape)
 
-  defp validate_profiles(profiles, _name) when is_map(profiles), do: :ok
+  defp validate_profiles(profiles, name) when is_map(profiles) do
+    Enum.reduce_while(profiles, :ok, fn
+      {_key, profile}, :ok when is_map(profile) ->
+        {:cont, :ok}
+
+      {key, _profile}, :ok ->
+        {:halt, invalid_reason("providers.#{name}.profiles.#{key}", :wrong_shape)}
+    end)
+  end
 
   defp validate_profiles(_profiles, name),
     do: invalid_reason("providers.#{name}.profiles", :wrong_shape)
