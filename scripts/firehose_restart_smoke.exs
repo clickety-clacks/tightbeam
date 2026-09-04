@@ -13,7 +13,6 @@ defmodule Tightbeam.FirehoseRestartSmoke do
 
     port = 12_800 + rem(System.unique_integer([:positive]), 500)
     File.mkdir_p!(base_dir)
-    Tightbeam.CursorSigning.provision!(base_dir)
     gateway = LegGateway.boot!(base_dir, port, repo_root: File.cwd!())
 
     try do

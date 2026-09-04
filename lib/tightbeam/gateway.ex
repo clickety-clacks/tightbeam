@@ -65,9 +65,9 @@ defmodule Tightbeam.Gateway do
     Archetypes,
     Artifacts,
     Assignments,
+    Breathing,
     ConditionFacts,
     CriticalLeases,
-    CursorSigning,
     Placement,
     DB,
     Devices,
@@ -118,7 +118,6 @@ defmodule Tightbeam.Gateway do
 
   @typedoc "Gateway config (gateway.ts GatewayConfig)."
   @type config :: %{
-          optional(:cursor_signing) => CursorSigning.t(),
           base_dir: String.t(),
           cwd: String.t(),
           port: non_neg_integer(),
@@ -142,10 +141,7 @@ defmodule Tightbeam.Gateway do
   @spec children(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children(config) do
     preflight!(config)
-
-    config
-    |> Map.put_new_lazy(:cursor_signing, fn -> CursorSigning.load!(config.base_dir) end)
-    |> children_after_preflight()
+    children_after_preflight(config)
   end
 
   @doc false
@@ -153,7 +149,6 @@ defmodule Tightbeam.Gateway do
   def children_after_preflight(config) do
     db = Map.get(config, :db, Tightbeam.DB)
     prod_limit = Map.get(config, :prod_limit, 3)
-    cursor_signing = config |> Map.get(:cursor_signing) |> CursorSigning.validate!()
 
     unless is_integer(prod_limit) and prod_limit >= 0 do
       raise ArgumentError, "prod_limit must be an integer >= 0"
@@ -235,7 +230,6 @@ defmodule Tightbeam.Gateway do
       Map.merge(socket_deps, %{
         base_dir: config.base_dir,
         cli_token: cli_token,
-        cursor_signing: cursor_signing,
         session_status: &session_status/1,
         adapter_coordinator: Tightbeam.AdapterCoordinator
       })
@@ -712,6 +706,15 @@ defmodule Tightbeam.Gateway do
               %{code: "unknown_caller"}
 
             true ->
+              call =
+                case config do
+                  %{wake_tick_ms: interval} ->
+                    Map.put(call, :supervision_interval_ms, interval)
+
+                  _ ->
+                    call
+                end
+
               wake_result(config, db, call)
           end
         end,
@@ -1105,6 +1108,7 @@ defmodule Tightbeam.Gateway do
         )
       end,
       {"work-item-get", []} => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
+      {"breathing", []} => fn call -> Breathing.handle(db, call) end,
       {"work-item-trace", []} => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       {"transcript", []} => fn call -> Tightbeam.Transcript.read(db, call) end,
       {"turn-trace", []} => fn call -> TurnLifecycle.read(db, call) end,
@@ -5460,13 +5464,17 @@ defmodule Tightbeam.Gateway do
 
   defp bind_liveness_checkpoint_in_txn(
          txn,
-         %{principal: {:session, creator_session_key}},
+         %{
+           principal: {:session, creator_session_key},
+           supervision_interval_ms: supervision_interval_ms
+         },
          %{session_key: creator_session_key, wake_id: wake_id}
        ) do
     Supervision.transition_in_txn(txn, %{
       kind: "checkpoint_scheduled",
       wake_id: wake_id,
-      creator_session_key: creator_session_key
+      creator_session_key: creator_session_key,
+      supervision_interval_ms: supervision_interval_ms
     })
   end
 

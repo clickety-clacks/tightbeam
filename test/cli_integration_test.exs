@@ -139,7 +139,6 @@ defmodule Tightbeam.CliIntegrationTest do
       Router.init(
         db: db,
         base_dir: base_dir,
-        cursor_signing: cursor_signing!(base_dir),
         handlers: handlers,
         cli_token: "tbc_cli_integration",
         session_status: fn _ -> nil end
@@ -2552,6 +2551,67 @@ defmodule Tightbeam.CliIntegrationTest do
                         priority: 7
                       }
                     }}
+  end
+
+  test "real CLI returns typed breathing answers with the exact exit contract", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO turns (sessionKey,messageId,origin,prompt,status,adapterGen,createdAt,startedAt) VALUES ('cli-holder','m_breathing','user:flynn','work','running',4,10,11)"
+      )
+
+    {output, 0} =
+      System.cmd(ctx.binary, ["breathing", "session", "cli-holder"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "schema" => "breathing-v1",
+             "target" => %{"kind" => "session", "id" => "cli-holder"},
+             "breathing" => true,
+             "reason" => "running_turn",
+             "evidence" => %{"turn" => %{"seq" => _}}
+           } = JSON.decode!(output)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "breathing",
+                      params: %{target_kind: "session", target_id: "cli-holder"}
+                    }}
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE kind='verb' AND verb='breathing' ORDER BY id DESC LIMIT 1"
+             )
+
+    {audit, []} = Code.eval_string(payload)
+
+    assert %{
+             elided: true,
+             count: 0,
+             params: %{target_kind: "session", target_id: "cli-holder"}
+           } = audit
+
+    refute payload =~ "running_turn"
+    refute payload =~ ~s("breathing":true)
+
+    {missing, 0} =
+      System.cmd(ctx.binary, ["breathing", "session", "missing"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"breathing" => false, "reason" => "session_missing"} = JSON.decode!(missing)
+
+    {usage, 1} =
+      System.cmd(ctx.binary, ["breathing", "session"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert usage =~ "usage: tightbeam breathing session|assignment|work-item <id>"
   end
 
   defp open_agent_request(ctx, opts \\ []) do

@@ -2647,22 +2647,13 @@ defmodule Tightbeam.AssignmentsTest do
     assert error =~ "revoked assignment requires revocation provenance"
   end
 
-  test "a failure after the history insert rolls back the whole reopen (Sol xhigh review, finding 7)",
+  test "reopen replaces stale pacing in the same transaction",
        ctx do
     assignment =
       handle(ctx, "assign", assign_call({:session, "holder"}, "post-insert failure"))
 
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
 
-    # `terminal_disposition` DELETEs the supervision_entitlements row on close,
-    # so there is normally none left to conflict with by the time a card
-    # reopens. Forcing one back makes `apply_reopen`'s later
-    # `supervision_transition!(:armed, ...)` observe `:duplicate` (the INSERT's
-    # `ON CONFLICT(assignmentId) DO NOTHING` fires) instead of `:armed` — an
-    # uncaught raise landing AFTER the INSERT into `assignment_reopenings` and
-    # the UPDATE to the `assignments` row, proving the whole transaction —
-    # history row included — rolls back together rather than leaving an
-    # orphaned papertrail row behind a card the code never actually reopened.
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -2670,22 +2661,148 @@ defmodule Tightbeam.AssignmentsTest do
         INSERT INTO supervision_entitlements
           (assignmentId, generation, dueAt, state, basisKind, basisId, cause, principal,
            supervisionIntervalMs)
-        VALUES (?1, 1, 0, 'armed', 'assignment_open', ?1, 'assignment_open', 'process:test', 1000)
+        VALUES (?1, 9, NULL, 'terminus', 'assignment_open', ?1, 'terminus', 'process:test', NULL)
         """,
         [assignment.id]
       )
 
-    before = reopen_mutation_snapshot(ctx.db, assignment.id)
+    assignment_id = assignment.id
 
-    assert_raise RuntimeError, ~r/invalid supervision transition result/, fn ->
-      handle(
-        ctx,
-        "reopen-assignment",
-        reopen_call({:session, "holder"}, assignment.id, "racing supervision state")
-      )
-    end
+    assert %{id: ^assignment_id, state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "holder"}, assignment.id, "replace stale pacing", 80_000)
+               |> Map.put(:supervision_interval_ms, 60_000)
+             )
 
-    assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
+    assert {:ok, [[1, 140_000, "armed", nil, nil, nil, "assignment_open", "assignment_open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,dueAt,state,lastAttemptGeneration,claimClock,terminusAt,basisKind,cause FROM supervision_entitlements WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  test "reopen fixed-clock matrix replaces absent armed claimed and terminus pacing", ctx do
+    Enum.each(Enum.with_index(~w(absent armed claimed terminus), 1), fn {stale_state, index} ->
+      assignment =
+        handle(
+          ctx,
+          "assign",
+          assign_call({:session, "holder"}, "reopen #{stale_state} #{index}")
+        )
+
+      _ =
+        handle(
+          ctx,
+          "attest",
+          attest_call({:session, "holder"}, assignment.id, "completion")
+        )
+
+      if stale_state != "absent" do
+        {due_at, last_attempt, claim_clock, terminus_at, interval} =
+          case stale_state do
+            "armed" -> {70_000, nil, nil, nil, 60_000}
+            "claimed" -> {70_000, 9, 70_000, nil, 60_000}
+            "terminus" -> {nil, nil, nil, 70_000, nil}
+          end
+
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "INSERT INTO supervision_entitlements (assignmentId,generation,dueAt,state,lastAttemptGeneration,claimClock,basisKind,basisId,terminusAt,cause,principal,supervisionIntervalMs) VALUES (?1,9,?2,?3,?4,?5,'assignment_open',?1,?6,'terminus','process:test',?7)",
+            [
+              assignment.id,
+              due_at,
+              stale_state,
+              last_attempt,
+              claim_clock,
+              terminus_at,
+              interval
+            ]
+          )
+      end
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO supervision_watermarks (sessionKey,lastEvaluatedTerminal,pendingBranch,pendingAssignment,pendingK,pendingN) VALUES ('holder',?1,'prod',?2,1,2) ON CONFLICT(sessionKey) DO UPDATE SET lastEvaluatedTerminal=excluded.lastEvaluatedTerminal,pendingBranch='prod',pendingAssignment=excluded.pendingAssignment,pendingK=1,pendingN=2",
+          [index, assignment.id]
+        )
+
+      assert {:ok, [[receipt_cursor_before]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT attestCursor FROM supervision_liveness_receipt_state WHERE assignmentId=?1",
+                 [assignment.id]
+               )
+
+      assert %{state: "open"} =
+               handle(
+                 ctx,
+                 "reopen-assignment",
+                 reopen_call(
+                   {:session, "holder"},
+                   assignment.id,
+                   "fixed #{stale_state}",
+                   80_000
+                 )
+                 |> Map.put(:supervision_interval_ms, 60_000)
+               )
+
+      assert {:ok,
+              [
+                [
+                  1,
+                  140_000,
+                  "armed",
+                  nil,
+                  nil,
+                  nil,
+                  "assignment_open",
+                  ^receipt_cursor_before
+                ]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT e.generation,e.dueAt,e.state,e.lastAttemptGeneration,e.claimClock,e.terminusAt,e.basisKind,r.attestCursor FROM supervision_entitlements e JOIN supervision_liveness_receipt_state r ON r.assignmentId=e.assignmentId WHERE e.assignmentId=?1",
+                 [assignment.id]
+               )
+
+      assert {:ok, [[1, nil, nil, nil, nil]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT (SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1),pendingBranch,pendingAssignment,pendingK,pendingN FROM supervision_watermarks WHERE sessionKey='holder'",
+                 [assignment.id]
+               )
+
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "DELETE FROM supervision_entitlements WHERE assignmentId=?1 AND EXISTS (SELECT 1 FROM assignments WHERE id=?1 AND state='closed')",
+                 [assignment.id]
+               )
+
+      assert %{code: "assignment_open"} =
+               handle(
+                 ctx,
+                 "reopen-assignment",
+                 reopen_call(
+                   {:session, "holder"},
+                   assignment.id,
+                   "losing reopen",
+                   90_000
+                 )
+               )
+
+      assert {:ok, [[1, 140_000, "armed"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT generation,dueAt,state FROM supervision_entitlements WHERE assignmentId=?1",
+                 [assignment.id]
+               )
+    end)
   end
 
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
@@ -3643,6 +3760,9 @@ defmodule Tightbeam.AssignmentsTest do
     do:
       call("reopen-assignment", principal, nil, %{assignment_id: id, reason: reason})
       |> Map.put(:supervision_interval_ms, 1_000)
+
+  defp reopen_call(principal, id, reason, clock),
+    do: reopen_call(principal, id, reason) |> Map.put(:clock, clock)
 
   defp query_call(principal, state, holder),
     do: call("assignments", principal, holder, %{state: state})
