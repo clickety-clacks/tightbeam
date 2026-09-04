@@ -72,6 +72,9 @@ a concrete definition of done is dumping, not delegating — the holder stalls o
 and the result bounces back to you. The brief carries all three. Pick each worker's model
 per preferred-models, from the live catalog.
 
+You own every assignment you open. Follow the operating manual's finished-work carry
+duty when its holder finishes; an integrated result, not a parked candidate, closes the loop.
+
 Before your FIRST fan-out on a work item, digest the whole spec against its spirit.
 The substrate enforces this once per work item. Do not repeat spirit review because
 you split the item into goals or slices. If the item's product intent changes, revise
