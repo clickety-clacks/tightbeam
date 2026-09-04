@@ -448,7 +448,7 @@ defmodule Tightbeam.Readiness do
   defp adapter_line(%{adapter: :present}), do: nil
   defp adapter_line(%{adapter: {:unknown, _reason}}), do: nil
 
-  # The fallback command is PINNED and `--no-save`. An operator who follows a remedy
+  # The fallback command is PINNED and `--save-exact`. An operator who follows a remedy
   # verbatim gets whatever it says, so a bare package name here installs npm's latest
   # and floats the adapter off its pin — the drift the install site was fixed to prevent,
   # reintroduced by the sentence that tells someone how to do it by hand (#47).
@@ -458,7 +458,7 @@ defmodule Tightbeam.Readiness do
     "ACP adapter missing at #{path}. Boot only checks readiness; it does not install " <>
       "adapters. Tightbeam will install its pinned adapters automatically when the next " <>
       "session is spawned. Manual fallback: npm install --prefix " <>
-      "#{Tightbeam.Harness.Support.shell_quote(install_dir)} --no-save " <>
+      "#{Tightbeam.Harness.Support.shell_quote(install_dir)} --save-exact " <>
       "#{package_for(wire)}@#{version_for(wire)}"
   end
 

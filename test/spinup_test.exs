@@ -45,6 +45,40 @@ defmodule Tightbeam.SpinupTest do
     assert detail =~ "credentials present"
   end
 
+  test "an unknown existing codex adapter version warns and remains runnable", ctx do
+    adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
+
+    package =
+      Path.join([
+        ctx.base_dir,
+        "adapters",
+        "node_modules",
+        "@agentclientprotocol",
+        "codex-acp",
+        "package.json"
+      ])
+
+    File.mkdir_p!(Path.dirname(adapter))
+    File.mkdir_p!(Path.dirname(package))
+    File.write!(adapter, "#!/bin/sh\n")
+    File.chmod!(adapter, 0o755)
+    File.write!(package, JSON.encode!(%{"version" => "9.9.9"}))
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, "adapters present"} =
+                 Tightbeam.Harness.Codex.ensure_adapter(%{
+                   base_dir: ctx.base_dir,
+                   host_config: %{base_dir: ctx.base_dir, ssh: nil},
+                   host_name: "testhost",
+                   sh: fn command -> flunk("unexpected shell command: #{inspect(command)}") end
+                 })
+      end)
+
+    assert log =~ "codex adapter patch skipped: expected version 1.8.0, found 9.9.9"
+    assert log =~ "continuing with the installed adapter unpatched"
+  end
+
   # The gateway host used to be the only machine that could not supply its own adapters:
   # it refused and told the operator to go install them by hand, on the host tightbeam
   # was standing on. It provisions now, through the same mechanism the remote path uses
@@ -79,6 +113,8 @@ defmodule Tightbeam.SpinupTest do
     # Local means local: no ssh hop to reach the machine tightbeam is running on.
     refute script =~ "ssh"
     assert script =~ "npm install --prefix"
+    assert script =~ "--save-exact"
+    refute script =~ "--no-save"
     assert script =~ Path.join(ctx.base_dir, "adapters")
 
     # Every harness at its pin, asserted per harness rather than by naming packages —

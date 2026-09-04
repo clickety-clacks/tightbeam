@@ -194,9 +194,9 @@ defmodule Tightbeam.SubagentMarkers do
     end
   end
 
-  @doc "Resolve a parent-visible tool-call handle to its canonical subagent ref."
+  @doc "Resolve a parent-visible adapter subagent handle to its canonical subagent ref."
   @spec resolve_subagent_in_txn(Txn.t(), String.t(), String.t()) :: String.t() | nil
-  def resolve_subagent_in_txn(%Txn{} = txn, parent_session, tool_call_id) do
+  def resolve_subagent_in_txn(%Txn{} = txn, parent_session, source_handle) do
     txn
     |> Txn.q(
       """
@@ -210,7 +210,7 @@ defmodule Tightbeam.SubagentMarkers do
       case marker_by_source_in_txn(
              txn,
              "subagent_start",
-             source_event_ref(source_session_ref, tool_call_id)
+             source_event_ref(source_session_ref, source_handle)
            ) do
         nil -> nil
         marker -> marker.subagent_ref
