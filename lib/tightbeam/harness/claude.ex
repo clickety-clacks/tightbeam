@@ -525,6 +525,7 @@ defmodule Tightbeam.Harness.Claude do
       %{
         slug: model["slug"],
         name: model["name"] || model["slug"],
+        aliases: Map.get(model, "aliases", []),
         current_version: version,
         min_version: gate["minVersion"],
         max_version_exclusive: gate["maxVersionExclusive"]

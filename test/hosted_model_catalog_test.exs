@@ -25,6 +25,23 @@ defmodule Tightbeam.HostedModelCatalogTest do
     assert [%{name: "Fable 5.1", min_version: "2.1.257", current_version: "2.1.220"}] =
              @host |> ModelCatalog.metadata("claude", old) |> Map.fetch!(:version_blocks)
 
+    selection = Model.new("claude-fable-5-1", context: "1m", effort: "high")
+
+    assert {:error,
+            %Unroutable{
+              cause: :family_absent,
+              version_block: %{slug: "claude-fable-5-1"}
+            } = refusal} =
+             ModelCatalog.route(@host, "claude", selection, old)
+
+    assert Unroutable.message(refusal) =~
+             "Claude Code v2.1.220 is too old for Fable 5.1; needs v2.1.257"
+
+    assert {:error, %Unroutable{version_block: %{slug: "claude-fable-5-1"}} = refusal} =
+             ModelCatalog.route(@host, selection, old)
+
+    assert Unroutable.message(refusal) =~ "claude on host #{@host}"
+
     current = start_catalog(ctx, "2.1.257")
     await_health(current, :fresh)
     {entries, :fresh} = ModelCatalog.get(@host, "claude", current)
