@@ -417,6 +417,34 @@ defmodule Tightbeam.ArchetypesTest do
              )
   end
 
+  test "reviewer guidance serves the bounded verdict-note artifact remedy", ctx do
+    Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
+    reviewer =
+      Identity.snapshot_at!(
+        ctx.base_dir,
+        Identity.live_revision!(ctx.base_dir),
+        "reviewer",
+        :codex
+      )
+
+    assert reviewer.guidance =~ "The verdict note has a 2,000-character cap"
+    assert reviewer.guidance =~ "record it as a report artifact on the work item"
+    assert reviewer.guidance =~ "report artifact's id and SHA-256"
+    assert reviewer.guidance =~ ~r/Do not copy the clause table into the\s+note/
+
+    conformance = reviewer.skills["spec-conformance"]
+    assert conformance =~ "The verdict note has a 2,000-character cap"
+    assert conformance =~ "The full clause table is REQUIRED in the review document"
+    assert conformance =~ "tightbeam artifact-record --kind report"
+    assert conformance =~ "--sha256 <hex>"
+    assert conformance =~ "artifact's id and SHA-256"
+    assert conformance =~ "<summary + art_id + sha256>"
+  end
+
   # Every archetype x both harnesses, and each `snapshot_at!` is a chain of
   # SEQUENTIAL git forks (rev-parse for the required refs, ls-tree for the
   # guidance set, then a `git show` per fragment, manifest and skill). A single
