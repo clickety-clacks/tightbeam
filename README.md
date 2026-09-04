@@ -305,18 +305,19 @@ distinct ports already give distinct names and there is nothing extra to set.
 `TIGHTBEAM_NODE` names it yourself if you want to; the only way to collide is to
 give two instances the same port, or to pin them to the same name by hand.
 
-That name is also how `tightbeam-gateway stop`, `remote` and `pid` FIND a running
-gateway — so **run them the same way you started it**. Same port (or same
-`TIGHTBEAM_NODE`), same machine name. When they disagree you do not get a clear
-message; you get a connection failure like
+The lifecycle verbs `tightbeam-gateway stop`, `remote` and `pid` FIND a running
+gateway through its descriptor at `<base_dir>/gateway.json` — resolved from
+`TIGHTBEAM_BASE_DIR` ONLY, never from an ambient port or inherited node. `stop`
+SIGTERMs the owned OS pid the descriptor records (identity-checked, so a recycled
+pid is never signalled — no Erlang node or cookie is consulted); `remote` and
+`pid` read the same descriptor. So **point them at the same `TIGHTBEAM_BASE_DIR`
+you started the instance with**. With no `TIGHTBEAM_BASE_DIR` set, `stop` REFUSES
+rather than guess a target — set `TIGHTBEAM_BASE_DIR=<dir>` for the instance you
+mean, or use `systemctl stop tightbeam` for the managed gateway.
 
-```
---rpc-eval : RPC failed with reason :noconnection
-```
-
-about a gateway that is running perfectly well. It means the name they looked for
-is not the name it started under. Same discipline as the CLI, for the same
-reason.
+The `restart` verb was removed: for an isolated instance run `stop` then `start`;
+for the managed gateway use `systemctl restart tightbeam`. (A SIGTERM-then-boot
+restart would replace a service-managed gateway with an unsupervised process.)
 
 With at least one usable harness through preflight, the first boot creates the
 base dir and serves, but **cannot run a turn yet**: it has no credentials, so it
