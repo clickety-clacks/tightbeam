@@ -77,24 +77,31 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert record.routing.reportTo.sharesParentNotice == false
     assert record.request.status == "open"
     assert is_integer(record.request.deadlineAt)
+    assert record.request.currentRecipient == "session:#{ctx.parent.session_key}"
+    assert record.request.recipientGeneration == 0
+    assert record.request.recipientReissueCount == 0
+    assert record.request.recipientReissueLimit == 3
 
     assert wake_for(ctx.db, record.id, "parent-notice").wake_id ==
-             "completion:#{record.closingAttestId}:parent-notice:0"
+             "completion:attest:#{record.closingAttestId}:parent-notice:0"
 
     assert wake_for(ctx.db, record.id, "report-to-notice").wake_id ==
-             "completion:#{record.closingAttestId}:report-to-notice"
+             "completion:attest:#{record.closingAttestId}:report-to-notice"
 
     assert wake_for(ctx.db, record.id, "deadline").wake_id ==
-             "completion:#{record.closingAttestId}:deadline:0"
+             "completion:attest:#{record.closingAttestId}:deadline:0"
 
     expected_parent_prompt =
       """
-      Child completion recorded.
+      Child assignment slate became empty.
       completionId=#{record.id}
       assignmentId=#{assignment.id}
       workItemId=none
       childSessionKey=#{ctx.child.session_key}
+      causeKind=attest
+      causeId=#{record.closingAttestId}
       closingAttestId=#{record.closingAttestId}
+      revocationId=none
       outcome=completed
       causePrincipal=session:#{ctx.child.session_key}
       immediateParentSessionKey=#{ctx.parent.session_key}
@@ -103,6 +110,10 @@ defmodule Tightbeam.CompletionEscalationTest do
       reportToSessionKey=#{ctx.report.session_key}
       remainingOpenAssignments=0
       actionNeeded=true
+      recipientPrincipal=session:#{ctx.parent.session_key}
+      recipientGeneration=0
+      recipientReissueCount=0
+      recipientReissueLimit=3
       Choose retain, park, or retire with `tightbeam completion-disposition #{record.id} --decision <retain|park|retire>`. Tightbeam will not choose or auto-retire.
       """
       |> String.trim_trailing()
@@ -125,7 +136,7 @@ defmodule Tightbeam.CompletionEscalationTest do
       reportToSessionKey=#{ctx.report.session_key}
       remainingOpenAssignments=0
       actionNeeded=true
-      This report is informational. Only the exact completion parent target or owner user can choose a disposition.
+      This report is informational. It grants no disposition authority.
       """
       |> String.trim_trailing()
 
@@ -140,14 +151,25 @@ defmodule Tightbeam.CompletionEscalationTest do
                "SELECT count(*) FROM lifecycle_events WHERE kind='completion_escalation_opened' AND subject=?1",
                [record.id]
              )
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE kind='completion_escalation_opened' AND subject=?1",
+               [record.id]
+             )
   end
 
   test "notice and membership failures roll back the whole close transaction", ctx do
     failures = [
+      {"completion_escalations", "1"},
       {"wakes", "NEW.wakeId LIKE '%:parent-notice:0'"},
       {"wakes", "NEW.wakeId LIKE '%:report-to-notice'"},
+      {"wakes", "NEW.wakeId LIKE '%:deadline:0'"},
       {"completion_escalation_wakes", "NEW.kind = 'parent-notice'"},
-      {"completion_escalation_wakes", "NEW.kind = 'report-to-notice'"}
+      {"completion_escalation_wakes", "NEW.kind = 'report-to-notice'"},
+      {"completion_escalation_wakes", "NEW.kind = 'deadline'"},
+      {"lifecycle_events", "NEW.kind = 'completion_escalation_opened'"}
     ]
 
     failures
@@ -236,7 +258,8 @@ defmodule Tightbeam.CompletionEscalationTest do
     projection =
       Enum.map_join(names, ",", fn
         "id" -> "'ce_corrupt_open'"
-        "dedupeKey" -> "'completion:att_corrupt_open'"
+        "dedupeKey" -> "'terminal:attest:att_corrupt_open'"
+        "causeId" -> "'att_corrupt_open'"
         "closingAttestId" -> "'att_corrupt_open'"
         name -> ~s("#{name}")
       end)
@@ -407,7 +430,7 @@ defmodule Tightbeam.CompletionEscalationTest do
                [record.id]
              )
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM completion_escalation_wakes WHERE completionId=?1 AND kind='parent-notice'",
@@ -419,6 +442,11 @@ defmodule Tightbeam.CompletionEscalationTest do
 
   test "authenticated device retirement propagates its typed user principal", ctx do
     token = "tbt_a14_completion_device_token"
+
+    signing_base =
+      Path.join(System.tmp_dir!(), "completion-a14-signing-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(signing_base) end)
 
     assert {:ok, _} =
              DB.query(
@@ -434,10 +462,6 @@ defmodule Tightbeam.CompletionEscalationTest do
     record = only_notice_for(ctx, {:user, "owner"}, completion_assignment.id)
     interrupted = assign(ctx, holder: descendant.session_key)
 
-    base_dir =
-      Path.join(System.tmp_dir!(), "completion-a14-#{System.unique_integer([:positive])}")
-
-    on_exit(fn -> File.rm_rf!(base_dir) end)
     real_retire = ctx.handlers["retire"]
     caller = self()
 
@@ -452,7 +476,7 @@ defmodule Tightbeam.CompletionEscalationTest do
         db: ctx.db,
         handlers: handlers,
         cli_token: "unused",
-        cursor_signing: cursor_signing!(base_dir),
+        cursor_signing: cursor_signing!(signing_base),
         defaults: %{},
         session_status: fn _ -> nil end
       )
@@ -481,10 +505,17 @@ defmodule Tightbeam.CompletionEscalationTest do
                [record.id]
              )
 
-    assert {:ok, [["owner", nil]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT revokedByUser,revokedBySession FROM assignment_revocations WHERE assignmentId=?1",
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId=?1",
+               [interrupted.id]
+             )
+
+    assert {:ok, [["acknowledged", "retire", "owner", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status,decision,actedByUser,actedBySession FROM completion_escalations WHERE assignmentId=?1",
                [interrupted.id]
              )
 
@@ -508,9 +539,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert Org.get(ctx.db, descendant.session_key).state == "retired"
 
     spoofed = session(ctx.db, "a14-spoofed-origin", "owner", ctx.parent.session_key)
-    spoofed_assignment = assign(ctx, holder: spoofed.session_key)
-    complete(ctx, spoofed_assignment.id, spoofed.session_key)
-    spoofed_record = only_notice_for(ctx, {:user, "owner"}, spoofed_assignment.id)
+    spoofed_interrupted = assign(ctx, holder: spoofed.session_key)
 
     assert %{deleted_session_key: key} =
              real_retire.(%{
@@ -526,8 +555,19 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert {:ok, [["owner", "decision=retire"]]} =
              DB.query(
                ctx.db,
-               "SELECT ce.actedByUser,le.detail FROM completion_escalations ce JOIN lifecycle_events le ON le.subject=ce.id AND le.kind='completion_escalation_acknowledged' WHERE ce.id=?1",
-               [spoofed_record.id]
+               "SELECT ce.actedByUser,le.detail FROM completion_escalations ce JOIN lifecycle_events le ON le.subject=ce.id AND le.kind='completion_escalation_acknowledged' WHERE ce.assignmentId=?1",
+               [spoofed_interrupted.id]
+             )
+
+    assert {:ok, [["owner", nil, "owner", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT r.revokedByUser,r.revokedBySession,a.closedByUser,a.closedBySession
+               FROM assignment_revocations r JOIN assignments a ON a.id=r.assignmentId
+               WHERE r.assignmentId=?1
+               """,
+               [spoofed_interrupted.id]
              )
 
     refused = session(ctx.db, "a14-missing-principal", "owner", ctx.parent.session_key)
@@ -550,9 +590,13 @@ defmodule Tightbeam.CompletionEscalationTest do
 
   test "null parent selects owner Main and inactive report-to stays independent", ctx do
     assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE sessions SET operationalParent=NULL WHERE sessionKey=?1", [
-               ctx.child.session_key
-             ])
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET spawnedBy=NULL,operationalParent=NULL WHERE sessionKey=?1",
+               [
+                 ctx.child.session_key
+               ]
+             )
 
     assignment = assign(ctx, report_to: ctx.report.session_key)
     Org.retire(ctx.db, ctx.report.session_key, "user:owner", 1_000)
@@ -663,7 +707,7 @@ defmodule Tightbeam.CompletionEscalationTest do
 
   test "retired exact target never inspects or delivers to a foreign ancestor", ctx do
     assert {:ok, _} =
-             DB.query(ctx.db, "UPDATE sessions SET operationalParent=?2 WHERE sessionKey=?1", [
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
                ctx.parent.session_key,
                ctx.foreign.session_key
              ])
@@ -686,7 +730,7 @@ defmodule Tightbeam.CompletionEscalationTest do
              ])
   end
 
-  test "an inactive exact parent is recorded without climbing", ctx do
+  test "an inactive exact parent is preserved while the request climbs", ctx do
     Org.retire(ctx.db, ctx.parent.session_key, "user:owner", 1_000)
     assignment = assign(ctx)
     complete(ctx, assignment.id)
@@ -707,7 +751,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert detail ==
              "channel=parent resolution=parent-unavailable reason=parent-inactive generation=0 principal=process:tightbeam:completion-escalation"
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM completion_escalation_wakes WHERE completionId=?1 AND kind='parent-notice'",
@@ -866,30 +910,22 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert only_notice(ctx, {:user, "owner"}).request.status == "open"
   end
 
-  test "reopen supersedes history and later completion appends a new row", ctx do
+  test "new assignment supersedes history and later completion appends a new row", ctx do
     assignment = assign(ctx)
     first_attest = complete(ctx, assignment.id)
     first = only_notice(ctx, {:user, "owner"})
 
-    reopened =
-      Assignments.__handle__(ctx.db, "reopen-assignment", %{
-        verb: "reopen-assignment",
-        origin: "user:owner",
-        principal: {:user, "owner"},
-        session_key: nil,
-        supervision_interval_ms: 1_000,
-        params: %{assignment_id: assignment.id, reason: "recheck"}
-      })
+    successor = assign(ctx)
 
-    assert reopened.state == "open"
+    assert successor.state == "open"
     assert CompletionEscalation.get(ctx.db, first.id).request.status == "superseded"
-    second_attest = complete(ctx, assignment.id)
+    second_attest = complete(ctx, successor.id)
 
     records =
       CompletionEscalation.notices(ctx.db, notice_call({:user, "owner"}, "all")).completionNotices
 
     assert length(records) == 2
-    assert Enum.map(records, & &1.assignmentId) == [assignment.id, assignment.id]
+    assert Enum.map(records, & &1.assignmentId) == [assignment.id, successor.id]
 
     assert Enum.map(records, & &1.closingAttestId) == [
              first_attest.attest.id,
@@ -994,7 +1030,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert record.request.deadlineAt == nil
 
     assert %{code: "action_not_required"} =
-             disposition(ctx, record.id, "retain", {:session, ctx.parent.session_key})
+             disposition(ctx, record.id, "retain", {:user, "owner"})
 
     assert {:ok, [[0]]} =
              DB.query(
@@ -1020,7 +1056,8 @@ defmodule Tightbeam.CompletionEscalationTest do
 
     second = only_notice(ctx, {:user, "owner"})
     assert second.request.generation == 1
-    assert second.routing.parent.receipt.state == "pending"
+    assert second.routing.parent.receipt.state == "canceled"
+    assert second.request.receipt.state == "pending"
     assert Wakes.get(ctx.db, first_parent.wake_id).state == "canceled"
     assert Wakes.get(ctx.db, report_wake.wake_id).state == "pending"
     assert Wakes.get(ctx.db, deadline.wake_id).state == "fired"
@@ -1044,7 +1081,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert completion_wake_state(ctx.db, first.id) == before
   end
 
-  test "deadline advances without rerouting when the exact parent is unavailable", ctx do
+  test "deadline advances the recipient without rewriting exact-parent truth", ctx do
     assignment = assign(ctx, report_to: ctx.report.session_key)
     complete(ctx, assignment.id)
     first = only_notice(ctx, {:user, "owner"})
@@ -1060,10 +1097,83 @@ defmodule Tightbeam.CompletionEscalationTest do
 
     current = CompletionEscalation.get(ctx.db, first.id)
     assert current.request.generation == 1
-    assert current.routing.parent.routeStatus == "unavailable"
-    assert current.routing.parent.receipt.state == "not-created"
+    assert current.routing.parent.routeStatus == "scheduled"
+    assert current.routing.parent.receipt.state == "canceled"
     assert Wakes.get(ctx.db, old_parent.wake_id).state == "canceled"
     assert Wakes.get(ctx.db, report.wake_id).state == "pending"
+  end
+
+  test "reissue stops at a current recipient that became foreign-owned", ctx do
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    first = only_notice(ctx, {:user, "owner"})
+    deadline = wake_for(ctx.db, first.id, "deadline")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET ownerUserId='other' WHERE sessionKey=?1", [
+               ctx.parent.session_key
+             ])
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               CompletionEscalation.reissue_in_txn(txn, deadline.wake_id)
+             end)
+
+    record = CompletionEscalation.get(ctx.db, first.id)
+    assert record.request.currentRecipient == "user:owner"
+    assert record.request.recipientGeneration == 1
+    assert record.request.deadlineAt == nil
+
+    assert {:ok, [[detail]]} =
+             DB.query(
+               ctx.db,
+               "SELECT detail FROM lifecycle_events WHERE kind='completion_escalation_cross_owner_lineage' AND subject=?1 ORDER BY id DESC LIMIT 1",
+               [record.id]
+             )
+
+    assert detail ==
+             "recipientPathSessionKey=#{ctx.parent.session_key} principal=process:tightbeam:completion-escalation"
+  end
+
+  test "completion user columns retain database foreign-key enforcement", ctx do
+    for {table, column} <- [
+          {"completion_escalations", "causeByUser"},
+          {"completion_escalations", "ownerUserId"},
+          {"completion_escalations", "currentRecipientUserId"},
+          {"completion_escalations", "actedByUser"},
+          {"completion_escalation_wakes", "recipientUserId"}
+        ] do
+      assert {:ok, rows} = DB.query(ctx.db, "PRAGMA foreign_key_list(#{table})")
+
+      assert Enum.any?(rows, fn row ->
+               Enum.at(row, 3) == column and Enum.at(row, 2) == "users"
+             end)
+    end
+  end
+
+  test "revocation generation schema admits distinct reopened generation identities", ctx do
+    assignment = assign(ctx)
+
+    assert %{state: "closed"} = revoke(ctx, assignment.id, {:user, "owner"})
+
+    assert %{state: "open"} =
+             Assignments.__handle__(ctx.db, "reopen-assignment", %{
+               verb: "reopen-assignment",
+               origin: "user:owner",
+               principal: {:user, "owner"},
+               session_key: nil,
+               supervision_interval_ms: 1_000,
+               params: %{assignment_id: assignment.id, reason: "exercise reopened generation"}
+             })
+
+    assert %{state: "closed"} = revoke(ctx, assignment.id, {:user, "owner"})
+
+    assert {:ok, [[2, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*),count(reopeningId) FROM assignment_revocation_generations WHERE assignmentId=?1",
+               [assignment.id]
+             )
   end
 
   test "new assignment supersedes the request atomically", ctx do
@@ -1276,10 +1386,14 @@ defmodule Tightbeam.CompletionEscalationTest do
 
   test "cross-owner spawnedBy fails closed and remains diagnostic", ctx do
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE sessions SET operationalParent=?2 WHERE sessionKey=?1", [
-        ctx.child.session_key,
-        ctx.foreign.session_key
-      ])
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET spawnedBy=?2,operationalParent=?2 WHERE sessionKey=?1",
+        [
+          ctx.child.session_key,
+          ctx.foreign.session_key
+        ]
+      )
 
     assignment = assign(ctx)
     complete(ctx, assignment.id)
@@ -1307,7 +1421,7 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert detail ==
              "parentSessionKey=#{ctx.foreign.session_key} principal=process:tightbeam:completion-escalation"
 
-    assert {:ok, [[0]]} =
+    assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
                "SELECT count(*) FROM completion_escalation_wakes WHERE completionId=?1 AND kind='parent-notice'",
@@ -1326,8 +1440,11 @@ defmodule Tightbeam.CompletionEscalationTest do
     assert mutation_sites != []
     assert mutation_sites |> Enum.map(&elem(&1, 0)) |> Enum.uniq() == [owner]
 
-    assert remote_call_sites(assignments, :CompletionEscalation, :open_in_txn, 3) == [
-             "apply_lifecycle_attest/5"
+    assert remote_call_sites(assignments, :CompletionEscalation, :open_terminal_in_txn, 4)
+           |> Enum.sort() == [
+             "apply_lifecycle_attest/5",
+             "interrupt_for_retire_in_txn/4",
+             "revoke_open_assignment_in_txn/3"
            ]
 
     assert remote_call_sites(
@@ -1342,12 +1459,15 @@ defmodule Tightbeam.CompletionEscalationTest do
              "retire_session_in_txn/7"
            ]
 
-    assert remote_call_sites(owner, :Org, :effective_parent_in_txn, 2) == ["open_in_txn/3"]
+    assert remote_call_sites(owner, :Org, :effective_parent_in_txn, 2) == [
+             "open_terminal_in_txn/4"
+           ]
+
     assert remote_call_sites(owner, :Wakes, :cancel_in_txn, 2) == ["cancel_wake!/3"]
     assert remote_call_sites(owner, :Wakes, :fire_internal_in_txn, 4) == ["fire_deadline!/2"]
 
     assert remote_call_sites(owner, :EventLog, :lifecycle_in_txn, 4) |> Enum.sort() ==
-             ~w(acknowledge_in_txn/5 dispose_undeliverable_delivery_in_txn/2 open_in_txn/3 park_unavailable_in_txn/3 preflight_existing_in_txn/4 record_parent_failure/4 record_parent_failure/4 record_report_to_failure/4 reissue_open_in_txn/2 retire_deferred_in_txn/4 transition_superseded_in_txn/5)
+             ~w(acknowledge_in_txn/5 dispose_undeliverable_delivery_in_txn/2 open_admitted_terminal_in_txn/7 park_unavailable_in_txn/3 preflight_existing_in_txn/4 record_cross_owner_walk/3 record_owner_carrier_failure/5 record_parent_failure/4 record_parent_failure/4 record_recipient_failure/3 record_report_to_failure/4 reissue_open_in_txn/2 retire_deferred_in_txn/4 transition_superseded_in_txn/5)
              |> Enum.sort()
 
     assert local_call_sites(owner, :root_main_now?, 2) |> Enum.sort() ==
@@ -1468,6 +1588,169 @@ defmodule Tightbeam.CompletionEscalationTest do
              )
   end
 
+  test "only the zero-producing revocation opens an empty epoch", ctx do
+    first = assign(ctx)
+    second = assign(ctx)
+
+    assert %{outcome: "revoked"} = revoke(ctx, first.id, {:user, "owner"})
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM completion_escalations WHERE assignmentId=?1",
+               [first.id]
+             )
+
+    assert %{outcome: "revoked"} = revoke(ctx, second.id, {:user, "owner"})
+    record = only_notice(ctx, {:user, "owner"})
+
+    assert record.assignmentId == second.id
+    assert record.causeKind == "revocation"
+    assert record.causeId == record.revocationId
+    assert record.closingAttestId == nil
+    assert record.outcome == "revoked"
+    assert record.cause == %{bySession: nil, byUser: "owner", principal: "user:owner"}
+    assert record.request.status == "open"
+    assert record.request.currentRecipient == "session:#{ctx.parent.session_key}"
+
+    assert wake_for(ctx.db, record.id, "parent-notice").wake_id ==
+             "completion:revocation:#{record.revocationId}:parent-notice:0"
+
+    assert wake_for(ctx.db, record.id, "deadline").wake_id ==
+             "completion:revocation:#{record.revocationId}:deadline:0"
+  end
+
+  test "revocation request and outbox failures roll back the terminal mutation", ctx do
+    failures = [
+      {"completion_escalations", "1"},
+      {"wakes", "NEW.wakeId LIKE '%:parent-notice:0'"},
+      {"wakes", "NEW.wakeId LIKE '%:deadline:0'"},
+      {"completion_escalation_wakes", "NEW.kind = 'parent-notice'"},
+      {"completion_escalation_wakes", "NEW.kind = 'deadline'"}
+    ]
+
+    failures
+    |> Enum.with_index()
+    |> Enum.each(fn {{table, condition}, index} ->
+      child = session(ctx.db, "revoke-rollback-child-#{index}", "owner", ctx.parent.session_key)
+      assignment = assign(ctx, holder: child.session_key)
+      before = revocation_rollback_snapshot(ctx.db, assignment.id)
+
+      :ok =
+        DB.execute(
+          ctx.db,
+          "CREATE TRIGGER abort_revocation_completion BEFORE INSERT ON #{table} WHEN #{condition} BEGIN SELECT RAISE(ABORT, 'forced revocation rollback'); END"
+        )
+
+      assert_raise DB.Error, ~r/forced revocation rollback/, fn ->
+        revoke(ctx, assignment.id, {:user, "owner"})
+      end
+
+      assert revocation_rollback_snapshot(ctx.db, assignment.id) == before
+      :ok = DB.execute(ctx.db, "DROP TRIGGER abort_revocation_completion")
+
+      assert %{outcome: "revoked"} = revoke(ctx, assignment.id, {:user, "owner"})
+
+      assert {:ok, [[1, 1, 1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*),count(DISTINCT revocationId),count(DISTINCT causeId) FROM completion_escalations WHERE assignmentId=?1 AND causeKind='revocation'",
+                 [assignment.id]
+               )
+    end)
+  end
+
+  test "bounded reissues climb same-owner ancestors and terminate at the owner user", ctx do
+    previous = Application.get_env(:tightbeam, :prod_limit)
+    Application.put_env(:tightbeam, :prod_limit, 0)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :prod_limit),
+        else: Application.put_env(:tightbeam, :prod_limit, previous)
+    end)
+
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    first = only_notice(ctx, {:user, "owner"})
+    first_deadline = wake_for(ctx.db, first.id, "deadline")
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               CompletionEscalation.reissue_in_txn(txn, first_deadline.wake_id)
+             end)
+
+    ancestor = CompletionEscalation.get(ctx.db, first.id)
+    assert ancestor.request.currentRecipient == "session:#{ctx.main.session_key}"
+    assert ancestor.request.recipientGeneration == 1
+    assert ancestor.request.recipientReissueCount == 0
+    assert ancestor.request.recipientReissueLimit == 0
+
+    assert %{code: "not_authorized"} =
+             disposition(ctx, ancestor.id, "retain", {:session, ctx.parent.session_key})
+
+    ancestor_deadline = wake_for_generation(ctx.db, ancestor.id, "deadline", 1)
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               CompletionEscalation.reissue_in_txn(txn, ancestor_deadline.wake_id)
+             end)
+
+    root = CompletionEscalation.get(ctx.db, ancestor.id)
+    assert root.request.currentRecipient == "user:owner"
+    assert root.request.recipientGeneration == 2
+    assert root.request.recipientReissueCount == 0
+    assert root.request.deadlineAt == nil
+
+    assert %{code: "not_authorized"} =
+             disposition(ctx, root.id, "retain", {:session, ctx.main.session_key})
+
+    assert %{request: %{status: "acknowledged", decision: "retain"}} =
+             disposition(ctx, root.id, "retain", {:user, "owner"})
+  end
+
+  test "stored reissue limit survives later configuration changes", ctx do
+    previous = Application.get_env(:tightbeam, :prod_limit)
+    Application.put_env(:tightbeam, :prod_limit, 3)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :prod_limit),
+        else: Application.put_env(:tightbeam, :prod_limit, previous)
+    end)
+
+    assignment = assign(ctx)
+    complete(ctx, assignment.id)
+    record = only_notice(ctx, {:user, "owner"})
+    Application.put_env(:tightbeam, :prod_limit, 0)
+    deadline = wake_for(ctx.db, record.id, "deadline")
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn ->
+               CompletionEscalation.reissue_in_txn(txn, deadline.wake_id)
+             end)
+
+    reissued = CompletionEscalation.get(ctx.db, record.id)
+    assert reissued.request.currentRecipient == "session:#{ctx.parent.session_key}"
+    assert reissued.request.recipientGeneration == 0
+    assert reissued.request.recipientReissueCount == 1
+    assert reissued.request.recipientReissueLimit == 3
+  end
+
+  test "startup and reads do not invent an initial-zero epoch", ctx do
+    assert %{completionNotices: []} =
+             CompletionEscalation.notices(ctx.db, notice_call({:user, "owner"}, "all"))
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM completion_escalations")
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM completion_escalation_wakes")
+
+    assert %{completionNotices: []} =
+             CompletionEscalation.notices(
+               ctx.db,
+               notice_call({:session, ctx.child.session_key}, "all")
+             )
+  end
+
   defp assign(ctx, opts \\ []) do
     holder = Keyword.get(opts, :holder, ctx.child.session_key)
     principal = Keyword.get(opts, :principal, {:user, "owner"})
@@ -1500,6 +1783,16 @@ defmodule Tightbeam.CompletionEscalationTest do
       principal: {:session, session_key},
       session_key: nil,
       params: %{assignment_id: assignment_id, kind: "completion"}
+    })
+  end
+
+  defp revoke(ctx, assignment_id, principal) do
+    Assignments.__handle__(ctx.db, "revoke-assignment", %{
+      verb: "revoke-assignment",
+      origin: origin(principal),
+      principal: principal,
+      session_key: nil,
+      params: %{assignment_id: assignment_id, reason: "completion escalation fixture"}
     })
   end
 
@@ -1579,6 +1872,17 @@ defmodule Tightbeam.CompletionEscalationTest do
         db,
         "SELECT wakeId FROM completion_escalation_wakes WHERE completionId=?1 AND kind=?2",
         [completion_id, kind]
+      )
+
+    Wakes.get(db, wake_id)
+  end
+
+  defp wake_for_generation(db, completion_id, kind, generation) do
+    {:ok, [[wake_id]]} =
+      DB.query(
+        db,
+        "SELECT wakeId FROM completion_escalation_wakes WHERE completionId=?1 AND kind=?2 AND generation=?3",
+        [completion_id, kind, generation]
       )
 
     Wakes.get(db, wake_id)
@@ -1730,6 +2034,22 @@ defmodule Tightbeam.CompletionEscalationTest do
       end
 
     {assignment, work_item, attests, completions, completion_wakes, side_effect_counts}
+  end
+
+  defp revocation_rollback_snapshot(db, assignment_id) do
+    {:ok, [[revocations]]} =
+      DB.query(db, "SELECT count(*) FROM assignment_revocations WHERE assignmentId=?1", [
+        assignment_id
+      ])
+
+    {:ok, [[generations]]} =
+      DB.query(
+        db,
+        "SELECT count(*) FROM assignment_revocation_generations WHERE assignmentId=?1",
+        [assignment_id]
+      )
+
+    {rollback_snapshot(db, assignment_id), revocations, generations}
   end
 
   defp disposition_state(db, completion_id) do
