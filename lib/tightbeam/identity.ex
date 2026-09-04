@@ -547,6 +547,63 @@ defmodule Tightbeam.Identity do
     end)
   end
 
+  @doc false
+  @spec public_kungfu_names(String.t()) :: [String.t()]
+  def public_kungfu_names(base_dir) do
+    dir = identity_dir(base_dir)
+
+    installed =
+      if File.dir?(Path.join(dir, ".git")), do: public_kungfu_names_at(dir, @live), else: []
+
+    (available_bundle_names() ++ installed)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  @doc false
+  @spec public_kungfu(String.t(), String.t()) :: map() | nil
+  def public_kungfu(base_dir, name) do
+    validate_public_kungfu_name!(name)
+    dir = identity_dir(base_dir)
+
+    available = Enum.find(available_bundles(), &(&1.name == name))
+
+    manifest_path = Path.join(["kungfu", name, "manifest.toml"])
+
+    installed? =
+      File.dir?(Path.join(dir, ".git")) and path_exists_at?(dir, @live, manifest_path)
+
+    cond do
+      installed? ->
+        live = git_output!(dir, ["rev-parse", @live])
+        manifest = bundle_manifest!(git_show!(dir, @live, manifest_path), manifest_path)
+
+        %{
+          "name" => name,
+          "purpose" => manifest.purpose,
+          "phrases" => Enum.sort(manifest.phrases),
+          "rootArchetype" => manifest.root_archetype,
+          "installedRevision" => live,
+          "status" => "installed",
+          "documents" => public_kungfu_documents(dir, base_dir, name)
+        }
+
+      available ->
+        %{
+          "name" => name,
+          "purpose" => available.purpose,
+          "phrases" => Enum.sort(available.phrases),
+          "rootArchetype" => available.root_archetype,
+          "installedRevision" => nil,
+          "status" => "available",
+          "documents" => []
+        }
+
+      true ->
+        nil
+    end
+  end
+
   defp bundle_manifest!(content, path) do
     manifest = Toml.decode!(content)
     purpose = Map.fetch!(manifest, "purpose")
@@ -809,7 +866,11 @@ defmodule Tightbeam.Identity do
   end
 
   defp learned_bundle_names(dir) do
-    git_output!(dir, ["ls-tree", "-r", "--name-only", "main", "--", "kungfu"])
+    learned_bundle_names_at(dir, "main")
+  end
+
+  defp learned_bundle_names_at(dir, revision) do
+    git_output!(dir, ["ls-tree", "-r", "--name-only", revision, "--", "kungfu"])
     |> String.split("\n", trim: true)
     |> Enum.flat_map(fn path ->
       case String.split(path, "/") do
@@ -818,6 +879,147 @@ defmodule Tightbeam.Identity do
       end
     end)
     |> Enum.sort()
+  end
+
+  defp public_kungfu_names_at(dir, revision) do
+    git_output!(dir, ["ls-tree", "-r", "--name-only", revision, "--", "kungfu"])
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn path ->
+      case String.split(path, "/") do
+        ["kungfu", name, "manifest.toml"] -> [name]
+        _ -> []
+      end
+    end)
+    |> Enum.sort()
+  end
+
+  defp public_kungfu_documents(dir, base_dir, name) do
+    allowed = MapSet.new(~w(README.md capabilities.md preferred-models.md))
+    root = Path.join(["kungfu", name])
+    banked_secret_values = banked_secret_values(base_dir)
+
+    git_output!(dir, ["ls-tree", "-r", @live, "--", root])
+    |> String.split("\n", trim: true)
+    |> Enum.flat_map(fn line ->
+      case Regex.run(~r/^(100644|100755) blob [0-9a-f]+\t(.+)$/, line, capture: :all_but_first) do
+        [_mode, path] ->
+          relative = Path.relative_to(path, root)
+
+          if Path.dirname(relative) == "." and MapSet.member?(allowed, relative) and
+               Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9._\/-]*$/, relative) and
+               ".." not in Path.split(relative) do
+            content =
+              dir
+              |> git_show!(@live, path)
+              |> sanitize_public_document(base_dir, banked_secret_values)
+
+            [
+              %{
+                "path" => relative,
+                "content" => content,
+                "sha256" => :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
+              }
+            ]
+          else
+            []
+          end
+
+        _ ->
+          []
+      end
+    end)
+    |> Enum.sort_by(& &1["path"])
+  end
+
+  defp sanitize_public_document(content, base_dir, banked_secret_values) do
+    content
+    |> replace_banked_secret_values(banked_secret_values)
+    |> replace_literal_path(base_dir)
+    |> String.replace(
+      ~r/-----BEGIN [^-\r\n]*PRIVATE KEY-----.*?-----END [^-\r\n]*PRIVATE KEY-----/s,
+      "[redacted-secret]"
+    )
+    |> String.replace(
+      ~r/(?im)\b(?:authorization|api[_-]?key|token|password|secret)\s*[:=]\s*(?:bearer\s+)?[^\s,;]+/,
+      "[redacted-secret]"
+    )
+    |> String.replace(
+      ~r/(?i)\b(?:sk|ghp|github_pat|tbc|tbs|tbt|tbp)_[A-Za-z0-9._-]{8,}\b/,
+      "[redacted-secret]"
+    )
+    |> String.replace(~r{/(?:home|Users)/[^/\s]+(?:/[^\s),;]*)?}, "[redacted-host-path]")
+  end
+
+  defp replace_literal_path(content, base_dir) when is_binary(base_dir) and base_dir != "" do
+    String.replace(content, base_dir, "[redacted-host-path]")
+  end
+
+  defp replace_literal_path(content, _base_dir), do: content
+
+  defp banked_secret_values(base_dir) do
+    auth_dir = Path.join(base_dir, "auth")
+
+    case File.lstat(auth_dir) do
+      {:ok, %File.Stat{type: :directory}} ->
+        auth_dir
+        |> regular_files_beneath!()
+        |> Enum.flat_map(fn path ->
+          bytes = File.read!(path)
+
+          if bytes != "" and String.valid?(bytes) do
+            [bytes, String.trim(bytes)]
+          else
+            []
+          end
+        end)
+        |> Enum.reject(&(&1 == ""))
+        |> Enum.uniq()
+        |> Enum.sort_by(&byte_size/1, :desc)
+
+      {:error, :enoent} ->
+        []
+
+      {:ok, %File.Stat{type: type}} ->
+        raise ArgumentError, "credential bank must be a directory, found #{type}"
+
+      {:error, reason} ->
+        raise File.Error, action: "read credential bank", path: auth_dir, reason: reason
+    end
+  end
+
+  defp regular_files_beneath!(dir) do
+    dir
+    |> File.ls!()
+    |> Enum.sort()
+    |> Enum.flat_map(fn entry ->
+      path = Path.join(dir, entry)
+
+      case File.lstat(path) do
+        {:ok, %File.Stat{type: :directory}} ->
+          regular_files_beneath!(path)
+
+        {:ok, %File.Stat{type: :regular}} ->
+          [path]
+
+        {:ok, %File.Stat{}} ->
+          []
+
+        {:error, reason} ->
+          raise File.Error, action: "inspect credential bank", path: path, reason: reason
+      end
+    end)
+  end
+
+  defp replace_banked_secret_values(content, banked_secret_values) do
+    Enum.reduce(banked_secret_values, content, fn value, sanitized ->
+      String.replace(sanitized, value, "[redacted-secret]")
+    end)
+  end
+
+  defp validate_public_kungfu_name!(name) do
+    unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/, name) do
+      raise ArgumentError, "invalid kungfu name: #{inspect(name)}"
+    end
   end
 
   defp receipt_path(name), do: Path.join(["kungfu", name, "installed.toml"])
@@ -932,7 +1134,10 @@ defmodule Tightbeam.Identity do
   end
 
   defp path_exists_at?(dir, revision, path) do
-    case System.cmd("git", ["cat-file", "-e", "#{revision}:#{path}"], cd: dir) do
+    case System.cmd("git", ["cat-file", "-e", "#{revision}:#{path}"],
+           cd: dir,
+           stderr_to_stdout: true
+         ) do
       {_output, 0} -> true
       {_output, _status} -> false
     end

@@ -30,6 +30,7 @@ defmodule Tightbeam.EffortCheckin do
   }
 
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @origin "process:tightbeam"
   @default_horizon_ms 14_400_000
@@ -382,6 +383,11 @@ defmodule Tightbeam.EffortCheckin do
         error("not_authorized", "current expecter required")
 
       request.status == "ruled" and request.decision == action and request.ruled_by == actor ->
+        {:ok, :ok} =
+          DB.transaction(db, fn txn ->
+            Publisher.maybe_accepted_in_txn(txn, call, request)
+          end)
+
         request
 
       request.status != "open" ->
@@ -404,15 +410,21 @@ defmodule Tightbeam.EffortCheckin do
           end
 
         case DB.transaction(db, fn txn ->
-               rule_in_txn(
-                 txn,
-                 config,
-                 request,
-                 action,
-                 actor,
-                 call.principal,
-                 fresh
-               )
+               result =
+                 rule_in_txn(
+                   txn,
+                   config,
+                   request,
+                   action,
+                   actor,
+                   call.principal,
+                   fresh
+                 )
+
+               if is_map(result) and not Map.has_key?(result, :code),
+                 do: Publisher.maybe_accepted_in_txn(txn, call, result)
+
+               result
              end) do
           {:ok, result} -> result
           {:error, error} -> raise error
