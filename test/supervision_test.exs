@@ -929,6 +929,52 @@ defmodule Tightbeam.SupervisionTest do
     assert %{stalledAt: nil} = Supervision.prod_state(ctx.db, "asg_1")
   end
 
+  test "a progress receipt starts a fresh heard-prod epoch", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    seq1 = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
+    assert [wake] = Wakes.list_pending(ctx.db)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO turns (sessionKey, messageId, origin, prompt, status, wakeId, createdAt, endedAt)
+        VALUES ('holder', 'm_progress_reset_1', 'process:tightbeam', 'prod', 'delivered', ?1, 1, 1)
+        """,
+        [wake.wake_id]
+      )
+
+    settle_supervision_wake!(ctx.db, wake.wake_id)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_progress_epoch','asg_1','progress','material progress','holder',2)"
+      )
+
+    seq2 = terminal!(ctx.db, "holder")
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
+
+    assert {:ok, [["progress", "att_progress_epoch", 3]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId,generation FROM supervision_liveness_progress_receipts"
+             )
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1'")
+
+    seq3 = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq3)
+    assert %{stalledAt: nil} = Supervision.prod_state(ctx.db, "asg_1")
+  end
+
   # THE LEGACY-TRANSFER REGRESSION (Sol confirmation round). Retirement-era
   # sidecar rows carry transfer evidence but a NULL chargedGeneration. Before
   # any receipt exists they are real heard evidence (NULL fails >= silently);
@@ -1026,17 +1072,47 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
   end
 
-  test "progress prose does not reset delivered or attempted counters", ctx do
+  test "the August 31 Cards 1, 3, 4, and 5 durable filings rebase liveness", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
     [wake] = Wakes.list_pending(ctx.db)
     cancel_wake!(ctx.db, wake)
 
+    # Exact wi_4ee303fa liveness specimens: Card 1's four filings; Card 3's
+    # dependency fallback; Card 4's durable progress; and Card 5's dependency
+    # fallback. att_99c4c115 remains the original valid dependency receipt.
+    # This receipt-selection fixture deliberately does not model stale
+    # post-closure state or unexpired-wake eligibility, which have separate
+    # boundaries.
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_1','asg_1','progress','holder',2)"
+        """
+        INSERT INTO attests (id, assignmentId, kind, bySession, ts)
+        VALUES
+          ('att_44706a9f','asg_1','progress','holder',2),
+          ('att_38a1a229','asg_1','progress','holder',3),
+          ('att_f0f735ae','asg_1','progress','holder',4),
+          ('att_7b4d29c1','asg_1','progress','holder',5),
+          ('att_a6051dd2','asg_1','progress','holder',6),
+          ('att_c532a60d','asg_1','progress','holder',7),
+          ('att_de16e957','asg_1','progress','holder',8),
+          ('att_99c4c115','asg_1','progress','holder',9)
+        """
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts)
+        VALUES
+          ('att_cc66ba00','asg_1','verdict','cannot-proceed-external-main-red','flynn',10),
+          ('att_c4f2d593','asg_1','verdict','liveness-crediting-false-stall','flynn',11),
+          ('att_46f3b9a5','asg_1','verdict','liveness-crediting-false-stall','flynn',12),
+          ('att_8ca4dfcd','asg_1','verdict','liveness-crediting-false-stall','flynn',13)
+        """
       )
 
     {:ok, _} =
@@ -1047,17 +1123,38 @@ defmodule Tightbeam.SupervisionTest do
 
     seq2 = terminal!(ctx.db, "holder")
 
-    # The wire numbering counts HEARD prods (outage regression, 2026-08-15):
-    # the canceled first prod never reached anyone, so this send is still
-    # "prod 1 of 2". The stored counters below keep counting every attempt —
-    # which is this test's actual subject: progress prose resets neither.
-    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
 
-    assert %{attemptCount: 2, prodCount: 2, attestCount: 1, stalledAt: nil} =
+    assert %{attemptCount: 0, prodCount: 0, attestCount: 12, stalledAt: nil} =
              Supervision.prod_state(ctx.db, "asg_1")
 
-    assert {:ok, []} =
-             DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
+    assert {:ok,
+            [
+              ["progress", "att_44706a9f"],
+              ["progress", "att_38a1a229"],
+              ["progress", "att_f0f735ae"],
+              ["progress", "att_7b4d29c1"],
+              ["progress", "att_a6051dd2"],
+              ["progress", "att_c532a60d"],
+              ["progress", "att_de16e957"],
+              ["progress", "att_99c4c115"]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_progress_receipts ORDER BY receiptId"
+             )
+
+    assert {:ok,
+            [
+              ["verdict", "att_cc66ba00"],
+              ["verdict", "att_c4f2d593"],
+              ["verdict", "att_46f3b9a5"],
+              ["verdict", "att_8ca4dfcd"]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts ORDER BY receiptId"
+             )
   end
 
   # Immutable authority: art_201ab36d, SHA-256
@@ -1213,7 +1310,7 @@ defmodule Tightbeam.SupervisionTest do
     refute second.wake_id in [first_id, third_id]
   end
 
-  test "vague progress and unbound, unrelated, or expired wakes are not receipts", ctx do
+  test "unrelated progress and unbound, unrelated, or expired wakes are not receipts", ctx do
     assignment(ctx.db, "asg_other", "holder", "other work", 2)
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     now = System.system_time(:millisecond)
@@ -1239,7 +1336,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_vague','asg_1','progress','blocked, no state change','holder',?1)",
+        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_unrelated','asg_other','progress','other work','holder',?1)",
         [now]
       )
 
