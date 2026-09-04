@@ -1193,6 +1193,73 @@ defmodule Tightbeam.StateResources do
     end
   end
 
+  @doc "Canonical public evidence serializer for a physical breathing session row."
+  def breathing_session([session_key, state]), do: %{sessionKey: session_key, state: state}
+
+  @doc "Canonical public evidence serializer for a physical breathing assignment row."
+  def breathing_assignment([id, opened_at, state, outcome, holder_key, work_item_id]) do
+    %{
+      id: id,
+      openedAt: opened_at,
+      state: state,
+      outcome: outcome,
+      holderKey: holder_key,
+      workItemId: work_item_id
+    }
+  end
+
+  @doc "Canonical public evidence serializer for a physical breathing work-item row."
+  def breathing_work_item([id, state, fail_reason]),
+    do: %{id: id, state: state, failReason: fail_reason}
+
+  @doc "Canonical public evidence serializer for a physical breathing turn row."
+  def breathing_turn([
+        seq,
+        session_key,
+        assignment_id,
+        job_ref,
+        status,
+        adapter_gen,
+        error,
+        created_at,
+        started_at,
+        ended_at
+      ]) do
+    %{
+      seq: seq,
+      sessionKey: session_key,
+      assignmentId: assignment_id,
+      jobRef: job_ref,
+      status: status,
+      adapterGen: adapter_gen,
+      error: error,
+      createdAt: created_at,
+      startedAt: started_at,
+      endedAt: ended_at
+    }
+  end
+
+  @doc "Canonical public evidence serializer for a physical breathing wake row."
+  def breathing_wake([
+        wake_id,
+        session_key,
+        assignment_id,
+        work_item_id,
+        state,
+        due_at,
+        created_at
+      ]) do
+    %{
+      wakeId: wake_id,
+      sessionKey: session_key,
+      assignmentId: assignment_id,
+      workItemId: work_item_id,
+      state: state,
+      dueAt: due_at,
+      createdAt: created_at
+    }
+  end
+
   def work_item(row), do: public(row)
   def assignment(row), do: public(row)
   def attest(row), do: public(row)

@@ -919,6 +919,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("workItemId", work_item_id)],
         )),
+        Command::Breathing {
+            identity,
+            target_kind,
+            target_id,
+        } => Ok(request(
+            identity,
+            "breathing",
+            vec![],
+            vec![
+                string_field("targetKind", target_kind),
+                string_field("targetId", target_id),
+            ],
+        )),
         Command::WorkItemTrace {
             identity,
             work_item_id,
@@ -2049,6 +2062,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
+        | Command::Breathing { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
@@ -3563,6 +3577,10 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null}}"#
+        );
+        assert_eq!(
+            body(&["breathing", "assignment", "asg_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"breathing","params":{"targetKind":"assignment","targetId":"asg_1"}}"#
         );
         assert_eq!(
             body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),

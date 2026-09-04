@@ -65,6 +65,7 @@ defmodule Tightbeam.Gateway do
     Archetypes,
     Artifacts,
     Assignments,
+    Breathing,
     ConditionFacts,
     CriticalLeases,
     Placement,
@@ -705,6 +706,15 @@ defmodule Tightbeam.Gateway do
               %{code: "unknown_caller"}
 
             true ->
+              call =
+                case config do
+                  %{wake_tick_ms: interval} ->
+                    Map.put(call, :supervision_interval_ms, interval)
+
+                  _ ->
+                    call
+                end
+
               wake_result(config, db, call)
           end
         end,
@@ -1098,6 +1108,7 @@ defmodule Tightbeam.Gateway do
         )
       end,
       {"work-item-get", []} => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
+      {"breathing", []} => fn call -> Breathing.handle(db, call) end,
       {"work-item-trace", []} => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
       {"transcript", []} => fn call -> Tightbeam.Transcript.read(db, call) end,
       {"turn-trace", []} => fn call -> TurnLifecycle.read(db, call) end,
@@ -5453,13 +5464,17 @@ defmodule Tightbeam.Gateway do
 
   defp bind_liveness_checkpoint_in_txn(
          txn,
-         %{principal: {:session, creator_session_key}},
+         %{
+           principal: {:session, creator_session_key},
+           supervision_interval_ms: supervision_interval_ms
+         },
          %{session_key: creator_session_key, wake_id: wake_id}
        ) do
     Supervision.transition_in_txn(txn, %{
       kind: "checkpoint_scheduled",
       wake_id: wake_id,
-      creator_session_key: creator_session_key
+      creator_session_key: creator_session_key,
+      supervision_interval_ms: supervision_interval_ms
     })
   end
 

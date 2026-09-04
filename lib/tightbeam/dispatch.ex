@@ -335,12 +335,11 @@ defmodule Tightbeam.Dispatch do
   # (a second copy of every transcript on every read, plus content in crash rows)
   # and keeps the trail to WHAT was read rather than WHAT was returned.
   #
-  # ADDING THE SECOND VERB: `elided_count/1` defines N as the summed length of the
-  # result's top-level lists. That is exactly the entry/candidate count for a verb
-  # whose result carries ONE page list. A verb returning two lists would have them
-  # summed, and one returning none would report 0 — so a second member either
-  # accepts that meaning of N or brings its own counter.
-  @result_elided ~w(transcript)
+  # `elided_count/1` defines N as the summed length of the result's top-level lists.
+  # That is exactly the entry count for transcript. Breathing returns no lists and
+  # deliberately records count 0: the audit row proves only that the caller ran the
+  # query, never the computed physical answer.
+  @result_elided ~w(transcript breathing)
   @activation_write_verbs ~w(activation-declare activation-authority activation-attempt activation-observe activation-reconcile activation-withdraw activation-renotify activation-ack)
 
   # The CALL is audited with its params — that IS the access trail — and the

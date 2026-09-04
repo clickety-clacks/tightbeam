@@ -2140,7 +2140,7 @@ defmodule Tightbeam.Assignments do
 
   defp apply_reopen(txn, call, assignment) do
     assignment_id = assignment.id
-    now = now()
+    now = Map.get(call, :clock, now())
     {reopened_user, reopened_session} = opener(call.principal)
 
     # The close is written down BEFORE it is cleared. Order matters: a crash
@@ -2198,11 +2198,9 @@ defmodule Tightbeam.Assignments do
       call.prepared_effort_arm
     )
 
-    # A terminal disposition DELETEs the entitlement row, so this arms a fresh
-    # generation exactly as `assign` does — a reopened card is watched like any
-    # other open card rather than living unsupervised.
+    # Reopen replaces every stale closed-lifecycle pacing state in one upsert.
     supervision_transition!(txn, :armed, %{
-      kind: "assignment_open",
+      kind: "assignment_reopen",
       assignment_id: assignment_id,
       opened_at: now,
       supervision_interval_ms: call.supervision_interval_ms,
