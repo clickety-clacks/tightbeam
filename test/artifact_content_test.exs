@@ -672,7 +672,7 @@ defmodule Tightbeam.ArtifactContentTest do
   defp restore_env(key, value), do: Application.put_env(:tightbeam, key, value)
 
   defp install_cli!(base_dir) do
-    source = Path.expand("../cli/target/debug/tightbeam", __DIR__)
+    source = Path.expand("../cli/target/release/tightbeam", __DIR__)
     destination = Path.join([base_dir, "bin", "tightbeam"])
     File.mkdir_p!(Path.dirname(destination))
     File.cp!(source, destination)

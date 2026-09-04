@@ -939,7 +939,7 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(Path.dirname(artifact_path))
     File.write!(artifact_path, "banana")
 
-    cli_source = Path.expand("../cli/target/debug/tightbeam", __DIR__)
+    cli_source = Path.expand("../cli/target/release/tightbeam", __DIR__)
     cli_target = Path.join([base_dir, "bin", "tightbeam"])
     File.mkdir_p!(Path.dirname(cli_target))
     File.cp!(cli_source, cli_target)
