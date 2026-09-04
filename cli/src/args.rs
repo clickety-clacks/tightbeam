@@ -325,6 +325,9 @@ pub enum Command {
         identity: Identity,
         provider: String,
         api_key: bool,
+        daemon_credential: bool,
+        endpoint: Option<String>,
+        provider_name: Option<String>,
         hostname: Option<String>,
         remote: Option<String>,
     },
@@ -648,6 +651,17 @@ COMMANDS:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+  onboard opencode-go (--api-key | --daemon-credential)
+      Bank an OpenCode Go API key for Pi. --api-key reads and validates the key
+      from stdin. --daemon-credential asks the gateway daemon to read the fixed
+      owner-private opencode-go-api-key file from its configured credentials
+      directory; no key or staging path crosses the CLI wire. OpenCode Go has no
+      subscription onboarding path here.
+  onboard local-openai --name NAME --endpoint URL [--api-key]
+      Bank a host-scoped local OpenAI-compatible provider. The endpoint base URL
+      is required. An API key is optional and, when present, is read from stdin
+      -- never as an argument. The endpoint is live-probed with GET /v1/models
+      before anything is banked.
   onboard github [--hostname github.com] [--remote URL]
       Prove or create this host's GitHub CLI browser/device login, then stamp
       non-secret capability metadata. The credential is banked file-backed
@@ -762,6 +776,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "all",
     "api-key",
     "clear-spec-ref",
+    "daemon-credential",
     "dry-run",
     "help",
     "json",
@@ -2163,15 +2178,27 @@ fn parse_identity_command(
 
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
-        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+        return Err(
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key | --daemon-credential] [--hostname HOST]"
+                .to_owned(),
+        );
     }
     let provider = parsed.positional[1].clone();
     let fixture_provider = cfg!(test) && provider == "fixture-provider";
-    if !matches!(provider.as_str(), "openai" | "anthropic" | "github") && !fixture_provider {
-        return Err("provider must be openai, anthropic, or github".to_owned());
+    if !matches!(
+        provider.as_str(),
+        "openai" | "anthropic" | "opencode-go" | "local-openai" | "github"
+    ) && !fixture_provider
+    {
+        return Err(
+            "provider must be openai, anthropic, opencode-go, local-openai, or github".to_owned(),
+        );
     }
     let allowed = [
         "api-key",
+        "daemon-credential",
+        "endpoint",
+        "name",
         "hostname",
         "remote",
         "as",
@@ -2179,15 +2206,53 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         "as-process",
     ];
     if flags.keys().any(|flag| !allowed.contains(&flag.as_str())) {
-        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+        return Err(
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key | --daemon-credential] [--hostname HOST]"
+                .to_owned(),
+        );
     }
+    let endpoint = nonempty(flags, "endpoint");
+    let provider_name = nonempty(flags, "name");
     let hostname = nonempty(flags, "hostname");
     let remote = nonempty(flags, "remote");
+    let daemon_credential = flags.contains_key("daemon-credential");
+    if daemon_credential && flags.contains_key("api-key") {
+        return Err("--daemon-credential and --api-key are mutually exclusive".to_owned());
+    }
+    if daemon_credential && provider != "opencode-go" {
+        return Err(
+            "--daemon-credential is only valid for tightbeam onboard opencode-go".to_owned(),
+        );
+    }
     if provider == "github" && flags.contains_key("api-key") {
         return Err(
             "tightbeam onboard github does not accept --api-key; use GitHub CLI browser/device auth"
                 .to_owned(),
         );
+    }
+    if provider == "opencode-go" && !flags.contains_key("api-key") && !daemon_credential {
+        return Err(
+            "tightbeam onboard opencode-go requires --api-key or --daemon-credential; OpenCode Go has no subscription onboarding path"
+                .to_owned(),
+        );
+    }
+    if provider == "local-openai" {
+        if endpoint.is_none() {
+            return Err("tightbeam onboard local-openai requires --endpoint URL".to_owned());
+        }
+        if provider_name.is_none() {
+            return Err("tightbeam onboard local-openai requires --name NAME".to_owned());
+        }
+        if hostname.is_some() || remote.is_some() {
+            return Err(
+                "tightbeam onboard local-openai does not accept --hostname or --remote".to_owned(),
+            );
+        }
+    } else if endpoint.is_some() {
+        return Err("--endpoint is only valid for tightbeam onboard local-openai".to_owned());
+    }
+    if provider != "local-openai" && provider_name.is_some() {
+        return Err("--name is only valid for tightbeam onboard local-openai".to_owned());
     }
     if provider == "github"
         && ["as", "as-user", "as-process"]
@@ -2207,10 +2272,10 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     Ok(Command::Onboard {
         identity: identity(flags)?,
         provider,
-        // A BOOLEAN flag, deliberately. `--api-key <value>` would put the key in
-        // this process's argv, where anyone on the box can read it out of the
-        // process table. The key arrives on stdin instead.
         api_key: flags.contains_key("api-key"),
+        daemon_credential,
+        endpoint,
+        provider_name,
         hostname,
         remote,
     })
@@ -2633,6 +2698,9 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             })
@@ -2652,6 +2720,9 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: Some("github.example".to_owned()),
                 remote: None,
             })
@@ -2667,6 +2738,9 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: Some("https://github.com/example/project.git".to_owned()),
             })
@@ -2688,6 +2762,116 @@ mod tests {
         assert_eq!(
             parse(strings(&["onboard", "openai", "--hostname", "github.com"])),
             Err("--hostname is only valid for tightbeam onboard github".to_owned())
+        );
+    }
+
+    #[test]
+    fn opencode_go_onboard_is_api_key_only() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--api-key",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "opencode-go".to_owned(),
+                api_key: true,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
+                hostname: None,
+                remote: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "opencode-go"])),
+            Err(
+                "tightbeam onboard opencode-go requires --api-key or --daemon-credential; OpenCode Go has no subscription onboarding path"
+                    .to_owned()
+            )
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--daemon-credential",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "opencode-go".to_owned(),
+                api_key: false,
+                daemon_credential: true,
+                endpoint: None,
+                provider_name: None,
+                hostname: None,
+                remote: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--api-key",
+                "--daemon-credential"
+            ])),
+            Err("--daemon-credential and --api-key are mutually exclusive".to_owned())
+        );
+    }
+
+    #[test]
+    fn local_openai_onboard_requires_endpoint_and_name() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "local-openai",
+                "--name",
+                "spark",
+                "--endpoint",
+                "https://spark.example/v1",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "local-openai".to_owned(),
+                api_key: false,
+                daemon_credential: false,
+                endpoint: Some("https://spark.example/v1".to_owned()),
+                provider_name: Some("spark".to_owned()),
+                hostname: None,
+                remote: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "local-openai", "--as-user", "flynn"])),
+            Err("tightbeam onboard local-openai requires --endpoint URL".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "local-openai",
+                "--endpoint",
+                "https://spark.example/v1",
+                "--as-user",
+                "flynn"
+            ])),
+            Err("tightbeam onboard local-openai requires --name NAME".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "openai",
+                "--endpoint",
+                "https://x/v1"
+            ])),
+            Err("--endpoint is only valid for tightbeam onboard local-openai".to_owned())
         );
     }
 
@@ -2823,6 +3007,8 @@ mod tests {
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
+            "onboard opencode-go (--api-key | --daemon-credential)",
+            "onboard local-openai --name NAME --endpoint URL [--api-key]",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
             "config get default-archetype|default-priority",
@@ -3914,6 +4100,9 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     provider: "openai".to_owned(),
                     api_key: false,
+                    daemon_credential: false,
+                    endpoint: None,
+                    provider_name: None,
                     hostname: None,
                     remote: None,
                 },

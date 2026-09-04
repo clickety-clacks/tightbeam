@@ -165,6 +165,23 @@ defmodule Tightbeam.PlacementTest do
     assert error.message =~ inspect(reason)
   end
 
+  test "Pi adapter context accepts a named local provider when OpenCode is absent", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      credential_kind: fn
+        :opencode_go, "testhost" -> {:error, :missing}
+        :local_openai, "testhost" -> :api_key
+      end
+    }
+
+    assert [credential_kind: :api_key] =
+             Placement.adapter_context(config, {:pi, "shared", "testhost"})
+  end
+
   test "workdir_path names a disappeared host instead of falling back to the gateway", %{
     base_dir: base_dir,
     db: db

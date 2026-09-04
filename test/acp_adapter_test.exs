@@ -382,6 +382,10 @@ defmodule Tightbeam.Acp.AdapterTest do
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "tool_call", content: [{ type: "content", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } }] } } });
             return send({ id: m.id, result: { stopReason: "end_turn" } });
           }
+          if (gateMode === "pass-tool-pi-bash-meta") {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "tool_call_update", _meta: { terminal_output: { data: "Command blocked [gate: tightbeam-probe]" } } } } });
+            return send({ id: m.id, result: { stopReason: "end_turn" } });
+          }
           if (gateMode === "no-marker") {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "command not found" } } } });
             return send({ id: m.id, result: { stopReason: "end_turn" } });
@@ -2036,8 +2040,8 @@ defmodule Tightbeam.Acp.AdapterTest do
              Adapter.new_session(plain, Model.new("haiku"), "/tmp", [], "guidance")
   end
 
-  test "gate wiring-check passes on message or tool content and discards the probe session" do
-    for gate_mode <- ["pass-message", "pass-tool"] do
+  test "gate wiring-check passes on message, tool content, or pi-acp terminal-output meta and discards the probe session" do
+    for gate_mode <- ["pass-message", "pass-tool", "pass-tool-pi-bash-meta"] do
       parent = self()
 
       {adapter, capture_path} =

@@ -1304,8 +1304,19 @@ defmodule Tightbeam.Placement do
 
     [
       credential_kind:
-        credential_kind(config, module.credential_provider(), host, module.wire_name())
+        credential_kind(
+          config,
+          adapter_credential_providers(module),
+          host,
+          module.wire_name()
+        )
     ]
+  end
+
+  defp adapter_credential_providers(module) do
+    if module.id() == :pi,
+      do: [:opencode_go, :local_openai],
+      else: [module.credential_provider()]
   end
 
   @doc "Derive the stored name for a normalized overridden identity."
@@ -1561,25 +1572,36 @@ defmodule Tightbeam.Placement do
 
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
 
-  defp credential_kind(config, provider, host, harness) do
-    case read_credential_kind(config, provider, host) do
-      {:error, reason} ->
-        code =
-          case reason do
-            {name, _detail} when is_atom(name) -> Atom.to_string(name)
-            _other -> "host_unready"
-          end
+  defp credential_kind(config, providers, host, harness) when is_list(providers) do
+    result =
+      Enum.reduce_while(providers, nil, fn provider, first_error ->
+        case read_credential_kind(config, provider, host) do
+          {:error, reason} -> {:cont, first_error || reason}
+          kind -> {:halt, {:ok, kind}}
+        end
+      end)
 
-        raise Refusal,
-          code: code,
-          host: host,
-          harness: harness,
-          message:
-            "credential kind for #{harness} on host #{host} is unreadable: #{inspect(reason)}"
-
-      kind ->
-        kind
+    case result do
+      {:ok, kind} -> kind
+      reason -> raise_credential_kind_refusal(reason, host, harness)
     end
+  end
+
+  defp credential_kind(config, provider, host, harness) when is_atom(provider),
+    do: credential_kind(config, [provider], host, harness)
+
+  defp raise_credential_kind_refusal(reason, host, harness) do
+    code =
+      case reason do
+        {name, _detail} when is_atom(name) -> Atom.to_string(name)
+        _other -> "host_unready"
+      end
+
+    raise Refusal,
+      code: code,
+      host: host,
+      harness: harness,
+      message: "credential kind for #{harness} on host #{host} is unreadable: #{inspect(reason)}"
   end
 
   defp read_credential_kind(%{credential_kind: kind}, _provider, _host)

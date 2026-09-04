@@ -3280,6 +3280,41 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
   end
 
+  test "Pi spawn validates the selected catalog provider independently", ctx do
+    base_dir = role_test_base("spawn-pi-selected-provider", false)
+    Archetypes.load!(base_dir)
+
+    put_host_catalog("testhost", "pi", [
+      {"spark/qwen3.5-35b", [], :local_openai}
+    ])
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :pi)
+      |> Map.put(:default_model, Model.new("spark/qwen3.5-35b"))
+      |> Map.put(:credential_status, fn
+        :local_openai, "testhost" -> {:needs_onboarding, :missing}
+        :opencode_go, "testhost" -> raise "unrelated OpenCode credential was consulted"
+      end)
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "needs_onboarding"},
+             message: message
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Spark selected provider",
+                 idempotency_key: "spawn-pi-selected-provider"
+               }
+             })
+
+    assert message =~ "local_openai"
+    refute message =~ "opencode_go"
+  end
+
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
     base_dir = placement_test_base("later-eligible", ["eurisko", "racter"])
     ensure_global_registry()
@@ -7129,7 +7164,12 @@ defmodule Tightbeam.GatewayTest do
   defp put_host_catalog(host, harness, models) do
     entries =
       Enum.map(models, fn spec ->
-        {family, efforts} = if is_tuple(spec), do: spec, else: {spec, []}
+        {family, efforts, provider} =
+          case spec do
+            {family, efforts, provider} -> {family, efforts, provider}
+            {family, efforts} -> {family, efforts, :anthropic}
+            family -> {family, [], :anthropic}
+          end
 
         %{
           family: family,
@@ -7139,7 +7179,7 @@ defmodule Tightbeam.GatewayTest do
           efforts: efforts,
           max_input_tokens: 200_000,
           capabilities: %{},
-          provider: :anthropic
+          provider: provider
         }
       end)
 

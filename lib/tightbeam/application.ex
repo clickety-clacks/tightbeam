@@ -263,7 +263,8 @@ defmodule Tightbeam.Application do
         Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 14_400_000),
       critical_lease_hard_cap_ms:
         Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000),
-      onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000)
+      onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000),
+      credentials_directory: Application.get_env(:tightbeam, :credentials_directory)
     }
   end
 

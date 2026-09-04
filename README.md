@@ -42,7 +42,7 @@ from the failure — see `mix tightbeam.doctor` and the notes below.
 
 Needed by **both** paths:
 
-- **A registered harness CLI** — `claude` and/or `codex` — installed and on
+- **A registered harness CLI** — `claude`, `codex`, and/or `pi` — installed and on
   PATH *before* you start. Boot refuses by name when it cannot find a usable
   registered harness. `mix tightbeam.doctor` reports each as
   `harness_binary:<harness>`.
@@ -174,13 +174,13 @@ confirm before and after.
   `--security-opt seccomp=unconfined` or an equivalent. A host that cannot
   provide the namespace at all cannot run Codex agents.
 
-If a host cannot be fixed, it can still run `claude` harness sessions, which do
-not use bubblewrap.
+If a host cannot be fixed, it can still run `claude` or `pi` harness sessions,
+which do not use bubblewrap.
 
 ## Install
 
 Install at least one harness first. These are the vendors' install commands;
-install both if you want both harnesses:
+install every harness you intend to use:
 
 ```sh
 npm install -g @anthropic-ai/claude-code
@@ -192,6 +192,13 @@ and/or:
 ```sh
 npm install -g @openai/codex
 codex --version
+```
+
+and/or:
+
+```sh
+npm install -g @earendil-works/pi-coding-agent
+pi --version
 ```
 
 ### From a release package
@@ -360,8 +367,29 @@ vendor's own `login` does not onboard Tightbeam:
 <base_dir>/bin/tightbeam onboard <provider> --as-user <userId>
 ```
 
-`<provider>` is the credential provider — **`anthropic`** or **`openai`** — not
-the harness name. `<userId>` is the admin created by that first pairing. From a
+`<provider>` is the credential provider — **`anthropic`**, **`openai`**, or
+**`opencode-go`** — not the harness name. OpenCode Go is API-key-only:
+
+```sh
+printenv OPENCODE_API_KEY | <base_dir>/bin/tightbeam onboard opencode-go --api-key
+```
+
+For a daemon-owned OpenCode Go credential, configure an absolute
+`TIGHTBEAM_CREDENTIALS_DIRECTORY` on the gateway service. A human writes the
+key to its fixed `opencode-go-api-key` file with directory mode `0700` and file
+mode `0600` or `0400`. Then run:
+
+```sh
+<base_dir>/bin/tightbeam onboard opencode-go --daemon-credential --as-user <userId>
+```
+
+The key does not enter the CLI process, request, response, or event record.
+On a systemd unit, `LoadCredential=opencode-go-api-key:<abs-source>` supplies the
+standard `CREDENTIALS_DIRECTORY` instead of `TIGHTBEAM_CREDENTIALS_DIRECTORY`:
+systemd copies `<abs-source>` into `$CREDENTIALS_DIRECTORY/opencode-go-api-key`,
+the fixed name the daemon reads — see the systemd unit below.
+
+`<userId>` is the admin created by that first pairing. From a
 release install `tightbeam` is already on PATH, so the `<base_dir>/bin/` prefix
 is only needed on a source install.
 
@@ -549,6 +577,9 @@ Environment=TIGHTBEAM_BASE_DIR=/home/you/.tightbeam
 Environment=TIGHTBEAM_PORT=11373
 Environment=TIGHTBEAM_ADVERTISED_URL=ws://gibson.local:11373
 Environment=PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Daemon-owned OpenCode Go key (optional): systemd copies the source file into
+# $CREDENTIALS_DIRECTORY/opencode-go-api-key, the fixed name the gateway reads.
+# LoadCredential=opencode-go-api-key:/home/you/secrets/opencode-go-api-key
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s

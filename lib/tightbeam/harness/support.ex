@@ -53,6 +53,12 @@ defmodule Tightbeam.Harness.Support do
   def catalog_probe_argv(dest, script),
     do: ["ssh" | @ssh_opts] ++ [dest, "sh", "-c", shell_quote(script)]
 
+  @doc false
+  def catalog_probe_argv(nil, script, %{sh: sh}), do: [sh, "-c", script]
+
+  def catalog_probe_argv(dest, script, %{ssh: ssh, sh: sh}),
+    do: [ssh | @ssh_opts] ++ [dest, sh, "-c", shell_quote(script)]
+
   @doc """
   The curl line every catalog probe ends in.
 
@@ -64,9 +70,14 @@ defmodule Tightbeam.Harness.Support do
   """
   @spec catalog_curl(String.t(), [String.t()], String.t()) :: String.t()
   def catalog_curl(url, headers, trailer \\ "") do
+    catalog_curl(url, headers, trailer, "curl")
+  end
+
+  @doc false
+  def catalog_curl(url, headers, trailer, curl) do
     header_args = Enum.map_join(headers, " ", &~s(-H "#{&1}"))
 
-    ~s(curl -sS --max-time #{@catalog_probe_timeout_s} ) <>
+    ~s(#{shell_quote(curl)} -sS --max-time #{@catalog_probe_timeout_s} ) <>
       ~s(-w "\\n%{http_code}#{trailer}" ) <> header_args <> " " <> ~s("#{url}")
   end
 
@@ -108,47 +119,85 @@ defmodule Tightbeam.Harness.Support do
   end
 
   @doc false
-  def owned_home_entries(credential_file, rails_file) do
+  def owned_home_entries(credential_file, rails_file, extra \\ []) do
     [
       ".tightbeam/manifest",
       credential_file,
       rails_file
-      | Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}")
+      | Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}") ++ extra
     ]
     |> Enum.sort()
   end
 
-  def credential_transport(target, %{command: command}) do
-    invocation =
-      if local?(target) do
-        command
-      else
-        ["ssh" | ssh_opts()] ++
-          [
-            target.host_config.ssh,
-            "sh",
-            "-lc",
-            shell_quote(Enum.map_join(command, " ", &shell_quote/1))
-          ]
+  def credential_transport(target, %{command: command} = request) do
+    with {:ok, invocation} <- credential_transport_argv(target, command) do
+      case target.sh.(invocation) do
+        {output, 0} ->
+          decode_credential_transport(request, output)
+
+        {output, exit} ->
+          {:error, {:transport_exit, exit, String.trim(output)}}
       end
+    end
+  end
 
-    case target.sh.(invocation) do
-      {output, 0} ->
-        case JSON.decode(output) do
-          {:ok, decoded} ->
-            {:ok,
-             %{
-               status: decoded["status"],
-               headers: decoded["headers"],
-               body: decoded["body"]
-             }}
+  defp credential_transport_argv(target, command) do
+    if local?(target) do
+      {:ok, command}
+    else
+      case absolute_executable(target, "ssh") do
+        {:ok, ssh} ->
+          {:ok,
+           [ssh | ssh_opts()] ++
+             [
+               target.host_config.ssh,
+               "/bin/sh",
+               "-lc",
+               shell_quote(Enum.map_join(command, " ", &shell_quote/1))
+             ]}
 
-          {:error, reason} ->
-            {:error, {:malformed_transport_response, reason}}
-        end
+        :error ->
+          {:error, {:executable_not_found, "ssh"}}
+      end
+    end
+  end
 
-      {output, exit} ->
-        {:error, {:transport_exit, exit, String.trim(output)}}
+  defp absolute_executable(container, name) do
+    find =
+      Map.get(container, :find_executable) ||
+        get_in(container, [:options, :find_executable]) ||
+        (&System.find_executable/1)
+
+    case find.(name) do
+      path when is_binary(path) ->
+        if Path.type(path) == :absolute, do: {:ok, path}, else: :error
+
+      _ ->
+        :error
+    end
+  end
+
+  defp decode_credential_transport(%{response: :catalog}, output) do
+    {body, trailer} = split_trailing_line(output)
+
+    case Integer.parse(String.trim(trailer)) do
+      {status, ""} -> {:ok, %{status: status, headers: %{}, body: body}}
+      _ -> {:error, {:malformed_transport_response, :missing_http_status}}
+    end
+  end
+
+  defp decode_credential_transport(_request, output) do
+    case JSON.decode(output) do
+      {:ok, decoded} ->
+        {:ok,
+         %{
+           status: decoded["status"],
+           headers: decoded["headers"],
+           body: decoded["body"]
+         }}
+
+      {:error, reason} ->
+        {:error, {:malformed_transport_response, reason}}
     end
   end
 
@@ -348,6 +397,9 @@ defmodule Tightbeam.Harness.Support do
           env: [{profile.home_env, home}, {"COMMON", "1"} | extra]
         ]
       else
+        ssh = if profile.wire_name == "pi", do: System.find_executable("ssh"), else: "ssh"
+        env = if profile.wire_name == "pi", do: "/usr/bin/env", else: "env"
+
         remote_env =
           profile.remote_prefix.(base, home, kind) ++
             ["REMOTE=1"] ++
@@ -358,8 +410,8 @@ defmodule Tightbeam.Harness.Support do
 
         [
           cmd:
-            ["ssh" | ssh_opts()] ++
-              ["vector@remote", "exec", "env" | remote_env] ++ [adapter],
+            [ssh | ssh_opts()] ++
+              ["vector@remote", "exec", env | remote_env] ++ [adapter],
           env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
         ]
       end
@@ -368,7 +420,12 @@ defmodule Tightbeam.Harness.Support do
       if railed? and profile.railed_probe do
         Keyword.merge(plan,
           probe_cwd: Path.join(base, "work/gate-probe"),
-          probe_model: Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
+          probe_model:
+            Map.get(
+              profile,
+              :probe_model,
+              Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
+            )
         )
       else
         plan
@@ -949,7 +1006,16 @@ defmodule Tightbeam.Harness.Support do
 
   defp install_fake_adapter!(adapter, profile) do
     node_modules = adapter |> Path.dirname() |> Path.dirname()
-    package_dir = Path.join([node_modules, "@agentclientprotocol", profile.adapter_package])
+
+    package_dir =
+      case Map.get(profile, :adapter_scope, :agentclientprotocol) do
+        :unscoped ->
+          Path.join(node_modules, profile.adapter_package)
+
+        :agentclientprotocol ->
+          Path.join([node_modules, "@agentclientprotocol", profile.adapter_package])
+      end
+
     bundle = Path.join([package_dir, "dist", profile.adapter_bundle])
     File.mkdir_p!(Path.dirname(adapter))
     File.mkdir_p!(Path.dirname(bundle))
