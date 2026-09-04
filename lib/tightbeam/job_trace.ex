@@ -347,7 +347,8 @@ defmodule Tightbeam.JobTrace do
                c.replacementWakeId, c.dispositionKind, c.dispositionId,
                c.primaryWorkKind, c.primaryWorkId, c.workImpactKind,
                c.livenessTriggerKind, c.livenessTriggerId, c.actionNeeded,
-               (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0)
+               (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0),
+               (SELECT o.role FROM effort_checkin_wake_ownership AS o WHERE o.wakeId = w.wakeId)
         FROM (
           SELECT w.*, w.rowid AS rid,
                  CASE WHEN w.firedBy = 'condition' THEN (
@@ -404,7 +405,8 @@ defmodule Tightbeam.JobTrace do
                    c.replacementWakeId, c.dispositionKind, c.dispositionId,
                    c.primaryWorkKind, c.primaryWorkId, c.workImpactKind,
                    c.livenessTriggerKind, c.livenessTriggerId, c.actionNeeded,
-                   (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0)
+                   (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0),
+                   (SELECT o.role FROM effort_checkin_wake_ownership AS o WHERE o.wakeId = w.wakeId)
             FROM wakes AS w
             JOIN links ON links.wakeId = w.wakeId
             LEFT JOIN wake_cancellations AS c ON c.wakeId=w.wakeId
@@ -445,7 +447,8 @@ defmodule Tightbeam.JobTrace do
                c.replacementWakeId, c.dispositionKind, c.dispositionId,
                c.primaryWorkKind, c.primaryWorkId, c.workImpactKind,
                c.livenessTriggerKind, c.livenessTriggerId, c.actionNeeded,
-               (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0)
+               (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0),
+               (SELECT o.role FROM effort_checkin_wake_ownership AS o WHERE o.wakeId = w.wakeId)
         FROM completion_escalation_wakes AS cew
         JOIN completion_escalations AS ce ON ce.id=cew.completionId
         JOIN wakes AS w ON w.wakeId=cew.wakeId
@@ -491,14 +494,16 @@ defmodule Tightbeam.JobTrace do
                         liveness_trigger_kind,
                         liveness_trigger_id,
                         action_needed,
-                        activated_at
+                        activated_at,
+                        effort_role
                       ] ->
       scheduled = %{
         at: created,
         type: "wake_scheduled",
         id: id,
         assignmentId: assignment_id,
-        dueAt: due
+        dueAt: due,
+        effortRole: effort_role
       }
 
       fired_entry =
@@ -510,7 +515,8 @@ defmodule Tightbeam.JobTrace do
               id: id,
               assignmentId: assignment_id,
               firedBy: fired_by,
-              matchedFactAt: matched_fact_at
+              matchedFactAt: matched_fact_at,
+              effortRole: effort_role
             }
           ]
         else
@@ -550,7 +556,8 @@ defmodule Tightbeam.JobTrace do
               type: "wake_canceled",
               id: id,
               assignmentId: assignment_id,
-              reason: nil
+              reason: nil,
+              effortRole: effort_role
             })
           ]
         else
@@ -702,21 +709,36 @@ defmodule Tightbeam.JobTrace do
       DB.query(
         db,
         """
-        SELECT assignmentId, generation, state, evidence, armedAt
+        SELECT assignmentId, generation, state, evidence, armedAt,
+               retiredAt, retiredOutcome, retiredCause, retiredPrincipal
         FROM effort_checkin_generations
         WHERE assignmentId IN (#{clause})
         """,
         params
       )
 
-    Enum.map(rows, fn [assignment_id, generation, state, evidence, at] ->
+    Enum.map(rows, fn [
+                        assignment_id,
+                        generation,
+                        state,
+                        evidence,
+                        at,
+                        retired_at,
+                        retired_outcome,
+                        retired_cause,
+                        retired_principal
+                      ] ->
       %{
         at: at,
         type: "effort_generation",
         id: "gen:#{assignment_id}:#{generation}",
         assignmentId: assignment_id,
         state: state,
-        evidence: decode(evidence)
+        evidence: decode(evidence),
+        retiredAt: retired_at,
+        retiredOutcome: retired_outcome,
+        retiredCause: retired_cause,
+        retiredPrincipal: retired_principal
       }
     end)
   end

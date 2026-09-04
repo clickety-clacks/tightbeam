@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v16"
+  @shape "coordination-fabric-v1-phase1-v19"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -532,19 +532,136 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
-  test "the exact v14 predecessor is refused before v15 DDL", %{db: db} do
+  test "the exact v14 predecessor is refused before v19 DDL", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v14'")
     before = table_columns(db, "assignments")
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v14"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v16"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v19"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 
     assert {:ok, [["coordination-fabric-v1-phase1-v14"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "EGR-A7: the v18 migration backfills ownership only for structurally referenced wakes and stamps v19",
+       %{db: db} do
+    setup_v18_effort_db(db)
+
+    assert :ok = Schema.upgrade_effort_generator_retirement_v1(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v19"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    # Backfill is exactly the generation's probe wake and the effort decision
+    # request's deadline wake — the only two structurally-owned effort wakes v18
+    # ever recorded — keyed by foreign-key equality alone.
+    assert {:ok,
+            [
+              ["w_deadline", "asg_effort", 1, "decision_deadline"],
+              ["w_probe", "asg_effort", 1, "probe"]
+            ]} =
+             DB.query(
+               db,
+               "SELECT wakeId,assignmentId,generation,role FROM effort_checkin_wake_ownership ORDER BY role,wakeId"
+             )
+
+    # The decoy's effort-looking prompt text was never consulted: it sits on an
+    # assignment with no effort history, so it owns nothing and never blocks.
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM effort_checkin_wake_ownership WHERE wakeId='w_decoy'"
+             )
+
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+  end
+
+  test "EGR-A7: the v18 migration refuses an ambiguous legacy effort wake by id and changes nothing",
+       %{db: db} do
+    holder = setup_v18_effort_db(db)
+
+    # A pending process:tightbeam prompt on the SAME assignment that carries
+    # effort history, with no generation or deadline referencing it. The
+    # substrate cannot prove it is not an effort wake, so it must refuse by name.
+    :ok =
+      DB.execute(db, """
+      INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,assignmentId)
+      VALUES ('w_ambiguous','#{holder}','process:tightbeam','prod the holder','prompt',0,'pending',1,'asg_effort');
+      """)
+
+    error =
+      assert_raise Schema.ShapeError, fn ->
+        Schema.upgrade_effort_generator_retirement_v1(db)
+      end
+
+    assert error.message =~ "incompatible_effort_wake_provenance: w_ambiguous"
+
+    # The whole migration rolled back: no ownership relation, the predecessor
+    # stamp stands, the named wake is untouched, and the business rows are
+    # exactly as they were.
+    refute table?(db, "effort_checkin_wake_ownership")
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v18"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["pending"]]} =
+             DB.query(db, "SELECT state FROM wakes WHERE wakeId='w_ambiguous'")
+
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM effort_checkin_generations")
+
+    assert {:ok, [["open"]]} =
+             DB.query(db, "SELECT status FROM decision_requests WHERE id='dr_effort'")
+  end
+
+  test "EGR-A7: while the ambiguous wake stays pending every retry refuses identically, then settling admits the migration",
+       %{db: db} do
+    holder = setup_v18_effort_db(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,assignmentId)
+      VALUES ('w_ambiguous','#{holder}','process:tightbeam','prod the holder','prompt',0,'pending',1,'asg_effort');
+      """)
+
+    # The refusal is idempotent: while the wake stays pending, every retry names
+    # the same id and leaves the stamp, the ownership relation, and the wake
+    # exactly as before.
+    for _ <- 1..2 do
+      error =
+        assert_raise Schema.ShapeError, fn ->
+          Schema.upgrade_effort_generator_retirement_v1(db)
+        end
+
+      assert error.message =~ "incompatible_effort_wake_provenance: w_ambiguous"
+
+      assert {:ok, [["coordination-fabric-v1-phase1-v18"]]} =
+               DB.query(db, "SELECT shape FROM schema_stamp")
+
+      refute table?(db, "effort_checkin_wake_ownership")
+
+      assert {:ok, [["pending"]]} =
+               DB.query(db, "SELECT state FROM wakes WHERE wakeId='w_ambiguous'")
+    end
+
+    # Predecessor behavior settles the named wake to fired. The migration then
+    # proceeds and stamps v19; a settled wake is never backfilled.
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET state='fired', firedAt=3 WHERE wakeId='w_ambiguous'")
+
+    assert :ok = Schema.upgrade_effort_generator_retirement_v1(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v19"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM effort_checkin_wake_ownership WHERE wakeId='w_ambiguous'"
+             )
   end
 
   test "the historical migration helpers preserve their exact v4 to v6 contract", %{db: db} do
@@ -1389,6 +1506,119 @@ defmodule Tightbeam.SchemaShapeTest do
         DB.Txn.q(
           txn,
           "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v8', stampedAt=1"
+        )
+
+        :ok
+      end)
+
+    :ok
+  end
+
+  # Build a genuine v18 effort database: the schema stamped v18 with a live
+  # effort generation carrying its probe wake, and an effort decision request
+  # carrying its deadline wake — the only two structurally-owned effort wakes
+  # v18 ever recorded, since typed ownership did not exist yet. A second
+  # assignment with no effort history carries a decoy prompt whose TEXT reads
+  # like an effort prod but which no generation or deadline references.
+  defp setup_v18_effort_db(db) do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "legacy-device",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    holder = Org.get(db, Org.personal_session_key("flynn")).session_key
+    downgrade_to_v18(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments (id,subject,holderKey,openedBySession,openedAt)
+      VALUES ('asg_effort','effort holder','#{holder}','#{holder}',1),
+             ('asg_decoy','decoy holder','#{holder}','#{holder}',1);
+      INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,assignmentId)
+      VALUES
+        ('w_probe','#{holder}','process:tightbeam','probe','prompt',0,'pending',1,'asg_effort'),
+        ('w_deadline','#{holder}','process:tightbeam','deadline','prompt',0,'pending',1,'asg_effort'),
+        ('w_decoy','#{holder}','process:tightbeam','Zero effect prods the agent','prompt',0,'pending',1,'asg_decoy');
+      INSERT INTO effort_checkin_generations
+        (assignmentId,generation,state,baseHorizonMs,multiplier,armedAt,terminalSeqWatermark,holderKey,host,root,baseline,wakeId)
+      VALUES
+        ('asg_effort',1,'armed',14400000,1,1,0,'#{holder}','testhost','','{}','w_probe');
+      INSERT INTO decision_requests
+        (id,kind,raiserId,ownerUserId,assignmentId,expecterUserId,lineageRung,effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,context,status)
+      VALUES
+        ('dr_effort','effort','process:tightbeam','flynn','asg_effort','flynn',0,1,'w_deadline',1,2,'effort check','{}','open');
+      """)
+
+    holder
+  end
+
+  # Revert the effort tables to their v18 predecessor shape: drop the typed
+  # ownership relation, rebuild effort_checkin_generations to its 17 base
+  # columns (no retirement columns, no all-or-none CHECK), recreate the wake
+  # index, and re-stamp v18. SQLite cannot drop a column named in a table
+  # CHECK, so the generation table is renamed → recreated → copied → dropped.
+  defp downgrade_to_v18(db) do
+    {:ok, :ok} =
+      DB.foreign_key_rebuild(db, fn txn ->
+        :ok = DB.Txn.exec(txn, "DROP TABLE effort_checkin_wake_ownership")
+
+        :ok =
+          DB.Txn.exec(
+            txn,
+            "ALTER TABLE effort_checkin_generations RENAME TO effort_checkin_generations_v18_old"
+          )
+
+        :ok =
+          DB.Txn.exec(txn, """
+          CREATE TABLE effort_checkin_generations (
+            assignmentId TEXT NOT NULL REFERENCES assignments(id),
+            generation INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('armed','probed','canceled')),
+            baseHorizonMs INTEGER NOT NULL,
+            multiplier INTEGER NOT NULL CHECK (multiplier IN (1,2,4)),
+            armedAt INTEGER NOT NULL,
+            terminalSeqWatermark INTEGER NOT NULL,
+            holderKey TEXT NOT NULL,
+            host TEXT NOT NULL,
+            root TEXT NOT NULL,
+            baseline TEXT NOT NULL,
+            wakeId TEXT NOT NULL,
+            evidence TEXT,
+            agentProdded INTEGER NOT NULL DEFAULT 0,
+            artifactWatermark INTEGER NOT NULL DEFAULT 0,
+            attestWatermark INTEGER NOT NULL DEFAULT 0,
+            workItemWatermark INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (assignmentId, generation)
+          )
+          """)
+
+        columns =
+          "assignmentId,generation,state,baseHorizonMs,multiplier,armedAt," <>
+            "terminalSeqWatermark,holderKey,host,root,baseline,wakeId,evidence," <>
+            "agentProdded,artifactWatermark,attestWatermark,workItemWatermark"
+
+        :ok =
+          DB.Txn.exec(
+            txn,
+            "INSERT INTO effort_checkin_generations (#{columns}) SELECT #{columns} FROM effort_checkin_generations_v18_old"
+          )
+
+        :ok = DB.Txn.exec(txn, "DROP TABLE effort_checkin_generations_v18_old")
+
+        :ok =
+          DB.Txn.exec(txn, """
+          CREATE INDEX IF NOT EXISTS effort_checkin_wake
+            ON effort_checkin_generations (wakeId, state)
+          """)
+
+        DB.Txn.q(
+          txn,
+          "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v18', stampedAt=1"
         )
 
         :ok

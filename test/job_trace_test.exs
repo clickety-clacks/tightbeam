@@ -358,16 +358,17 @@ defmodule Tightbeam.JobTraceTest do
           ~w(assignmentId at commitRefs deliverableClaim id kind type verdict)a
 
         "wake_scheduled" ->
-          ~w(assignmentId at dueAt id type)a
+          ~w(assignmentId at dueAt id type effortRole)a
 
         "wake_fired" ->
-          ~w(assignmentId at firedBy id matchedFactAt type)a
+          ~w(assignmentId at firedBy id matchedFactAt type effortRole)a
 
         "decision_request" ->
           ~w(assignmentId at id ruling state type)a
 
         "effort_generation" ->
-          ~w(assignmentId at evidence id state type)a
+          ~w(assignmentId at evidence id state type
+             retiredAt retiredOutcome retiredCause retiredPrincipal)a
 
         # job-forensics-v2 §3 — pinned EXACTLY: every key always present,
         # nullable where the spec marks it, so a consumer never has to
@@ -384,7 +385,7 @@ defmodule Tightbeam.JobTraceTest do
           ~w(at completionId detail id kind type)a
 
         "wake_canceled" ->
-          ~w(assignmentId at id reason seqTiebreak type)a
+          ~w(assignmentId at id reason seqTiebreak type effortRole)a
       end
 
     assert_keys(entry, keys)

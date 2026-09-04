@@ -2086,15 +2086,26 @@ defmodule Tightbeam.Escalation do
         request.question <>
         "\nActions: #{Enum.join(request.options || [], ", ")}"
 
-    Wakes.schedule_in_txn(txn, %{
-      session_key:
-        request.expecter_session_key || Org.personal_session_key(request.expecter_user_id),
-      origin: "process:tightbeam",
-      prompt: prompt,
-      due_at: now(),
-      assignment_id: request.assignment_id,
-      target_gate: 0
-    })
+    wake =
+      Wakes.schedule_in_txn(txn, %{
+        session_key:
+          request.expecter_session_key || Org.personal_session_key(request.expecter_user_id),
+        origin: "process:tightbeam",
+        prompt: prompt,
+        due_at: now(),
+        assignment_id: request.assignment_id,
+        target_gate: 0
+      })
+
+    Tightbeam.EffortCheckin.own_effort_wake_in_txn(
+      txn,
+      wake.wake_id,
+      request.assignment_id,
+      request.effort_generation,
+      "decision_notification"
+    )
+
+    wake
   end
 
   @doc """

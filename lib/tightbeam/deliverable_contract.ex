@@ -9,7 +9,7 @@ defmodule Tightbeam.DeliverableContract do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  @shape "coordination-fabric-v1-phase1-v16"
+  @shape "coordination-fabric-v1-phase1-v19"
 
   defmodule Inconsistent do
     @moduledoc false
