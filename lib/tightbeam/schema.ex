@@ -1815,13 +1815,7 @@ defmodule Tightbeam.Schema do
              FROM effort_checkin_generations
              """)
 
-           :ok =
-             Txn.exec(txn, """
-             INSERT INTO effort_checkin_wake_ownership (wakeId, assignmentId, generation, role)
-             SELECT deadlineWakeId, assignmentId, effortGeneration, 'decision_deadline'
-             FROM decision_requests
-             WHERE kind = 'effort' AND deadlineWakeId IS NOT NULL
-             """)
+           :ok = Tightbeam.Escalation.migrate_effort_deadline_ownership_v1_in_txn(txn)
 
            # EGR-9 preflight. Before the new stamp commits, refuse if any
            # ambiguous legacy prompt wake exists: a pending prompt wake from

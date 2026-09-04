@@ -398,6 +398,26 @@ defmodule Tightbeam.Escalation do
     :ok
   end
 
+  @doc false
+  @spec migrate_effort_deadline_ownership_v1_in_txn(Txn.t()) :: :ok
+  # EGR-9 backfill for the effort_checkin_generator_retirement (v18->v19)
+  # migration: one ownership row per effort decision request's deadline wake,
+  # by exact foreign-key equality on the referenced wake id. Kept here beside
+  # the other decision_requests readers because §10 admits the literal only in
+  # this module; the probe half of the backfill reads effort_checkin_generations
+  # alone and stays inline in schema.ex. Nothing is inferred from prompt text.
+  def migrate_effort_deadline_ownership_v1_in_txn(txn) do
+    :ok =
+      Txn.exec(txn, """
+      INSERT INTO effort_checkin_wake_ownership (wakeId, assignmentId, generation, role)
+      SELECT deadlineWakeId, assignmentId, effortGeneration, 'decision_deadline'
+      FROM decision_requests
+      WHERE kind = 'effort' AND deadlineWakeId IS NOT NULL
+      """)
+
+    :ok
+  end
+
   defp preflight_terminal_operator_rows_in_txn(txn, legacy_fact_max_id) do
     txn
     |> Txn.q("SELECT #{@legacy_request_columns} FROM decision_requests WHERE kind = 'operator'")
@@ -1833,6 +1853,7 @@ defmodule Tightbeam.Escalation do
     effort_id_by_generation_in_txn: "effort",
     effort_supersede_open_in_txn: "effort",
     effort_update_generation_in_txn: "effort",
+    migrate_effort_deadline_ownership_v1_in_txn: "effort",
     insert_operator_request_in_txn: "operator",
     operator_open_in_txn: "operator",
     preflight_terminal_operator_rows_in_txn: "operator",

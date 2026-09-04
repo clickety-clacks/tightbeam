@@ -1008,6 +1008,19 @@ defmodule Tightbeam.JobForensicsTest do
               'holder', 1, 1, '#{wake.wake_id}', 1, 1, 'q', '[]', '{}', 'open')
       """)
 
+    # The generator this deadline belongs to. deadline/3 advances the expecter
+    # and schedules a replacement decision_deadline wake, whose ownership row
+    # carries a composite FK to this (assignmentId, generation) — so the row
+    # must exist for the advance to commit, exactly as it does in production
+    # (the probe arms the generator before any deadline fires).
+    :ok =
+      DB.execute(db, """
+      INSERT INTO effort_checkin_generations
+        (assignmentId, generation, state, baseHorizonMs, multiplier, armedAt,
+         terminalSeqWatermark, holderKey, host, root, baseline, wakeId)
+      VALUES ('asg_effort', 1, 'armed', 1000, 1, 1, 0, 'holder', 'h', 'r', '{}', 'w_probe')
+      """)
+
     assert :ok = EffortCheckin.deadline(db, %{}, wake)
 
     assert {:ok, [[2]]} =
