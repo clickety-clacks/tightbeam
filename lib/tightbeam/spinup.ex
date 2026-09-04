@@ -124,21 +124,16 @@ defmodule Tightbeam.Spinup do
   # `name@version`, not a bare name: npm resolves a bare name to LATEST, so every
   # provision pulled whatever was published that day while @adapter_version documented a
   # pin nothing enforced. Measured before that change, BOTH adapters had drifted past
-  # their pins. The patch anchors and the local patcher's exact-version assertion are
-  # written against the pinned release, so the install has to land that release — an
-  # unpinned tree makes the patcher raise. Versions stay in the harness modules; this
-  # seam only asks each of them for its own.
+  # their pins. Versions stay in the harness modules; this seam asks each of them for
+  # its own and records the exact set in adapters/package.json.
   defp install_command(target, install_dir, locality) do
     packages =
       Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
 
-    # `--no-save`, because npm records a CARET RANGE for a version it installed
-    # exactly: `npm install pkg@1.1.4` writes `"^1.1.4"` into package.json, so the
-    # pin held only until the next bare `npm install` in that directory floated it
-    # forward. The directory is ours and nothing else installs there, so there is
-    # no manifest worth writing — the pin lives in the harness module, and the only
-    # record that matters is what is on disk.
-    script = "npm install --prefix #{shell_quote(install_dir)} --no-save " <> packages
+    # `--save-exact` prevents npm from translating an exact requested version into
+    # a caret range. The runtime manifest is the durable packaging record and a
+    # later bare `npm install` therefore preserves the elected adapter releases.
+    script = "npm install --prefix #{shell_quote(install_dir)} --save-exact " <> packages
 
     case locality do
       :local -> ["sh", "-c", script]
