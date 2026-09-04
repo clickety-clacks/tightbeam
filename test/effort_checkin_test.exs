@@ -2876,7 +2876,112 @@ defmodule Tightbeam.EffortCheckinTest do
     assert effort_trace.() == trace0
   end
 
-  test "EGR-A11: holder retirement revokes each assignment (generator retired, owned wake canceled revoked) then the drain target-retires only the unowned wake; owned wakes aren't re-canceled, the running turn is untouched, and a fault rolls it all back",
+  # EGR-A10 verifies the shared-transaction composition assumption and EGR-3.
+  # The assignment-terminal seam is shared by TWO amendments: mine (retire the
+  # generator, cancel its pending owned wakes) and the sibling queued-turn
+  # amendment wi_154bf46b (dispose the matching queued turn). That sibling is
+  # ABSENT from this checkout and owns a separate acceptance lane per the spec's
+  # Architecture section, so A10 proves MY half in isolation. My mutation never
+  # reads or writes the turns table, so the close leaves every turn — the queued
+  # turn a fired owned prompt would carry, an already-running turn, and an
+  # unrelated queued turn — byte-for-byte unchanged. A forced fault in either of
+  # my two mutations (generator retirement, owned-wake cancellation) rolls the
+  # whole assignment close back.
+  test "EGR-A10: the terminal seam cancels only the pending owned wake and retires the generator, changes no turn, and a fault in either mutation rolls the close back",
+       ctx do
+    complete = fn _ctx, id ->
+      assignment(ctx, "attest", {:session, "holder"}, nil, %{
+        assignment_id: id,
+        kind: "completion"
+      })
+    end
+
+    turns_snapshot = fn ->
+      rows(
+        ctx.db,
+        "SELECT seq,sessionKey,messageId,wakeId,origin,status,owner,startedAt,endedAt FROM turns ORDER BY seq",
+        []
+      )
+    end
+
+    # --- Happy path: one pending owned holder-checkin prompt wake, plus the
+    # three turns the sibling amendment would act on: a queued turn (the one a
+    # fired owned prompt carries), an already-running turn, and an unrelated
+    # queued turn on another session.
+    a = dispatch(ctx, {:session, "parent"}, "holder", "A10 composition")
+    fire_probe(ctx, a.id)
+    hc = owned_prompt_wake(ctx.db, a.id, "holder_checkin")
+
+    _queued = queued_turn(ctx.db, "holder")
+    _running = running_turn(ctx.db, "holder")
+    _unrelated = queued_turn(ctx.db, "parent")
+
+    assert [["pending", nil]] =
+             rows(ctx.db, "SELECT state,canceledAt FROM wakes WHERE wakeId=?1", [hc.wake_id])
+
+    turns_before = turns_snapshot.()
+
+    {selected, pending} =
+      assert_terminal_retirement(ctx, a.id, complete, "completed", "session:holder")
+
+    # My half: the pending owned wake is canceled by the assignment-terminal
+    # disposition and the EGR-3 selected set is retired.
+    assert hc.wake_id in Enum.map(pending, & &1.wake_id)
+
+    assert [["assignment_transition", _id, "obligation_disposed", "canceled"]] =
+             wake_cancellations(ctx.db, hc.wake_id)
+
+    assert retired_count(ctx.db, a.id) == length(selected)
+
+    # The sibling amendment's territory: not one turn changed.
+    assert turns_snapshot.() == turns_before
+
+    # --- Rollback: a fault on EITHER of my two mutations rolls the whole close
+    # back — the assignment stays open, no generation is retired, the owned wake
+    # stays pending and uncanceled, and no turn changes.
+    fault_rolls_back = fn label, trigger_fn ->
+      d = dispatch(ctx, {:session, "parent"}, "holder", label)
+      fire_probe(ctx, d.id)
+      d_hc = owned_prompt_wake(ctx.db, d.id, "holder_checkin")
+      snap = turns_snapshot.()
+      {trigger_sql, trigger_name} = trigger_fn.(d_hc)
+
+      :ok = DB.execute(ctx.db, trigger_sql)
+
+      _ =
+        try do
+          complete.(ctx, d.id)
+        rescue
+          e -> {:rescued, e}
+        catch
+          kind, value -> {:caught, kind, value}
+        end
+
+      :ok = DB.execute(ctx.db, "DROP TRIGGER #{trigger_name}")
+
+      assert rows(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [d.id]) ==
+               [["open", nil]]
+
+      assert retired_count(ctx.db, d.id) == 0
+      assert %{state: "pending"} = Wakes.get(ctx.db, d_hc.wake_id)
+      assert wake_cancellations(ctx.db, d_hc.wake_id) == []
+      assert turns_snapshot.() == snap
+    end
+
+    fault_rolls_back.("A10 generator fault", fn _d_hc ->
+      {"CREATE TEMP TRIGGER egr_a10_gen_fault BEFORE UPDATE OF retiredCause " <>
+         "ON effort_checkin_generations BEGIN SELECT RAISE(ABORT,'egr-a10 gen fault'); END",
+       "egr_a10_gen_fault"}
+    end)
+
+    fault_rolls_back.("A10 owned-wake fault", fn d_hc ->
+      {"CREATE TEMP TRIGGER egr_a10_wake_fault BEFORE UPDATE OF state ON wakes " <>
+         "WHEN NEW.wakeId='#{d_hc.wake_id}' AND NEW.state='canceled' " <>
+         "BEGIN SELECT RAISE(ABORT,'egr-a10 wake fault'); END", "egr_a10_wake_fault"}
+    end)
+  end
+
+  test "EGR-A11: holder retirement revokes assignments (gen retired, owned wake canceled), drain target-retires only the unowned wake, owned wakes aren't re-canceled, running turn survives, fault rolls back",
        ctx do
     # EGR-11 verification. Holder retirement is one transaction, two stages.
     # Stage 1 (interrupt_for_retire) revokes each open assignment, retiring its
