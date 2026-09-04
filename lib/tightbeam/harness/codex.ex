@@ -7,7 +7,7 @@ defmodule Tightbeam.Harness.Codex do
   alias Tightbeam.Harness.Support
   alias Tightbeam.Model
 
-  @adapter_version "1.1.4"
+  @adapter_version "1.8.0"
   @adapter_package "codex-acp"
   # Two routes, one per credential kind, because they are two different accounts'
   # worth of entitlement expressed two different ways.
@@ -64,30 +64,28 @@ defmodule Tightbeam.Harness.Codex do
   @probe_model %Tightbeam.Model{family: "gpt-5.6-sol", effort: "medium", context: nil}
 
   @adapter_bundle "index.js"
+
+  # Mike ruling dr_4409f63c authorizes exactly two temporary compatibility
+  # behaviors on codex-acp 1.8.0. The first three replacements are one logical
+  # identity patch across new, resume, and load. The fourth forwards
+  # account/updated. Native subagent lifecycle support is upstream in 1.8.0 and
+  # must not return to this list.
   @adapter_replacements [
     {
       "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd\n",
       "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd,\n      developerInstructions: request._meta?.developerInstructions\n"
     },
     {
-      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
-      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions\n"
+      "  async resumeSession(request, onSubscribed) {\n    const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);\n    await this.refreshSkills(request.cwd, additionalDirectories);\n    const response = await this.codexClient.threadResume({\n      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),\n      cwd: request.cwd,\n      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
+      "  async resumeSession(request, onSubscribed) {\n    const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);\n    await this.refreshSkills(request.cwd, additionalDirectories);\n    const response = await this.codexClient.threadResume({\n      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),\n      cwd: request.cwd,\n      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions\n"
+    },
+    {
+      "  async loadSession(request, onSubscribed) {\n    const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);\n    await this.refreshSkills(request.cwd, additionalDirectories);\n    const response = await this.codexClient.threadResume({\n      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),\n      cwd: request.cwd,\n      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
+      "  async loadSession(request, onSubscribed) {\n    const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);\n    await this.refreshSkills(request.cwd, additionalDirectories);\n    const response = await this.codexClient.threadResume({\n      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),\n      cwd: request.cwd,\n      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions\n"
     },
     {
       "      case \"account/updated\":\n      case \"fs/changed\":",
       "      case \"account/updated\":\n        return this.createCodexSessionInfoUpdate({ accountUpdated: notification.params });\n      case \"fs/changed\":"
-    },
-    {
-      "  activeSubAgentActivities = /* @__PURE__ */ new Set();\n",
-      "  activeSubAgentActivities = /* @__PURE__ */ new Set();\n  subAgentActivityCallIds = /* @__PURE__ */ new Map();\n"
-    },
-    {
-      "      case \"thread/status/changed\":\n        return this.createCodexSessionInfoUpdate({\n          threadStatus: notification.params.status\n        });",
-      "      case \"thread/status/changed\": {\n        const childToolCallId = this.subAgentActivityCallIds.get(notification.params.threadId);\n        if (childToolCallId && [\"idle\", \"systemError\", \"notLoaded\"].includes(notification.params.status.type)) {\n          return {\n            sessionUpdate: \"tool_call_update\",\n            toolCallId: childToolCallId,\n            status: notification.params.status.type === \"idle\" ? \"completed\" : \"failed\",\n            _meta: { codex: { subagentTerminated: { agentThreadId: notification.params.threadId, threadStatus: notification.params.status } } }\n          };\n        }\n        return this.createCodexSessionInfoUpdate({\n          threadStatus: notification.params.status\n        });\n      }"
-    },
-    {
-      "      case \"subAgentActivity\":\n        this.activeSubAgentActivities.add(event.item.id);\n        return createSubAgentActivityUpdate(event.item, \"in_progress\", \"tool_call\");",
-      "      case \"subAgentActivity\":\n        this.activeSubAgentActivities.add(event.item.id);\n        this.subAgentActivityCallIds.set(event.item.agentThreadId, event.item.id);\n        return createSubAgentActivityUpdate(event.item, \"in_progress\", \"tool_call\");"
     }
   ]
 
@@ -411,28 +409,19 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def classify_subagent_event(%{
-        "toolCallId" => source,
-        "_meta" => %{"codex" => %{"subagentTerminated" => %{"agentThreadId" => subagent}}}
+        "sessionUpdate" => "subagent_spawned",
+        "subagentSessionId" => subagent
       }) do
-    {:subagent_stop, %{source_event_ref: source, subagent_ref: subagent}}
+    {:subagent_start, %{source_event_ref: subagent, subagent_ref: subagent}}
   end
 
   def classify_subagent_event(%{
-        "toolCallId" => source,
-        "_meta" => %{
-          "codex" => %{"subagent" => %{"threadId" => subagent, "activity" => "started"}}
-        }
-      }) do
-    {:subagent_start, %{source_event_ref: source, subagent_ref: subagent}}
-  end
-
-  def classify_subagent_event(%{
-        "toolCallId" => source,
-        "_meta" => %{
-          "codex" => %{"subagent" => %{"threadId" => subagent, "activity" => "interrupted"}}
-        }
-      }) do
-    {:subagent_stop, %{source_event_ref: source, subagent_ref: subagent}}
+        "sessionUpdate" => "subagent_state_update",
+        "subagentSessionId" => subagent,
+        "state" => state
+      })
+      when state in ["completed", "failed", "cancelled", "disconnected"] do
+    {:subagent_stop, %{source_event_ref: subagent, subagent_ref: subagent}}
   end
 
   def classify_subagent_event(_update), do: :skip
@@ -659,33 +648,33 @@ defmodule Tightbeam.Harness.Codex do
         %{
           case: "positive_start",
           envelope: %{
-            "toolCallId" => "codex-call",
-            "_meta" => %{
-              "codex" => %{
-                "subagent" => %{
-                  "threadId" => "codex-thread",
-                  "activity" => "started"
-                }
-              }
-            }
+            "sessionUpdate" => "subagent_spawned",
+            "subagentSessionId" => "codex-thread",
+            "name" => "Reviewer",
+            "task" => "Review the implementation",
+            "capabilities" => %{}
           },
           expected:
-            {:subagent_start, %{source_event_ref: "codex-call", subagent_ref: "codex-thread"}}
+            {:subagent_start, %{source_event_ref: "codex-thread", subagent_ref: "codex-thread"}}
         },
         %{
           case: "positive_stop",
           envelope: %{
-            "toolCallId" => "codex-call",
-            "_meta" => %{
-              "codex" => %{
-                "subagentTerminated" => %{"agentThreadId" => "codex-thread"}
-              }
-            }
+            "sessionUpdate" => "subagent_state_update",
+            "subagentSessionId" => "codex-thread",
+            "state" => "completed"
           },
           expected:
-            {:subagent_stop, %{source_event_ref: "codex-call", subagent_ref: "codex-thread"}}
+            {:subagent_stop, %{source_event_ref: "codex-thread", subagent_ref: "codex-thread"}}
         },
-        %{case: "negative", envelope: %{"toolCallId" => "codex-call"}, expected: :skip}
+        %{
+          case: "negative",
+          envelope: %{
+            "sessionUpdate" => "tool_call",
+            "toolCallId" => "codex-call"
+          },
+          expected: :skip
+        }
       ],
       catalog_expected: %{
         "valid" => {:ok, [valid_entry]},
@@ -952,8 +941,16 @@ defmodule Tightbeam.Harness.Codex do
            ["ssh" | Support.ssh_opts()] ++
              [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
          ) do
-      {_output, 0} -> {:ok, detail <> "; codex adapter patched"}
-      {output, _exit} -> {:error, %{code: "host_unready", message: String.trim(output)}}
+      {output, 0} ->
+        if String.contains?(output, "codex adapter patch skipped:") do
+          Logger.warning(String.trim(output))
+          {:ok, detail <> "; codex adapter patch skipped for unknown version"}
+        else
+          {:ok, detail <> "; codex adapter patched"}
+        end
+
+      {output, _exit} ->
+        {:error, %{code: "host_unready", message: String.trim(output)}}
     end
   end
 
@@ -983,6 +980,7 @@ defmodule Tightbeam.Harness.Codex do
       path,
       @adapter_package,
       @adapter_bundle,
+      @adapter_version,
       @adapter_replacements,
       wire_name()
     )

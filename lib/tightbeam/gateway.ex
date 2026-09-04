@@ -4371,7 +4371,7 @@ defmodule Tightbeam.Gateway do
         nil ->
           %{
             code: "subagent_not_found",
-            message: "no subagent for this session and tool call"
+            message: "no subagent for this session and adapter handle"
           }
 
         subagent_ref ->

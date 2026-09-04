@@ -1,0 +1,41 @@
+// Source-audited 2026-09-04 from @agentclientprotocol/claude-agent-acp 0.73.0 native ACP updates.
+// Right-sizing: assert only consumed fields and relied-on invariants; additive unconsumed fields must not fail.
+{
+  "adapter": "@agentclientprotocol/claude-agent-acp",
+  "version": "0.73.0",
+  "semantic": {
+    "spawn_operation_terminal": "the parent Agent tool call may settle while the native child session remains independently live",
+    "child_termination_terminal": "subagent_state_update carries the child session terminal state"
+  },
+  "live_agent_started": {
+    "sessionUpdate": "subagent_spawned",
+    "subagentSessionId": "task-child-1",
+    "name": "Reviewer",
+    "task": "Review the implementation",
+    "capabilities": {}
+  },
+  "live_task_started": {
+    "sessionUpdate": "subagent_spawned",
+    "subagentSessionId": "task-child-2",
+    "name": "Checker",
+    "task": "Check the proof",
+    "capabilities": {}
+  },
+  "spawn_operation_terminal": {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call-claude-1",
+    "status": "completed"
+  },
+  "native_termination": {
+    "sessionUpdate": "subagent_state_update",
+    "subagentSessionId": "task-child-1",
+    "state": "completed"
+  },
+  "load_replay_started": {
+    "sessionUpdate": "subagent_spawned",
+    "subagentSessionId": "task-child-replayed",
+    "name": "Replayed",
+    "task": "Delegated task for Replayed",
+    "capabilities": {}
+  }
+}

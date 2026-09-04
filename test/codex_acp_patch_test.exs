@@ -3,39 +3,58 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
 
   alias Tightbeam.Harness.{Claude, Codex}
 
-  test "codex patch carries identity, account, and child-thread settlement idempotently" do
+  test "codex 1.8 patch carries identity and account updates idempotently" do
     source =
       [
         "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd\n",
-        "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
-        "      case \"account/updated\":\n      case \"fs/changed\":",
-        "  activeSubAgentActivities = /* @__PURE__ */ new Set();\n",
-        "      case \"thread/status/changed\":\n        return this.createCodexSessionInfoUpdate({\n          threadStatus: notification.params.status\n        });",
-        "      case \"subAgentActivity\":\n        this.activeSubAgentActivities.add(event.item.id);\n        return createSubAgentActivityUpdate(event.item, \"in_progress\", \"tool_call\");"
+        "  async resumeSession(request, onSubscribed) {\n    const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);\n    await this.refreshSkills(request.cwd, additionalDirectories);\n    const response = await this.codexClient.threadResume({\n      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),\n      cwd: request.cwd,\n      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
+        "  async loadSession(request, onSubscribed) {\n    const additionalDirectories = readAdditionalDirectories(request.cwd, request.additionalDirectories, request._meta);\n    await this.refreshSkills(request.cwd, additionalDirectories);\n    const response = await this.codexClient.threadResume({\n      config: await this.createSessionConfig(request.cwd, additionalDirectories, request.mcpServers ?? []),\n      cwd: request.cwd,\n      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
+        "      case \"account/updated\":\n      case \"fs/changed\":"
       ]
       |> Enum.join("\n")
 
     patched = Codex.patch_adapter_source(source)
-    assert patched =~ "developerInstructions: request._meta?.developerInstructions"
+
+    assert length(
+             Regex.scan(
+               ~r/developerInstructions: request\._meta\?\.developerInstructions/,
+               patched
+             )
+           ) == 3
+
     assert patched =~ "accountUpdated: notification.params"
-    assert patched =~ "subAgentActivityCallIds"
-    assert patched =~ "subagentTerminated"
-    assert patched =~ ~s(["idle", "systemError", "notLoaded"])
+    refute patched =~ "subagentTerminated"
+    refute patched =~ "subAgentActivityCallIds"
     assert Codex.patch_adapter_source(patched) == patched
   end
 
-  test "claude patch emits at both liveBackgroundTasks settlement bookends idempotently" do
-    source =
-      [
-        "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
-        "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }"
-      ]
-      |> Enum.join("\n")
+  test "current adapters use the native subagent lifecycle" do
+    assert Codex.adapter_version() == "1.8.0"
+    assert Claude.adapter_version() == "0.73.0"
+    refute function_exported?(Claude, :patch_adapter_source, 1)
 
-    patched = Claude.patch_adapter_source(source)
-    assert patched =~ "const record = session.liveBackgroundTasks.get(message.task_id)"
-    assert patched =~ "subagentTerminated"
-    assert patched =~ "toolCallId: record.parentToolUseId"
-    assert Claude.patch_adapter_source(patched) == patched
+    for harness <- [Codex, Claude] do
+      assert {:subagent_start, %{source_event_ref: "child-1", subagent_ref: "child-1"}} =
+               harness.classify_subagent_event(%{
+                 "sessionUpdate" => "subagent_spawned",
+                 "subagentSessionId" => "child-1"
+               })
+
+      for state <- ["completed", "failed", "cancelled", "disconnected"] do
+        assert {:subagent_stop, %{source_event_ref: "child-1", subagent_ref: "child-1"}} =
+                 harness.classify_subagent_event(%{
+                   "sessionUpdate" => "subagent_state_update",
+                   "subagentSessionId" => "child-1",
+                   "state" => state
+                 })
+      end
+
+      assert :skip =
+               harness.classify_subagent_event(%{
+                 "sessionUpdate" => "subagent_state_update",
+                 "subagentSessionId" => "child-1",
+                 "state" => "running"
+               })
+    end
   end
 end

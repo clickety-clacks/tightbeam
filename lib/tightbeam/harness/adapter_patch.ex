@@ -1,31 +1,40 @@
 defmodule Tightbeam.Harness.AdapterPatch do
   @moduledoc false
 
+  require Logger
+
   @doc false
   def ensure!(binary_path, package_name, bundle_name, version, replacements, label) do
     {package, bundle} = installed_paths(binary_path, package_name, bundle_name)
     %{"version" => installed_version} = package |> File.read!() |> JSON.decode!()
-    ^version = installed_version
-    source = File.read!(bundle)
-    patched = patch(source, replacements, label, version)
 
-    if patched != source do
-      # Preserve the bundle's own mode: npm marks bin-target bundles executable,
-      # and node_modules/.bin symlinks exec them directly — a hardcoded 644 here
-      # stripped the x-bit and broke every codex adapter spawn (Permission denied).
-      %File.Stat{mode: mode} = File.stat!(bundle)
-      temporary = bundle <> ".tightbeam-patch"
-      File.write!(temporary, patched)
-      File.chmod!(temporary, mode)
-      File.rename!(temporary, bundle)
+    if installed_version == version do
+      source = File.read!(bundle)
+      patched = patch(source, replacements, label, version)
+
+      if patched != source do
+        # Preserve the bundle's own mode: npm marks bin-target bundles executable,
+        # and node_modules/.bin symlinks exec them directly — a hardcoded 644 here
+        # stripped the x-bit and broke every codex adapter spawn (Permission denied).
+        %File.Stat{mode: mode} = File.stat!(bundle)
+        temporary = bundle <> ".tightbeam-patch"
+        File.write!(temporary, patched)
+        File.chmod!(temporary, mode)
+        File.rename!(temporary, bundle)
+      end
+    else
+      Logger.warning(
+        "#{label} adapter patch skipped: expected version #{version}, found #{installed_version}; " <>
+          "continuing with the installed adapter unpatched"
+      )
     end
 
     :ok
   end
 
   @doc false
-  def remote_script(binary_path, package_name, bundle_name, replacements, label) do
-    {_package, bundle} = installed_paths(binary_path, package_name, bundle_name)
+  def remote_script(binary_path, package_name, bundle_name, version, replacements, label) do
+    {package, bundle} = installed_paths(binary_path, package_name, bundle_name)
 
     encoded =
       replacements
@@ -34,10 +43,12 @@ defmodule Tightbeam.Harness.AdapterPatch do
       |> Base.encode64()
 
     """
-    const fs=require('fs');const p=#{JSON.encode!(bundle)};
+    const fs=require('fs');const j=#{JSON.encode!(package)};const p=#{JSON.encode!(bundle)};const v=#{JSON.encode!(version)};
+    const installed=JSON.parse(fs.readFileSync(j,'utf8')).version;
+    if(installed!==v){process.stdout.write('#{label} adapter patch skipped: expected version '+v+', found '+installed+'; continuing with the installed adapter unpatched');process.exit(0)}
     const rs=JSON.parse(Buffer.from(#{JSON.encode!(encoded)},'base64').toString());
     let s=fs.readFileSync(p,'utf8');
-    for(const [a,b] of rs){if(!s.includes(a)&&!s.includes(b))throw new Error('unsupported #{label} adapter bundle');s=s.replace(a,b)}
+    for(const [a,b] of rs){if(!s.includes(a)&&!s.includes(b))throw new Error('unsupported #{label} adapter '+v+' bundle');s=s.replace(a,b)}
     fs.writeFileSync(p,s);
     """
     |> String.replace("\n", "")

@@ -201,7 +201,7 @@ defmodule Tightbeam.ReadinessTest do
              "install",
              "--prefix",
              Path.join(base, "adapters"),
-             "--no-save",
+             "--save-exact",
              "#{module.install_package()}@#{module.adapter_version()}"
            ]
   end
