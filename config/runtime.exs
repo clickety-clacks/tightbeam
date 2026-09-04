@@ -13,6 +13,16 @@ if config_env() != :test do
     config :tightbeam, :cwd, value
   end
 
+  # Parsed by the artifact-content owner so a missing, negative, or malformed
+  # deployment value is a named capture refusal rather than a boot crash.
+  if value = System.get_env("TIGHTBEAM_ARTIFACT_CONTENT_QUOTA_BYTES") do
+    config :tightbeam, :artifact_content_quota_bytes, value
+  end
+
+  if value = System.get_env("TIGHTBEAM_ARTIFACT_CONTENT_RESERVED_FREE_BYTES") do
+    config :tightbeam, :artifact_content_reserved_free_bytes, value
+  end
+
   if value = System.get_env("TIGHTBEAM_DEFAULT_HARNESS") do
     config :tightbeam, :default_harness, Tightbeam.Harness.parse!(value).id()
   end

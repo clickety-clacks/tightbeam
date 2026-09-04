@@ -1462,6 +1462,12 @@ defmodule Tightbeam.RulesTest do
 
   defp record_artifact(ctx, work_item_id, session_key, kind, state) do
     home = if state == "archived", do: "/tmp/archive/#{System.unique_integer([:positive])}"
+
+    content_sha256 =
+      if state == "released",
+        do: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+    content_size = if state == "released", do: 0
     message_id = "msg_#{System.unique_integer([:positive])}"
 
     {:ok, _} =
@@ -1477,14 +1483,16 @@ defmodule Tightbeam.RulesTest do
         """
         INSERT INTO artifacts
           (artifactId, kind, title, createdBySession, workItemId, originPath,
-           recordedMessageId, state, home, createdAt, updatedAt)
-        VALUES (?1, ?2, 'results', ?3, ?4, '/tmp/results.txt', ?5, ?6, ?7, 1, 1)
+           contentSha256, contentSize, recordedMessageId, state, home, createdAt, updatedAt)
+        VALUES (?1, ?2, 'results', ?3, ?4, '/tmp/results.txt', ?5, ?6, ?7, ?8, ?9, 1, 1)
         """,
         [
           "art_#{System.unique_integer([:positive])}",
           kind,
           session_key,
           work_item_id,
+          content_sha256,
+          content_size,
           message_id,
           state,
           home

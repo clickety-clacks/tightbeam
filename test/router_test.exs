@@ -47,6 +47,8 @@ defmodule Tightbeam.Wire.RouterTest do
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-router-#{System.unique_integer([:positive])}")
 
+    File.mkdir_p!(base_dir)
+
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     {:paired, device} =
@@ -116,6 +118,21 @@ defmodule Tightbeam.Wire.RouterTest do
         if call.params[:return_code],
           do: %{code: call.params.return_code},
           else: %{artifact_id: call.params.artifact_id}
+      end,
+      "artifact-content-fetch" => fn call ->
+        send(parent, {:call, call})
+        path = Path.join(base_dir, "fetch-#{System.unique_integer([:positive])}")
+        File.write!(path, <<0, 1, 255, "bytes">>)
+        {:ok, descriptor} = File.open(path, [:read, :binary])
+        File.rm!(path)
+
+        %{
+          artifact_id: call.params.artifact_id,
+          digest: String.duplicate("a", 64),
+          size: 8,
+          fetch_id: "fetch_test",
+          descriptor: descriptor
+        }
       end,
       "artifacts" => fn call ->
         send(parent, {:call, call})
@@ -1794,6 +1811,120 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert missing.status == 404
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_found"
+  end
+
+  test "artifact content fetch sends verified descriptor bytes and stable headers", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "artifact-content-fetch",
+        asUser: "flynn",
+        params: %{artifactId: "art_12345678"}
+      })
+
+    assert response.status == 200
+    assert response.resp_body == <<0, 1, 255, "bytes">>
+
+    assert get_resp_header(response, "content-type") == [
+             "application/octet-stream; charset=utf-8"
+           ]
+
+    assert get_resp_header(response, "content-length") == ["8"]
+    assert get_resp_header(response, "x-tightbeam-content-size") == ["8"]
+    assert get_resp_header(response, "x-tightbeam-content-sha256") == [String.duplicate("a", 64)]
+    assert get_resp_header(response, "x-tightbeam-artifact-id") == ["art_12345678"]
+    assert get_resp_header(response, "x-tightbeam-fetch-id") == ["fetch_test"]
+
+    assert_receive {:call,
+                    %{
+                      verb: "artifact-content-fetch",
+                      principal: {:user, "flynn"},
+                      params: %{artifact_id: "art_12345678"}
+                    }}
+  end
+
+  test "artifact content corruption returns 410 with no body", ctx do
+    opts =
+      with_handler(ctx.opts, "artifact-content-fetch", fn _call ->
+        %{code: "content_corrupt", message: "private detail"}
+      end)
+
+    response =
+      dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
+        verb: "artifact-content-fetch",
+        asUser: "flynn",
+        params: %{artifactId: "art_corrupt"}
+      })
+
+    assert response.status == 410
+    assert response.resp_body == ""
+  end
+
+  test "artifact recovery import derives its principal and stages exact bytes", ctx do
+    parent = self()
+    bytes = <<0, 1, 255, "recovery">>
+
+    opts =
+      with_handler(ctx.opts, "artifact-content-recover", fn call ->
+        staged = Path.join(call.params.import_root, call.params.import_relative_path)
+        send(parent, {:recovery_import, call, File.read!(staged)})
+        %{artifact_id: call.params.artifact_id, state: "released"}
+      end)
+
+    metadata =
+      JSON.encode!(%{
+        verb: "artifact-content-recover",
+        asUser: "flynn",
+        params: %{
+          artifactId: "art_12345678",
+          idempotencyKey: "recover-1",
+          importRoot: "/caller/forged",
+          importRelativePath: "escape",
+          declaredLength: 99
+        }
+      })
+
+    payload =
+      <<byte_size(metadata)::unsigned-big-integer-size(32), metadata::binary, bytes::binary>>
+
+    response =
+      conn(:post, "/agent/artifact-content-import", payload)
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+
+    assert_receive {:recovery_import,
+                    %{
+                      verb: "artifact-content-recover",
+                      origin: "user:flynn",
+                      principal: {:user, "flynn"},
+                      session_key: nil,
+                      params: params
+                    }, ^bytes}
+
+    assert params.declared_length == byte_size(bytes)
+    assert params.import_relative_path == "content"
+
+    assert String.starts_with?(
+             params.import_root,
+             Path.join(ctx.base_dir, "artifact-content/import/user/")
+           )
+
+    refute params.import_root == "/caller/forged"
+  end
+
+  test "ordinary recovery dispatch cannot forge import custody fields" do
+    params =
+      Router.atomize_params_for_test("artifact-content-recover", %{
+        "artifactId" => "art_12345678",
+        "idempotencyKey" => "recover-1",
+        "importRoot" => "/caller/forged",
+        "importRelativePath" => "escape",
+        "declaredLength" => 99
+      })
+
+    assert params == %{artifact_id: "art_12345678", idempotency_key: "recover-1"}
   end
 
   test "session bearer enforces the identity ladder and threads the normative principal seam",

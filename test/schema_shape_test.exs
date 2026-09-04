@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "identity-universal-root-render-v1-019"
+  @shape "identity-universal-root-render-v1-019-artifact-content-v1"
+  @artifact_content_source_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
   @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
@@ -93,6 +94,33 @@ defmodule Tightbeam.SchemaShapeTest do
   )
   """
 
+  @source_artifacts_ddl """
+  CREATE TABLE artifacts (
+    artifactId        TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL CHECK (kind IN ('spec','report','doc','data','other')),
+    title             TEXT NOT NULL,
+    description       TEXT,
+    createdBySession  TEXT NOT NULL REFERENCES sessions(sessionKey),
+    workItemId        TEXT NOT NULL REFERENCES work_items(id),
+    parentSession     TEXT REFERENCES sessions(sessionKey),
+    originPath        TEXT NOT NULL,
+    contentSha256     TEXT,
+    recordedMessageId TEXT REFERENCES messages(id),
+    recordedTurnEvidence TEXT NOT NULL DEFAULT 'none'
+                      CHECK (recordedTurnEvidence IN
+                             ('tool-call-observed','session-concurrent','none')),
+    state             TEXT NOT NULL DEFAULT 'in-workspace'
+                      CHECK (state IN ('in-workspace','archived','released')),
+    home              TEXT,
+    createdAt         INTEGER NOT NULL,
+    updatedAt         INTEGER NOT NULL,
+    CHECK ((state = 'archived') = (home IS NOT NULL))
+  );
+  CREATE INDEX artifacts_work_item ON artifacts (workItemId);
+  CREATE INDEX artifacts_created_by_session ON artifacts (createdBySession);
+  CREATE INDEX artifacts_recorded_message ON artifacts (recordedMessageId);
+  """
+
   @model_identity_messages_ddl """
   CREATE TABLE messages (
     seq                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,6 +171,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    assert :ok = downgrade_artifacts_to_source(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
 
@@ -159,6 +188,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact pre-liveness notice stamp resumes without physical-shape inference", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    assert :ok = downgrade_artifacts_to_source(db)
     drop_liveness_activation(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
@@ -173,6 +203,211 @@ defmodule Tightbeam.SchemaShapeTest do
     assert "identityRenderContract" in table_columns(db, "sessions")
     assert "identityGuidanceDigest" in table_columns(db, "sessions")
     assert table?(db, "wake_cancellations")
+  end
+
+  test "the exact current 0.1.9 shape quarantines artifacts and leaves other rows exact", %{
+    db: db
+  } do
+    :ok = Schema.ensure_all(db)
+    downgrade_artifacts_to_source(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+         actionKey, question, context, status)
+      VALUES
+        ('dr_statute', 'statute', 'session:holder', 'mike', 1, 2, 'law-a',
+         'action-a', 'allow?', '{}', 'open');
+
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
+         lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
+         question, context, status, decision, ruledBy, ruledAt)
+      VALUES
+        ('dr_effort', 'effort', 'process:tightbeam', 'mike', 'asg_a', 'holder',
+         2, 3, 'w_deadline', 3, 4, 'continue?', '{}', 'ruled', 'continue',
+         'user:mike', 5);
+
+      INSERT INTO wakes
+        (wakeId, sessionKey, origin, prompt, dueAt, state, createdAt, firedAt)
+      VALUES
+        ('w_pending', 'holder', 'process:test', 'resume', 10, 'pending', 6, NULL),
+        ('w_fired', 'holder', 'process:test', 'done', 11, 'fired', 7, 12);
+
+      INSERT INTO messages
+        (seq, id, sessionKey, role, content, timestamp, sender, deviceId,
+         clientMessageId, replyToMessageId, replyToClientMessageId,
+         llmVisibleMessageId, attachments, attentionTier)
+      VALUES
+        (7, 'm_one', 'holder', 'user', 'hello', 13, 'user:mike', 'device-a',
+         'client-a', NULL, NULL, 'm_one', '[{"kind":"text"}]', 1),
+        (11, 'm_two', 'holder', 'assistant', 'world', 14, 'session:holder', NULL,
+         NULL, 'm_one', NULL, 'm_two', '[]', 0);
+
+      INSERT INTO users (userId, isAdmin, createdAt)
+      VALUES ('mike', 1, 1);
+      INSERT INTO sessions
+        (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+         provider, model, createdAt, updatedAt)
+      VALUES
+        ('holder', 'holder', 'mike', 'user:mike', 'coder', 'codex', 'openai',
+         'fixture-model', 1, 1);
+      INSERT INTO work_items
+        (id, title, ownerUserId, createdByUser, createdAt)
+      VALUES ('wi_one', 'one', 'mike', 'mike', 1);
+      INSERT INTO artifacts
+        (artifactId, kind, title, createdBySession, workItemId, originPath,
+         recordedMessageId, createdAt, updatedAt)
+      VALUES
+        ('art_one', 'report', 'one', 'holder', 'wi_one', '/tmp/one',
+         'm_one', 1, 1);
+      """)
+
+    {:ok, decision_requests_before} =
+      DB.query(
+        db,
+        "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
+      )
+
+    {:ok, wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    {:ok, messages_before} =
+      DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, ^decision_requests_before} =
+             DB.query(
+               db,
+               "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
+             )
+
+    assert {:ok, [[nil], [nil]]} =
+             DB.query(db, "SELECT ruledViaSessionKey FROM decision_requests ORDER BY id")
+
+    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, ^messages_before} =
+             DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
+
+    assert {:ok, [[nil, nil, nil, nil], [nil, nil, nil, nil]]} =
+             DB.query(
+               db,
+               "SELECT messageType, markerKind, markerFrom, markerTo FROM messages ORDER BY seq"
+             )
+
+    assert {:ok, []} = table_names(db, "decision_requests_model_identity_v1")
+    assert {:ok, []} = table_names(db, "messages_new")
+    assert {:ok, [[1]]} = index_count(db, "decision_requests_operator_open")
+    assert {:ok, [["m_one"]]} = DB.query(db, "SELECT recordedMessageId FROM artifacts")
+
+    assert {:ok, [[nil, nil, nil, nil, "migration-pending", "legacy-unavailable"]]} =
+             DB.query(
+               db,
+               "SELECT contentSha256, contentSize, contentRecoverySha256, legacyDeclaredSha256, unavailableReason, state FROM artifacts WHERE artifactId = 'art_one'"
+             )
+
+    assert {:ok, [["0.1.9/artifact-content-v1", "art_one", "in-workspace", "pending"]]} =
+             DB.query(
+               db,
+               "SELECT migrationId, artifactId, sourceState, outcome FROM artifact_content_migrations"
+             )
+
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+
+    # The rebuilt table is the same target shape a fresh database gets.
+    fresh = :"schema_shape_fresh_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: ":memory:", name: fresh}, id: fresh)
+    assert :ok = Schema.ensure_all(fresh)
+
+    assert object_sql(db, "table", "decision_requests") ==
+             object_sql(fresh, "table", "decision_requests")
+
+    for name <-
+          ~w(decision_requests_owner decision_requests_key decision_requests_one_open decision_requests_effort_generation decision_requests_operator_open) do
+      assert object_sql(db, "index", name) == object_sql(fresh, "index", name)
+    end
+
+    assert object_sql(db, "table", "messages") == object_sql(fresh, "table", "messages")
+
+    for name <- ~w(messages_session messages_client_dedupe) do
+      assert object_sql(db, "index", name) == object_sql(fresh, "index", name)
+    end
+
+    # A second boot is ordinary and leaves both commissioned populations exact.
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, ^decision_requests_before} =
+             DB.query(
+               db,
+               "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
+             )
+
+    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, ^messages_before} =
+             DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
+  end
+
+  test "a failed exact artifact migration rolls back the rename and stamp", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    downgrade_artifacts_to_source(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+         actionKey, question, context, status)
+      VALUES
+        ('dr_kept', 'statute', 'session:holder', 'mike', 1, 2, 'law-a',
+         'action-a', 'allow?', '{}', 'open');
+      DROP INDEX artifacts_work_item;
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "failed and was rolled back"
+
+    assert {:ok, [[@artifact_content_source_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["dr_kept"]]} = DB.query(db, "SELECT id FROM decision_requests")
+    assert {:ok, []} = table_names(db, "artifacts_operator_decision_requests_v1")
+    refute "contentSize" in table_columns(db, "artifacts")
+  end
+
+  test "a partial future content table makes source migration roll back", %{db: db} do
+    :ok = Schema.ensure_all(db)
+    downgrade_artifacts_to_source(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+         actionKey, question, context, status)
+      VALUES
+        ('dr_kept', 'statute', 'session:holder', 'mike', 1, 2, 'law-a',
+         'action-a', 'allow?', '{}', 'open');
+      INSERT INTO messages
+        (seq, id, sessionKey, role, content, timestamp, llmVisibleMessageId)
+      VALUES (9, 'm_kept', 'holder', 'user', 'hello', 3, 'm_kept');
+      CREATE TABLE artifact_blobs (digest TEXT PRIMARY KEY);
+      """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "found partial target tables"
+
+    assert {:ok, [[@artifact_content_source_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["dr_kept"]]} = DB.query(db, "SELECT id FROM decision_requests")
+    assert {:ok, [[9, "m_kept"]]} = DB.query(db, "SELECT seq, id FROM messages")
+    assert {:ok, []} = table_names(db, "artifacts_operator_decision_requests_v1")
+    refute "contentSize" in table_columns(db, "artifacts")
+    assert table_columns(db, "artifact_blobs") == ["digest"]
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
@@ -318,6 +553,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "operator-decision migration classifies the complete predecessor census once", %{db: db} do
     :ok = Schema.ensure_all(db)
+    :ok = downgrade_artifacts_to_source(db)
 
     :ok =
       DB.execute(db, """
@@ -485,6 +721,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     {:ok, first_pid} = DB.start_link(path: path, name: first)
     assert :ok = Schema.ensure_all(first)
+    assert :ok = downgrade_artifacts_to_source(first)
 
     :ok =
       DB.execute(first, """
@@ -876,6 +1113,7 @@ defmodule Tightbeam.SchemaShapeTest do
   test "the exact notice-batching predecessor widens effort cancellation and preserves the stamp",
        %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    assert :ok = downgrade_artifacts_to_source(db)
 
     {:ok, [[current_ddl]]} =
       DB.query(
@@ -987,32 +1225,29 @@ defmodule Tightbeam.SchemaShapeTest do
   # interrupted. Stamped last, a bootstrap that died between `sessions` and the
   # stamp left a database indistinguishable from a genuinely old one, and the
   # next boot refused what this build had just created.
-  test "a fresh bootstrap interrupted midway is resumed, not refused", %{db: db} do
+  test "a target bootstrap interrupted midway is named as a partial shape", %{db: db} do
     # A GENUINE interruption stopped mid-run, not its end state rebuilt by hand
     # — the question is WHEN the stamp lands relative to the tables, and only a
-    # real run can answer it. `work_state_events` is near the END of the module list
-    # and executes its DDL directly (the stub matches SQL text, so a module that
-    # wraps its DDL in a transaction closure cannot be interrupted this way), so
-    # this fails well AFTER `sessions` exists: exactly the window. Stamped last, what
-    # that leaves is indistinguishable from a database written before this
-    # build, and the next boot refused one this build had just created.
+    # real run can answer it. Artifact content follows the artifact pointer
+    # table, so this fails after `sessions` and `artifacts` exist but before the
+    # R1 custody tables exist.
     failing =
-      start_supervised!({Tightbeam.SchemaShapeTest.FailingDb, db: db, fragment: "work_state"})
+      start_supervised!(
+        {Tightbeam.SchemaShapeTest.FailingDb, db: db, fragment: "artifact_content_requests"}
+      )
 
     assert catch_error(Schema.ensure_all(failing))
 
-    assert {:ok, [["sessions"]]} =
-             DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'"),
-           "the interruption must land AFTER sessions, or this proves nothing"
-
-    # Boot again against the real server: this must RESUME, not refuse.
-    assert :ok = Schema.ensure_all(db)
-
-    assert {:ok, [["work_state_events"]]} =
+    assert {:ok, [["artifacts"]]} =
              DB.query(
                db,
-               "SELECT name FROM sqlite_master WHERE type='table' AND name='work_state_events'"
-             )
+               "SELECT name FROM sqlite_master WHERE type='table' AND name='artifacts'"
+             ),
+           "the interruption must land AFTER artifacts, or this proves nothing"
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incomplete #{@shape} shape"
+    assert error.message =~ "artifact_blobs"
   end
 
   test "more than one stamp is refused rather than crashing", %{db: db} do
@@ -1043,7 +1278,26 @@ defmodule Tightbeam.SchemaShapeTest do
     rows == [[1]]
   end
 
+  defp downgrade_artifacts_to_source(db) do
+    :ok =
+      DB.execute(db, """
+      DROP TABLE artifact_content_requests;
+      DROP TABLE artifact_content_migrations;
+      DROP TABLE artifact_blobs;
+      DROP INDEX artifacts_work_item;
+      DROP INDEX artifacts_created_by_session;
+      DROP INDEX artifacts_recorded_message;
+      DROP TABLE artifacts;
+      #{@source_artifacts_ddl}
+      UPDATE schema_stamp SET shape = '#{@artifact_content_source_shape}', stampedAt = 1;
+      """)
+
+    :ok
+  end
+
   defp downgrade_decision_requests_to_model_identity(db) do
+    :ok = downgrade_artifacts_to_source(db)
+
     :ok =
       DB.execute(db, """
       DROP INDEX decision_requests_owner;
@@ -1079,6 +1333,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_wakes_to_terminal_decision(db) do
+    :ok = downgrade_artifacts_to_source(db)
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do

@@ -1,8 +1,14 @@
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
 
@@ -118,6 +124,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::ArtifactCustodyRead { .. }
+        | Command::ArtifactContentStat { .. }
         | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
@@ -180,6 +188,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             description,
             work_item_id,
             content_sha256,
+            idempotency_key,
         } => {
             let mut params = vec![
                 string_field("kind", kind),
@@ -190,12 +199,44 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("description", description),
                 ("workItemId", work_item_id),
                 ("contentSha256", content_sha256),
+                ("idempotencyKey", idempotency_key),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
                 }
             }
             Ok(request(identity, "artifact-record", vec![], params))
+        }
+        Command::ArtifactContentFetch {
+            identity,
+            artifact_id,
+            ..
+        } => Ok(request(
+            identity,
+            "artifact-content-fetch",
+            vec![],
+            vec![string_field("artifactId", artifact_id)],
+        )),
+        Command::ArtifactContentRecover {
+            identity,
+            artifact_id,
+            idempotency_key,
+            expected_digest,
+            ..
+        } => {
+            let mut params = vec![
+                string_field("artifactId", artifact_id),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+            if let Some(digest) = expected_digest {
+                params.push(string_field("expectedDigest", digest));
+            }
+            Ok(request(
+                identity,
+                "artifact-content-recover",
+                vec![],
+                params,
+            ))
         }
         Command::Artifacts {
             identity,
@@ -1387,11 +1428,440 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
     Ok(json.get("result").cloned())
 }
 
+#[cfg(unix)]
+fn artifact_content_fetch(
+    endpoint: &Endpoint,
+    identity: &Identity,
+    artifact_id: &str,
+    output: &Path,
+) -> Result<(), String> {
+    let fetch_request = request(
+        identity,
+        "artifact-content-fetch",
+        vec![],
+        vec![string_field("artifactId", artifact_id)],
+    );
+    let call = gateway_request("POST", endpoint, fetch_request.path, None)
+        .set("content-type", "application/json")
+        .send_string(&fetch_request.body_json);
+
+    let response = match call {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let code = response
+                .header("x-tightbeam-error-code")
+                .map(str::to_owned)
+                .unwrap_or_else(|| match status {
+                    404 => "not_found".to_owned(),
+                    409 => "content_not_released".to_owned(),
+                    410 => "content_corrupt".to_owned(),
+                    503 => "corruption_transition_failed".to_owned(),
+                    _ => format!("http_{status}"),
+                });
+            return Err(code);
+        }
+        Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
+    };
+
+    let digest = required_fetch_header(&response, "x-tightbeam-content-sha256")?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("artifact fetch returned an invalid digest header".to_owned());
+    }
+    let returned_artifact = required_fetch_header(&response, "x-tightbeam-artifact-id")?;
+    if returned_artifact != artifact_id {
+        return Err("artifact fetch returned a different artifact id".to_owned());
+    }
+    let fetch_id = required_fetch_header(&response, "x-tightbeam-fetch-id")?;
+    let size = required_fetch_header(&response, "x-tightbeam-content-size")?
+        .parse::<u64>()
+        .map_err(|_| "artifact fetch returned an invalid content length".to_owned())?;
+
+    if let Some(content_length) = response.header("content-length") {
+        if content_length != size.to_string() {
+            return Err("artifact fetch HTTP content length differs from trusted size".to_owned());
+        }
+    }
+
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "artifact fetch output must name a file".to_owned())?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{name}.tightbeam-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|error| format!("artifact fetch temporary file: {error}"))?;
+
+    let install = (|| {
+        let mut reader = response.into_reader();
+        let mut hash = Sha256::new();
+        let mut count = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .map_err(|error| format!("artifact fetch transport read: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read])
+                .map_err(|error| format!("artifact fetch output write: {error}"))?;
+            hash.update(&buffer[..read]);
+            count = count
+                .checked_add(read as u64)
+                .ok_or_else(|| "artifact fetch size overflow".to_owned())?;
+        }
+
+        let computed = format!("{:x}", hash.finalize());
+        if count != size {
+            return Err("artifact fetch content length mismatch".to_owned());
+        }
+        if computed != digest {
+            return Err("artifact fetch digest mismatch".to_owned());
+        }
+
+        file.sync_all()
+            .map_err(|error| format!("artifact fetch file fsync: {error}"))?;
+        drop(file);
+
+        fs::hard_link(&temporary, output).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                "artifact fetch output already exists".to_owned()
+            } else {
+                format!("artifact fetch no-replace install: {error}")
+            }
+        })?;
+        fs::remove_file(&temporary)
+            .map_err(|error| format!("artifact fetch temporary unlink: {error}"))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("artifact fetch directory fsync: {error}"))?;
+
+        Ok(())
+    })();
+
+    if temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    install?;
+
+    let completion = request(
+        identity,
+        "artifact-content-fetch-complete",
+        vec![],
+        vec![
+            string_field("artifactId", artifact_id),
+            string_field("fetchId", &fetch_id),
+            string_field("contentSha256", &digest),
+            format!("\"contentSize\":{size}"),
+        ],
+    );
+
+    match send_to(endpoint, &completion)? {
+        Some(receipt) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt).expect("fetch receipt serializes")
+            );
+            Ok(())
+        }
+        None => Err("artifact fetch completion returned no receipt".to_owned()),
+    }
+}
+
+#[cfg(not(unix))]
+fn artifact_content_fetch(
+    _endpoint: &Endpoint,
+    _identity: &Identity,
+    _artifact_id: &str,
+    _output: &Path,
+) -> Result<(), String> {
+    Err("artifact content fetch is unsupported on this platform".to_owned())
+}
+
+fn required_fetch_header(response: &ureq::Response, name: &str) -> Result<String, String> {
+    response
+        .header(name)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("artifact fetch response is missing {name}"))
+}
+
+#[cfg(unix)]
+fn artifact_content_stat(path: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("artifact content filesystem metadata failed: {error}"))?;
+    let encoded = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "artifact content filesystem path contains NUL".to_owned())?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let result = unsafe { libc::statvfs(encoded.as_ptr(), stats.as_mut_ptr()) };
+    if result != 0 {
+        return Err(format!(
+            "artifact content filesystem free-space probe failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stats = unsafe { stats.assume_init() };
+    let free_bytes = (stats.f_bavail as u128)
+        .checked_mul(stats.f_frsize as u128)
+        .ok_or_else(|| "artifact content filesystem free-space overflow".to_owned())?;
+
+    println!(
+        "{}",
+        serde_json::json!({"device": metadata.dev(), "freeBytes": free_bytes})
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn artifact_content_stat(_path: &Path) -> Result<(), String> {
+    Err("artifact content filesystem probing is unsupported on this platform".to_owned())
+}
+
+fn artifact_custody_read(root: &str, relative_path: &str) -> Result<(), String> {
+    let mut source = open_artifact_custody(Path::new(root), Path::new(relative_path))?;
+    let stdout = std::io::stdout();
+    let mut pipe = stdout.lock();
+    std::io::copy(&mut source, &mut pipe)
+        .map_err(|error| format!("artifact custody pipe write failed: {error}"))?;
+    std::io::Write::flush(&mut pipe)
+        .map_err(|error| format!("artifact custody pipe flush failed: {error}"))
+}
+
+fn custody_components(relative_path: &Path) -> Result<Vec<std::ffi::OsString>, String> {
+    let mut components = Vec::new();
+
+    for component in relative_path.components() {
+        match component {
+            std::path::Component::Normal(value) => components.push(value.to_owned()),
+            _ => return Err("artifact custody path must be a strict relative path".to_owned()),
+        }
+    }
+
+    if components.is_empty() {
+        return Err("artifact custody path must be a strict relative path".to_owned());
+    }
+
+    Ok(components)
+}
+
+fn regular_file_from_fd(fd: std::os::fd::OwnedFd) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fd` is owned and live, and `stat` points to writable storage of
+    // the exact type `fstat` initializes.
+    let status = unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) };
+    if status != 0 {
+        return Err(format!(
+            "artifact custody descriptor proof failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // SAFETY: successful `fstat` initialized every field.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err("artifact custody source is not a regular file".to_owned());
+    }
+
+    Ok(std::fs::File::from(fd))
+}
+
+#[cfg(target_os = "linux")]
+fn open_artifact_custody(root: &Path, relative_path: &Path) -> Result<std::fs::File, String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let _components = custody_components(relative_path)?;
+    let root = std::ffi::CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| "artifact custody root contains NUL".to_owned())?;
+    let relative = std::ffi::CString::new(relative_path.as_os_str().as_bytes())
+        .map_err(|_| "artifact custody path contains NUL".to_owned())?;
+
+    // The trusted root itself is opened without following a final symlink.
+    // SAFETY: `root` is NUL-terminated and flags require no variadic mode.
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return Err(format!(
+            "artifact custody root open failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the successful `open` returned one new descriptor owned here.
+    let root_fd = unsafe { OwnedFd::from_raw_fd(root_fd) };
+
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+    const RESOLVE_BENEATH: u64 = 0x08;
+
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+    };
+
+    // No fallback is permitted. ENOSYS/EINVAL means this platform cannot
+    // uphold R4 and the helper fails closed.
+    // SAFETY: all pointers are live for the syscall and `how` has the kernel's
+    // three-u64 `open_how` layout.
+    let source_fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root_fd.as_raw_fd(),
+            relative.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if source_fd < 0 {
+        return Err(format!(
+            "artifact custody source open failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // SAFETY: successful `openat2` returned one new descriptor owned here.
+    regular_file_from_fd(unsafe { OwnedFd::from_raw_fd(source_fd as libc::c_int) })
+}
+
+#[cfg(target_os = "macos")]
+fn open_artifact_custody(root: &Path, relative_path: &Path) -> Result<std::fs::File, String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let components = custody_components(relative_path)?;
+    let root = std::ffi::CString::new(root.as_os_str().as_bytes())
+        .map_err(|_| "artifact custody root contains NUL".to_owned())?;
+
+    // SAFETY: `root` is NUL-terminated and flags require no variadic mode.
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return Err(format!(
+            "artifact custody root open failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: successful `open` returned one new descriptor owned here.
+    let mut directory = unsafe { OwnedFd::from_raw_fd(root_fd) };
+
+    for (index, component) in components.iter().enumerate() {
+        let component = std::ffi::CString::new(component.as_bytes())
+            .map_err(|_| "artifact custody path contains NUL".to_owned())?;
+        let final_component = index + 1 == components.len();
+        let flags = if final_component {
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
+        } else {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW
+        };
+
+        // SAFETY: the directory descriptor and NUL-terminated component are
+        // live; no component can be `..` because `custody_components` closed
+        // that representation before this walk.
+        let opened = unsafe { libc::openat(directory.as_raw_fd(), component.as_ptr(), flags) };
+        if opened < 0 {
+            return Err(format!(
+                "artifact custody source open failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: successful `openat` returned one new descriptor owned here.
+        let opened = unsafe { OwnedFd::from_raw_fd(opened) };
+
+        if final_component {
+            return regular_file_from_fd(opened);
+        }
+        directory = opened;
+    }
+
+    Err("artifact custody path must be a strict relative path".to_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_artifact_custody(_root: &Path, relative_path: &Path) -> Result<std::fs::File, String> {
+    let _components = custody_components(relative_path)?;
+    Err("artifact custody is unsupported on this platform".to_owned())
+}
+
 pub fn run(command: Command) -> Result<(), String> {
     // `tool-call-observed` carries no identity flag, so it is not in
     // `command_identity`; it is nonetheless a session call and only a session
     // call, and saying so here makes a run from outside a workdir fail with the
     // reason rather than with a 403 from the org token.
+    if let Command::ArtifactContentFetch {
+        identity,
+        artifact_id,
+        output,
+    } = &command
+    {
+        let endpoint = if matches!(identity, Identity::Session) {
+            let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+            discover_session_from(&cwd)?.ok_or_else(|| identity_required(&cwd))?
+        } else {
+            discover()?
+        };
+        require_session_endpoint(identity, &endpoint)?;
+        return artifact_content_fetch(&endpoint, identity, artifact_id, Path::new(output));
+    }
+
+    let import = match &command {
+        Command::ArtifactRecord {
+            identity,
+            origin_path,
+            idempotency_key: Some(_),
+            ..
+        } => Some((identity, origin_path.as_str())),
+        Command::ArtifactContentRecover { identity, path, .. } => Some((identity, path.as_str())),
+        _ => None,
+    };
+
+    if let Some((identity, source_path)) = import {
+        let endpoint = if matches!(identity, Identity::Session) {
+            let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+            discover_session_from(&cwd)?.ok_or_else(|| identity_required(&cwd))?
+        } else {
+            discover()?
+        };
+        require_session_endpoint(identity, &endpoint)?;
+        return artifact_content_import(&endpoint, &command, Path::new(source_path));
+    }
+
     let session_identity = matches!(command, Command::ToolCallObserved)
         || command_identity(&command).is_some_and(|identity| matches!(identity, Identity::Session));
     run_with(
@@ -1407,6 +1877,43 @@ pub fn run(command: Command) -> Result<(), String> {
         send_to_with_deadline,
         crate::harnesses::load_optional_from,
     )
+}
+
+fn artifact_content_import(
+    endpoint: &Endpoint,
+    command: &Command,
+    source_path: &Path,
+) -> Result<(), String> {
+    let source = File::open(source_path)
+        .map_err(|error| format!("artifact content source open failed: {error}"))?;
+    let metadata = build_request(command)?.body_json;
+    let metadata_len = u32::try_from(metadata.len())
+        .map_err(|_| "artifact content metadata is too large".to_owned())?;
+    let prefix = metadata_len
+        .to_be_bytes()
+        .into_iter()
+        .chain(metadata.into_bytes())
+        .collect::<Vec<_>>();
+    let body = std::io::Cursor::new(prefix).chain(source);
+
+    let call = gateway_request("POST", endpoint, "/agent/artifact-content-import", None)
+        .set("content-type", "application/octet-stream")
+        .send(body);
+
+    let (status, response) = match call {
+        Ok(response) => (response.status(), response),
+        Err(ureq::Error::Status(status, response)) => (status, response),
+        Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
+    };
+    let encoded = response.into_string().map_err(|error| error.to_string())?;
+
+    if let Some(result) = parse_response(status, &encoded)? {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).expect("artifact record result serializes")
+        );
+    }
+    Ok(())
 }
 
 fn run_with<D, S, H>(
@@ -1425,6 +1932,17 @@ where
             unreachable!("help is handled before dispatch")
         }
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
+        Command::ArtifactCustodyRead {
+            root,
+            relative_path,
+        } => artifact_custody_read(&root, &relative_path),
+        Command::ArtifactContentStat { path } => artifact_content_stat(Path::new(&path)),
+        Command::ArtifactContentFetch { .. } => {
+            Err("artifact fetch bypassed its binary response path".to_owned())
+        }
+        Command::ArtifactContentRecover { .. } => {
+            Err("artifact recovery bypassed its binary import path".to_owned())
+        }
         Command::AddUser {
             identity,
             user_id,
@@ -1568,6 +2086,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
         | Command::ArtifactRecord { identity, .. }
+        | Command::ArtifactContentFetch { identity, .. }
+        | Command::ArtifactContentRecover { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
@@ -1619,6 +2139,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         Command::Help
         | Command::CommandHelp(_)
         | Command::Doctor { .. }
+        | Command::ArtifactCustodyRead { .. }
+        | Command::ArtifactContentStat { .. }
         | Command::ToolCallObserved
         | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
@@ -1654,6 +2176,7 @@ mod tests {
     use super::*;
     use crate::args;
     use std::collections::HashMap;
+    use std::io::Read;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn parse(values: &[&str]) -> Command {
@@ -1662,6 +2185,81 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn custody_root(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam_artifact_custody_{label}_{}_{}",
+            std::process::id(),
+            unique
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn artifact_custody_opens_valid_file_once_and_survives_path_replacement() {
+        let root = custody_root("stable");
+        fs::create_dir_all(root.join("reports")).unwrap();
+        fs::write(root.join("reports/result.md"), b"opened bytes").unwrap();
+
+        let mut opened = open_artifact_custody(&root, Path::new("reports/result.md")).unwrap();
+        fs::rename(
+            root.join("reports/result.md"),
+            root.join("reports/original.md"),
+        )
+        .unwrap();
+        fs::write(root.join("reports/result.md"), b"replacement bytes").unwrap();
+
+        let mut bytes = Vec::new();
+        opened.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"opened bytes");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn artifact_custody_rejects_final_and_intermediate_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = custody_root("symlink");
+        fs::create_dir_all(root.join("inside")).unwrap();
+        fs::write(root.join("inside/content"), b"bytes").unwrap();
+        symlink("inside/content", root.join("final-link")).unwrap();
+        symlink("inside", root.join("directory-link")).unwrap();
+
+        for relative in ["final-link", "directory-link/content"] {
+            let error = open_artifact_custody(&root, Path::new(relative)).unwrap_err();
+            assert!(error.contains("source open failed"));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn artifact_custody_rejects_escape_and_special_file() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = custody_root("classes");
+        let fifo = root.join("pipe");
+        let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is NUL-terminated and names a fresh test location.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+
+        for relative in ["../outside", "/etc/passwd", "./pipe"] {
+            let error = open_artifact_custody(&root, Path::new(relative)).unwrap_err();
+            assert!(error.contains("strict relative path"));
+        }
+
+        let error = open_artifact_custody(&root, Path::new("pipe")).unwrap_err();
+        assert_eq!(error, "artifact custody source is not a regular file");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2063,6 +2661,32 @@ mod tests {
                 "writer",
             ]),
             r#"{"as":"writer","verb":"artifact-record","params":{"kind":"spec","title":"Banana design","originPath":"specs/banana.md","description":"Ratified design","workItemId":"wi_1","contentSha256":"abc123"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "artifact-content-fetch",
+                "art_12345678",
+                "--output",
+                "result.bin",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"artifact-content-fetch","params":{"artifactId":"art_12345678"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "artifact-content-recover",
+                "art_12345678",
+                "--path",
+                "recovered.bin",
+                "--key",
+                "recover-1",
+                "--sha256",
+                "abc123",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"artifact-content-recover","params":{"artifactId":"art_12345678","idempotencyKey":"recover-1","expectedDigest":"abc123"}}"#
         );
         assert_eq!(
             body(&[

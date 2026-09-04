@@ -1,7 +1,7 @@
 defmodule Tightbeam.Schema do
   @moduledoc "The single production-owned schema bootstrap for a Tightbeam database."
 
-  alias Tightbeam.DB
+  alias Tightbeam.{ArtifactContent, Artifacts, DB}
   alias Tightbeam.DB.Txn
 
   @schema_modules [
@@ -9,6 +9,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.EventLog,
     Tightbeam.Assets,
     Tightbeam.Artifacts,
+    Tightbeam.ArtifactContent,
     Tightbeam.CausalEvents,
     Tightbeam.Devices,
     Tightbeam.Idempotency,
@@ -40,7 +41,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "identity-universal-root-render-v1-019"
+  @shape "identity-universal-root-render-v1-019-artifact-content-v1"
+  @artifact_content_source_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -922,11 +924,13 @@ defmodule Tightbeam.Schema do
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
-    :ok = check_shape(db)
+    shape_status = check_shape(db)
 
     Enum.each(@schema_modules, fn module ->
       :ok = module.ensure_schema(db)
     end)
+
+    if shape_status == :fresh, do: validate_artifact_content_shape!(db)
 
     activated_at = System.system_time(:millisecond)
 
@@ -1187,17 +1191,25 @@ defmodule Tightbeam.Schema do
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@shape]]} ->
-        :ok
+        validate_artifact_content_shape!(db)
+        :target
+
+      {:ok, [[@artifact_content_source_shape]]} ->
+        migrate_artifact_content_v1(db)
+        :target
 
       {:ok, [[@identity_render_stamp_previous_shape]]} ->
-        upgrade_identity_render_stamp_v1(db)
+        :ok = upgrade_identity_render_stamp_v1(db)
+        check_shape(db)
 
       {:ok, [[@effort_request_exit_previous_shape]]} ->
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_identity_render_stamp_v1(db)
+        :ok = upgrade_identity_render_stamp_v1(db)
+        check_shape(db)
 
       {:ok, [[@notice_batching_pre_liveness_shape]]} ->
-        upgrade_identity_render_stamp_v1(db, @notice_batching_pre_liveness_shape)
+        :ok = upgrade_identity_render_stamp_v1(db, @notice_batching_pre_liveness_shape)
+        check_shape(db)
 
       {:ok, [[@terminal_decision_shape]]} ->
         :ok = migrate_notice_batching_v1_019(db, @terminal_decision_shape, true)
@@ -1221,6 +1233,7 @@ defmodule Tightbeam.Schema do
         # them apart is the whole point — an unstamped database with a
         # `sessions` table in it predates the structured model identity.
         unstamped(db)
+        :fresh
 
       {:ok, [[found]]} ->
         raise ShapeError, """
@@ -1232,9 +1245,10 @@ defmodule Tightbeam.Schema do
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
-        #{@effort_request_exit_previous_shape} to #{@shape}. It can also migrate
-        #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
-        then #{@shape}.
+        #{@effort_request_exit_previous_shape} to #{@artifact_content_source_shape}. It can also
+        migrate #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
+        then #{@artifact_content_source_shape}. The exact #{@artifact_content_source_shape}
+        stamp migrates to #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1275,7 +1289,7 @@ defmodule Tightbeam.Schema do
            Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityGuidanceDigest TEXT")
 
            Txn.q(txn, "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3", [
-             @shape,
+             @artifact_content_source_shape,
              System.system_time(:millisecond),
              predecessor
            ])
@@ -1712,6 +1726,194 @@ defmodule Tightbeam.Schema do
       raise ShapeError,
         message:
           "migration #{@terminal_decision_shape} -> #{next_shape} lost its exact stamp transition"
+    end
+
+    :ok
+  end
+
+  defp validate_artifact_content_shape!(db) do
+    required_tables =
+      ~w(artifacts artifact_blobs artifact_content_requests artifact_content_migrations)
+
+    {:ok, table_rows} =
+      DB.query(
+        db,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?1, ?2, ?3, ?4) ORDER BY name",
+        required_tables
+      )
+
+    found_tables = List.flatten(table_rows)
+    missing_tables = required_tables -- found_tables
+
+    required_columns = %{
+      "artifacts" =>
+        ~w(contentSha256 contentSize contentRecoverySha256 legacyDeclaredSha256 unavailableReason),
+      "artifact_blobs" =>
+        ~w(digest size storageVersion status createdAt verifiedAt corruptAt corruptReason),
+      "artifact_content_requests" =>
+        ~w(principalKind principalId operation idempotencyKey requestHash artifactId createdAt),
+      "artifact_content_migrations" =>
+        ~w(migrationId artifactId sourceState outcome contentSha256 contentSize reason updatedAt cause principal)
+    }
+
+    missing_columns =
+      Enum.flat_map(required_columns, fn {table, required} ->
+        found =
+          case DB.query(db, "PRAGMA table_info(#{table})") do
+            {:ok, rows} -> Enum.map(rows, &Enum.at(&1, 1))
+            _ -> []
+          end
+
+        Enum.map(required -- found, &"#{table}.#{&1}")
+      end)
+
+    if missing_tables != [] or missing_columns != [] do
+      raise ShapeError, """
+      this Tightbeam database carries an incomplete #{@shape} shape.
+
+        found artifact-content tables: #{Enum.join(found_tables, ", ")}
+        missing artifact-content tables: #{Enum.join(missing_tables, ", ")}
+        missing artifacts columns: #{Enum.join(missing_columns, ", ")}
+
+      The #{@shape} stamp requires all R1 tables and columns. Nothing here will
+      infer or repair a partial target shape.
+      """
+    end
+
+    :ok
+  end
+
+  defp migrate_artifact_content_v1(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, &migrate_artifact_content_v1_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{@artifact_content_source_shape} -> #{@shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+
+    validate_artifact_content_shape!(db)
+  end
+
+  defp migrate_artifact_content_v1_in_txn(%Txn{} = txn) do
+    existing_content_tables =
+      Txn.q(
+        txn,
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('artifact_blobs','artifact_content_requests','artifact_content_migrations') ORDER BY name"
+      )
+
+    if existing_content_tables != [] do
+      raise ShapeError,
+        message:
+          "migration #{@artifact_content_source_shape} -> #{@shape} found partial target tables: #{inspect(List.flatten(existing_content_tables))}"
+    end
+
+    [[artifact_count]] = Txn.q(txn, "SELECT COUNT(*) FROM artifacts")
+    migrated_at = System.system_time(:millisecond)
+
+    :ok = Txn.exec(txn, "ALTER TABLE artifacts RENAME TO artifacts_operator_decision_requests_v1")
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP INDEX artifacts_work_item;
+        DROP INDEX artifacts_created_by_session;
+        DROP INDEX artifacts_recorded_message;
+        CREATE TABLE artifacts_new (
+        #{Artifacts.table_definition()}
+        );
+        """
+      )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO artifacts_new (
+        artifactId, kind, title, description, createdBySession, workItemId,
+        parentSession, originPath, contentSha256, contentSize,
+        contentRecoverySha256, legacyDeclaredSha256, unavailableReason,
+        recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt
+      )
+      SELECT
+        artifactId, kind, title, description, createdBySession, workItemId,
+        parentSession, originPath, NULL, NULL, NULL, contentSha256,
+        'migration-pending', recordedMessageId, recordedTurnEvidence,
+        'legacy-unavailable', home, createdAt, updatedAt
+      FROM artifacts_operator_decision_requests_v1
+      """
+    )
+
+    if Txn.changes(txn) != artifact_count do
+      raise ShapeError,
+        message:
+          "migration #{@artifact_content_source_shape} -> #{@shape} copied #{Txn.changes(txn)} of #{artifact_count} artifacts"
+    end
+
+    :ok = Txn.exec(txn, ArtifactContent.ddl())
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO artifact_content_migrations (
+        migrationId, artifactId, sourceState, outcome, contentSha256,
+        contentSize, reason, updatedAt, cause, principal
+      )
+      SELECT
+        ?1, artifactId, state, 'pending', NULL, NULL, 'migration-pending',
+        ?2, 'shape-migration', 'process:tightbeam'
+      FROM artifacts_operator_decision_requests_v1
+      """,
+      [ArtifactContent.migration_id(), migrated_at]
+    )
+
+    if Txn.changes(txn) != artifact_count do
+      raise ShapeError,
+        message:
+          "migration #{@artifact_content_source_shape} -> #{@shape} censused #{Txn.changes(txn)} of #{artifact_count} artifacts"
+    end
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP TABLE artifacts_operator_decision_requests_v1;
+        ALTER TABLE artifacts_new RENAME TO artifacts;
+        #{Artifacts.index_ddl()}
+        """
+      )
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "migration #{@artifact_content_source_shape} -> #{@shape} left invalid foreign keys: #{inspect(rows)}"
+    end
+
+    Txn.q(
+      txn,
+      "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
+      [@shape, migrated_at, @artifact_content_source_shape]
+    )
+
+    if Txn.changes(txn) != 1 do
+      raise ShapeError,
+        message:
+          "migration #{@artifact_content_source_shape} -> #{@shape} lost its exact stamp transition"
     end
 
     :ok

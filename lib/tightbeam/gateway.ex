@@ -62,6 +62,7 @@ defmodule Tightbeam.Gateway do
     AdapterCoordinator,
     AdminProjection,
     Archetypes,
+    ArtifactContent,
     Artifacts,
     Assignments,
     ConditionFacts,
@@ -172,6 +173,9 @@ defmodule Tightbeam.Gateway do
     File.chmod!(gateway_path, 0o600)
     provision_host_endpoints(db, config, cli_token)
     cli_bin = install_cli_bin(config.base_dir)
+    :ok = ArtifactContent.cleanup_temps(config.base_dir)
+    :ok = promote_legacy_artifact_content(config, db)
+    :ok = ArtifactContent.boot_scrub!(db, config.base_dir)
     defaults = defaults(config, db)
     # Post-commit recognition: both consumers of a committed terminal are
     # FIRE-AND-FORGET casts into their own processes — the bubble sweeper and
@@ -192,6 +196,7 @@ defmodule Tightbeam.Gateway do
       config
       |> Map.put(:db, db)
       |> Map.put(:on_retired, on_retired)
+      |> Map.put(:cli_bin, Path.join(cli_bin, "tightbeam"))
       |> handlers()
 
     runner = turn_runner(Map.put(config, :db, db))
@@ -514,6 +519,178 @@ defmodule Tightbeam.Gateway do
   # same way rather than reaching for the global name directly.
   defp gateway_db(config), do: Map.get(config, :db, Tightbeam.DB)
 
+  defp record_imported_artifact(db, config, call) do
+    with {:session, session_key} <- call[:principal],
+         ^session_key <- call.session_key,
+         key when is_binary(key) and key != "" <- call.params[:idempotency_key] do
+      request_hash =
+        :crypto.hash(
+          :sha256,
+          JSON.encode!([
+            call.params[:kind],
+            call.params[:title],
+            call.params[:description],
+            call.params[:work_item_id],
+            call.params[:origin_path],
+            call.params[:content_sha256],
+            call.params[:declared_length]
+          ])
+        )
+        |> Base.encode16(case: :lower)
+
+      request = %{
+        principal_kind: "session",
+        principal_id: session_key,
+        operation: "record",
+        idempotency_key: key,
+        request_hash: request_hash
+      }
+
+      case ArtifactContent.lookup_request(db, request) do
+        {:replay, artifact} ->
+          artifact
+
+        {:error, refusal} ->
+          refusal
+
+        :miss ->
+          artifact = Artifacts.record(db, call)
+
+          if artifact[:code] do
+            artifact
+          else
+            capture_opts = %{
+              artifact_id: artifact.artifact_id,
+              base_dir: config.base_dir,
+              source_root: call.params.import_root,
+              relative_path: call.params.import_relative_path,
+              declared_length: call.params.declared_length,
+              expected_digest: call.params[:content_sha256],
+              principal: call.origin,
+              request: request
+            }
+
+            case ArtifactContent.capture(db, capture_opts) do
+              {:ok, released} ->
+                released
+
+              {:error, refusal} ->
+                :ok = Artifacts.discard_unreleased(db, artifact.artifact_id)
+                refusal
+            end
+          end
+      end
+    else
+      _ -> %{code: "invalid", message: "keyed artifact record requires a session caller"}
+    end
+  end
+
+  defp recover_imported_artifact(db, config, call) do
+    artifact = Artifacts.get(db, call.params[:artifact_id])
+
+    with %{} <- artifact,
+         :ok <- authorize_artifact_recovery(db, artifact, call),
+         key when is_binary(key) and key != "" <- call.params[:idempotency_key],
+         {principal_kind, principal_id} <- artifact_recovery_principal(call.principal) do
+      request_hash =
+        :crypto.hash(
+          :sha256,
+          JSON.encode!([
+            artifact.artifact_id,
+            call.params[:expected_digest],
+            call.params[:declared_length]
+          ])
+        )
+        |> Base.encode16(case: :lower)
+
+      request = %{
+        principal_kind: principal_kind,
+        principal_id: principal_id,
+        operation: "recover",
+        idempotency_key: key,
+        request_hash: request_hash
+      }
+
+      case ArtifactContent.lookup_request(db, request) do
+        {:replay, released} -> released
+        {:error, refusal} -> refusal
+        :miss -> recover_unavailable_artifact(db, config, artifact, call, request)
+      end
+    else
+      nil ->
+        %{code: "not_found", message: "artifact not found"}
+
+      {:error, refusal} ->
+        refusal
+
+      _ ->
+        %{
+          code: "invalid",
+          message: "artifact recovery requires an authenticated principal and key"
+        }
+    end
+  end
+
+  defp recover_unavailable_artifact(db, config, artifact, call, request) do
+    with true <- artifact.state in ["legacy-unavailable", "corrupt-unavailable"],
+         :ok <- validate_recovery_expected_digest(artifact, call.params[:expected_digest]) do
+      capture_opts = %{
+        artifact_id: artifact.artifact_id,
+        base_dir: config.base_dir,
+        source_root: call.params.import_root,
+        relative_path: call.params.import_relative_path,
+        declared_length: call.params.declared_length,
+        expected_digest: call.params[:expected_digest],
+        principal: call.origin,
+        request: request
+      }
+
+      case ArtifactContent.capture(db, capture_opts) do
+        {:ok, released} -> released
+        {:error, refusal} -> refusal
+      end
+    else
+      false ->
+        %{code: "content_not_unavailable", message: "artifact content is not recoverable"}
+
+      {:error, refusal} ->
+        refusal
+    end
+  end
+
+  defp authorize_artifact_recovery(db, artifact, call) do
+    creator = Org.get(db, artifact.created_by_session)
+
+    if admin_origin?(db, call.origin) or
+         (call.principal == {:session, artifact.created_by_session} and
+            match?(%{state: "active"}, creator)) do
+      :ok
+    else
+      {:error,
+       %{
+         code: "not_authorized",
+         message: "artifact recovery requires its active creator session or an administrator"
+       }}
+    end
+  end
+
+  defp validate_recovery_expected_digest(
+         %{state: "corrupt-unavailable", content_recovery_sha256: recovery_digest},
+         expected_digest
+       )
+       when is_binary(expected_digest) and expected_digest != recovery_digest,
+       do:
+         {:error,
+          %{
+            code: "content_digest_mismatch",
+            message: "expected digest differs from the recovery digest"
+          }}
+
+  defp validate_recovery_expected_digest(_artifact, _expected_digest), do: :ok
+
+  defp artifact_recovery_principal({:session, session_key}), do: {"session", session_key}
+  defp artifact_recovery_principal({:user, user_id}), do: {"user", user_id}
+
   defp provision_host_endpoints(db, config, cli_token) do
     config.base_dir
     |> Placement.hosts(db)
@@ -715,9 +892,30 @@ defmodule Tightbeam.Gateway do
         end
       end,
       "facts-read" => fn call -> facts_read_result(db, call) end,
-      "artifact-record" => fn call -> Artifacts.record(db, call) end,
+      "artifact-record" => fn call ->
+        if call.params[:import_root],
+          do: record_imported_artifact(db, config, call),
+          else: Artifacts.record(db, call)
+      end,
       "artifact-get" => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
+      end,
+      "artifact-content-fetch" => fn call ->
+        case ArtifactContent.fetch(
+               db,
+               config.base_dir,
+               call.params[:artifact_id],
+               call.origin
+             ) do
+          {:ok, result} -> result
+          {:error, refusal} -> refusal
+        end
+      end,
+      "artifact-content-fetch-complete" => fn call ->
+        ArtifactContent.complete_fetch(db, call)
+      end,
+      "artifact-content-recover" => fn call ->
+        recover_imported_artifact(db, config, call)
       end,
       "artifacts" => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
       "rule" => fn call ->
@@ -6493,46 +6691,10 @@ defmodule Tightbeam.Gateway do
 
           %{owner_user_id: ^owner} = session ->
             if session.state == "active" do
-              {:ok, result} =
-                DB.transaction(db, fn txn ->
-                  result =
-                    retire_cascade_in_txn(
-                      txn,
-                      session.session_key,
-                      owner,
-                      call.origin,
-                      Map.fetch!(config, :wake_tick_ms),
-                      "retired: session retired before execution"
-                    )
-
-                  if result.retired != [] and p[:idempotency_key] do
-                    Idempotency.put_in_txn(txn, %{
-                      owner_user_id: owner,
-                      operation: "retire",
-                      idempotency_key: p.idempotency_key,
-                      session_key: session.session_key
-                    })
-                  end
-
-                  result
-                end)
-
-              Enum.each(result.retired, fn retired ->
-                broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
-                Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
-
-                Enum.each(retired.assignments, fn assignment ->
-                  emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
-                end)
-              end)
-
-              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
-
-              %{
-                deleted_session_key: session.session_key,
-                retired_session_keys: Enum.map(result.retired, & &1.session_key),
-                deferred: result.deferred
-              }
+              case capture_retiring_artifacts(config, db, session.session_key, call.origin) do
+                :ok -> commit_retirement(config, db, call, session, owner)
+                {:error, refusal} -> refusal
+              end
             else
               %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []}
             end
@@ -6541,6 +6703,280 @@ defmodule Tightbeam.Gateway do
             %{code: "not_found"}
         end
     end
+  end
+
+  defp commit_retirement(config, db, call, session, owner) do
+    p = call.params
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        result =
+          retire_cascade_in_txn(
+            txn,
+            session.session_key,
+            owner,
+            call.origin,
+            Map.fetch!(config, :wake_tick_ms),
+            "retired: session retired before execution"
+          )
+
+        if result.retired != [] and p[:idempotency_key] do
+          Idempotency.put_in_txn(txn, %{
+            owner_user_id: owner,
+            operation: "retire",
+            idempotency_key: p.idempotency_key,
+            session_key: session.session_key
+          })
+        end
+
+        result
+      end)
+
+    Enum.each(result.retired, fn retired ->
+      broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
+      Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+
+      Enum.each(retired.assignments, fn assignment ->
+        emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+      end)
+    end)
+
+    reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+
+    %{
+      deleted_session_key: session.session_key,
+      retired_session_keys: Enum.map(result.retired, & &1.session_key),
+      deferred: result.deferred
+    }
+  end
+
+  defp capture_retiring_artifacts(config, db, root_session_key, principal) do
+    artifacts =
+      active_subtree_keys(db, root_session_key)
+      |> Enum.flat_map(fn session_key ->
+        session = Org.get(db, session_key)
+
+        Artifacts.list(db, %{session_key: session_key})
+        |> Enum.map(&{session, &1})
+      end)
+
+    corrupt =
+      Enum.find(artifacts, fn {_session, artifact} -> artifact.state == "corrupt-unavailable" end)
+
+    candidates =
+      Enum.filter(artifacts, fn {_session, artifact} ->
+        artifact.state in ["in-workspace", "archived", "legacy-unavailable"]
+      end)
+
+    with nil <- corrupt,
+         {:ok, captures} <- retirement_capture_sources(config, db, candidates) do
+      case captures do
+        [] ->
+          :ok
+
+        _ ->
+          case ArtifactContent.capture_many(db, captures, %{
+                 base_dir: config.base_dir,
+                 principal: principal
+               }) do
+            {:ok, _released} -> :ok
+            {:error, refusal} -> {:error, refusal}
+          end
+      end
+    else
+      {:error, refusal} ->
+        {:error, refusal}
+
+      {_session, artifact} ->
+        {:error,
+         %{
+           code: "content_corrupt",
+           message:
+             "artifact #{artifact.artifact_id} requires exact-digest recovery before retirement"
+         }}
+    end
+  end
+
+  defp promote_legacy_artifact_content(config, db) do
+    {:ok, pending} =
+      DB.query(
+        db,
+        """
+        SELECT artifactId FROM artifact_content_migrations
+        WHERE migrationId = ?1 AND outcome = 'pending'
+        ORDER BY artifactId
+        """,
+        [ArtifactContent.migration_id()]
+      )
+
+    Enum.each(pending, fn [artifact_id] ->
+      artifact = Artifacts.get(db, artifact_id)
+      session = artifact && Org.get(db, artifact.created_by_session)
+
+      result =
+        with artifact when not is_nil(artifact) <- artifact,
+             session when not is_nil(session) <- session,
+             {:ok, root, relative} <- retirement_capture_source(config, db, session, artifact),
+             {:ok, released} <-
+               ArtifactContent.capture(db, %{
+                 artifact_id: artifact.artifact_id,
+                 base_dir: config.base_dir,
+                 source_root: root,
+                 relative_path: relative,
+                 principal: "process:tightbeam"
+               }) do
+          {:released, released}
+        else
+          nil -> {:error, %{code: "legacy-source-missing"}}
+          {:error, refusal} -> {:error, refusal}
+        end
+
+      now = System.system_time(:millisecond)
+
+      case result do
+        {:released, released} ->
+          {:ok, _} =
+            DB.query(
+              db,
+              """
+              UPDATE artifact_content_migrations
+              SET outcome = 'released', contentSha256 = ?2, contentSize = ?3,
+                  reason = NULL, updatedAt = ?4
+              WHERE migrationId = ?1 AND artifactId = ?5 AND outcome = 'pending'
+              """,
+              [
+                ArtifactContent.migration_id(),
+                released.content_sha256,
+                released.content_size,
+                now,
+                artifact_id
+              ]
+            )
+
+        {:error, refusal} ->
+          reason = refusal[:code] || "legacy-source-unavailable"
+
+          {:ok, :ok} =
+            DB.transaction(db, fn txn ->
+              DB.Txn.q(
+                txn,
+                """
+                UPDATE artifacts SET unavailableReason = ?2, updatedAt = ?3
+                WHERE artifactId = ?1 AND state = 'legacy-unavailable'
+                """,
+                [artifact_id, reason, now]
+              )
+
+              DB.Txn.q(
+                txn,
+                """
+                UPDATE artifact_content_migrations
+                SET outcome = 'unavailable', reason = ?2, updatedAt = ?3
+                WHERE migrationId = ?4 AND artifactId = ?1 AND outcome = 'pending'
+                """,
+                [artifact_id, reason, now, ArtifactContent.migration_id()]
+              )
+
+              :ok
+            end)
+      end
+    end)
+
+    :ok
+  end
+
+  defp retirement_capture_sources(config, db, candidates) do
+    Enum.reduce_while(candidates, {:ok, []}, fn {session, artifact}, {:ok, captures} ->
+      case retirement_capture_source(config, db, session, artifact) do
+        {:ok, root, relative} ->
+          capture = %{
+            artifact_id: artifact.artifact_id,
+            source_root: root,
+            relative_path: relative
+          }
+
+          {:cont, {:ok, captures ++ [capture]}}
+
+        {:error, refusal} ->
+          {:halt, {:error, refusal}}
+      end
+    end)
+  end
+
+  defp retirement_capture_source(config, db, session, artifact)
+
+  defp retirement_capture_source(_config, _db, _session, %{home: home})
+       when is_binary(home) do
+    {:ok, Path.dirname(home), Path.basename(home)}
+  end
+
+  defp retirement_capture_source(config, db, session, artifact) do
+    host = Placement.hosts(config.base_dir, db)[session.host]
+
+    if host && host.ssh != nil do
+      {:error, %{code: "source_not_local", message: "artifact source is on another host"}}
+    else
+      workspace = Placement.workdir_path(config, session)
+      local_origin = local_origin_path(artifact.origin_path, session.host)
+
+      with {:ok, origin} <- local_origin,
+           {:ok, relative} <- relative_below(workspace, origin) do
+        {:ok, workspace, relative}
+      end
+    end
+  end
+
+  defp local_origin_path(origin, host) do
+    case Regex.run(~r{^([^/:]+):(/.*)$}, origin) do
+      [_, ^host, path] ->
+        {:ok, path}
+
+      [_, _other, _path] ->
+        {:error, %{code: "source_not_local", message: "artifact source is on another host"}}
+
+      nil ->
+        {:ok, origin}
+    end
+  end
+
+  defp relative_below(workspace, origin) when is_binary(workspace) do
+    relative =
+      if Path.type(origin) == :absolute,
+        do: Path.relative_to(origin, workspace),
+        else: origin
+
+    if Path.type(relative) == :absolute or relative == ".." or
+         String.starts_with?(relative, "../") do
+      {:error, %{code: "source_escape", message: "artifact source escapes its workspace"}}
+    else
+      {:ok, relative}
+    end
+  end
+
+  defp relative_below(_workspace, _origin),
+    do: {:error, %{code: "source_unavailable", message: "artifact workspace is unavailable"}}
+
+  defp active_subtree_keys(db, root_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT sessionKey, spawnedBy, state FROM sessions ORDER BY createdAt, sessionKey"
+      )
+
+    children = Enum.group_by(rows, &Enum.at(&1, 1))
+
+    walk = fn walk, key ->
+      descendants =
+        children
+        |> Map.get(key, [])
+        |> Enum.flat_map(fn [child_key, _parent, state] ->
+          if state == "active", do: walk.(walk, child_key), else: []
+        end)
+
+      descendants ++ [key]
+    end
+
+    walk.(walk, root_key)
   end
 
   defp critical_result(config, db, call) do

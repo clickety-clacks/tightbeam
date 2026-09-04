@@ -55,6 +55,15 @@ pub enum Command {
         json: bool,
         base_dir: Option<String>,
     },
+    /// Gateway-only descriptor custody helper. Deliberately omitted from help:
+    /// it is an internal pipe endpoint, not an operator command.
+    ArtifactCustodyRead {
+        root: String,
+        relative_path: String,
+    },
+    ArtifactContentStat {
+        path: String,
+    },
     Wake {
         identity: Identity,
         target: Target,
@@ -82,6 +91,19 @@ pub enum Command {
         description: Option<String>,
         work_item_id: Option<String>,
         content_sha256: Option<String>,
+        idempotency_key: Option<String>,
+    },
+    ArtifactContentFetch {
+        identity: Identity,
+        artifact_id: String,
+        output: String,
+    },
+    ArtifactContentRecover {
+        identity: Identity,
+        artifact_id: String,
+        path: String,
+        idempotency_key: String,
+        expected_digest: Option<String>,
     },
     Artifacts {
         identity: Identity,
@@ -477,7 +499,13 @@ COMMANDS:
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
+                  [--key <idempotencyKey>]
       Record a deliberate artifact pointer for the calling session.
+  artifact-content-fetch <artifactId> --output <path>
+      Fetch verified released bytes without replacing an existing output.
+  artifact-content-recover <artifactId> --path <path> --key <idempotencyKey>
+                           [--sha256 <expected>]
+      Recover unavailable content through verified immutable custody.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
 
@@ -1093,6 +1121,32 @@ fn parse_with_optional_catalog(
                 base_dir,
             })
         }
+        "artifact-custody-read" => {
+            if parsed.positional.len() != 1
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "root" | "path"))
+            {
+                return Err(
+                    "usage: tightbeam artifact-custody-read --root <trustedRoot> --path <relativePath>"
+                        .to_owned(),
+                );
+            }
+
+            Ok(Command::ArtifactCustodyRead {
+                root: nonempty(flags, "root").ok_or_else(|| "--root is required".to_owned())?,
+                relative_path: nonempty(flags, "path")
+                    .ok_or_else(|| "--path is required".to_owned())?,
+            })
+        }
+        "artifact-content-stat" => {
+            if parsed.positional.len() != 1 || flags.keys().any(|flag| flag.as_str() != "path") {
+                return Err("usage: tightbeam artifact-content-stat --path <path>".to_owned());
+            }
+            Ok(Command::ArtifactContentStat {
+                path: nonempty(flags, "path").ok_or_else(|| "--path is required".to_owned())?,
+            })
+        }
         "harness-process" => parse_harness_process(&parsed, flags),
         "wake" => {
             let targets = [
@@ -1195,6 +1249,45 @@ fn parse_with_optional_catalog(
                 description: nonempty(flags, "description"),
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
+                idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "artifact-content-fetch" => {
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| {
+                    !matches!(flag.as_str(), "output" | "as" | "as-user" | "as-process")
+                })
+            {
+                return Err(
+                    "usage: tightbeam artifact-content-fetch <artifactId> --output <path>"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::ArtifactContentFetch {
+                identity: identity(flags)?,
+                artifact_id: parsed.positional[1].clone(),
+                output: nonempty(flags, "output")
+                    .ok_or_else(|| "--output is required".to_owned())?,
+            })
+        }
+        "artifact-content-recover" => {
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| {
+                    !matches!(
+                        flag.as_str(),
+                        "path" | "key" | "sha256" | "as" | "as-user" | "as-process"
+                    )
+                })
+            {
+                return Err("usage: tightbeam artifact-content-recover <artifactId> --path <path> --key <idempotencyKey> [--sha256 <expected>]".to_owned());
+            }
+            Ok(Command::ArtifactContentRecover {
+                identity: identity(flags)?,
+                artifact_id: parsed.positional[1].clone(),
+                path: nonempty(flags, "path").ok_or_else(|| "--path is required".to_owned())?,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+                expected_digest: nonempty(flags, "sha256"),
             })
         }
         "tool-call-observed" => {
@@ -1851,7 +1944,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifact-content-recover, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2233,6 +2326,116 @@ mod tests {
             strings(&["-h"]),
         ] {
             assert_eq!(parse(args), Ok(Command::Help));
+        }
+    }
+
+    #[test]
+    fn parses_hidden_artifact_custody_mode_exactly() {
+        assert_eq!(
+            parse(strings(&[
+                "artifact-custody-read",
+                "--root",
+                "/srv/tightbeam/work/session-a",
+                "--path",
+                "reports/result.md",
+            ])),
+            Ok(Command::ArtifactCustodyRead {
+                root: "/srv/tightbeam/work/session-a".to_owned(),
+                relative_path: "reports/result.md".to_owned(),
+            })
+        );
+
+        for args in [
+            strings(&["artifact-custody-read", "--path", "result.md"]),
+            strings(&["artifact-custody-read", "--root", "/srv/root"]),
+            strings(&[
+                "artifact-custody-read",
+                "--root",
+                "/srv/root",
+                "--path",
+                "result.md",
+                "--as-user",
+                "flynn",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_artifact_content_fetch_with_exclusive_output() {
+        assert_eq!(
+            parse(strings(&[
+                "artifact-content-fetch",
+                "art_12345678",
+                "--output",
+                "result.bin",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::ArtifactContentFetch {
+                identity: Identity::User("flynn".to_owned()),
+                artifact_id: "art_12345678".to_owned(),
+                output: "result.bin".to_owned(),
+            })
+        );
+
+        for args in [
+            strings(&["artifact-content-fetch", "art_12345678"]),
+            strings(&["artifact-content-fetch", "--output", "result.bin"]),
+            strings(&[
+                "artifact-content-fetch",
+                "art_12345678",
+                "--output",
+                "result.bin",
+                "--sha256",
+                "caller-selected",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_artifact_content_recovery_with_required_replay_key() {
+        assert_eq!(
+            parse(strings(&[
+                "artifact-content-recover",
+                "art_12345678",
+                "--path",
+                "recovered.bin",
+                "--key",
+                "recover-1",
+                "--sha256",
+                "abc123",
+                "--as-user",
+                "flynn",
+            ])),
+            Ok(Command::ArtifactContentRecover {
+                identity: Identity::User("flynn".to_owned()),
+                artifact_id: "art_12345678".to_owned(),
+                path: "recovered.bin".to_owned(),
+                idempotency_key: "recover-1".to_owned(),
+                expected_digest: Some("abc123".to_owned()),
+            })
+        );
+
+        for args in [
+            strings(&[
+                "artifact-content-recover",
+                "art_12345678",
+                "--path",
+                "recovered.bin",
+            ]),
+            strings(&[
+                "artifact-content-recover",
+                "--path",
+                "recovered.bin",
+                "--key",
+                "recover-1",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
         }
     }
 
@@ -2767,6 +2970,8 @@ mod tests {
                 "assimilate",
                 "assign",
                 "assignments",
+                "artifact-content-fetch",
+                "artifact-content-recover",
                 "artifact-record",
                 "artifacts",
                 "attest",
@@ -3354,7 +3559,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifact-content-recover, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 

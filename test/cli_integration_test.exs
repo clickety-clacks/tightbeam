@@ -7,6 +7,7 @@ defmodule Tightbeam.CliIntegrationTest do
   alias Tightbeam.{
     Assets,
     Archetypes,
+    Artifacts,
     Assignments,
     CliCompatibility,
     ConditionFacts,
@@ -18,6 +19,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Idempotency,
     Ledger,
     Org,
+    Placement,
     Projection,
     RailRemedy,
     Rails,
@@ -30,8 +32,22 @@ defmodule Tightbeam.CliIntegrationTest do
 
   alias Tightbeam.Wire.Router
 
+  @cli_dir Path.expand("../cli", __DIR__)
+  @release_binary Path.join(@cli_dir, "target/release/tightbeam")
+
+  setup_all do
+    {output, status} =
+      System.cmd("cargo", ["build", "--release"], cd: @cli_dir, stderr_to_stdout: true)
+
+    if status != 0 do
+      raise "CLI integration build failed (exit #{status}):\n#{output}"
+    end
+
+    :ok
+  end
+
   setup do
-    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
+    binary = @release_binary
 
     unless File.exists?(binary) do
       raise "CLI integration binary missing: #{binary}; run cargo build --release in cli/"
@@ -50,6 +66,12 @@ defmodule Tightbeam.CliIntegrationTest do
     outside = Path.join(base_dir, "outside")
     File.mkdir_p!(workdir)
     File.mkdir_p!(outside)
+    File.mkdir_p!(Path.join(base_dir, "bin"))
+    test_binary = Path.join([base_dir, "bin", "tightbeam"])
+    File.cp!(binary, test_binary)
+    File.chmod!(test_binary, 0o755)
+    Application.put_env(:tightbeam, :artifact_content_quota_bytes, "33554432")
+    Application.put_env(:tightbeam, :artifact_content_reserved_free_bytes, "0")
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     # Delegate to the ONE canonical schema list. A hand-kept copy here is how
@@ -135,7 +157,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
     bandit =
       start_supervised!(
-        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        restart: :temporary
       )
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
@@ -151,10 +174,12 @@ defmodule Tightbeam.CliIntegrationTest do
 
     %{
       base_dir: base_dir,
-      binary: binary,
+      binary: test_binary,
       db: db,
       handlers: handlers,
+      bandit: bandit,
       port: port,
+      router_opts: router_opts,
       session: session,
       worker: worker,
       workdir: workdir,
@@ -178,6 +203,268 @@ defmodule Tightbeam.CliIntegrationTest do
     version = String.trim(version)
 
     assert version == CliCompatibility.required_version()
+  end
+
+  test "real CLI fetch installs verified bytes exclusively and then files completion", ctx do
+    bytes = <<0, 1, 255, "released bytes", 0>>
+    source = Path.join(ctx.workdir, "released.bin")
+    output = Path.join(ctx.outside, "fetched.bin")
+    File.write!(source, bytes)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items
+          (id, title, ownerUserId, createdByUser, createdAt)
+        VALUES ('wi_fetch', 'Fetch', 'flynn', 'flynn', 1)
+        """
+      )
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Released bytes",
+          "--path",
+          "released.bin",
+          "--work-item",
+          "wi_fetch",
+          "--key",
+          "record-fetch-fixture"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    artifact_id = JSON.decode!(recorded)["artifactId"]
+    assert Artifacts.get(ctx.db, artifact_id).state == "released"
+    assert_receive {:cli_call, %{verb: "artifact-record"}}
+
+    File.rm!(source)
+
+    {receipt, 0} =
+      System.cmd(
+        ctx.binary,
+        ["artifact-content-fetch", artifact_id, "--output", output],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert File.read!(output) == bytes
+    assert JSON.decode!(receipt)["completed"] == true
+
+    assert_receive {:cli_call, %{verb: "artifact-content-fetch"}}
+    assert_receive {:cli_call, %{verb: "artifact-content-fetch-complete"}}
+
+    {collision, 1} =
+      System.cmd(
+        ctx.binary,
+        ["artifact-content-fetch", artifact_id, "--output", output],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert collision =~ "output already exists"
+    assert File.read!(output) == bytes
+    assert_receive {:cli_call, %{verb: "artifact-content-fetch"}}
+    refute_receive {:cli_call, %{verb: "artifact-content-fetch-complete"}}
+  end
+
+  test "real CLI fetch survives retirement, workspace removal, and gateway restart", ctx do
+    session =
+      Org.create(ctx.db, %{
+        session_key: "cli-retirement-holder",
+        display_name: "CLI retirement holder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    Roles.create!(ctx.db, "cli-retirement-holder", "flynn", session.session_key)
+
+    workspace = Placement.workdir_path(%{base_dir: ctx.base_dir, db: ctx.db}, session)
+    File.mkdir_p!(workspace)
+
+    File.write!(
+      Path.join(workspace, ".tightbeam-session"),
+      JSON.encode!(%{
+        url: "http://127.0.0.1:#{ctx.port}",
+        token: session.cli_token,
+        sessionKey: session.session_key
+      })
+    )
+
+    bytes = <<0, 255, "post-retirement", 0>>
+    File.write!(Path.join(workspace, "retired.bin"), bytes)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items
+          (id, title, ownerUserId, createdByUser, createdAt)
+        VALUES ('wi_retirement_fetch', 'Retirement fetch', 'flynn', 'flynn', 1)
+        """
+      )
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Post-retirement bytes",
+          "--path",
+          "retired.bin",
+          "--work-item",
+          "wi_retirement_fetch",
+          "--key",
+          "retirement-fetch-record"
+        ],
+        cd: workspace,
+        stderr_to_stdout: true
+      )
+
+    artifact_id = JSON.decode!(recorded)["artifactId"]
+    assert Artifacts.get(ctx.db, artifact_id).state == "released"
+
+    org_env = [
+      {"TIGHTBEAM_URL", "http://127.0.0.1:#{ctx.port}"},
+      {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+    ]
+
+    if Process.whereis(Tightbeam.ConnRegistry) == nil do
+      start_supervised!({Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry})
+    end
+
+    {retired, 0} =
+      System.cmd(
+        ctx.binary,
+        ["retire", "--session", session.session_key, "--as-user", "flynn"],
+        cd: ctx.outside,
+        env: org_env,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(retired)["retiredSessionKeys"] == [session.session_key]
+    refute File.exists?(workspace)
+
+    GenServer.stop(ctx.bandit)
+    :ok = Tightbeam.ArtifactContent.cleanup_temps(ctx.base_dir)
+    :ok = Tightbeam.ArtifactContent.boot_scrub!(ctx.db, ctx.base_dir)
+
+    restarted =
+      start_supervised!(
+        {Bandit,
+         plug: {Router, ctx.router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        restart: :temporary
+      )
+
+    {:ok, {_address, restarted_port}} = ThousandIsland.listener_info(restarted)
+    output = Path.join(ctx.outside, "post-retirement.bin")
+
+    fetch_env = [
+      {"TIGHTBEAM_URL", "http://127.0.0.1:#{restarted_port}"},
+      {"TIGHTBEAM_TOKEN", "tbc_cli_integration"}
+    ]
+
+    {receipt, 0} =
+      System.cmd(
+        ctx.binary,
+        ["artifact-content-fetch", artifact_id, "--output", output, "--as-user", "flynn"],
+        cd: ctx.outside,
+        env: fetch_env,
+        stderr_to_stdout: true
+      )
+
+    assert File.read!(output) == bytes
+    assert JSON.decode!(receipt)["completed"] == true
+  end
+
+  test "real CLI recovers legacy bytes through authenticated import custody", ctx do
+    bytes = <<0, 255, "legacy recovery", 0>>
+    source = Path.join(ctx.workdir, "legacy-recovery.bin")
+    File.write!(source, bytes)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO work_items
+          (id, title, ownerUserId, createdByUser, createdAt)
+        VALUES ('wi_recover', 'Recover', 'flynn', 'flynn', 1)
+        """
+      )
+
+    {recorded, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-record",
+          "--kind",
+          "report",
+          "--title",
+          "Legacy bytes",
+          "--path",
+          "legacy-recovery.bin",
+          "--work-item",
+          "wi_recover"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    artifact_id = JSON.decode!(recorded)["artifactId"]
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE artifacts
+        SET state='legacy-unavailable', unavailableReason='migration-pending'
+        WHERE artifactId=?1
+        """,
+        [artifact_id]
+      )
+
+    digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+    {receipt, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "artifact-content-recover",
+          artifact_id,
+          "--path",
+          "legacy-recovery.bin",
+          "--key",
+          "recover-cli-fixture",
+          "--sha256",
+          digest
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(receipt)["state"] == "released"
+    released = Artifacts.get(ctx.db, artifact_id)
+    assert released.content_sha256 == digest
+    assert released.content_size == byte_size(bytes)
+    assert File.read!(Tightbeam.ArtifactContent.cas_path(ctx.base_dir, digest)) == bytes
+
+    assert_receive {:cli_call, %{verb: "artifact-record"}}
+    assert_receive {:cli_call, %{verb: "artifact-content-recover"}}
   end
 
   test "real tune CLI uses session identity, typed fields, and structured refusals", ctx do

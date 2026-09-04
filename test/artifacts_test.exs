@@ -69,7 +69,9 @@ defmodule Tightbeam.ArtifactsTest do
     assert first.state == "in-workspace"
     assert first.home == nil
     assert first.origin_path == "specs/banana.md"
-    assert first.content_sha256 == "abc123"
+    assert first.content_sha256 == nil
+    assert first.content_size == nil
+    assert first.legacy_declared_sha256 == "abc123"
 
     assert Artifacts.get(ctx.db, first.artifact_id) == first
 
@@ -148,8 +150,8 @@ defmodule Tightbeam.ArtifactsTest do
 
     assert Enum.map(columns, &Enum.at(&1, 1)) == ~w(
              artifactId kind title description createdBySession workItemId parentSession
-             originPath contentSha256 recordedMessageId recordedTurnEvidence state home
-             createdAt updatedAt
+             originPath contentSha256 contentSize contentRecoverySha256 legacyDeclaredSha256
+             unavailableReason recordedMessageId recordedTurnEvidence state home createdAt updatedAt
            )
 
     # NULLABLE now, and paired with a closed evidence domain.
@@ -245,9 +247,36 @@ defmodule Tightbeam.ArtifactsTest do
                        'msg_child', 'released', '/claimed/home', 1, 1)
                """
              )
+
+    assert {:error, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId, originPath,
+                  recordedTurnEvidence, state, createdAt, updatedAt)
+               VALUES ('art_false_release', 'other', 'Bad', 'child', 'wi_banana', 'bad',
+                       'none', 'released', 1, 1)
+               """
+             )
+
+    digest = String.duplicate("a", 64)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO artifacts
+                 (artifactId, kind, title, createdBySession, workItemId, originPath,
+                  contentSha256, contentSize, recordedTurnEvidence, state, createdAt, updatedAt)
+               VALUES ('art_real_release', 'other', 'Good', 'child', 'wi_banana', 'good',
+                       ?1, 4, 'none', 'released', 1, 1)
+               """,
+               [digest]
+             )
   end
 
-  test "archives the exact artifact home and release clears custody location", ctx do
+  test "workspace cleanup requires captured release and clears no custody location", ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
 
@@ -270,26 +299,22 @@ defmodule Tightbeam.ArtifactsTest do
         work_item_id: "wi_banana"
       })
 
-    assert :ok =
-             Artifacts.archive_session(
-               ctx.db,
-               ctx.child.session_key,
-               workspace,
-               archive_root
-             )
+    assert_raise ArgumentError, ~r/workspace cleanup requires released artifact content/, fn ->
+      Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+    end
 
-    archived = Artifacts.get(ctx.db, row.artifact_id)
-    [archive_dir_name] = File.ls!(archive_root)
+    assert File.read!(Path.join(workspace, "reports/result.md")) == "durable result"
+    assert Artifacts.get(ctx.db, row.artifact_id).state == "in-workspace"
+    refute File.exists?(archive_root)
 
-    assert archived.state == "archived"
-    assert archived.home == Path.join([archive_root, archive_dir_name, "reports/result.md"])
-    assert File.read!(archived.home) == "durable result"
-    refute File.exists?(workspace)
+    mark_released!(ctx.db, row.artifact_id, "durable result")
+    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
 
-    released = Artifacts.release(ctx.db, row.artifact_id)
+    released = Artifacts.get(ctx.db, row.artifact_id)
     assert released.state == "released"
     assert released.home == nil
-    assert released.artifact_id == row.artifact_id
+    refute File.exists?(workspace)
+    refute File.exists?(archive_root)
   end
 
   test "archive failure preserves in-workspace truth instead of inventing custody", ctx do
@@ -303,7 +328,7 @@ defmodule Tightbeam.ArtifactsTest do
     archive_root =
       Path.join(System.tmp_dir!(), "missing-artifacts-#{System.unique_integer([:positive])}")
 
-    assert_raise ArgumentError, "workspace is unavailable for artifact archival", fn ->
+    assert_raise ArgumentError, ~r/workspace cleanup requires released artifact content/, fn ->
       Artifacts.archive_session(
         ctx.db,
         ctx.child.session_key,
@@ -318,7 +343,7 @@ defmodule Tightbeam.ArtifactsTest do
     refute File.exists?(archive_root)
   end
 
-  test "acceptance 7: an origin outside the workspace is external — released, and nothing raises",
+  test "an origin outside the workspace cannot create a released claim or permit cleanup",
        ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
@@ -345,20 +370,20 @@ defmodule Tightbeam.ArtifactsTest do
         origin_path: outside
       })
 
-    # The work happened somewhere Tightbeam does not hold. The ROW is the
-    # record; there is nothing to take into custody, and nothing raises.
-    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+    assert_raise ArgumentError, ~r/workspace cleanup requires released artifact content/, fn ->
+      Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+    end
 
     external = Artifacts.get(ctx.db, row.artifact_id)
-    assert external.state == "released"
+    assert external.state == "in-workspace"
     assert external.home == nil
     assert external.origin_path == outside
     assert File.read!(outside) == "not in workspace"
-    refute File.exists?(workspace)
+    assert File.exists?(workspace)
     refute File.exists?(archive_root)
   end
 
-  test "canonical custody accepts an internal symlink and records the archived target", ctx do
+  test "an internal symlink cannot bypass closed native custody", ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
 
@@ -381,24 +406,19 @@ defmodule Tightbeam.ArtifactsTest do
         origin_path: "inside-link.md"
       })
 
-    assert :ok =
-             Artifacts.archive_session(
-               ctx.db,
-               ctx.child.session_key,
-               workspace,
-               archive_root
-             )
+    assert_raise ArgumentError, ~r/workspace cleanup requires released artifact content/, fn ->
+      Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+    end
 
-    [archive_dir_name] = File.ls!(archive_root)
-    archived = Artifacts.get(ctx.db, row.artifact_id)
-
-    assert archived.state == "archived"
-    assert archived.home == Path.join([archive_root, archive_dir_name, "data/inside.md"])
-    assert File.read!(archived.home) == "inside"
-    refute File.exists?(workspace)
+    unchanged = Artifacts.get(ctx.db, row.artifact_id)
+    assert unchanged.state == "in-workspace"
+    assert unchanged.home == nil
+    assert File.read!(Path.join(workspace, "data/inside.md")) == "inside"
+    assert File.exists?(workspace)
+    refute File.exists?(archive_root)
   end
 
-  test "a symlink to bytes outside the workspace is external, not custody", ctx do
+  test "a symlink to bytes outside the workspace cannot invent custody", ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
 
@@ -425,19 +445,19 @@ defmodule Tightbeam.ArtifactsTest do
         origin_path: "outside-link.md"
       })
 
-    # The bytes live outside the workspace, so the link is a pointer at external
-    # work — released, never claimed as custody Tightbeam does not have.
-    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+    assert_raise ArgumentError, ~r/workspace cleanup requires released artifact content/, fn ->
+      Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+    end
 
     external = Artifacts.get(ctx.db, row.artifact_id)
-    assert external.state == "released"
+    assert external.state == "in-workspace"
     assert external.home == nil
     assert File.read!(outside) == "outside"
-    refute File.exists?(workspace)
+    assert File.exists?(workspace)
     refute File.exists?(archive_root)
   end
 
-  test "valid artifacts archive beside each external and unreadable mixed-row class", ctx do
+  test "one uncapturable artifact blocks cleanup for every mixed-row class", ctx do
     for invalid_kind <- [:outside, :missing, :external_symlink] do
       suffix = "#{invalid_kind}-#{System.unique_integer([:positive])}"
       session_key = "mixed-#{suffix}"
@@ -478,46 +498,28 @@ defmodule Tightbeam.ArtifactsTest do
           origin_path: invalid_origin
         })
 
-      assert :ok =
-               Artifacts.archive_session(
-                 ctx.db,
-                 session_key,
-                 workspace,
-                 archive_root
-               )
-
-      [archive_dir_name] = File.ls!(archive_root)
-      archived = Artifacts.get(ctx.db, valid.artifact_id)
-      other = Artifacts.get(ctx.db, invalid.artifact_id)
-
-      assert archived.state == "archived"
-
-      assert archived.home ==
-               Path.join([archive_root, archive_dir_name, "reports/valid.md"])
-
-      assert File.read!(archived.home) == "valid #{invalid_kind}"
-
-      # An origin OUTSIDE the workspace (directly or through a link) is external
-      # work, released. An origin inside the workspace that is not there at all
-      # is neither: nothing was released, so the row stays as recorded.
-      case invalid_kind do
-        :missing ->
-          assert other.state == "in-workspace"
-          assert other.home == nil
-
-        _external ->
-          assert other.state == "released"
-          assert other.home == nil
+      assert_raise ArgumentError, ~r/workspace cleanup requires released artifact content/, fn ->
+        Artifacts.archive_session(ctx.db, session_key, workspace, archive_root)
       end
 
-      refute File.exists?(workspace)
+      unchanged = Artifacts.get(ctx.db, valid.artifact_id)
+      other = Artifacts.get(ctx.db, invalid.artifact_id)
 
+      assert unchanged.state == "in-workspace"
+      assert other.state == "in-workspace"
+      assert unchanged.home == nil
+      assert other.home == nil
+      assert File.read!(Path.join(workspace, "reports/valid.md")) == "valid #{invalid_kind}"
+      assert File.exists?(workspace)
+      refute File.exists?(archive_root)
+
+      File.rm_rf!(workspace)
       File.rm_rf!(archive_root)
       File.rm!(outside)
     end
   end
 
-  test "an origin that names a machine is external without ever touching the workspace", ctx do
+  test "an origin that names a machine stays unreleased without local custody", ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
 
@@ -536,15 +538,18 @@ defmodule Tightbeam.ArtifactsTest do
         origin_path: "shrdlu:/etc/nginx/sites-enabled/app"
       })
 
-    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+    assert_raise ArgumentError, ~r/workspace cleanup requires released artifact content/, fn ->
+      Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
+    end
 
     external = Artifacts.get(ctx.db, row.artifact_id)
-    assert external.state == "released"
+    assert external.state == "in-workspace"
     assert external.home == nil
+    assert File.exists?(workspace)
     refute File.exists?(archive_root)
   end
 
-  test "a remote session with only declared work archives with no reachable workspace", ctx do
+  test "a remote session with only declared work cannot claim release", ctx do
     row =
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
@@ -552,10 +557,11 @@ defmodule Tightbeam.ArtifactsTest do
         origin_path: "eurisko:/srv/app/report.md"
       })
 
-    # Reap passes nil for a workspace it cannot see (gateway archive_retired_workspace).
-    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, nil, "/unused")
+    assert_raise ArgumentError, ~r/workspace cleanup requires released artifact content/, fn ->
+      Artifacts.archive_session(ctx.db, ctx.child.session_key, nil, "/unused")
+    end
 
-    assert Artifacts.get(ctx.db, row.artifact_id).state == "released"
+    assert Artifacts.get(ctx.db, row.artifact_id).state == "in-workspace"
   end
 
   test "removes an artifact-free workspace", ctx do
@@ -583,6 +589,21 @@ defmodule Tightbeam.ArtifactsTest do
       session_key: session_key,
       params: Map.put_new(params, :work_item_id, "wi_banana")
     })
+  end
+
+  defp mark_released!(db, artifact_id, bytes) do
+    digest = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        UPDATE artifacts
+        SET state='released', contentSha256=?2, contentSize=?3, home=NULL
+        WHERE artifactId=?1
+        """,
+        [artifact_id, digest, byte_size(bytes)]
+      )
   end
 
   defp seed_work_items(db) do

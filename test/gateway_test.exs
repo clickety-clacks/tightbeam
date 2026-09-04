@@ -43,6 +43,12 @@ defmodule Tightbeam.GatewayTest do
     {:identity_repoint, "lib/tightbeam/gateway.ex", "Org.repoint_archetype_in_txn"}
   ]
 
+  @null_hash_fixture Path.expand(
+                       "fixtures/artifacts/dark-factory-flow-watchdog-design-final.md",
+                       __DIR__
+                     )
+  @null_hash_fixture_digest "550139de0f0e4732bd6e68f88a66c5d7e2533a9f44d81badcefe0b4253336c80"
+
   import ExUnit.CaptureLog
 
   alias Tightbeam.{
@@ -908,7 +914,8 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
   end
 
-  test "reap archives a local workspace with artifacts before adapter teardown", ctx do
+  test "retire refuses an uncapturable local artifact, then releases all bytes before cleanup",
+       ctx do
     ensure_global_registry()
 
     base_dir =
@@ -928,8 +935,17 @@ defmodule Tightbeam.GatewayTest do
     session = Org.get(ctx.db, session.session_key)
     workspace = Placement.workdir_path(%{base_dir: base_dir, db: ctx.db}, session)
     artifact_path = Path.join(workspace, "specs/banana.md")
+    second_path = Path.join(workspace, "reports/result.md")
     File.mkdir_p!(Path.dirname(artifact_path))
     File.write!(artifact_path, "banana")
+
+    cli_source = Path.expand("../cli/target/debug/tightbeam", __DIR__)
+    cli_target = Path.join([base_dir, "bin", "tightbeam"])
+    File.mkdir_p!(Path.dirname(cli_target))
+    File.cp!(cli_source, cli_target)
+    File.chmod!(cli_target, 0o755)
+    Application.put_env(:tightbeam, :artifact_content_quota_bytes, "1024")
+    Application.put_env(:tightbeam, :artifact_content_reserved_free_bytes, "0")
 
     {:ok, _} =
       DB.query(
@@ -967,18 +983,70 @@ defmodule Tightbeam.GatewayTest do
         }
       })
 
-    external =
+    second =
       Artifacts.record(ctx.db, %{
         principal: {:session, session.session_key},
         session_key: session.session_key,
         recorded_message_id: "msg_external_artifact",
         params: %{
           kind: "report",
-          title: "External report",
-          origin_path: "/outside/report.md",
+          title: "Result report",
+          origin_path: second_path,
           work_item_id: "wi_banana"
         }
       })
+
+    refused =
+      Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
+        origin: "user:flynn",
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert refused.code == "source_unavailable"
+    assert Org.get(ctx.db, session.session_key).state == "active"
+    assert File.exists?(workspace)
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "in-workspace"
+    assert Artifacts.get(ctx.db, second.artifact_id).state == "in-workspace"
+
+    File.mkdir_p!(Path.dirname(second_path))
+    File.write!(second_path, "result")
+
+    recovery_digest = :crypto.hash(:sha256, "result") |> Base.encode16(case: :lower)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE artifacts
+        SET state='corrupt-unavailable', contentRecoverySha256=?2,
+            unavailableReason='cas-missing'
+        WHERE artifactId=?1
+        """,
+        [second.artifact_id, recovery_digest]
+      )
+
+    corrupt_refusal =
+      Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
+        origin: "user:flynn",
+        session_key: session.session_key,
+        params: %{}
+      })
+
+    assert corrupt_refusal.code == "content_corrupt"
+    assert Org.get(ctx.db, session.session_key).state == "active"
+    assert File.exists?(workspace)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        UPDATE artifacts
+        SET state='in-workspace', contentRecoverySha256=NULL, unavailableReason=NULL
+        WHERE artifactId=?1
+        """,
+        [second.artifact_id]
+      )
 
     result =
       Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
@@ -990,15 +1058,20 @@ defmodule Tightbeam.GatewayTest do
     assert result.retired_session_keys == [session.session_key]
     refute File.exists?(workspace)
 
-    [archive_dir] = Path.wildcard(Path.join(base_dir, "archive/artifact_writer-*"))
-    archived = Artifacts.get(ctx.db, artifact.artifact_id)
-    assert archived.state == "archived"
-    assert archived.home == Path.join(archive_dir, "specs/banana.md")
-    assert File.read!(archived.home) == "banana"
+    released = Artifacts.get(ctx.db, artifact.artifact_id)
+    assert released.state == "released"
+    assert released.home == nil
 
-    unchanged_external = Artifacts.get(ctx.db, external.artifact_id)
-    assert unchanged_external.state == "in-workspace"
-    assert unchanged_external.home == nil
+    assert File.read!(Tightbeam.ArtifactContent.cas_path(base_dir, released.content_sha256)) ==
+             "banana"
+
+    released_second = Artifacts.get(ctx.db, second.artifact_id)
+    assert released_second.state == "released"
+    assert released_second.home == nil
+
+    assert File.read!(
+             Tightbeam.ArtifactContent.cas_path(base_dir, released_second.content_sha256)
+           ) == "result"
   end
 
   test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do
@@ -1131,6 +1204,88 @@ defmodule Tightbeam.GatewayTest do
     assert first["cliToken"] == second["cliToken"]
     assert second["port"] == 5_432
     assert File.stat!(Path.join(base_dir, "gateway.json")).mode |> Bitwise.band(0o777) == 0o600
+  end
+
+  test "boot promotes the verbatim null-hash archive fixture and fetch survives archive removal",
+       ctx do
+    base_dir =
+      Path.join(System.tmp_dir!(), "gateway_null_hash_#{System.unique_integer([:positive])}")
+
+    archive = Path.join([base_dir, "archive", "dark-factory-flow-watchdog-design-final.md"])
+    File.mkdir_p!(Path.dirname(archive))
+    File.cp!(@null_hash_fixture, archive)
+
+    assert :crypto.hash(:sha256, File.read!(@null_hash_fixture))
+           |> Base.encode16(case: :lower) == @null_hash_fixture_digest
+
+    item = create_work_item(ctx.db, "Null-hash archive migration")
+    artifact_id = "art_null_hash_fixture"
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO artifacts
+          (artifactId, kind, title, createdBySession, workItemId, originPath,
+           recordedTurnEvidence, state, home, unavailableReason, createdAt, updatedAt)
+        VALUES (?1, 'report', 'Null-hash fixture', 'k1', ?2, ?3,
+                'none', 'legacy-unavailable', ?4, 'migration-pending', ?5, ?5)
+        """,
+        [artifact_id, item.id, archive, archive, now]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO artifact_content_migrations
+          (migrationId, artifactId, sourceState, outcome, updatedAt, cause, principal)
+        VALUES (?1, ?2, 'archived', 'pending', ?3, 'shape-migration', 'process:tightbeam')
+        """,
+        [Tightbeam.ArtifactContent.migration_id(), artifact_id, now]
+      )
+
+    previous_quota = Application.get_env(:tightbeam, :artifact_content_quota_bytes)
+    previous_floor = Application.get_env(:tightbeam, :artifact_content_reserved_free_bytes)
+    previous_release_root = System.get_env("RELEASE_ROOT")
+    Application.put_env(:tightbeam, :artifact_content_quota_bytes, "33554432")
+    Application.put_env(:tightbeam, :artifact_content_reserved_free_bytes, "0")
+    System.delete_env("RELEASE_ROOT")
+
+    on_exit(fn ->
+      restore_application_env(:artifact_content_quota_bytes, previous_quota)
+      restore_application_env(:artifact_content_reserved_free_bytes, previous_floor)
+      restore_system_env("RELEASE_ROOT", previous_release_root)
+      File.rm_rf!(base_dir)
+    end)
+
+    Gateway.children(gateway_config(base_dir, ctx.db, 0))
+
+    released = Artifacts.get(ctx.db, artifact_id)
+    assert released.state == "released"
+    assert released.content_sha256 == @null_hash_fixture_digest
+    assert released.content_size == File.stat!(@null_hash_fixture).size
+
+    File.rm!(archive)
+
+    assert {:ok, fetched} =
+             Tightbeam.ArtifactContent.fetch(
+               ctx.db,
+               base_dir,
+               artifact_id,
+               "user:flynn"
+             )
+
+    assert IO.binread(fetched.descriptor, :eof) == File.read!(@null_hash_fixture)
+    File.close(fetched.descriptor)
+
+    assert {:ok, [["released"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT outcome FROM artifact_content_migrations WHERE artifactId=?1",
+               [artifact_id]
+             )
   end
 
   test "children recovers liveness before any runtime child can start", ctx do
@@ -2054,6 +2209,8 @@ defmodule Tightbeam.GatewayTest do
   end
 
   test "children installs the release Rust CLI, and refuses instead of falling back", ctx do
+    System.delete_env("RELEASE_ROOT")
+
     repo_dir =
       Path.join(
         System.tmp_dir!(),
@@ -9789,6 +9946,11 @@ defmodule Tightbeam.GatewayTest do
       patch_adapter: fn _harness, _path -> :ok end
     }
   end
+
+  defp restore_application_env(key, nil), do: Application.delete_env(:tightbeam, key)
+  defp restore_application_env(key, value), do: Application.put_env(:tightbeam, key, value)
+  defp restore_system_env(key, nil), do: System.delete_env(key)
+  defp restore_system_env(key, value), do: System.put_env(key, value)
 
   defp make_model_unknown(db, session_key) do
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
