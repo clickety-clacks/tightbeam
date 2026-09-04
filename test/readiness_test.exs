@@ -35,6 +35,15 @@ defmodule Tightbeam.ReadinessTest do
       {:reply, answer, answers}
     end
 
+    def handle_call({:routing_snapshot, {host, harness}}, _from, answers) do
+      {entries, health} =
+        Map.get(answers, {host, harness}) || Map.get(answers, harness) ||
+          {[], {:unavailable, :not_derived}}
+
+      metadata = Map.get(answers, {:metadata, host, harness}, %{})
+      {:reply, {entries, health, metadata}, answers}
+    end
+
     def handle_call(:get, _from, answers), do: {:reply, answers, answers}
 
     def handle_call({:metadata, {host, harness}}, _from, answers) do
