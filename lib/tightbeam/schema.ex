@@ -94,7 +94,14 @@ defmodule Tightbeam.Schema do
   # classification. SQLite cannot widen those existing shapes in place. The
   # reviewed R17 boundary therefore refuses every predecessor and recreates at
   # v15; the older named migration helpers remain explicit test seams only.
-  @shape "coordination-fabric-v1-phase1-v15"
+  # Principal-duty provenance then materializes immutable work-item source rows
+  # and advances v15 to v16; terminal-horizon cancellation rebuilds
+  # `work_item_horizons` for the cancellation state and advances v16 to v17.
+  # Both land on a fresh database through `WorkItems.ensure_schema`; their two
+  # named helpers remain explicit test seams like the others.
+  @shape "coordination-fabric-v1-phase1-v17"
+  @terminal_horizon_previous_shape "coordination-fabric-v1-phase1-v16"
+  @principal_duty_previous_shape "coordination-fabric-v1-phase1-v15"
   @completion_previous_shape "coordination-fabric-v1-phase1-v14"
   @cannot_proceed_previous_shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
@@ -1688,6 +1695,87 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "incompatible_cannot_proceed_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_principal_duty_v1(DB.server()) :: :ok
+  def upgrade_principal_duty_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@principal_duty_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_principal_duty_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.WorkItems.principal_duty_schema_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @principal_duty_previous_shape,
+             @terminal_horizon_previous_shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_principal_duty_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_principal_duty_v1: migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_terminal_horizon_cancellation_v1(DB.server()) :: :ok
+  def upgrade_terminal_horizon_cancellation_v1(db) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@terminal_horizon_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_terminal_horizon_cancellation_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.WorkItems.terminal_horizon_cancellation_schema_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @terminal_horizon_previous_shape,
+             @shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_terminal_horizon_cancellation_v1: stamp race"
+               )
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_terminal_horizon_cancellation_v1: migration failed: #{Exception.message(error)}"
     end
   end
 

@@ -20,6 +20,8 @@ defmodule Tightbeam.Firehose.Registry do
     {"work_item.reopened", "work-items", "upsert", "workItemId"},
     {"work_item.closed", "work-items", "upsert", "workItemId"},
     {"work_item.failed", "work-items", "upsert", "workItemId"},
+    {"work_item.deprioritized", "work-items", "upsert", "workItemId"},
+    {"work_item.boundary_declared", "work-items", "upsert", "workItemId"},
     {"assignment.opened", "assignments", "upsert", "assignmentId"},
     {"assignment.reopened", "assignments", "upsert", "assignmentId"},
     {"assignment.closed", "assignments", "upsert", "assignmentId"},

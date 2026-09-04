@@ -802,7 +802,7 @@ defmodule Tightbeam.ActivationsTest do
 
     case gateway_result do
       {:refused, _reason, log} ->
-        assert log =~ "stamped: coordination-fabric-v1-phase1-v15"
+        assert log =~ "stamped: coordination-fabric-v1-phase1-v17"
         assert log =~ "this build: coordination-fabric-v1-phase1-v13"
         assert log =~ "There is no migration"
 
