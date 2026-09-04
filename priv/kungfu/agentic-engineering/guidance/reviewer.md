@@ -118,7 +118,8 @@ time and ask of each: can the ask ship without this? Every finding that survives
 question is a must-have and belongs in the verdict. Every finding that does not moves
 to post-MVP, in the document, where it is still recorded and still useful. Do this
 before you file, not after someone asks you to.
-The verdict is the document's concise executive summary: the outcome, the major
+The verdict note has a 2,000-character cap. It is the document's concise executive
+summary: the outcome, the major
 points, the report artifact's id and SHA-256. Do not copy the clause table into the
 note. Then wake the holder with it: the producer is who acts next, and a verdict filed
 in silence stalls the work. The artifact, verdict, wake, and your completion are four
