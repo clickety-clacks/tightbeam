@@ -174,10 +174,11 @@ defmodule Tightbeam.ModelCatalog do
           {:ok, routed()} | {:error, Unroutable.t()}
   def route(host, harness, %Model{} = selection, server)
       when is_binary(host) and is_binary(harness) do
-    {entries, health} = get(host, harness, server)
+    {entries, health, metadata} = routing_snapshot({host, harness}, server)
     entry = Enum.find(entries, &names_same_model?(&1, selection))
+    version_block = version_block_for(selection, metadata)
 
-    refuse = fn cause, offered ->
+    refuse = fn cause, offered, block ->
       {:error,
        %Unroutable{
          cause: cause,
@@ -185,13 +186,17 @@ defmodule Tightbeam.ModelCatalog do
          harness: harness,
          selection: selection,
          health: [{harness, health}],
-         offered: offered
+         offered: offered,
+         version_block: block
        }}
     end
 
     cond do
       entries == [] or match?({:unavailable, _reason}, health) ->
-        refuse.(:no_catalog, [])
+        refuse.(:no_catalog, [], nil)
+
+      is_nil(entry) and not is_nil(version_block) ->
+        refuse.(:family_absent, offers(harness, entries), version_block)
 
       is_nil(entry) and unknown_model_passthrough?(harness, selection, entries) ->
         module = Harness.parse!(harness)
@@ -205,7 +210,7 @@ defmodule Tightbeam.ModelCatalog do
          }}
 
       is_nil(entry) ->
-        refuse.(:family_absent, offers(harness, entries))
+        refuse.(:family_absent, offers(harness, entries), nil)
 
       offers_effort?(entry, selection.effort) ->
         {:ok,
@@ -217,11 +222,22 @@ defmodule Tightbeam.ModelCatalog do
          }}
 
       is_nil(selection.effort) ->
-        refuse.(:needs_effort, offers(harness, [entry]))
+        refuse.(:needs_effort, offers(harness, [entry]), nil)
 
       true ->
-        refuse.(:effort_not_offered, offers(harness, [entry]))
+        refuse.(:effort_not_offered, offers(harness, [entry]), nil)
     end
+  end
+
+  defp version_block_for(selection, metadata) do
+    metadata
+    |> Map.get(:version_blocks, [])
+    |> Enum.find(fn block ->
+      slug = Map.get(block, :slug)
+
+      is_binary(slug) and
+        (selection.family == slug or selection.family in Map.get(block, :aliases, []))
+    end)
   end
 
   defp unknown_model_passthrough?(harness, selection, entries) do
@@ -245,30 +261,36 @@ defmodule Tightbeam.ModelCatalog do
     refusals = for {_harness, {:error, unroutable}} <- answers, do: unroutable
     health = Enum.flat_map(refusals, & &1.health)
     named = Enum.filter(refusals, &(&1.cause in [:needs_effort, :effort_not_offered]))
+    version_gated = Enum.find(refusals, &is_map(&1.version_block))
 
-    {cause, offered} =
+    {cause, offered, version_block, harness} =
       cond do
         # Named refusals cannot disagree about WHICH effort cause they are:
         # `route/3` decides that from the selection, which is the same on every
         # harness. So folding them is a union of what they offer, not a vote.
         named != [] ->
           {if(is_nil(selection.effort), do: :needs_effort, else: :effort_not_offered),
-           Enum.flat_map(named, & &1.offered)}
+           Enum.flat_map(named, & &1.offered), nil, nil}
+
+        version_gated ->
+          {:family_absent, version_gated.offered, version_gated.version_block,
+           version_gated.harness}
 
         Enum.all?(refusals, &(&1.cause == :no_catalog)) ->
-          {:no_catalog, []}
+          {:no_catalog, [], nil, nil}
 
         true ->
-          {:family_absent, Enum.flat_map(refusals, & &1.offered)}
+          {:family_absent, Enum.flat_map(refusals, & &1.offered), nil, nil}
       end
 
     %Unroutable{
       cause: cause,
       host: host,
-      harness: nil,
+      harness: harness,
       selection: selection,
       health: health,
-      offered: offered
+      offered: offered,
+      version_block: version_block
     }
   end
 
@@ -379,6 +401,22 @@ defmodule Tightbeam.ModelCatalog do
       case state.entries[key] do
         nil -> {[], {:unavailable, {:host_not_configured, elem(key, 0)}}}
         cache -> {cache.entries, health(cache, now_ms(state), state.ttl_ms)}
+      end
+
+    {:reply, answer, state}
+  end
+
+  def handle_call({:routing_snapshot, key}, _from, state) do
+    state = refresh_due(state)
+
+    answer =
+      case state.entries[key] do
+        nil ->
+          {[], {:unavailable, {:host_not_configured, elem(key, 0)}}, %{}}
+
+        cache ->
+          {cache.entries, health(cache, now_ms(state), state.ttl_ms),
+           Map.get(cache, :metadata, %{})}
       end
 
     {:reply, answer, state}
@@ -727,6 +765,13 @@ defmodule Tightbeam.ModelCatalog do
       {:ok, GenServer.call(server, request)}
     catch
       :exit, _ -> :unavailable
+    end
+  end
+
+  defp routing_snapshot(key, server) do
+    case safe_call(server, {:routing_snapshot, key}) do
+      {:ok, snapshot} -> snapshot
+      :unavailable -> {[], {:unavailable, :catalog_not_started}, %{}}
     end
   end
 
