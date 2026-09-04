@@ -50,6 +50,7 @@ defmodule Tightbeam.Readiness do
           binary: :runnable | {:broken, term()} | {:unknown, atom()},
           credential: :live | {:absent, atom()} | {:unknown, term()} | {:degraded, term()},
           model: :selectable | :unset | {:unroutable, Unroutable.t()} | :unknown,
+          manifest: map(),
           runnable?: boolean()
         }
 
@@ -145,6 +146,7 @@ defmodule Tightbeam.Readiness do
     binary = binary_state(module, local?, config)
     credential = credential_state(entries, health)
     model = model_state(host, wire, credential, config, catalog)
+    manifest = ModelCatalog.metadata(host, wire, catalog)
 
     %{
       host: host,
@@ -160,6 +162,7 @@ defmodule Tightbeam.Readiness do
       binary: binary,
       credential: credential,
       model: model,
+      manifest: manifest,
       # An UNKNOWN adapter or an UNKNOWN binary does not veto. Boot establishes
       # both with local checks that cannot see a satellite, and this module's rule
       # is that a fact it cannot establish is never reported as a failure of the
@@ -278,10 +281,8 @@ defmodule Tightbeam.Readiness do
       |> Enum.filter(& &1.runnable?)
       |> Enum.map_join(", ", &"#{&1.harness} on #{&1.host}")
 
-    blocked = Enum.reject(rows, & &1.runnable?)
-
     ["READY: #{ready} can run turns."] ++
-      Enum.flat_map(blocked, &harness_lines/1) ++
+      Enum.flat_map(rows, &harness_lines/1) ++
       pre_expiry_lines(rows) ++
       archetype_lines(summary) ++
       supervision_lines()
@@ -386,7 +387,8 @@ defmodule Tightbeam.Readiness do
         else: credential_line(row)
 
     gaps =
-      [binary_line(row), adapter_line(row), credential, model_line(row)]
+      ([binary_line(row), adapter_line(row), credential, model_line(row), manifest_line(row)] ++
+         version_gate_lines(row))
       |> Enum.reject(&is_nil/1)
 
     case gaps do
@@ -512,6 +514,39 @@ defmodule Tightbeam.Readiness do
       remedy -> "default model " <> Unroutable.message(unroutable) <> " — " <> remedy
     end
   end
+
+  defp manifest_line(%{manifest: %{manifest_health: :fresh}}), do: nil
+
+  defp manifest_line(%{manifest: %{manifest_health: :stale}}) do
+    "hosted model manifest is STALE; the last-good document remains active"
+  end
+
+  defp manifest_line(%{manifest: %{manifest_health: {:unavailable, reason}}}) do
+    "hosted model manifest refresh is unavailable (#{inspect(reason)}); the bundled or " <>
+      "on-disk last-good document remains active"
+  end
+
+  defp manifest_line(_row), do: nil
+
+  defp version_gate_lines(%{host: host, manifest: %{version_blocks: blocks}})
+       when is_list(blocks) do
+    Enum.map(blocks, fn block ->
+      cond do
+        is_binary(block.min_version) ->
+          "Claude Code v#{block.current_version} on #{host} is too old for #{block.name}; " <>
+            "needs v#{block.min_version}"
+
+        is_binary(block.max_version_exclusive) ->
+          "Claude Code v#{block.current_version} on #{host} is too new for #{block.name}; " <>
+            "requires a version below v#{block.max_version_exclusive}"
+
+        true ->
+          "Claude Code v#{block.current_version} on #{host} cannot run #{block.name}"
+      end
+    end)
+  end
+
+  defp version_gate_lines(_row), do: []
 
   # A REMEDY THAT CANNOT WORK IS A FALSE STATEMENT. Naming a tier fixes a model
   # that HAS tiers; a model with none is fixed by unsetting the level; and a
