@@ -684,7 +684,6 @@ defmodule Tightbeam.EscalationDeliveryTest do
   defp config(base_dir, db) do
     %{
       base_dir: base_dir,
-      cursor_signing: cursor_signing!(base_dir),
       cwd: base_dir,
       port: 0,
       default_harness: :claude,

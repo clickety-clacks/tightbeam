@@ -132,7 +132,6 @@ defmodule Tightbeam.RestReadPlaneD1Test do
       base_dir: base_dir,
       handlers: %{"inspect" => inspect_handler},
       cli_token: "tbc_rest_d1",
-      cursor_signing: cursor_signing!(base_dir),
       model_catalog: catalog,
       session_status: fn _ -> nil end
     ]
@@ -420,7 +419,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     end
   end
 
-  test "tuple cursors page both directions, survive deletion, and bind filters and principals",
+  test "plain tuple cursors survive insertion, deletion, and restart and bind request shape",
        ctx do
     for user <- ~w(cursor-a cursor-b cursor-c cursor-d) do
       Devices.add_user(ctx.db, user, false)
@@ -433,8 +432,13 @@ defmodule Tightbeam.RestReadPlaneD1Test do
         []
       )
 
-    first = get(ctx, "/api/users?userId=cursor-a&userId=cursor-b&limit=1", ctx.admin_device.token)
-    first_body = JSON.decode!(first.resp_body)
+    filter = "userId=cursor-a&userId=cursor-aa&userId=cursor-b"
+    port = start_http!(ctx)
+
+    {200, _headers, first_bytes} =
+      http_get(port, "/api/users?#{filter}&limit=1", ctx.admin_device.token)
+
+    first_body = JSON.decode!(first_bytes)
     assert Enum.map(first_body["items"], & &1["userId"]) == ["cursor-b"]
     boundary = first_body["page"]["oldestCursor"]
     after_boundary = first_body["page"]["newestCursor"]
@@ -453,57 +457,52 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     assert payload["principalKind"] == "user"
     assert payload["principalId"] == "flynn"
     assert payload["tuple"] == [424_242, "cursor-b"]
+    assert encode_cursor_payload(payload) == boundary
+    refute String.contains?(boundary, ".")
+    refute String.contains?(boundary, "{")
     refute Map.has_key?(payload, "rowid")
     refute Map.has_key?(payload, "offset")
 
-    org_page =
-      get(
-        ctx,
-        "/api/users?asUser=flynn&userId=cursor-a&userId=cursor-b&limit=1",
-        "tbc_rest_d1"
-      )
-      |> then(&JSON.decode!(&1.resp_body))
+    stale_cursor = payload |> Map.put("version", 0) |> encode_cursor_payload()
+    stale = get(ctx, "/api/users?#{filter}&before=#{stale_cursor}", ctx.admin_device.token)
+    assert stale.status == 400
+    assert JSON.decode!(stale.resp_body)["error"]["code"] == "invalid_cursor"
 
-    forged_cursor =
-      org_page["page"]["newestCursor"]
-      |> decode_cursor_payload()
-      |> Map.put("principalId", "operator")
-      |> JSON.encode!()
-      |> then(fn forged_payload ->
-        rejected_secret = :crypto.hash(:sha256, "tbc_rest_d1:rest-d1")
-        rejected_signature = :crypto.mac(:hmac, :sha256, rejected_secret, forged_payload)
+    Devices.add_user(ctx.db, "cursor-aa", false)
 
-        Base.url_encode64(forged_payload, padding: false) <>
-          "." <> Base.url_encode64(rejected_signature, padding: false)
-      end)
+    {:ok, _rows} =
+      DB.query(ctx.db, "UPDATE users SET createdAt = 424242 WHERE userId = 'cursor-aa'", [])
 
-    forged =
-      get(
-        ctx,
-        "/api/users?asUser=operator&userId=cursor-a&userId=cursor-b&after=#{forged_cursor}",
-        "tbc_rest_d1"
+    :ok = stop_supervised(:rest_read_plane_http)
+    restarted_port = start_http!(ctx)
+
+    {200, _headers, inserted_bytes} =
+      http_get(
+        restarted_port,
+        "/api/users?#{filter}&before=#{boundary}",
+        ctx.admin_device.token
       )
 
-    assert forged.status == 400
-    assert JSON.decode!(forged.resp_body)["error"]["code"] == "invalid_cursor"
+    inserted = JSON.decode!(inserted_bytes)
+    assert Enum.map(inserted["items"], & &1["userId"]) == ["cursor-a", "cursor-aa"]
 
     {:ok, _rows} = DB.query(ctx.db, "DELETE FROM users WHERE userId = 'cursor-b'", [])
 
     previous =
       get(
         ctx,
-        "/api/users?userId=cursor-a&userId=cursor-b&limit=1&before=#{boundary}",
+        "/api/users?#{filter}&limit=1&before=#{boundary}",
         ctx.admin_device.token
       )
       |> then(&JSON.decode!(&1.resp_body))
 
-    assert Enum.map(previous["items"], & &1["userId"]) == ["cursor-a"]
+    assert Enum.map(previous["items"], & &1["userId"]) == ["cursor-aa"]
 
     for {field, cursor} <- [{"after", boundary}, {"before", after_boundary}] do
       replay =
         get(
           ctx,
-          "/api/users?userId=cursor-a&userId=cursor-b&#{field}=#{cursor}",
+          "/api/users?#{filter}&#{field}=#{cursor}",
           ctx.admin_device.token
         )
 
@@ -524,7 +523,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     wrong_principal =
       get(
         ctx,
-        "/api/users?userId=cursor-a&userId=cursor-b&after=#{after_boundary}",
+        "/api/users?#{filter}&after=#{after_boundary}",
         ctx.operator_device.token
       )
 
@@ -540,7 +539,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     now_hidden =
       get(
         ctx,
-        "/api/users?userId=cursor-a&userId=cursor-b&after=#{after_boundary}",
+        "/api/users?#{filter}&after=#{after_boundary}",
         ctx.admin_device.token
       )
 
@@ -716,11 +715,15 @@ defmodule Tightbeam.RestReadPlaneD1Test do
   end
 
   defp start_http!(ctx) do
-    bandit =
-      start_supervised!(
+    child =
+      Supervisor.child_spec(
         {Bandit,
-         plug: {Router, Router.init(ctx.opts)}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+         plug: {Router, Router.init(ctx.opts)}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        id: :rest_read_plane_http
       )
+
+    bandit =
+      start_supervised!(child)
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
     port
@@ -756,8 +759,16 @@ defmodule Tightbeam.RestReadPlaneD1Test do
   end
 
   defp decode_cursor_payload(cursor) do
-    [payload, _signature] = String.split(cursor, ".", parts: 2)
-    payload |> Base.url_decode64!(padding: false) |> JSON.decode!()
+    cursor |> Base.url_decode64!(padding: false) |> JSON.decode!()
+  end
+
+  defp encode_cursor_payload(payload) do
+    ~w(direction filters principalId principalKind resource route tuple version)
+    |> Enum.map_join(",", fn key ->
+      JSON.encode!(key) <> ":" <> JSON.encode!(Map.fetch!(payload, key))
+    end)
+    |> then(&("{" <> &1 <> "}"))
+    |> Base.url_encode64(padding: false)
   end
 
   defp hydrated_identity!(db, name, principal_binding) do

@@ -756,7 +756,6 @@ defmodule Tightbeam.TranscriptTest do
     [
       db: ctx.db,
       base_dir: ctx.base_dir,
-      cursor_signing: cursor_signing!(ctx.base_dir),
       handlers: %{"transcript" => fn call -> Transcript.read(ctx.db, call) end},
       cli_token: "tbc_transcript",
       session_status: fn _ -> nil end
