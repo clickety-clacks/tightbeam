@@ -1847,7 +1847,6 @@ defmodule Tightbeam.GatewayTest do
 
     {Bandit, bandit_opts} = List.last(children)
     {Tightbeam.Wire.Router, socket_deps} = Keyword.fetch!(bandit_opts, :plug)
-    assert :ok = Tightbeam.CursorSigning.validate(socket_deps.cursor_signing)
     socket_deps = %{socket_deps | conn_registry: ctx.registry}
 
     empty_catalog(:not_derived)
@@ -11094,7 +11093,6 @@ defmodule Tightbeam.GatewayTest do
   defp gateway_config(base_dir, db, port) do
     %{
       base_dir: base_dir,
-      cursor_signing: cursor_signing!(base_dir),
       cwd: "/tmp",
       port: port,
       default_harness: :claude,
@@ -11134,7 +11132,6 @@ defmodule Tightbeam.GatewayTest do
     base = Path.join(System.tmp_dir!(), "gateway_children_#{suffix}")
     File.rm_rf!(base)
     File.mkdir!(base)
-    _provider = cursor_signing!(base)
     on_exit(fn -> File.rm_rf!(base) end)
     base
   end

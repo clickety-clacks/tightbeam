@@ -4,7 +4,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
   alias Tightbeam.ClientE2E.{LegGateway, SimClient, WS}
   alias Tightbeam.Firehose.Hub
   alias Tightbeam.Wire.Router
-  alias Tightbeam.{CursorSigning, DB, Gateway, Harness, Placement, Rules}
+  alias Tightbeam.{DB, Gateway, Harness, Placement, Rules}
 
   defstruct [
     :base_dir,
@@ -73,7 +73,6 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
         Router.init(
           db: db,
           base_dir: base_dir,
-          cursor_signing: Tightbeam.TestCase.cursor_signing!(base_dir),
           handlers: handlers,
           cli_token: cli_token,
           firehose_hub: hub,
@@ -125,7 +124,6 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
 
     try do
       File.mkdir_p!(base_dir)
-      CursorSigning.provision!(base_dir)
 
       gateway =
         case LegGateway.boot(base_dir, port, repo_root: repo_root) do

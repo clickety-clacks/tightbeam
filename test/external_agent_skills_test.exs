@@ -82,7 +82,6 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
     opts = [
       db: db,
       base_dir: base_dir,
-      cursor_signing: cursor_signing!(base_dir),
       handlers: handlers,
       cli_token: "tbc_external_agent_skills",
       session_status: fn _ -> nil end

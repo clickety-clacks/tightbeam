@@ -452,7 +452,6 @@ defmodule Tightbeam.CompletionEscalationTest do
         db: ctx.db,
         handlers: handlers,
         cli_token: "unused",
-        cursor_signing: cursor_signing!(base_dir),
         defaults: %{},
         session_status: fn _ -> nil end
       )
