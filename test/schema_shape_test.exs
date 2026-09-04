@@ -34,12 +34,26 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v17"
+  @shape "coordination-fabric-v1-phase1-v18"
+  @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v17"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     %{db: name}
+  end
+
+  test "the exact v17 completion predecessor refuses through boot dispatch", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               @completion_escalation_previous_shape
+             ])
+
+    assert_raise Tightbeam.Schema.ShapeError,
+                 ~r/predates terminal empty-epoch completion escalation.*stamped: coordination-fabric-v1-phase1-v17.*this build: coordination-fabric-v1-phase1-v18.*Move the database aside/s,
+                 fn -> Schema.ensure_all(db) end
   end
 
   test "a fresh database is created and stamped", %{db: db} do
@@ -451,7 +465,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.upgrade_premise_gate_v1(db)
 
-    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[@completion_escalation_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
     assert premise_gate_objects(db) == Enum.sort(premise_gate_object_names())
 
     assert table_columns(db, "park_premises") ==
@@ -503,7 +518,7 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
-  test "the exact v16 predecessor gains the premise gate through boot dispatch", %{db: db} do
+  test "the detailed premise gate seam preserves the exact v17 target", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
     :ok =
@@ -517,13 +532,10 @@ defmodule Tightbeam.SchemaShapeTest do
     drop_premise_gate(db)
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v16'")
 
-    # The boot path itself, not the explicit seam: `ensure_all` -> `check_shape`
-    # must dispatch the exact v16 stamp into the migration and advance it. This
-    # is the only proof the wire is real; the seam test can pass while boot still
-    # refuses.
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_premise_gate_v1(db)
 
-    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[@completion_escalation_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
     assert premise_gate_objects(db) == Enum.sort(premise_gate_object_names())
 
     assert table_columns(db, "premise_claims") ==
@@ -538,9 +550,8 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM premise_claims")
     assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
 
-    # Idempotent: booting again on the freshly migrated shape is a clean accept.
-    assert :ok = Schema.ensure_all(db)
-    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ @completion_escalation_previous_shape
   end
 
   test "a non-predecessor shape is refused by name on boot", %{db: db} do
@@ -682,7 +693,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v14"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v17"
+    assert error.message =~ "this build: #{@shape}"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 
