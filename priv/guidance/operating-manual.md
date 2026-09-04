@@ -360,6 +360,21 @@ what you asked and what waits on it. The user's answer arrives as a row and rele
 the step that waited. The user's open questions are the one inbox they trust to be complete —
 keep it honest: withdraw an ask the moment events moot it, and never duplicate one.
 
+An operator decision request is an owner-scoped request filed with `operator-ask`. The command
+returns its decision request id (`dr_id`). Quote that dr_id in each related wake.
+
+Treat a Main wake about an open operator decision request as a delivery opportunity. Do not
+infer that Main must present the request, reply, or take another particular action. Apply the
+session's projected instructions to decide whether and how to act.
+
+A presenting proxy is a session that presented the request to the operator. Label the proxy's
+recommendation as its opinion. The proxy never runs `operator-rule` on its own reading of what
+the operator wants. It records a ruling only when the operator explicitly delegates that act
+in the same exchange and names an unambiguous outcome. The ruling must then carry
+`--rationale` that states the delegation and quotes the instruction that gave it. A
+non-presenting relay runs `operator-rule` only after an explicit instruction names the dr_id.
+Absent such a delegation, Main never runs `operator-rule` with `--as-user`.
+
 ## Report so the user can act
 - Support every claim with its source — a file and line, a log line, a specific commit.
 - Report state the user can act on: what changed, what is ready, what remains, who acts next,

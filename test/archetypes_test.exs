@@ -187,6 +187,35 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "the operating manual is the one home for operator ruling delegation" do
+    manual = Archetypes.builtin_fragments()["operating-manual.md"]
+    normalized_manual = Regex.replace(~r/\s+/, manual, " ")
+
+    directive =
+      "The proxy never runs `operator-rule` on its own reading of what the operator wants. " <>
+        "It records a ruling only when the operator explicitly delegates that act"
+
+    assert normalized_manual =~ "returns its decision request id (`dr_id`)"
+    assert normalized_manual =~ directive
+
+    assert normalized_manual =~
+             "`--rationale` that states the delegation and quotes the instruction"
+
+    cli_help = File.read!(Path.expand("../cli/src/args.rs", __DIR__))
+
+    assert cli_help =~
+             "only on the operator's explicit delegation, quoted in --rationale"
+
+    delegation_homes =
+      ["../priv/guidance/**/*.md", "../priv/kungfu/**/*.md"]
+      |> Enum.flat_map(&Path.wildcard(Path.expand(&1, __DIR__)))
+      |> Enum.filter(&(Regex.replace(~r/\s+/, File.read!(&1), " ") =~ directive))
+
+    assert delegation_homes == [
+             Path.expand("../priv/guidance/operating-manual.md", __DIR__)
+           ]
+  end
+
   test "the shipped bundle loads role guidance and elected shared skills", ctx do
     Identity.init!(ctx.base_dir)
 
