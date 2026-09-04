@@ -96,9 +96,11 @@ defmodule Tightbeam.Schema do
   # reviewed R17 boundary therefore refuses every predecessor and recreates at
   # v15; the older named migration helpers remain explicit test seams only.
   # The deliverable contract adds companion tables and advances the exact v15
-  # predecessor transactionally to v16.
-  @shape "coordination-fabric-v1-phase1-v16"
-  @deliverable_contract_previous_shape "coordination-fabric-v1-phase1-v15"
+  # predecessor transactionally to v16. The terminal empty-epoch and bounded-
+  # recipient revision then changes the completion-owned tables again, so the
+  # complete v16 predecessor must refuse before module DDL.
+  @shape "coordination-fabric-v1-phase1-v17"
+  @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v16"
   @completion_previous_shape "coordination-fabric-v1-phase1-v14"
   @cannot_proceed_previous_shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
@@ -1934,12 +1936,16 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
-      {:ok, [[@deliverable_contract_previous_shape]]} ->
-        Tightbeam.DeliverableContract.upgrade_v1(
-          db,
-          @deliverable_contract_previous_shape,
-          @shape
-        )
+      {:ok, [[@completion_escalation_previous_shape]]} ->
+        raise ShapeError, """
+        this Tightbeam database predates terminal empty-epoch completion escalation.
+
+          stamped: #{@completion_escalation_previous_shape}
+          this build: #{@shape}
+
+        No in-place migration is defined for this boundary.
+        Move the database aside and let this build recreate it.
+        """
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1955,8 +1961,8 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration from #{found}. The only supported upgrade source
-        is #{@deliverable_contract_previous_shape}.
+        There is no migration from #{found}. The exact completion predecessor
+        #{@completion_escalation_previous_shape} also requires recreation.
         Move this database aside and let it be recreated.
         """
 

@@ -34,12 +34,26 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v16"
+  @shape "coordination-fabric-v1-phase1-v17"
+  @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v16"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     %{db: name}
+  end
+
+  test "the complete v16 shape refuses before terminal empty-epoch DDL", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               @completion_escalation_previous_shape
+             ])
+
+    assert_raise Tightbeam.Schema.ShapeError,
+                 ~r/predates terminal empty-epoch completion escalation.*stamped: coordination-fabric-v1-phase1-v16.*this build: coordination-fabric-v1-phase1-v17.*Move the database aside/s,
+                 fn -> Schema.ensure_all(db) end
   end
 
   test "a fresh database is created and stamped", %{db: db} do
@@ -539,7 +553,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v14"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v16"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v17"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 
