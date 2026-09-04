@@ -602,7 +602,7 @@ defmodule Tightbeam.SchemaShapeTest do
              ~w(attestId assignmentId attestTs generation recoveryBaseline cause principal)
 
     assert table_columns(db, "supervision_liveness_sidecar") ==
-             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded)
+             ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded receiptChildTurnSeq receiptAcceptedGeneration receiptCause receiptPrincipal)
 
     assert table_columns(db, "wake_cancellations") ==
              ~w(wakeId wakeState canceledAt requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind replacementWakeId dispositionKind dispositionId primaryWorkKind primaryWorkId workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)
@@ -612,6 +612,14 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert table_columns(db, "supervision_liveness_migrations") ==
              ~w(migrationId appliedAt affectedRows cause principal)
+
+    assert {:ok, [[applied_at, 0, "release_upgrade", "process:tightbeam"]]} =
+             DB.query(
+               db,
+               "SELECT appliedAt,affectedRows,cause,principal FROM supervision_liveness_migrations WHERE migrationId='terminal_child_receipt_v1'"
+             )
+
+    assert is_integer(applied_at) and applied_at >= 0
 
     assert table_columns(db, "supervision_liveness_receipt_state") ==
              ~w(assignmentId artifactCursor attestCursor workItemEventCursor wakeCursor baselineCause baselinePrincipal)

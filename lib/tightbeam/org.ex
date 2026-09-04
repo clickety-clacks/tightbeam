@@ -4,7 +4,7 @@ defmodule Tightbeam.Org do
   and append-only harness-session pointer chains.
   """
 
-  alias Tightbeam.{AdminProjection, DB, EventLog, NoticeBatcher, Supervision, Wakes}
+  alias Tightbeam.{AdminProjection, Assignments, DB, EventLog, NoticeBatcher, Supervision, Wakes}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Model
 
@@ -676,7 +676,13 @@ defmodule Tightbeam.Org do
       """,
       [session_key]
     )
-    |> Enum.each(fn row -> cancel_retirement_wake_in_txn!(txn, session_key, row) end)
+    |> Enum.each(fn [wake_id | _] = row ->
+      case Assignments.terminal_child_wake_status_in_txn(txn, wake_id) do
+        :match -> :ok
+        :none -> cancel_retirement_wake_in_txn!(txn, session_key, row)
+        :conflict -> raise "terminal_wake_identity_conflict"
+      end
+    end)
 
     :ok
   end

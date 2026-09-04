@@ -154,6 +154,20 @@ defmodule Tightbeam.Wire.Router do
          :ok <- allowed_agent_verb(verb),
          {:ok, origin, principal} <- agent_identity(body, auth, conn),
          {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
+      params = atomize_params(verb, body["params"] || %{})
+
+      params =
+        if verb == "wake" do
+          Map.put(
+            params,
+            :parent_wake_receipt_context_forbidden,
+            Map.has_key?(body["params"] || %{}, "assignmentId") or
+              Map.has_key?(body["params"] || %{}, "assignment_id")
+          )
+        else
+          params
+        end
+
       call = %{
         verb: verb,
         origin: origin,
@@ -164,8 +178,9 @@ defmodule Tightbeam.Wire.Router do
         transport_session_key: authenticated_session_key(auth),
         session_key: artifact_caller_session(verb, session_key, principal),
         target_role: target_meta.role,
+        target_kind: target_meta.kind,
         role_fallback: target_meta.fallback,
-        params: atomize_params(verb, body["params"] || %{})
+        params: params
       }
 
       dispatch_response(conn, call, 200, &%{"result" => &1})
@@ -1038,7 +1053,7 @@ defmodule Tightbeam.Wire.Router do
         {:error, 400, "missing_target", "#{verb} requires a sessionKey or role target"}
 
       given == [] ->
-        {:ok, nil, %{role: nil, fallback: false}}
+        {:ok, nil, %{role: nil, fallback: false, kind: nil}}
 
       given == ["sessionKey"] ->
         if verb == "tune" do
@@ -1046,7 +1061,7 @@ defmodule Tightbeam.Wire.Router do
           # gateway receives the opaque key and returns the same not_found for
           # unknown, retired, foreign, and process callers. Other verbs retain
           # the router's existing eager target semantics.
-          {:ok, body["sessionKey"], %{role: nil, fallback: false}}
+          {:ok, body["sessionKey"], %{role: nil, fallback: false, kind: "session"}}
         else
           case Org.get(db(conn), body["sessionKey"]) do
             nil ->
@@ -1056,13 +1071,15 @@ defmodule Tightbeam.Wire.Router do
               {:error, 400, "session_retired", "assignments require an active holder session"}
 
             session ->
-              {:ok, session.session_key, %{role: nil, fallback: false}}
+              {:ok, session.session_key, %{role: nil, fallback: false, kind: "session"}}
           end
         end
 
       given == ["userId"] ->
         if Devices.user(db(conn), body["userId"]),
-          do: {:ok, Org.personal_session_key(body["userId"]), %{role: nil, fallback: false}},
+          do:
+            {:ok, Org.personal_session_key(body["userId"]),
+             %{role: nil, fallback: false, kind: "user"}},
           else: {:error, 404, "not_found", "unknown userId: #{body["userId"]}"}
 
       given == ["role"] ->
@@ -1084,7 +1101,7 @@ defmodule Tightbeam.Wire.Router do
                "or target an active sessionKey"}
 
           {:ok, session_key, fallback} ->
-            {:ok, session_key, %{role: body["role"], fallback: fallback}}
+            {:ok, session_key, %{role: body["role"], fallback: fallback, kind: "role"}}
 
           {:error, %{code: "unknown_role"}} ->
             {:error, 404, "not_found", "unknown role: #{body["role"]}"}

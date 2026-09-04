@@ -306,6 +306,10 @@ defmodule Tightbeam.Schema do
         ),
         retirementPrincipal TEXT,
         retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)),
+        receiptChildTurnSeq INTEGER CHECK (receiptChildTurnSeq > 0),
+        receiptAcceptedGeneration INTEGER CHECK (receiptAcceptedGeneration > 0),
+        receiptCause TEXT CHECK (receiptCause = 'child_exact_parent_wake_invoked'),
+        receiptPrincipal TEXT,
         CHECK (
           (controllerOrigin IS NULL AND wakeKind IS NULL AND controllerState IS NULL AND
            chargedGeneration IS NULL)
@@ -342,7 +346,21 @@ defmodule Tightbeam.Schema do
            retirementOutcomeKind = 'main_elevation' AND
            retirementPrincipal = 'process:tightbeam' AND retirementActionNeeded = 1)
         ),
-        CHECK (controllerOrigin IS NOT NULL OR transferEvidenceId IS NOT NULL)
+        CHECK (
+          (receiptCause IS NULL AND receiptChildTurnSeq IS NULL AND
+           receiptAcceptedGeneration IS NULL AND receiptPrincipal IS NULL)
+          OR
+          (receiptCause = 'child_exact_parent_wake_invoked' AND
+           receiptChildTurnSeq > 0 AND receiptAcceptedGeneration > 0 AND
+           receiptPrincipal IS NOT NULL AND controllerOrigin IS NULL AND
+           wakeKind IS NULL AND controllerState IS NULL AND chargedGeneration IS NULL AND
+           transferEvidenceId IS NULL AND retirementEpoch IS NULL AND
+           retiringSessionKey IS NULL AND retirementOutcomeKind IS NULL AND
+           retirementOutcomeId IS NULL AND retirementTargetSessionKey IS NULL AND
+           retirementCause IS NULL AND retirementPrincipal IS NULL AND
+           retirementActionNeeded IS NULL)
+        ),
+        CHECK (controllerOrigin IS NOT NULL OR transferEvidenceId IS NOT NULL OR receiptCause IS NOT NULL)
       )
       """
     },
@@ -552,9 +570,9 @@ defmodule Tightbeam.Schema do
       sql: """
       CREATE TRIGGER IF NOT EXISTS supervision_liveness_retirement_immutable_update
       BEFORE UPDATE ON supervision_liveness_sidecar
-      WHEN OLD.transferEvidenceId IS NOT NULL
+      WHEN OLD.transferEvidenceId IS NOT NULL OR OLD.receiptCause IS NOT NULL
       BEGIN
-        SELECT RAISE(ABORT, 'supervision retirement outcome is immutable');
+        SELECT RAISE(ABORT, 'supervision retirement outcome or terminal-child receipt is immutable');
       END
       """
     },
@@ -564,9 +582,9 @@ defmodule Tightbeam.Schema do
       sql: """
       CREATE TRIGGER IF NOT EXISTS supervision_liveness_retirement_immutable_delete
       BEFORE DELETE ON supervision_liveness_sidecar
-      WHEN OLD.transferEvidenceId IS NOT NULL
+      WHEN OLD.transferEvidenceId IS NOT NULL OR OLD.receiptCause IS NOT NULL
       BEGIN
-        SELECT RAISE(ABORT, 'supervision retirement outcome is immutable');
+        SELECT RAISE(ABORT, 'supervision retirement outcome or terminal-child receipt is immutable');
       END
       """
     }
@@ -684,11 +702,30 @@ defmodule Tightbeam.Schema do
       sql: """
       CREATE TRIGGER IF NOT EXISTS supervision_liveness_sidecar_insert_coherent
       BEFORE INSERT ON supervision_liveness_sidecar
-      WHEN NOT EXISTS (
+      WHEN (NEW.receiptCause IS NULL AND NOT EXISTS (
         SELECT 1 FROM wakes w
         WHERE w.wakeId=NEW.wakeId AND w.assignmentId=NEW.assignmentId
           AND w.consumer='prompt' AND w.origin='process:tightbeam'
-      )
+      ))
+      OR (NEW.receiptCause IS NOT NULL AND NOT EXISTS (
+        SELECT 1
+        FROM wakes w
+        JOIN assignments c ON c.id=NEW.assignmentId
+        JOIN assignments p ON p.id=c.reviewsAssignmentId
+        JOIN turns t ON t.seq=NEW.receiptChildTurnSeq
+        JOIN supervision_entitlements e ON e.assignmentId=c.id
+        WHERE w.wakeId=NEW.wakeId AND w.assignmentId IS NULL
+          AND w.targetRole IS NULL AND w.consumer='prompt' AND w.state='pending'
+          AND substr(w.origin, 1, 6)='agent:'
+          AND w.creatorSessionKey=NEW.receiptPrincipal
+          AND NEW.receiptPrincipal=c.holderKey
+          AND c.state='open' AND p.state='open' AND w.sessionKey=p.holderKey
+          AND w.reresolve='lineage' AND w.reresolveSeed=p.holderKey
+          AND w.reresolveRung=1
+          AND t.assignmentId=c.id AND t.sessionKey=c.holderKey AND t.status='running'
+          AND e.generation=NEW.receiptAcceptedGeneration
+          AND NEW.receiptCause='child_exact_parent_wake_invoked'
+      ))
       OR (
         NEW.controllerOrigin IS NOT NULL
         AND NOT EXISTS (
@@ -897,6 +934,61 @@ defmodule Tightbeam.Schema do
     }
   ]
 
+  @terminal_child_receipt_migration_id "terminal_child_receipt_v1"
+  @terminal_child_receipt_columns ~w(receiptChildTurnSeq receiptAcceptedGeneration receiptCause receiptPrincipal)
+
+  @terminal_child_sidecar_v2 Enum.find(
+                               @supervision_liveness_objects,
+                               &(&1.name == "supervision_liveness_sidecar")
+                             )
+
+  @terminal_child_sidecar_v1_sql Regex.replace(
+                                   ~r/^\s*receipt(?:ChildTurnSeq|AcceptedGeneration|Cause|Principal).*\n/m,
+                                   @terminal_child_sidecar_v2.sql,
+                                   ""
+                                 )
+                                 |> then(
+                                   &Regex.replace(
+                                     ~r/  CHECK \(\n    \(receiptCause.*?\n  \),\n  CHECK \(controllerOrigin/s,
+                                     &1,
+                                     "  CHECK (controllerOrigin"
+                                   )
+                                 )
+                                 |> String.replace(
+                                   "CHECK (controllerOrigin IS NOT NULL OR transferEvidenceId IS NOT NULL OR receiptCause IS NOT NULL)",
+                                   "CHECK (controllerOrigin IS NOT NULL OR transferEvidenceId IS NOT NULL)"
+                                 )
+
+  @terminal_child_sidecar_v1 %{
+    type: "table",
+    name: "supervision_liveness_sidecar",
+    sql: @terminal_child_sidecar_v1_sql
+  }
+
+  @terminal_child_insert_v2 Enum.find(
+                              @supervision_liveness_enforcement_objects,
+                              &(&1.name == "supervision_liveness_sidecar_insert_coherent")
+                            )
+  @terminal_child_insert_v1_sql @terminal_child_insert_v2.sql
+                                |> String.replace(
+                                  "WHEN (NEW.receiptCause IS NULL AND NOT EXISTS (",
+                                  "WHEN NOT EXISTS ("
+                                )
+                                |> then(
+                                  &Regex.replace(
+                                    ~r/\)\)\nOR \(NEW\.receiptCause.*?\)\)\nOR \(\n  NEW\.controllerOrigin/s,
+                                    &1,
+                                    ")\nOR (\n  NEW.controllerOrigin"
+                                  )
+                                )
+  @terminal_child_insert_v1 %{
+    type: "trigger",
+    name: "supervision_liveness_sidecar_insert_coherent",
+    sql: @terminal_child_insert_v1_sql
+  }
+
+  @terminal_child_immutable_names ~w(supervision_liveness_retirement_immutable_update supervision_liveness_retirement_immutable_delete)
+
   defmodule ShapeError do
     @moduledoc "A database whose stamped shape this build cannot read or migrate exactly."
     defexception [:message]
@@ -954,6 +1046,30 @@ defmodule Tightbeam.Schema do
   end
 
   @doc false
+  def terminal_child_receipt_v1_objects_for_test do
+    immutable =
+      Enum.map(@terminal_child_immutable_names, fn name ->
+        object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+
+        %{
+          object
+          | sql:
+              object.sql
+              |> String.replace(
+                "WHEN OLD.transferEvidenceId IS NOT NULL OR OLD.receiptCause IS NOT NULL",
+                "WHEN OLD.transferEvidenceId IS NOT NULL"
+              )
+              |> String.replace(
+                "supervision retirement outcome or terminal-child receipt is immutable",
+                "supervision retirement outcome is immutable"
+              )
+        }
+      end)
+
+    [@terminal_child_sidecar_v1, @terminal_child_insert_v1 | immutable]
+  end
+
+  @doc false
   @spec ensure_supervision_liveness_v1_in_txn(Txn.t(), non_neg_integer()) :: :ok
   def ensure_supervision_liveness_v1_in_txn(%Txn{} = txn, activated_at) do
     ensure_supervision_liveness_v1_in_txn(txn, activated_at, [])
@@ -963,6 +1079,7 @@ defmodule Tightbeam.Schema do
   @spec ensure_supervision_liveness_v1_in_txn(Txn.t(), non_neg_integer(), keyword()) :: :ok
   def ensure_supervision_liveness_v1_in_txn(%Txn{} = txn, activated_at, opts)
       when is_integer(activated_at) and activated_at >= 0 and is_list(opts) do
+    receipt_shape = maybe_upgrade_terminal_child_receipt_v1!(txn, activated_at)
     present = Enum.filter(@supervision_liveness_objects, &owned_object_present?(txn, &1))
     Enum.each(present, &validate_owned_object!(txn, &1))
 
@@ -1011,11 +1128,186 @@ defmodule Tightbeam.Schema do
       end
     end)
 
+    ensure_terminal_child_receipt_migration!(txn, receipt_shape, activated_at)
+
     :ok
   end
 
   def ensure_supervision_liveness_v1_in_txn(%Txn{}, _activated_at, _opts) do
     incompatible_supervision_liveness!("activation epoch must be a nonnegative integer")
+  end
+
+  defp maybe_upgrade_terminal_child_receipt_v1!(txn, activated_at) do
+    if owned_object_present?(txn, @terminal_child_sidecar_v2) do
+      columns =
+        Txn.q(txn, "PRAGMA table_info(supervision_liveness_sidecar)")
+        |> Enum.map(&Enum.at(&1, 1))
+
+      present = Enum.filter(@terminal_child_receipt_columns, &(&1 in columns))
+
+      cond do
+        present == @terminal_child_receipt_columns ->
+          :current
+
+        present == [] ->
+          validate_owned_object!(txn, @terminal_child_sidecar_v1)
+          validate_owned_object!(txn, @terminal_child_insert_v1)
+
+          Enum.each(@terminal_child_immutable_names, fn name ->
+            object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+
+            v1 = %{
+              object
+              | sql:
+                  object.sql
+                  |> String.replace(
+                    "WHEN OLD.transferEvidenceId IS NOT NULL OR OLD.receiptCause IS NOT NULL",
+                    "WHEN OLD.transferEvidenceId IS NOT NULL"
+                  )
+                  |> String.replace(
+                    "supervision retirement outcome or terminal-child receipt is immutable",
+                    "supervision retirement outcome is immutable"
+                  )
+            }
+
+            validate_owned_object!(txn, v1)
+          end)
+
+          migration =
+            Enum.find(
+              @supervision_liveness_enforcement_objects,
+              &(&1.name == "supervision_liveness_migrations")
+            )
+
+          validate_owned_object!(txn, migration)
+          [[affected_rows]] = Txn.q(txn, "SELECT COUNT(*) FROM supervision_liveness_sidecar")
+
+          rebuild_terminal_child_receipt_sidecar!(txn, affected_rows)
+
+          validate_owned_object!(txn, @terminal_child_sidecar_v2)
+
+          Txn.q(
+            txn,
+            """
+            INSERT INTO supervision_liveness_migrations
+              (migrationId, appliedAt, affectedRows, cause, principal)
+            VALUES (?1, ?2, ?3, 'release_upgrade', 'process:tightbeam')
+            """,
+            [@terminal_child_receipt_migration_id, activated_at, affected_rows]
+          )
+
+          :upgraded
+
+        true ->
+          incompatible_supervision_liveness!("mixed terminal-child receipt columns")
+      end
+    else
+      :fresh
+    end
+  end
+
+  defp rebuild_terminal_child_receipt_sidecar!(txn, affected_rows) do
+    objects = @supervision_liveness_objects ++ @supervision_liveness_enforcement_objects
+
+    dependent =
+      Enum.filter(objects, fn object ->
+        object.type in ["index", "trigger"] and
+          String.contains?(object.sql, "supervision_liveness_sidecar") and
+          owned_object_present?(txn, object)
+      end)
+
+    Enum.each(dependent, fn object ->
+      expected =
+        cond do
+          object.name == @terminal_child_insert_v1.name ->
+            @terminal_child_insert_v1
+
+          object.name in @terminal_child_immutable_names ->
+            %{
+              object
+              | sql:
+                  object.sql
+                  |> String.replace(
+                    "WHEN OLD.transferEvidenceId IS NOT NULL OR OLD.receiptCause IS NOT NULL",
+                    "WHEN OLD.transferEvidenceId IS NOT NULL"
+                  )
+                  |> String.replace(
+                    "supervision retirement outcome or terminal-child receipt is immutable",
+                    "supervision retirement outcome is immutable"
+                  )
+            }
+
+          true ->
+            object
+        end
+
+      validate_owned_object!(txn, expected)
+      :ok = Txn.exec(txn, "DROP #{String.upcase(object.type)} IF EXISTS #{object.name}")
+    end)
+
+    :ok =
+      Txn.exec(
+        txn,
+        "ALTER TABLE supervision_liveness_sidecar RENAME TO supervision_liveness_sidecar_terminal_child_v1"
+      )
+
+    :ok = Txn.exec(txn, @terminal_child_sidecar_v2.sql)
+
+    legacy_columns =
+      ~w(wakeId assignmentId controllerOrigin wakeKind controllerState chargedGeneration transferEvidenceId retirementEpoch retiringSessionKey retirementOutcomeKind retirementOutcomeId retirementTargetSessionKey retirementCause retirementPrincipal retirementActionNeeded)
+      |> Enum.join(",")
+
+    Txn.q(
+      txn,
+      "INSERT INTO supervision_liveness_sidecar (#{legacy_columns}) SELECT #{legacy_columns} FROM supervision_liveness_sidecar_terminal_child_v1"
+    )
+
+    if Txn.changes(txn) != affected_rows do
+      incompatible_supervision_liveness!("terminal-child receipt migration row count changed")
+    end
+
+    :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_sidecar_terminal_child_v1")
+
+    Enum.each(dependent, fn object ->
+      :ok = Txn.exec(txn, object.sql)
+      validate_owned_object!(txn, object)
+    end)
+
+    :ok
+  end
+
+  defp ensure_terminal_child_receipt_migration!(txn, :fresh, activated_at) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_liveness_migrations
+        (migrationId, appliedAt, affectedRows, cause, principal)
+      VALUES (?1, ?2, 0, 'release_upgrade', 'process:tightbeam')
+      """,
+      [@terminal_child_receipt_migration_id, activated_at]
+    )
+
+    :ok
+  end
+
+  defp ensure_terminal_child_receipt_migration!(txn, shape, _activated_at)
+       when shape in [:current, :upgraded] do
+    case Txn.q(
+           txn,
+           """
+           SELECT appliedAt, affectedRows, cause, principal
+           FROM supervision_liveness_migrations WHERE migrationId=?1
+           """,
+           [@terminal_child_receipt_migration_id]
+         ) do
+      [[applied_at, affected_rows, "release_upgrade", "process:tightbeam"]]
+      when is_integer(applied_at) and applied_at >= 0 and is_integer(affected_rows) and
+             affected_rows >= 0 ->
+        :ok
+
+      _ ->
+        incompatible_supervision_liveness!("invalid terminal-child receipt migration")
+    end
   end
 
   defp owned_object_present?(txn, %{type: type, name: name}) do
@@ -1118,6 +1410,22 @@ defmodule Tightbeam.Schema do
           message: "incompatible_effort_request_exit_v1: predecessor stamp #{inspect(rows)}"
     end
 
+    sidecar_columns =
+      Txn.q(txn, "PRAGMA table_info(supervision_liveness_sidecar)")
+      |> Enum.map(&Enum.at(&1, 1))
+
+    sidecar_triggers =
+      if "receiptCause" in sidecar_columns do
+        []
+      else
+        terminal_child_receipt_v1_objects_for_test()
+        |> Enum.drop(1)
+      end
+
+    for %{name: name} <- sidecar_triggers do
+      :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{name}")
+    end
+
     for name <- [
           "wakes_typed_cancellation_required",
           "wake_cancellations_pending_insert"
@@ -1153,6 +1461,10 @@ defmodule Tightbeam.Schema do
           "wakes_typed_cancellation_required"
         ] do
       object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+      :ok = Txn.exec(txn, object.sql)
+    end
+
+    for object <- sidecar_triggers do
       :ok = Txn.exec(txn, object.sql)
     end
 
