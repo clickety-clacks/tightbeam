@@ -2191,8 +2191,10 @@ defmodule Tightbeam.EscalationTest do
              )
 
     send(writer_pid, :commit_terminal_ruling)
-    ruled = Task.await(task)
-    assert :ok = Task.await(evaluator_task)
+    # The observer can spend the full SQLite busy timeout behind the writer.
+    # Do not make Task.await's identical 5-second default race that contract.
+    ruled = Task.await(task, 30_000)
+    assert :ok = Task.await(evaluator_task, 30_000)
 
     assert {:ok, [[cursor]]} =
              DB.query(
