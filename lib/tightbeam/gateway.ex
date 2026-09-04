@@ -286,7 +286,9 @@ defmodule Tightbeam.Gateway do
 
     credential_children(config, db) ++
       [
-        {ModelCatalog, base_dir: config.base_dir, db: db},
+        {Tightbeam.ModelManifest, base_dir: config.base_dir},
+        {ModelCatalog,
+         base_dir: config.base_dir, db: db, model_manifest: Tightbeam.ModelManifest},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
         # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
         # statute, and the episode writer must already own the ordering before the first
@@ -2027,6 +2029,10 @@ defmodule Tightbeam.Gateway do
           },
           modelCatalog: %{
             available: true,
+            manifest:
+              session.host
+              |> ModelCatalog.manifest_health(session.harness, ModelCatalog)
+              |> wire_manifest_health(),
             # Client Model decoder REQUIRES id + provider + ref (id is the
             # stable identity; ref doubles as it here). One row per vendor
             # model — including each context variant, which is part of the
@@ -2134,7 +2140,17 @@ defmodule Tightbeam.Gateway do
       context: entry.context,
       efforts: entry.efforts
     }
+    |> maybe_put(:aliases, Map.get(entry, :aliases))
+    |> maybe_put(:status, Map.get(entry, :status))
+    |> maybe_put(:profile, Map.get(entry, :profile))
+    |> maybe_put(:capabilities, Map.get(entry, :capabilities))
   end
+
+  defp wire_manifest_health(:fresh), do: %{status: "fresh"}
+  defp wire_manifest_health(:stale), do: %{status: "stale"}
+
+  defp wire_manifest_health({:unavailable, reason}),
+    do: %{status: "unavailable", reason: inspect(reason)}
 
   # The inbound half of `wire_model/1`, and the one place a caller's named
   # fields become an identity.
