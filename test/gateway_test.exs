@@ -317,6 +317,36 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule CandidateAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, {parent, %{}})
+    def init(state), do: {:ok, state}
+
+    def handle_call({:new_session, model, _cwd, _mcp, guidance}, _from, {parent, models}) do
+      sid = "candidate-#{map_size(models) + 1}"
+      send(parent, {:candidate_created, sid, model})
+      send(parent, {:candidate_guidance, sid, guidance})
+      {:reply, {:ok, sid}, {parent, Map.put(models, sid, model)}}
+    end
+
+    def handle_call({:new_candidate_session, model, cwd, mcp, guidance}, from, state),
+      do: handle_call({:new_session, model, cwd, mcp, guidance}, from, state)
+
+    def handle_call({:current_model, sid}, _from, {_parent, models} = state),
+      do: {:reply, Map.fetch(models, sid), state}
+
+    def handle_call({:knows_session?, sid}, _from, {_parent, models} = state),
+      do: {:reply, Map.has_key?(models, sid), state}
+
+    def handle_call({:fast_status, _sid}, _from, state),
+      do: {:reply, {:error, :fast_unsupported}, state}
+
+    def handle_call({:close_session, sid}, _from, {parent, models}) do
+      send(parent, {:candidate_closed, sid})
+      {:reply, :ok, {parent, Map.delete(models, sid)}}
+    end
+  end
+
   defmodule CloseErrorAdapterStub do
     use GenServer
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
@@ -656,7 +686,7 @@ defmodule Tightbeam.GatewayTest do
       File.rm_rf!(catalog_base)
     end)
 
-    {:paired, _device} =
+    {:paired, device} =
       claim_org(db, %{
         device_id: "flynn-device",
         claimed_name: "Flynn",
@@ -687,7 +717,14 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
-    %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, main_key: main_key}
+    %{
+      db: db,
+      registry: registry,
+      lane: lane,
+      catalog_base: catalog_base,
+      main_key: main_key,
+      device: device
+    }
   end
 
   test "assignment handlers inject configured supervision and effort settings before mutation",
@@ -3873,7 +3910,7 @@ defmodule Tightbeam.GatewayTest do
            "the one harness-switch commit must expose only its final session projection, got #{inspect(observed)}"
   end
 
-  describe "the substrate never elects a model (F2, Sol xhigh review)" do
+  describe "destination harness defaults" do
     setup ctx do
       base_dir = role_test_base("tune-model-election")
       codex_auth = Path.join([base_dir, "auth", "codex"])
@@ -3903,43 +3940,39 @@ defmodule Tightbeam.GatewayTest do
       %{handlers: Gateway.handlers(gateway_config(base_dir, ctx.db, 0))}
     end
 
-    test "set_harness with no --model refuses model_required, never a destination default", ctx do
-      assert %{ok: false, code: "model_required", message: message} =
+    test "set_harness with no --model uses the destination default", ctx do
+      assert %{ok: true, harness: "codex", model: "gpt-5.6-sol", effort: "medium"} =
                ctx.handlers["tune"].(%{
                  origin: "user:flynn",
                  session_key: "elect",
                  params: %{setting: "set_harness", harness: "codex"}
                })
 
-      assert message =~ "explicit --model"
-      assert Org.get(ctx.db, "elect").harness == "claude"
+      assert Org.get(ctx.db, "elect").model == Model.new("gpt-5.6-sol", effort: "medium")
     end
 
-    test "set_harness with --context and no --model refuses the more specific context_requires_model",
+    test "set_harness with --context and no --model qualifies the destination default",
          ctx do
-      assert %{ok: false, code: "context_requires_model", message: message} =
+      assert %{code: "model_unavailable", message: _} =
                ctx.handlers["tune"].(%{
                  origin: "user:flynn",
                  session_key: "elect",
                  params: %{setting: "set_harness", harness: "codex", context: "1m"}
                })
 
-      assert message =~ "--context"
       assert Org.get(ctx.db, "elect").harness == "claude"
     end
 
-    test "set_harness onto a tiered model with no --effort refuses effort_required, naming the tiers",
+    test "set_harness onto a tiered model with no --effort uses its supported default",
          ctx do
-      assert %{ok: false, code: "effort_required", message: message} =
+      assert %{ok: true, harness: "codex", model: "gpt-5.6-sol", effort: "medium"} =
                ctx.handlers["tune"].(%{
                  origin: "user:flynn",
                  session_key: "elect",
                  params: %{setting: "set_harness", harness: "codex", model: "gpt-5.6-sol"}
                })
 
-      assert message =~ "gpt-5.6-sol"
-      assert message =~ "medium"
-      assert Org.get(ctx.db, "elect").harness == "claude"
+      assert Org.get(ctx.db, "elect").model == Model.new("gpt-5.6-sol", effort: "medium")
     end
 
     test "set_harness with an explicit --model and --effort still applies cleanly", ctx do
@@ -7180,6 +7213,193 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "Tightbeam has no credential for openai on testhost"
     assert Org.get(ctx.db, "k1") == before
+  end
+
+  test "model-free session-control round trip uses each destination harness default", ctx do
+    base_dir = role_test_base("harness-destination-default-round-trip")
+    codex_auth = Path.join([base_dir, "auth", "codex"])
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:conn_registry, ctx.registry)
+      |> Map.put(:lane_manager, ctx.lane)
+
+    local_host = Placement.local_host_name()
+    Org.set_host(ctx.db, "k1", local_host)
+    Org.set_model(ctx.db, "k1", Model.new("source-claude", effort: "high"), "anthropic")
+
+    stable_identity =
+      ctx.db
+      |> Org.get("k1")
+      |> Map.take([:session_key, :display_name, :owner_user_id, :origin, :archetype])
+
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["low", "high"],
+      provider: :openai
+    })
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-explicit",
+      efforts: ["high"],
+      provider: :openai
+    })
+
+    put_host_catalog(local_host, "claude", [])
+
+    put_host_catalog_entry(local_host, "claude", %{
+      family: "claude-sonnet-5",
+      efforts: [],
+      provider: :anthropic
+    })
+
+    candidate = start_supervised!({CandidateAdapterStub, self()})
+    start_supervised!({CoordinatorStub, candidate})
+    start_lane!(ctx.db, "k1")
+
+    router_opts = [
+      db: ctx.db,
+      base_dir: base_dir,
+      handlers: Gateway.handlers(config),
+      session_status: fn session_key -> Gateway.session_status(session_key, ctx.db) end
+    ]
+
+    post = fn body ->
+      Plug.Test.conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(Map.put(body, "sessionKey", "k1"))
+      )
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Tightbeam.Wire.Router.call(Tightbeam.Wire.Router.init(router_opts))
+      |> then(&JSON.decode!(&1.resp_body))
+    end
+
+    assert %{
+             "ok" => true,
+             "status" => %{
+               "display" => %{
+                 "harness" => "codex",
+                 "modelFamily" => "gpt-5.6-sol",
+                 "reasoningLevel" => "low"
+               }
+             }
+           } = post.(%{"action" => "set_harness", "harness" => "codex"})
+
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "low")
+
+    [codex_marker] =
+      Projection.list_after(
+        ctx.db,
+        "k1",
+        nil,
+        50,
+        Org.get(ctx.db, "k1").cleared_through_seq
+      )
+
+    assert codex_marker.content =~
+             "changed from claude (source-claude (effort high)) to " <>
+               "codex (gpt-5.6-sol (effort low))"
+
+    assert %{
+             "ok" => true,
+             "status" => %{
+               "display" => %{
+                 "harness" => "claude",
+                 "modelFamily" => "claude-sonnet-5",
+                 "reasoningLevel" => nil
+               }
+             }
+           } = post.(%{"action" => "set_harness", "harness" => "claude"})
+
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-5")
+
+    before_missing_default = Org.get(ctx.db, "k1")
+
+    {:ok, [[before_message_count]]} =
+      DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", ["k1"])
+
+    put_host_catalog(local_host, "codex", [{"other-codex-model", ["low"]}])
+
+    assert %{"ok" => false, "code" => "model_unavailable"} =
+             post.(%{"action" => "set_harness", "harness" => "codex"})
+
+    assert Org.get(ctx.db, "k1") == before_missing_default
+
+    assert {:ok, [[^before_message_count]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM messages WHERE sessionKey = ?1", ["k1"])
+
+    put_host_catalog(local_host, "codex", [])
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-5.6-sol",
+      efforts: ["low", "high"],
+      provider: :openai
+    })
+
+    put_host_catalog_entry(local_host, "codex", %{
+      family: "gpt-explicit",
+      efforts: ["high"],
+      provider: :openai
+    })
+
+    assert %{
+             "ok" => true,
+             "status" => %{
+               "display" => %{
+                 "harness" => "codex",
+                 "modelContext" => nil,
+                 "modelFamily" => "gpt-5.6-sol",
+                 "reasoningLevel" => "low"
+               }
+             }
+           } = post.(%{"action" => "set_harness", "harness" => "codex"})
+
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-5.6-sol", effort: "low")
+
+    assert %{"ok" => true} = post.(%{"action" => "set_harness", "harness" => "claude"})
+
+    assert %{
+             "ok" => true,
+             "status" => %{
+               "display" => %{
+                 "modelContext" => nil,
+                 "modelFamily" => "gpt-explicit",
+                 "reasoningLevel" => "high"
+               }
+             }
+           } =
+             post.(%{
+               "action" => "set_harness",
+               "harness" => "codex",
+               "model" => "gpt-explicit",
+               "effort" => "high"
+             })
+
+    assert Org.get(ctx.db, "k1").model == Model.new("gpt-explicit", effort: "high")
+
+    assert ctx.db
+           |> Org.get("k1")
+           |> Map.take([:session_key, :display_name, :owner_user_id, :origin, :archetype]) ==
+             stable_identity
+
+    before_refusal = Org.get(ctx.db, "k1")
+
+    assert %{"ok" => false, "code" => "model_unavailable"} =
+             post.(%{
+               "action" => "set_harness",
+               "harness" => "claude",
+               "model" => "not-a-claude-model",
+               "effort" => "high"
+             })
+
+    assert Org.get(ctx.db, "k1") == before_refusal
   end
 
   test "set_harness changes the engine and projects its home at a turn boundary", ctx do

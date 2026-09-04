@@ -6170,13 +6170,14 @@ defmodule Tightbeam.Gateway do
     with {:ok, session} <- tunable_session(db, call),
          {:ok, module} <- known_harness(harness),
          :ok <- distinct_harness(session, harness),
-         :ok <- validate_model_election(p),
+         :ok <- validate_harness_model_election(p),
          :ok <- refuse_packed_model(p),
-         {:ok, model} <-
-           compose_tune_model_selection(
+         model =
+           compose_model_selection(
              session.host,
              harness,
-             destination_model(session, harness, p)
+             nil,
+             destination_model(session, module, harness, p)
            ),
          :ok <- validate_credential(config, harness, session.host),
          {:ok, routed} <-
@@ -6342,18 +6343,19 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  # A HARNESS BOUNDARY NEVER INHERITS THE SOURCE'S EFFORT, and never invents a
-  # model the caller did not name (v0.2 program §4 — Sol xhigh review,
-  # live-switch finding 2: `set_harness_result/4` refuses `model_required`
-  # before this is ever called, so `p` always names one here). Effort is a
-  # tier in the DESTINATION catalog's vocabulary and the source's tier may
-  # simply not exist there; carrying it across produced a bogus
-  # `effort_not_offered` for a model the destination offers perfectly well.
-  # There is no fallback base: a family is always present in `p`, so
-  # `resolve_selection/4` always takes its "caller named a family" branch,
-  # which never inherits from a base anyway.
-  defp destination_model(session, harness, p) do
-    resolve_selection(session.host, harness, p, nil)
+  # A HARNESS BOUNDARY NEVER INHERITS THE SOURCE'S MODEL OR EFFORT. When the
+  # caller does not name a model, the destination harness supplies its own
+  # default and the destination catalog composes that model's supported
+  # default effort. Explicit fields still win.
+  defp destination_model(session, module, harness, p) do
+    named = Model.named_fields(p)
+
+    selection_base =
+      if Map.has_key?(named, :family),
+        do: nil,
+        else: %{module.default_model() | effort: nil}
+
+    resolve_selection(session.host, harness, p, selection_base)
   end
 
   # THE IN-FLIGHT ANSWER: a live switch never interrupts a turn and is never
@@ -6444,14 +6446,9 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # TUNE's composition (v0.2 program §4 — the substrate never elects; Sol
-  # xhigh review, live-switch finding 2). A model that offers reasoning tiers
-  # and gets no `--effort` is REFUSED, naming the tiers on offer — never the
-  # session's outgoing effort, never "medium", never the catalog's first
-  # entry. Those were three different elections `compose_model_selection/4`
-  # (spawn's, above) wore as one function; a live switch gets none of them,
-  # mid-session, on the substrate's own initiative. A model with no tiers
-  # needs no effort at all — `nil` stands.
+  # Same-harness model composition remains explicit: a model that offers
+  # reasoning tiers and gets no `--effort` is refused, naming the tiers on
+  # offer. Cross-harness changes use the destination-default composition above.
   defp compose_tune_model_selection(host, harness, %Model{effort: nil} = selected) do
     case efforts_for(host, harness, selected) do
       [] -> {:ok, selected}
@@ -6471,14 +6468,9 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  # THE SUBSTRATE NEVER ELECTS A MODEL (v0.2 program §4 — Sol xhigh review,
-  # live-switch finding 2). A harness swap or a same-harness model change
-  # that names no model used to complete itself from the destination's
-  # configured default; that is the substrate choosing, not validating a
-  # caller's choice, and it is refused here BY NAME instead of silently
-  # substituted. `--context` qualifies a model, so a context with no model to
-  # qualify gets the more specific refusal — it names the actual mistake
-  # (a stray `--context`) rather than the generic "you must name a model".
+  # A same-harness model change still requires the caller to name the model.
+  # `--context` qualifies a model, so a context with no model to qualify gets
+  # the more specific refusal instead of the generic "you must name a model".
   # FIELDS ARE NEVER PACKED ACROSS THE ENGINE BOUNDARY, and the server owns
   # that contract — not the CLI (Sol round 2, important 5). Raw-dispatch and
   # device callers reach the gateway directly, and a packed ref like
@@ -6498,6 +6490,13 @@ defmodule Tightbeam.Gateway do
   end
 
   defp refuse_packed_model(_p), do: :ok
+
+  defp validate_harness_model_election(p) do
+    case Map.fetch(p, :model) do
+      :error -> :ok
+      _named -> validate_model_election(p)
+    end
+  end
 
   defp validate_model_election(p) do
     case Map.fetch(p, :model) do
