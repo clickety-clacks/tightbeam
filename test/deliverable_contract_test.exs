@@ -1371,6 +1371,18 @@ defmodule Tightbeam.DeliverableContractTest do
 
     assert [["coordination-fabric-v1-phase1-v9"]] = rows!(db, "SELECT shape FROM schema_stamp")
 
+    # The capture is schema.ex ONLY, so the module's @schema_modules list still
+    # names the CURRENT Tightbeam.Assignments — ensure_all/1 above therefore
+    # installs main's post-v9 revocation write-guards into a v9-stamped
+    # database. Build 724e5c96, which this fixture was dumped from, had no such
+    # trigger, so its genuine revoked row carries no provenance. A real v9
+    # database never trips them either: they are BEFORE INSERT/UPDATE guards on
+    # new writes, and its rows are already stored. Only this DML replay does.
+    # Drop them for the load exactly as migrate_revocation_reason_constraint/1
+    # does around its own bulk swap.
+    :ok = DB.execute(db, "DROP TRIGGER IF EXISTS assignments_revocation_reason_required")
+    :ok = DB.execute(db, "DROP TRIGGER IF EXISTS assignments_revocation_reason_required_insert")
+
     fixture =
       Path.expand("fixtures/deliverable_contract/phase1_v9_history.sql", __DIR__)
       |> File.read!()
