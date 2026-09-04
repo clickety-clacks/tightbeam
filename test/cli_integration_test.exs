@@ -139,7 +139,6 @@ defmodule Tightbeam.CliIntegrationTest do
       Router.init(
         db: db,
         base_dir: base_dir,
-        cursor_signing: cursor_signing!(base_dir),
         handlers: handlers,
         cli_token: "tbc_cli_integration",
         session_status: fn _ -> nil end
@@ -889,6 +888,62 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     item_id = JSON.decode!(created)["id"]
+
+    # The posture gate refuses a coder card on an unpostured work item, so the
+    # org's orchestrator rules the slice first, through the same real CLI.
+    orchestrator =
+      Org.create(ctx.db, %{
+        session_key: "cli-orchestrator",
+        display_name: "CLI Orchestrator",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "orchestrator",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("test")
+      })
+
+    Roles.create!(ctx.db, "cli-orchestrator", "flynn", orchestrator.session_key)
+
+    {slice, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "orchestrate the slice",
+          "--session",
+          "cli-orchestrator",
+          "--work-item",
+          item_id,
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    slice_id = JSON.decode!(slice)["id"]
+
+    {_postured, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          slice_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "posture-light",
+          "--note",
+          "e2e: the input is the spec",
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
 
     {assigned, 0} =
       System.cmd(

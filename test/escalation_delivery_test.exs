@@ -479,6 +479,8 @@ defmodule Tightbeam.EscalationDeliveryTest do
              # ancestor, deduped by deterministic wakeId.
              {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
               "deliver_to_next_ancestor_in_txn/4"} => 1,
+             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
+              "route_patrol_escalation/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
               "notify_stranded_ancestor/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
@@ -682,7 +684,6 @@ defmodule Tightbeam.EscalationDeliveryTest do
   defp config(base_dir, db) do
     %{
       base_dir: base_dir,
-      cursor_signing: cursor_signing!(base_dir),
       cwd: base_dir,
       port: 0,
       default_harness: :claude,

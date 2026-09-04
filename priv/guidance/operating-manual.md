@@ -171,6 +171,24 @@ a session with an open assignment: its holder must first file completion, or its
 opener must explicitly dispose of the work through the lawful assignment path. Retirement does
 not silently solve unfinished work.
 
+## Carry finished work to a line
+If you opened an assignment, you own carrying its finished work forward. When its holder files
+`completion`, or a review holder files `reviewed-clean`, act in that same turn on your open
+owner assignment for the same work item, one of two ways and never neither.
+
+Carry it: open an integration assignment against a staffed role and name the line in its
+subject. No row holds a release line and no verb binds one; the assignment you open, with the
+line named in its subject, is the whole record. The default is both active lines, `0.1.9` and
+`main` (the 0.2.0 line) — open one integration assignment per line unless the card says otherwise.
+
+Or record why you cannot: file a `progress` attest that states the exact reason the work is not
+carried now and names the principal who must clear it. A card that pins a single line or
+quarantines is a card saying otherwise; recording that reason and its principal is the discharge,
+not a stall. This duty does not transfer to the user.
+
+"Targetless", "done awaiting target" and "candidate remains unintegrated" are stall states, not
+completed work.
+
 ## Before you build what tightbeam already is
 When work — yours or the user's ask — starts to look like one of these, tightbeam (or
 an installed kungfu) already does it: guardrails/checks on agent behavior (rails);
@@ -196,6 +214,17 @@ never paste credential bytes into a durable record.
 - An assignment is an obligation on that work, held by a session:
 
     tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
+
+An assignment normally delivers its exact subject. Add `--delivers-work-item` only when
+the obligation delivers the whole card. Completion copies that stored identity. A note
+cannot narrow or replace it. Close a card by naming the current completion:
+
+    tightbeam work-item-close <workItemId> --completion-attest <attestId>
+
+A different deliverable cannot close the card silently. Only the exact captured card
+product-owner session can record an explicit narrower close. `work-item-update --title`
+changes display text only. It never changes the original deliverable name, id, or hash.
+If the original deliverable is wrong, fail or icebox the card and create a replacement.
 
 Open the card against a role, never a bare session key. The card records the role it
 was opened against; opened against a session key alone it records none, and
@@ -286,9 +315,11 @@ work or a named dependency recheck, and state when it resumes. Do not file "stil
 "unchanged," "waiting," or "no update." Do not repeat a result, blocker, refusal, decision
 request, or checkpoint that adds no new evidence or owner-relevant state.
 
-A valid receipt ends the stall response for that turn. If a stall alarm arrives after the
-receipt, do not file a rebuttal attest, send a rebuttal wake, or change the work. Treat the
-alarm as already answered; report a monitor defect only when you have new defect evidence.
+When you need more time, say so in a receipt that carries evidence: what moved on the
+deliverable since the last one, with the row, commit or artifact that shows it. A receipt
+that asserts effort without evidence buys nothing and should not be filed. Reserve your
+judgment for the work; how any particular monitor behaves is not a rule of this
+substrate.
 
 If no reporting exception applies, record the one valid bounded checkpoint when available or
 schedule a concrete continuation wake. Do not manufacture a generic progress attest.

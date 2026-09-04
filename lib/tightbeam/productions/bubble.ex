@@ -66,7 +66,48 @@ defmodule Tightbeam.Productions.Bubble do
     end
   end
 
+  @doc """
+  Route one durable patrol threshold through the existing capable-ancestor
+  climb. The cause is distinct from each source turn, so replay and failed
+  notice turns continue one logical escalation instead of creating another.
+  """
+  @spec recognize_patrol_escalation(DB.server(), String.t()) :: :ok
+  def recognize_patrol_escalation(db, escalation_id) when is_binary(escalation_id) do
+    case Supervision.failure_escalation(db, escalation_id) do
+      %{state: state} = escalation when state in ["pending", "admitted"] ->
+        if ConditionFacts.standing?(db, "user-alerted", escalation.owner_user_id) do
+          {:ok, _} =
+            DB.transaction(db, fn txn ->
+              Supervision.update_failure_escalation_route_in_txn(
+                txn,
+                escalation_id,
+                "resolved"
+              )
+            end)
+
+          :ok
+        else
+          route_patrol_escalation(db, escalation)
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
   defp recognize(db, seq, "delivered", turn) do
+    if is_binary(turn[:patrol_escalation_id]) do
+      {:ok, _} =
+        DB.transaction(db, fn txn ->
+          Supervision.update_failure_escalation_route_in_txn(
+            txn,
+            turn.patrol_escalation_id,
+            "resolved",
+            turn.session_key
+          )
+        end)
+    end
+
     # Retraction is observed, not declared: a delivered turn is proof the
     # owner has capacity. Guarded by the cheap any?/2 read because almost
     # every database has never filed a user-alerted fact and this runs on
@@ -84,6 +125,11 @@ defmodule Tightbeam.Productions.Bubble do
     end
 
     :ok
+  end
+
+  defp recognize(db, _seq, terminal, %{patrol_escalation_id: escalation_id})
+       when terminal in @climbing_notice_terminals do
+    recognize_patrol_escalation(db, escalation_id)
   end
 
   defp recognize(db, _seq, terminal, turn) do
@@ -190,6 +236,198 @@ defmodule Tightbeam.Productions.Bubble do
       {:delivery, recipient, delivery} ->
         handle_notice_delivery(db, turn, recipient, Gateway.complete_delivery(db, delivery))
     end
+  end
+
+  defp route_patrol_escalation(db, escalation) do
+    request_ref = "bubble:patrol:#{escalation.id}"
+    {coverage, excluded} = patrol_coverage(db, request_ref)
+
+    case coverage do
+      :resolved ->
+        {:ok, _} =
+          DB.transaction(db, fn txn ->
+            Supervision.update_failure_escalation_route_in_txn(
+              txn,
+              escalation.id,
+              "resolved"
+            )
+          end)
+
+        :ok
+
+      :pending ->
+        :ok
+
+      :continue ->
+        prompt =
+          "Six consecutive turns in #{escalation.session_key} could not complete. " <>
+            "The latest classified failure is #{escalation.failure_class}. " <>
+            "You are the nearest ancestor shown able to run a turn. What to do " <>
+            "about it is your judgment."
+
+        {:ok, result} =
+          DB.transaction(db, fn txn ->
+            case next_active_ancestor_in_txn(
+                   txn,
+                   escalation.session_key,
+                   excluded
+                 ) do
+              {:ok, recipient} ->
+                delivery =
+                  Gateway.deliver_prompt_in_txn(
+                    txn,
+                    recipient,
+                    "process:tightbeam",
+                    prompt,
+                    sender: "process:tightbeam",
+                    device_id: "process:tightbeam",
+                    client_message_id: "bubble:patrol:#{escalation.id}:#{recipient}",
+                    wake_id: "bubble:patrol:#{escalation.id}:#{recipient}",
+                    request_ref: request_ref
+                  )
+
+                Supervision.update_failure_escalation_route_in_txn(
+                  txn,
+                  escalation.id,
+                  "admitted",
+                  recipient
+                )
+
+                {:delivery, recipient, delivery}
+
+              _absence ->
+                :exhausted
+            end
+          end)
+
+        case result do
+          {:delivery, recipient, delivery} ->
+            handle_patrol_delivery(
+              db,
+              escalation,
+              recipient,
+              Gateway.complete_delivery(db, delivery)
+            )
+
+          :exhausted ->
+            patrol_terminal_alert(db, escalation)
+        end
+    end
+  end
+
+  defp patrol_coverage(db, request_ref) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT sessionKey, status FROM turns WHERE requestRef=?1 ORDER BY seq",
+        [request_ref]
+      )
+
+    cond do
+      Enum.any?(rows, fn [_session, status] -> status == "delivered" end) ->
+        {:resolved, MapSet.new()}
+
+      Enum.any?(rows, fn [_session, status] -> status in ["queued", "running"] end) ->
+        {:pending, MapSet.new()}
+
+      true ->
+        {:continue, MapSet.new(rows, &hd/1)}
+    end
+  end
+
+  defp handle_patrol_delivery(db, escalation, recipient, result) do
+    case result do
+      delivery when delivery in [:appended, :duplicate] ->
+        :ok
+
+      :skipped ->
+        route_patrol_escalation(db, %{escalation | first_recipient: recipient})
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp patrol_terminal_alert(db, escalation) do
+    message =
+      "[no agent can act]\n\nSix consecutive turns in " <>
+        "#{escalation.session_key} could not complete, and no active agent in " <>
+        "its lineage could be told. The latest classified failure is " <>
+        "#{escalation.failure_class}. Tightbeam will not repeat this alert " <>
+        "until a turn is observed to run."
+
+    main_key = Org.personal_session_key(escalation.owner_user_id)
+
+    {:ok, published} =
+      DB.transaction(db, fn txn ->
+        {route_state, stream?} =
+          case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
+            [["active"]] -> {"owner_alerted", true}
+            _ -> {"record_only", false}
+          end
+
+        DB.Txn.q(
+          txn,
+          """
+          UPDATE patrol_failure_escalations SET state=?2, updatedAt=?3
+          WHERE id=?1 AND state IN ('pending','admitted')
+          """,
+          [escalation.id, route_state, System.system_time(:millisecond)]
+        )
+
+        if DB.Txn.changes(txn) == 1 do
+          EventLog.lifecycle_in_txn(
+            txn,
+            "patrol_failure_lineage_exhausted",
+            escalation.owner_user_id,
+            "escalationId=#{escalation.id} session=#{escalation.session_key} thresholdTurnSeq=#{escalation.threshold_turn_seq} principal=process:tightbeam"
+          )
+
+          ConditionFacts.file_in_txn(txn, %{
+            kind: "user-alerted",
+            scope: escalation.owner_user_id,
+            origin: "process:tightbeam"
+          })
+
+          if stream? do
+            {:appended, marker} =
+              Projection.append_substrate_in_txn(txn, main_key, message, :high)
+
+            Tightbeam.Firehose.Publisher.message_in_txn(
+              txn,
+              main_key,
+              marker,
+              escalation.owner_user_id
+            )
+
+            {:ok, marker}
+          else
+            :no_stream
+          end
+        else
+          :already_terminal
+        end
+      end)
+
+    case published do
+      {:ok, marker} ->
+        ConnRegistry.publish_message(
+          Tightbeam.ConnRegistry,
+          main_key,
+          escalation.owner_user_id,
+          marker.seq,
+          Payloads.server_message(marker),
+          fn pid, payload -> send(pid, {:push_message, main_key, marker.seq, payload}) end
+        )
+
+      :no_stream ->
+        :ok
+
+      :already_terminal ->
+        :ok
+    end
+
+    :ok
   end
 
   defp deliver_to_next_ancestor_in_txn(txn, turn, prompt, excluded) do
@@ -360,6 +598,31 @@ defmodule Tightbeam.Productions.Bubble do
             EventLog.lifecycle(db, "bubble_marker_malformed", session_key, "seq=#{seq}")
             nil
 
+          {:patrol_notice, escalation_id} ->
+            case Supervision.failure_escalation(db, escalation_id) do
+              nil ->
+                EventLog.lifecycle(
+                  db,
+                  "bubble_cause_missing",
+                  session_key,
+                  "patrolEscalationId=#{escalation_id} seq=#{seq}"
+                )
+
+                nil
+
+              escalation ->
+                %{
+                  session_key: session_key,
+                  owner: escalation.owner_user_id,
+                  status: status,
+                  cause_seq: escalation.threshold_turn_seq,
+                  notice?: true,
+                  patrol_escalation_id: escalation_id,
+                  harness: current_harness,
+                  host: current_host
+                }
+            end
+
           {kind, cause_seq} ->
             {harness, host} =
               if kind == :notice do
@@ -388,13 +651,19 @@ defmodule Tightbeam.Productions.Bubble do
   end
 
   defp parse_cause_seq("bubble:" <> cause, _seq) do
-    case Integer.parse(cause) do
-      {cause_seq, ""} -> {:notice, cause_seq}
-      # A malformed marker is DIRT (review M5): a turn that claims to be a
-      # rung of a climb but names no cause must not be promoted to the start
-      # of a new bubble — notices about notices do not exist — and must not
-      # be silently indulged. Report it; recognition declines.
-      _ -> :malformed
+    case cause do
+      "patrol:" <> escalation_id when escalation_id != "" ->
+        {:patrol_notice, escalation_id}
+
+      _ ->
+        case Integer.parse(cause) do
+          {cause_seq, ""} -> {:notice, cause_seq}
+          # A malformed marker is DIRT (review M5): a turn that claims to be a
+          # rung of a climb but names no cause must not be promoted to the start
+          # of a new bubble — notices about notices do not exist — and must not
+          # be silently indulged. Report it; recognition declines.
+          _ -> :malformed
+        end
     end
   end
 

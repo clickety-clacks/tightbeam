@@ -1225,6 +1225,21 @@ defmodule Tightbeam.GatewayTest do
         "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_recovery', 'boot recovery', 'k1', 'flynn', 1)"
       )
 
+    {:ok, :ok} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.DeliverableContract.bind_assignment_in_txn(
+          txn,
+          %{
+            id: "asg_boot_recovery",
+            subject: "boot recovery",
+            holderKey: "k1",
+            openedAt: 1,
+            workItemId: nil
+          },
+          false
+        )
+      end)
+
     children =
       Gateway.children(
         gateway_config(gateway_children_base!(), ctx.db, 0)
@@ -1771,6 +1786,15 @@ defmodule Tightbeam.GatewayTest do
         """
       )
 
+    for assignment_id <- [
+          "asg_audit_target",
+          "asg_audit_conflict",
+          "asg_cycle_a",
+          "asg_cycle_b"
+        ] do
+      bind_assignment_deliverable_fixture!(ctx.db, assignment_id)
+    end
+
     {:ok, before_rows} =
       DB.query(
         ctx.db,
@@ -1823,7 +1847,6 @@ defmodule Tightbeam.GatewayTest do
 
     {Bandit, bandit_opts} = List.last(children)
     {Tightbeam.Wire.Router, socket_deps} = Keyword.fetch!(bandit_opts, :plug)
-    assert :ok = Tightbeam.CursorSigning.validate(socket_deps.cursor_signing)
     socket_deps = %{socket_deps | conn_registry: ctx.registry}
 
     empty_catalog(:not_derived)
@@ -4052,6 +4075,7 @@ defmodule Tightbeam.GatewayTest do
 
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
     start_lane!(ctx.db, "digester")
+    await_lane_quiet(ctx.db, "digester")
 
     assert %{ok: true} =
              handlers["tune"].(%{
@@ -8721,6 +8745,8 @@ defmodule Tightbeam.GatewayTest do
       VALUES ('wi_process_cause', 'Process cause', 'flynn', 'flynn', 1)
       """)
 
+    create_work_item_deliverable_fixture!(ctx.db, "wi_process_cause")
+
     for assignment_id <- ["asg_codex", "asg_claude", "asg_unknown", "asg_credential_known"] do
       {:ok, _} =
         DB.query(
@@ -8732,6 +8758,8 @@ defmodule Tightbeam.GatewayTest do
           """,
           [assignment_id]
         )
+
+      bind_assignment_deliverable_fixture!(ctx.db, assignment_id)
     end
 
     {:ok, _} =
@@ -8743,6 +8771,8 @@ defmodule Tightbeam.GatewayTest do
         VALUES ('asg_holder_fallback', 'Holder fallback test', 'k1', 'flynn', 1)
         """
       )
+
+    bind_assignment_deliverable_fixture!(ctx.db, "asg_holder_fallback")
 
     base = gateway_children_base!()
 
@@ -9020,6 +9050,9 @@ defmodule Tightbeam.GatewayTest do
         ('asg_process_rollback', 'Process rollback', 'k1', 'flynn', 1,
          'wi_process_rollback');
       """)
+
+    create_work_item_deliverable_fixture!(ctx.db, "wi_process_rollback")
+    bind_assignment_deliverable_fixture!(ctx.db, "asg_process_rollback")
 
     config = %{
       base_dir: gateway_children_base!(),
@@ -11060,7 +11093,6 @@ defmodule Tightbeam.GatewayTest do
   defp gateway_config(base_dir, db, port) do
     %{
       base_dir: base_dir,
-      cursor_signing: cursor_signing!(base_dir),
       cwd: "/tmp",
       port: port,
       default_harness: :claude,
@@ -11100,7 +11132,6 @@ defmodule Tightbeam.GatewayTest do
     base = Path.join(System.tmp_dir!(), "gateway_children_#{suffix}")
     File.rm_rf!(base)
     File.mkdir!(base)
-    _provider = cursor_signing!(base)
     on_exit(fn -> File.rm_rf!(base) end)
     base
   end
@@ -11178,6 +11209,45 @@ defmodule Tightbeam.GatewayTest do
     })
   end
 
+  defp create_work_item_deliverable_fixture!(db, work_item_id) do
+    {:ok, [[title, created_at]]} =
+      DB.query(db, "SELECT title, createdAt FROM work_items WHERE id=?1", [work_item_id])
+
+    {:ok, _} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.create_work_item_in_txn(
+          txn,
+          work_item_id,
+          title,
+          created_at
+        )
+      end)
+  end
+
+  defp bind_assignment_deliverable_fixture!(db, assignment_id) do
+    {:ok, [[subject, holder_key, opened_at, work_item_id]]} =
+      DB.query(
+        db,
+        "SELECT subject,holderKey,openedAt,workItemId FROM assignments WHERE id=?1",
+        [assignment_id]
+      )
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.bind_assignment_in_txn(
+          txn,
+          %{
+            id: assignment_id,
+            subject: subject,
+            holderKey: holder_key,
+            openedAt: opened_at,
+            workItemId: work_item_id
+          },
+          false
+        )
+      end)
+  end
+
   # A REAL lane for a session, because identity apply now decides its boundary in
   # the lane's mailbox: a session without one cannot be applied to at all. The
   # default runner is inert — these lanes exist to own a boundary, not to work.
@@ -11194,6 +11264,30 @@ defmodule Tightbeam.GatewayTest do
          [[session_key: session_key, db: db, task_sup: task_sup, runner: runner]]}
     })
   end
+
+  # A lane started over an already-queued turn claims it before it can serve any
+  # call: `SessionLane.init/1` self-sends `:nudge`, so that message is in the
+  # mailbox by the time `start_link` returns. A test that then acts on the
+  # session's turn boundary is racing its own runner for that mailbox, and loses
+  # under load — `at_turn_boundary` replies `:busy` while `task_ref` is set.
+  # Wait for the claimed turn to go terminal instead of assuming it has: the lane
+  # finalizes the row and clears `task_ref` in the same `handle_info`, so a zero
+  # count here means a boundary call queued behind it cannot see `:busy`.
+  defp await_lane_quiet(db, session_key, attempts \\ 100)
+
+  defp await_lane_quiet(db, session_key, attempts) when attempts > 0 do
+    case Ledger.pending_count(db, session_key) do
+      0 ->
+        :ok
+
+      _ ->
+        Process.sleep(10)
+        await_lane_quiet(db, session_key, attempts - 1)
+    end
+  end
+
+  defp await_lane_quiet(_db, session_key, 0),
+    do: flunk("lane for #{session_key} did not drain its queued turns")
 
   defp ensure_global_registry do
     case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do

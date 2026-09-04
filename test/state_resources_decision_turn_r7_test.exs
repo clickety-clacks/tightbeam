@@ -129,7 +129,7 @@ defmodule Tightbeam.StateResourcesDecisionTurnR7Test do
              )
   end
 
-  test "v15 migration assigns existing decision rows version one and activates increments", %{
+  test "v16 migration assigns existing decision rows version one and activates increments", %{
     db: db
   } do
     insert_decision_rows(db)
@@ -140,7 +140,7 @@ defmodule Tightbeam.StateResourcesDecisionTurnR7Test do
     assert {:ok, _} =
              DB.query(
                db,
-               "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v15'"
+               "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v16'"
              )
 
     assert :ok = Schema.ensure_all(db)

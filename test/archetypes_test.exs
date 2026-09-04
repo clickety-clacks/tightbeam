@@ -152,6 +152,41 @@ defmodule Tightbeam.ArchetypesTest do
     refute manual =~ "worktree-session"
   end
 
+  @tag timeout: 180_000
+  test "the finished-work carry law is single-homed and served to owner projections", ctx do
+    heading = "## Carry finished work to a line"
+    manual = Archetypes.builtin_fragments()["operating-manual.md"]
+
+    assert manual =~ heading
+    assert manual =~ "No row holds a release line and no verb binds one"
+    assert manual =~ "The default is both active lines"
+    assert manual =~ "names the principal who must clear it"
+    assert manual =~ "This duty does not transfer to the user"
+    assert manual =~ ~s("done awaiting target" and "candidate remains unintegrated")
+
+    for role <- ~w(product-owner orchestrator) do
+      role_guidance =
+        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/guidance/#{role}.md")
+        |> File.read!()
+
+      assert role_guidance =~ "the operating manual's finished-work carry"
+      refute role_guidance =~ heading
+      refute role_guidance =~ "The default is both active lines"
+    end
+
+    Identity.init!(ctx.base_dir)
+    assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+    revision = Identity.live_revision!(ctx.base_dir)
+
+    for role <- ~w(product-owner orchestrator), harness <- [:codex, :claude] do
+      served = Identity.snapshot_at!(ctx.base_dir, revision, role, harness).guidance
+
+      assert length(String.split(served, heading)) == 2
+      assert served =~ "the operating manual's finished-work carry"
+      refute Regex.match?(~r/^#include/m, served)
+    end
+  end
+
   test "the shipped bundle loads role guidance and elected shared skills", ctx do
     Identity.init!(ctx.base_dir)
 

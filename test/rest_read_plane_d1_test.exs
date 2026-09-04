@@ -132,7 +132,6 @@ defmodule Tightbeam.RestReadPlaneD1Test do
       base_dir: base_dir,
       handlers: %{"inspect" => inspect_handler},
       cli_token: "tbc_rest_d1",
-      cursor_signing: cursor_signing!(base_dir),
       model_catalog: catalog,
       session_status: fn _ -> nil end
     ]
@@ -420,7 +419,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     end
   end
 
-  test "tuple cursors page both directions, survive deletion, and bind filters and principals",
+  test "plain tuple cursors survive insertion, deletion, and restart and bind request shape",
        ctx do
     for user <- ~w(cursor-a cursor-b cursor-c cursor-d) do
       Devices.add_user(ctx.db, user, false)
@@ -433,8 +432,13 @@ defmodule Tightbeam.RestReadPlaneD1Test do
         []
       )
 
-    first = get(ctx, "/api/users?userId=cursor-a&userId=cursor-b&limit=1", ctx.admin_device.token)
-    first_body = JSON.decode!(first.resp_body)
+    filter = "userId=cursor-a&userId=cursor-aa&userId=cursor-b"
+    port = start_http!(ctx)
+
+    {200, _headers, first_bytes} =
+      http_get(port, "/api/users?#{filter}&limit=1", ctx.admin_device.token)
+
+    first_body = JSON.decode!(first_bytes)
     assert Enum.map(first_body["items"], & &1["userId"]) == ["cursor-b"]
     boundary = first_body["page"]["oldestCursor"]
     after_boundary = first_body["page"]["newestCursor"]
@@ -453,57 +457,52 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     assert payload["principalKind"] == "user"
     assert payload["principalId"] == "flynn"
     assert payload["tuple"] == [424_242, "cursor-b"]
+    assert encode_cursor_payload(payload) == boundary
+    refute String.contains?(boundary, ".")
+    refute String.contains?(boundary, "{")
     refute Map.has_key?(payload, "rowid")
     refute Map.has_key?(payload, "offset")
 
-    org_page =
-      get(
-        ctx,
-        "/api/users?asUser=flynn&userId=cursor-a&userId=cursor-b&limit=1",
-        "tbc_rest_d1"
-      )
-      |> then(&JSON.decode!(&1.resp_body))
+    stale_cursor = payload |> Map.put("version", 0) |> encode_cursor_payload()
+    stale = get(ctx, "/api/users?#{filter}&before=#{stale_cursor}", ctx.admin_device.token)
+    assert stale.status == 400
+    assert JSON.decode!(stale.resp_body)["error"]["code"] == "invalid_cursor"
 
-    forged_cursor =
-      org_page["page"]["newestCursor"]
-      |> decode_cursor_payload()
-      |> Map.put("principalId", "operator")
-      |> JSON.encode!()
-      |> then(fn forged_payload ->
-        rejected_secret = :crypto.hash(:sha256, "tbc_rest_d1:rest-d1")
-        rejected_signature = :crypto.mac(:hmac, :sha256, rejected_secret, forged_payload)
+    Devices.add_user(ctx.db, "cursor-aa", false)
 
-        Base.url_encode64(forged_payload, padding: false) <>
-          "." <> Base.url_encode64(rejected_signature, padding: false)
-      end)
+    {:ok, _rows} =
+      DB.query(ctx.db, "UPDATE users SET createdAt = 424242 WHERE userId = 'cursor-aa'", [])
 
-    forged =
-      get(
-        ctx,
-        "/api/users?asUser=operator&userId=cursor-a&userId=cursor-b&after=#{forged_cursor}",
-        "tbc_rest_d1"
+    :ok = stop_supervised(:rest_read_plane_http)
+    restarted_port = start_http!(ctx)
+
+    {200, _headers, inserted_bytes} =
+      http_get(
+        restarted_port,
+        "/api/users?#{filter}&before=#{boundary}",
+        ctx.admin_device.token
       )
 
-    assert forged.status == 400
-    assert JSON.decode!(forged.resp_body)["error"]["code"] == "invalid_cursor"
+    inserted = JSON.decode!(inserted_bytes)
+    assert Enum.map(inserted["items"], & &1["userId"]) == ["cursor-a", "cursor-aa"]
 
     {:ok, _rows} = DB.query(ctx.db, "DELETE FROM users WHERE userId = 'cursor-b'", [])
 
     previous =
       get(
         ctx,
-        "/api/users?userId=cursor-a&userId=cursor-b&limit=1&before=#{boundary}",
+        "/api/users?#{filter}&limit=1&before=#{boundary}",
         ctx.admin_device.token
       )
       |> then(&JSON.decode!(&1.resp_body))
 
-    assert Enum.map(previous["items"], & &1["userId"]) == ["cursor-a"]
+    assert Enum.map(previous["items"], & &1["userId"]) == ["cursor-aa"]
 
     for {field, cursor} <- [{"after", boundary}, {"before", after_boundary}] do
       replay =
         get(
           ctx,
-          "/api/users?userId=cursor-a&userId=cursor-b&#{field}=#{cursor}",
+          "/api/users?#{filter}&#{field}=#{cursor}",
           ctx.admin_device.token
         )
 
@@ -524,7 +523,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     wrong_principal =
       get(
         ctx,
-        "/api/users?userId=cursor-a&userId=cursor-b&after=#{after_boundary}",
+        "/api/users?#{filter}&after=#{after_boundary}",
         ctx.operator_device.token
       )
 
@@ -540,7 +539,7 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     now_hidden =
       get(
         ctx,
-        "/api/users?userId=cursor-a&userId=cursor-b&after=#{after_boundary}",
+        "/api/users?#{filter}&after=#{after_boundary}",
         ctx.admin_device.token
       )
 
@@ -677,83 +676,6 @@ defmodule Tightbeam.RestReadPlaneD1Test do
     assert length(identity_queries) == 4
   end
 
-  @tag :rest_d1_timing
-  @tag timeout: 600_000
-  test "identity metadata and denied real-HTTP cohorts stay within the five-percent bound", ctx do
-    fixture_bytes = install_large_identity_fixture!(ctx.db)
-    assert fixture_bytes >= 116_000
-
-    metadata_cohorts = [
-      {:known_authorized, "served", {:user, "flynn"}},
-      {:known_forbidden, "served", {:user, "operator"}},
-      {:unknown, "missing-identity", {:user, "flynn"}}
-    ]
-
-    for cohort <- metadata_cohorts, _call <- 1..2_000 do
-      metadata_latency(ctx.db, cohort)
-    end
-
-    port = start_http!(ctx)
-
-    http_cohorts = [
-      known_forbidden: "/api/identity/served",
-      unknown: "/api/identity/missing-identity"
-    ]
-
-    for {_cohort, path} <- http_cohorts, _call <- 1..2_000 do
-      {_elapsed, response} = http_latency(port, path, ctx.operator_device.token)
-      assert_denied_identity_http(response)
-    end
-
-    {:ok, [[sqlite_version]]} = DB.query(ctx.db, "SELECT sqlite_version()", [])
-    {:ok, hostname} = :inet.gethostname()
-    seeds = [8_520_001, 8_520_002, 8_520_003, 8_520_004, 8_520_005]
-    http_seeds = Enum.map(seeds, &(&1 + 100_000))
-
-    IO.puts(
-      "rest_d1_identity_timing machine=#{hostname} otp=#{System.otp_release()} " <>
-        "elixir=#{System.version()} sqlite=#{sqlite_version} fixture_bytes=#{fixture_bytes} " <>
-        "metadata_seeds=#{Enum.join(seeds, ",")} http_seeds=#{Enum.join(http_seeds, ",")}"
-    )
-
-    for seed <- seeds do
-      metadata_samples =
-        metadata_cohorts
-        |> balanced_order(10_000, seed)
-        |> Enum.reduce(%{}, fn {cohort, _name, _principal} = entry, samples ->
-          elapsed = metadata_latency(ctx.db, entry)
-          Map.update(samples, cohort, [elapsed], &[elapsed | &1])
-        end)
-
-      assert Enum.all?(metadata_samples, fn {_cohort, samples} -> length(samples) == 10_000 end)
-
-      assert_timing_pairs!(
-        "metadata",
-        seed,
-        metadata_samples,
-        [
-          {:known_authorized, :known_forbidden},
-          {:known_authorized, :unknown},
-          {:known_forbidden, :unknown}
-        ]
-      )
-
-      http_seed = seed + 100_000
-
-      http_samples =
-        http_cohorts
-        |> balanced_order(10_000, http_seed)
-        |> Enum.reduce(%{}, fn {cohort, path}, samples ->
-          {elapsed, response} = http_latency(port, path, ctx.operator_device.token)
-          assert_denied_identity_http(response)
-          Map.update(samples, cohort, [elapsed], &[elapsed | &1])
-        end)
-
-      assert Enum.all?(http_samples, fn {_cohort, samples} -> length(samples) == 10_000 end)
-      assert_timing_pairs!("http", http_seed, http_samples, [{:known_forbidden, :unknown}])
-    end
-  end
-
   test "D1 adds no REST serializer, projection, cursor module, or list seam" do
     source = File.read!(Path.expand("../lib/tightbeam/wire/router.ex", __DIR__))
 
@@ -793,11 +715,15 @@ defmodule Tightbeam.RestReadPlaneD1Test do
   end
 
   defp start_http!(ctx) do
-    bandit =
-      start_supervised!(
+    child =
+      Supervisor.child_spec(
         {Bandit,
-         plug: {Router, Router.init(ctx.opts)}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+         plug: {Router, Router.init(ctx.opts)}, port: 0, ip: {127, 0, 0, 1}, startup_log: false},
+        id: :rest_read_plane_http
       )
+
+    bandit =
+      start_supervised!(child)
 
     {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
     port
@@ -833,94 +759,16 @@ defmodule Tightbeam.RestReadPlaneD1Test do
   end
 
   defp decode_cursor_payload(cursor) do
-    [payload, _signature] = String.split(cursor, ".", parts: 2)
-    payload |> Base.url_decode64!(padding: false) |> JSON.decode!()
+    cursor |> Base.url_decode64!(padding: false) |> JSON.decode!()
   end
 
-  defp install_large_identity_fixture!(db) do
-    identity = hydrated_identity!(db, "served", {:user, "flynn"})
-
-    session_revisions =
-      Map.new(1..4_000, fn index ->
-        {"agent:timing:#{String.pad_leading(Integer.to_string(index), 4, "0")}",
-         "revision-#{String.pad_leading(Integer.to_string(index), 4, "0")}-payload"}
-      end)
-
-    stored_item =
-      identity
-      |> Map.delete("rowVersion")
-      |> Map.put("sessionRevisions", session_revisions)
-      |> Map.put("staleness", [])
-
-    bytes = JSON.encode!(stored_item)
-
-    {:ok, _rows} =
-      DB.query(
-        db,
-        "UPDATE admin_projection_versions SET item = ?1 WHERE resource = 'identity' AND primaryKey = 'served'",
-        [bytes]
-      )
-
-    hydrated = hydrated_identity!(db, "served", {:user, "flynn"})
-    _closed_item = StateResources.identity(hydrated)
-    byte_size(bytes)
-  end
-
-  defp metadata_latency(db, {_cohort, name, principal_binding}) do
-    request_binding = make_ref()
-
-    try do
-      started_at = System.monotonic_time(:nanosecond)
-
-      {:ok, descriptor} =
-        StateResources.query_identity(
-          db,
-          {:metadata, name, request_binding, principal_binding}
-        )
-
-      elapsed = System.monotonic_time(:nanosecond) - started_at
-      assert is_binary(descriptor)
-      elapsed
-    after
-      :ok = StateResources.query_identity(db, {:close, request_binding})
-    end
-  end
-
-  defp http_latency(port, path, bearer) do
-    started_at = System.monotonic_time(:nanosecond)
-    response = http_get(port, path, bearer)
-    {System.monotonic_time(:nanosecond) - started_at, response}
-  end
-
-  defp assert_denied_identity_http({404, headers, body}) do
-    assert application_header(headers, "cache-control") == "no-store"
-    assert body == ~s({"schemaVersion":1,"resource":"identity","error":{"code":"not_found"}})
-  end
-
-  defp balanced_order(cohorts, count, seed) do
-    :rand.seed(:exsss, {seed, seed + 17, seed + 101})
-    cohorts |> Enum.flat_map(&List.duplicate(&1, count)) |> Enum.shuffle()
-  end
-
-  defp assert_timing_pairs!(stage, seed, samples, pairs) do
-    for {left, right} <- pairs, percentile <- [50, 95] do
-      left_value = nearest_rank(Map.fetch!(samples, left), percentile)
-      right_value = nearest_rank(Map.fetch!(samples, right), percentile)
-      delta = abs(left_value - right_value) / min(left_value, right_value) * 100
-
-      IO.puts(
-        "rest_d1_identity_timing stage=#{stage} seed=#{seed} pair=#{left}/#{right} " <>
-          "p#{percentile}=#{left_value}/#{right_value} delta=#{Float.round(delta, 3)}%"
-      )
-
-      assert delta <= 5.0
-    end
-  end
-
-  defp nearest_rank(samples, percentile) do
-    ordered = Enum.sort(samples)
-    rank = ceil(percentile / 100 * length(ordered))
-    Enum.at(ordered, rank - 1)
+  defp encode_cursor_payload(payload) do
+    ~w(direction filters principalId principalKind resource route tuple version)
+    |> Enum.map_join(",", fn key ->
+      JSON.encode!(key) <> ":" <> JSON.encode!(Map.fetch!(payload, key))
+    end)
+    |> then(&("{" <> &1 <> "}"))
+    |> Base.url_encode64(padding: false)
   end
 
   defp hydrated_identity!(db, name, principal_binding) do

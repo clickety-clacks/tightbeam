@@ -1,6 +1,8 @@
 # Preferred models — engineering kungfu
 
 The single model catalog, selection, and ring-down source for this engineering kungfu.
+The org owns this table; retune it through an identity edit, not by deference to
+whoever wrote it. There is no separate policy table.
 
 ## Working set (capsules)
 <!-- machine-read: mix tightbeam.catalog.diff parses each capsule id from the

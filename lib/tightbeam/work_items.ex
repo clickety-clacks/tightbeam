@@ -133,6 +133,13 @@ defmodule Tightbeam.WorkItems do
               put_priority_in_txn(txn, id, priority)
               stamp_version_in_txn(txn, id, created_at)
 
+              Tightbeam.DeliverableContract.create_work_item_in_txn(
+                txn,
+                id,
+                call.params.title,
+                created_at
+              )
+
               routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
 
               if key do
@@ -340,7 +347,8 @@ defmodule Tightbeam.WorkItems do
   ## Terminal dispositions (owner-or-admin) — icebox/reopen/close/fail
 
   defp dispose_result(db, call, verb) do
-    with :ok <- principal_allowed(call.principal) do
+    with :ok <- principal_allowed(call.principal),
+         :ok <- valid_disposition_key(verb, call.params[:idempotency_key]) do
       id = call.params[:work_item_id]
       reason = call.params[:reason]
 
@@ -357,7 +365,7 @@ defmodule Tightbeam.WorkItems do
             case IdPrefix.resolve_in_txn(txn, :work_item, id, visible?) do
               {:ok, resolved} ->
                 id_resolved(call, txn, :work_item, resolved)
-                dispose_in_txn(txn, call.principal, resolved, verb, reason)
+                dispose_in_txn(txn, call.principal, resolved, verb, reason, call.params)
 
               :unknown ->
                 unknown(id)
@@ -391,7 +399,7 @@ defmodule Tightbeam.WorkItems do
     end
   end
 
-  defp dispose_in_txn(txn, principal, id, verb, reason) do
+  defp dispose_in_txn(txn, principal, id, verb, reason, params) do
     case fetch_in_txn(txn, id) do
       nil ->
         unknown(id)
@@ -402,6 +410,19 @@ defmodule Tightbeam.WorkItems do
         cond do
           not disposition_allowed?(txn, principal, item) ->
             error("not_authorized", "work-item disposition requires its owner or an admin")
+
+          item.state == target and verb == :close ->
+            case Tightbeam.DeliverableContract.existing_close_replay_in_txn(
+                   txn,
+                   id,
+                   principal,
+                   params[:completion_attest_id],
+                   params[:owner_ruling_reason]
+                 ) do
+              {:ok, _closure} -> {:disposed, item, false}
+              :legacy -> {:disposed, item, false}
+              error -> error
+            end
 
           item.state == target ->
             # Same-state transition is a no-op success — changes nothing, and
@@ -414,49 +435,100 @@ defmodule Tightbeam.WorkItems do
               "cannot #{verb} a #{item.state} work item"
             )
 
-          verb != :reopen and open_assignments?(txn, id) ->
+          verb != :reopen and verb != :close and open_assignments?(txn, id) ->
             error(
               "assignments_open",
               "work item #{id} still has open assignments; close them first"
             )
 
           true ->
-            apply_disposition(txn, item, verb, target, reason)
-            stamp_version_in_txn(txn, id, now())
-            disposed = fetch_in_txn(txn, id)
+            close_plan =
+              if verb == :close do
+                Tightbeam.DeliverableContract.prepare_close_in_txn(
+                  txn,
+                  id,
+                  principal,
+                  params[:completion_attest_id],
+                  params[:owner_ruling_reason]
+                )
+              else
+                {:ok, nil}
+              end
 
-            # The item keeps its CURRENT state only, and reopen nulls failReason;
-            # work_item_events is a bare doorbell (kind is 'metadata' or
-            # 'composition'), so it records that something changed, never from
-            # what to what. jobRef IS the work-item id here, and a disposition
-            # belongs to no assignment.
-            CausalEvents.append_in_txn(txn, %{
-              kind: "disposition_transition",
-              job_ref: id,
-              assignment_id: nil,
-              session_key: nil,
-              detail: %{
-                workItemId: id,
-                fromState: item.state,
-                toState: target,
-                failReason: disposed.failReason
-              }
-            })
+            with {:ok, close_plan} <- close_plan,
+                 :miss <-
+                   if(close_plan,
+                     do:
+                       Tightbeam.DeliverableContract.close_receipt_in_txn(
+                         txn,
+                         principal,
+                         params[:idempotency_key],
+                         close_plan.fingerprint
+                       ),
+                     else: :miss
+                   ) do
+              apply_disposition(txn, item, verb, target, reason)
+              stamp_version_in_txn(txn, id, now())
 
-            [[transition_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+              if close_plan do
+                Tightbeam.DeliverableContract.insert_closure_in_txn(
+                  txn,
+                  id,
+                  principal,
+                  close_plan,
+                  now()
+                )
+              end
 
-            if verb != :reopen do
-              cancel_brackets_in_txn(txn, id, %{
-                causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
-                outcome: %{
-                  kind: "disposition",
-                  disposition_kind: "work_item_transition",
-                  disposition_id: to_string(transition_id)
+              disposed = fetch_in_txn(txn, id)
+
+              if close_plan do
+                Tightbeam.DeliverableContract.store_close_receipt_in_txn(
+                  txn,
+                  principal,
+                  params[:idempotency_key],
+                  close_plan.fingerprint,
+                  id,
+                  %{ok: true, workItem: public_work_item(disposed)}
+                )
+              end
+
+              # The item keeps its CURRENT state only, and reopen nulls failReason;
+              # work_item_events is a bare doorbell (kind is 'metadata' or
+              # 'composition'), so it records that something changed, never from
+              # what to what. jobRef IS the work-item id here, and a disposition
+              # belongs to no assignment.
+              CausalEvents.append_in_txn(txn, %{
+                kind: "disposition_transition",
+                job_ref: id,
+                assignment_id: nil,
+                session_key: nil,
+                detail: %{
+                  workItemId: id,
+                  fromState: item.state,
+                  toState: target,
+                  failReason: disposed.failReason
                 }
               })
-            end
 
-            {:disposed, disposed, true}
+              [[transition_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
+              if verb != :reopen do
+                cancel_brackets_in_txn(txn, id, %{
+                  causal_source: %{kind: "work_item_transition", id: to_string(transition_id)},
+                  outcome: %{
+                    kind: "disposition",
+                    disposition_kind: "work_item_transition",
+                    disposition_id: to_string(transition_id)
+                  }
+                })
+              end
+
+              {:disposed, disposed, true}
+            else
+              {:replay, response} -> response
+              error -> error
+            end
         end
     end
   end
@@ -785,21 +857,51 @@ defmodule Tightbeam.WorkItems do
       {:ok, rows} =
         DB.query(db, "SELECT #{columns()} FROM work_items ORDER BY createdAt DESC, id DESC")
 
-      %{workItems: Enum.map(rows, &(work_item(&1) |> public_work_item()))}
+      work_items =
+        Enum.map(rows, fn row ->
+          item = work_item(row)
+
+          item
+          |> Map.put(
+            :deliverableProjection,
+            Tightbeam.DeliverableContract.work_item_projection(db, item.id)
+          )
+          |> public_work_item()
+        end)
+
+      %{workItems: work_items}
     end
   end
 
   defp fetch(db, id) do
     case DB.query(db, "SELECT #{columns()} FROM work_items WHERE id = ?1", [id]) do
-      {:ok, [row]} -> work_item(row)
-      {:ok, []} -> nil
+      {:ok, [row]} ->
+        item = work_item(row)
+
+        Map.put(
+          item,
+          :deliverableProjection,
+          Tightbeam.DeliverableContract.work_item_projection(db, id)
+        )
+
+      {:ok, []} ->
+        nil
     end
   end
 
   defp fetch_in_txn(txn, id) do
     case Txn.q(txn, "SELECT #{columns()} FROM work_items WHERE id = ?1", [id]) do
-      [row] -> work_item(row)
-      [] -> nil
+      [row] ->
+        item = work_item(row)
+
+        Map.put(
+          item,
+          :deliverableProjection,
+          Tightbeam.DeliverableContract.work_item_projection_in_txn(txn, id)
+        )
+
+      [] ->
+        nil
     end
   end
 
@@ -851,6 +953,12 @@ defmodule Tightbeam.WorkItems do
 
   defp valid_idempotency_key(_),
     do: error("invalid_idempotency_key", "idempotencyKey must be text")
+
+  defp valid_disposition_key(:close, key), do: valid_idempotency_key(key)
+  defp valid_disposition_key(_verb, nil), do: :ok
+
+  defp valid_disposition_key(_verb, _key),
+    do: error("invalid_idempotency_key", "idempotencyKey is not valid for this disposition")
 
   defp principal_allowed({:process, _}),
     do: error("process_denied", "process principals cannot use work-item verbs")
@@ -990,7 +1098,11 @@ defmodule Tightbeam.WorkItems do
     }
   end
 
-  defp public_work_item(item), do: Map.drop(item, [:routingWakeId, :slateWakeId])
+  defp public_work_item(item) do
+    item
+    |> Map.drop([:routingWakeId, :slateWakeId, :deliverableProjection])
+    |> Map.merge(Map.get(item, :deliverableProjection, %{}))
+  end
 
   defp bool_to_int(true), do: 1
   defp bool_to_int(false), do: 0

@@ -59,51 +59,20 @@ defmodule Tightbeam.Application do
   end
 
   defp start_tree(config) do
-    # The server-held cursor signer is composed before the listener. An absent
-    # canonical path selects the explicit bootstrap state: the base tree may run,
-    # but no gateway child or listener is admitted until local provisioning
-    # reaches the durable healthy transition. Normal startup never provisions or
-    # substitutes material.
-    cursor_signing = Tightbeam.CursorSigning.load!(config.base_dir)
-
-    config = Map.put(config, :cursor_signing, cursor_signing)
-
     with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
-      case Tightbeam.CursorSigning.lifecycle(cursor_signing) do
-        :healthy ->
-          :ok = admit_gateway(supervisor, config)
-          {:ok, supervisor}
+      Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
+        {:ok, _pid} = Supervisor.start_child(supervisor, child)
+      end)
 
-        :unprovisioned ->
-          {:ok, _bootstrap} =
-            Supervisor.start_child(
-              supervisor,
-              {Tightbeam.CursorSigning.Bootstrap,
-               supervisor: supervisor, config: config, provider: cursor_signing}
-            )
+      # LAST, deliberately: Bandit's "Running ... (http)" has already been
+      # logged by now, and that line reads as a verdict. On an org that cannot
+      # run a single turn it was the wrong one, so the real verdict goes after
+      # it. Assembled from what boot already knows; it starts nothing and cannot
+      # fail the boot.
+      report_readiness(config)
 
-          {:ok, supervisor}
-
-        _refusal ->
-          Supervisor.stop(supervisor)
-          raise Tightbeam.CursorSigning.Error, reason: :unavailable
-      end
+      {:ok, supervisor}
     end
-  end
-
-  @doc false
-  def admit_gateway(supervisor, config) do
-    Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
-      {:ok, _pid} = Supervisor.start_child(supervisor, child)
-    end)
-
-    # LAST, deliberately: Bandit's "Running ... (http)" has already been
-    # logged by now, and that line reads as a verdict. On an org that cannot
-    # run a single turn it was the wrong one, so the real verdict goes after
-    # it. Assembled from what boot already knows; it starts nothing and cannot
-    # fail the boot.
-    report_readiness(config)
-    :ok
   end
 
   # AN EXPECTED REFUSAL IS NOT A CRASH.

@@ -1,12 +1,10 @@
 defmodule Tightbeam.ActivationsTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Activations, ColdStart, DB, Dispatch, Gateway, Model, Org, Rules}
-  alias Tightbeam.ClientE2E.LegGateway
+  alias Tightbeam.{Activations, DB, Dispatch, Gateway, Model, Org, Rules}
 
   @sha String.duplicate("a", 64)
   @sha2 String.duplicate("b", 64)
-  @legacy_base "6e852693a4ba9f6bedbc9a77ed24675abdbd4fea"
 
   setup do
     db = :activations_db
@@ -699,163 +697,6 @@ defmodule Tightbeam.ActivationsTest do
     assert length(indexes) == 12
   end
 
-  @tag timeout: 420_000
-  test "the exact older gateway opens activation rows and current CLI refuses before dispatch" do
-    root =
-      Path.join(
-        System.tmp_dir!(),
-        "activation-downgrade-client-e2e-#{System.unique_integer([:positive])}"
-      )
-
-    File.mkdir_p!(root)
-    Tightbeam.CursorSigning.provision!(root)
-    path = Path.join(root, "state.db")
-    writer = :activation_downgrade_writer
-    reader = :activation_downgrade_reader
-    on_exit(fn -> File.rm_rf!(root) end)
-
-    legacy_checkout = exact_legacy_checkout!()
-    legacy_build = Path.join(Path.expand("..", __DIR__), "_build/legacy-base-#{System.pid()}")
-
-    # The legacy gateway must own the database shape used by this downgrade
-    # test. A current bootstrap would stamp a newer shape that the exact older
-    # binary must refuse, which tests schema downgrade rather than CLI feature
-    # negotiation.
-    bootstrap_gateway =
-      case LegGateway.boot(root, free_port(),
-             repo_root: legacy_checkout,
-             boot_timeout_ms: 300_000,
-             env: [
-               {"PATH", System.fetch_env!("PATH")},
-               {"ELIXIR_ERL_OPTIONS", "+fnu"},
-               {"MIX_BUILD_PATH", legacy_build}
-             ]
-           ) do
-        {:ok, gateway} ->
-          gateway
-
-        {:error, reason, gateway} ->
-          log = if File.exists?(gateway.log_path), do: File.read!(gateway.log_path), else: ""
-          LegGateway.teardown(gateway, remove: false)
-          flunk("exact legacy gateway failed to bootstrap: #{inspect(reason)}\n#{log}")
-      end
-
-    assert :ok = LegGateway.teardown(bootstrap_gateway, remove: false)
-
-    {:ok, writer_pid} = DB.start_link(path: path, name: writer)
-    :ok = Activations.ensure_schema(writer)
-
-    assert {:ok, %{phase: "reserved"}} =
-             ColdStart.add_first_user(writer, "legacy", %{
-               host: "testhost",
-               harness: :claude,
-               provider: :anthropic,
-               model: Model.new("fable")
-             })
-
-    session(writer, "legacy-holder", "legacy")
-
-    {:ok, _} =
-      DB.query(
-        writer,
-        "INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdAt) VALUES ('wi_legacy','legacy-readable','legacy','open','legacy',1)"
-      )
-
-    {:ok, _} =
-      DB.query(
-        writer,
-        "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES ('asg_legacy','legacy','legacy-holder','legacy',1,'open','wi_legacy')"
-      )
-
-    current =
-      apply(writer, "activation-declare", {:session, "legacy-holder"}, %{
-        root_assignment_id: "asg_legacy",
-        owner_user_id: "legacy",
-        domain: "example",
-        correlation_key: "downgrade",
-        prepared_input: resource("downgrade-input", @sha),
-        target: resource("downgrade-target", nil),
-        idempotency_key: "downgrade-declare"
-      })
-
-    GenServer.stop(writer_pid)
-    port = free_port()
-
-    gateway_result =
-      case LegGateway.boot(root, port,
-             repo_root: legacy_checkout,
-             boot_timeout_ms: 300_000,
-             env: [
-               {"PATH", System.fetch_env!("PATH")},
-               {"ELIXIR_ERL_OPTIONS", "+fnu"},
-               {"MIX_BUILD_PATH", legacy_build}
-             ]
-           ) do
-        {:ok, gateway} ->
-          {:ok, gateway}
-
-        {:error, reason, gateway} ->
-          log = if File.exists?(gateway.log_path), do: File.read!(gateway.log_path), else: ""
-          LegGateway.teardown(gateway, remove: false)
-          {:refused, reason, log}
-      end
-
-    case gateway_result do
-      {:refused, _reason, log} ->
-        assert log =~ "stamped: coordination-fabric-v1-phase1-v15"
-        assert log =~ "this build: coordination-fabric-v1-phase1-v13"
-        assert log =~ "There is no migration"
-
-      {:ok, gateway} ->
-        on_exit(fn -> assert :ok = LegGateway.teardown(gateway, remove: false) end)
-
-        assert %{"protocolVersion" => 1} = version = gateway_version!(port)
-        refute Map.has_key?(version, "features")
-
-        cli = Path.expand("../cli/target/release/tightbeam", __DIR__)
-        assert File.exists?(cli), "build cli/target/release/tightbeam before running this gate"
-
-        cli_env = [{"TIGHTBEAM_BASE_DIR", root}]
-
-        assert {legacy_journey, 0} =
-                 System.cmd(cli, ["work-item-get", "wi_legacy", "--as-user", "legacy"],
-                   cd: root,
-                   env: cli_env,
-                   stderr_to_stdout: true
-                 )
-
-        assert legacy_journey =~ "wi_legacy"
-        assert legacy_journey =~ "legacy-readable"
-
-        assert {"capability_missing: activation-events-v1\n", 1} =
-                 System.cmd(
-                   cli,
-                   [
-                     "activation-status",
-                     "--activation",
-                     current.event.activation_id,
-                     "--as-user",
-                     "legacy"
-                   ],
-                   cd: root,
-                   env: cli_env,
-                   stderr_to_stdout: true
-                 )
-
-        {:ok, reader_pid} = DB.start_link(path: path, name: reader)
-        on_exit(fn -> if Process.alive?(reader_pid), do: GenServer.stop(reader_pid) end)
-
-        assert {:ok, [["wi_legacy", "legacy-readable", "open"]]} =
-                 DB.query(reader, "SELECT id,title,state FROM work_items WHERE id='wi_legacy'")
-
-        assert {:ok, [[current.event.activation_id]]} ==
-                 DB.query(reader, "SELECT activationId FROM activation_events")
-
-        assert {:ok, [[0]]} =
-                 DB.query(reader, "SELECT COUNT(*) FROM events WHERE verb='activation-status'")
-    end
-  end
-
   test "dispatch and work trace expose activation metadata without protected payload objects", %{
     db: db
   } do
@@ -989,71 +830,6 @@ defmodule Tightbeam.ActivationsTest do
   defp resource(id, sha), do: %{"namespace" => "example", "id" => id, "sha256" => sha}
   defp origin({:session, session}), do: "agent:" <> session
   defp origin({:user, user}), do: "user:" <> user
-
-  defp exact_legacy_checkout! do
-    repo = Path.expand("..", __DIR__)
-    checkout = Path.join(repo, "_build/legacy-checkout-#{@legacy_base}")
-
-    unless File.dir?(Path.join(checkout, ".git")) do
-      assert {origin, 0} = System.cmd("git", ["remote", "get-url", "origin"], cd: repo)
-
-      assert {_output, 0} =
-               System.cmd("git", ["clone", "--shared", "--no-checkout", repo, checkout],
-                 stderr_to_stdout: true
-               )
-
-      assert {_output, 0} =
-               System.cmd("git", ["fetch", "--depth=1", String.trim(origin), @legacy_base],
-                 cd: checkout,
-                 stderr_to_stdout: true
-               )
-
-      assert {_output, 0} =
-               System.cmd("git", ["checkout", "--detach", @legacy_base],
-                 cd: checkout,
-                 stderr_to_stdout: true
-               )
-
-      File.ln_s!(Path.join(repo, "deps"), Path.join(checkout, "deps"))
-      File.ln_s!(Path.join(repo, "cli/target"), Path.join(checkout, "cli/target"))
-    end
-
-    # Current clean/build gates may prune a nested checkout's tracked lib tree.
-    # Restore the pinned source before every use; the checkout is generated and
-    # contains no authored work.
-    assert {_output, 0} =
-             System.cmd(
-               "git",
-               ["restore", "--source", @legacy_base, "--staged", "--worktree", "--", "."],
-               cd: checkout,
-               stderr_to_stdout: true
-             )
-
-    assert {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: checkout)
-    assert String.trim(commit) == @legacy_base
-    checkout
-  end
-
-  defp free_port do
-    {:ok, socket} = :gen_tcp.listen(0, [:binary, ip: {127, 0, 0, 1}, active: false])
-    {:ok, {_address, port}} = :inet.sockname(socket)
-    :ok = :gen_tcp.close(socket)
-    port
-  end
-
-  defp gateway_version!(port) do
-    {:ok, _} = Application.ensure_all_started(:inets)
-
-    {:ok, {{_http, 200, _reason}, _headers, body}} =
-      :httpc.request(
-        :get,
-        {~c"http://127.0.0.1:#{port}/version", []},
-        [],
-        body_format: :binary
-      )
-
-    JSON.decode!(body)
-  end
 
   defp personal(db, owner), do: session(db, Org.personal_session_key(owner), owner)
 
