@@ -2685,7 +2685,7 @@ defmodule Tightbeam.EffortCheckinTest do
   # cancellation disposition, and effortRole null on a non-effort wake. The
   # unauthorized reader keeps the pre-amendment not_found refusal with no
   # ownership or retirement data.
-  test "EGR-A8: the authorized work-item trace exposes stored effort roles on canceled, fired, and unaffected owned wakes, the four retirement fields on retired generations, and unchanged historical disposition; the unauthorized reader keeps the not_found refusal with no new data",
+  test "EGR-A8: authorized work-item trace exposes effort roles on owned wakes and the four retirement fields on retired generations; unauthorized reader keeps the not_found refusal",
        ctx do
     host = Placement.local_host_name()
     item = work_item!(ctx.db, "A8 trace exposure")
