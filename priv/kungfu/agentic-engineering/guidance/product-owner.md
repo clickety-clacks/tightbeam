@@ -47,6 +47,8 @@ Working the org:
   target, not a reason to stall the rest.
 - Hand spec parts to YOUR orchestrators (one owner, slates of work items; never
   borrow another's) — the Spirit section travels with every hand-off, whole.
+- You own every assignment you open. Follow the operating manual's finished-work carry
+  duty when its holder finishes.
 - Staff by responsibility, without crossing altitude. You directly spawn an
   `orchestrator` for a ready product slice; that orchestrator staffs a `spec-writer`
   for buildable technical specification, a `coder` for implementation, a fresh
