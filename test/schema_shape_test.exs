@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v15"
+  @shape "coordination-fabric-v1-phase1-v16"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -193,6 +193,7 @@ defmodule Tightbeam.SchemaShapeTest do
          db: db
        } do
     assert :ok = Schema.ensure_all(db)
+    drop_deliverable_contract(db)
     downgrade_to_v8(db)
 
     {:ok, _} =
@@ -317,6 +318,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact v6 predecessor gains a nullable stored message discriminator", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    drop_deliverable_contract(db)
 
     {:appended, historical} =
       Projection.append(db, %{
@@ -540,7 +542,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v14"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v15"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v16"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 
@@ -1326,6 +1328,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_previous_shape(db) do
+    drop_deliverable_contract(db)
     remove_controller_root_link(db)
     :ok = DB.execute(db, "DROP TRIGGER users_gateway_owned_insert")
     :ok = DB.execute(db, "DROP TABLE cold_start_receipts")
@@ -1344,6 +1347,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_to_v8(db) do
+    drop_deliverable_contract(db)
     remove_controller_root_link(db)
 
     {:ok, :ok} =
@@ -1392,6 +1396,23 @@ defmodule Tightbeam.SchemaShapeTest do
 
         :ok
       end)
+
+    :ok
+  end
+
+  defp drop_deliverable_contract(db) do
+    for object <- [
+          "deliverable_contract_idempotency",
+          "work_item_closures",
+          "completion_claims",
+          "assignment_product_owner_ancestry",
+          "assignment_product_lineage_captures",
+          "assignment_deliverables",
+          "work_item_deliverables",
+          "deliverables"
+        ] do
+      :ok = DB.execute(db, "DROP TABLE IF EXISTS #{object}")
+    end
 
     :ok
   end

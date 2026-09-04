@@ -583,6 +583,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             effect_kind,
             files,
             report_to,
+            delivers_work_item,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -611,6 +612,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = report_to {
                 params.push(string_field("reportToSessionKey", value));
             }
+            if *delivers_work_item {
+                params.push("\"deliversWorkItem\":true".to_owned());
+            }
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
@@ -623,6 +627,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             brief,
             idempotency_key,
             report_to,
+            delivers_work_item,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
@@ -642,6 +647,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = report_to {
                 params.push(string_field("reportToSessionKey", value));
+            }
+            if *delivers_work_item {
+                params.push("\"deliversWorkItem\":true".to_owned());
             }
             Ok(request(
                 identity,
@@ -1050,12 +1058,22 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemClose {
             identity,
             work_item_id,
-        } => Ok(request(
-            identity,
-            "work-item-close",
-            vec![],
-            vec![string_field("workItemId", work_item_id)],
-        )),
+            completion_attest_id,
+            owner_ruling_reason,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("workItemId", work_item_id),
+                string_field("completionAttestId", completion_attest_id),
+            ];
+            if let Some(value) = owner_ruling_reason {
+                params.push(string_field("ownerRulingReason", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            Ok(request(identity, "work-item-close", vec![], params))
+        }
         Command::WorkItemFail {
             identity,
             work_item_id,
@@ -1077,6 +1095,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             release_fact_kind,
             release_fact_scope,
             release_fact_principal_ref,
+            idempotency_key,
         } => {
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
@@ -1102,6 +1121,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = release_fact_principal_ref {
                 params.push(string_field("releaseFactPrincipalRef", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
             }
             Ok(request(identity, "attest", vec![], params))
         }
@@ -3270,10 +3292,11 @@ mod tests {
                 "[\"lib/a.ex\",\"test/a_test.exs\"]",
                 "--report-to",
                 "agent:report s_1",
+                "--delivers-work-item",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","effectKind":"policy","files":["lib/a.ex","test/a_test.exs"],"reportToSessionKey":"agent:report s_1"}}"#
+            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","effectKind":"policy","files":["lib/a.ex","test/a_test.exs"],"reportToSessionKey":"agent:report s_1","deliversWorkItem":true}}"#
         );
         assert_eq!(
             body(&[
@@ -3294,10 +3317,11 @@ mod tests {
                 "idem",
                 "--report-to",
                 "agent:report s_1",
+                "--delivers-work-item",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem","reportToSessionKey":"agent:report s_1"}}"#
+            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem","reportToSessionKey":"agent:report s_1","deliversWorkItem":true}}"#
         );
         assert_eq!(
             body(&[
@@ -3414,10 +3438,12 @@ mod tests {
                 "completion",
                 "--note",
                 "ready",
+                "--key",
+                "completion-key",
                 "--as",
                 "builder",
             ]),
-            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","note":"ready"}}"#
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","note":"ready","idempotencyKey":"completion-key"}}"#
         );
         assert_eq!(
             body(&[
@@ -3586,8 +3612,19 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-reopen","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
-            body(&["work-item-close", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-close","params":{"workItemId":"wi_1"}}"#
+            body(&[
+                "work-item-close",
+                "wi_1",
+                "--completion-attest",
+                "att_1",
+                "--owner-ruling-reason",
+                "accept the narrower claim",
+                "--key",
+                "close-key",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-close","params":{"workItemId":"wi_1","completionAttestId":"att_1","ownerRulingReason":"accept the narrower claim","idempotencyKey":"close-key"}}"#
         );
         assert_eq!(
             body(&[

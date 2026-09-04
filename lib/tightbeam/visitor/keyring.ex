@@ -13,7 +13,8 @@ defmodule Tightbeam.Visitor.Keyring do
 
   @schema "visitor-keyring-v1"
   @visitor_schema "visitor-principal-v3-v1"
-  @current_previsitor_schema "coordination-fabric-v1-phase1-v15"
+  @current_previsitor_schema "coordination-fabric-v1-phase1-v16"
+  @migratable_previsitor_schema "coordination-fabric-v1-phase1-v15"
   @filename "visitor-keyring-v1.json"
   @derivation_purpose "credential-derivation"
   @digest_purpose "credential-digest"
@@ -310,6 +311,9 @@ defmodule Tightbeam.Visitor.Keyring do
         referenced_rows(db)
 
       {:ok, [[@current_previsitor_schema]]} ->
+        {:ok, empty_references()}
+
+      {:ok, [[@migratable_previsitor_schema]]} when phase == :before_schema ->
         {:ok, empty_references()}
 
       {:error, _} when phase == :before_schema ->

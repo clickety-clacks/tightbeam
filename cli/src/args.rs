@@ -257,6 +257,7 @@ pub enum Command {
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
         report_to: Option<String>,
+        delivers_work_item: bool,
     },
     Dispatch {
         identity: Identity,
@@ -268,6 +269,7 @@ pub enum Command {
         brief: String,
         idempotency_key: Option<String>,
         report_to: Option<String>,
+        delivers_work_item: bool,
     },
     EffortRule {
         identity: Identity,
@@ -408,6 +410,9 @@ pub enum Command {
     WorkItemClose {
         identity: Identity,
         work_item_id: String,
+        completion_attest_id: String,
+        owner_ruling_reason: Option<String>,
+        idempotency_key: Option<String>,
     },
     WorkItemFail {
         identity: Identity,
@@ -424,6 +429,7 @@ pub enum Command {
         release_fact_kind: Option<String>,
         release_fact_scope: Option<String>,
         release_fact_principal_ref: Option<String>,
+        idempotency_key: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -805,20 +811,23 @@ COMMANDS:
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
   work-item-reopen <workItemId>
-  work-item-close <workItemId>
-      Conclude an item (→ closed). Requires zero open assignments.
+  work-item-close <workItemId> --completion-attest <attestId>
+                  [--owner-ruling-reason <text>] [--key <key>]
+      Conclude an item from one current completion claim. A different
+      deliverable requires the exact card product-owner session's ruling.
   work-item-fail <workItemId> [--reason <text>]
       Rule an item failed (→ failed); --reason is recorded on the item.
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
+         [--delivers-work-item]
          [--files '["lib/a.ex","test/a_test.exs"]'] [--report-to <sessionKey>]
       Open an obligation held by a session; a work item is the durable thread
-      across assignments.
+      across assignments. Use --delivers-work-item only for the whole card.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
-           [--report-to <sessionKey>]
+           [--report-to <sessionKey>] [--delivers-work-item]
       Atomically open an assignment and wake its holder with the card id.
   completion-notices --status open|all [--session <childSessionKey>]
       List visible completion notices, optionally for one exact child session.
@@ -877,11 +886,12 @@ COMMANDS:
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
          [--verdict <kind>] [--note "..."]
          [--release-fact-kind <kind> --release-fact-scope <scope>
-          --release-fact-principal-ref <principal>]
+          --release-fact-principal-ref <principal>] [--key <idempotencyKey>]
       File against an assignment. Verdicts on review cards require the review
       holder; producer-card verdicts may be filed by any session or user.
       cannot-proceed requires a non-empty --note, keeps the card open, and
-      accepts the three release-fact flags only as one complete tuple.
+      accepts the three release-fact flags only as one complete tuple. A key is
+      valid only for completion.
   attests <assignmentId> [--after <attestId>] [--limit <n>]
       List every attest filed against an assignment. Without --limit you get
       all of them: an audit list that shortens itself silently is worse than a
@@ -1038,6 +1048,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "all",
     "api-key",
     "clear-spec-ref",
+    "delivers-work-item",
     "dry-run",
     "help",
     "json",
@@ -2040,6 +2051,7 @@ fn parse_with_optional_catalog(
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
                 report_to: nonempty(flags, "report-to"),
+                delivers_work_item: flags.contains_key("delivers-work-item"),
             })
         }
         "dispatch" => {
@@ -2063,6 +2075,7 @@ fn parse_with_optional_catalog(
                 brief,
                 idempotency_key: nonempty(flags, "key"),
                 report_to: nonempty(flags, "report-to"),
+                delivers_work_item: flags.contains_key("delivers-work-item"),
             })
         }
         "effort-rule" => {
@@ -2513,11 +2526,19 @@ fn parse_with_optional_catalog(
         }
         "work-item-close" => {
             if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam work-item-close <workItemId>".to_owned());
+                return Err(
+                    "usage: tightbeam work-item-close <workItemId> --completion-attest <attestId>"
+                        .to_owned(),
+                );
             }
+            let completion_attest_id = nonempty(flags, "completion-attest")
+                .ok_or_else(|| "--completion-attest is required".to_owned())?;
             Ok(Command::WorkItemClose {
                 identity: identity(flags)?,
                 work_item_id: parsed.positional[1].clone(),
+                completion_attest_id,
+                owner_ruling_reason: nonempty(flags, "owner-ruling-reason"),
+                idempotency_key: nonempty(flags, "key"),
             })
         }
         "work-item-fail" => {
@@ -2544,6 +2565,10 @@ fn parse_with_optional_catalog(
             }
             if kind != "verdict" && verdict.is_some() {
                 return Err("--verdict is only valid when --kind is verdict".to_owned());
+            }
+            let idempotency_key = nonempty(flags, "key");
+            if kind != "completion" && idempotency_key.is_some() {
+                return Err("--key is only valid when --kind is completion".to_owned());
             }
             let commit_refs = nonempty(flags, "commit-refs")
                 .map(|encoded| {
@@ -2584,6 +2609,7 @@ fn parse_with_optional_catalog(
                 release_fact_kind,
                 release_fact_scope,
                 release_fact_principal_ref,
+                idempotency_key,
             })
         }
         "coordination-share" => {
@@ -3309,6 +3335,20 @@ mod tests {
         assert!(
             !entry.contains("DISCOVERY:") && !entry.contains("  doctor "),
             "the entry must stop at its own last line: {entry}"
+        );
+    }
+
+    #[test]
+    fn attest_help_names_completion_idempotency_key() {
+        let entry = render_command_help(None, "attest").unwrap();
+        assert!(entry.contains("[--key <idempotencyKey>]"));
+        // Match the sentence, not where the renderer happened to wrap it: this
+        // assertion baked in a line break and the cannot-proceed sentence
+        // landing above it reflowed the paragraph.
+        let flowed = entry.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flowed.contains("A key is valid only for completion."),
+            "{entry}"
         );
     }
 

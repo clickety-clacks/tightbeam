@@ -25,6 +25,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
+    Tightbeam.DeliverableContract,
     Tightbeam.Productions.CompletionEscalation,
     Tightbeam.Activations,
     Tightbeam.EffortCheckin,
@@ -94,7 +95,10 @@ defmodule Tightbeam.Schema do
   # classification. SQLite cannot widen those existing shapes in place. The
   # reviewed R17 boundary therefore refuses every predecessor and recreates at
   # v15; the older named migration helpers remain explicit test seams only.
-  @shape "coordination-fabric-v1-phase1-v15"
+  # The deliverable contract adds companion tables and advances the exact v15
+  # predecessor transactionally to v16.
+  @shape "coordination-fabric-v1-phase1-v16"
+  @deliverable_contract_previous_shape "coordination-fabric-v1-phase1-v15"
   @completion_previous_shape "coordination-fabric-v1-phase1-v14"
   @cannot_proceed_previous_shape "coordination-fabric-v1-phase1-v13"
   @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
@@ -998,10 +1002,14 @@ defmodule Tightbeam.Schema do
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
-    :ok = check_shape(db)
+    shape_state = check_shape(db)
 
     Enum.each(@schema_modules, fn module ->
-      :ok = module.ensure_schema(db)
+      if shape_state == :fresh and module == Tightbeam.DeliverableContract do
+        :ok = Tightbeam.DeliverableContract.bootstrap_schema(db)
+      else
+        :ok = module.ensure_schema(db)
+      end
     end)
 
     :ok = Tightbeam.Escalation.ensure_terminal_epoch(db)
@@ -1942,6 +1950,13 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@deliverable_contract_previous_shape]]} ->
+        Tightbeam.DeliverableContract.upgrade_v1(
+          db,
+          @deliverable_contract_previous_shape,
+          @shape
+        )
+
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
         # written before stamping existed. Those are DIFFERENT, and telling
@@ -1956,7 +1971,9 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration from #{found}. Move this database aside and let it be recreated.
+        There is no migration from #{found}. The only supported upgrade source
+        is #{@deliverable_contract_previous_shape}.
+        Move this database aside and let it be recreated.
         """
 
       # More than one shape stamped. Nothing writes a second row, so this is a
@@ -1984,12 +2001,15 @@ defmodule Tightbeam.Schema do
   # database" sharing one representation.
   #
   # Stamping first cannot lose that way. Interrupted after the stamp, the next
-  # boot reads its own shape and carries on creating what is missing, which is
-  # exactly what `CREATE TABLE IF NOT EXISTS` is for.
+  # boot reads its own shape. Ordinary additive schema creation can continue,
+  # while a contract whose accepted stamp requires an all-or-nothing object set
+  # refuses any missing object instead of silently recreating authoritative
+  # state.
   defp unstamped(db) do
     case DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'") do
       {:ok, []} ->
-        stamp(db)
+        :ok = stamp(db)
+        :fresh
 
       {:ok, [_ | _]} ->
         raise ShapeError, """
