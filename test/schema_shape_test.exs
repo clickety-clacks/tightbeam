@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v16"
+  @shape "coordination-fabric-v1-phase1-v17"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -413,6 +413,146 @@ defmodule Tightbeam.SchemaShapeTest do
     refute table?(db, "supervision_liveness_epoch")
   end
 
+  test "the premise gate ships one exact additive shape", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert table_columns(db, "premise_claims") ==
+             ~w(claimId declaredBy subjectKind subjectId verifierType verifierVersion canonicalSource predicate expectedResult sensitivity createdAt)
+
+    assert table_columns(db, "premise_checks") ==
+             ~w(checkId claimId purpose result observedSourceVersion checkedAt durationMs runner verifierVersion summary rawOutputDigest errorClass expiresAt)
+
+    assert table_columns(db, "park_premises") ==
+             ~w(parkKind parkId claimId policy linkedBy linkedAt)
+
+    assert premise_gate_objects(db) == Enum.sort(premise_gate_object_names())
+
+    assert :ok = Schema.ensure_all(db)
+    assert premise_gate_objects(db) == Enum.sort(premise_gate_object_names())
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the exact v16 predecessor gains the premise gate", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO wakes
+        (wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,firedAt,canceledAt)
+      VALUES ('w_predecessor','session-a','process:tightbeam','pending',90,'pending',10,NULL,NULL)
+      """)
+
+    {:ok, before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    drop_premise_gate(db)
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v16'")
+
+    assert :ok = Schema.upgrade_premise_gate_v1(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert premise_gate_objects(db) == Enum.sort(premise_gate_object_names())
+
+    assert table_columns(db, "park_premises") ==
+             ~w(parkKind parkId claimId policy linkedBy linkedAt)
+
+    # Additive means additive: the predecessor's rows are byte-stable, and the
+    # new tables arrive empty rather than seeded from anything already stored.
+    assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM premise_claims")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM park_premises")
+    assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+  end
+
+  test "the premise gate upgrade refuses a predecessor that is not v16", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    drop_premise_gate(db)
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v14'")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.upgrade_premise_gate_v1(db) end
+    assert error.message =~ "incompatible_premise_gate_v1"
+    assert error.message =~ "coordination-fabric-v1-phase1-v14"
+
+    refute table?(db, "premise_claims")
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v14"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "a partial premise shape refuses without activation", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    drop_premise_gate(db)
+
+    :ok = DB.execute(db, "CREATE TABLE premise_claims (claimId TEXT PRIMARY KEY)")
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v16'")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.upgrade_premise_gate_v1(db) end
+    assert error.message =~ "incompatible_premise_gate_v1"
+    assert error.message =~ "incomplete additive shape"
+    assert error.message =~ "premise_checks"
+
+    # A half-built shape is reported, never completed by inference: the odd
+    # table the operator left behind is exactly as they left it.
+    assert table_columns(db, "premise_claims") == ["claimId"]
+    refute table?(db, "premise_checks")
+    refute table?(db, "park_premises")
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v16"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the exact v16 predecessor gains the premise gate through boot dispatch", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO wakes
+        (wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,firedAt,canceledAt)
+      VALUES ('w_boot_predecessor','session-a','process:tightbeam','pending',90,'pending',10,NULL,NULL)
+      """)
+
+    {:ok, before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    drop_premise_gate(db)
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v16'")
+
+    # The boot path itself, not the explicit seam: `ensure_all` -> `check_shape`
+    # must dispatch the exact v16 stamp into the migration and advance it. This
+    # is the only proof the wire is real; the seam test can pass while boot still
+    # refuses.
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert premise_gate_objects(db) == Enum.sort(premise_gate_object_names())
+
+    assert table_columns(db, "premise_claims") ==
+             ~w(claimId declaredBy subjectKind subjectId verifierType verifierVersion canonicalSource predicate expectedResult sensitivity createdAt)
+
+    assert table_columns(db, "park_premises") ==
+             ~w(parkKind parkId claimId policy linkedBy linkedAt)
+
+    # Additive: the predecessor's rows survive byte-stable and the new tables
+    # arrive empty.
+    assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT COUNT(*) FROM premise_claims")
+    assert {:ok, [["ok"]]} = DB.query(db, "PRAGMA integrity_check")
+
+    # Idempotent: booting again on the freshly migrated shape is a clean accept.
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "a non-predecessor shape is refused by name on boot", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v15'")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "stamped: coordination-fabric-v1-phase1-v15"
+    assert error.message =~ "this build: #{@shape}"
+    assert error.message =~ "There is no migration"
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v15"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
   test "an existing liveness activation gains the lineage firing invariant", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
@@ -539,7 +679,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v14"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v16"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v17"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 
@@ -1495,6 +1635,43 @@ defmodule Tightbeam.SchemaShapeTest do
       )
 
     List.flatten(rows)
+  end
+
+  # Read the owned set from the module that owns it. A hand-kept second list
+  # here would pass while the two drifted, which is the failure the single
+  # `@objects` list in `Tightbeam.Premises` exists to prevent.
+  defp premise_gate_object_names, do: Enum.map(Tightbeam.Premises.owned_objects(), & &1.name)
+
+  defp premise_gate_objects(db) do
+    names = premise_gate_object_names()
+    placeholders = Enum.map_join(1..length(names), ",", &"?#{&1}")
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        "SELECT name FROM sqlite_master WHERE name IN (#{placeholders}) ORDER BY name",
+        names
+      )
+
+    List.flatten(rows)
+  end
+
+  defp drop_premise_gate(db) do
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER IF EXISTS park_premises_immutable_update;
+      DROP TRIGGER IF EXISTS premise_checks_append_only_delete;
+      DROP TRIGGER IF EXISTS premise_checks_append_only_update;
+      DROP TRIGGER IF EXISTS premise_claims_immutable_delete;
+      DROP TRIGGER IF EXISTS premise_claims_immutable_update;
+      DROP INDEX IF EXISTS park_premises_claim;
+      DROP INDEX IF EXISTS premise_checks_idempotency;
+      DROP INDEX IF EXISTS premise_checks_newest;
+      DROP INDEX IF EXISTS premise_claims_subject;
+      DROP TABLE IF EXISTS park_premises;
+      DROP TABLE IF EXISTS premise_checks;
+      DROP TABLE IF EXISTS premise_claims;
+      """)
   end
 
   defp drop_liveness_activation(db) do

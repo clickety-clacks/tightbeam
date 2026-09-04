@@ -1822,6 +1822,15 @@ defmodule Tightbeam.DeliverableContractTest do
                [assignment.id]
              )
 
+    # The v15->v16 upgrade above is proven. Restart-validation must be proven
+    # at the CURRENT shape: once the shape advances past v16 a v16 stamp is a
+    # predecessor, and ensure_schema/1 validates only at its own @shape (the
+    # predecessor arm silently skips — carded separately as wi_3f79cab0).
+    # Advance to current through the real boot rung, then assert the same two
+    # things — a clean database validates, a corrupted deliverable raises — at
+    # the live shape.
+    assert :ok = Tightbeam.Schema.upgrade_premise_gate_v1(ctx.db)
+
     assert :ok = DeliverableContract.ensure_schema(ctx.db)
 
     {:ok, _} =
