@@ -85,6 +85,39 @@ defmodule Tightbeam.ModelManifestTest do
     assert model_slugs(ModelManifest.get(restarted)) == ["claude-remote"]
   end
 
+  test "malformed nested remote data leaves the loader alive on last-good", ctx do
+    valid = File.read!(ctx.bundled)
+    document = JSON.decode!(valid)
+    [first | rest] = get_in(document, ["providers", "claude", "models"])
+    malformed_first = Map.put(first, "adapter", "not-a-map")
+
+    malformed =
+      document
+      |> put_in(["providers", "claude", "models"], [malformed_first | rest])
+      |> JSON.encode!()
+
+    {:ok, results} = Agent.start_link(fn -> [{:ok, valid}, {:ok, malformed}] end)
+
+    fetch = fn _url, _timeout ->
+      Agent.get_and_update(results, fn [result | remaining] -> {result, remaining} end)
+    end
+
+    name = unique_name()
+    start_manifest(name, ctx, fetch: fetch, ttl_ms: :timer.hours(1))
+    await(fn -> ModelManifest.get(name).health == :fresh end)
+
+    snapshot = ModelManifest.get(name)
+    pid = Process.whereis(name)
+    send(pid, :refresh_due)
+    await(fn -> ModelManifest.get(name).health == :stale end)
+
+    assert Process.whereis(name) == pid
+    assert Process.alive?(pid)
+    assert ModelManifest.get(name).document == snapshot.document
+    assert {:error, {:invalid_field, path, :wrong_shape}} = ModelManifest.validate(malformed)
+    assert path =~ ".adapter"
+  end
+
   test "invalid remote leaves bundled last-good active and a hung fetch never holds readers",
        ctx do
     parent = self()
