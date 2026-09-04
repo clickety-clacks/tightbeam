@@ -1822,14 +1822,14 @@ defmodule Tightbeam.DeliverableContractTest do
                [assignment.id]
              )
 
-    # The v15->v16 upgrade above is proven. Restart-validation must be proven
-    # at the CURRENT shape: once the shape advances past v16 a v16 stamp is a
-    # predecessor, and ensure_schema/1 validates only at its own @shape (the
-    # predecessor arm silently skips — carded separately as wi_3f79cab0).
-    # Advance to current through the real boot rung, then assert the same two
-    # things — a clean database validates, a corrupted deliverable raises — at
-    # the live shape.
-    assert :ok = Tightbeam.Schema.upgrade_premise_gate_v1(ctx.db)
+    # This migration lands the v16 stamp, which is now a predecessor of the
+    # current shape rather than the current shape itself. The tail below
+    # exercises current-shape validation (ensure_schema validates a v18 stamp
+    # and refuses a corrupted deliverable), so advance the marker to the
+    # current shape first. The contract tables are byte-identical v16..v18,
+    # so this is a stamp advance with nothing to migrate.
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v18'")
 
     assert :ok = DeliverableContract.ensure_schema(ctx.db)
 

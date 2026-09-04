@@ -13,8 +13,8 @@ defmodule Tightbeam.Visitor.KeyringTest do
   @retained_digest :binary.copy(<<0x44>>, 32)
   @retained_derivation_id "vdk_retained"
   @retained_digest_id "vgk_retained"
-  @current_previsitor_schema "coordination-fabric-v1-phase1-v17"
-  @migratable_previsitor_schema "coordination-fabric-v1-phase1-v16"
+  @current_previsitor_schema "coordination-fabric-v1-phase1-v18"
+  @migratable_previsitor_schema "coordination-fabric-v1-phase1-v17"
 
   setup do
     base = Path.join(System.tmp_dir!(), "tightbeam-keyring-#{System.unique_integer([:positive])}")
