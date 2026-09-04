@@ -146,6 +146,14 @@ defmodule Tightbeam.Unroutable do
       "this is #{host}'s grant to fix; run tightbeam onboard #{provider} on #{host}"
   end
 
+  defp catalog_story({harness, {:unavailable, {:credential_rejected, reason}}}, host) do
+    provider = Harness.parse!(harness).credential_provider()
+
+    "the #{provider} credential for #{harness} on #{host} was rejected " <>
+      "(#{inspect(reason)}); hosted-manifest health is a separate fact, and the manifest " <>
+      "did not create an empty offered set; repair that credential on #{host}"
+  end
+
   # The codex models endpoint filters by the caller's client_version and says
   # nothing about it: too old a binary and every model is dropped, with a 200.
   # Blaming the account would send the operator to re-onboard a grant that was
