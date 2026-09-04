@@ -152,7 +152,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert manual =~ "No row holds a release line and no verb binds one"
     assert manual =~ "The default is both active lines"
     assert manual =~ "names the principal who must clear it"
-    assert manual =~ "defers the line to a named person is a card saying otherwise"
+    assert manual =~ "This duty does not transfer to the user"
     assert manual =~ ~s("done awaiting target" and "candidate remains unintegrated")
 
     for role <- ~w(product-owner orchestrator) do

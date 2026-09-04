@@ -87,9 +87,9 @@ line named in its subject, is the whole record. The default is both active lines
 `main` (the 0.2.0 line) — open one integration assignment per line unless the card says otherwise.
 
 Or record why you cannot: file a `progress` attest that states the exact reason the work is not
-carried now and names the principal who must clear it. A card that pins a single line,
-quarantines, or defers the line to a named person is a card saying otherwise; recording that
-reason and its principal is the discharge, not a stall.
+carried now and names the principal who must clear it. A card that pins a single line or
+quarantines is a card saying otherwise; recording that reason and its principal is the discharge,
+not a stall. This duty does not transfer to the user.
 
 "Targetless", "done awaiting target" and "candidate remains unintegrated" are stall states, not
 completed work.
