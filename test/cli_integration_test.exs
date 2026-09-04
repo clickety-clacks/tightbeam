@@ -1420,7 +1420,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert pairing =~ "supplied together"
   end
 
-  test "real CLI exposes the complete work-item PATCH contract", ctx do
+  test "real CLI composes priority and metadata in one work-item update", ctx do
     sha = String.duplicate("a", 64)
     sha2 = String.duplicate("b", 64)
 
@@ -1434,27 +1434,44 @@ defmodule Tightbeam.CliIntegrationTest do
           "--spec-ref",
           "governing.md",
           "--spec-sha256",
-          sha
+          sha,
+          "--priority",
+          "4"
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
     work_item_id = JSON.decode!(created)["id"]
-
     assert_receive {:cli_call, %{verb: "work-item-create"}}
 
-    {retitled, 0} =
-      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--title", "After"],
+    {priority_only, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--priority", "5"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
     assert %{
-             "title" => "After",
+             "title" => "Before",
+             "priority" => 5,
              "specRefName" => "governing.md",
              "specRefSha256" => ^sha
-           } = JSON.decode!(retitled)
+           } = JSON.decode!(priority_only)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{work_item_id: ^work_item_id, priority: 5}
+                    }}
+
+    {metadata_only, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--title", "After"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"title" => "After", "priority" => 5, "specRefSha256" => ^sha} =
+             JSON.decode!(metadata_only)
 
     assert_receive {:cli_call,
                     %{
@@ -1462,19 +1479,29 @@ defmodule Tightbeam.CliIntegrationTest do
                       params: %{work_item_id: ^work_item_id, title: "After"}
                     }}
 
-    {repinned, 0} =
-      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--spec-sha256", sha2],
+    {combined, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--spec-sha256", sha2, "--priority", "6"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
-    assert %{"specRefName" => "governing.md", "specRefSha256" => ^sha2} =
-             JSON.decode!(repinned)
+    assert %{
+             "title" => "After",
+             "priority" => 6,
+             "specRefName" => "governing.md",
+             "specRefSha256" => ^sha2
+           } = JSON.decode!(combined)
 
     assert_receive {:cli_call,
                     %{
                       verb: "work-item-update",
-                      params: %{work_item_id: ^work_item_id, spec_ref_sha256: ^sha2}
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        spec_ref_sha256: ^sha2,
+                        priority: 6
+                      }
                     }}
 
     {noop, 0} =
@@ -1483,7 +1510,7 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert JSON.decode!(noop) == JSON.decode!(repinned)
+    assert JSON.decode!(noop) == JSON.decode!(combined)
 
     assert_receive {:cli_call,
                     %{verb: "work-item-update", params: %{work_item_id: ^work_item_id}}}
@@ -1494,7 +1521,8 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert %{"specRefName" => nil, "specRefSha256" => nil} = JSON.decode!(cleared)
+    assert %{"priority" => 6, "specRefName" => nil, "specRefSha256" => nil} =
+             JSON.decode!(cleared)
 
     assert_receive {:cli_call,
                     %{
@@ -1582,8 +1610,14 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert got =~ "next.md"
-    assert got =~ sha
+    assert %{
+             "workItem" => %{
+               "priority" => 6,
+               "specRefName" => "next.md",
+               "specRefSha256" => ^sha
+             }
+           } = JSON.decode!(got)
+
     assert_receive {:cli_call, %{verb: "work-item-get"}}
 
     {combined, 0} =
