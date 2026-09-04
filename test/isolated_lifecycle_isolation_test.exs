@@ -204,15 +204,97 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
              )
   end
 
-  # ── Case 2 — direct mix-script cookie backstop [N5: Phase-2-gated] ──────────
+  # ── R1/R4 — rpc/remote resolve the node from the descriptor (Phase 1) ───────
 
-  @tag skip:
-         "Phase-2-gated (N5): exercises the per-instance cookie (fix C), which ships in Phase 2"
-  test "Case 2: direct release rpc at production is refused by the per-instance cookie" do
-    flunk("Phase-2-gated placeholder — not implemented in Phase 1")
+  test "rpc resolves the node from the descriptor, and the descriptor node wins over ambient" do
+    shim = faked_release_shim!()
+
+    base = Path.join(System.tmp_dir!(), "tb-rpc-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    # A CUSTOM-node instance (booted with its own TIGHTBEAM_NODE), recorded in the
+    # descriptor at boot.
+    write_descriptor(base, %{
+      port: 11_484,
+      cliToken: "tbc_iso",
+      node: "custom_iso_node",
+      ownedPid: "1",
+      ownedCommand: "x"
+    })
+
+    {out, status} =
+      System.cmd(shim, ["rpc", "Foo.bar()"],
+        env: [
+          {"TIGHTBEAM_BASE_DIR", base},
+          # the exact incident vector, now aimed at a debug verb:
+          {"RELEASE_NODE", "tightbeam_gateway_11373"},
+          {"TIGHTBEAM_NODE", "tightbeam_gateway_11373"}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, out
+    # (a) custom-node support restored: rpc used the descriptor's node.
+    assert out =~ ~r/^REL_NODE=custom_iso_node$/m
+    # (b) incident-safety for the debug verbs: the inherited node did NOT redirect.
+    refute out =~ ~r/^REL_NODE=tightbeam_gateway_11373$/m
+    # the debug argv is forwarded intact.
+    assert out =~ ~r/^ARG=rpc$/m
+    assert out =~ ~r/^ARG=Foo\.bar\(\)$/m
   end
 
+  test "rpc refuses when the descriptor has no node" do
+    shim = faked_release_shim!()
+
+    base = Path.join(System.tmp_dir!(), "tb-rpc-nonode-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(base) end)
+
+    write_descriptor(base, %{port: 11_484, cliToken: "tbc_iso", ownedPid: "1", ownedCommand: "x"})
+
+    {out, status} =
+      System.cmd(shim, ["rpc", "Foo.bar()"],
+        env: [{"TIGHTBEAM_BASE_DIR", base}, {"RELEASE_NODE", "tightbeam_gateway_11373"}],
+        stderr_to_stdout: true
+      )
+
+    assert status != 0, "rpc must refuse a descriptor with no node"
+    assert out =~ "no node"
+    refute out =~ "REL_NODE="
+  end
+
+  # Case 2 (design §5, N5) — the direct mix-script per-instance-cookie backstop —
+  # exercises fix C, which ships in Phase 2. It is omitted here rather than left
+  # as a permanent skip/stub (AGENTS.md "Tests"): a real Case-2 proof lands with
+  # Phase 2.
+
   # ── helpers ────────────────────────────────────────────────────────────────
+
+  # A temp copy of the packaged layout: the committed shim at
+  # <root>/release/bin/tightbeam-gateway, forwarding (per its own DIR resolution)
+  # to a FAKE release binary at <root>/release/release/bin/tightbeam_gateway that
+  # echoes the RELEASE_NODE it was handed plus its argv.
+  defp faked_release_shim! do
+    root = Path.join(System.tmp_dir!(), "tb-rel-#{System.unique_integer([:positive])}")
+    bin = Path.join(root, "release/bin")
+    rel_bin = Path.join(root, "release/release/bin")
+    File.mkdir_p!(bin)
+    File.mkdir_p!(rel_bin)
+
+    shim = Path.join(bin, "tightbeam-gateway")
+    File.cp!(@shim, shim)
+    File.chmod!(shim, 0o755)
+
+    fake = Path.join(rel_bin, "tightbeam_gateway")
+
+    File.write!(
+      fake,
+      "#!/bin/sh\nprintf 'REL_NODE=%s\\n' \"$RELEASE_NODE\"\nfor a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done\n"
+    )
+
+    File.chmod!(fake, 0o755)
+    on_exit(fn -> File.rm_rf!(root) end)
+    shim
+  end
 
   defp spawn_standin do
     port =

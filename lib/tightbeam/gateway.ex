@@ -172,8 +172,11 @@ defmodule Tightbeam.Gateway do
     # exact process by identity — no Erlang node, no cookie, no handshake. The
     # command signature is captured now (VM is up by the time this runs) and
     # re-checked before any signal, so a recycled pid cannot be mis-signalled.
-    # `cliToken` is preserved (read above); `port`/`ownedPid`/`ownedCommand` are
-    # overwritten every boot.
+    # R1/R4: also record `node` — the instance's ACTUAL booted RELEASE_NODE — so
+    # the debug verbs `rpc`/`remote` resolve the node FROM the descriptor (custom
+    # `TIGHTBEAM_NODE` instances included), never from an ambient/inherited node.
+    # `cliToken` is preserved (read above); `port`/`node`/`ownedPid`/
+    # `ownedCommand` are overwritten every boot.
     owned_pid = System.pid()
 
     File.write!(
@@ -181,6 +184,7 @@ defmodule Tightbeam.Gateway do
       JSON.encode!(%{
         port: config.port,
         cliToken: cli_token,
+        node: System.get_env("RELEASE_NODE"),
         ownedPid: owned_pid,
         ownedCommand: owned_command(owned_pid)
       })

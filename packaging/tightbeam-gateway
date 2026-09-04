@@ -107,17 +107,20 @@ do_pid() {
 }
 
 do_debug() { # $@: the full argv (rpc <expr> | remote)
-  # rpc/remote still use Erlang distribution, but the node is resolved from the
-  # descriptor's port, NEVER from an ambient RELEASE_NODE/TIGHTBEAM_PORT. Force
-  # RELEASE_NODE so an inherited one cannot win (the incident vector). The cookie
+  # rpc/remote still use Erlang distribution, but the node is read from the
+  # descriptor the instance wrote at boot (R1/R4), NEVER from an ambient
+  # RELEASE_NODE/TIGHTBEAM_NODE. Setting RELEASE_NODE from the descriptor makes
+  # the descriptor node WIN over any inherited one — the same incident-safety
+  # property `stop` has, now for the debug verbs too, and it preserves custom
+  # `TIGHTBEAM_NODE` instances (their real node is in the descriptor). The cookie
   # stays the baked releases/COOKIE for Phase 1 (per-instance cookie is Phase 2).
   require_descriptor "$1"
   _json="$(cat "$DESC_PATH")"
-  _port="$(printf '%s' "$_json" | json_number port)"
-  if [ -z "$_port" ]; then
-    refuse "refusing to $1: descriptor has no port."
+  _node="$(printf '%s' "$_json" | json_string node)"
+  if [ -z "$_node" ]; then
+    refuse "refusing to $1: descriptor has no node (pre-upgrade or malformed)."
   fi
-  RELEASE_NODE="tightbeam_gateway_${_port}"
+  RELEASE_NODE="$_node"
   export RELEASE_NODE
   exec "$REL" "$@"
 }
