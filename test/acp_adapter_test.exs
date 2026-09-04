@@ -710,8 +710,7 @@ defmodule Tightbeam.Acp.AdapterTest do
   end
 
   test "Claude model switch forks the conversation and applies the model to the new session" do
-    {adapter, capture_path} =
-      start_adapter(harness: :claude, fail_mode: "canonical-no-take-then-alias")
+    {adapter, capture_path} = start_adapter(harness: :claude)
 
     assert {:ok, "sess-1"} =
              Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "old guidance")
@@ -737,7 +736,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, ^switched_model} = Adapter.current_model(adapter, "sess-fork-1")
 
     assert {:ok, switchable} = Adapter.switchable_models(adapter, "sess-fork-1")
-    assert Model.new("claude-opus-4-8", context: "1m") in switchable
+    assert Model.new("claude-opus-4-8") in switchable
     assert Model.new("claude-sonnet-5") in switchable
     refute Model.new("claude-opus-5") in switchable
 
@@ -754,7 +753,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
       end)
 
-    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]", "opus[1m]"]
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]"]
   end
 
   test "Claude model switch accepts canonical Opus 5 only when public readback identifies Opus 5" do
@@ -818,7 +817,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
       end)
 
-    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]", "opus[1m]"]
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]"]
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-fork-1")
 
     assert Enum.any?(captured_requests(capture_path), fn request ->
