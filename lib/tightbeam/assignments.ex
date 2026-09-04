@@ -1716,7 +1716,8 @@ defmodule Tightbeam.Assignments do
         assignment_closed()
       end
 
-    error in Tightbeam.DeliverableContract.MutationError -> error.response
+    error in Tightbeam.DeliverableContract.MutationError ->
+      error.response
   end
 
   defp keyed_completion_result(db, call) do
