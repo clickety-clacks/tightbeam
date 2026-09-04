@@ -13,7 +13,8 @@ defmodule Tightbeam.Visitor.KeyringTest do
   @retained_digest :binary.copy(<<0x44>>, 32)
   @retained_derivation_id "vdk_retained"
   @retained_digest_id "vgk_retained"
-  @current_previsitor_schema "coordination-fabric-v1-phase1-v15"
+  @current_previsitor_schema "coordination-fabric-v1-phase1-v16"
+  @migratable_previsitor_schema "coordination-fabric-v1-phase1-v15"
 
   setup do
     base = Path.join(System.tmp_dir!(), "tightbeam-keyring-#{System.unique_integer([:positive])}")
@@ -279,6 +280,15 @@ defmodule Tightbeam.Visitor.KeyringTest do
     assert :ok = Boot.load_visitor_keyring!(ctx.base, current, phase: :before_schema)
     assert :ok = Boot.load_visitor_keyring!(ctx.base, current, phase: :after_schema)
     GenServer.stop(current)
+
+    migratable = start_stamped_db(ctx.base, @migratable_previsitor_schema)
+    assert :ok = Boot.load_visitor_keyring!(ctx.base, migratable, phase: :before_schema)
+
+    assert_raise UnavailableError, ~r/database_references/, fn ->
+      Boot.load_visitor_keyring!(ctx.base, migratable, phase: :after_schema)
+    end
+
+    GenServer.stop(migratable)
   end
 
   test "A18 missing pair half, symlink, wrong owner, and unsafe modes all refuse one redacted class",
