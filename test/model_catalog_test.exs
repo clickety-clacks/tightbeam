@@ -1429,6 +1429,13 @@ defmodule Tightbeam.ModelCatalogTest do
 
   defp claude_probe?(command), do: Enum.any?(command, &String.contains?(&1, "api.anthropic.com"))
 
+  defp codex_probe?(command) do
+    line = Enum.join(command, " ")
+
+    String.contains?(line, "api.openai.com") or
+      String.contains?(line, "token=$(node -e")
+  end
+
   # Four probes race into one mailbox and each caller wants a different one, so a
   # record this call skipped goes BACK — it is the next call's evidence. Dropping
   # it made every assertion below depend on the order the four refresh Tasks
@@ -1439,7 +1446,11 @@ defmodule Tightbeam.ModelCatalogTest do
   defp probe_command!(harness, dest \\ nil, skipped \\ []) do
     receive do
       {:probe, command} = record ->
-        matches_harness? = claude_probe?(command) == (harness == :claude)
+        matches_harness? =
+          case harness do
+            :claude -> claude_probe?(command)
+            :codex -> codex_probe?(command)
+          end
 
         matches_dest? =
           case dest do

@@ -13,6 +13,8 @@ defmodule Tightbeam.HarnessProcess do
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @command_timeout_ms 5_000
+  @cursor_account "tightbeam-cursor"
+  @cursor_launcher "/usr/local/libexec/tightbeam-cursor-launcher"
   @old_schema_refusal "The database carries a pre-release harness_processes shape; it is not upgraded by design. Reset the database and restart Tightbeam."
 
   @process_ddl """
@@ -111,7 +113,12 @@ defmodule Tightbeam.HarnessProcess do
         Path.dirname(stderr_path)
 
     identity_path = Path.join([root, "harness-processes", launch_id <> ".identity"])
-    if is_nil(ssh), do: File.mkdir_p!(Path.dirname(identity_path))
+    dedicated_cursor? = Keyword.get(opts, :cursor_execution_identity, false)
+
+    if is_nil(ssh) do
+      File.mkdir_p!(Path.dirname(identity_path))
+      if dedicated_cursor?, do: File.chmod!(Path.dirname(identity_path), 0o2770)
+    end
 
     case DB.transaction(db, fn txn ->
            case DB.Txn.q(
@@ -169,7 +176,16 @@ defmodule Tightbeam.HarnessProcess do
     opts
     |> Keyword.put(
       :cmd,
-      wrap_command(Keyword.fetch!(opts, :cmd), ssh, helper_path, identity_path, launch_id)
+      wrap_command(
+        {key, dedicated_cursor?},
+        Keyword.fetch!(opts, :cmd),
+        ssh,
+        helper_path,
+        identity_path,
+        launch_id,
+        root,
+        Keyword.get(opts, :cursor_rails_sha256)
+      )
     )
     |> Keyword.put(:harness_process_launch_id, launch_id)
   end
@@ -661,13 +677,11 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
-  defp run_group_command(%{ssh: nil} = row, timeout_ms) do
-    bounded_command(
-      row.helper_path,
-      ["harness-group" | group_args(row)],
-      timeout_ms
-    )
-  end
+  defp run_group_command(%{ssh: nil, harness: "cursor"} = row, timeout_ms),
+    do: run_cursor_group_command(row, timeout_ms)
+
+  defp run_group_command(%{ssh: nil} = row, timeout_ms),
+    do: run_local_group_command(row, timeout_ms)
 
   defp run_group_command(%{ssh: destination} = row, timeout_ms) do
     bounded_command(
@@ -683,6 +697,32 @@ defmodule Tightbeam.HarnessProcess do
     )
   end
 
+  defp run_cursor_group_command(row, timeout_ms) do
+    bounded_command(
+      "/usr/bin/sudo",
+      cursor_sudo_args() ++
+        [
+          @cursor_launcher,
+          "cursor-exec",
+          "group",
+          Tightbeam.Harness.Cursor.execution_base(nil),
+          cursor_org_base(row.helper_path),
+          operator_uid(),
+          operator_home()
+          | group_args(row)
+        ],
+      timeout_ms
+    )
+  end
+
+  defp run_local_group_command(row, timeout_ms) do
+    bounded_command(
+      row.helper_path,
+      ["harness-group" | group_args(row)],
+      timeout_ms
+    )
+  end
+
   defp group_args(row) do
     [
       Integer.to_string(row.process_group_id),
@@ -692,11 +732,74 @@ defmodule Tightbeam.HarnessProcess do
     ]
   end
 
-  defp wrap_command(cmd, nil, helper_path, identity_path, launch_id) do
+  defp wrap_command(
+         {{:cursor, _preset, _host}, true},
+         _cmd,
+         destination,
+         _helper_path,
+         _identity_path,
+         _launch_id,
+         _root,
+         _rails_sha256
+       )
+       when not is_nil(destination) do
+    raise ArgumentError, "Cursor execution identity is local-only; SSH hosts are unsupported"
+  end
+
+  defp wrap_command(
+         {{:cursor, _preset, _host}, true},
+         cmd,
+         nil,
+         helper_path,
+         identity_path,
+         launch_id,
+         _root,
+         rails_sha256
+       ) do
+    [
+      "/usr/bin/sudo"
+      | cursor_sudo_args() ++
+          [
+            @cursor_launcher,
+            "cursor-exec",
+            "launch",
+            Tightbeam.Harness.Cursor.execution_base(nil),
+            cursor_org_base(helper_path),
+            operator_uid(),
+            operator_home(),
+            rails_sha256,
+            "--",
+            identity_path,
+            launch_id,
+            "--"
+            | cmd
+          ]
+    ]
+  end
+
+  defp wrap_command(
+         _key_and_mode,
+         cmd,
+         nil,
+         helper_path,
+         identity_path,
+         launch_id,
+         _root,
+         _rails_sha256
+       ) do
     [helper_path, "harness-exec", identity_path, launch_id, "--" | cmd]
   end
 
-  defp wrap_command(["ssh" | rest], destination, helper_path, identity_path, launch_id) do
+  defp wrap_command(
+         _key_and_mode,
+         ["ssh" | rest],
+         destination,
+         helper_path,
+         identity_path,
+         launch_id,
+         _root,
+         _rails_sha256
+       ) do
     {prefix, remote} = Enum.split_while(rest, &(&1 != destination))
 
     case remote do
@@ -720,7 +823,29 @@ defmodule Tightbeam.HarnessProcess do
     end
   end
 
+  defp cursor_sudo_args, do: ["-n", "-H", "-u", @cursor_account, "--"]
+
+  defp operator_uid do
+    {uid, 0} = System.cmd("/usr/bin/id", ["-u"])
+    String.trim(uid)
+  end
+
+  defp operator_home, do: System.user_home!()
+
+  defp cursor_org_base(helper_path) do
+    helper_path
+    |> Path.dirname()
+    |> Path.dirname()
+  end
+
   defp bounded_command(executable, args, timeout_ms) do
+    case Application.get_env(:tightbeam, :harness_process_command_runner_for_test) do
+      runner when is_function(runner, 3) -> runner.(executable, args, timeout_ms)
+      nil -> bounded_command_real(executable, args, timeout_ms)
+    end
+  end
+
+  defp bounded_command_real(executable, args, timeout_ms) do
     # `:spawn_executable` NEVER searches PATH -- it wants a real path and raises
     # `:enoent` for a bare name. Callers pass "ssh", so every remote identity read and
     # every remote `harness-group` failed before it was attempted, and the rescue below

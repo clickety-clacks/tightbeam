@@ -1,0 +1,884 @@
+defmodule Tightbeam.Harness.Cursor do
+  @moduledoc """
+  Cursor harness — dormant, gateway-local ACP adapter using the dedicated execution identity.
+
+  Registration requires an explicit enablement election. Launch planning refuses non-local
+  targets before any credential access.
+  """
+  @behaviour Tightbeam.Harness
+
+  require Logger
+
+  alias Tightbeam.Harness.{CursorRails, Support}
+  alias Tightbeam.Model
+
+  @adapter_version "2026.08.11-e8db854"
+  # The `cursor-agent` launcher script is byte-identical across all four
+  # published platform archives; only `index.js` differs per platform. Both
+  # verified against the real archives (ops, 2026-08-30); the CLI's admin
+  # block pins the same values (parity test in cursor_registration_test.exs).
+  @launcher_sha256 "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+  @bundle_sha256_by_platform %{
+    {:darwin, :arm64} => "6aceb24b7c7ecddb1993946ebb18a7dd4d025842e6efda955eb0c13255b1e5f0",
+    {:darwin, :x64} => "2def6db128c49b95f33b8b6f9624a15e65616f074ae505c06ffccf35fe0feb7b",
+    {:linux, :x64} => "f6fd4e6bf3d6ecbf66cc2dcabcf708b8a7c37b400d10c82a58658b5e331c36d0",
+    {:linux, :arm64} => "468106299df5dcebf227e0d478172a7241a202d25c4b2b7060b6723ee19cabac"
+  }
+  @credential_file "cli-config.json"
+  @api_key_file "api-key"
+  @rails_file ".cursor/hooks.json"
+
+  # The catalog must not advertise what the adapter will refuse. `cursor-agent
+  # --list-models` publishes ~200 refs; ACP `session/new` exposes a closed enum
+  # of ~35 decorated wire values whose option `name` is the public ref. Re-probe
+  # live against cursor-agent #{@adapter_version} before changing this pin.
+  @adapter_selectable_models ~w(auto grok-4.6 composer-2.5 claude-opus-5 claude-opus-4-8
+                                gpt-5.6-sol gpt-5.5 claude-fable-5 grok-4.5 gemini-3.7-flash
+                                gpt-5.6-terra claude-sonnet-5 claude-sonnet-4-6 gpt-5.3-codex
+                                claude-opus-4-7 gpt-5.4 claude-opus-4-6 claude-opus-4-5 gpt-5.2
+                                gpt-5.6-luna gemini-3.6-flash gemini-3.1-pro gpt-5.4-mini
+                                gpt-5.4-nano claude-haiku-4-5 claude-sonnet-4-5 gpt-5.1
+                                gemini-3-flash gemini-3.5-flash claude-sonnet-4 gpt-5-mini
+                                gemini-2.5-flash kimi-k3 kimi-k2.7-code glm-5.2)
+
+  @doc """
+  Model values this adapter version accepts at `session/set_config_option`.
+
+  Narrower than `cursor-agent --list-models` — see the note above the attribute.
+  """
+  def adapter_selectable_models, do: @adapter_selectable_models
+
+  @impl true
+  def id, do: :cursor
+
+  @impl true
+  def wire_name, do: "cursor"
+
+  @impl true
+  def credential_provider, do: :cursor
+
+  @impl true
+  def credential_env_vars, do: ["CURSOR_API_KEY"]
+
+  @impl true
+  def default_model, do: Model.new("auto")
+
+  @impl true
+  def install_package, do: "cursor-agent"
+
+  @impl true
+  def cli_binary, do: "cursor-agent"
+
+  @doc false
+  def adapter_version, do: @adapter_version
+
+  @impl true
+  def wire_projection do
+    JSON.encode!(%{
+      "id" => "cursor",
+      "wire_name" => wire_name(),
+      "install_package" => install_package(),
+      "cli_binary" => cli_binary(),
+      "process_markers" => ["cursor-agent acp"]
+    })
+  end
+
+  @impl true
+  def ensure_adapter(target) do
+    with {:ok, _installed} <- verify_installed_cli(target) do
+      {:ok, "Cursor execution launcher present"}
+    end
+  end
+
+  @impl true
+  def preflight_launch(target, _home, opts) do
+    if local?(target) do
+      case Keyword.fetch(opts, :credential_kind) do
+        {:ok, :api_key} -> load_api_key(target, opts)
+        _ -> credential_refusal()
+      end
+    else
+      local_only_refusal()
+    end
+  end
+
+  @impl true
+  def prepare_launch(target, home, opts) do
+    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
+      if local?(target) do
+        case Keyword.fetch(opts, :cursor_api_key) do
+          {:ok, key} ->
+            {:ok,
+             [
+               readiness_rendezvous: true,
+               cursor_execution_identity: true,
+               cursor_rails_sha256: Keyword.fetch!(opts, :cursor_rails_sha256),
+               cmd: [launcher, "acp"],
+               env: [
+                 {"CURSOR_CONFIG_DIR", home},
+                 {"AGENT_CLI_CREDENTIAL_STORE", "memory"},
+                 {"CURSOR_API_KEY", key}
+                 | Keyword.fetch!(opts, :common_env)
+               ]
+             ]}
+
+          :error ->
+            credential_refusal()
+        end
+      else
+        local_only_refusal()
+      end
+    end
+  end
+
+  @doc false
+  def execution_base(home_override), do: Path.join(execution_home(home_override), ".tightbeam")
+
+  @doc false
+  def execution_home(home_override) when is_binary(home_override), do: home_override
+
+  def execution_home(nil) do
+    case :os.type() do
+      {:unix, :darwin} -> "/Users/tightbeam-cursor"
+      {:unix, _} -> "/home/tightbeam-cursor"
+    end
+  end
+
+  @doc false
+  def project_execution_rails!(home_override, settings, opts \\ []) do
+    path = Path.join(execution_home(home_override), @rails_file)
+    bytes = settings |> CursorRails.compile(rails_opts(opts)) |> JSON.encode!()
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, bytes)
+    File.chmod!(path, 0o644)
+    Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+  end
+
+  # Both hooks.json writers (projection home and execution home) MUST compile
+  # with identical options: the launcher verifies the execution-home file against
+  # the digest of the bytes the projection wrote.
+  defp rails_opts(opts), do: Keyword.take(opts, [:path])
+
+  @doc """
+  Root-owned directory the dedicated execution identity resolves `tightbeam`
+  from: it holds a `tightbeam` symlink to the Cursor execution launcher, which
+  admits the read-only rail guards (`github-auth-check`, `tool-call-observed`)
+  when invoked unprivileged. Nothing under the operator's home is traversed.
+  """
+  @helper_path_dir "/usr/local/libexec/tightbeam-cursor-path"
+  @spec helper_path_dir() :: String.t()
+  def helper_path_dir, do: @helper_path_dir
+
+  @workspace_group "tightbeam-workspace"
+
+  @doc """
+  Grant the provisioned execution group read access to the banked GitHub CLI
+  config ON ITS CANONICAL PATH (`<base>/auth/github/gh`): no copy, so rotation
+  semantics are exactly the bank's. Applied only when the host is provisioned —
+  the execution home carries the `tightbeam-workspace` gid, resolved by NAME —
+  and never widened to any other group. `tightbeam onboard github` (credential
+  rotation) detects the grant by that same name on the gh dir and keeps it —
+  traversal 0710, gh 0750, exactly these two files 0640 on the group,
+  including the `hosts.yml` gh rewrites — so a live Cursor session never loses git auth between a
+  rotation and its next delivery (`cli/src/github_auth/bank.rs` `BankLayout`).
+  """
+  @spec grant_bank_access!(String.t(), String.t() | nil) :: :ok
+  def grant_bank_access!(base_dir, execution_home_override \\ nil) do
+    auth = Path.join(base_dir, "auth")
+    github = Path.join(auth, "github")
+    gh = Tightbeam.GithubAuth.config_dir(base_dir)
+
+    case provisioned_workspace_gid(execution_home(execution_home_override)) do
+      {:ok, gid} ->
+        if File.dir?(gh) do
+          for {path, mode} <- [{auth, 0o710}, {github, 0o710}, {gh, 0o750}] do
+            :ok = :file.change_group(path, gid)
+            File.chmod!(path, mode)
+          end
+
+          for name <- ["config.yml", "hosts.yml"],
+              file = Path.join(gh, name),
+              File.regular?(file) do
+            :ok = :file.change_group(file, gid)
+            File.chmod!(file, 0o640)
+          end
+        end
+
+      {:refuse, reason} ->
+        Logger.warning("Cursor GitHub bank access not granted: #{reason}")
+    end
+
+    :ok
+  end
+
+  # The tightbeam-workspace gid, resolved by name through the platform's
+  # directory service, and required on the admin-provisioned execution home.
+  # Never the gateway's primary group and never "whatever secondary gid a
+  # directory happens to carry".
+  defp provisioned_workspace_gid(execution_home) do
+    with {:ok, gid} <- workspace_gid(),
+         :distinct <- if(gid == primary_gid(), do: :primary, else: :distinct),
+         {:ok, %File.Stat{gid: ^gid}} <- File.stat(execution_home) do
+      {:ok, gid}
+    else
+      :error ->
+        {:refuse,
+         "group #{@workspace_group} does not exist; provision the dedicated account first"}
+
+      :primary ->
+        {:refuse, "group #{@workspace_group} is the gateway's primary group"}
+
+      {:error, reason} ->
+        {:refuse, "execution home #{execution_home} unavailable (#{inspect(reason)})"}
+
+      {:ok, %File.Stat{gid: other}} ->
+        {:refuse,
+         "execution home #{execution_home} is group #{other}, not #{@workspace_group}; " <>
+           "re-run the admin block from tightbeam onboard cursor"}
+    end
+  end
+
+  # Cached only on success: a group provisioned after the gateway started must
+  # take effect on the next delivery, not after a restart.
+  defp workspace_gid do
+    case :persistent_term.get({__MODULE__, :workspace_gid}, :unset) do
+      :unset ->
+        case lookup_workspace_gid() do
+          {:ok, gid} = ok ->
+            :persistent_term.put({__MODULE__, :workspace_gid}, ok)
+            ok
+
+          :error ->
+            :error
+        end
+
+      {:ok, _} = cached ->
+        cached
+    end
+  end
+
+  defp lookup_workspace_gid do
+    {argv, parse} =
+      case :os.type() do
+        {:unix, :darwin} ->
+          {["dscl", ".", "-read", "/Groups/#{@workspace_group}", "PrimaryGroupID"],
+           fn out -> out |> String.split() |> List.last() end}
+
+        {:unix, _} ->
+          {["getent", "group", @workspace_group],
+           fn out -> out |> String.trim() |> String.split(":") |> Enum.at(2) end}
+      end
+
+    case System.cmd(hd(argv), tl(argv), stderr_to_stdout: true) do
+      {out, 0} ->
+        case out |> parse.() |> Integer.parse() do
+          {gid, _} -> {:ok, gid}
+          :error -> :error
+        end
+
+      _ ->
+        :error
+    end
+  rescue
+    ErlangError -> :error
+  end
+
+  defp primary_gid do
+    case :persistent_term.get({__MODULE__, :primary_gid}, nil) do
+      nil ->
+        {out, 0} = System.cmd("id", ["-g"])
+        gid = out |> String.trim() |> String.to_integer()
+        :persistent_term.put({__MODULE__, :primary_gid}, gid)
+        gid
+
+      gid ->
+        gid
+    end
+  end
+
+  @doc false
+  def prepare_projection_runtime!(home) do
+    # Cursor 2026.08.11 writes ACP session state beneath CURSOR_CONFIG_DIR.
+    # The dedicated execution account reaches this operator-owned projection
+    # through tightbeam-workspace. Keep the writable surface to the projection
+    # root and the runtime directory. cli-config.json is projected separately as
+    # a non-secret 0640 copy; the API key remains environment-only.
+    runtime_dirs = [home, Path.join(home, "acp-sessions")]
+
+    Enum.each(runtime_dirs, fn path ->
+      File.mkdir_p!(path)
+      File.chmod!(path, 0o2770)
+    end)
+
+    root_gid = File.stat!(home).gid
+
+    Enum.each(runtime_dirs, fn path ->
+      stat = File.stat!(path)
+
+      if stat.gid != root_gid or Bitwise.band(stat.mode, 0o7777) != 0o2770 do
+        raise "Cursor runtime projection #{path} must inherit the projection group and mode 2770"
+      end
+    end)
+
+    :ok
+  end
+
+  @impl true
+  def session_config(session, guidance) do
+    prefix =
+      "Your Tight Beam archetype identity arrives as this Cursor instruction. " <>
+        "It is authoritative and outranks product AGENTS.md instructions on conflict."
+
+    guidance =
+      if Map.get(session, :identity) == true and not String.starts_with?(guidance, prefix),
+        do: prefix <> "\n\n" <> guidance,
+        else: guidance
+
+    %{
+      guidance: guidance,
+      meta: %{instructions: guidance},
+      permission_mode: "full",
+      # Cursor folds its tuning into the opaque ACP model value. It exposes no
+      # separate effort config option, unlike Claude/Codex.
+      effort_config: nil,
+      resident_model_switch: :in_place,
+      # `cursor-agent --list-models` publishes `auto`, while ACP exposes this
+      # exact value. Tightbeam keeps the stable public ref and translates only
+      # at the adapter boundary, with config readback verification.
+      model_option_aliases: %{"auto-smart[optimize_for=balanced]" => "auto"},
+      # Cursor's ACP model enum is closed and decorated: every selectable model
+      # is one exact wire value (`composer-2.5[fast=true]`) whose option `name`
+      # is the public ref (`composer-2.5`). A bare ref is refused (-32602), so
+      # the adapter resolves refs to wire values through the live option list
+      # rather than a static table the server-side menu would drift past.
+      model_wire_by_name: true,
+      canonical_model_prefixes: []
+    }
+  end
+
+  @impl true
+  def owned_home_entries,
+    do: Support.owned_home_entries(@credential_file, @rails_file)
+
+  @impl true
+  def reconcile_home(target, home, desired) do
+    rails =
+      desired.rails
+      |> CursorRails.compile(rails_opts(path: Map.get(desired, :rails_path)))
+      |> JSON.encode!()
+
+    # harvest_auth: false — the projection root is group-writable by the
+    # execution identity, so a home-side cli-config.json can be replaced by
+    # uid 503; harvesting it back would let execution-controlled content land
+    # in the operator's credential store. Cursor's credential is env-delivered
+    # and cli-config.json is non-secret preferences: nothing needs harvesting.
+    Tightbeam.Homes.reconcile(
+      target,
+      home,
+      %{desired | rails: rails} |> Map.put(:harvest_auth, false),
+      credential_names: [@credential_file],
+      credential_projection: :copy_readable,
+      rails_filename: @rails_file,
+      preserve_manifest_dir: true
+    )
+  end
+
+  @impl true
+  def materialize_skills(target, cwd, snapshot) do
+    Tightbeam.Identity.materialize_for_harness!(
+      target,
+      snapshot,
+      cwd,
+      Path.join([".cursor", "skills"])
+    )
+  end
+
+  @impl true
+  def credential_ready?(target, _home) do
+    store = Tightbeam.Credentials.store_dir(target.host_config.base_dir, credential_provider())
+    Tightbeam.Homes.credential_ready?(target, store, [@api_key_file])
+  end
+
+  @impl true
+  def harvest_credential(_target, _home), do: nil
+
+  @impl true
+  def credential_live?(_target, _home, _opts),
+    do: {:unknown, :no_captured_cursor_liveness_fixtures}
+
+  @impl true
+  def install_cli_projection(_cli_bin), do: :ok
+
+  @impl true
+  def probe_cli(target) do
+    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target) do
+      Support.bounded_probe(launcher, target)
+    end
+  end
+
+  @doc false
+  def verify_installed_cli(target) do
+    with launcher when is_binary(launcher) <- resolve_launcher(target),
+         {:ok, canonical} <- canonical_path(target, launcher),
+         true <- Path.basename(Path.dirname(canonical)) == @adapter_version,
+         :ok <- verify_hash(target, canonical, @launcher_sha256),
+         {:ok, bundle_sha256} <- bundle_sha256_for_host(),
+         :ok <-
+           verify_hash(target, Path.join(Path.dirname(canonical), "index.js"), bundle_sha256) do
+      {:ok, %{launcher: canonical, version: @adapter_version}}
+    else
+      nil -> integrity_refusal(:not_found)
+      {:error, :unsupported_platform} -> integrity_refusal(:unsupported_platform)
+      _ -> integrity_refusal()
+    end
+  end
+
+  @doc false
+  def bundle_sha256_by_platform, do: @bundle_sha256_by_platform
+
+  @doc false
+  def bundle_sha256_for_host! do
+    {:ok, digest} = bundle_sha256_for_host()
+    digest
+  end
+
+  # Cursor placement is gateway-local only, so the platform whose pin applies
+  # is always this node's. An unmapped platform is a refusal, never a skipped
+  # check.
+  defp bundle_sha256_for_host do
+    os =
+      case :os.type() do
+        {:unix, :darwin} -> :darwin
+        {:unix, :linux} -> :linux
+        _ -> nil
+      end
+
+    arch =
+      case :erlang.system_info(:system_architecture) |> List.to_string() |> String.split("-") do
+        [a | _] when a in ["aarch64", "arm64"] -> :arm64
+        [a | _] when a in ["x86_64", "amd64"] -> :x64
+        _ -> nil
+      end
+
+    case Map.fetch(@bundle_sha256_by_platform, {os, arch}) do
+      {:ok, digest} -> {:ok, digest}
+      :error -> {:error, :unsupported_platform}
+    end
+  end
+
+  @impl true
+  def classify_auth_event(_event), do: :unknown
+
+  @impl true
+  def classify_subagent_event(_event), do: :skip
+
+  @impl true
+  def fetch_catalog(state) do
+    case get_in(state, [:options, :cursor_fetch]) do
+      nil -> fetch_installed_catalog(state)
+      fetch -> derive_catalog(fetch.())
+    end
+  end
+
+  defp fetch_installed_catalog(state) do
+    options = Map.get(state, :options, %{})
+    sh = Map.get(options, :sh, &Support.system_cmd_out/1)
+    host_config = Map.get(state, :host_config, %{base_dir: state.base_dir, ssh: nil})
+
+    target =
+      options
+      |> Map.take([:find_executable, :realpath, :sha256])
+      |> Map.merge(%{host_config: host_config, sh: sh})
+
+    with {:ok, %{launcher: launcher}} <- verify_installed_cli(target),
+         {output, 0} <- sh.(catalog_argv(host_config, launcher, state.base_dir)),
+         {:ok, entries} <- parse_catalog(output),
+         entries <- build_selectable_catalog(entries, selectable_models(state)),
+         true <- entries != [] do
+      {:ok, entries}
+    else
+      {output, exit} when is_binary(output) and is_integer(exit) ->
+        {:error, {:cursor_catalog_probe_failed, exit, String.trim(output)}}
+
+      false ->
+        {:error, :empty_inventory}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _ ->
+        {:error, :malformed_catalog}
+    end
+  end
+
+  defp catalog_argv(host_config, launcher, base_dir) do
+    key_path = api_key_path(base_dir)
+
+    script =
+      "test -r #{Support.shell_quote(key_path)} && " <>
+        "exec env AGENT_CLI_CREDENTIAL_STORE=memory " <>
+        "CURSOR_API_KEY=\"$(cat #{Support.shell_quote(key_path)})\" " <>
+        "#{Support.shell_quote(launcher)} --list-models"
+
+    Support.catalog_probe_argv(host_config.ssh, script)
+  end
+
+  defp parse_catalog(output) when is_binary(output) do
+    entries =
+      output
+      |> String.split("\n")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == "" or &1 == "Available models" or String.starts_with?(&1, "Tip:")))
+      |> Enum.map(&parse_catalog_line/1)
+
+    if entries != [] and Enum.all?(entries, &match?({:ok, _}, &1)) do
+      {:ok, Enum.map(entries, fn {:ok, entry} -> entry end)}
+    else
+      {:error, :malformed_catalog}
+    end
+  end
+
+  defp parse_catalog_line(line) do
+    case String.split(line, " - ", parts: 2) do
+      [family, display_name] when family != "" and display_name != "" ->
+        name = String.replace_suffix(display_name, " (default)", "")
+
+        {:ok,
+         %{
+           family: family,
+           context: nil,
+           display_name: name,
+           name: name,
+           efforts: [],
+           max_input_tokens: nil,
+           capabilities: %{},
+           provider: credential_provider()
+         }}
+
+      _ ->
+        :error
+    end
+  end
+
+  defp derive_catalog({:ok, :valid}) do
+    {:ok,
+     [
+       %{
+         family: "auto",
+         context: nil,
+         display_name: "Auto",
+         name: "Auto",
+         efforts: [],
+         max_input_tokens: nil,
+         capabilities: %{},
+         provider: credential_provider()
+       }
+     ]}
+  end
+
+  defp derive_catalog({:ok, _malformed}), do: {:error, :malformed_catalog}
+  defp derive_catalog({:error, reason}), do: {:error, reason}
+
+  @impl true
+  def conformance_vectors do
+    valid_entry = %{
+      family: "auto",
+      context: nil,
+      display_name: "Auto",
+      name: "Auto",
+      efforts: [],
+      max_input_tokens: nil,
+      capabilities: %{},
+      provider: credential_provider()
+    }
+
+    profile = %{
+      wire_name: wire_name(),
+      provider: credential_provider(),
+      home_scope: wire_name(),
+      home_env: "CURSOR_CONFIG_DIR",
+      credential_file: @api_key_file,
+      credential_live: :unsupported,
+      credential_live_unknown_reason: :no_captured_cursor_liveness_fixtures,
+      credential_live_divergence: "DIV-CREDENTIAL-LIVE-CURSOR-NO-FIXTURES",
+      rails_file: @rails_file,
+      rails: %{"hooks" => %{"PreToolUse" => []}},
+      skills_path: Path.join([".cursor", "skills"]),
+      local_extra_env: %{subscription: [], api_key: [{"CURSOR_API_KEY", "vector-token"}]},
+      unsupported_launch_kinds: [:subscription],
+      rails_env: nil,
+      remote_prefix: fn base, home, kind ->
+        case kind do
+          :api_key ->
+            [
+              "CURSOR_API_KEY=$(cat #{base}/auth/cursor/api-key 2>/dev/null)",
+              "CURSOR_CONFIG_DIR=#{home}"
+            ]
+
+          # Support builds a uniform registry matrix. Cursor retains the subscription
+          # vectors as explicit unsupported cases, and this branch builds their oracles.
+          :subscription ->
+            ["CURSOR_CONFIG_DIR=#{home}"]
+        end
+      end,
+      remote_rails_env: nil,
+      railed_probe: false,
+      provisioning: :shim,
+      adapter_bin: "cursor-agent",
+      cli_name: "cursor-agent",
+      pinned_cli_path: Path.join([@adapter_version, "cursor-agent"]),
+      shim_exec_args: ["acp"],
+      session_meta: %{instructions: "vector guidance"},
+      cli_version: "cursor-agent vector 1.0",
+      probe_path: :discovered,
+      auth_events: [
+        %{
+          case: "positive",
+          envelope: %{"authMode" => nil},
+          expected: :unknown,
+          divergence: "DIV-AUTH-CURSOR-UNSUPPORTED"
+        },
+        %{case: "negative", envelope: %{"unrelated" => true}, expected: :unknown}
+      ],
+      subagent_events: [
+        %{
+          case: "positive_start",
+          envelope: %{"cursor" => "start"},
+          expected: :skip,
+          divergence: "DIV-SUBAGENT-CURSOR-UNSUPPORTED"
+        },
+        %{
+          case: "positive_stop",
+          envelope: %{"cursor" => "stop"},
+          expected: :skip,
+          divergence: "DIV-SUBAGENT-CURSOR-UNSUPPORTED"
+        },
+        %{case: "negative", envelope: %{"unrelated" => true}, expected: :skip}
+      ],
+      catalog_expected: %{
+        "valid" => {:ok, [valid_entry]},
+        "valid_api_key" => {:ok, [valid_entry]},
+        "malformed" => {:error, :malformed_catalog},
+        "unavailable" => {:error, :cursor_unavailable}
+      },
+      catalog_state: fn case_name, _base ->
+        fetch = fn ->
+          case case_name do
+            "valid" -> {:ok, :valid}
+            "valid_api_key" -> {:ok, :valid}
+            "malformed" -> {:ok, :malformed}
+            "unavailable" -> {:error, :cursor_unavailable}
+          end
+        end
+
+        %{credential_kind: :api_key, options: %{cursor_fetch: fetch}}
+      end,
+      wire_projection: %{
+        "id" => "cursor",
+        "wire_name" => "cursor",
+        "install_package" => "cursor-agent",
+        "cli_binary" => "cursor-agent",
+        "process_markers" => ["cursor-agent acp"]
+      }
+    }
+
+    vectors = Support.conformance_vectors(__MODULE__, profile)
+
+    local_only_error =
+      {:error,
+       %{
+         code: "DIV-CURSOR-LOCAL-ONLY",
+         message:
+           "Cursor shim harness is gateway-local only until remote zero-listener probe exists"
+       }}
+
+    launch_vectors =
+      Enum.map(vectors["prepare_launch"], fn vector ->
+        cond do
+          String.starts_with?(vector.case, "remote_") ->
+            %{
+              vector
+              | support: {:unsupported, "DIV-CURSOR-LOCAL-ONLY"},
+                expected: local_only_error
+            }
+
+          String.ends_with?(vector.case, "_subscription") ->
+            %{vector | support: {:unsupported, "DIV-CURSOR-API-KEY-ONLY"}}
+
+          true ->
+            vector
+        end
+      end)
+
+    home_profile = %{profile | credential_file: @credential_file}
+
+    home_vectors = fn callback ->
+      Enum.map(vectors[callback], fn vector ->
+        put_in(vector, [:input, :profile], home_profile)
+      end)
+    end
+
+    credential_vectors =
+      Enum.map(vectors["credential_ready?/harvest_credential"], fn vector ->
+        vector
+        |> Map.update!(:expected, &Map.put(&1, :harvested, nil))
+      end)
+
+    vectors
+    |> Map.put("prepare_launch", launch_vectors)
+    |> Map.put("owned_home_entries", home_vectors.("owned_home_entries"))
+    |> Map.put("reconcile_home", home_vectors.("reconcile_home"))
+    |> Map.put("credential_ready?/harvest_credential", credential_vectors)
+  end
+
+  defp api_key_path(base_dir),
+    do: Path.join([base_dir, "auth", "cursor", @api_key_file])
+
+  defp load_api_key(target, opts) do
+    loader = Keyword.get(opts, :cursor_api_key_loader, &read_api_key(target, &1))
+
+    case loader.(api_key_path(target.host_config.base_dir)) do
+      {:ok, key} when is_binary(key) ->
+        case String.trim(key) do
+          "" -> credential_refusal()
+          trimmed -> {:ok, Keyword.put(opts, :cursor_api_key, trimmed)}
+        end
+
+      _ ->
+        credential_refusal()
+    end
+  end
+
+  defp read_api_key(target, path) do
+    if local?(target) do
+      File.read(path)
+    else
+      script = "test -r #{Support.shell_quote(path)} && cat #{Support.shell_quote(path)}"
+
+      case target.sh.(
+             ["ssh" | Support.ssh_opts()] ++
+               [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+           ) do
+        {output, 0} -> {:ok, output}
+        _ -> {:error, :unreadable}
+      end
+    end
+  end
+
+  defp selectable_models(state),
+    do: Map.get(state.options, :cursor_selectable_models, @adapter_selectable_models)
+
+  defp build_selectable_catalog(entries, :all), do: entries
+
+  defp build_selectable_catalog(entries, selectable) do
+    {kept, dropped} = Enum.split_with(entries, &(vendor_ref(&1) in selectable))
+
+    if dropped != [] do
+      Logger.info(
+        "cursor catalog: #{length(dropped)} model(s) from --list-models are not selectable by " <>
+          "cursor-agent #{@adapter_version} ACP and were withheld — re-probe " <>
+          "@adapter_selectable_models in harness/cursor.ex if this looks wrong"
+      )
+    end
+
+    kept
+  end
+
+  defp vendor_ref(entry),
+    do: Model.to_ref(Model.new(entry.family, context: entry.context))
+
+  defp credential_refusal do
+    {:error, %{code: "DIV-CURSOR-API-KEY-ONLY", message: "Cursor requires a banked API key"}}
+  end
+
+  defp local_only_refusal do
+    {:error,
+     %{
+       code: "DIV-CURSOR-LOCAL-ONLY",
+       message:
+         "Cursor shim harness is gateway-local only until remote zero-listener probe exists"
+     }}
+  end
+
+  defp integrity_refusal do
+    {:error,
+     %{code: "cursor_cli_integrity_mismatch", message: "Cursor CLI integrity check failed"}}
+  end
+
+  defp integrity_refusal(reason) do
+    {:error,
+     %{
+       code: "cursor_cli_integrity_mismatch",
+       message: "Cursor CLI integrity check failed",
+       reason: reason
+     }}
+  end
+
+  defp canonical_path(target, path) do
+    realpath =
+      Map.get_lazy(target, :realpath, fn ->
+        if local?(target), do: &default_realpath/1, else: &remote_realpath(target, &1)
+      end)
+
+    case realpath.(path) do
+      {:ok, canonical} when is_binary(canonical) -> {:ok, canonical}
+      canonical when is_binary(canonical) -> {:ok, canonical}
+      _ -> {:error, :canonical_path}
+    end
+  end
+
+  defp default_realpath(path) do
+    case System.cmd("/bin/realpath", [path], stderr_to_stdout: true) do
+      {canonical, 0} -> {:ok, String.trim(canonical)}
+      _ -> {:error, :canonical_path}
+    end
+  end
+
+  defp verify_hash(target, path, expected) do
+    hash =
+      Map.get_lazy(target, :sha256, fn ->
+        if local?(target), do: &local_sha256/1, else: &remote_sha256(target, &1)
+      end)
+
+    digest = hash.(path)
+    if digest == expected or digest == {:ok, expected}, do: :ok, else: {:error, :hash}
+  end
+
+  defp resolve_launcher(%{find_executable: find}), do: find.(cli_binary())
+
+  defp resolve_launcher(_target) do
+    Path.join([
+      execution_home(nil),
+      ".local",
+      "share",
+      "cursor-agent",
+      "versions",
+      @adapter_version,
+      "cursor-agent"
+    ])
+  end
+
+  defp remote_realpath(target, path),
+    do: remote_value(target, "realpath #{Support.shell_quote(path)}")
+
+  defp remote_sha256(target, path),
+    do: remote_value(target, "shasum -a 256 #{Support.shell_quote(path)} | cut -d' ' -f1")
+
+  defp remote_value(target, script) do
+    command =
+      ["ssh" | Support.ssh_opts()] ++
+        [target.host_config.ssh, "sh", "-c", Support.shell_quote(script)]
+
+    case target.sh.(command) do
+      {output, 0} -> output |> String.trim() |> String.split("\n") |> List.last()
+      _ -> nil
+    end
+  end
+
+  defp local_sha256(path) do
+    with {:ok, bytes} <- File.read(path),
+         do: Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+  end
+
+  defp local?(target), do: get_in(target, [:host_config, :ssh]) == nil
+end

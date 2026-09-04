@@ -2193,7 +2193,7 @@ defmodule Tightbeam.GatewayTest do
 
     System.put_env("PATH", missing_bin)
 
-    assert_raise RuntimeError, ~r/no registered harness CLI is installed/, fn ->
+    assert_raise RuntimeError, ~r/no usable harness CLI is installed/, fn ->
       Gateway.children(gateway_config(missing_base, ctx.db, 0))
     end
 
@@ -6736,6 +6736,78 @@ defmodule Tightbeam.GatewayTest do
     assert Gateway.deliver_prompt("k1", "user:flynn", "hello", opts) == :duplicate
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM messages")
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
+  end
+
+  test "a checkout refusal keeps its stable code through the real runner and turn wire", ctx do
+    refusal = %{
+      code: "DIV-CURSOR-API-KEY-ONLY",
+      message: "Cursor requires a banked API key"
+    }
+
+    coordinator =
+      start_supervised!({CoordinatorStub, fn _key -> {:error, {:launch_refused, refusal}} end})
+
+    exact_registry =
+      case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+        {:ok, pid} -> pid
+        {:error, {:already_started, pid}} -> pid
+      end
+
+    ConnRegistry.register(exact_registry, %{
+      pid: self(),
+      user_id: "flynn",
+      device_id: "cursor-refusal-wire",
+      is_admin: false,
+      subscriptions: MapSet.new(["chat"])
+    })
+
+    ConnRegistry.register(ctx.registry, %{
+      pid: self(),
+      user_id: "flynn",
+      device_id: "cursor-refusal",
+      is_admin: false,
+      subscriptions: MapSet.new(["chat"])
+    })
+
+    config =
+      gateway_config(gateway_children_base!(), ctx.db, 0)
+      |> Map.put(:adapter_coordinator, coordinator)
+
+    {Tightbeam.LaneManager, lane_opts} =
+      config
+      |> Gateway.children()
+      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(lane_opts, :runner)
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "cursor refusal",
+               db: ctx.db,
+               conn_registry: ctx.registry,
+               lane_manager: ctx.lane,
+               device_id: "cursor-refusal",
+               client_message_id: "c_cursor_refusal"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+
+    assert {:error, %{reason: ^refusal, terminal_publish: publish}} =
+             runner.(Map.put(turn, :session_key, "k1"))
+
+    publish.("failed")
+
+    assert_receive {:push,
+                    %{
+                      "event" => "prompt_turn_state",
+                      "payload" => %{
+                        "state" => "failed",
+                        "error" => %{
+                          code: "DIV-CURSOR-API-KEY-ONLY",
+                          message: "Cursor requires a banked API key"
+                        }
+                      }
+                    }},
+                   2_000
   end
 
   test "conversational turns stay unattributed and bracket-1 nags reverse-link jobRef only",

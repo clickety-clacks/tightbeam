@@ -6,6 +6,7 @@ mod ceremonies;
 mod child_process;
 mod command_execution;
 mod contain;
+mod cursor_execution_identity;
 mod dispatch;
 mod github_auth;
 mod harness_process;
@@ -18,6 +19,25 @@ mod users;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if cursor_execution_identity::running_as_launcher()
+        && !cursor_execution_identity::launcher_command_allowed(&args)
+    {
+        eprintln!(
+            "Cursor execution launcher refused: only cursor-exec is permitted (rail guards only when invoked unprivileged)"
+        );
+        std::process::exit(1);
+    }
+
+    if args.first().is_some_and(|arg| arg == "cursor-exec") {
+        match cursor_execution_identity::run(&args[1..]) {
+            Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     if args.first().is_some_and(|arg| arg == "rail-exec") {
         match contain::rail_exec(&args[1..]) {

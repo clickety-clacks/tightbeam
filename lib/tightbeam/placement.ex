@@ -1136,31 +1136,65 @@ defmodule Tightbeam.Placement do
   `config` is the Gateway config map (base_dir, cwd, …). Local keys must
   produce exactly the pre-placement behavior. Calls deliver_home/3.
   """
-  @spec adapter_opts(map(), adapter_key()) :: keyword()
+  @spec adapter_opts(map(), adapter_key()) ::
+          {:ok, keyword()} | {:error, Harness.launch_refusal()}
   def adapter_opts(config, {harness, identity_name, host} = key) do
     module = Harness.module!(harness)
-
-    lineage =
-      "tb1-" <> Base.url_encode64("#{harness}@#{host}", padding: false)
-
     host_config = Map.fetch!(hosts_for(config), host)
     sh = Map.get(config, :sh, &system_cmd/1)
-    ensure_toolchain_dirs!(host, host_config, sh)
 
-    target = %{
-      base_dir: config.base_dir,
-      host_config: host_config,
-      host_name: host,
-      sh: sh,
-      cli_bin: config.cli_bin
-    }
+    target =
+      Map.merge(
+        %{
+          base_dir: config.base_dir,
+          host_config: host_config,
+          host_name: host,
+          sh: sh,
+          cli_bin: config.cli_bin
+        },
+        Map.get(config, :harness_target_overrides, %{})
+      )
+
+    projected_home = Homes.home_path(host_config.base_dir, host, module.id())
+
+    with {:ok, _} <- cursor_locality_before_kind(module, target, projected_home),
+         kind = credential_kind(config, module.credential_provider(), host, module.wire_name()),
+         {:ok, checked_opts} <-
+           Harness.preflight_launch(module, target, projected_home, credential_kind: kind) do
+      build_adapter_opts(
+        config,
+        key,
+        module,
+        target,
+        checked_opts,
+        identity_name,
+        host,
+        host_config,
+        sh
+      )
+    end
+  end
+
+  defp build_adapter_opts(
+         config,
+         {harness, _identity_name, _host} = key,
+         module,
+         target,
+         checked_opts,
+         identity_name,
+         host,
+         host_config,
+         sh
+       ) do
+    ensure_toolchain_dirs!(host, host_config, sh)
+    lineage = "tb1-" <> Base.url_encode64("#{harness}@#{host}", padding: false)
 
     deliver_opts =
       []
       |> then(&if(config[:sh], do: Keyword.put(&1, :sh, config.sh), else: &1))
       |> then(&if(config[:sh_out], do: Keyword.put(&1, :sh_out, config.sh_out), else: &1))
 
-    home = deliver_home(config, key, deliver_opts)
+    {home, cursor_rails_sha256} = deliver_home_with_metadata(config, key, deliver_opts)
 
     stderr_path =
       Path.join(config.base_dir, "adapter-#{harness}:#{identity_name}@#{host}.stderr.log")
@@ -1203,32 +1237,56 @@ defmodule Tightbeam.Placement do
         []
       end
 
-    plan =
-      module.prepare_launch(target, home,
+    launch_opts =
+      [
         common_env: common_env,
         remote_env: remote_env,
         lineage: lineage,
         rails: Rails.hook_settings(),
         statutes: Rails.statutes?(),
-        credential_kind:
-          credential_kind(config, module.credential_provider(), host, module.wire_name()),
         ensure_workdir: &ensure_workdir/4,
         sh_out: Map.get(config, :sh_out)
-      )
+      ]
+      |> then(fn opts ->
+        if harness == :cursor do
+          Keyword.put(
+            opts,
+            :cursor_rails_sha256,
+            cursor_rails_sha256
+          )
+        else
+          opts
+        end
+      end)
+      |> Kernel.++(checked_opts)
 
-    [
+    process_identity_dir =
+      if harness == :cursor and is_nil(host_config.ssh),
+        do: Path.join(home, ".tightbeam"),
+        else: host_config.base_dir
+
+    base = [
       harness: harness,
       home: home,
       cwd: config.cwd,
       stderr_path: stderr_path,
       process_ssh: host_config.ssh,
-      process_identity_dir: host_config.base_dir,
+      process_identity_dir: process_identity_dir,
       process_helper: Path.join(host_config[:cli_bin] || config.cli_bin, "tightbeam"),
       on_auth_event: auth_event_handler(config, host, module),
       on_subagent_event: subagent_event_handler(config, host, module),
       env: []
     ]
-    |> Keyword.merge(plan)
+
+    with {:ok, plan} <- Harness.prepare_launch(module, target, home, launch_opts) do
+      {:ok, Keyword.merge(base, plan)}
+    end
+  end
+
+  @doc false
+  def adapter_opts!(config, key) do
+    {:ok, opts} = adapter_opts(config, key)
+    opts
   end
 
   @doc "Preview the exact PATH an adapter on a configured host will receive."
@@ -1243,19 +1301,26 @@ defmodule Tightbeam.Placement do
   defp adapter_path(config, %{ssh: ssh} = host_config) do
     case Map.fetch(host_config, :toolchain_dirs) do
       {:ok, dirs} ->
-        cli_bin = if ssh, do: host_config[:cli_bin], else: config.cli_bin
+        cli_bin = if ssh, do: host_config[:cli_bin], else: local_cli_bin(config)
 
         [cli_bin | dirs ++ @posix_path]
         |> Enum.reject(&(&1 in [nil, ""]))
         |> Enum.join(":")
 
       :error when is_nil(ssh) ->
-        config.cli_bin <> ":" <> (System.get_env("PATH") || "")
+        local_cli_bin(config) <> ":" <> (System.get_env("PATH") || "")
 
       :error ->
         "#{host_config[:cli_bin] || ""}:$PATH"
     end
   end
+
+  # The gateway installs its own CLI at <base>/bin and puts that on the adapter
+  # config as :cli_bin (Gateway.install_cli_bin/1). Home-only deliveries (turn
+  # boundary, set_harness) run with the plain gateway config, which carries no
+  # :cli_bin — derive the same location rather than crash on the missing key.
+  defp local_cli_bin(config),
+    do: Map.get(config, :cli_bin) || Path.join(config.base_dir, "bin")
 
   defp ensure_toolchain_dirs!(_host, host_config, _sh)
        when not is_map_key(host_config, :toolchain_dirs), do: :ok
@@ -1382,8 +1447,11 @@ defmodule Tightbeam.Placement do
           {:ok, %{bin: String.t(), version: String.t()}}
           | {:error, :not_found}
           | {:error, {:exec_failed, String.t()}}
+          | {:error, Harness.launch_refusal()}
   def harness_binary_probe(harness, cli_bin, opts \\ []) do
-    Harness.module!(harness).probe_cli(%{
+    module = Harness.module!(harness)
+
+    Harness.probe_cli(module, %{
       cli_bin: cli_bin,
       find_executable: Keyword.get(opts, :find_executable, &System.find_executable/1),
       timeout: Keyword.get(opts, :timeout, 2_000),
@@ -1511,10 +1579,23 @@ defmodule Tightbeam.Placement do
   selection).
   """
   @spec deliver_home(map(), adapter_key(), keyword()) :: String.t()
-  def deliver_home(config, {harness, _identity_name, host}, opts \\ []) do
+  def deliver_home(config, {_harness, _identity_name, _host} = key, opts \\ []) do
+    {home, _cursor_rails_sha256} =
+      deliver_home_with_metadata(config, key, opts)
+
+    home
+  end
+
+  defp deliver_home_with_metadata(config, {harness, _identity_name, host}, opts) do
     host_config = Map.fetch!(hosts_for(config), host)
     module = Harness.module!(harness)
+
+    if harness == :cursor and not is_nil(host_config.ssh) do
+      raise ArgumentError, "Cursor execution identity is local-only; SSH hosts are unsupported"
+    end
+
     home = Homes.home_path(host_config.base_dir, host, harness)
+
     sh = Keyword.get(opts, :sh, &system_cmd/1)
 
     sh_out =
@@ -1522,34 +1603,63 @@ defmodule Tightbeam.Placement do
         if Keyword.has_key?(opts, :sh), do: sh, else: &system_cmd_out/1
       end)
 
-    module.reconcile_home(
-      %{
-        base_dir: config.base_dir,
-        host_config: host_config,
-        host_name: host,
-        sh: sh,
-        sh_out: sh_out
-      },
-      home,
-      %{
-        harness: harness,
-        machine: host,
-        rails: Rails.hook_settings(),
-        # The pinned model tracks the SESSION'S resolved selection when the caller
-        # supplies one (`:model`), falling back to the org default only when there
-        # is no session context (adapter cold-boot). The claude adapter's offered
-        # /accepted model set follows this home pin (wi_263814d3), so pinning the
-        # selected model is what makes the adapter accept it at session/new — the
-        # cure for the accepted-then-dead class.
-        default_model: Keyword.get(opts, :model) || Map.get(config, :default_model),
-        auth_dir:
-          Tightbeam.Credentials.store_dir(
-            host_config.base_dir,
-            module.credential_provider()
-          )
-      }
-    )
-    |> Map.fetch!(:home_path)
+    rails = Rails.hook_settings()
+    # Reserved rails call the `tightbeam` helper (and `gh`) by bare name; Cursor's
+    # wrapper carries the same PATH common_env gives every harness (see
+    # CursorRails) because the dedicated identity's launcher pins PATH.
+    # Only Cursor carries it; other harnesses must not require `cli_bin` here
+    # (deliver_home also runs for home-only projections with minimal configs).
+    rails_path =
+      if harness == :cursor,
+        do: Tightbeam.Harness.Cursor.helper_path_dir() <> ":" <> adapter_path(config, host_config)
+
+    result =
+      module.reconcile_home(
+        %{
+          base_dir: config.base_dir,
+          host_config: host_config,
+          host_name: host,
+          sh: sh,
+          sh_out: sh_out
+        },
+        home,
+        %{
+          harness: harness,
+          machine: host,
+          rails: rails,
+          rails_path: rails_path,
+          # The pinned model tracks the SESSION'S resolved selection when the caller
+          # supplies one (`:model`), falling back to the org default only when there
+          # is no session context (adapter cold-boot). The claude adapter's offered
+          # /accepted model set follows this home pin (wi_263814d3), so pinning the
+          # selected model is what makes the adapter accept it at session/new — the
+          # cure for the accepted-then-dead class.
+          default_model: Keyword.get(opts, :model) || Map.get(config, :default_model),
+          auth_dir:
+            Tightbeam.Credentials.store_dir(
+              host_config.base_dir,
+              module.credential_provider()
+            )
+        }
+      )
+
+    cursor_rails_sha256 =
+      if harness == :cursor do
+        Tightbeam.Harness.Cursor.prepare_projection_runtime!(Map.fetch!(result, :home_path))
+
+        Tightbeam.Harness.Cursor.grant_bank_access!(
+          host_config.base_dir,
+          Map.get(config, :cursor_execution_home)
+        )
+
+        Tightbeam.Harness.Cursor.project_execution_rails!(
+          Map.get(config, :cursor_execution_home),
+          rails,
+          path: rails_path
+        )
+      end
+
+    {Map.fetch!(result, :home_path), cursor_rails_sha256}
   end
 
   defp effective_identity_fingerprint(effective) do
@@ -1560,6 +1670,18 @@ defmodule Tightbeam.Placement do
   end
 
   defp shell_quote(script), do: "'" <> String.replace(script, "'", "'\\''") <> "'"
+
+  # Remote Cursor is local-only; refuse through harness preflight before any
+  # credential-store kind read (Placement.adapter_opts product entry point).
+  defp cursor_locality_before_kind(Tightbeam.Harness.Cursor, target, projected_home) do
+    if get_in(target, [:host_config, :ssh]) != nil do
+      Tightbeam.Harness.Cursor.preflight_launch(target, projected_home, [])
+    else
+      {:ok, []}
+    end
+  end
+
+  defp cursor_locality_before_kind(_module, _target, _projected_home), do: {:ok, []}
 
   defp credential_kind(config, provider, host, harness) do
     case read_credential_kind(config, provider, host) do

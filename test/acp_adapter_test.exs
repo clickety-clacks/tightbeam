@@ -7,6 +7,21 @@ defmodule Tightbeam.Acp.AdapterTest do
   alias Tightbeam.Acp.Adapter
   alias Tightbeam.Model
 
+  setup do
+    previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
+    Application.put_env(:tightbeam, :enabled_dormant_harnesses, [:cursor])
+
+    on_exit(fn ->
+      if is_nil(previous) do
+        Application.delete_env(:tightbeam, :enabled_dormant_harnesses)
+      else
+        Application.put_env(:tightbeam, :enabled_dormant_harnesses, previous)
+      end
+    end)
+
+    :ok
+  end
+
   defmodule SlowBootAdapter do
     use GenServer
 
@@ -175,6 +190,13 @@ defmodule Tightbeam.Acp.AdapterTest do
     "default", "opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku",
     "gpt-old", "gpt-new", "gpt-blocking", "gpt-5.6-sol"
   ];
+  // Cursor's live grammar, recorded 2026-08-24: a closed enum of decorated
+  // wire values whose option name is the public ref; anything else is -32602.
+  const cursorWireOptions = [
+    { value: "auto-smart[optimize_for=balanced]", name: "Auto Balance" },
+    { value: "composer-2.5[fast=true]", name: "composer-2.5" },
+    { value: "claude-opus-5[thinking=true,context=300k,effort=high,fast=false]", name: "claude-opus-5" }
+  ];
   const publicModelOption = (value) => {
     const opus5Vocabulary = failMode === "canonical-opus5-alias" || failMode === "opus-alias-drift";
     switch (value) {
@@ -206,8 +228,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     }] : []),
     {
       id: "model",
-      currentValue: models[sid] || "haiku",
-      options: (offeredModels[sid] || defaultOfferedModels).map(publicModelOption)
+      currentValue: models[sid] || (failMode === "cursor-wire-enum" ? "auto-smart[optimize_for=balanced]" : "haiku"),
+      options: failMode === "cursor-wire-enum"
+        ? cursorWireOptions
+        : (offeredModels[sid] || defaultOfferedModels).map(publicModelOption)
     },
     { id: "effort", currentValue: efforts[sid] || "default" },
     { id: "reasoning_effort", currentValue: efforts[sid] || "medium" }
@@ -289,6 +313,18 @@ defmodule Tightbeam.Acp.AdapterTest do
           // Recorded live 2026-07-28: codex-acp's refusal of a model value the
           // catalog advertised (`gpt-5.1-codex`) — JSON-RPC -32602 Invalid params.
           return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
+        }
+        if (failMode === "cursor-auto-alias" &&
+            m.params.configId === "model" &&
+            m.params.value === "auto") {
+          return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
+        }
+        if (failMode === "cursor-wire-enum" && m.params.configId === "model") {
+          if (!cursorWireOptions.some((o) => o.value === m.params.value)) {
+            return send({ id: m.id, error: { code: -32602, message: "Invalid params" } });
+          }
+          models[m.params.sessionId] = m.params.value;
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
         if (failMode === "fast-refusal" && m.params.configId === "fast") {
           return send({ id: m.id, error: { code: -32000, message: "fast refused" } });
@@ -422,6 +458,24 @@ defmodule Tightbeam.Acp.AdapterTest do
   });
   """
 
+  # macOS CI can race adapter teardown: a killed adapter may still hold capture
+  # paths when on_exit runs, and File.rm_rf!/1 raises "file already exists".
+  defp cleanup_run_dir!(run_dir) do
+    case File.rm_rf(run_dir) do
+      {:ok, _} ->
+        :ok
+
+      {:error, _, _} ->
+        Process.sleep(100)
+
+        case File.rm_rf(run_dir) do
+          {:ok, _} -> :ok
+          {:error, :enoent, _} -> :ok
+          other -> flunk("failed to clean acp run dir #{run_dir}: #{inspect(other)}")
+        end
+    end
+  end
+
   defp start_adapter(opts \\ []) do
     # Per-run private dir: unique_integer resets across VM restarts, so
     # bare /tmp names collide with stale files from prior/concurrent runs.
@@ -432,7 +486,7 @@ defmodule Tightbeam.Acp.AdapterTest do
       )
 
     File.mkdir_p!(run_dir)
-    on_exit(fn -> File.rm_rf!(run_dir) end)
+    on_exit(fn -> cleanup_run_dir!(run_dir) end)
 
     path = Path.join(run_dir, "fake_harness.js")
     capture_path = Path.join(run_dir, "capture.jsonl")
@@ -958,7 +1012,13 @@ defmodule Tightbeam.Acp.AdapterTest do
       start_adapter(harness: :codex, fail_mode: "silent-model-no-take")
 
     assert {:ok, "sess-1"} =
-             Adapter.new_session(adapter, Model.new("gpt-old"), "/tmp", [], "guidance")
+             Adapter.new_session(
+               adapter,
+               Model.new("haiku", effort: "medium"),
+               "/tmp",
+               [],
+               "guidance"
+             )
 
     assert {:error,
             {:runtime_config_mismatch, %Model{family: "haiku", effort: "medium", context: nil}}} =
@@ -1224,6 +1284,101 @@ defmodule Tightbeam.Acp.AdapterTest do
              )
 
     refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "Cursor retries its verified ACP alias and does not send a separate effort option" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-auto-alias")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(
+               adapter,
+               Model.new("auto", effort: "medium"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    requests = captured_requests(capture)
+
+    assert ["auto", "auto-smart[optimize_for=balanced]"] ==
+             requests
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+             )
+             |> Enum.map(& &1["value"])
+
+    refute Enum.any?(
+             requests,
+             &(&1["method"] == "session/set_config_option" and &1["configId"] == "effort")
+           )
+  end
+
+  test "Cursor resolves a bare ref to the closed wire enum through the option name" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(
+               adapter,
+               Model.new("composer-2.5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    model_writes =
+      captured_requests(capture)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+      |> Enum.map(& &1["value"])
+
+    # Canonical first (the architecture's rule), then the name-paired wire value.
+    assert model_writes == ["composer-2.5", "composer-2.5[fast=true]"]
+  end
+
+  test "Cursor strict in-place switch resolves the wire value by option name" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("auto"), "/tmp", [], "guidance")
+
+    assert {:ok, prior_model} = Adapter.current_model(adapter, "sess-1")
+
+    assert {:ok, _model} =
+             Adapter.apply_model_strict(
+               adapter,
+               "sess-1",
+               Model.new("composer-2.5"),
+               prior_model
+             )
+
+    strict_writes =
+      captured_requests(capture)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+      |> Enum.map(& &1["value"])
+      |> Enum.drop_while(&(&1 != "composer-2.5"))
+
+    assert strict_writes == ["composer-2.5", "composer-2.5[fast=true]"]
+  end
+
+  test "Cursor refuses a ref no wire option is named for" do
+    {adapter, capture} = start_adapter(harness: :cursor, fail_mode: "cursor-wire-enum")
+
+    assert {:error, {:session_prepare_failed, :model_unavailable, "sess-1", _teardown}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("composer-2.5-fast"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    model_writes =
+      captured_requests(capture)
+      |> Enum.filter(&(&1["method"] == "session/set_config_option" and &1["configId"] == "model"))
+      |> Enum.map(& &1["value"])
+
+    # Only the canonical ref is ever sent: no option is named for it, so no
+    # wire candidate exists and no invented decoration is guessed at.
+    assert model_writes == ["composer-2.5-fast"]
   end
 
   test "a rejected candidate reports verified teardown" do
@@ -1684,7 +1839,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     placement_opts =
-      Tightbeam.Placement.adapter_opts(
+      Tightbeam.Placement.adapter_opts!(
         %{
           base_dir: base,
           db: db,
@@ -1802,7 +1957,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     start_supervised!({AdapterCallingWakeScheduler, {adapter_slot, self()}})
 
     placement_opts =
-      Tightbeam.Placement.adapter_opts(
+      Tightbeam.Placement.adapter_opts!(
         %{
           base_dir: base,
           db: db,
@@ -1892,7 +2047,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     Tightbeam.Org.append_pointer(db, session.session_key, "sess-1", "created")
 
     placement_opts =
-      Tightbeam.Placement.adapter_opts(
+      Tightbeam.Placement.adapter_opts!(
         %{
           base_dir: base,
           db: db,

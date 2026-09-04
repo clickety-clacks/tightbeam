@@ -9,7 +9,7 @@ defmodule Tightbeam.Spinup do
 
   require Logger
 
-  alias Tightbeam.{EventLog, Harness, Homes, Placement}
+  alias Tightbeam.{Credentials, EventLog, Harness, Homes, Placement}
   alias Tightbeam.Harness.Support
 
   @type denial :: %{code: String.t(), message: String.t()}
@@ -130,7 +130,12 @@ defmodule Tightbeam.Spinup do
   # seam only asks each of them for its own.
   defp install_command(target, install_dir, locality) do
     packages =
-      Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
+      Harness.all()
+      # Cursor is not an npm adapter: its pinned bundle is installed by Cursor's
+      # own installer under the dedicated execution account and verified by
+      # Cursor.verify_installed_cli/1 (`cursor-agent@<version>` is not published).
+      |> Enum.reject(&(&1 == Tightbeam.Harness.Cursor))
+      |> Enum.map_join(" ", &"#{&1.install_package()}@#{&1.adapter_version()}")
 
     # `--no-save`, because npm records a CARET RANGE for a version it installed
     # exactly: `npm install pkg@1.1.4` writes `"^1.1.4"` into package.json, so the
@@ -141,7 +146,7 @@ defmodule Tightbeam.Spinup do
     script = "npm install --prefix #{shell_quote(install_dir)} --no-save " <> packages
 
     case locality do
-      :local -> ["sh", "-c", script]
+      :local -> ["/bin/sh", "-c", script]
       {:remote, _check} -> remote_command(target.host_config.ssh, script)
     end
   end
@@ -210,7 +215,7 @@ defmodule Tightbeam.Spinup do
 
         case dirs_result do
           {:error, path, reason} when is_binary(path) ->
-            location = if path, do: " at #{path}", else: ""
+            location = " at #{path}"
 
             message =
               "host #{target.host_name} is not ready for #{module.wire_name()}: directory setup failed#{location}: #{:file.format_error(reason)} " <>
@@ -228,7 +233,7 @@ defmodule Tightbeam.Spinup do
           :ok ->
             home = Homes.home_path(host.base_dir, target.host_name, module.id())
 
-            case module.ensure_adapter(target) do
+            case Harness.ensure_adapter(module, target) do
               {:error, denial} ->
                 {{:error, denial}, "reached; directories ensured; DENIED: #{denial.message}"}
 
@@ -248,7 +253,8 @@ defmodule Tightbeam.Spinup do
                       "#{target.host_name}. It does not use or import your normal " <>
                       "#{module.wire_name()} CLI login; Tightbeam keeps its own credential " <>
                       "under #{Path.dirname(auth_dir)}. Run on #{target.host_name}: " <>
-                      "tightbeam onboard #{module.credential_provider()} --as-user <userId>"
+                      "#{Credentials.onboard_command(module.credential_provider())} " <>
+                      "--as-user <userId>"
 
                   {{:error, host_unready(message)},
                    "reached; directories ensured; #{adapter_detail}; DENIED: #{message}"}

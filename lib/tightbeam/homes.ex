@@ -118,7 +118,12 @@ defmodule Tightbeam.Homes do
     Enum.each(credential_names, &File.rm(Path.join(home, &1)))
 
     unless File.read(manifest_path) == {:ok, manifest} do
-      remove_owned_projection(home, rails_filename)
+      remove_owned_projection(
+        home,
+        rails_filename,
+        Keyword.get(mechanics, :preserve_manifest_dir, false)
+      )
+
       write_rails(home, rails_filename, Map.get(desired, :rails))
       File.mkdir_p!(Path.dirname(manifest_path))
       File.write!(manifest_path, manifest)
@@ -129,7 +134,13 @@ defmodule Tightbeam.Homes do
     %{
       home_path: home,
       manifest_path: manifest_path,
-      linked_auth_files: link_auth(auth_dir, home, credential_names)
+      linked_auth_files:
+        project_auth(
+          auth_dir,
+          home,
+          credential_names,
+          Keyword.get(mechanics, :credential_projection, :link)
+        )
     }
   end
 
@@ -398,15 +409,17 @@ defmodule Tightbeam.Homes do
   defp auth_dir(base_dir, module),
     do: Tightbeam.Credentials.store_dir(base_dir, module.credential_provider())
 
-  defp remove_owned_projection(home, rails_filename) do
-    File.rm_rf!(Path.join(home, ".tightbeam"))
+  defp remove_owned_projection(home, rails_filename, preserve_manifest_dir?) do
+    unless preserve_manifest_dir?, do: File.rm_rf!(Path.join(home, ".tightbeam"))
     File.rm_rf!(Path.join(home, rails_filename))
   end
 
   defp write_rails(_home, _filename, nil), do: :ok
 
   defp write_rails(home, filename, content) do
-    File.write!(Path.join(home, filename), content)
+    path = Path.join(home, filename)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, content)
   end
 
   defp project_baseline_skills(home) do
@@ -460,16 +473,43 @@ defmodule Tightbeam.Homes do
   defp provider_of(%{harness: harness}),
     do: Harness.module!(harness).credential_provider()
 
-  defp link_auth(auth_dir, home, credential_names) do
+  defp project_auth(auth_dir, home, credential_names, projection) do
     auth_dir
     |> credential_store_files(credential_names)
     |> Enum.map(fn file ->
       source = Path.join(auth_dir, file)
       target = Path.join(home, file)
 
-      case File.lstat(target) do
-        {:error, :enoent} -> File.ln_s!(source, target)
-        _ -> :ok
+      case projection do
+        :link ->
+          case File.lstat(target) do
+            {:error, :enoent} -> File.ln_s!(source, target)
+            _ -> :ok
+          end
+
+        :copy_readable ->
+          # The target's directory may be writable by the execution identity, so
+          # never follow whatever is at `target`: remove it (a planted symlink
+          # goes with it) and create the copy exclusively, which fails rather
+          # than writes through anything re-planted in between.
+          case File.rm(target) do
+            :ok -> :ok
+            {:error, :enoent} -> :ok
+            {:error, reason} -> raise File.Error, reason: reason, action: "remove", path: target
+          end
+
+          bytes = File.read!(source)
+
+          case :file.open(target, [:write, :exclusive, :binary]) do
+            {:ok, io} ->
+              :ok = :file.write(io, bytes)
+              :ok = :file.close(io)
+
+            {:error, reason} ->
+              raise File.Error, reason: reason, action: "create exclusively", path: target
+          end
+
+          File.chmod!(target, 0o640)
       end
 
       file

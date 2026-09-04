@@ -3,6 +3,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
   alias Tightbeam.{AdapterCoordinator, DB, EventLog}
 
+  @process_helper Path.expand("../cli/target/release/tightbeam", __DIR__)
+
   @fake ~S"""
   const rl = require("node:readline").createInterface({ input: process.stdin });
   const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\n");
@@ -24,6 +26,513 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     :ok = ensure_all_schemas(db)
     start_supervised!({DynamicSupervisor, strategy: :one_for_one, name: sup})
     %{db: db, sup: sup, test_dir: test_dir}
+  end
+
+  test "all public checkout APIs retain the reviewed 190s budget over the 185s generation deadline" do
+    source = File.read!("lib/tightbeam/adapter_coordinator.ex")
+    assert source =~ "@adapter_readiness_timeout 185_000"
+    assert source =~ "@adapter_checkout_timeout 190_000"
+    assert length(Regex.scan(~r/GenServer\.call\([^\n]+@adapter_checkout_timeout\)/, source)) == 3
+    refute source =~ "{:adapter_for, key}, 30_000"
+  end
+
+  test "typed launch refusal is coalesced and never starts an adapter child", ctx do
+    parent = self()
+    refusal = %{code: "DIV-CURSOR-API-KEY-ONLY", message: "Cursor requires a banked API key"}
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           send(parent, :preflight)
+           Process.sleep(25)
+           {:error, refusal}
+         end,
+         db: ctx.db,
+         name: :typed_refusal_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+
+    callers =
+      for _ <- 1..3, do: Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+
+    assert Enum.map(callers, &Task.await/1) ==
+             List.duplicate({:error, {:launch_refused, refusal}}, 3)
+
+    assert_receive :preflight
+    refute_receive :preflight
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+  end
+
+  test "generation readiness timeout flushes callers and ignores its late preflight", ctx do
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           send(parent, {:preflight_waiting, self()})
+
+           receive do
+             :release -> [harness: :cursor]
+           end
+         end,
+         db: ctx.db,
+         name: :readiness_timeout_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+    caller = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive {:preflight_waiting, task}
+
+    state = :sys.get_state(coordinator)
+    entry = state.adapters[key]
+
+    send(
+      coordinator,
+      {:adapter_readiness_timeout, key, entry.generation, entry.readiness_token}
+    )
+
+    assert {:error, {:launch_refused, %{code: "adapter_readiness_timeout"}}} = Task.await(caller)
+
+    refute Process.alive?(task)
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+  end
+
+  test "authoritative credential context replaces pending stale preflight", ctx do
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [credential_kind: :subscription] end,
+         adapter_opts: fn _, context ->
+           send(parent, {:preflight_context, self(), context})
+
+           if context[:credential_kind] == :subscription do
+             receive do
+               :release_stale -> :ok
+             end
+           end
+
+           {:error, %{code: Atom.to_string(context[:credential_kind]), message: "context used"}}
+         end,
+         db: ctx.db,
+         name: :authoritative_pending_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+    initial = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive {:preflight_context, stale_task, [credential_kind: :subscription]}
+
+    authoritative =
+      Task.async(fn ->
+        AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :api_key)
+      end)
+
+    assert_receive {:preflight_context, _replacement_task, [credential_kind: :api_key]}
+    refute Process.alive?(stale_task)
+
+    expected = {:error, {:launch_refused, %{code: "api_key", message: "context used"}}}
+    assert Task.await(initial) == expected
+    assert Task.await(authoritative) == expected
+  end
+
+  test "authoritative replacement of a booting child settles its old launch and transfers both callers",
+       ctx do
+    slow = Path.join(ctx.test_dir, "slow_authoritative.js")
+    fast = Path.join(ctx.test_dir, "fast_authoritative.js")
+
+    File.write!(slow, """
+    const rl = require("node:readline").createInterface({ input: process.stdin });
+    const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\\n");
+    rl.on("line", (line) => {
+      const m = JSON.parse(line);
+      if (m.method === "initialize") setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 10000);
+    });
+    """)
+
+    File.write!(fast, @fake)
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [credential_kind: :subscription] end,
+         adapter_opts: fn _, context ->
+           kind = context[:credential_kind]
+           send(parent, {:authoritative_child_opts, kind})
+
+           [
+             harness: :claude,
+             readiness_rendezvous: true,
+             cmd: [System.find_executable("node"), if(kind == :api_key, do: fast, else: slow)],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :authoritative_child_replacement_coordinator}
+      )
+
+    key = {:claude, "shared", "testhost"}
+    first = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive {:authoritative_child_opts, :subscription}
+
+    assert wait_until(fn ->
+             match?(
+               [%{state: "running", resolved_at: nil}],
+               Tightbeam.HarnessProcess.list(ctx.db)
+             )
+           end)
+
+    old = :sys.get_state(coordinator).adapters[key]
+    assert is_pid(old.pid)
+    assert is_reference(old.monitor)
+    assert is_reference(old.readiness_token)
+
+    second =
+      Task.async(fn ->
+        AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :api_key)
+      end)
+
+    assert_receive {:authoritative_child_opts, :api_key}
+    assert {:ok, replacement, 2} = Task.await(first, 5_000)
+    assert {:ok, ^replacement, 2} = Task.await(second, 5_000)
+
+    [current, replaced] = Tightbeam.HarnessProcess.list(ctx.db)
+    assert current.state == "running"
+    assert current.resolved_at == nil
+    assert replaced.state == "exited"
+    assert is_integer(replaced.resolved_at)
+
+    current_entry = :sys.get_state(coordinator).adapters[key]
+    assert current_entry.pid == replacement
+    assert current_entry.generation == 2
+
+    send(
+      coordinator,
+      {:adapter_readiness_timeout, key, old.generation, old.readiness_token}
+    )
+
+    send(coordinator, {:adapter_ready, key, old.pid, old.generation, old.readiness_token})
+
+    send(
+      coordinator,
+      {:adapter_readiness_result, key, old.generation, old.readiness_token, self(),
+       {:error, %{code: "stale"}}}
+    )
+
+    send(coordinator, {:DOWN, old.monitor, :process, old.pid, :killed})
+    Process.sleep(20)
+
+    after_stale = :sys.get_state(coordinator).adapters[key]
+    assert after_stale.pid == replacement
+    assert after_stale.generation == 2
+    assert after_stale.ready
+
+    assert Enum.map(Tightbeam.HarnessProcess.list(ctx.db), &{&1.state, &1.resolved_at}) ==
+             [{"running", nil}, {"exited", replaced.resolved_at}]
+  end
+
+  test "coordinator shutdown reaps the live harness process group before its supervisor", ctx do
+    script = Path.join(ctx.test_dir, "shutdown_reap.js")
+    File.write!(script, @fake)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), script],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :shutdown_reap_coordinator}
+      )
+
+    key = {:claude, "shared", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert Process.alive?(adapter)
+
+    assert wait_until(fn ->
+             match?(
+               [%{state: "running", resolved_at: nil}],
+               Tightbeam.HarnessProcess.list(ctx.db)
+             )
+           end)
+
+    assert :ok = GenServer.stop(coordinator, :shutdown, 30_000)
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+
+    assert [%{state: "exited", resolved_at: resolved_at}] =
+             Tightbeam.HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+  end
+
+  test "supervisor shutdown runs Cursor group cleanup through the dedicated launcher", ctx do
+    parent = self()
+    name = :supervised_cursor_cleanup_coordinator
+    key = {:cursor, "default", "testhost"}
+    script = Path.join(ctx.test_dir, "supervised_cursor_cleanup.js")
+    File.write!(script, @fake)
+
+    previous_runner =
+      Application.get_env(:tightbeam, :harness_process_command_runner_for_test)
+
+    Application.put_env(
+      :tightbeam,
+      :harness_process_command_runner_for_test,
+      fn executable, args, timeout ->
+        if executable == "/usr/bin/sudo" do
+          send(parent, {:cleanup_command, executable, args, timeout})
+          {"", 0}
+        else
+          System.cmd(executable, args, stderr_to_stdout: true)
+        end
+      end
+    )
+
+    on_exit(fn ->
+      if previous_runner do
+        Application.put_env(
+          :tightbeam,
+          :harness_process_command_runner_for_test,
+          previous_runner
+        )
+      else
+        Application.delete_env(:tightbeam, :harness_process_command_runner_for_test)
+      end
+    end)
+
+    {:ok, owner} =
+      Supervisor.start_link(
+        [
+          {AdapterCoordinator,
+           adapter_sup: ctx.sup,
+           adapter_context: fn _ -> [] end,
+           adapter_opts: fn _, _ ->
+             [
+               harness: :cursor,
+               cmd: [System.find_executable("node"), script],
+               home: ctx.test_dir,
+               cwd: ctx.test_dir,
+               process_identity_dir: ctx.test_dir,
+               process_helper: @process_helper
+             ]
+           end,
+           db: ctx.db,
+           name: name}
+        ],
+        strategy: :one_for_one
+      )
+
+    Process.unlink(owner)
+
+    on_exit(fn -> if Process.alive?(owner), do: Supervisor.stop(owner) end)
+
+    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(name, key)
+
+    assert wait_until(fn ->
+             match?([%{state: "running"}], Tightbeam.HarnessProcess.list(ctx.db))
+           end)
+
+    assert :ok = Supervisor.stop(owner, :shutdown, 30_000)
+
+    assert_receive {:cleanup_command, "/usr/bin/sudo", args, _timeout}
+
+    assert [
+             "-n",
+             "-H",
+             "-u",
+             "tightbeam-cursor",
+             "--",
+             "/usr/local/libexec/tightbeam-cursor-launcher",
+             "cursor-exec",
+             "group"
+             | _identity_args
+           ] = args
+
+    assert [%{state: "exited", resolved_at: resolved_at}] =
+             Tightbeam.HarnessProcess.list(ctx.db)
+
+    assert is_integer(resolved_at)
+  end
+
+  test "hung readiness task times out, removes its child state, and flushes caller", ctx do
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         readiness_timeout_ms: 30,
+         adapter_context: fn _ -> Process.sleep(:infinity) end,
+         adapter_opts: fn _, _ -> flunk("hung context reached adapter opts") end,
+         db: ctx.db,
+         name: :hung_readiness_coordinator}
+      )
+
+    assert {:error, {:launch_refused, %{code: "adapter_readiness_timeout"}}} =
+             AdapterCoordinator.adapter_for(coordinator, {:cursor, "default", "testhost"})
+
+    state = :sys.get_state(coordinator)
+    entry = state.adapters[{:cursor, "default", "testhost"}]
+    assert entry.pid == nil
+    assert entry.readiness_task == nil
+    assert entry.readiness_timer == nil
+    assert entry.waiters == []
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+  end
+
+  test "caller cancellation removes its readiness waiter without extending the generation", ctx do
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ ->
+           send(parent, :context_blocked)
+           Process.sleep(:infinity)
+         end,
+         adapter_opts: fn _, _ -> [] end,
+         db: ctx.db,
+         name: :caller_cancel_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+    caller = spawn(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive :context_blocked
+    Process.exit(caller, :kill)
+
+    assert wait_until(fn -> :sys.get_state(coordinator).adapters[key].waiters == [] end)
+    entry = :sys.get_state(coordinator).adapters[key]
+    assert is_reference(entry.readiness_timer)
+  end
+
+  test "duplicate restart messages coalesce behind one generation readiness task", ctx do
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ ->
+           send(parent, {:restart_generation_preflight, self()})
+
+           receive do
+             :release -> []
+           end
+         end,
+         adapter_opts: fn _, _ ->
+           {:error, %{code: "bounded", message: "bounded test refusal"}}
+         end,
+         db: ctx.db,
+         name: :restart_generation_coalescing_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+    caller = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert_receive {:restart_generation_preflight, task}
+    generation = :sys.get_state(coordinator).adapters[key].generation
+
+    send(coordinator, {:restart_adapter, key, generation})
+    send(coordinator, {:restart_adapter, key, generation})
+    _ = :sys.get_state(coordinator)
+    refute_receive {:restart_generation_preflight, _}
+
+    send(task, :release)
+
+    assert {:error, {:launch_refused, %{code: "bounded"}}} = Task.await(caller)
+  end
+
+  test "rendezvous does not release checkout before a delayed valid ready signal", ctx do
+    path = Path.join(ctx.test_dir, "slow_ready.js")
+
+    File.write!(path, """
+    const rl = require("node:readline").createInterface({ input: process.stdin });
+    const send = (o) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...o }) + "\\n");
+    rl.on("line", (line) => {
+      const m = JSON.parse(line);
+      if (m.method === "initialize") setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 75);
+    });
+    """)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         readiness_timeout_ms: 500,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :cursor,
+             readiness_rendezvous: true,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :slow_valid_readiness_coordinator}
+      )
+
+    started = System.monotonic_time(:millisecond)
+
+    assert {:ok, _pid, 1} =
+             AdapterCoordinator.adapter_for(coordinator, {:cursor, "default", "testhost"})
+
+    assert System.monotonic_time(:millisecond) - started >= 50
+  end
+
+  test "hung live rendezvous child is terminated through its supervisor at deadline", ctx do
+    path = Path.join(ctx.test_dir, "never_ready.js")
+
+    File.write!(
+      path,
+      "process.stdin.resume(); process.stdin.on('end', () => process.exit(0)); setInterval(() => {}, 1000);\n"
+    )
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         readiness_timeout_ms: 75,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :cursor,
+             readiness_rendezvous: true,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :hung_child_readiness_coordinator}
+      )
+
+    assert {:error, {:launch_refused, %{code: "adapter_readiness_timeout"}}} =
+             AdapterCoordinator.adapter_for(coordinator, {:cursor, "default", "testhost"})
+
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+    Process.sleep(100)
   end
 
   test "five consecutive boot failures open the circuit (async boot)", ctx do
@@ -151,10 +660,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       )
 
     key = {:claude, "default", "testhost"}
+
     assert {:ok, adapter, _generation} = AdapterCoordinator.adapter_for(coordinator, key)
+
     assert_receive {:adapter_context, context_worker, ^key}
     refute context_worker == coordinator
-    assert_receive {:adapter_opts, ^adapter, ^key, [credential_kind: :subscription]}
+    assert_receive {:adapter_opts, readiness_task, ^key, [credential_kind: :subscription]}
+    refute readiness_task == adapter
   end
 
   test "context capture frees the coordinator mailbox for a lifecycle callback", ctx do
@@ -220,7 +732,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     key = {:claude, "default", "testhost"}
     assert {:ok, first, 1} = AdapterCoordinator.adapter_for(coordinator, key)
-    assert_receive {:boot_context, ^first, [credential_kind: :subscription]}
+    assert_receive {:boot_context, first_readiness, [credential_kind: :subscription]}
+    refute first_readiness == first
     first_ref = Process.monitor(first)
 
     assert {:ok, second, 2} =
@@ -228,7 +741,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     refute second == first
     assert_receive {:DOWN, ^first_ref, :process, ^first, _reason}
-    assert_receive {:boot_context, ^second, [credential_kind: :api_key]}
+    assert_receive {:boot_context, second_readiness, [credential_kind: :api_key]}
+    refute second_readiness == second
   end
 
   test "failure circuit threshold uses application config", ctx do

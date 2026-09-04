@@ -220,7 +220,18 @@ end
 # a multi-sender race means reading the target's own books rather than trusting
 # mailbox order between processes that never exchanged a message.
 # test/support/test_case.ex documents the sanctioned ones.
-ExUnit.start(assert_receive_timeout: 1_000)
+# The pinned-bundle acceptance test (:cursor_bundle) inspects the LIVE
+# cursor-agent vendor bundle — its shas and its credential-store selector code.
+# That verdict can only be earned on a machine holding the pinned bundle; no
+# committed fixture can stand in for it (the point is the real bytes). Unlike
+# the prerequisites above, cursor-agent is not something every contributor or
+# CI runner installs, so absence here is a DECLARED exclusion — visible in the
+# run's excluded count — rather than a suite refusal or a silent skip. Where
+# the binary exists, the test always runs.
+cursor_bundle_exclusions =
+  if System.find_executable("cursor-agent"), do: [], else: [cursor_bundle: true]
+
+ExUnit.start(assert_receive_timeout: 1_000, exclude: cursor_bundle_exclusions)
 
 suite_tmp = Application.fetch_env!(:tightbeam, :test_suite_tmp)
 

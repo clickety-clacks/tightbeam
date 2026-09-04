@@ -4,12 +4,18 @@ defmodule Tightbeam.Harness do
   @bundle @bundle_path |> File.read!() |> JSON.decode!()
   @registry_path Application.app_dir(:tightbeam, "priv/harness_registry.json")
   @external_resource @registry_path
-  @production_registry @registry_path
-                       |> File.read!()
-                       |> JSON.decode!()
+  @registry_rows @registry_path |> File.read!() |> JSON.decode!()
+  @production_registry @registry_rows
+                       |> Enum.reject(&(&1["enabled"] == false))
                        |> Enum.map(fn row ->
                          row["module"] |> String.split(".") |> Module.concat()
                        end)
+  @dormant_registry @registry_rows
+                    |> Enum.filter(&(&1["enabled"] == false))
+                    |> Enum.map(fn row ->
+                      row["module"] |> String.split(".") |> Module.concat()
+                    end)
+  @fixture_harness? Application.compile_env(:tightbeam, :fixture_harness, false)
   @bundle_checklist Enum.map_join(@bundle["obligations"], "\n", fn obligation ->
                       "- `#{obligation["id"]}` — #{obligation["title"]}: " <>
                         obligation["description"]
@@ -30,6 +36,17 @@ defmodule Tightbeam.Harness do
 
   @type target :: map()
   @type launch_plan :: keyword()
+  @type launch_refusal :: %{
+          required(:code) => String.t(),
+          required(:message) => String.t(),
+          optional(:details) => map()
+        }
+  @type preflight_result :: {:ok, keyword()} | {:error, launch_refusal()}
+  @type launch_result :: {:ok, launch_plan()} | {:error, launch_refusal()}
+  @type ensure_result :: {:ok, String.t()} | {:error, launch_refusal()}
+  @type probe_result ::
+          {:ok, %{bin: String.t(), version: String.t()}}
+          | {:error, :not_found | {:exec_failed, String.t()} | launch_refusal()}
   @type desired_home :: map()
   @type credential_liveness ::
           :live | {:dead, term()} | {:unknown, term()}
@@ -59,8 +76,9 @@ defmodule Tightbeam.Harness do
   """
   @callback cli_binary() :: binary()
   @callback wire_projection() :: binary()
-  @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan()
-  @callback ensure_adapter(target()) :: {:ok, String.t()} | {:error, map()}
+  @callback preflight_launch(target(), String.t(), keyword()) :: preflight_result()
+  @callback prepare_launch(target(), String.t(), keyword()) :: launch_plan() | launch_result()
+  @callback ensure_adapter(target()) :: ensure_result()
   @callback session_config(map(), binary()) :: map()
   @doc "The harness-owned leaf entries of a projected home."
   @callback owned_home_entries() :: [String.t()]
@@ -90,12 +108,42 @@ defmodule Tightbeam.Harness do
   @callback install_cli_projection(String.t()) :: :ok
   @callback probe_cli(target()) ::
               {:ok, %{bin: String.t(), version: String.t()}}
-              | {:error, :not_found | {:exec_failed, String.t()}}
+              | {:error, :not_found | {:exec_failed, String.t()} | launch_refusal()}
   @callback classify_auth_event(map()) :: :terminal | :transient | :unknown
   @callback classify_subagent_event(map()) ::
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
-  @optional_callbacks warm_home: 2
+
+  @optional_callbacks preflight_launch: 3,
+                      warm_home: 2
+
+  @spec preflight_launch(module(), target(), String.t(), keyword()) :: preflight_result()
+  def preflight_launch(module, target, home, opts) do
+    if function_exported?(module, :preflight_launch, 3),
+      do: module.preflight_launch(target, home, opts),
+      else: {:ok, opts}
+  end
+
+  @spec prepare_launch(module(), target(), String.t(), keyword()) :: launch_result()
+  def prepare_launch(module, target, home, opts) do
+    case module.prepare_launch(target, home, opts) do
+      {:ok, plan} when is_list(plan) ->
+        {:ok, plan}
+
+      {:error, %{code: code, message: message} = refusal}
+      when is_binary(code) and is_binary(message) ->
+        {:error, refusal}
+
+      plan when is_list(plan) ->
+        {:ok, plan}
+    end
+  end
+
+  @spec ensure_adapter(module(), target()) :: ensure_result()
+  def ensure_adapter(module, target), do: module.ensure_adapter(target)
+
+  @spec probe_cli(module(), target()) :: probe_result()
+  def probe_cli(module, target), do: module.probe_cli(target)
 
   @callback conformance_vectors() :: %{
               required(String.t()) => [
@@ -108,15 +156,21 @@ defmodule Tightbeam.Harness do
               ]
             }
 
-  @registry @production_registry ++
-              if(Application.compile_env(:tightbeam, :fixture_harness, false),
-                do: [Fixture],
-                else: []
-              )
-
   @doc "The ordered harness registry. Its order is the product fallback order."
   @spec all() :: [module()]
-  def all, do: @registry
+  def all do
+    enabled_dormant = Application.get_env(:tightbeam, :enabled_dormant_harnesses, [])
+
+    @production_registry ++
+      Enum.filter(@dormant_registry, &(&1.id() in enabled_dormant)) ++
+      if(@fixture_harness?, do: [Fixture], else: [])
+  end
+
+  @doc "All known harness modules, including dormant entries used by onboarding."
+  @spec known() :: [module()]
+  def known do
+    @production_registry ++ @dormant_registry ++ if(@fixture_harness?, do: [Fixture], else: [])
+  end
 
   @doc "The configured default harness module, or the first registry entry."
   @spec default() :: module()
@@ -130,11 +184,9 @@ defmodule Tightbeam.Harness do
 
   @doc "Resolve a harness id or module, raising at every unknown boundary."
   @spec module!(atom() | module()) :: module()
-  def module!(module) when module in @registry, do: module
-
-  def module!(id) when is_atom(id) do
-    Enum.find(all(), &(&1.id() == id)) ||
-      raise ArgumentError, "unknown harness: #{inspect(id)}"
+  def module!(value) when is_atom(value) do
+    Enum.find(known(), &(&1 == value or &1.id() == value)) ||
+      raise ArgumentError, "unknown harness: #{inspect(value)}"
   end
 
   @doc "Parse a wire harness name, raising instead of selecting another harness."

@@ -307,7 +307,11 @@ defmodule Tightbeam.Harness.Support do
         host_name: "vector",
         host_config: %{base_dir: base, ssh: if(local?, do: nil, else: "vector@remote")},
         adapter_binary: adapter,
-        sh: fn _command -> {"", 0} end
+        sh: fn _command -> {"", 0} end,
+        find_executable: fn _ -> Path.join([base, "2026.08.11-e8db854", "cursor-agent"]) end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: &cursor_vector_sha256/1,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
       }
 
       opts = [
@@ -320,17 +324,30 @@ defmodule Tightbeam.Harness.Support do
         rails: %{"hooks" => %{"PreToolUse" => []}},
         statutes: rails == :railed,
         credential_kind: kind,
+        cursor_api_key_loader: fn _ -> {:ok, "vector-token"} end,
+        cursor_rails_sha256: String.duplicate("a", 64),
         ensure_workdir: fn _host, _cwd, _content, _opts -> :ok end,
         sh_out: nil
       ]
 
-      module.prepare_launch(target, home, opts)
+      with {:ok, checked} <- Tightbeam.Harness.preflight_launch(module, target, home, opts),
+           {:ok, plan} <- Tightbeam.Harness.prepare_launch(module, target, home, checked) do
+        plan
+      end
       |> launch_observation()
       |> normalize_paths(base, home)
     end)
   end
 
   defp expected_launch(profile, locality, rails, kind) do
+    if kind in Map.get(profile, :unsupported_launch_kinds, []) do
+      {:error, %{code: "DIV-CURSOR-API-KEY-ONLY", message: "Cursor requires a banked API key"}}
+    else
+      expected_supported_launch(profile, locality, rails, kind)
+    end
+  end
+
+  defp expected_supported_launch(profile, locality, rails, kind) do
     base = "<BASE>"
     home = "<HOME>"
     adapter = adapter_path(base, profile.adapter_bin, locality)
@@ -338,30 +355,27 @@ defmodule Tightbeam.Harness.Support do
     railed? = rails == :railed
 
     plan =
-      if local? do
-        extra =
-          Map.fetch!(profile.local_extra_env, kind) ++
-            if(profile.rails_env, do: [profile.rails_env], else: [])
-
-        [
-          cmd: [adapter],
-          env: [{profile.home_env, home}, {"COMMON", "1"} | extra]
-        ]
+      if profile.wire_name == "cursor" do
+        if local? do
+          [
+            cmd: [Path.join(base, profile.pinned_cli_path), "acp"],
+            env: [
+              {"CURSOR_CONFIG_DIR", home},
+              {"AGENT_CLI_CREDENTIAL_STORE", "memory"},
+              {"CURSOR_API_KEY", "vector-token"},
+              {"COMMON", "1"}
+            ]
+          ]
+        else
+          {:error,
+           %{
+             code: "DIV-CURSOR-LOCAL-ONLY",
+             message:
+               "Cursor shim harness is gateway-local only until remote zero-listener probe exists"
+           }}
+        end
       else
-        remote_env =
-          profile.remote_prefix.(base, home, kind) ++
-            ["REMOTE=1"] ++
-            if(profile.remote_rails_env,
-              do: [profile.remote_rails_env],
-              else: []
-            )
-
-        [
-          cmd:
-            ["ssh" | ssh_opts()] ++
-              ["vector@remote", "exec", "env" | remote_env] ++ [adapter],
-          env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
-        ]
+        expected_standard_launch(profile, locality, kind, base, home, adapter)
       end
 
     plan =
@@ -376,6 +390,45 @@ defmodule Tightbeam.Harness.Support do
 
     launch_observation(plan)
   end
+
+  defp expected_standard_launch(profile, locality, kind, base, home, adapter) do
+    if locality == :local do
+      extra =
+        Map.fetch!(profile.local_extra_env, kind) ++
+          if(profile.rails_env, do: [profile.rails_env], else: [])
+
+      # Most harnesses deliver their projected home through ONE env var (`home_env`). A harness
+      # whose home projection needs several (OpenCode: XDG_DATA_HOME/XDG_CONFIG_HOME plus the
+      # out-of-tree OPENCODE_CONFIG gate) supplies `local_home_env: fn base, home -> [{k, v}] end`.
+      home_entries =
+        case Map.get(profile, :local_home_env) do
+          nil -> [{profile.home_env, home}]
+          builder when is_function(builder, 2) -> builder.(base, home)
+        end
+
+      [
+        cmd: [adapter],
+        env: home_entries ++ [{"COMMON", "1"} | extra]
+      ]
+    else
+      remote_env =
+        profile.remote_prefix.(base, home, kind) ++
+          ["REMOTE=1"] ++
+          if(profile.remote_rails_env,
+            do: [profile.remote_rails_env],
+            else: []
+          )
+
+      [
+        cmd:
+          ["ssh" | ssh_opts()] ++
+            ["vector@remote", "exec", "env" | remote_env] ++ [adapter],
+        env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
+      ]
+    end
+  end
+
+  defp launch_observation({:error, _refusal} = error), do: error
 
   defp launch_observation(plan) do
     argv = Keyword.fetch!(plan, :cmd)
@@ -403,6 +456,16 @@ defmodule Tightbeam.Harness.Support do
   end
 
   defp observe_adapter(module, profile, locality, presence) do
+    observe_adapter_npm(module, profile, locality, presence)
+  end
+
+  defp cursor_vector_sha256(path) do
+    if Path.basename(path) == "index.js",
+      do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
+      else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+  end
+
+  defp observe_adapter_npm(module, profile, locality, presence) do
     with_tmp("adapter", fn base ->
       adapter = adapter_path(base, profile.adapter_bin, locality)
       bundle = install_fake_adapter!(adapter, profile)
@@ -453,7 +516,7 @@ defmodule Tightbeam.Harness.Support do
         sh: sh
       }
 
-      result = module.ensure_adapter(target)
+      result = Tightbeam.Harness.ensure_adapter(module, target)
       commands = drain_commands(ref, [])
       Process.delete({ref, :checks})
       stat = File.stat!(bundle)
@@ -474,6 +537,10 @@ defmodule Tightbeam.Harness.Support do
   end
 
   defp expected_adapter(profile, locality, presence) do
+    expected_adapter_npm(profile, locality, presence)
+  end
+
+  defp expected_adapter_npm(profile, locality, presence) do
     detail =
       case {locality, presence} do
         {:local, :present} -> "adapters present"
@@ -508,7 +575,7 @@ defmodule Tightbeam.Harness.Support do
 
     case locality do
       :local ->
-        Enum.join(["sh", "-c", script], " ")
+        Enum.join(["/bin/sh", "-c", script], " ")
 
       :remote ->
         (["ssh" | ssh_opts()] ++ ["vector@remote", "sh", "-c", shell_quote(script)])
@@ -676,10 +743,20 @@ defmodule Tightbeam.Harness.Support do
       {expected, support} =
         case profile.credential_live do
           :unsupported ->
-            {
-              {:unknown, :no_cheap_authenticated_probe},
-              {:unsupported, "DIV-CREDENTIAL-LIVE-FIXTURE-NO-PROBE"}
-            }
+            # The :unknown REASON and the divergence name are per-profile: fixture has no cheap
+            # probe, opencode owns provider auth. A profile that omits them keeps fixture's
+            # defaults, so the fixture vectors stay byte-identical.
+            reason =
+              Map.get(profile, :credential_live_unknown_reason, :no_cheap_authenticated_probe)
+
+            divergence =
+              Map.get(
+                profile,
+                :credential_live_divergence,
+                "DIV-CREDENTIAL-LIVE-FIXTURE-NO-PROBE"
+              )
+
+            {{:unknown, reason}, {:unsupported, divergence}}
 
           _ ->
             {supported_expected, :supported}
@@ -876,9 +953,13 @@ defmodule Tightbeam.Harness.Support do
 
   defp probe_cli_vectors(_module, profile) do
     expected_path =
-      case profile.probe_path do
-        :shim -> "<BASE>/bin/#{profile.cli_name}"
-        :discovered -> "<BASE>/discovered/#{profile.cli_name}"
+      if pinned = Map.get(profile, :pinned_cli_path) do
+        "<BASE>/#{pinned}"
+      else
+        case profile.probe_path do
+          :shim -> "<BASE>/bin/#{profile.cli_name}"
+          :discovered -> "<BASE>/discovered/#{profile.cli_name}"
+        end
       end
 
     [
@@ -893,13 +974,20 @@ defmodule Tightbeam.Harness.Support do
   defp observe_probe_cli(module, profile) do
     with_tmp("cli", fn base ->
       cli_name = profile.cli_name
-      discovered = Path.join([base, "discovered", profile.cli_name])
+
+      discovered =
+        if pinned = Map.get(profile, :pinned_cli_path),
+          do: Path.join(base, pinned),
+          else: Path.join([base, "discovered", profile.cli_name])
+
       File.mkdir_p!(Path.dirname(discovered))
       File.write!(discovered, "#!/bin/sh\n")
 
-      module.probe_cli(%{
+      Tightbeam.Harness.probe_cli(module, %{
         cli_bin: Path.join(base, "bin"),
         find_executable: fn ^cli_name -> discovered end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: &cursor_vector_sha256/1,
         run: fn [_binary, "--version"] -> {"#{profile.cli_version}\n", 0} end
       })
       |> normalize_paths(base, nil)

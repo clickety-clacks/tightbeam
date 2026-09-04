@@ -378,7 +378,7 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   end
 
   defp onboard_command(provider, _host),
-    do: "tightbeam onboard #{provider} --as-user <userId>"
+    do: "#{Tightbeam.Credentials.onboard_command(provider)} --as-user <userId>"
 
   # Doctor formats and reports; Tightbeam.GithubAuth judges. This check owns
   # only the presentation of the probe result — the readiness model lives in

@@ -14,5 +14,14 @@
     "install_package": "@agentclientprotocol/codex-acp",
     "cli_binary": "codex",
     "process_markers": ["codex-acp"]
+  },
+  {
+    "module": "Tightbeam.Harness.Cursor",
+    "id": "cursor",
+    "wire_name": "cursor",
+    "install_package": "cursor-agent",
+    "cli_binary": "cursor-agent",
+    "process_markers": ["cursor-agent acp"],
+    "enabled": false
   }
 ]

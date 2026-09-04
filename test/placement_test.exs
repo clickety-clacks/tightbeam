@@ -686,17 +686,43 @@ defmodule Tightbeam.PlacementTest do
   # path passed the whole suite — the exact regression the ticket is about.
   test "every harness resolves its local adapter under base_dir, never a sibling checkout",
        %{base_dir: base_dir, db: db} do
-    config = %{base_dir: base_dir, db: db, cwd: "/work", cli_bin: Path.join(base_dir, "bin")}
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      cursor_execution_home: Path.join(base_dir, "cursor-execution-test-home"),
+      credential_kind: :api_key,
+      harness_target_overrides: %{
+        find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: fn path ->
+          if Path.basename(path) == "index.js",
+            do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
+            else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+        end,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
+      }
+    }
+
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
 
     for module <- Tightbeam.Harness.all() do
-      opts = Placement.adapter_opts(config, {module.id(), "shared", "testhost"})
+      opts = Placement.adapter_opts!(config, {module.id(), "shared", "testhost"})
       binary = hd(opts[:cmd])
 
-      assert String.ends_with?(
-               binary,
-               Path.join(["adapters", "node_modules", ".bin", Path.basename(binary)])
-             ),
-             "#{module.wire_name()} local adapter is not under <base_dir>/adapters: #{binary}"
+      if module.id() == :cursor do
+        assert opts[:cmd] == [binary, "acp"]
+        assert Path.basename(Path.dirname(binary)) == "2026.08.11-e8db854"
+      else
+        assert String.ends_with?(
+                 binary,
+                 Path.join(["adapters", "node_modules", ".bin", Path.basename(binary)])
+               ),
+               "#{module.wire_name()} local adapter is not under <base_dir>/adapters: #{binary}"
+      end
 
       # The base_dir's unique final segment, rather than a prefix compare: macOS
       # resolves /var through /private and the two sides disagree on which form.
@@ -706,6 +732,270 @@ defmodule Tightbeam.PlacementTest do
       refute binary =~ "src/tightbeam/node_modules",
              "#{module.wire_name()} still resolves to the retired sibling checkout: #{binary}"
     end
+  end
+
+  test "Cursor kind refusal precedes toolchain and home side effects", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      credential_kind: :arbitrary_invalid,
+      sh: fn _ -> flunk("credential refusal executed a target command") end,
+      harness_target_overrides: %{
+        find_executable: fn _ -> flunk("credential refusal resolved an executable") end
+      }
+    }
+
+    assert {:error, %{code: "DIV-CURSOR-API-KEY-ONLY"}} =
+             Placement.adapter_opts(config, {:cursor, "shared", "testhost"})
+
+    refute File.exists?(Tightbeam.Homes.home_path(base_dir, "testhost", :cursor))
+  end
+
+  test "Cursor launch keeps the digest returned by the rails projection", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    hooks_path = Path.join(execution_home, ".cursor/hooks.json")
+
+    expected_digest =
+      Rails.hook_settings()
+      |> Tightbeam.Harness.CursorRails.compile(
+        path:
+          Tightbeam.Harness.Cursor.helper_path_dir() <>
+            ":" <> Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+      )
+      |> JSON.encode!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      cursor_execution_home: execution_home,
+      credential_kind: :api_key,
+      harness_target_overrides: %{
+        find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: fn path ->
+          File.write!(hooks_path, "tampered-after-projection")
+
+          if Path.basename(path) == "index.js",
+            do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
+            else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+        end,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
+      }
+    }
+
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+
+    opts = Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+
+    assert File.read!(hooks_path) == "tampered-after-projection"
+    assert opts[:cursor_rails_sha256] == expected_digest
+
+    refute opts[:cursor_rails_sha256] ==
+             Base.encode16(:crypto.hash(:sha256, "tampered-after-projection"), case: :lower)
+  end
+
+  defp cursor_config(base_dir, db, execution_home) do
+    %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      cursor_execution_home: execution_home,
+      credential_kind: :api_key,
+      harness_target_overrides: %{
+        find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: fn path ->
+          if Path.basename(path) == "index.js",
+            do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
+            else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+        end,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
+      }
+    }
+  end
+
+  test "Cursor launch keeps GH_CONFIG_DIR on the canonical bank and carries the root-owned helper dir first",
+       %{base_dir: base_dir, db: db} do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+    banked = Tightbeam.GithubAuth.config_dir(base_dir)
+    File.mkdir_p!(banked)
+    File.write!(Path.join(banked, "hosts.yml"), "github.com:\n  oauth_token: fixture\n")
+    File.chmod!(Path.join(base_dir, "auth"), 0o700)
+    File.chmod!(Path.join([base_dir, "auth", "github"]), 0o700)
+    File.chmod!(banked, 0o700)
+
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+
+    opts =
+      Placement.adapter_opts!(
+        cursor_config(base_dir, db, execution_home),
+        {:cursor, "shared", "testhost"}
+      )
+
+    # Path-only credential rule: no copy of the GitHub config anywhere in the projection.
+    assert {"GH_CONFIG_DIR", banked} in opts[:env]
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
+    refute File.exists?(Path.join(home, "gh"))
+
+    # Unprovisioned test host (no tightbeam-workspace on the execution home): the
+    # bank is left exactly as onboarding keeps it.
+    assert Bitwise.band(File.stat!(banked).mode, 0o777) == 0o700
+    assert Bitwise.band(File.stat!(Path.join(base_dir, "auth")).mode, 0o777) == 0o700
+
+    # The wrapped rails resolve `tightbeam` from the root-owned helper dir before
+    # anything under the operator's base, then the harness PATH for `gh`.
+    hooks = JSON.decode!(File.read!(Path.join(execution_home, ".cursor/hooks.json")))
+
+    expected_path =
+      Tightbeam.Harness.Cursor.helper_path_dir() <>
+        ":" <> Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+
+    for %{"command" => command} <- hooks["hooks"]["beforeShellExecution"] do
+      assert String.starts_with?(command, "PATH='#{expected_path}':\"$PATH\"; export PATH; ")
+    end
+  end
+
+  test "Cursor projection never harvests the home-side cli-config back into the bank",
+       %{base_dir: base_dir, db: db} do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+    File.write!(Path.join(cursor_auth, "cli-config.json"), ~s({"version":1,"trusted":false}))
+
+    config = cursor_config(base_dir, db, execution_home)
+    Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+
+    # An execution-controlled replacement of the projected copy (the projection
+    # root is group-writable by uid 503) must never reach the operator store.
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
+    projected = Path.join(home, "cli-config.json")
+    File.rm!(projected)
+    File.write!(projected, ~s({"version":1,"trusted":true,"planted":true}))
+
+    Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+
+    assert File.read!(Path.join(cursor_auth, "cli-config.json")) ==
+             ~s({"version":1,"trusted":false})
+
+    # ...and the projection is re-materialized from the bank, not the planted file.
+    assert File.read!(projected) == ~s({"version":1,"trusted":false})
+  end
+
+  test "Cursor cli-config projection does not write through a planted symlink",
+       %{base_dir: base_dir, db: db} do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+    File.write!(Path.join(cursor_auth, "cli-config.json"), ~s({"version":1}))
+
+    home = Tightbeam.Homes.home_path(base_dir, "testhost", :cursor)
+    File.mkdir_p!(home)
+    external = Path.join(base_dir, "external-target")
+    File.write!(external, "untouched")
+    File.ln_s!(external, Path.join(home, "cli-config.json"))
+
+    Placement.adapter_opts!(
+      cursor_config(base_dir, db, execution_home),
+      {:cursor, "shared", "testhost"}
+    )
+
+    assert File.read!(external) == "untouched"
+    assert {:ok, %File.Stat{type: :regular}} = File.lstat(Path.join(home, "cli-config.json"))
+    assert File.read!(Path.join(home, "cli-config.json")) == ~s({"version":1})
+  end
+
+  test "Cursor home delivery with a gateway-shaped config (no :cli_bin) derives the helper PATH",
+       %{base_dir: base_dir, db: db} do
+    # Turn-boundary / set_harness deliveries use the plain gateway config, which
+    # has no :cli_bin. The wrapper PATH must resolve to the gateway's own
+    # <base>/bin rather than crash.
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cursor_execution_home: execution_home,
+      harness_target_overrides: %{
+        find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
+        realpath: fn path -> {:ok, path} end,
+        sha256: fn path ->
+          if Path.basename(path) == "index.js",
+            do: Tightbeam.Harness.Cursor.bundle_sha256_for_host!(),
+            else: "eed61c5224668c9236334c4c68936a16aecc37374b592f59e31eb50433817831"
+        end,
+        verify_adapter_shim: fn _shim, _launcher -> :ok end
+      }
+    }
+
+    refute Map.has_key?(config, :cli_bin)
+    home = Placement.deliver_home(config, {:cursor, "shared", "testhost"})
+
+    hooks = JSON.decode!(File.read!(Path.join(execution_home, ".cursor/hooks.json")))
+
+    expected_path =
+      Tightbeam.Harness.Cursor.helper_path_dir() <>
+        ":" <> Path.join(base_dir, "bin") <> ":" <> (System.get_env("PATH") || "")
+
+    assert hooks["version"] == 1
+
+    for %{"command" => command} <- hooks["hooks"]["beforeShellExecution"] do
+      assert String.starts_with?(command, "PATH='#{expected_path}':\"$PATH\"; export PATH; ")
+    end
+
+    assert File.read!(Path.join(home, ".cursor/hooks.json")) ==
+             File.read!(Path.join(execution_home, ".cursor/hooks.json"))
+  end
+
+  test "remote Cursor adapter_opts refuses local-only before credential kind read", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    parent = self()
+
+    register_hosts(db, %{
+      "worker" => %{ssh: "cursor@worker", base_dir: "/srv/tb", cli_bin: "/srv/tb/bin"}
+    })
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: Path.join(base_dir, "bin"),
+      sh: fn _ -> flunk("remote cursor adapter_opts ran target command") end,
+      credential_kind: fn provider, _host ->
+        send(parent, {:credential_kind_read, provider})
+        :api_key
+      end
+    }
+
+    assert {:error, %{code: "DIV-CURSOR-LOCAL-ONLY"}} =
+             Placement.adapter_opts(config, {:cursor, "shared", "worker"})
+
+    refute_receive {:credential_kind_read, _}
   end
 
   test "adapter_opts preserves the pre-placement local shape", %{base_dir: base_dir, db: db} do
@@ -723,7 +1013,7 @@ defmodule Tightbeam.PlacementTest do
       end
     }
 
-    opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
+    opts = Placement.adapter_opts!(config, {:codex, "default", "testhost"})
 
     # The adapter lives under the host's OWN base_dir, not a sibling checkout (#46).
     expected_binary =
@@ -776,7 +1066,7 @@ defmodule Tightbeam.PlacementTest do
       sh: fn _command -> {"", 0} end
     }
 
-    handler = Placement.adapter_opts(config, {:codex, "default", "testhost"})[:on_auth_event]
+    handler = Placement.adapter_opts!(config, {:codex, "default", "testhost"})[:on_auth_event]
     handler.(:transient, %{"authMode" => "chatgpt"})
     refute eventually(fn -> HarnessHealth.active(db) != [] end, 4)
 
@@ -807,7 +1097,7 @@ defmodule Tightbeam.PlacementTest do
       default_model: Model.new("fable")
     }
 
-    baseline = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    baseline = Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:env]
     refute {"EXAMPLE_OVERLAY_VAR", "example-local"} in baseline
 
     assert {:ok, _row} =
@@ -820,7 +1110,7 @@ defmodule Tightbeam.PlacementTest do
                "agent:test"
              )
 
-    assert Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env] ==
+    assert Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:env] ==
              baseline ++ [{"EXAMPLE_OVERLAY_VAR", "example-local"}]
   end
 
@@ -844,7 +1134,7 @@ defmodule Tightbeam.PlacementTest do
     assert {:ok, []} = DB.query(db, "SELECT host FROM host_toolchain_dirs")
     refute Map.has_key?(Placement.hosts(base_dir, db)["testhost"], :toolchain_dirs)
 
-    baseline = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    baseline = Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:env]
 
     assert {:ok, %{dirs: [^first, ^second]}} =
              Placement.set_toolchain_dirs(
@@ -856,7 +1146,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert Placement.hosts(base_dir, db)["testhost"].toolchain_dirs == [first, second]
 
-    configured = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    configured = Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:env]
 
     assert {"PATH", "/local/bin:#{first}:#{second}:/usr/local/bin:/usr/bin:/bin"} in configured
 
@@ -866,7 +1156,7 @@ defmodule Tightbeam.PlacementTest do
              Placement.set_toolchain_dirs(db, "testhost", [], "user:operator")
 
     refute Map.has_key?(Placement.hosts(base_dir, db)["testhost"], :toolchain_dirs)
-    assert Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env] == baseline
+    assert Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:env] == baseline
   end
 
   test "host toolchain rows use the same constructed PATH for ssh adapters", %{
@@ -910,7 +1200,7 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    command = Placement.adapter_opts(config, {:codex, "default", "worker"})[:cmd]
+    command = Placement.adapter_opts!(config, {:codex, "default", "worker"})[:cmd]
 
     assert "PATH=/srv/tb/bin:/tools/one:/tools/two:/usr/local/bin:/usr/bin:/bin" in command
     refute "PATH=/srv/tb/bin:$PATH" in command
@@ -961,7 +1251,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert_raise RuntimeError,
                  "host testhost toolchain directory is unavailable at adapter start: #{missing}",
-                 fn -> Placement.adapter_opts(config, {:claude, "default", "testhost"}) end
+                 fn -> Placement.adapter_opts!(config, {:claude, "default", "testhost"}) end
 
     assert {:ok, _} =
              Placement.register_host(db, "worker", %{
@@ -977,7 +1267,7 @@ defmodule Tightbeam.PlacementTest do
 
     assert_raise RuntimeError,
                  "host worker toolchain directory is unavailable at adapter start (exit 1): /missing-remote",
-                 fn -> Placement.adapter_opts(remote, {:codex, "default", "worker"}) end
+                 fn -> Placement.adapter_opts!(remote, {:codex, "default", "worker"}) end
   end
 
   test "adapter_opts always pins GH_CONFIG_DIR at the banked github dir", %{
@@ -998,7 +1288,7 @@ defmodule Tightbeam.PlacementTest do
     gh_dir = Path.join([base_dir, "auth", "github", "gh"])
     refute File.dir?(gh_dir)
 
-    assert {"GH_CONFIG_DIR", gh_dir} in Placement.adapter_opts(
+    assert {"GH_CONFIG_DIR", gh_dir} in Placement.adapter_opts!(
              config,
              {:claude, "default", "testhost"}
            )[:env]
@@ -1040,7 +1330,7 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    command = Placement.adapter_opts(config, {:codex, "default", "worker"})[:cmd]
+    command = Placement.adapter_opts!(config, {:codex, "default", "worker"})[:cmd]
     assignment = "EXAMPLE_OVERLAY_VAR='example remote'"
     assert assignment in command
 
@@ -1086,9 +1376,9 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    gibson_claude = Placement.adapter_opts(config, {:claude, "default", "gibson"})[:cmd]
-    gibson_codex = Placement.adapter_opts(config, {:codex, "default", "gibson"})[:cmd]
-    other_claude = Placement.adapter_opts(config, {:claude, "default", "other-host"})[:cmd]
+    gibson_claude = Placement.adapter_opts!(config, {:claude, "default", "gibson"})[:cmd]
+    gibson_codex = Placement.adapter_opts!(config, {:codex, "default", "gibson"})[:cmd]
+    other_claude = Placement.adapter_opts!(config, {:claude, "default", "other-host"})[:cmd]
 
     assert "EXAMPLE_OVERLAY_VAR='isolated'" in gibson_claude
     refute Enum.any?(gibson_codex, &String.starts_with?(&1, "EXAMPLE_OVERLAY_VAR="))
@@ -1117,7 +1407,7 @@ defmodule Tightbeam.PlacementTest do
       default_model: Model.new("fable")
     }
 
-    opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
+    opts = Placement.adapter_opts!(config, {:codex, "default", "testhost"})
 
     assert {"CODEX_CONFIG", ~s({"bypass_hook_trust":true})} in opts[:env]
     refute Enum.any?(opts[:env], fn {key, _value} -> key == "CODEX_PATH" end)
@@ -1126,7 +1416,7 @@ defmodule Tightbeam.PlacementTest do
     refute opts[:probe_model] == config.default_model
     refute File.exists?(Path.join(probe_cwd, "stale"))
 
-    claude_opts = Placement.adapter_opts(config, {:claude, "default", "testhost"})
+    claude_opts = Placement.adapter_opts!(config, {:claude, "default", "testhost"})
     refute Keyword.has_key?(claude_opts, :probe_cwd)
     refute Keyword.has_key?(claude_opts, :probe_model)
     refute Enum.any?(claude_opts[:env], fn {key, _value} -> key == "CODEX_CONFIG" end)
@@ -1156,7 +1446,7 @@ defmodule Tightbeam.PlacementTest do
     # A subscription credential reaches the harness as a FILE in its home, never as an
     # environment variable: it carries a refresh token that Claude Code rotates in place,
     # and an env var has nowhere to keep one.
-    claude_env = Placement.adapter_opts(config, {:claude, "default", "testhost"})[:env]
+    claude_env = Placement.adapter_opts!(config, {:claude, "default", "testhost"})[:env]
     refute Enum.any?(claude_env, fn {k, _} -> k == "CLAUDE_CODE_OAUTH_TOKEN" end)
     assert Enum.any?(claude_env, fn {k, _} -> k == "CLAUDE_CONFIG_DIR" end)
 
@@ -1195,7 +1485,7 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
+    opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
     remote_home = "/srv/tb/homes/worker/codex"
 
     assert opts[:cmd] == [
@@ -1226,7 +1516,7 @@ defmodule Tightbeam.PlacementTest do
     assert lineage_assignment == "TIGHTBEAM_LINEAGE=tb1-Y29kZXhAd29ya2Vy"
     refute Enum.any?(opts[:cmd], &String.contains?(&1, "'TIGHTBEAM_LINEAGE="))
 
-    claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
+    claude_opts = Placement.adapter_opts!(config, {:claude, "default", "worker"})
 
     # No credential expansion for a subscription: the remote reads its own home file.
     refute Enum.any?(claude_opts[:cmd], &String.contains?(&1, "CLAUDE_CODE_OAUTH_TOKEN"))
@@ -1268,7 +1558,7 @@ defmodule Tightbeam.PlacementTest do
       sh: sh
     }
 
-    opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
+    opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
     assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in opts[:cmd]
     assert opts[:probe_cwd] == "/srv/tb/work/gate-probe"
     assert opts[:probe_model] == Model.new("gpt-5.6-sol", effort: "medium")
@@ -1278,7 +1568,7 @@ defmodule Tightbeam.PlacementTest do
                "-rf" in command
            end)
 
-    claude_opts = Placement.adapter_opts(config, {:claude, "default", "worker"})
+    claude_opts = Placement.adapter_opts!(config, {:claude, "default", "worker"})
     refute Enum.any?(claude_opts[:cmd], &String.starts_with?(&1, "CODEX_CONFIG="))
     refute Keyword.has_key?(claude_opts, :probe_cwd)
 
@@ -1288,7 +1578,7 @@ defmodule Tightbeam.PlacementTest do
     # when trust is bypassed.
     File.rm_rf!(Path.join([base_dir, "identity", "rails"]))
     Rails.load!(base_dir)
-    lawless_opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
+    lawless_opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
     assert ~s(CODEX_CONFIG='{"bypass_hook_trust":true}') in lawless_opts[:cmd]
     refute Keyword.has_key?(lawless_opts, :probe_cwd)
     refute Keyword.has_key?(lawless_opts, :probe_model)
@@ -1309,7 +1599,7 @@ defmodule Tightbeam.PlacementTest do
       default_model: Model.new("fable")
     }
 
-    opts = Placement.adapter_opts(config, {:codex, identity_name, "testhost"})
+    opts = Placement.adapter_opts!(config, {:codex, identity_name, "testhost"})
 
     {"TIGHTBEAM_LINEAGE", "tb1-" <> encoded} =
       Enum.find(opts[:env], fn {key, _value} -> key == "TIGHTBEAM_LINEAGE" end)
@@ -1355,6 +1645,74 @@ defmodule Tightbeam.PlacementTest do
                ]
              }
            }
+  end
+
+  test "local Cursor projection uses the dedicated account's real home" do
+    expected_home =
+      case :os.type() do
+        {:unix, :darwin} -> "/Users/tightbeam-cursor"
+        {:unix, _} -> "/home/tightbeam-cursor"
+      end
+
+    assert Tightbeam.Harness.Cursor.execution_home(nil) == expected_home
+
+    assert Tightbeam.Harness.Cursor.execution_base(nil) ==
+             Path.join(expected_home, ".tightbeam")
+
+    assert Tightbeam.Harness.Cursor.execution_home("/test/cursor-home") ==
+             "/test/cursor-home"
+  end
+
+  test "Cursor delivery keeps the Homes projection outside the execution account home", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    execution_home = Path.join(base_dir, "dedicated-cursor-home")
+    auth_dir = Path.join(base_dir, "auth/cursor")
+    auth_file = Path.join(auth_dir, "cli-config.json")
+    File.mkdir_p!(auth_dir)
+    File.write!(auth_file, ~s({"authInfo":{"email":"cursor@example.com"}}))
+    File.chmod!(auth_dir, 0o700)
+    File.chmod!(auth_file, 0o600)
+    File.mkdir_p!(Path.join(execution_home, ".cursor"))
+    File.mkdir_p!(Path.join(execution_home, ".tightbeam"))
+    sentinel = Path.join(execution_home, ".tightbeam/execution-owned")
+    File.write!(sentinel, "preserve")
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("auto"),
+      cursor_execution_home: execution_home
+    }
+
+    projected = Placement.deliver_home(config, {:cursor, "default", "testhost"})
+
+    assert projected == Homes.home_path(base_dir, "testhost", :cursor)
+    refute projected == execution_home
+    assert File.read!(sentinel) == "preserve"
+    hooks = Path.join(execution_home, ".cursor/hooks.json")
+    assert File.regular?(hooks)
+    hooks_stat = File.stat!(hooks)
+    assert Bitwise.band(hooks_stat.mode, 0o777) == 0o644
+    assert hooks_stat.uid == File.stat!(execution_home).uid
+    refute File.exists?(Path.join(execution_home, "cli-config.json"))
+
+    projection_stat = File.stat!(projected)
+    sessions_stat = File.stat!(Path.join(projected, "acp-sessions"))
+    assert Bitwise.band(projection_stat.mode, 0o7777) == 0o2770
+    assert Bitwise.band(sessions_stat.mode, 0o7777) == 0o2770
+    assert sessions_stat.gid == projection_stat.gid
+
+    credential = Path.join(projected, "cli-config.json")
+    assert {:ok, %File.Stat{type: :regular}} = File.lstat(credential)
+    assert File.read!(credential) == File.read!(auth_file)
+    assert Bitwise.band(File.stat!(credential).mode, 0o777) == 0o640
+    assert File.stat!(credential).gid == projection_stat.gid
+    assert Bitwise.band(File.stat!(auth_dir).mode, 0o777) == 0o700
+    assert Bitwise.band(File.stat!(auth_file).mode, 0o777) == 0o600
   end
 
   # wi_263814d3 — accepted-then-dead: the claude adapter's offered/accepted model
