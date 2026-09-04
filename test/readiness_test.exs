@@ -36,6 +36,11 @@ defmodule Tightbeam.ReadinessTest do
     end
 
     def handle_call(:get, _from, answers), do: {:reply, answers, answers}
+
+    def handle_call({:metadata, {host, harness}}, _from, answers) do
+      metadata = Map.get(answers, {:metadata, host, harness}, %{})
+      {:reply, metadata, answers}
+    end
   end
 
   setup do
@@ -137,6 +142,35 @@ defmodule Tightbeam.ReadinessTest do
     refute Enum.any?(advisory, &(&1 =~ "FOREGROUND")), "supervised: no foreground line"
   end
 
+  test "a Claude Code version gate names the exact host upgrade", ctx do
+    module = Tightbeam.Harness.Claude
+    install_adapter!(ctx.base, module)
+
+    catalog =
+      catalog!(%{
+        "claude" => live("claude-opus-5", ["high"]),
+        {:metadata, "testhost", "claude"} => %{
+          manifest_health: :fresh,
+          version_blocks: [
+            %{
+              name: "Fable 5.1",
+              current_version: "2.1.220",
+              min_version: "2.1.257",
+              max_version_exclusive: nil
+            }
+          ]
+        }
+      })
+
+    config = %{ctx.config | default_model: Model.new("claude-opus-5", effort: "high")}
+    rendered = config |> Readiness.summary(catalog) |> Readiness.render(config)
+
+    assert Enum.any?(rendered, fn line ->
+             line =~
+               "Claude Code v2.1.220 on testhost is too old for Fable 5.1; needs v2.1.257"
+           end)
+  end
+
   test "a ready install with NO service manager says so — the install is not finished", ctx do
     # The gap that cost a production host its uptime and its crash log (gibson,
     # 2026-08-05): a gateway running foreground in tmux does not survive a
@@ -233,7 +267,7 @@ defmodule Tightbeam.ReadinessTest do
   end
 
   test "a default model outside the live catalog is named by its fields", ctx do
-    [module | _] = Harness.all()
+    module = Tightbeam.Harness.Codex
     install_adapter!(ctx.base, module)
     catalog = catalog!(%{module.wire_name() => live("something-else", ["low"])})
 
