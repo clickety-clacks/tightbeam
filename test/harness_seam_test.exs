@@ -146,57 +146,18 @@ defmodule Tightbeam.HarnessSeamTest do
              )
   end
 
-  # Task #41 (Flynn: "hard code it and leave a note"). The claude adapter accepts a
-  # NARROWER model vocabulary than the derived catalog, and every substitution for a
-  # refused model is a silent downgrade — `claude-opus-5` -> `opus` delivers Opus 4.8,
-  # and `claude-fable-5` has no equivalent at all. This pins the recorded table AND the
-  # rule that no substitution is smuggled in later: a request the adapter refuses must
-  # fail, not quietly become a different model.
-  test "the recorded claude model vocabulary never substitutes a refused model" do
-    selectable = Tightbeam.Harness.Claude.adapter_selectable_models()
+  test "claude offered models come from the manifest, not a compiled accessor" do
+    refute function_exported?(Tightbeam.Harness.Claude, :adapter_selectable_models, 0)
 
-    # Recorded live 2026-07-26 (claude CLI 2.1.220 / claude-agent-acp 0.59.0);
-    # fable added 2026-08-05 after a live re-measurement on gibson (CLI 2.1.221,
-    # the production grant) answered a real prompt on claude-fable-5 — the July
-    # REJECTED row was one environment's snapshot, not an account property.
-    assert Enum.sort(selectable) ==
-             Enum.sort(~w(default sonnet opus haiku fable claude-sonnet-5 claude-opus-4-8
-                          claude-haiku-4-5-20251001 claude-fable-5 claude-opus-5
-                          claude-fable-5-1 claude-fable-5-1[1m]))
+    assert {:ok, provider, _health} = Tightbeam.ModelManifest.provider("claude")
 
-    # Values the adapter REFUSES must never appear here — listing one would make the
-    # gateway offer a model the adapter cannot select. Fable left this list
-    # 2026-08-05: measured answering a real prompt on gibson with the production
-    # grant, so the July refusal was environmental, not categorical. Opus 5 left
-    # 2026-08-06 the same way: pin-probed offered+accepted and answered a live
-    # prompt on gibson with the production grant.
-    for refused <- ~w(claude-opus-4-7 claude-sonnet-4-6
-                      claude-opus-4-6 claude-opus-4-5-20251101 claude-sonnet-4-5-20250929
-                      claude-opus-4-1-20250805) do
-      refute refused in selectable,
-             "#{refused} is refused by claude-agent-acp 0.73.0 and must not be listed " <>
-               "as selectable; if a newer adapter accepts it, re-probe and update the " <>
-               "note in claude.ex together with the version stamp"
-    end
+    assert Enum.map(provider["models"], & &1["slug"]) ==
+             ~w(claude-fable-5-1 claude-fable-5 claude-opus-5 claude-opus-4-8
+                claude-sonnet-5 claude-haiku-4-5-20251001)
 
-    # The note is the load-bearing half — it must carry the version it was probed at.
     source = File.read!(Path.join(File.cwd!(), "lib/tightbeam/harness/claude.ex"))
-    assert source =~ "claude CLI 2.1.220"
-    assert source =~ "claude-agent-acp 0.59.0"
-    assert source =~ ~s(@adapter_version "0.73.0")
-    assert source =~ "SDK 0.3.257"
-    assert source =~ "Claude Code 2.1.257"
-    assert source =~ "silent downgrade"
-
-    # The codex half is PROBED now, and kind-scoped: the 2026-07-28 api-key
-    # exercise (#99) recorded the codex adapter refusing a platform id at
-    # set_config_option (-32602), so the note must carry that evidence — and it
-    # must never grow back into a wholesale "cannot diverge" claim, which the
-    # exercise disproved for the platform route.
-    assert source =~ "kind-scoped"
-    assert source =~ "-32602"
-    refute source =~ "come from one artifact and cannot diverge"
-    refute source =~ "divergence is structurally unlikely"
+    refute source =~ "@adapter_selectable_models"
+    refute source =~ "/v1/models?limit=100"
   end
 
   test "claude 0.73.0 aliases select Fable 5.1 at both context widths" do
