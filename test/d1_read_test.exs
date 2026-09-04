@@ -64,7 +64,7 @@ defmodule Tightbeam.D1ReadRouteTest do
   import Plug.Conn
   import Plug.Test
 
-  alias Tightbeam.{DB, Devices, Harness, Identity, Org, Placement, Schema}
+  alias Tightbeam.{D1Read, DB, Devices, Harness, Identity, Org, Placement, Schema}
   alias Tightbeam.Wire.Router
 
   setup do
@@ -130,23 +130,27 @@ defmodule Tightbeam.D1ReadRouteTest do
 
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
-    %{db: db, opts: opts, admin: admin, operator: operator, session: session}
+    %{db: db, base_dir: base_dir, opts: opts, admin: admin, operator: operator, session: session}
   end
 
   test "all six D1 routes provide fixed envelopes, ordered bytes, and no-store", ctx do
-    for {path, resource} <- [
-          {"/api/config", "config"},
-          {"/api/host-env", "host environment"},
-          {"/api/hosts", "hosts"},
-          {"/api/users", "users"},
-          {"/api/identity", "identity"},
-          {"/api/kungfu", "kungfu"}
+    for {path, resource, resource_key} <- [
+          {"/api/config", "config", :config},
+          {"/api/host-env", "host environment", :host_environment},
+          {"/api/hosts", "hosts", :hosts},
+          {"/api/users", "users", :users},
+          {"/api/identity", "identity", :identity},
+          {"/api/kungfu", "kungfu", :kungfu}
         ] do
       response = get(ctx.opts, path, ctx.admin.token)
       assert response.status == 200, "#{path}: #{response.resp_body}"
       assert get_resp_header(response, "cache-control") == ["no-store"]
       assert JSON.decode!(response.resp_body)["resource"] == resource
       assert JSON.decode!(response.resp_body)["schemaVersion"] == 1
+
+      for item <- D1Read.collection(ctx.db, ctx.base_dir, resource_key, %{}) do
+        assert response.resp_body =~ D1Read.encode(resource_key, item)
+      end
     end
 
     users = get(ctx.opts, "/api/users?userId=alpha&userId=beta&userId=zeta", ctx.admin.token)
@@ -174,6 +178,11 @@ defmodule Tightbeam.D1ReadRouteTest do
              )
 
     assert users_payload["tuple"] == ["zeta"]
+
+    assert first_page["page"]["oldestCursor"] ==
+             users_payload
+             |> JSON.encode!()
+             |> Base.url_encode64(padding: false)
 
     previous =
       get(
@@ -207,6 +216,16 @@ defmodule Tightbeam.D1ReadRouteTest do
     malformed = get(ctx.opts, users_path <> "&after=not-a-cursor", ctx.admin.token)
     assert malformed.status == 400
     assert JSON.decode!(malformed.resp_body)["error"]["code"] == "invalid_cursor"
+
+    stale_version =
+      users_payload
+      |> Map.put("version", 0)
+      |> JSON.encode!()
+      |> Base.url_encode64(padding: false)
+
+    stale = get(ctx.opts, users_path <> "&after=" <> stale_version, ctx.admin.token)
+    assert stale.status == 400
+    assert JSON.decode!(stale.resp_body)["error"]["code"] == "invalid_cursor"
 
     hosts_path = "/api/hosts?host=alpha&host=beta&host=zeta&limit=1"
     hosts = get(ctx.opts, hosts_path, ctx.session.cli_token) |> then(&JSON.decode!(&1.resp_body))
