@@ -2,7 +2,12 @@ defmodule Tightbeam.Harness.Support do
   @moduledoc false
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
-  @reserved_overlay_env_vars ~w(PATH CLAUDE_CONFIG_DIR CODEX_HOME TIGHTBEAM_URL)
+  # The production-identity vars (exact names) are folded in so a DB env overlay
+  # cannot re-inject the poison R3 scrubs (RELEASE_*, instance selectors, ERTS
+  # paths). Their prefixes (e.g. RELEASE_*) are enforced in
+  # placement.ex `unreserved_env_name/1`, which a flat list cannot express.
+  @reserved_overlay_env_vars ~w(PATH CLAUDE_CONFIG_DIR CODEX_HOME TIGHTBEAM_URL) ++
+                               Tightbeam.ProductionIdentityEnv.exact()
   @bundle_path Application.app_dir(:tightbeam, "priv/harness_bundle.json")
   @external_resource @bundle_path
   @credential_live_timeout_ms @bundle_path

@@ -168,7 +168,24 @@ defmodule Tightbeam.Gateway do
         _ -> "tbc_" <> (:crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false))
       end
 
-    File.write!(gateway_path, JSON.encode!(%{port: config.port, cliToken: cli_token}))
+    # R5: round-trip the OWNED pid so the lifecycle `stop` verb can SIGTERM this
+    # exact process by identity — no Erlang node, no cookie, no handshake. The
+    # command signature is captured now (VM is up by the time this runs) and
+    # re-checked before any signal, so a recycled pid cannot be mis-signalled.
+    # `cliToken` is preserved (read above); `port`/`ownedPid`/`ownedCommand` are
+    # overwritten every boot.
+    owned_pid = System.pid()
+
+    File.write!(
+      gateway_path,
+      JSON.encode!(%{
+        port: config.port,
+        cliToken: cli_token,
+        ownedPid: owned_pid,
+        ownedCommand: owned_command(owned_pid)
+      })
+    )
+
     File.chmod!(gateway_path, 0o600)
     provision_host_endpoints(db, config, cli_token)
     cli_bin = install_cli_bin(config.base_dir)
@@ -513,6 +530,29 @@ defmodule Tightbeam.Gateway do
   # handler-scoped functions that were only ever handed `config` resolve it the
   # same way rather than reaching for the global name directly.
   defp gateway_db(config), do: Map.get(config, :db, Tightbeam.DB)
+
+  # The command line of our own OS pid, for the descriptor's `ownedCommand`. The
+  # `stop` verb re-derives this exact signature (`ps -ww -o command= -p <pid>`)
+  # and signals ONLY on a match, so a pid the OS has recycled onto an unrelated
+  # process is never mis-signalled. nil (ps failed) writes JSON null, which the
+  # stop path treats as a refusal — never a fall-through to a node-based stop.
+  defp owned_command(pid) do
+    case System.cmd("ps", ["-ww", "-o", "command=", "-p", pid], stderr_to_stdout: true) do
+      {out, 0} ->
+        case String.trim(out) do
+          "" -> nil
+          command -> command
+        end
+
+      _ ->
+        nil
+    end
+  rescue
+    # `ps` off PATH (System.cmd raises :enoent) must not crash the boot. A nil
+    # ownedCommand makes the `stop` verb refuse rather than mis-signal — the safe
+    # degradation, never a fall-through to a node-based stop.
+    _ -> nil
+  end
 
   defp provision_host_endpoints(db, config, cli_token) do
     config.base_dir

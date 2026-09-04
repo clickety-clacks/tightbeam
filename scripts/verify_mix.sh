@@ -72,14 +72,40 @@ fi
 # The authoritative Mix gate can run inside a Tightbeam session, whose process
 # environment belongs to the live release.  A source test run must not inherit
 # that release's base directory, endpoint, node identity, or ERTS paths.
-for name in $(
-  env | sed -n \
-    -e 's/^\(TIGHTBEAM_[A-Za-z0-9_]*\)=.*/\1/p' \
-    -e 's/^\(RELEASE_[A-Za-z0-9_]*\)=.*/\1/p'
-); do
-  unset "$name"
+#
+# The production-identity set (RELEASE_*, ERTS paths, instance selectors) is read
+# from the ONE canonical fragment shared with R3 (spawn scrub) and R9 (overlay
+# reservation), so the three cannot drift.  On top of it a source run also drops
+# EVERY remaining TIGHTBEAM_* (home, url, ...): a spawned session legitimately
+# keeps those, but a pristine `mix test` must not see them.
+pi_prefixes=""
+pi_exact=""
+while read -r kind token _rest; do
+  case "$kind" in
+    '' | '#'*) : ;;
+    prefix) pi_prefixes="$pi_prefixes $token" ;;
+    exact) pi_exact="$pi_exact $token" ;;
+    *) refuse_preflight production-identity-fragment-malformed ;;
+  esac
+done <"$script_dir/production-identity-env"
+
+for name in $(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p'); do
+  drop=""
+  case " $pi_exact " in *" $name "*) drop=1 ;; esac
+  if [ -z "$drop" ]; then
+    for p in $pi_prefixes; do
+      case "$name" in "$p"*)
+        drop=1
+        break
+        ;;
+      esac
+    done
+  fi
+  case "$name" in TIGHTBEAM_*) drop=1 ;; esac
+  if [ -n "$drop" ]; then
+    unset "$name"
+  fi
 done
-unset ROOTDIR BINDIR
 
 # Every authoritative gate records the exact BEAM toolchain that executes it.
 if [ "$beam_runner" = mise ]; then

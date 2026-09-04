@@ -1,0 +1,25 @@
+# Canonical production-identity environment variables — ONE definition.
+#
+# These name a running production (or any specific) gateway instance: its ERTS
+# paths, its release identity, and its instance selectors. They must never be
+# INHERITED by a spawned session (R3), never be a DB env overlay (R9), and never
+# leak into a source `mix test` run (verify_mix.sh). This file is the single
+# source of truth so the three consumers cannot drift.
+#
+# Consumers:
+#   - lib/tightbeam/production_identity_env.ex  (parsed at compile time; R3 + R9)
+#   - scripts/verify_mix.sh                     (parsed at run time; source-test scrub)
+#
+# Format: one entry per line. `prefix <STR>` matches any var name starting with
+# STR; `exact <NAME>` matches that var name exactly. Blank lines and lines
+# beginning with `#` are ignored.
+#
+# NOTE the SESSION identity vars TIGHTBEAM_HOME / TIGHTBEAM_MACHINE /
+# TIGHTBEAM_LINEAGE / TIGHTBEAM_URL are deliberately NOT here: they are
+# per-session and are re-provided to spawned children, never a production leak.
+prefix RELEASE_
+exact ROOTDIR
+exact BINDIR
+exact TIGHTBEAM_BASE_DIR
+exact TIGHTBEAM_PORT
+exact TIGHTBEAM_NODE

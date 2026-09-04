@@ -15,56 +15,165 @@ while [ -L "$SELF" ]; do
   esac
 done
 DIR="$(cd "$(dirname "$SELF")/.." && pwd)"
+REL="$DIR/release/bin/tightbeam_gateway"
 
-# ONE ERLANG NODE NAME PER INSTANCE, DERIVED FROM THE PORT.
+# LIFECYCLE VERBS RESOLVE THEIR TARGET FROM $TIGHTBEAM_BASE_DIR/gateway.json ONLY.
 #
-# A mix release names its node after the RELEASE, so every instance on a machine
-# claimed `tightbeam_gateway@<host>` and the second one refused to boot with
+# The incident this guards against: a test teardown ran `stop` in an environment
+# where the production systemd unit had exported RELEASE_NODE/TIGHTBEAM_PORT to
+# it. The mix release resolves `stop`/`rpc` by NODE NAME, an inherited
+# RELEASE_NODE wins, and the shared Erlang cookie let the test's `stop` reach and
+# halt PRODUCTION. So the incident verb no longer resolves a node at all: `stop`
+# SIGTERMs the OS pid the descriptor records, identity-gated. `rpc`/`remote`
+# still use distribution but take their node from the descriptor, never ambient.
 #
-#   Protocol 'inet_tcp': the name tightbeam_gateway@eezo seems to be in use by
-#   another Erlang node
-#
-# — a message naming no port, no base dir, and nothing an operator would connect to
-# Tightbeam. Nothing in the product prevents two gateways coexisting; only this
-# default did. The port is the right discriminator because two instances need
-# different ports anyway, so a collision here means a collision there too, reported
-# by whichever notices first.
-#
-# `TIGHTBEAM_NODE` overrides it for anyone who wants a name of their own; an explicit
-# `RELEASE_NODE` still wins, since that is the release runtime's own knob and this
-# script has no business overruling it.
-if [ -z "${RELEASE_NODE:-}" ]; then
-  if [ -n "${TIGHTBEAM_NODE:-}" ]; then
-    RELEASE_NODE="$TIGHTBEAM_NODE"
-  else
-    RELEASE_NODE="tightbeam_gateway_${TIGHTBEAM_PORT:-11373}"
+# There is NO TIGHTBEAM_HOME fallback, NO ~/.tightbeam default, NO port-derived
+# guess: an absent TIGHTBEAM_BASE_DIR or descriptor is a REFUSAL, so reaching an
+# instance requires explicitly naming it.
+
+refuse() {
+  # $1: one-line reason (the verb-specific lead-in)
+  printf 'tightbeam-gateway: %s\n' "$1" >&2
+  printf '  Set TIGHTBEAM_BASE_DIR=<dir> for the instance you mean, or use\n' >&2
+  printf '  `systemctl stop tightbeam` for the managed gateway.\n' >&2
+  printf '  (The `restart` verb was removed: use `stop` then `start`, or\n' >&2
+  printf '  `systemctl restart tightbeam` for the managed gateway.)\n' >&2
+  exit 64
+}
+
+require_descriptor() {
+  # Sets DESC_PATH to $TIGHTBEAM_BASE_DIR/gateway.json, or REFUSES ($1 = verb,
+  # for the message) when TIGHTBEAM_BASE_DIR is unset or the descriptor is
+  # absent. Call this DIRECTLY (never in a command substitution): `refuse`
+  # exits, and an exit inside `$(...)` would only kill the subshell — the caller
+  # would run on past the refusal.
+  if [ -z "${TIGHTBEAM_BASE_DIR:-}" ]; then
+    refuse "refusing to $1: TIGHTBEAM_BASE_DIR is not set."
   fi
-  export RELEASE_NODE
-fi
+  DESC_PATH="$TIGHTBEAM_BASE_DIR/gateway.json"
+  if [ ! -f "$DESC_PATH" ]; then
+    refuse "refusing to $1: no descriptor at $DESC_PATH."
+  fi
+}
 
-# EVERY release command goes through here, not just `start`. This used to exec
-# `start "$@"` unconditionally, which left `stop`, `restart`, `remote`, `rpc` and `pid`
-# reachable only by invoking `release/bin/tightbeam_gateway` directly — where the
-# derivation above has not run, so they defaulted to the old `tightbeam_gateway` node and
-# failed `nodedown` against a gateway that was plainly running. A name that only the
-# start path knows is not a name.
-#
-# Those commands find the node by NAME, so they must resolve to the same one the gateway
-# started under — which the release also qualifies with the machine name, since
-# RELEASE_DISTRIBUTION defaults to `sname`.
-#
-# Do not restate the precedence here. Three attempts to summarise it in a sentence were
-# each wrong by omission ("the same port"; then "the port or TIGHTBEAM_NODE"; then a
-# three-item list that still missed the hostname), every one describing a guarantee
-# narrower than the code gives. The resolution is the four lines below and the release's
-# own `RELEASE_NODE="${RELEASE_NODE:-$RELEASE_NAME}"`; read those, not a paraphrase.
-#
-# A LEADING FLAG STILL MEANS `start`. The previous form was `start "$@"`, so
-# `tightbeam-gateway --erl "+sbwt none"` passed that option to start; treating a
-# leading `-` as a subcommand would answer it with `Unknown command --erl`. Only a
-# bare word is a subcommand.
-case "${1:-}" in
-  "" | -*) set -- start "$@" ;;
+# JSON field extraction. A gateway command line and an OS pid carry no
+# JSON-special characters, so these bounded matches are exact; any oddity yields
+# an empty result, and every caller treats empty as a REFUSAL rather than a
+# guess — dirt is reported, never accommodated.
+json_string() { # stdin: JSON; $1: key -> value of "key":"<value>"
+  sed -n "s/.*\"$1\":\"\\([^\"]*\\)\".*/\\1/p"
+}
+json_number() { # stdin: JSON; $1: key -> value of "key":<digits>
+  sed -n "s/.*\"$1\":\\([0-9][0-9]*\\).*/\\1/p"
+}
+
+process_command() { # $1: pid -> its current command line, or empty
+  # Strip leading and trailing whitespace so this matches the descriptor's
+  # ownedCommand, which gateway.ex captures with the same `ps` and String.trim.
+  ps -ww -o command= -p "$1" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d'
+}
+
+do_stop() {
+  require_descriptor stop
+  _json="$(cat "$DESC_PATH")"
+  _pid="$(printf '%s' "$_json" | json_string ownedPid)"
+  _cmd="$(printf '%s' "$_json" | json_string ownedCommand)"
+  if [ -z "$_pid" ] || [ -z "$_cmd" ]; then
+    refuse "refusing to stop: descriptor has no ownedPid/ownedCommand (pre-upgrade or malformed)."
+  fi
+  _now="$(process_command "$_pid")"
+  if [ -z "$_now" ]; then
+    refuse "refusing to stop: owned pid $_pid is not running (already stopped)."
+  fi
+  if [ "$_now" != "$_cmd" ]; then
+    # The pid has been recycled onto an unrelated process. Signalling it would
+    # kill somebody else's work — the exact failure the identity gate prevents.
+    refuse "refusing to stop: owned pid $_pid was recycled (command no longer matches the descriptor)."
+  fi
+  # SIGTERM triggers the same OTP graceful shutdown (prep_stop) as `systemctl
+  # stop`. No node, no cookie, no restart follow-on.
+  exec kill -TERM "$_pid"
+}
+
+do_pid() {
+  require_descriptor pid
+  _json="$(cat "$DESC_PATH")"
+  _pid="$(printf '%s' "$_json" | json_string ownedPid)"
+  if [ -z "$_pid" ]; then
+    refuse "refusing to resolve pid: descriptor has no ownedPid (pre-upgrade or malformed)."
+  fi
+  printf '%s\n' "$_pid"
+  exit 0
+}
+
+do_debug() { # $@: the full argv (rpc <expr> | remote)
+  # rpc/remote still use Erlang distribution, but the node is resolved from the
+  # descriptor's port, NEVER from an ambient RELEASE_NODE/TIGHTBEAM_PORT. Force
+  # RELEASE_NODE so an inherited one cannot win (the incident vector). The cookie
+  # stays the baked releases/COOKIE for Phase 1 (per-instance cookie is Phase 2).
+  require_descriptor "$1"
+  _json="$(cat "$DESC_PATH")"
+  _port="$(printf '%s' "$_json" | json_number port)"
+  if [ -z "$_port" ]; then
+    refuse "refusing to $1: descriptor has no port."
+  fi
+  RELEASE_NODE="tightbeam_gateway_${_port}"
+  export RELEASE_NODE
+  exec "$REL" "$@"
+}
+
+verb="${1:-}"
+case "$verb" in
+  "" | -*)
+    # A LEADING FLAG STILL MEANS `start`. `tightbeam-gateway --erl "+sbwt none"`
+    # passes that option to start; treating a leading `-` as a subcommand would
+    # answer it with `Unknown command --erl`. Only a bare word is a subcommand.
+    verb=start
+    ;;
 esac
 
-exec "$DIR/release/bin/tightbeam_gateway" "$@"
+case "$verb" in
+  stop)
+    do_stop
+    ;;
+  pid)
+    do_pid
+    ;;
+  restart)
+    # [F1] The `restart` verb is REMOVED. A SIGTERM-then-boot restart would
+    # replace a systemd-managed production with an UNMANAGED process — the exact
+    # failure class this work removes. Isolated restart = `stop` then `start`;
+    # production restart = `systemctl restart tightbeam`.
+    printf 'tightbeam-gateway: the `restart` verb was removed.\n' >&2
+    printf '  Isolated restart: run `stop` then `start`.\n' >&2
+    printf '  Production restart: `systemctl restart tightbeam`.\n' >&2
+    exit 64
+    ;;
+  rpc | remote)
+    do_debug "$@"
+    ;;
+  *)
+    # start and every other release verb (version, eval, daemon, ...) keep the
+    # per-instance node name derived from the port.
+    #
+    # ONE ERLANG NODE NAME PER INSTANCE, DERIVED FROM THE PORT. A mix release
+    # names its node after the RELEASE, so every instance on a machine claimed
+    # `tightbeam_gateway@<host>` and the second refused to boot ("name ... seems
+    # to be in use by another Erlang node"). The port is the right discriminator
+    # because two instances need different ports anyway. `TIGHTBEAM_NODE`
+    # overrides it; an explicit `RELEASE_NODE` still wins, since that is the
+    # release runtime's own knob and this script has no business overruling it.
+    if [ -z "${RELEASE_NODE:-}" ]; then
+      if [ -n "${TIGHTBEAM_NODE:-}" ]; then
+        RELEASE_NODE="$TIGHTBEAM_NODE"
+      else
+        RELEASE_NODE="tightbeam_gateway_${TIGHTBEAM_PORT:-11373}"
+      fi
+      export RELEASE_NODE
+    fi
+    case "${1:-}" in
+      "" | -*) set -- start "$@" ;;
+    esac
+    exec "$REL" "$@"
+    ;;
+esac
