@@ -6,7 +6,7 @@ defmodule Tightbeam.Harness.Support do
   # cannot re-inject the poison R3 scrubs (RELEASE_*, instance selectors, ERTS
   # paths). Their prefixes (e.g. RELEASE_*) are enforced in
   # placement.ex `unreserved_env_name/1`, which a flat list cannot express.
-  @reserved_overlay_env_vars ~w(PATH CLAUDE_CONFIG_DIR CODEX_HOME TIGHTBEAM_URL) ++
+  @reserved_overlay_env_vars ~w(PATH CLAUDE_CONFIG_DIR CODEX_HOME GH_CONFIG_DIR TIGHTBEAM_URL) ++
                                Tightbeam.ProductionIdentityEnv.exact()
   @bundle_path Application.app_dir(:tightbeam, "priv/harness_bundle.json")
   @external_resource @bundle_path

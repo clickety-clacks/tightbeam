@@ -281,6 +281,17 @@ defmodule Tightbeam.IdentityTest do
     coder = Identity.snapshot!(base, "coder", :codex)
     assert coder.guidance =~ "Review can start before a passing-test receipt"
     assert coder.guidance =~ "--verdict tests-passed"
+
+    for archetype <- ["coder", "orchestrator", "product-owner"] do
+      guidance = Identity.snapshot!(base, archetype, :codex).guidance
+      assert guidance =~ "attach the mandatory evidence block"
+      assert guidance =~ "projection-broken-stale-overlay"
+      assert guidance =~ "projection-broken-session-predates-reservation"
+    end
+
+    capabilities = File.read!(Path.join(shipped, "capabilities.md"))
+    assert capabilities =~ "GitHub auth looks missing"
+    assert capabilities =~ "$TIGHTBEAM_HOME/auth/github/gh"
   end
 
   test "init refuses an identity repository missing the live ref with repair guidance", ctx do

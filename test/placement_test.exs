@@ -1015,10 +1015,20 @@ defmodule Tightbeam.PlacementTest do
     gh_dir = Path.join([base_dir, "auth", "github", "gh"])
     refute File.dir?(gh_dir)
 
-    assert {"GH_CONFIG_DIR", gh_dir} in Placement.adapter_opts(
-             config,
-             {:claude, "default", "testhost"}
-           )[:env]
+    {:ok, []} =
+      DB.query(
+        db,
+        "INSERT INTO harness_env_overlays (host, harness, name, value, setBy, setAt) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        [Placement.local_host_name(), "claude", "GH_CONFIG_DIR", "/stale/gh", "user:operator", 1]
+      )
+
+    projected =
+      config
+      |> Placement.adapter_opts({:claude, "default", "testhost"})
+      |> Keyword.fetch!(:env)
+      |> Enum.filter(fn {name, _value} -> name == "GH_CONFIG_DIR" end)
+
+    assert projected == [{"GH_CONFIG_DIR", gh_dir}]
   end
 
   test "adapter_opts appends an ssh overlay to remote_env", %{base_dir: base_dir, db: db} do
@@ -1041,6 +1051,13 @@ defmodule Tightbeam.PlacementTest do
                "user:operator"
              )
 
+    {:ok, []} =
+      DB.query(
+        db,
+        "INSERT INTO harness_env_overlays (host, harness, name, value, setBy, setAt) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        ["worker", "codex", "GH_CONFIG_DIR", "/stale/gh", "user:operator", 1]
+      )
+
     sh = fn command ->
       if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
            Enum.any?(command, &String.contains?(&1, "cat")),
@@ -1060,6 +1077,10 @@ defmodule Tightbeam.PlacementTest do
     command = Placement.adapter_opts(config, {:codex, "default", "worker"})[:cmd]
     assignment = "EXAMPLE_OVERLAY_VAR='example remote'"
     assert assignment in command
+
+    assert Enum.filter(command, &String.starts_with?(&1, "GH_CONFIG_DIR=")) == [
+             "GH_CONFIG_DIR='/srv/tb/auth/github/gh'"
+           ]
 
     assert Enum.find_index(command, &(&1 == assignment)) >
              Enum.find_index(command, &String.starts_with?(&1, "TIGHTBEAM_LINEAGE="))

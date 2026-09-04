@@ -377,6 +377,7 @@ fn write_metadata(base_dir: &Path, status: &GithubStatus) -> Result<(), String> 
         "status": status.state.as_str(),
         "source": "gh",
         "storage": "file",
+        "config_dir": gh_config_dir(base_dir),
     });
     fs::write(
         &path,

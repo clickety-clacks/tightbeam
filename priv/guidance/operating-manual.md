@@ -318,6 +318,25 @@ rows already authorize, or asks how to record work rather than what to build. Th
 genuine product choices, trust roots (what the org may touch and under whose credential),
 and scope questions only.
 
+Before filing an `operator-ask` that claims GitHub auth or write access is missing, or that
+asks for a GitHub token, attach the mandatory evidence block defined in `docs/GITHUB-AUTH.md`
+under "Agent environment." An ask without that block is incomplete and must be bounced.
+Run the live probe in the environment where the git or gh operation will run. For another
+host, use a session on that host and attach its result.
+
+Compare the projected `$GH_CONFIG_DIR` with the expected
+`$TIGHTBEAM_HOME/auth/github/gh`. A mismatch means the projection is broken. An absent
+`$GH_CONFIG_DIR` with a `live` capability fact also means the projection is broken. Diagnose
+a stale overlay on a release without the reservation as `projection-broken-stale-overlay`;
+repair it with `tightbeam host-env-unset --host <host> --harness <harness> GH_CONFIG_DIR` or by
+fixing the overlay. If the release includes the reservation but the session started before that
+release was installed, diagnose
+`projection-broken-session-predates-reservation` and restart or respawn the session. A post-ship
+restart re-projects the corrected environment, so an unset is not required. Only a matching
+projection plus a non-live probe is `needs-onboarding`, repaired with `tightbeam onboard github
+--hostname <host>`. Never ask for a PAT. Record paths and state only. Never record token bytes or
+`hosts.yml` contents.
+
 File an owner-scoped decision with `operator-ask`. The command returns a decision request id
 (`dr_id`). Quote that dr_id in each related wake.
 

@@ -1013,17 +1013,27 @@ defmodule Tightbeam.Placement do
   defp unreserved_env_name(name) do
     credential_env_names = Enum.flat_map(Harness.all(), & &1.credential_env_vars())
 
-    if String.starts_with?(name, "TIGHTBEAM_") or
-         name in Tightbeam.Harness.Support.reserved_overlay_env_vars() or
-         Enum.any?(Tightbeam.ProductionIdentityEnv.prefixes(), &String.starts_with?(name, &1)) or
-         name in credential_env_names do
-      {:error,
-       %{
-         code: "reserved_env_name",
-         message: "reserved_env_name rule: Tightbeam owns #{name}; it cannot be an overlay"
-       }}
-    else
-      :ok
+    cond do
+      name == "GH_CONFIG_DIR" ->
+        {:error,
+         %{
+           code: "reserved_env_name",
+           message:
+             "reserved_env_name rule: Tightbeam owns GH_CONFIG_DIR; use tightbeam onboard github to change the GitHub bank"
+         }}
+
+      String.starts_with?(name, "TIGHTBEAM_") or
+        name in Tightbeam.Harness.Support.reserved_overlay_env_vars() or
+        Enum.any?(Tightbeam.ProductionIdentityEnv.prefixes(), &String.starts_with?(name, &1)) or
+          name in credential_env_names ->
+        {:error,
+         %{
+           code: "reserved_env_name",
+           message: "reserved_env_name rule: Tightbeam owns #{name}; it cannot be an overlay"
+         }}
+
+      true ->
+        :ok
     end
   end
 
@@ -1357,6 +1367,7 @@ defmodule Tightbeam.Placement do
       config
       |> Map.get(:db, DB)
       |> env_overlays(host, module.wire_name())
+      |> Enum.reject(&(&1.name == "GH_CONFIG_DIR"))
       |> Enum.map(&{&1.name, &1.value})
 
     path = adapter_path(config, host_config)

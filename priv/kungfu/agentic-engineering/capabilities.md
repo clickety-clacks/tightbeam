@@ -16,6 +16,12 @@ with an addressable PO alongside it for product intent and acceptance judgment.
   Activity-based model selection supports mixed, Codex-only and Claude-only organizations.
 - Protected coordination: explicit responsibility, useful recovery, effect-based
   completion review and destructive-git protection.
+- GitHub auth looks missing, or an agent asks for a PAT or token: the projected
+  `GH_CONFIG_DIR` points at the host's banked gh store. Read state with the live probe
+  from the agent's own shell, but first compare `$GH_CONFIG_DIR` with
+  `$TIGHTBEAM_HOME/auth/github/gh` as `docs/GITHUB-AUTH.md` requires. A mismatch means
+  the projection is broken, not that onboarding or a PAT is needed. Watch for: "give
+  me a GitHub token," "auth is missing host-wide," or a stalled clone or push.
 
 Use these capabilities when the user needs help carrying engineering work through
 delivery. Establish the product's delivery owner and PO within existing authority;
