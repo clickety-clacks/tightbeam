@@ -696,6 +696,14 @@ defmodule Tightbeam.Assignments do
         [assignment_id, session_key, ts]
       )
 
+      revoked_assignment = fetch_assignment!(txn, assignment_id)
+
+      CompletionEscalation.open_terminal_in_txn(txn, revoked_assignment, "revocation", %{
+        id: revocation_id,
+        by_user: revoked_by_user,
+        by_session: revoked_by_session
+      })
+
       append_notice(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
       Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
 
@@ -2840,7 +2848,7 @@ defmodule Tightbeam.Assignments do
     closed_assignment = fetch_assignment!(txn, assignment.id)
 
     if call.params.kind == "completion" do
-      CompletionEscalation.open_in_txn(txn, closed_assignment, attest)
+      CompletionEscalation.open_terminal_in_txn(txn, closed_assignment, "attest", attest)
     end
 
     Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
@@ -3193,6 +3201,13 @@ defmodule Tightbeam.Assignments do
 
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     revoked_assignment = fetch_assignment!(txn, assignment_id)
+
+    CompletionEscalation.open_terminal_in_txn(txn, revoked_assignment, "revocation", %{
+      id: revocation_id,
+      by_user: closed_user,
+      by_session: closed_session
+    })
+
     Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
 
     liveness_trigger = disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
