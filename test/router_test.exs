@@ -332,7 +332,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert body["build"] == Tightbeam.BuildStamp.build()
     assert body["sha"] == Tightbeam.BuildStamp.sha()
     assert body["protocolVersion"] == 1
-    assert body["features"] == ["activation-events-v1"]
+    assert body["features"] == ["activation-events-v1", "stale-turn-settlement-v1"]
   end
 
   test "activation wire verbs are non-target calls with camel-case params", ctx do

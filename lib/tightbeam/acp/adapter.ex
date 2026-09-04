@@ -361,7 +361,8 @@ defmodule Tightbeam.Acp.Adapter do
         cmd: Keyword.fetch!(opts, :cmd),
         env: Keyword.get(opts, :env, []),
         stderr_path: stderr_path,
-        subscriber: self()
+        subscriber: self(),
+        connection_generation: Keyword.get(opts, :connection_generation)
       )
 
     case Keyword.fetch(opts, :harness_process_launch_id) do

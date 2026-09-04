@@ -78,6 +78,19 @@ defmodule Tightbeam.AdapterCoordinator do
     GenServer.call(server, {:adapter_for, key}, :infinity)
   end
 
+  @doc "Run one callback while adapter replacement is fenced to an exact generation."
+  @spec with_generation_fence(GenServer.server(), adapter_key(), pos_integer(), map()) ::
+          {:ok, term()} | {:error, term()}
+  def with_generation_fence(server \\ __MODULE__, key, expected_generation, owner_scope) do
+    GenServer.call(
+      server,
+      {:with_generation_fence, key, expected_generation, owner_scope},
+      :infinity
+    )
+  catch
+    :exit, reason -> {:error, {:coordinator_unavailable, reason}}
+  end
+
   @doc """
   Start or return an adapter using context already captured by the caller.
 
@@ -235,6 +248,29 @@ defmodule Tightbeam.AdapterCoordinator do
       end
 
     {:reply, reply, state}
+  end
+
+  def handle_call(
+        {:with_generation_fence, key, expected_generation, owner_scope},
+        _from,
+        state
+      ) do
+    entry = Map.get(state.adapters, key, fresh_entry())
+
+    result =
+      with true <- is_integer(expected_generation) and expected_generation > 0,
+           %{lane_pid: lane_pid, gateway_pid: gateway_pid, callback: callback} <- owner_scope,
+           true <- is_pid(lane_pid) and is_pid(gateway_pid) and lane_pid != gateway_pid,
+           true <- Process.alive?(lane_pid) and Process.alive?(gateway_pid),
+           true <- live_entry?(entry) and entry.ready,
+           true <- entry.generation == expected_generation,
+           true <- is_function(callback, 3) do
+        run_generation_fence(entry, lane_pid, gateway_pid, callback)
+      else
+        _ -> {:error, :generation_unavailable}
+      end
+
+    {:reply, result, state}
   end
 
   def handle_call({:acquire_load_slot, machine, borrower}, from, state) do
@@ -679,9 +715,13 @@ defmodule Tightbeam.AdapterCoordinator do
     # dead host. Boot failures arrive as :DOWN — the uniform recovery path.
     adapter_opts = state.adapter_opts
     coordinator = self()
+    generation = max(entry.generation, 1)
 
     boot = fn ->
-      opts = adapter_opts.(key, adapter_context) |> Keyword.put(:db, state.db)
+      opts =
+        adapter_opts.(key, adapter_context)
+        |> Keyword.put(:db, state.db)
+        |> Keyword.put(:connection_generation, generation)
 
       opts =
         if Keyword.has_key?(opts, :process_identity_dir) do
@@ -709,7 +749,6 @@ defmodule Tightbeam.AdapterCoordinator do
     case DynamicSupervisor.start_child(state.adapter_sup, child) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
-        generation = max(entry.generation, 1)
 
         # Boot is LAZY: a spawned pid proves nothing. failures/circuit are
         # reset only by {:adapter_ready, key, pid} — the completed-boot signal.
@@ -854,6 +893,83 @@ defmodule Tightbeam.AdapterCoordinator do
   defp live_entry?(entry), do: is_pid(entry.pid) and Process.alive?(entry.pid)
   defp checkout(entry), do: {:ok, entry.pid, entry.generation}
   defp normalize_context(context), do: context |> Map.new() |> Enum.sort()
+
+  defp run_generation_fence(entry, lane_pid, gateway_pid, callback) do
+    {:ok, fence} =
+      __MODULE__.GenerationFence.start([lane_pid, gateway_pid, entry.pid], self())
+
+    owner = self()
+    work_id = make_ref()
+
+    {worker, monitor} =
+      spawn_monitor(fn ->
+        result =
+          try do
+            callback.(entry.pid, entry.generation, fn ->
+              __MODULE__.GenerationFence.valid?(fence)
+            end)
+          rescue
+            error -> {:error, {:callback_exception, error, __STACKTRACE__}}
+          catch
+            kind, reason -> {:error, {:callback_exit, kind, reason}}
+          end
+
+        send(owner, {:generation_fence_result, work_id, result})
+      end)
+
+    result =
+      receive do
+        {:generation_fence_result, ^work_id, callback_result} ->
+          Process.demonitor(monitor, [:flush])
+
+          if __MODULE__.GenerationFence.valid?(fence),
+            do: {:ok, callback_result},
+            else: {:error, :owner_lost}
+
+        {:generation_fence_owner_lost, ^fence, _owner_pid} ->
+          Process.exit(worker, :kill)
+
+          receive do
+            {:DOWN, ^monitor, :process, ^worker, _reason} -> :ok
+          after
+            1_000 -> Process.demonitor(monitor, [:flush])
+          end
+
+          {:error, :owner_lost}
+
+        {:DOWN, ^monitor, :process, ^worker, reason} ->
+          {:error, {:callback_exit, reason}}
+      end
+
+    __MODULE__.GenerationFence.stop(fence)
+    result
+  end
+
+  defmodule GenerationFence do
+    @moduledoc false
+    use GenServer
+
+    def start(owners, observer), do: GenServer.start(__MODULE__, {owners, observer})
+    def valid?(fence), do: GenServer.call(fence, :valid)
+    def stop(fence), do: GenServer.stop(fence, :normal)
+
+    @impl true
+    def init({owners, observer}) do
+      monitors = Map.new(owners, fn owner -> {Process.monitor(owner), owner} end)
+      {:ok, %{valid: true, monitors: monitors, observer: observer}}
+    end
+
+    @impl true
+    def handle_call(:valid, _from, state), do: {:reply, state.valid, state}
+
+    @impl true
+    def handle_info({:DOWN, ref, :process, owner, _reason}, state) do
+      if state.valid and Map.get(state.monitors, ref) == owner,
+        do: send(state.observer, {:generation_fence_owner_lost, self(), owner})
+
+      {:noreply, %{state | valid: false, monitors: Map.delete(state.monitors, ref)}}
+    end
+  end
 
   defp context_request_for_monitor(requests, monitor) do
     Enum.find(requests, fn {_request_ref, request} -> request.monitor == monitor end)

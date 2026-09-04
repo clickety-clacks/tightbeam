@@ -444,6 +444,8 @@ defmodule Tightbeam.TurnLifecycle do
 
   defp system_terminal_authority?(event) do
     (event.cause == "session-retired" and nonempty_string?(event.principal)) or
+      (event.cause == "operator:stale-running-turn" and
+         String.starts_with?(event.principal, "user:")) or
       (event.principal == "process:tightbeam" and
          (event.cause == "boot-recovery" or String.starts_with?(event.cause, "unclaimable:")))
   end

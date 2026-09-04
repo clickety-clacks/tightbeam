@@ -1044,6 +1044,108 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert Tightbeam.Projection.list_after(ctx.db, session_key, nil, 10) == []
   end
 
+  test "generation fence holds adapter teardown and releases it in mailbox order", ctx do
+    key = {:claude, "shared", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"fence_#{System.unique_integer([:positive])}")
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
+
+    owner = self()
+    lane = spawn(fn -> receive do: (:stop -> :ok) end)
+
+    fenced =
+      Task.async(fn ->
+        AdapterCoordinator.with_generation_fence(coordinator, key, 1, %{
+          lane_pid: lane,
+          gateway_pid: owner,
+          callback: fn checked_adapter, generation, valid? ->
+            send(owner, {:inside_fence, checked_adapter, generation, self()})
+
+            receive do
+              :release_fence -> {:checked, valid?.()}
+            end
+          end
+        })
+      end)
+
+    assert_receive {:inside_fence, ^adapter, 1, worker}, 2_000
+    close = Task.async(fn -> AdapterCoordinator.close_adapter(coordinator, key) end)
+    assert Task.yield(close, 50) == nil
+    send(worker, :release_fence)
+    assert {:ok, {:checked, true}} = Task.await(fenced, 2_000)
+    assert :ok = Task.await(close, 2_000)
+    refute Process.alive?(adapter)
+
+    send(lane, :stop)
+  end
+
+  test "generation fence refuses wrong generations and aborts on owner loss", ctx do
+    key = {:claude, "shared", "testhost"}
+
+    coordinator =
+      start_fake_coordinator(ctx, :"owner_fence_#{System.unique_integer([:positive])}")
+
+    assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
+
+    assert {:error, :generation_unavailable} =
+             AdapterCoordinator.with_generation_fence(coordinator, key, 2, %{
+               lane_pid: spawn(fn -> Process.sleep(:infinity) end),
+               gateway_pid: self(),
+               callback: fn _, _, _ -> :unreachable end
+             })
+
+    owner = self()
+    lane = spawn(fn -> receive do: (:stop -> :ok) end)
+
+    fenced =
+      Task.async(fn ->
+        AdapterCoordinator.with_generation_fence(coordinator, key, 1, %{
+          lane_pid: lane,
+          gateway_pid: owner,
+          callback: fn _, _, _ ->
+            send(owner, :owner_fence_entered)
+            Process.sleep(:infinity)
+          end
+        })
+      end)
+
+    assert_receive :owner_fence_entered, 2_000
+    Process.exit(lane, :kill)
+    assert {:error, :owner_lost} = Task.await(fenced, 2_000)
+    assert AdapterCoordinator.ready?(coordinator, key)
+  end
+
+  test "generation fence aborts before a dead adapter generation is absorbed", ctx do
+    key = {:claude, "shared", "testhost"}
+
+    coordinator =
+      start_fake_coordinator(ctx, :"adapter_fence_#{System.unique_integer([:positive])}")
+
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    await_ready!(coordinator, key)
+    owner = self()
+    lane = spawn(fn -> receive do: (:stop -> :ok) end)
+
+    fenced =
+      Task.async(fn ->
+        AdapterCoordinator.with_generation_fence(coordinator, key, 1, %{
+          lane_pid: lane,
+          gateway_pid: owner,
+          callback: fn _, _, _ ->
+            send(owner, :adapter_fence_entered)
+            Process.sleep(:infinity)
+          end
+        })
+      end)
+
+    assert_receive :adapter_fence_entered, 2_000
+    Process.exit(adapter, :kill)
+    assert {:error, :owner_lost} = Task.await(fenced, 2_000)
+    assert eventually(fn -> coordinator_generation(coordinator, key) == 2 end)
+    send(lane, :stop)
+  end
+
   # `start_supervised!` is not a boot barrier: Acp.Adapter returns from init
   # before `node` is spawned, and only {:adapter_ready, key} marks the entry
   # ready. A death BEFORE that point is a boot failure, which deliberately

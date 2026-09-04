@@ -96,8 +96,10 @@ defmodule Tightbeam.Schema do
   # reviewed R17 boundary therefore refuses every predecessor and recreates at
   # v15; the older named migration helpers remain explicit test seams only.
   # The deliverable contract adds companion tables and advances the exact v15
-  # predecessor transactionally to v16.
-  @shape "coordination-fabric-v1-phase1-v16"
+  # predecessor transactionally to v16. Stale-turn settlement then extends the
+  # wire idempotency ledger and advances that exact predecessor to v17.
+  @shape "coordination-fabric-v1-phase1-v17"
+  @stale_turn_settlement_previous_shape "coordination-fabric-v1-phase1-v16"
   @deliverable_contract_previous_shape "coordination-fabric-v1-phase1-v15"
   @completion_previous_shape "coordination-fabric-v1-phase1-v14"
   @cannot_proceed_previous_shape "coordination-fabric-v1-phase1-v13"
@@ -1019,6 +1021,57 @@ defmodule Tightbeam.Schema do
   end
 
   @doc false
+  @spec upgrade_stale_turn_settlement_v1(DB.server()) :: :ok
+  def upgrade_stale_turn_settlement_v1(db) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@stale_turn_settlement_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_stale_turn_settlement_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Idempotency.upgrade_settlement_v1_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @stale_turn_settlement_previous_shape,
+             @shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_stale_turn_settlement_v1: stamp race"
+               )
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_stale_turn_settlement_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_stale_turn_settlement_v1: migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
   @spec upgrade_effort_request_exit_v1(DB.server()) :: :ok
   def upgrade_effort_request_exit_v1(db) do
     case DB.foreign_key_rebuild(db, fn txn ->
@@ -1934,12 +1987,18 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@stale_turn_settlement_previous_shape]]} ->
+        upgrade_stale_turn_settlement_v1(db)
+
       {:ok, [[@deliverable_contract_previous_shape]]} ->
-        Tightbeam.DeliverableContract.upgrade_v1(
-          db,
-          @deliverable_contract_previous_shape,
-          @shape
-        )
+        :ok =
+          Tightbeam.DeliverableContract.upgrade_v1(
+            db,
+            @deliverable_contract_previous_shape,
+            @stale_turn_settlement_previous_shape
+          )
+
+        upgrade_stale_turn_settlement_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -1955,8 +2014,8 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration from #{found}. The only supported upgrade source
-        is #{@deliverable_contract_previous_shape}.
+        There is no migration from #{found}. The supported upgrade sources are
+        #{@stale_turn_settlement_previous_shape} and #{@deliverable_contract_previous_shape}.
         Move this database aside and let it be recreated.
         """
 

@@ -33,12 +33,12 @@ defmodule Tightbeam.Acp.ConnTest do
   });
   """
 
-  defp start_conn(ctx_name) do
+  defp start_conn(ctx_name, opts \\ []) do
     script_path = Path.join(System.tmp_dir!(), "fake_adapter_#{ctx_name}.js")
     File.write!(script_path, @fake)
 
     start_supervised!(
-      {Conn, cmd: [System.find_executable("node"), script_path], subscriber: self()}
+      {Conn, [cmd: [System.find_executable("node"), script_path], subscriber: self()] ++ opts}
     )
   end
 
@@ -129,6 +129,43 @@ defmodule Tightbeam.Acp.ConnTest do
     # adapter eventually answers (via cancel path) -> entry resolves
     Conn.notify(conn, "session/cancel", %{})
     assert eventually(fn -> map_size(:sys.get_state(conn).pending) == 0 end)
+  end
+
+  test "the local provider probe is generation and harness-session exact" do
+    conn = start_conn("probe", connection_generation: 7)
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
+
+    task =
+      Task.async(fn ->
+        Conn.request(conn, "never", %{}, session_id: "hs-1", timeout: :infinity)
+      end)
+
+    assert eventually(fn -> Map.has_key?(:sys.get_state(conn).pending, 2) end)
+    assert {:live, 2} = Conn.probe_request(conn, 2, "hs-1", 7, 1_000)
+    assert {:unknown, :uncorrelatable} = Conn.probe_request(conn, 2, "hs-other", 7, 1_000)
+    assert {:unknown, :uncorrelatable} = Conn.probe_request(conn, 2, "hs-1", 6, 1_000)
+    assert :absent = Conn.probe_request(conn, 99, "hs-1", 7, 1_000)
+
+    Task.shutdown(task, :brutal_kill)
+    assert_receive {:acp_orphan_resolved, "hs-1"}, 2_000
+  end
+
+  test "a timed-out unresolved request remains live to the local probe" do
+    conn = start_conn("probe_timeout", connection_generation: 7)
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
+    assert {:error, :timeout} = Conn.request(conn, "never", %{}, session_id: "hs-1", timeout: 20)
+    assert {:live, 2} = Conn.probe_request(conn, 2, "hs-1", 7, 1_000)
+
+    Conn.notify(conn, "session/cancel", %{})
+    assert eventually(fn -> map_size(:sys.get_state(conn).pending) == 0 end)
+  end
+
+  test "invalid and closed probes refuse without provider traffic" do
+    conn = start_conn("probe_closed", connection_generation: 7)
+    assert {:unknown, :uncorrelatable} = Conn.probe_request(conn, 0, "hs-1", 7, 1_000)
+    Conn.close(conn)
+    assert eventually(fn -> :sys.get_state(conn).closed end)
+    assert {:unknown, :uncorrelatable} = Conn.probe_request(conn, 1, "hs-1", 7, 1_000)
   end
 
   test "an unbounded prompt request stays pending until an event resolves it" do

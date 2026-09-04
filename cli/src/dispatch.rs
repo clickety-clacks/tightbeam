@@ -1216,6 +1216,25 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("cancelWakeId", wake_id)],
         )),
+        Command::SettleTurn {
+            identity,
+            session_key,
+            turn_seq,
+            outcome,
+            reason,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "settle-turn",
+            vec![],
+            vec![
+                string_field("sessionKey", session_key),
+                format!("\"turnSeq\":{turn_seq}"),
+                string_field("outcome", outcome),
+                string_field("reason", reason),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
         Command::IdentityEdit {
             identity,
             archetype,
@@ -1964,7 +1983,12 @@ where
             if let Some(identity) = command_identity(&command) {
                 require_session_endpoint(identity, &endpoint)?;
             }
-            if matches!(command, Command::Activation { .. }) {
+            let required_feature = match command {
+                Command::Activation { .. } => Some("activation-events-v1"),
+                Command::SettleTurn { .. } => Some("stale-turn-settlement-v1"),
+                _ => None,
+            };
+            if let Some(required_feature) = required_feature {
                 let version = RequestSpec {
                     method: "GET",
                     path: "/version",
@@ -1978,10 +2002,10 @@ where
                     .is_some_and(|features| {
                         features
                             .iter()
-                            .any(|feature| feature.as_str() == Some("activation-events-v1"))
+                            .any(|feature| feature.as_str() == Some(required_feature))
                     });
                 if !present {
-                    return Err("capability_missing: activation-events-v1".to_owned());
+                    return Err(format!("capability_missing: {required_feature}"));
                 }
             }
             let request = build_request(&command)?;
@@ -2067,6 +2091,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::CompletionNotices { identity, .. }
         | Command::CompletionDisposition { identity, .. }
         | Command::CancelWake { identity, .. }
+        | Command::SettleTurn { identity, .. }
         | Command::IdentityEdit { identity, .. }
         | Command::IdentityStatus { identity, .. }
         | Command::IdentityRelearn { identity, .. }
@@ -3776,6 +3801,24 @@ mod tests {
             (
                 &["cancel-wake", "wake-1", "--as-process", "cron"][..],
                 r#"{"asProcess":"cron","verb":"wake","params":{"cancelWakeId":"wake-1"}}"#,
+            ),
+            (
+                &[
+                    "settle-turn",
+                    "--session",
+                    "agent:coder:stale",
+                    "--seq",
+                    "42",
+                    "--outcome",
+                    "cancel",
+                    "--reason",
+                    "operator-confirmed phantom",
+                    "--key",
+                    "settlement-42",
+                    "--as-user",
+                    "mike",
+                ][..],
+                r#"{"asUser":"mike","verb":"settle-turn","params":{"sessionKey":"agent:coder:stale","turnSeq":42,"outcome":"cancel","reason":"operator-confirmed phantom","idempotencyKey":"settlement-42"}}"#,
             ),
             (
                 &["identity", "status", "--as-user", "flynn"][..],

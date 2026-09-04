@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
 
-  @shape "coordination-fabric-v1-phase1-v16"
+  @shape "coordination-fabric-v1-phase1-v17"
 
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
@@ -70,6 +70,45 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [[@shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the exact v16 predecessor preserves idempotency rows and gains settlement receipts",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    :ok = DB.execute(db, "DROP TABLE wire_idempotency")
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        CREATE TABLE wire_idempotency (
+          ownerUserId TEXT NOT NULL,
+          operation TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign','condition','work-item-create')),
+          idempotencyKey TEXT NOT NULL,
+          sessionKey TEXT NOT NULL,
+          PRIMARY KEY (ownerUserId, operation, idempotencyKey)
+        );
+        INSERT INTO wire_idempotency VALUES ('flynn','spawn','old-key','old-session');
+        UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v16';
+        """
+      )
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert Tightbeam.Idempotency.get(db, "flynn", "spawn", "old-key") == %{
+             owner_user_id: "flynn",
+             operation: "spawn",
+             idempotency_key: "old-key",
+             session_key: "old-session"
+           }
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, columns} = DB.query(db, "PRAGMA table_info(wire_idempotency)")
+    names = Enum.map(columns, fn [_cid, name | _] -> name end)
+    assert "requestFingerprint" in names
+    assert "responseJson" in names
+    assert :ok = Schema.ensure_all(db)
   end
 
   test "the exact v13 predecessor preserves historical surrender rows and gains cannot-proceed",
@@ -539,7 +578,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v14"
-    assert error.message =~ "this build: coordination-fabric-v1-phase1-v16"
+    assert error.message =~ "this build: coordination-fabric-v1-phase1-v17"
     assert error.message =~ "There is no migration"
     assert table_columns(db, "assignments") == before
 

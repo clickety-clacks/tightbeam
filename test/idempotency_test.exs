@@ -51,4 +51,35 @@ defmodule Tightbeam.IdempotencyTest do
                session_key: "1"
              })
   end
+
+  test "settlement metadata is durable and remains separate from terminal truth", %{db: db} do
+    response =
+      JSON.encode!(%{
+        "sessionKey" => "agent:coder:stale",
+        "turnSeq" => 42,
+        "status" => "canceled",
+        "won" => true,
+        "replayed" => false,
+        "storedError" => nil
+      })
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               Idempotency.put_settlement_in_txn(txn, %{
+                 principal: "user:mike",
+                 idempotency_key: "settlement-42",
+                 session_key: "agent:coder:stale",
+                 request_fingerprint: String.duplicate("a", 64),
+                 response_json: response
+               })
+             end)
+
+    assert Idempotency.settlement(db, "user:mike", "settlement-42") == %{
+             session_key: "agent:coder:stale",
+             request_fingerprint: String.duplicate("a", 64),
+             response_json: response
+           }
+
+    assert Idempotency.settlement(db, "user:other", "settlement-42") == nil
+  end
 end

@@ -130,6 +130,102 @@ defmodule Tightbeam.LaneTest do
     assert Agent.get(agent, & &1) == ["orphaned-commit"]
   end
 
+  test "a fresh settlement reservation suppresses nudges and drains once after release", ctx do
+    parent = self()
+
+    {:ok, manager} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: fn turn ->
+          send(parent, {:successor_ran, turn.seq})
+          {:ok, %{text: turn.prompt}}
+        end,
+        interval: 60_000,
+        name: :settlement_reservation_manager
+      )
+
+    target = enqueue!(ctx.db, "k1", "already terminal")
+    {:ok, claimed} = Ledger.claim_next(ctx.db, "k1", "fixture")
+
+    assert :ok =
+             Ledger.finish(ctx.db, target, "delivered", nil,
+               owner_lease: claimed.owner_lease,
+               cause: "turn-runner",
+               principal: "process:tightbeam"
+             )
+
+    successor = enqueue!(ctx.db, "k1", "run after settlement")
+    assert {:ok, lane, reservation} = LaneManager.ensure_settlement_lane(manager, "k1")
+    assert is_reference(reservation)
+
+    :ok = SessionLane.nudge("k1")
+    state = :sys.get_state(lane)
+    assert state.reservation_token == reservation
+    assert state.deferred_drain
+    assert state.task_ref == nil
+    refute_received {:successor_ran, _}
+
+    request = %{
+      session_key: "k1",
+      turn_seq: target,
+      outcome: "cancel",
+      reason: "operator-confirmed phantom",
+      idempotency_key: "terminal-replay",
+      principal: "user:t",
+      gateway_pid: self()
+    }
+
+    assert {:ok,
+            %{
+              session_key: "k1",
+              turn_seq: ^target,
+              status: "delivered",
+              won: false,
+              replayed: true
+            }} = SessionLane.settle_stale(lane, reservation, request)
+
+    assert_receive {:successor_ran, ^successor}, 2_000
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+  end
+
+  test "a refused settlement releases its fresh reservation and drains queued work", ctx do
+    parent = self()
+
+    {:ok, manager} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: fn turn ->
+          send(parent, {:released_successor_ran, turn.seq})
+          {:ok, %{text: turn.prompt}}
+        end,
+        interval: 60_000,
+        name: :refused_settlement_reservation_manager
+      )
+
+    successor = enqueue!(ctx.db, "k1", "run after refusal")
+    assert {:ok, lane, reservation} = LaneManager.ensure_settlement_lane(manager, "k1")
+
+    request = %{
+      session_key: "k1",
+      turn_seq: 999_999,
+      outcome: "cancel",
+      reason: "target does not exist",
+      idempotency_key: "missing-target",
+      principal: "user:t",
+      gateway_pid: self()
+    }
+
+    assert {:error, %{code: "turn_not_found"}} =
+             SessionLane.settle_stale(lane, reservation, request)
+
+    assert_receive {:released_successor_ran, ^successor}, 2_000
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+  end
+
   test "a crashing runner marks the turn failed and the lane drains on", ctx do
     {:ok, agent} = Agent.start_link(fn -> [] end)
 

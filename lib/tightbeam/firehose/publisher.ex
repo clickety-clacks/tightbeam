@@ -532,6 +532,8 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec observation_notice(String.t(), map(), map()) :: map()
   def observation_notice(class, call, details) do
+    details = Map.merge(settlement_observation_details(call, class), details)
+
     %{
       "class" => class,
       "op" => "observe",
@@ -543,6 +545,28 @@ defmodule Tightbeam.Firehose.Publisher do
         |> Map.put("verb", call.verb)
     }
   end
+
+  defp settlement_observation_details(%{verb: "settle-turn"} = call, class) do
+    params = Map.get(call, :params, %{})
+
+    %{
+      "sessionKey" => params[:session_key],
+      "turnSeq" => params[:turn_seq],
+      "outcome" => params[:outcome],
+      "principal" => Map.get(call, :origin),
+      "idempotencyKeyDigest" => digest(params[:idempotency_key]),
+      "reasonDigest" => digest(params[:reason]),
+      "code" => if(class == "verb.accepted", do: "settled", else: nil)
+    }
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
+  end
+
+  defp settlement_observation_details(_call, _class), do: %{}
+
+  defp digest(value) when is_binary(value),
+    do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
+
+  defp digest(_value), do: nil
 
   defp unwrap(result, "work-items"), do: wrapped(result, [:work_item, "workItem"])
   defp unwrap(result, "assignments"), do: wrapped(result, [:assignment, "assignment"])

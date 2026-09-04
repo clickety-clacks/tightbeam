@@ -1595,6 +1595,41 @@ defmodule Tightbeam.Org do
     end
   end
 
+  @doc "The newest pointer with its immutable row identity, or nil."
+  @spec current_pointer_snapshot(db(), String.t()) :: map() | nil
+  def current_pointer_snapshot(db \\ Tightbeam.DB, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id,harnessSessionId FROM harness_pointers
+        WHERE sessionKey=?1 ORDER BY id DESC LIMIT 1
+        """,
+        [session_key]
+      )
+
+    pointer_snapshot(rows)
+  end
+
+  @doc false
+  @spec current_pointer_snapshot_in_txn(Txn.t(), String.t()) :: map() | nil
+  def current_pointer_snapshot_in_txn(%Txn{} = txn, session_key) do
+    txn
+    |> Txn.q(
+      """
+      SELECT id,harnessSessionId FROM harness_pointers
+      WHERE sessionKey=?1 ORDER BY id DESC LIMIT 1
+      """,
+      [session_key]
+    )
+    |> pointer_snapshot()
+  end
+
+  defp pointer_snapshot([[id, harness_session_id]]),
+    do: %{id: id, harness_session_id: harness_session_id}
+
+  defp pointer_snapshot([]), do: nil
+
   @doc "The full pointer chain, oldest first — the session's harness-residence history."
   @spec pointer_chain(db(), String.t()) :: [pointer()]
   def pointer_chain(db \\ Tightbeam.DB, session_key) do

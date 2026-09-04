@@ -51,6 +51,12 @@ defmodule Tightbeam.LaneManager do
   def ensure_lane_quiet(server \\ __MODULE__, session_key),
     do: GenServer.call(server, {:ensure_lane_quiet, session_key})
 
+  @doc "Ensure an idle settlement lane, reserving a newly created lane before its first drain."
+  @spec ensure_settlement_lane(GenServer.server(), String.t()) ::
+          {:ok, pid(), reference() | nil} | {:error, :reservation_lost}
+  def ensure_settlement_lane(server \\ __MODULE__, session_key),
+    do: GenServer.call(server, {:ensure_settlement_lane, session_key}, :infinity)
+
   @impl true
   def init(opts) do
     state = %__MODULE__{
@@ -81,6 +87,28 @@ defmodule Tightbeam.LaneManager do
   def handle_call({:ensure_lane_quiet, session_key}, _from, state) do
     ensure(state, session_key)
     {:reply, :ok, state}
+  end
+
+  def handle_call({:ensure_settlement_lane, session_key}, _from, state) do
+    reply =
+      case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+        [{pid, _}] ->
+          {:ok, pid, nil}
+
+        [] ->
+          token = make_ref()
+
+          case DynamicSupervisor.start_child(
+                 state.lane_sup,
+                 {SessionLane, lane_opts(state, session_key, settlement_reservation: token)}
+               ) do
+            {:ok, pid} -> {:ok, pid, token}
+            {:error, {:already_started, _pid}} -> {:error, :reservation_lost}
+            {:error, _reason} -> {:error, :reservation_lost}
+          end
+      end
+
+    {:reply, reply, state}
   end
 
   @impl true
@@ -115,15 +143,20 @@ defmodule Tightbeam.LaneManager do
       [] ->
         DynamicSupervisor.start_child(
           state.lane_sup,
-          {SessionLane,
-           session_key: session_key,
-           db: state.db,
-           task_sup: state.task_sup,
-           runner: state.runner,
-           terminal_publisher: state.terminal_publisher,
-           on_terminal: state.on_terminal}
+          {SessionLane, lane_opts(state, session_key)}
         )
     end
+  end
+
+  defp lane_opts(state, session_key, extra \\ []) do
+    [
+      session_key: session_key,
+      db: state.db,
+      task_sup: state.task_sup,
+      runner: state.runner,
+      terminal_publisher: state.terminal_publisher,
+      on_terminal: state.on_terminal
+    ] ++ extra
   end
 
   defp schedule(interval), do: Process.send_after(self(), :tick, interval)

@@ -469,6 +469,14 @@ pub enum Command {
         identity: Identity,
         wake_id: String,
     },
+    SettleTurn {
+        identity: Identity,
+        session_key: String,
+        turn_seq: String,
+        outcome: String,
+        reason: String,
+        idempotency_key: String,
+    },
     IdentityEdit {
         identity: Identity,
         archetype: String,
@@ -905,6 +913,11 @@ COMMANDS:
   cancel-wake <wakeId>
       Cancel a pending (scheduled) wake by its id (from the wake command's
       output).
+
+  settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail
+              --reason <text> --key <idempotencyKey> --as-user <adminUserId>
+      Settle one proven-stale running turn. This operator-only command never
+      interrupts a live task; use cancel for a live task.
 
   kungfu list
       List the kungfu bundles shipped with this Tightbeam build and each
@@ -2710,6 +2723,34 @@ fn parse_with_optional_catalog(
                 wake_id,
             })
         }
+        "settle-turn" => {
+            let usage = "usage: tightbeam settle-turn --session <key> --seq <turnSeq> --outcome cancel|fail --reason <text> --key <idempotencyKey> --as-user <adminUserId>";
+            if parsed.positional.len() != 1 {
+                return Err(usage.to_owned());
+            }
+
+            let outcome = nonempty(flags, "outcome").ok_or_else(|| usage.to_owned())?;
+            if !matches!(outcome.as_str(), "cancel" | "fail") {
+                return Err("--outcome must be cancel or fail".to_owned());
+            }
+
+            let turn_seq = nonempty(flags, "seq").ok_or_else(|| usage.to_owned())?;
+            let normalized_turn_seq = turn_seq
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0 && *value <= i64::MAX as u64)
+                .map(|value| value.to_string())
+                .ok_or_else(|| "--seq must be a positive integer".to_owned())?;
+
+            Ok(Command::SettleTurn {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or_else(|| usage.to_owned())?,
+                turn_seq: normalized_turn_seq,
+                outcome,
+                reason: nonempty(flags, "reason").ok_or_else(|| usage.to_owned())?,
+                idempotency_key: nonempty(flags, "key").ok_or_else(|| usage.to_owned())?,
+            })
+        }
         "identity" => parse_identity_command(&parsed, flags),
         "kungfu" => {
             if parsed.positional.as_slice() != ["kungfu", "list"] {
@@ -2796,7 +2837,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, settle-turn, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
         )),
     }
 }
@@ -3836,6 +3877,7 @@ mod tests {
                 "reopen-assignment",
                 "repair-assignment",
                 "revoke-assignment",
+                "settle-turn",
                 "spawn",
                 "tune",
                 "wake",
@@ -4463,7 +4505,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, settle-turn, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -5011,6 +5053,31 @@ mod tests {
                 Command::CancelWake {
                     identity: Identity::Process("cron".to_owned()),
                     wake_id: "w1".to_owned(),
+                },
+            ),
+            (
+                strings(&[
+                    "settle-turn",
+                    "--session",
+                    "agent:coder:stale",
+                    "--seq",
+                    "42",
+                    "--outcome",
+                    "fail",
+                    "--reason",
+                    "operator-confirmed phantom",
+                    "--key",
+                    "settlement-42",
+                    "--as-user",
+                    "mike",
+                ]),
+                Command::SettleTurn {
+                    identity: Identity::User("mike".to_owned()),
+                    session_key: "agent:coder:stale".to_owned(),
+                    turn_seq: "42".to_owned(),
+                    outcome: "fail".to_owned(),
+                    reason: "operator-confirmed phantom".to_owned(),
+                    idempotency_key: "settlement-42".to_owned(),
                 },
             ),
             (

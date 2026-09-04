@@ -33,6 +33,7 @@ defmodule Tightbeam.Acp.Conn do
             # id => %{from, monitor, session_id, method, orphaned}
             pending: %{},
             subscriber: nil,
+            connection_generation: nil,
             closed: false
 
   ## Client
@@ -67,6 +68,27 @@ defmodule Tightbeam.Acp.Conn do
   @spec close(conn()) :: :ok
   def close(conn), do: GenServer.cast(conn, :close)
 
+  @doc "Read one exact unresolved request from this connection without provider I/O."
+  @spec probe_request(conn(), pos_integer(), String.t(), pos_integer(), pos_integer()) ::
+          {:live, pos_integer()} | :absent | {:unknown, term()}
+  def probe_request(conn, request_id, session_id, generation, timeout_ms)
+      when is_integer(request_id) and request_id > 0 and is_binary(session_id) and
+             is_integer(generation) and generation > 0 and is_integer(timeout_ms) and
+             timeout_ms > 0 do
+    GenServer.call(
+      conn,
+      {:probe_request, request_id, session_id, generation},
+      timeout_ms
+    )
+  catch
+    :exit, {:timeout, _} -> {:unknown, :timeout}
+    :exit, {:noproc, _} -> {:unknown, :closed}
+    :exit, reason -> {:unknown, {:connection_unavailable, reason}}
+  end
+
+  def probe_request(_conn, _request_id, _session_id, _generation, _timeout_ms),
+    do: {:unknown, :uncorrelatable}
+
   ## Server
 
   @impl true
@@ -85,7 +107,12 @@ defmodule Tightbeam.Acp.Conn do
         {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)}
       ])
 
-    {:ok, %__MODULE__{port: port, subscriber: Keyword.get(opts, :subscriber)}}
+    {:ok,
+     %__MODULE__{
+       port: port,
+       subscriber: Keyword.get(opts, :subscriber),
+       connection_generation: Keyword.get(opts, :connection_generation)
+     }}
   end
 
   @impl true
@@ -120,6 +147,24 @@ defmodule Tightbeam.Acp.Conn do
       end
     end
   end
+
+  def handle_call(
+        {:probe_request, request_id, session_id, generation},
+        _from,
+        %{connection_generation: generation, closed: false} = state
+      ) do
+    result =
+      case state.pending[request_id] do
+        %{session_id: ^session_id} -> {:live, request_id}
+        nil -> :absent
+        _mismatch -> {:unknown, :uncorrelatable}
+      end
+
+    {:reply, result, state}
+  end
+
+  def handle_call({:probe_request, _request_id, _session_id, _generation}, _from, state),
+    do: {:reply, {:unknown, :uncorrelatable}, state}
 
   @impl true
   def handle_cast({:notify, method, params}, state) do

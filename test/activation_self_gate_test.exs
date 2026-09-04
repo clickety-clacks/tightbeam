@@ -267,6 +267,7 @@ defmodule Tightbeam.ActivationSelfGateTest do
       |> List.first()
       |> then(&Regex.scan(~r/"([^"]+)"/, &1, capture: :all_but_first))
       |> List.flatten()
+      |> Enum.filter(&String.starts_with?(&1, "activation-"))
 
     %{
       tables:

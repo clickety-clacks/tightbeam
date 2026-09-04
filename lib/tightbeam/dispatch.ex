@@ -239,6 +239,11 @@ defmodule Tightbeam.Dispatch do
 
         case invoke(handler, handler_call) do
           {:returned, %{code: _} = error} ->
+            payload =
+              if verb == "settle-turn",
+                do: outcome_payload(verb, call, {:returned, error}),
+                else: error
+
             :ok =
               EventLog.append_event_with_handoff(
                 db,
@@ -246,7 +251,7 @@ defmodule Tightbeam.Dispatch do
                 verb,
                 origin,
                 session_key,
-                error,
+                payload,
                 principal,
                 &Publisher.denied_in_txn(&1, publisher_call, error)
               )
@@ -381,6 +386,25 @@ defmodule Tightbeam.Dispatch do
 
   defp outcome_payload("activations", _call, {:returned, result}), do: %{count: result.count}
 
+  defp outcome_payload("settle-turn", call, outcome) do
+    params = Map.get(call, :params, %{})
+
+    base = %{
+      session_key: params[:session_key],
+      turn_seq: params[:turn_seq],
+      outcome: params[:outcome],
+      principal: Map.get(call, :origin),
+      idempotency_key_digest: digest(params[:idempotency_key]),
+      reason_digest: digest(params[:reason])
+    }
+
+    case outcome do
+      {:returned, %{code: code}} -> Map.put(base, :code, code)
+      {:returned, result} -> Map.merge(base, %{code: "settled", result: result})
+      {:raised, _exception} -> Map.merge(base, %{code: "server_error", crash: true})
+    end
+  end
+
   defp outcome_payload(verb, _call, {:raised, _exception})
        when verb in @activation_write_verbs or verb in ["activation-status", "activations"],
        do: %{code: "server_error", crash: true}
@@ -409,6 +433,11 @@ defmodule Tightbeam.Dispatch do
   end
 
   defp elided_count(_result), do: 0
+
+  defp digest(value) when is_binary(value),
+    do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
+
+  defp digest(_value), do: nil
 
   defp best_effort_denial(db, verb, origin, principal, session_key, error) do
     try do
