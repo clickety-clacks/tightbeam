@@ -55,11 +55,12 @@ defmodule Tightbeam.Unroutable do
           harness: String.t() | nil,
           selection: Model.t(),
           health: [{String.t(), ModelCatalog.health()}],
-          offered: [offer()]
+          offered: [offer()],
+          version_block: map() | nil
         }
 
   @enforce_keys [:cause, :host, :selection]
-  defstruct [:cause, :host, :harness, :selection, health: [], offered: []]
+  defstruct [:cause, :host, :harness, :selection, :version_block, health: [], offered: []]
 
   @doc """
   The wire code for a cause. `:needs_effort` is `invalid` — the selection is
@@ -95,6 +96,12 @@ defmodule Tightbeam.Unroutable do
   def message(%__MODULE__{cause: :family_absent, harness: nil} = unroutable) do
     "#{Model.to_ref(unroutable.selection)} is not in a fresh harness inventory on " <>
       "#{unroutable.host}" <> offered_hint(unroutable)
+  end
+
+  def message(%__MODULE__{cause: :family_absent, version_block: block} = unroutable)
+      when is_map(block) do
+    "#{inspect(Model.describe(unroutable.selection))} is not offered by " <>
+      "#{unroutable.harness} on host #{unroutable.host}: #{version_gate_story(block)}"
   end
 
   # Opens on the SELECTION, like every other cause, so a caller can put its own
@@ -177,6 +184,32 @@ defmodule Tightbeam.Unroutable do
 
   defp catalog_story({harness, health}, host) do
     "no usable #{harness} model catalog on #{host} (#{inspect(health)})"
+  end
+
+  defp version_gate_story(%{
+         name: name,
+         current_version: current,
+         min_version: min
+       })
+       when is_binary(current) and is_binary(min) do
+    if Version.compare(current, min) == :lt do
+      "Claude Code v#{current} is too old for #{name}; needs v#{min}"
+    else
+      "Claude Code v#{current} does not satisfy the version gate for #{name}"
+    end
+  end
+
+  defp version_gate_story(%{
+         name: name,
+         current_version: current,
+         max_version_exclusive: max
+       })
+       when is_binary(current) and is_binary(max) do
+    "Claude Code v#{current} is too new for #{name}; needs a version before v#{max}"
+  end
+
+  defp version_gate_story(block) do
+    "Claude Code v#{block.current_version} does not satisfy the version gate for #{block.name}"
   end
 
   # A refusal that names only the rejected value makes the operator guess. The
