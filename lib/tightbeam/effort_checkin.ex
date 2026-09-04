@@ -757,78 +757,77 @@ defmodule Tightbeam.EffortCheckin do
     context = Map.put(request.context, "actions", menu)
 
     replacement =
-          schedule_owned_effort_wake_in_txn(
-            txn,
+      schedule_owned_effort_wake_in_txn(
+        txn,
+        %{
+          session_key: next.session_key || Org.personal_session_key(next.user_id),
+          origin: @origin,
+          consumer: "effort_deadline",
+          due_at: deadline,
+          assignment_id: request.assignment_id
+        },
+        request.effort_generation,
+        "decision_deadline"
+      )
+
+    outcome =
+      Escalation.effort_update_generation_in_txn(txn, request.id, wake.wake_id, %{
+        expecter_session_key: next.session_key,
+        expecter_user_id: next.user_id,
+        lineage_rung: next.rung,
+        deadline_at: deadline,
+        deadline_wake_id: replacement.wake_id,
+        options_json: JSON.encode!(menu),
+        context_json: JSON.encode!(context)
+      })
+
+    case outcome do
+      {:advanced, advanced} ->
+        mark_wake_fired(txn, wake.wake_id)
+
+        # The request row is overwritten in place and the replacement deadline
+        # wake carries no rung, so the rung it advanced FROM has no other home.
+        CausalEvents.append_in_txn(txn, %{
+          kind: "effort_rung_advance",
+          assignment_id: request.assignment_id,
+          job_ref: job_ref_in_txn(txn, request.assignment_id),
+          session_key: next.session_key,
+          detail: %{
+            requestId: request.id,
+            fromRung: request.lineage_rung,
+            toRung: next.rung,
+            fromExpecter: expecter_ref(request.expecter_session_key, request.expecter_user_id),
+            toExpecter: expecter_ref(next.session_key, next.user_id)
+          }
+        })
+
+        advanced
+
+      :lost ->
+        winner = request_for_id(txn, request.id)
+
+        command =
+          if winner.status == "open" and winner.deadline_wake_id != replacement.wake_id do
             %{
-              session_key: next.session_key || Org.personal_session_key(next.user_id),
-              origin: @origin,
-              consumer: "effort_deadline",
-              due_at: deadline,
-              assignment_id: request.assignment_id
-            },
-            request.effort_generation,
-            "decision_deadline"
-          )
-
-        outcome =
-          Escalation.effort_update_generation_in_txn(txn, request.id, wake.wake_id, %{
-            expecter_session_key: next.session_key,
-            expecter_user_id: next.user_id,
-            lineage_rung: next.rung,
-            deadline_at: deadline,
-            deadline_wake_id: replacement.wake_id,
-            options_json: JSON.encode!(menu),
-            context_json: JSON.encode!(context)
-          })
-
-        case outcome do
-          {:advanced, advanced} ->
-            mark_wake_fired(txn, wake.wake_id)
-
-            # The request row is overwritten in place and the replacement deadline
-            # wake carries no rung, so the rung it advanced FROM has no other home.
-            CausalEvents.append_in_txn(txn, %{
-              kind: "effort_rung_advance",
-              assignment_id: request.assignment_id,
-              job_ref: job_ref_in_txn(txn, request.assignment_id),
-              session_key: next.session_key,
-              detail: %{
-                requestId: request.id,
-                fromRung: request.lineage_rung,
-                toRung: next.rung,
-                fromExpecter:
-                  expecter_ref(request.expecter_session_key, request.expecter_user_id),
-                toExpecter: expecter_ref(next.session_key, next.user_id)
+              requester: %{kind: "process", id: "tightbeam:effort-checkin"},
+              reason_kind: "superseded",
+              causal_source: %{kind: "wake", id: winner.deadline_wake_id},
+              outcome: %{
+                kind: "replacement",
+                replacement_wake_id: winner.deadline_wake_id
               }
-            })
+            }
+          else
+            decision_disposition_command(
+              txn,
+              winner,
+              liveness_trigger_in_txn!(txn, winner.assignment_id)
+            )
+          end
 
-            advanced
-
-          :lost ->
-            winner = request_for_id(txn, request.id)
-
-            command =
-              if winner.status == "open" and winner.deadline_wake_id != replacement.wake_id do
-                %{
-                  requester: %{kind: "process", id: "tightbeam:effort-checkin"},
-                  reason_kind: "superseded",
-                  causal_source: %{kind: "wake", id: winner.deadline_wake_id},
-                  outcome: %{
-                    kind: "replacement",
-                    replacement_wake_id: winner.deadline_wake_id
-                  }
-                }
-              else
-                decision_disposition_command(
-                  txn,
-                  winner,
-                  liveness_trigger_in_txn!(txn, winner.assignment_id)
-                )
-              end
-
-            cancel_pending_wake_in_txn!(txn, replacement.wake_id, command)
-            nil
-        end
+        cancel_pending_wake_in_txn!(txn, replacement.wake_id, command)
+        nil
+    end
   end
 
   defp rule_in_txn(txn, config, request, action, actor, principal, fresh) do
@@ -1357,15 +1356,15 @@ defmodule Tightbeam.EffortCheckin do
         session_key: generation.holder_key,
         origin: @origin,
         prompt:
-        "[effort check-in] Assignment #{generation.assignment_id}: " <>
-          channel_sentence(evidence) <>
-          " Record only a new material result or evidence, an exact new blocker or refusal, " <>
-          "a bounded decision request, or one new, unexpired bounded checkpoint. " <>
-          "A checkpoint must name the next action or condition and its deadline. " <>
-          "Use `artifact-record` for anything produced outside this workdir " <>
-          "(another machine, a service, a conversation). Do not file generic or duplicate status. " <>
-          "If no reporting exception applies, schedule a concrete continuation wake that names " <>
-          "the next action or dependency condition and when to resume.",
+          "[effort check-in] Assignment #{generation.assignment_id}: " <>
+            channel_sentence(evidence) <>
+            " Record only a new material result or evidence, an exact new blocker or refusal, " <>
+            "a bounded decision request, or one new, unexpired bounded checkpoint. " <>
+            "A checkpoint must name the next action or condition and its deadline. " <>
+            "Use `artifact-record` for anything produced outside this workdir " <>
+            "(another machine, a service, a conversation). Do not file generic or duplicate status. " <>
+            "If no reporting exception applies, schedule a concrete continuation wake that names " <>
+            "the next action or dependency condition and when to resume.",
         due_at: now(),
         assignment_id: generation.assignment_id
       },
