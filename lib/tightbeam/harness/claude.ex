@@ -3,7 +3,7 @@ defmodule Tightbeam.Harness.Claude do
   @behaviour Tightbeam.Harness
 
   alias Tightbeam.Harness.Support
-  alias Tightbeam.Model
+  alias Tightbeam.{Model, ModelManifest}
 
   require Logger
 
@@ -16,110 +16,8 @@ defmodule Tightbeam.Harness.Claude do
     api_key: "ANTHROPIC_API_KEY"
   }
 
-  @api_base "https://api.anthropic.com"
-
-  # NOTE FOR FUTURE AGENTS — the claude model vocabulary is NARROWER than the catalog.
-  #
-  # The derived catalog for claude comes from the Anthropic API (`fetch_catalog/1` hits
-  # `/v1/models`), which currently lists 11 models. The claude ACP adapter's
-  # `session/set_config_option {configId: "model"}` accepts only TEN values, and the
-  # adapter seam renders the identity verbatim — family plus the vendor's context variant,
-  # with our effort on its own config option — so there is NO translation layer to fix. A model
-  # the adapter refuses fails the apply, which runs after EVERY `session/new` and every
-  # `session/load` (never-trust-the-advertised-model), so it recurs on resume, not just
-  # spawn.
-  #
-  # RECORDED LIVE 2026-07-26 against: claude CLI 2.1.220, claude-agent-acp 0.59.0,
-  # @anthropic-ai/claude-agent-sdk 0.3.207. Probe each value with
-  # `session/set_config_option` before trusting this table — it WILL rot, because the
-  # accepted set is whatever the installed CLI currently offers.
-  #
-  #   ACCEPTED  alias `default`  -> Sonnet 5      (same as `sonnet`)
-  #   ACCEPTED  alias `sonnet`   -> Sonnet 5
-  #   ACCEPTED  alias `opus`     -> Opus 4.8      (NOT Opus 5 — see below)
-  #   ACCEPTED  alias `haiku`    -> Haiku 4.5
-  #   ACCEPTED  id `claude-sonnet-5`
-  #   ACCEPTED  id `claude-opus-4-8`
-  #   ACCEPTED  id `claude-haiku-4-5-20251001`
-  #   ACCEPTED  alias `fable` / id `claude-fable-5`  (re-measured 2026-08-05; July
-  #             refusal was environmental — the projected-home pin offers it)
-  #   ACCEPTED  id `claude-opus-5`  (re-measured 2026-08-06; the REJECTED row below
-  #             measured the DEFAULT-PIN vocabulary, not the grant — a pin-probed
-  #             home offered+accepted it and a live prompt answered as Opus 5)
-  #   REJECTED  claude-opus-4-7, claude-sonnet-4-6, claude-opus-4-6,
-  #             claude-opus-4-5-20251101, claude-sonnet-4-5-20250929,
-  #             claude-opus-4-1-20250805
-  #
-  # The accepted ids were EXACTLY the models the aliases resolved to until the pin
-  # lesson (fable, then opus-5) showed the offered set follows the HOME PIN. So
-  # this is not an API-vs-CLI version lag that a mapping table can paper over: the
-  # adapter only accepts the models it is presently offering, by either name.
-  #
-  # WHY THERE IS NO SUBSTITUTION MAP HERE, deliberately: every candidate substitution is
-  # a silent downgrade. `claude-opus-5` -> `opus` delivers Opus 4.8, a different and
-  # older model. `claude-fable-5` has NO equivalent on this adapter version at all.
-  # Mapping either would make a request appear to succeed while delivering something
-  # else, which is the one outcome worse than failing. If a requested claude model is not
-  # in the ACCEPTED list above, it must fail and say so — do not quietly rewrite it.
-  #
-  # WHEN THIS ROTS (a new alias appears, or an accepted value stops being accepted):
-  # re-probe the adapter rather than editing from a changelog. Boot
-  # `node <adapters>/claude-agent-acp`, `initialize`, `session/new`, then read the
-  # `model` entry of the returned `configOptions` for the offered set, and confirm each
-  # candidate with `session/set_config_option`. Update this table and the version stamp
-  # together.
-  #
-  # ALSO GRANT- AND HOME-DEPENDENT, not only version-dependent. A smoke run recorded
-  # opus-5 and fable-5 "refused on this grant", and JOURNAL.md:804 records the offered
-  # list changing with the home's `settings.json` and the session cwd. So this table
-  # pins THREE things at once, and a different account may legitimately accept more.
-  # That is why the set is injectable (`claude_selectable_models` in the catalog's
-  # options, `:all` to disable) rather than only editable here.
-  #
-  # ON CODEX, kind-scoped: the shared-source argument holds only for the
-  # SUBSCRIPTION kind, whose catalog comes from the same account endpoint the
-  # CLI itself consults (codex.ex). The API-KEY kind derives from the platform
-  # route — the account's whole model universe — and the 2026-07-28 api-key
-  # exercise (#99) proved live that codex-acp refuses platform ids at
-  # set_config_option (-32602 for `gpt-5.1-codex`) while accepting codex-native
-  # slugs (`gpt-5.6-sol` ran a real turn). Codex's api-key catalog now carries
-  # its own `@adapter_selectable_models` guard on this precedent.
-  # RE-MEASURED 2026-08-05 on gibson (claude CLI 2.1.221, the production grant):
-  # `claude -p --model claude-fable-5` answered a real prompt — the 2026-07-26
-  # REJECTED row for fable was one environment's snapshot, not a property of the
-  # account or the CLI (Flynn was literally talking to Fable while this table
-  # said his account could not). The offered list is environment-dependent
-  # (JOURNAL.md:804); the projected-home model pin (ops-hardening-v1 §3) is what
-  # makes it deterministic. Keep re-probing per the note above before trusting
-  # any row here, in either direction.
-  # RE-MEASURED 2026-08-06 on gibson (adapter 0.59.0, the production grant):
-  # a pin-probe home (settings.json model=claude-opus-5) OFFERED and ACCEPTED
-  # claude-opus-5, and a live prompt through the production adapter+credential
-  # answered as Opus 5 — the 2026-07-26 REJECTED row for opus-5 was, like
-  # fable's, one environment's snapshot ("refused on this grant" measured a
-  # default-pin vocabulary, not the grant; the operator's own picker offered
-  # Opus 5 all along). Same lesson, second occurrence: re-probe from a second
-  # vantage before trusting any row here, in either direction.
-  # UPGRADED 2026-09-01 on gibson to claude-agent-acp 0.73.0 / SDK 0.3.257 /
-  # bundled Claude Code 2.1.257. This version offers and accepts claude-fable-5-1
-  # plus its 1M-context variant.
-  # Its public picker still exposes aliases, but their meaning changed: opus[1m]
-  # now identifies Opus 5. Tightbeam therefore tries a requested canonical id
-  # first and treats this table only as fallback candidates. The selected
-  # configOption's public currentValue plus init-derived name/description is the
-  # switch-time authority; a real next-turn modelUsage probe is the release gate.
-
-  @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
-                                claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5
-                                claude-opus-5 claude-fable-5-1 claude-fable-5-1[1m])
-
-  @doc """
-  Model values this adapter version accepts at `session/set_config_option`.
-
-  Narrower than the derived catalog — see the note above the attribute. Anything outside
-  this list is refused by the adapter; it is never silently substituted.
-  """
-  def adapter_selectable_models, do: @adapter_selectable_models
+  # The hosted manifest is the sole Claude offered-set authority. Unknown slugs
+  # still pass through to the adapter, whose turn-time refusal remains final.
 
   @adapter_replacements [
     {
@@ -148,7 +46,11 @@ defmodule Tightbeam.Harness.Claude do
   def credential_env_vars, do: @credential_env_vars |> Map.values() |> Enum.sort()
 
   @impl true
-  def default_model, do: Tightbeam.Model.new("claude-sonnet-5", effort: "medium")
+  def default_model, do: ModelManifest.default_model(wire_name())
+
+  @doc false
+  @impl true
+  def unknown_model_passthrough?, do: true
 
   @impl true
   def install_package, do: "@agentclientprotocol/claude-agent-acp"
@@ -261,25 +163,14 @@ defmodule Tightbeam.Harness.Claude do
         do: prefix <> "\n\n" <> guidance,
         else: guidance
 
-    # Candidate vocabulary only. Adapter readback, never this static map,
-    # decides which canonical model an alias means in the running version.
-    # Keeping the 0.59 mappings here preserves fallback on old satellites.
-
     %{
       guidance: guidance,
       meta: %{systemPrompt: %{type: "preset", preset: "claude_code", append: guidance}},
       permission_mode: "bypassPermissions",
       effort_config: "effort",
       resident_model_switch: :fork,
-      model_option_aliases: %{
-        "sonnet" => "claude-sonnet-5",
-        "haiku" => "claude-haiku-4-5-20251001",
-        "opus" => "claude-opus-4-8",
-        "opus[1m]" => "claude-opus-4-8[1m]",
-        "fable" => "claude-fable-5-1",
-        "fable[1m]" => "claude-fable-5-1[1m]"
-      },
-      canonical_model_prefixes: ["claude-"]
+      model_option_aliases: ModelManifest.aliases(wire_name()),
+      canonical_model_prefixes: ModelManifest.prefixes(wire_name())
     }
   end
 
@@ -324,8 +215,7 @@ defmodule Tightbeam.Harness.Claude do
     )
   end
 
-  defp packed_model(%Model{family: family, context: nil}), do: family
-  defp packed_model(%Model{family: family, context: context}), do: "#{family}[#{context}]"
+  defp packed_model(%Model{} = model), do: ModelManifest.render(wire_name(), model)
 
   @impl true
   def materialize_skills(target, cwd, snapshot) do
@@ -512,203 +402,172 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def fetch_catalog(state) do
-    with {:ok, get} <- catalog_getter(state),
-         {:ok, body} <- get.("/v1/models?limit=100"),
-         {:ok, models} <- decode_catalog(body),
-         {:ok, models} <- fill_capabilities(models, get),
-         {:ok, entries} <- derive_catalog_entries(models),
-         entries <- keep_selectable(entries, selectable_models(state)),
-         entries when entries != [] <- entries do
-      {:ok, entries}
+    with {:ok, provider, manifest_health} <- manifest_provider(state),
+         {:ok, version} <- claude_code_version(state),
+         {:ok, entries, version_blocks} <- manifest_entries(provider, version) do
+      {:ok, entries,
+       %{
+         manifest_health: manifest_health,
+         claude_code_version: version,
+         version_blocks: version_blocks
+       }}
     else
       {:error, reason} -> {:error, reason}
-      [] -> {:error, :empty_inventory}
-      _ -> {:error, :malformed_catalog}
     end
   end
 
-  # A catalog is an account's entitlements, so it is derived on the host whose
-  # account it describes. This is a plain vendor HTTPS GET with a bearer token
-  # read off local disk — NOT an ACP or harness surface — which is exactly why
-  # it can run remotely at all.
-  #
-  # Local: read the token, call the API from here. Remote: one bounded ssh whose
-  # script reads the token with `$(cat …)` in the REMOTE shell, the same pattern
-  # turn launch uses (`prepare_launch/3`). No token byte is interpolated into any
-  # command line, so none appears in a process table on either machine, and no
-  # credential moves between them — only the model list comes back.
-  defp catalog_getter(state) do
-    kind = Map.fetch!(state, :credential_kind)
-    credential_path = credential_path(state.base_dir)
-
-    case Map.get(state, :host_config, %{ssh: nil}).ssh do
-      nil -> local_getter(state, credential_path, kind)
-      dest -> {:ok, remote_getter(state, dest, credential_path, kind)}
+  defp manifest_provider(state) do
+    case Map.get(state.options, :model_manifest, ModelManifest) do
+      fun when is_function(fun, 0) -> provider_from_snapshot(fun.())
+      %{} = snapshot -> provider_from_snapshot(snapshot)
+      server -> ModelManifest.provider("claude", server)
     end
   end
 
-  defp local_getter(state, credential_path, kind) do
-    fetch = Map.get(state.options, :claude_fetch, &http_get/2)
+  defp provider_from_snapshot({:error, _reason} = error), do: error
 
-    with {:ok, raw} <- read_token(credential_path),
-         {:ok, credential} <- bearer_secret(kind, raw),
-         true <- credential != "" do
-      {:ok, fn path -> fetch.(path, catalog_headers(kind, credential)) end}
-    else
-      {:error, reason} -> {:error, reason}
-      false -> {:error, :missing_token}
+  defp provider_from_snapshot(%{document: document, health: health}) do
+    case get_in(document, ["providers", "claude"]) do
+      provider when is_map(provider) -> {:ok, provider, health}
+      _ -> {:error, {:manifest_provider_absent, "claude"}}
     end
   end
 
-  # The two kinds are two file FORMATS now, and anything sending this credential over the
-  # wire has to know which it holds.
-  #
-  # A subscription is Claude Code's own `.credentials.json` -- an OAuth record it refreshes
-  # in place -- so the bearer token is a field inside it. An API key is the bare secret and
-  # the file is just its container. Sending the JSON blob as a bearer token is what a naive
-  # read does, and the provider answers 401 "Invalid bearer token", which reads like a bad
-  # credential rather than a bad reader.
-  defp bearer_secret(:api_key, raw), do: {:ok, String.trim(raw)}
+  defp provider_from_snapshot(_snapshot), do: {:error, :malformed_manifest_snapshot}
 
-  defp bearer_secret(:subscription, raw) do
-    case JSON.decode(raw) do
-      {:ok, %{"claudeAiOauth" => %{"accessToken" => token}}} when is_binary(token) ->
-        {:ok, String.trim(token)}
-
-      _ ->
-        {:error, :malformed_credential}
+  defp claude_code_version(state) do
+    case Map.get(state.options, :claude_code_version) do
+      version when is_binary(version) -> normalize_version(version)
+      fun when is_function(fun, 1) -> normalize_version_result(fun.(state))
+      nil -> probe_claude_code_version(state)
     end
   end
 
-  # Both kinds read the SAME route; only the header differs. Recorded live
-  # 2026-07-28 with deliberately invalid credentials, which is what pins the two
-  # names apart: `x-api-key` answers 401 "API key is invalid." while
-  # `Authorization: Bearer` answers 401 "Invalid bearer token" -- two distinct
-  # code paths on one route, so the header is not interchangeable.
-  #
-  # Charlists because this is httpc's header shape, not ours.
-  defp catalog_headers(:subscription, credential) do
-    [
-      {~c"authorization", String.to_charlist("Bearer " <> credential)},
-      {~c"anthropic-version", ~c"2023-06-01"}
-    ]
+  defp normalize_version_result({:ok, version}), do: normalize_version(version)
+  defp normalize_version_result({:error, _reason} = error), do: error
+  defp normalize_version_result(version), do: normalize_version(version)
+
+  defp normalize_version(version) when is_binary(version) do
+    case Regex.run(~r/\d+\.\d+\.\d+/, version) do
+      [value] -> {:ok, value}
+      _ -> {:error, {:claude_code_version_unavailable, String.trim(version)}}
+    end
   end
 
-  defp catalog_headers(:api_key, credential) do
-    [
-      {~c"x-api-key", String.to_charlist(credential)},
-      {~c"anthropic-version", ~c"2023-06-01"}
-    ]
-  end
+  defp normalize_version(version), do: {:error, {:claude_code_version_unavailable, version}}
 
-  # The tightbeam binary on the host that owns the credential. `assimilate` installs it and
-  # the gateway already execs it there, so this names an existing artifact rather than
-  # introducing one.
-  defp cli_path(state), do: Path.join([state.base_dir, "bin", "tightbeam"])
-
-  defp remote_getter(state, dest, credential_path, kind) do
+  # Probe the Claude Code bundled by the adapter SDK on the host that owns the
+  # catalog. CLAUDE_CODE_EXECUTABLE remains the SDK's explicit override seam.
+  defp probe_claude_code_version(state) do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
+    host_config = Map.get(state, :host_config, %{ssh: nil})
+    sdk_root = Path.join([state.base_dir, "adapters", "node_modules"])
 
-    fn path ->
-      # The script's own stderr is folded into its stdout so a failure carries a
-      # reason; ssh's is NOT, because an ssh warning on a SUCCESSFUL connection
-      # would land in the middle of the JSON body.
-      # The CLI reads the credential, not this shell. It is already installed on every
-      # assimilated host and the gateway already execs it there for `harness-group`, so
-      # this is the same transport with the credential reader moved into the binary that
-      # WROTE the file. What it replaced was a `python3` one-liner parsing a vendor JSON
-      # shape -- a runtime dependency added to every satellite, and a third copy of an
-      # extraction that already existed twice.
-      script = """
-      exec 2>&1
-      set -eu
-      exec #{Support.shell_quote(cli_path(state))} catalog-probe anthropic #{kind} \
-        #{Support.shell_quote(credential_path)} #{Support.shell_quote("#{@api_base}#{path}")}
-      """
+    script = """
+    set -eu
+    if [ -n "${CLAUDE_CODE_EXECUTABLE:-}" ]; then
+      exec "$CLAUDE_CODE_EXECUTABLE" --version
+    fi
+    for candidate in \
+      #{Support.shell_quote(sdk_root)}/@anthropic-ai/claude-agent-sdk-*/claude \
+      #{Support.shell_quote(sdk_root)}/claude-agent-acp/node_modules/@anthropic-ai/claude-agent-sdk-*/claude
+    do
+      if [ -x "$candidate" ]; then exec "$candidate" --version; fi
+    done
+    echo "bundled Claude Code executable not found under #{sdk_root}" >&2
+    exit 127
+    """
 
-      case Support.catalog_probe(sh, Support.catalog_probe_argv(dest, script)) do
-        {:ok, body, _trailer} -> {:ok, body}
-        {:error, reason} -> {:error, reason}
-      end
+    argv = Support.catalog_probe_argv(Map.get(host_config, :ssh), script)
+
+    case Support.bounded_run(sh, argv, 2_000) do
+      {:ok, {output, 0}} ->
+        normalize_version(to_string(output))
+
+      {:ok, {output, status}} ->
+        {:error, {:claude_code_version_probe_failed, status, String.trim(to_string(output))}}
+
+      {:error, reason} ->
+        {:error, {:claude_code_version_probe_failed, reason}}
     end
   end
 
-  # The catalog must not advertise what the adapter will refuse. A PURE FILTER over
-  # the already-derived entries — no probe, no extra fetch, nothing at boot; the
-  # journal records this path being reverted once for adding live I/O, so it stays
-  # a filter. Effort suffixes are preserved: only the base ref is matched.
-  #
-  # This is a PIN, and it pins three things at once — the CLI version, the grant
-  # (a smoke run recorded opus-5 "refused on this grant"), and any model pins in
-  # the projected home's settings.json. When claude ships a version that accepts
-  # more, or a different grant offers more, THE TABLE is what to re-probe and
-  # update; nothing here discovers it. See the note on @adapter_selectable_models.
-  # Injectable through the same `state.options` seam as claude_fetch/codex_read/
-  # credential_status, for two reasons: a test must be able to exercise catalog
-  # derivation without being coupled to this table, and an operator on a DIFFERENT
-  # GRANT (the accepted set is grant-dependent — a smoke run recorded opus-5
-  # "refused on this grant") must be able to lift the ceiling without editing code.
-  # `:all` disables the filter entirely.
-  # What the adapter will actually accept, asked of the harness rather than remembered.
-  #
-  # The static list alone is a frozen snapshot of somebody's entitlements, and it starved:
-  # the API stopped returning the concrete ids in it, so the intersection went empty and a
-  # correctly onboarded claude reported ZERO models. The account's real extras -- a
-  # 1M-context Opus, Fable -- live in the harness's own `additionalModelOptionsCache`, which
-  # Claude Code fills from the server on first use. That is why onboarding warms the home:
-  # cold, this reads nothing and the catalog is a subset; warmed, it reads what the account
-  # actually has.
-  #
-  # The static aliases stay as the floor. They are SDK aliases rather than account
-  # entitlements, so they are true for every account and cost nothing to keep.
-  #
-  # Remote homes are not read here -- that needs the ssh path -- so a satellite falls back to
-  # the floor until someone teaches this to read over ssh. Stated rather than silent: the
-  # symptom is a satellite offering fewer models than the gateway, not a failure.
-  defp selectable_models(state) do
-    case Map.get(state.options, :claude_selectable_models) do
-      nil -> @adapter_selectable_models ++ home_offered_models(state)
-      override -> override
-    end
-  end
+  defp manifest_entries(provider, version) do
+    profiles = Map.get(provider, "profiles", %{})
 
-  defp home_offered_models(%{host_config: %{ssh: ssh}}) when not is_nil(ssh), do: []
+    {allowed, blocked} =
+      provider
+      |> Map.get("models", [])
+      |> Enum.split_with(&version_allowed?(&1, version))
 
-  defp home_offered_models(state) do
-    home = Tightbeam.Homes.home_path(state.base_dir, state.host_name, id())
+    entries = Enum.flat_map(allowed, &model_entries(&1, profiles))
 
-    with {:ok, body} <- File.read(Path.join(home, ".claude.json")),
-         {:ok, %{"additionalModelOptionsCache" => options}} when is_list(options) <-
-           JSON.decode(body) do
-      options
-      |> Enum.map(&Map.get(&1, "value"))
-      |> Enum.filter(&is_binary/1)
+    if entries == [] do
+      {:error, {:empty_manifest_inventory, version_blocks(blocked, version)}}
     else
-      _ -> []
+      {:ok, entries, version_blocks(blocked, version)}
     end
   end
 
-  defp keep_selectable(entries, :all), do: entries
+  defp version_allowed?(model, version) do
+    gate = get_in(model, ["adapter", "claudeCode"]) || %{}
+    min = Map.get(gate, "minVersion")
+    max = Map.get(gate, "maxVersionExclusive")
 
-  defp keep_selectable(entries, selectable) do
-    {kept, dropped} =
-      Enum.split_with(entries, &(vendor_ref(&1) in selectable))
-
-    if dropped != [] do
-      Logger.info(
-        "claude catalog: #{length(dropped)} model(s) the API offers are not selectable by " <>
-          "claude-agent-acp #{@adapter_version} and were withheld: " <>
-          Enum.map_join(dropped, ", ", &vendor_ref/1) <>
-          " — if an expected model is here, the harness home has not been used yet and its " <>
-          "model cache is empty; onboarding warms it, and first use fills it"
-      )
-    end
-
-    kept
+    (is_nil(min) or Version.compare(version, min) in [:eq, :gt]) and
+      (is_nil(max) or Version.compare(version, max) == :lt)
   end
 
-  defp vendor_ref(entry),
-    do: Model.to_ref(Model.new(entry.family, context: entry.context))
+  defp version_blocks(models, version) do
+    Enum.map(models, fn model ->
+      gate = get_in(model, ["adapter", "claudeCode"]) || %{}
+
+      %{
+        slug: model["slug"],
+        name: model["name"] || model["slug"],
+        current_version: version,
+        min_version: gate["minVersion"],
+        max_version_exclusive: gate["maxVersionExclusive"]
+      }
+    end)
+  end
+
+  defp model_entries(model, profiles) do
+    profile_name = Map.get(model, "profile")
+    profile = Map.get(profiles, profile_name, %{})
+    suffixes = get_in(profile, ["adapter", "claudeCode", "contextSuffix"]) || %{}
+
+    [nil | Map.keys(suffixes)]
+    |> Enum.uniq()
+    |> Enum.map(fn context ->
+      %{
+        family: model["slug"],
+        context: context,
+        display_name: model["name"] || model["slug"],
+        name: model["name"] || model["slug"],
+        efforts: Map.get(profile, "efforts", []),
+        max_input_tokens: context_tokens(profile, context),
+        capabilities: %{
+          "profile" => profile,
+          "status" => model["status"],
+          "badge" => model["badge"],
+          "adapter" => model["adapter"]
+        },
+        provider: :anthropic,
+        aliases: Map.get(model, "aliases", []),
+        status: model["status"],
+        profile: profile_name
+      }
+    end)
+  end
+
+  defp context_tokens(profile, nil) do
+    default = Map.get(profile, "defaultContext")
+    get_in(profile, ["contextWindowTokens", default])
+  end
+
+  defp context_tokens(profile, context),
+    do: get_in(profile, ["contextWindowTokens", context])
 
   @impl true
   def conformance_vectors do
@@ -721,8 +580,21 @@ defmodule Tightbeam.Harness.Claude do
       name: "Claude Vector",
       efforts: ["low"],
       max_input_tokens: 1_000,
-      capabilities: %{"effort" => %{"low" => %{"supported" => true}}},
-      provider: :anthropic
+      capabilities: %{
+        "profile" => %{
+          "efforts" => ["low"],
+          "defaultContext" => "1k",
+          "contextWindowTokens" => %{"1k" => 1_000},
+          "adapter" => %{"claudeCode" => %{"contextSuffix" => %{}}}
+        },
+        "status" => "current",
+        "badge" => nil,
+        "adapter" => %{"claudeCode" => %{"minVersion" => "1.0.0"}}
+      },
+      provider: :anthropic,
+      aliases: [],
+      status: "current",
+      profile: "vector"
     }
 
     Support.conformance_vectors(__MODULE__, %{
@@ -808,12 +680,13 @@ defmodule Tightbeam.Harness.Claude do
         %{case: "negative", envelope: %{"sessionUpdate" => "tool_call"}, expected: :skip}
       ],
       catalog_expected: %{
-        "valid" => {:ok, [valid_entry]},
-        # Same route and same response shape for both kinds, so the api-key case
-        # derives the same entry. What it exists to pin is the HEADER, which the
-        # fetch stand-in below asserts.
-        "valid_api_key" => {:ok, [valid_entry]},
-        "malformed" => {:error, :malformed_catalog},
+        "valid" =>
+          {:ok, [valid_entry],
+           %{manifest_health: :fresh, claude_code_version: "1.0.0", version_blocks: []}},
+        "valid_api_key" =>
+          {:ok, [valid_entry],
+           %{manifest_health: :fresh, claude_code_version: "1.0.0", version_blocks: []}},
+        "malformed" => {:error, {:manifest_provider_absent, "claude"}},
         "unavailable" => {:error, :unavailable}
       },
       catalog_state: fn case_name, base ->
@@ -832,51 +705,44 @@ defmodule Tightbeam.Harness.Claude do
 
         File.write!(token, credential)
 
-        body =
-          JSON.encode!(%{
-            "data" => [
-              %{
-                "id" => "claude-vector",
-                "display_name" => "Claude Vector",
-                "max_input_tokens" => 1_000,
-                "capabilities" => %{
-                  "effort" => %{"low" => %{"supported" => true}}
-                }
-              }
-            ]
-          })
+        provider = %{
+          "profiles" => %{
+            "vector" => %{
+              "efforts" => ["low"],
+              "defaultContext" => "1k",
+              "contextWindowTokens" => %{"1k" => 1_000},
+              "adapter" => %{"claudeCode" => %{"contextSuffix" => %{}}}
+            }
+          },
+          "models" => [
+            %{
+              "slug" => "claude-vector",
+              "name" => "Claude Vector",
+              "aliases" => [],
+              "status" => "current",
+              "profile" => "vector",
+              "adapter" => %{"claudeCode" => %{"minVersion" => "1.0.0"}}
+            }
+          ]
+        }
 
-        # The stand-in asserts the header it was called with, so a case cannot
-        # pass while sending the other kind's.
-        fetch = fn _path, headers ->
-          headers = Map.new(headers, fn {name, value} -> {to_string(name), to_string(value)} end)
-
-          {expected, value} =
-            if case_name == "valid_api_key",
-              do: {"x-api-key", "vector-token"},
-              else: {"authorization", "Bearer vector-token"}
-
-          if headers[expected] != value do
-            raise "claude catalog probe sent #{inspect(headers)}, expected #{expected}: #{value}"
-          end
-
+        manifest = fn ->
           case case_name do
-            "valid" -> {:ok, body}
-            "valid_api_key" -> {:ok, body}
-            "malformed" -> {:ok, "{}"}
-            "unavailable" -> {:error, :unavailable}
+            name when name in ["valid", "valid_api_key"] ->
+              %{document: %{"providers" => %{"claude" => provider}}, health: :fresh}
+
+            "malformed" ->
+              %{document: %{}, health: {:unavailable, :malformed}}
+
+            "unavailable" ->
+              {:error, :unavailable}
           end
         end
 
-        # The vector's subject is catalog DERIVATION — provider stamping and the
-        # exact source error — using a synthetic model id. The selectable pin is a
-        # separate concern with its own tests, so it is disabled here; leaving it on
-        # would filter `claude-vector` away and turn a derivation vector into a test
-        # of the table.
         %{
           base_dir: base,
           credential_kind: kind,
-          options: %{claude_fetch: fetch, claude_selectable_models: :all}
+          options: %{model_manifest: manifest, claude_code_version: "1.0.0"}
         }
       end,
       wire_projection: %{
@@ -887,146 +753,6 @@ defmodule Tightbeam.Harness.Claude do
         "process_markers" => ["claude-agent-acp"]
       }
     })
-  end
-
-  defp decode_catalog(body) when is_binary(body) do
-    case JSON.decode(body) do
-      {:ok, %{"data" => models}} when is_list(models) -> {:ok, models}
-      {:ok, _} -> {:error, :malformed_catalog}
-      {:error, _} -> {:error, :malformed_json}
-    end
-  end
-
-  defp decode_catalog(_body), do: {:error, :malformed_catalog}
-
-  # Reads the active credential of EITHER kind. The name and its two reasons are
-  # load-bearing -- doctor and the catalog tests match on them -- so they stay.
-  defp read_token(path) do
-    case File.read(path) do
-      {:ok, token} -> {:ok, token}
-      {:error, :enoent} -> {:error, :missing_token}
-      {:error, reason} -> {:error, {:token_read_failed, reason}}
-    end
-  end
-
-  defp fill_capabilities(models, get) do
-    Enum.reduce_while(models, {:ok, []}, fn model, {:ok, acc} ->
-      if is_map(get_in(model, ["capabilities", "effort"])) do
-        {:cont, {:ok, [model | acc]}}
-      else
-        case model["id"] do
-          id when is_binary(id) ->
-            path = "/v1/models/" <> URI.encode(id, &URI.char_unreserved?/1)
-
-            with {:ok, body} <- get.(path),
-                 {:ok, detail} <- JSON.decode(body),
-                 true <- is_map(detail) do
-              {:cont, {:ok, [Map.merge(model, detail) | acc]}}
-            else
-              {:error, reason} -> {:halt, {:error, reason}}
-              _ -> {:halt, {:error, :malformed_catalog}}
-            end
-
-          _ ->
-            {:halt, {:error, :malformed_catalog}}
-        end
-      end
-    end)
-    |> case do
-      {:ok, reversed} -> {:ok, Enum.reverse(reversed)}
-      error -> error
-    end
-  end
-
-  defp derive_catalog_entries(models) do
-    Enum.reduce_while(models, {:ok, []}, fn
-      %{
-        "id" => id,
-        "display_name" => display_name,
-        "max_input_tokens" => max_input_tokens,
-        "capabilities" => capabilities
-      } = model,
-      {:ok, entries}
-      when is_binary(id) and is_binary(display_name) and is_integer(max_input_tokens) and
-             max_input_tokens >= 0 and is_map(capabilities) ->
-        case efforts(capabilities) do
-          {:ok, effort_names} ->
-            {:cont, {:ok, entries ++ [entry_for(model, id, effort_names, capabilities)]}}
-
-          :error ->
-            {:halt, {:error, :malformed_catalog}}
-        end
-
-      _, _ ->
-        {:halt, {:error, :malformed_catalog}}
-    end)
-  end
-
-  defp efforts(capabilities) do
-    values = Map.get(capabilities, "effort", %{})
-
-    if is_map(values) and
-         Enum.all?(values, fn
-           {effort, %{"supported" => supported}}
-           when is_binary(effort) and is_boolean(supported) ->
-             true
-
-           {"supported", supported} when is_boolean(supported) ->
-             true
-
-           _ ->
-             false
-         end) do
-      {:ok, for({effort, %{"supported" => true}} <- values, do: effort)}
-    else
-      :error
-    end
-  end
-
-  # ONE entry per vendor model, carrying the efforts it offers. The vendor's id
-  # may itself name a context variant (`claude-fable-5[1m]`), which is parsed
-  # into its own field here rather than being mistaken for one of our efforts.
-  defp entry_for(model, id, effort_names, capabilities) do
-    identity = Model.parse_ref(id)
-    display_name = model["display_name"] || id
-
-    %{
-      family: identity.family,
-      context: identity.context,
-      display_name: display_name,
-      name: display_name,
-      efforts: effort_names,
-      max_input_tokens: model["max_input_tokens"],
-      capabilities: capabilities,
-      provider: :anthropic
-    }
-  end
-
-  defp http_get(path, headers) do
-    url = String.to_charlist(@api_base <> path)
-
-    ssl = [
-      verify: :verify_peer,
-      cacerts: :public_key.cacerts_get(),
-      customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]
-    ]
-
-    # One ceiling either side of the ssh seam, so a wedged vendor endpoint costs
-    # the same locally as remotely and never strands a refresh in flight.
-    timeout = Support.catalog_probe_timeout_s() * 1_000
-
-    case :httpc.request(:get, {url, headers}, [ssl: ssl, timeout: timeout], body_format: :binary) do
-      {:ok, {{_version, status, _reason}, _response_headers, body}} when status in 200..299 ->
-        {:ok, body}
-
-      # The BODY, not just the code: a 401 here says the grant needs signing in
-      # again, which is the sentence the operator acts on (#81's subject).
-      {:ok, {{_version, status, _reason}, _response_headers, body}} ->
-        {:error, {:http_status, status, String.trim(to_string(body))}}
-
-      {:error, reason} ->
-        {:error, {:network, reason}}
-    end
   end
 
   defp adapter_binary(target) do
