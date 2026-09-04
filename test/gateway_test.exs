@@ -1847,7 +1847,6 @@ defmodule Tightbeam.GatewayTest do
 
     {Bandit, bandit_opts} = List.last(children)
     {Tightbeam.Wire.Router, socket_deps} = Keyword.fetch!(bandit_opts, :plug)
-    assert :ok = Tightbeam.CursorSigning.validate(socket_deps.cursor_signing)
     socket_deps = %{socket_deps | conn_registry: ctx.registry}
 
     empty_catalog(:not_derived)
@@ -4076,6 +4075,7 @@ defmodule Tightbeam.GatewayTest do
 
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
     start_lane!(ctx.db, "digester")
+    await_lane_quiet(ctx.db, "digester")
 
     assert %{ok: true} =
              handlers["tune"].(%{
@@ -11093,7 +11093,6 @@ defmodule Tightbeam.GatewayTest do
   defp gateway_config(base_dir, db, port) do
     %{
       base_dir: base_dir,
-      cursor_signing: cursor_signing!(base_dir),
       cwd: "/tmp",
       port: port,
       default_harness: :claude,
@@ -11133,7 +11132,6 @@ defmodule Tightbeam.GatewayTest do
     base = Path.join(System.tmp_dir!(), "gateway_children_#{suffix}")
     File.rm_rf!(base)
     File.mkdir!(base)
-    _provider = cursor_signing!(base)
     on_exit(fn -> File.rm_rf!(base) end)
     base
   end
@@ -11266,6 +11264,30 @@ defmodule Tightbeam.GatewayTest do
          [[session_key: session_key, db: db, task_sup: task_sup, runner: runner]]}
     })
   end
+
+  # A lane started over an already-queued turn claims it before it can serve any
+  # call: `SessionLane.init/1` self-sends `:nudge`, so that message is in the
+  # mailbox by the time `start_link` returns. A test that then acts on the
+  # session's turn boundary is racing its own runner for that mailbox, and loses
+  # under load — `at_turn_boundary` replies `:busy` while `task_ref` is set.
+  # Wait for the claimed turn to go terminal instead of assuming it has: the lane
+  # finalizes the row and clears `task_ref` in the same `handle_info`, so a zero
+  # count here means a boundary call queued behind it cannot see `:busy`.
+  defp await_lane_quiet(db, session_key, attempts \\ 100)
+
+  defp await_lane_quiet(db, session_key, attempts) when attempts > 0 do
+    case Ledger.pending_count(db, session_key) do
+      0 ->
+        :ok
+
+      _ ->
+        Process.sleep(10)
+        await_lane_quiet(db, session_key, attempts - 1)
+    end
+  end
+
+  defp await_lane_quiet(_db, session_key, 0),
+    do: flunk("lane for #{session_key} did not drain its queued turns")
 
   defp ensure_global_registry do
     case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
