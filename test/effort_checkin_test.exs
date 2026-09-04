@@ -1925,6 +1925,29 @@ defmodule Tightbeam.EffortCheckinTest do
     wake_id
   end
 
+  # An unowned pending wake on an arbitrary session — no effort ownership row —
+  # so holder retirement's session drain (not an assignment revocation) is what
+  # disposes it. Mirrors insert_unowned_wake but is not pinned to `holder`.
+  defp insert_unowned_wake_on(ctx, session_key) do
+    wake_id = "wk_unowned_#{System.unique_integer([:positive])}"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO wakes
+                 (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,
+                  conditionKind,conditionScope,assignmentId,targetGate)
+               VALUES (?1,?2,'process:tightbeam','A11 unowned','prompt',?3,'pending',?4,
+                       NULL,NULL,NULL,1)
+               """,
+               [wake_id, session_key, now + 60_000, now]
+             )
+
+    wake_id
+  end
+
   defp fail_ownership_at(ctx, role, drive_fn) do
     trigger = "egr_a2_fail_#{role}"
 
@@ -2853,6 +2876,150 @@ defmodule Tightbeam.EffortCheckinTest do
     assert effort_trace.() == trace0
   end
 
+  test "EGR-A11: holder retirement revokes each assignment (generator retired, owned wake canceled revoked) then the drain target-retires only the unowned wake; owned wakes aren't re-canceled, the running turn is untouched, and a fault rolls it all back",
+       ctx do
+    # EGR-11 verification. Holder retirement is one transaction, two stages.
+    # Stage 1 (interrupt_for_retire) revokes each open assignment, retiring its
+    # generator and canceling its owned probe wake with the assignment-terminal
+    # revoked cause. Stage 2 (the session-retirement drain inside Org.retire)
+    # disposes the holder's remaining pending wakes as target_retired. An owned
+    # wake already 'canceled' by stage 1 is excluded from the drain's
+    # state='pending' select, so it is never re-canceled. A running turn is
+    # left untouched, and a fault in either stage rolls the whole retirement back.
+    host = Placement.local_host_name()
+
+    owned = fn a ->
+      [[wake_id]] =
+        rows(ctx.db, "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1", [
+          a.id
+        ])
+
+      wake_id
+    end
+
+    retire = fn holder ->
+      DB.transaction(ctx.db, fn txn ->
+        # The production order of retire_session_in_txn: revoke the holder's
+        # open assignments, then the session drain, then the queued-turn drain.
+        Assignments.interrupt_for_retire_in_txn(txn, holder, "h1", "user:h1")
+        Org.retire_in_txn(txn, holder, "user:h1", ctx.config.wake_tick_ms)
+
+        Ledger.drain_queued_for_retire_in_txn(txn, holder, "session-retired",
+          cause: "session-retired",
+          principal: "user:h1"
+        )
+      end)
+    end
+
+    # --- Happy path: a dedicated holder with two dispatched assignments (each an
+    # armed generation with one pending owned probe wake), one pending unowned
+    # wake, and one already-running turn.
+    holder_a = session(ctx.db, "holderA", "h1", host, %{spawned_by: "parent"})
+    init_workspace(Placement.workdir_path(ctx.config, holder_a))
+
+    a1 = dispatch(ctx, {:session, "parent"}, "holderA", "A11 first")
+    a2 = dispatch(ctx, {:session, "parent"}, "holderA", "A11 second")
+    owned1 = owned.(a1)
+    owned2 = owned.(a2)
+    unowned = insert_unowned_wake_on(ctx, "holderA")
+    running = running_turn(ctx.db, "holderA")
+
+    # Fixture population: exactly the two owned probes and the one unowned wake
+    # are pending on the holder, and the turn is running.
+    assert MapSet.new([owned1, owned2, unowned]) ==
+             ctx.db
+             |> rows(
+               "SELECT wakeId FROM wakes WHERE sessionKey='holderA' AND state='pending'",
+               []
+             )
+             |> Enum.map(&hd/1)
+             |> MapSet.new()
+
+    assert [["running"]] = rows(ctx.db, "SELECT status FROM turns WHERE seq=?1", [running])
+
+    {:ok, _} = retire.("holderA")
+
+    # Stage 1: each generator retired revoked with the assignment-terminal cause;
+    # each owned probe canceled exactly once, by revocation (obligation_disposed),
+    # never by the drain (target_retired).
+    for a <- [a1, a2] do
+      assert [["canceled", "revoked", cause, "user:h1"]] = gen_retirement(ctx.db, a.id, 1)
+      assert cause == "assignment-terminal:revoked:" <> a.id
+    end
+
+    for w <- [owned1, owned2] do
+      assert %{state: "canceled"} = Wakes.get(ctx.db, w)
+
+      assert [["assignment_transition", _id, "obligation_disposed", "canceled"]] =
+               wake_cancellations(ctx.db, w)
+    end
+
+    # Stage 2: the drain cancels only the unowned pending wake, as target_retired.
+    # It is the sole target-retirement cancellation in the whole store.
+    assert %{state: "canceled"} = Wakes.get(ctx.db, unowned)
+    assert [[_dk, _di, "target_retired", "canceled"]] = wake_cancellations(ctx.db, unowned)
+
+    assert rows(
+             ctx.db,
+             "SELECT COUNT(*) FROM wake_cancellations WHERE reasonKind='target_retired'",
+             []
+           ) == [[1]]
+
+    # The running turn is untouched, and the holder is retired.
+    assert [["running"]] = rows(ctx.db, "SELECT status FROM turns WHERE seq=?1", [running])
+
+    assert rows(ctx.db, "SELECT state FROM sessions WHERE sessionKey='holderA'", []) ==
+             [["retired"]]
+
+    # --- Rollback: a fault on the drain's target-retirement cancellation rolls
+    # back the whole holder retirement: assignment revocations, generator
+    # retirements, and every wake disposition (owned and unowned alike).
+    holder_b = session(ctx.db, "holderB", "h1", host, %{spawned_by: "parent"})
+    init_workspace(Placement.workdir_path(ctx.config, holder_b))
+
+    b1 = dispatch(ctx, {:session, "parent"}, "holderB", "A11 rollback first")
+    b2 = dispatch(ctx, {:session, "parent"}, "holderB", "A11 rollback second")
+    b_owned1 = owned.(b1)
+    b_owned2 = owned.(b2)
+    b_unowned = insert_unowned_wake_on(ctx, "holderB")
+    b_running = running_turn(ctx.db, "holderB")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "CREATE TEMP TRIGGER egr_a11_fault BEFORE INSERT ON wake_cancellations " <>
+          "WHEN NEW.reasonKind='target_retired' BEGIN SELECT RAISE(ABORT,'egr-a11 fault'); END"
+      )
+
+    _ =
+      try do
+        retire.("holderB")
+      rescue
+        e -> {:rescued, e}
+      catch
+        kind, value -> {:caught, kind, value}
+      end
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER egr_a11_fault")
+
+    for a <- [b1, b2] do
+      assert rows(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [a.id]) ==
+               [["open", nil]]
+
+      assert [["armed", nil, nil, nil]] = gen_retirement(ctx.db, a.id, 1)
+    end
+
+    for w <- [b_owned1, b_owned2, b_unowned] do
+      assert %{state: "pending"} = Wakes.get(ctx.db, w)
+      assert wake_cancellations(ctx.db, w) == []
+    end
+
+    assert [["running"]] = rows(ctx.db, "SELECT status FROM turns WHERE seq=?1", [b_running])
+
+    assert rows(ctx.db, "SELECT state FROM sessions WHERE sessionKey='holderB'", []) ==
+             [["active"]]
+  end
+
   defp work_item_trace(ctx, principal, work_item_id) do
     WorkItems.__handle__(ctx.db, "work-item-trace", %{
       verb: "work-item-trace",
@@ -3278,5 +3445,43 @@ defmodule Tightbeam.EffortCheckinTest do
       end)
 
     :ok = Ledger.finish(db, seq, terminal, nil, owner_lease: lease)
+  end
+
+  # A turn left in the `running` state (claimed, not finished): mirrors
+  # terminal_turn's claim but stops before Ledger.finish. Returns its seq so a
+  # caller can prove holder retirement leaves an already-running turn untouched.
+  defp running_turn(db, session_key) do
+    id = "m_#{System.unique_integer([:positive])}"
+
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: id,
+        origin: "agent:test",
+        prompt: id
+      })
+
+    lease = "ol_test_#{System.unique_integer([:positive])}"
+
+    {:ok, :appended} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "UPDATE turns SET status='running', startedAt=?2, owner='test' WHERE seq=?1 AND status='queued'",
+          [seq, System.system_time(:millisecond)]
+        )
+
+        Tightbeam.TurnLifecycle.append_in_txn(txn, seq, %{
+          event_key: "claimed",
+          producer_event_id: "effort-checkin-fixture:claimed:#{seq}",
+          kind: "claimed",
+          cause: "test-fixture:claim",
+          principal: "process:tightbeam",
+          owner_lease: lease,
+          detail: %{v: 1, owner: "test"}
+        })
+      end)
+
+    seq
   end
 end
