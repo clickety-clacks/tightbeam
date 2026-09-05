@@ -15,6 +15,11 @@ decision request that states:
 - what you propose instead, and what it costs;
 - what happens if we build the card as written anyway.
 
+An operator decision request asks the owner to choose among options. Do not raise one
+for a bookkeeping refusal that a lawful agent path can clear. Retract when the question
+has dissolved. Take the subject card opener's adjudication when it resolves the refusal.
+Open a fresh review round when the review evidence was never filed.
+
 Then HOLD for the user's answer. This is the one place the golden rule does
 not apply. The golden rule clears rails that block a safe way forward INSIDE
 your scope; it never authorizes you to change what is being built or how the

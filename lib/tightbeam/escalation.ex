@@ -670,7 +670,7 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  @doc "Withdraw one operator request as its owner or same-owner raiser."
+  @doc "Withdraw one operator request as its owner, same-owner raiser, or same-owner subject-card opener."
   @spec operator_withdraw(DB.server(), map()) :: map()
   def operator_withdraw(db, call) do
     request_id = param(call, :request_id) || param(call, :request)
@@ -1522,7 +1522,7 @@ defmodule Tightbeam.Escalation do
         rows =
           Txn.q(
             txn,
-            "SELECT id,context FROM decision_requests WHERE raiserSessionKey = ?1 AND kind != 'operator' AND status = 'open'",
+            "SELECT id,context FROM decision_requests WHERE raiserSessionKey = ?1 AND status = 'open'",
             [session_key]
           )
           |> Enum.reject(fn [_id, context] ->
@@ -1646,7 +1646,7 @@ defmodule Tightbeam.Escalation do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.kind != 'operator' AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
+        "SELECT s.sessionKey FROM sessions s WHERE s.state = 'retired' AND (EXISTS (SELECT 1 FROM decision_requests dr WHERE dr.raiserSessionKey = s.sessionKey AND dr.status = 'open') OR EXISTS (SELECT 1 FROM escalation_waivers ew WHERE ew.raiserId = 'session:' || s.sessionKey AND ew.revokedAt IS NULL))"
       )
 
     Enum.each(rows, fn [key] -> withdraw_for_retired(db, key) end)
@@ -3783,18 +3783,34 @@ defmodule Tightbeam.Escalation do
         {:ok, "user:" <> owner_user_id}
 
       {:session, session_key} ->
-        case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
-          [[owner_user_id]]
-          when owner_user_id == request.owner_user_id and call.origin == request.raiser_id ->
-            {:ok, call.origin}
+        case Txn.q(
+               txn,
+               "SELECT s.ownerUserId,a.openedBySession,a.openedByUser FROM sessions s LEFT JOIN assignments a ON a.id = ?2 WHERE s.sessionKey = ?1",
+               [session_key, request.assignment_id]
+             ) do
+          [[owner_user_id, opened_by_session, opened_by_user]]
+          when owner_user_id == request.owner_user_id ->
+            opener_session_key =
+              if is_binary(opened_by_user),
+                do: Org.personal_session_key(request.owner_user_id),
+                else: opened_by_session
+
+            if call.origin == request.raiser_id or session_key == opener_session_key,
+              do: {:ok, call.origin},
+              else: operator_withdrawer_error()
 
           _ ->
-            {:error, error("not_owner", "operator or same-owner raiser required")}
+            operator_withdrawer_error()
         end
 
       _ ->
-        {:error, error("not_owner", "operator or same-owner raiser required")}
+        operator_withdrawer_error()
     end
+  end
+
+  defp operator_withdrawer_error do
+    {:error,
+     error("not_owner", "operator, same-owner raiser, or same-owner subject-card opener required")}
   end
 
   defp shift_params(where) do
