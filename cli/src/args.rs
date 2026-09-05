@@ -258,6 +258,7 @@ pub enum Command {
         files: Option<Vec<String>>,
         report_to: Option<String>,
         delivers_work_item: bool,
+        succeeds: Option<String>,
     },
     Dispatch {
         identity: Identity,
@@ -270,6 +271,7 @@ pub enum Command {
         idempotency_key: Option<String>,
         report_to: Option<String>,
         delivers_work_item: bool,
+        succeeds: Option<String>,
     },
     EffortRule {
         identity: Identity,
@@ -828,7 +830,7 @@ COMMANDS:
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
-         [--delivers-work-item]
+         [--delivers-work-item] [--succeeds <assignmentId>]
          [--files '["lib/a.ex","test/a_test.exs"]'] [--report-to <sessionKey>]
       Open an obligation held by a session; a work item is the durable thread
       across assignments. Use --delivers-work-item only for the whole card.
@@ -836,6 +838,7 @@ COMMANDS:
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
            [--report-to <sessionKey>] [--delivers-work-item]
+           [--succeeds <assignmentId>]
       Atomically open an assignment and wake its holder with the card id.
   completion-notices --status open|all [--session <childSessionKey>]
       List visible completion notices, optionally for one exact child session.
@@ -1703,6 +1706,12 @@ fn parse_with_optional_catalog(
     if matches!(flags.get("report-to"), Some(value) if value.is_empty()) {
         return Err("--report-to requires a non-empty session key".to_owned());
     }
+    if flags.contains_key("succeeds") && !matches!(command, Some("assign" | "dispatch")) {
+        return Err("--succeeds is valid only with assign or dispatch".to_owned());
+    }
+    if matches!(flags.get("succeeds"), Some(value) if value.is_empty()) {
+        return Err("--succeeds requires a non-empty assignment id".to_owned());
+    }
 
     match command.expect("checked above") {
         name @ ("activation-declare"
@@ -2060,6 +2069,7 @@ fn parse_with_optional_catalog(
                 files,
                 report_to: nonempty(flags, "report-to"),
                 delivers_work_item: flags.contains_key("delivers-work-item"),
+                succeeds: nonempty(flags, "succeeds"),
             })
         }
         "dispatch" => {
@@ -2084,6 +2094,7 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key"),
                 report_to: nonempty(flags, "report-to"),
                 delivers_work_item: flags.contains_key("delivers-work-item"),
+                succeeds: nonempty(flags, "succeeds"),
             })
         }
         "effort-rule" => {
@@ -3150,6 +3161,55 @@ mod tests {
                 "flynn",
             ])),
             Err("--decision must be retain, park, or retire".to_owned())
+        );
+    }
+
+    #[test]
+    fn successor_assignment_input_parses_and_missing_values_refuse_locally() {
+        assert!(matches!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "work",
+                "--session",
+                "child",
+                "--succeeds",
+                "asg_full",
+            ])),
+            Ok(Command::Assign {
+                succeeds: Some(value),
+                ..
+            }) if value == "asg_full"
+        ));
+
+        assert!(matches!(
+            parse(strings(&[
+                "dispatch",
+                "--subject",
+                "work",
+                "--brief",
+                "continue it",
+                "--to",
+                "child",
+                "--succeeds",
+                "asg_full",
+            ])),
+            Ok(Command::Dispatch {
+                succeeds: Some(value),
+                ..
+            }) if value == "asg_full"
+        ));
+
+        assert_eq!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "work",
+                "--session",
+                "child",
+                "--succeeds",
+            ])),
+            Err("--succeeds requires a non-empty assignment id".to_owned())
         );
     }
 

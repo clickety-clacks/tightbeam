@@ -670,6 +670,82 @@ defmodule Tightbeam.Escalation do
     end
   end
 
+  @doc false
+  @spec late_ruling_receipt_context_in_txn(Txn.t(), String.t(), String.t(), term()) ::
+          :ok | :not_found
+  def late_ruling_receipt_context_in_txn(txn, request_id, assignment_id, principal) do
+    with %{kind: "operator", status: "ruled", assignment_id: ^assignment_id} = request <-
+           request_in_txn_optional(txn, request_id),
+         {:ok, accountable_owner} <- late_source_owner_in_txn(txn, request),
+         true <- late_route_marker_count_in_txn(txn, request_id) == 1,
+         [routed_session] <- late_ruling_wake_sessions_in_txn(txn, request_id),
+         true <-
+           principal in [
+             {:session, routed_session},
+             {:session, Org.personal_session_key(accountable_owner)},
+             {:user, accountable_owner}
+           ] do
+      :ok
+    else
+      _ -> :not_found
+    end
+  end
+
+  @doc false
+  @spec applicable_late_rulings_in_txn(Txn.t(), [String.t()], [String.t()], [String.t()]) ::
+          [String.t()]
+  def applicable_late_rulings_in_txn(txn, assignment_ids, work_item_ids, carried_ids) do
+    if assignment_ids == [] and work_item_ids == [] and carried_ids == [] do
+      []
+    else
+      Txn.q(
+        txn,
+        """
+        WITH ruled_unconsumed AS (
+          SELECT dr.id, dr.assignmentId, source.workItemId, dr.ruledAt
+          FROM decision_requests dr
+          JOIN assignments source ON source.id = dr.assignmentId
+          WHERE dr.kind = 'operator' AND dr.status = 'ruled'
+            AND 1 = (
+              SELECT COUNT(*) FROM condition_facts marker
+              WHERE marker.kind = 'operator-ruling-late-routed'
+                AND marker.scope = dr.id AND marker.origin = 'process:tightbeam'
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM attests receipt
+              WHERE receipt.assignmentId = dr.assignmentId
+                AND receipt.kind = ?4
+                AND receipt.verdictKind = 'ruling-consumed:' || dr.id
+            )
+        )
+        SELECT applicable.id
+        FROM (
+          SELECT ruled.id, ruled.ruledAt
+          FROM ruled_unconsumed ruled
+          JOIN json_each(?1) assignment_ids ON assignment_ids.value = ruled.assignmentId
+          UNION
+          SELECT ruled.id, ruled.ruledAt
+          FROM ruled_unconsumed ruled
+          JOIN json_each(?2) work_item_ids ON work_item_ids.value = ruled.workItemId
+          UNION
+          SELECT ruled.id, ruled.ruledAt
+          FROM ruled_unconsumed ruled
+          JOIN json_each(?3) carried_ids ON carried_ids.value = ruled.id
+        ) applicable
+        ORDER BY applicable.ruledAt ASC, applicable.id ASC
+        """,
+        [
+          JSON.encode!(assignment_ids),
+          JSON.encode!(work_item_ids),
+          JSON.encode!(carried_ids),
+          "verdict"
+        ]
+      )
+      |> Enum.map(fn [id] -> id end)
+      |> Enum.filter(&canonical_request_id?/1)
+    end
+  end
+
   @doc "Withdraw one operator request as its owner or same-owner raiser."
   @spec operator_withdraw(DB.server(), map()) :: map()
   def operator_withdraw(db, call) do
@@ -1859,6 +1935,8 @@ defmodule Tightbeam.Escalation do
     preflight_terminal_operator_rows_in_txn: "operator",
     rule_operator_request_in_txn: "operator",
     operator_withdraw_in_txn: "operator",
+    late_ruling_receipt_context_in_txn: "operator",
+    applicable_late_rulings_in_txn: "operator",
     open_counts_by_assignment: "statute,effort",
     # DIRECT: own SQL literal, unscoped by kind (id-scoped internal plumbing,
     # a genuinely cross-kind read, or a documented kind-agnostic exit).
@@ -2673,65 +2751,208 @@ defmodule Tightbeam.Escalation do
     via_state = if is_binary(via_session), do: "known", else: "none"
 
     if request.status == "open" do
-      ruled_at = now()
+      with {:ok, notification_session, late?} <- ruling_recipient_in_txn(txn, request) do
+        ruled_at = now()
 
-      Wakes.schedule_in_txn(txn, %{
-        session_key: request.raiser_session_key,
-        origin: "process:tightbeam",
-        prompt: operator_ruling_notification(request.id),
-        due_at: ruled_at + operator_decision_duration(request),
-        condition_kind: "escalation-ruled",
-        condition_scope: request.id,
-        creator_session_key: via_session,
-        target_gate: 0
-      })
-
-      %{fact_id: fact_id} =
-        ConditionFacts.file_in_txn(txn, %{
-          kind: "escalation-ruled",
-          scope: request.id,
-          origin: "process:tightbeam"
+        Wakes.schedule_in_txn(txn, %{
+          session_key: notification_session,
+          origin: "process:tightbeam",
+          prompt: operator_ruling_notification(request.id),
+          due_at: ruled_at + operator_decision_duration(request),
+          condition_kind: "escalation-ruled",
+          condition_scope: request.id,
+          creator_session_key: via_session,
+          target_gate: 0
         })
 
-      Txn.q(
-        txn,
-        "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledViaSessionKey = ?5, ruledViaPrincipal = ?6, ruledViaSessionState = ?7, ruledAt = ?8, rulingFactId = ?9 WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
-        [
+        %{fact_id: fact_id} =
+          ConditionFacts.file_in_txn(txn, %{
+            kind: "escalation-ruled",
+            scope: request.id,
+            origin: "process:tightbeam"
+          })
+
+        if late? do
+          ConditionFacts.file_in_txn(txn, %{
+            kind: "operator-ruling-late-routed",
+            scope: request.id,
+            origin: "process:tightbeam"
+          })
+        end
+
+        Txn.q(
+          txn,
+          "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledViaSessionKey = ?5, ruledViaPrincipal = ?6, ruledViaSessionState = ?7, ruledAt = ?8, rulingFactId = ?9 WHERE id = ?1 AND kind = 'operator' AND status = 'open'",
+          [
+            request.id,
+            decision,
+            answer.rationale,
+            ruled_by,
+            via_session,
+            performer,
+            via_state,
+            ruled_at,
+            fact_id
+          ]
+        )
+
+        if Txn.changes(txn) != 1,
+          do: raise(DB.Error, message: "operator ruling lost its open-row CAS")
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "decision_request_ruled",
           request.id,
-          decision,
-          answer.rationale,
-          ruled_by,
-          via_session,
-          performer,
-          via_state,
-          ruled_at,
-          fact_id
-        ]
-      )
+          "by=#{ruled_by} decision=#{decision} factId=#{fact_id}"
+        )
 
-      if Txn.changes(txn) != 1,
-        do: raise(DB.Error, message: "operator ruling lost its open-row CAS")
+        ruled = request_in_txn(txn, request.id)
 
-      EventLog.lifecycle_in_txn(
-        txn,
-        "decision_request_ruled",
-        request.id,
-        "by=#{ruled_by} decision=#{decision} factId=#{fact_id}"
-      )
+        case validate_operator_terminal_in_txn(txn, ruled, "detail", performer) do
+          :ok ->
+            Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
+            {ruled, fact_id}
 
-      ruled = request_in_txn(txn, request.id)
-
-      case validate_operator_terminal_in_txn(txn, ruled, "detail", performer) do
-        :ok ->
-          Publisher.maybe_accepted_in_txn(txn, opts[:firehose_call], ruled)
-          {ruled, fact_id}
-
-        {:error, refusal} ->
-          raise DB.Error, message: refusal.code
+          {:error, refusal} ->
+            raise DB.Error, message: refusal.code
+        end
+      else
+        {:error, refusal} -> {refusal, nil}
       end
     else
       {error("not_open", "decision request is not open"), nil}
     end
+  end
+
+  defp ruling_recipient_in_txn(txn, request) do
+    case late_ruling_route_in_txn(txn, request) do
+      :ordinary ->
+        {:ok, request.raiser_session_key, false}
+
+      {:late, session_key, _accountable_owner} ->
+        {:ok, session_key, true}
+
+      :unavailable ->
+        {:error,
+         error(
+           "late_ruling_recipient_unavailable",
+           "late ruling has no active opener or owner recipient"
+         )}
+    end
+  end
+
+  defp late_ruling_route_in_txn(_txn, %{assignment_id: nil}), do: :ordinary
+
+  defp late_ruling_route_in_txn(txn, request) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.state, a.holderKey, a.openedBySession, a.openedByUser,
+                  COALESCE(w.ownerUserId, ?2)
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id = a.workItemId
+           WHERE a.id = ?1
+           """,
+           [request.assignment_id, request.owner_user_id]
+         ) do
+      [["open", _holder, _opened_session, _opened_user, _owner]] ->
+        :ordinary
+
+      [["closed", holder, opened_session, opened_user, accountable_owner]] ->
+        candidates =
+          opener_lineage_in_txn(txn, opened_session) ++
+            optional_personal_session(opened_user) ++
+            [Org.personal_session_key(accountable_owner)]
+
+        recipient =
+          candidates
+          |> Enum.uniq()
+          |> Enum.reject(&(&1 in [holder, request.raiser_session_key]))
+          |> Enum.find(&active_session_in_txn?(txn, &1))
+
+        if recipient,
+          do: {:late, recipient, accountable_owner},
+          else: :unavailable
+
+      [] ->
+        :ordinary
+    end
+  end
+
+  defp late_source_owner_in_txn(txn, request) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(w.ownerUserId, ?2)
+           FROM assignments a
+           LEFT JOIN work_items w ON w.id = a.workItemId
+           WHERE a.id = ?1 AND a.state = 'closed'
+           """,
+           [request.assignment_id, request.owner_user_id]
+         ) do
+      [[accountable_owner]] -> {:ok, accountable_owner}
+      _ -> :not_found
+    end
+  end
+
+  defp opener_lineage_in_txn(_txn, nil), do: []
+
+  defp opener_lineage_in_txn(txn, session_key),
+    do: opener_lineage_in_txn(txn, session_key, MapSet.new(), [])
+
+  defp opener_lineage_in_txn(txn, session_key, visited, acc) do
+    if MapSet.member?(visited, session_key) do
+      Enum.reverse(acc)
+    else
+      next_acc = [session_key | acc]
+
+      case Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1", [session_key]) do
+        [[1]] ->
+          next = Org.effective_parent_in_txn(txn, session_key).session_key
+
+          opener_lineage_in_txn(
+            txn,
+            next,
+            MapSet.put(visited, session_key),
+            next_acc
+          )
+
+        [] ->
+          Enum.reverse(next_acc)
+      end
+    end
+  end
+
+  defp optional_personal_session(nil), do: []
+  defp optional_personal_session(user_id), do: [Org.personal_session_key(user_id)]
+
+  defp active_session_in_txn?(txn, session_key) do
+    Txn.q(txn, "SELECT 1 FROM sessions WHERE sessionKey = ?1 AND state = 'active'", [session_key]) ==
+      [[1]]
+  end
+
+  defp late_route_marker_count_in_txn(txn, request_id) do
+    [[count]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM condition_facts WHERE kind = 'operator-ruling-late-routed' AND scope = ?1 AND origin = 'process:tightbeam'",
+        [request_id]
+      )
+
+    count
+  end
+
+  defp late_ruling_wake_sessions_in_txn(txn, request_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT sessionKey FROM wakes
+      WHERE conditionKind = 'escalation-ruled' AND conditionScope = ?1
+        AND origin = 'process:tightbeam' AND targetRole IS NULL
+      """,
+      [request_id]
+    )
+    |> Enum.map(fn [session_key] -> session_key end)
   end
 
   defp operator_withdraw_in_txn(txn, call, request_id, reason) do
@@ -3098,7 +3319,7 @@ defmodule Tightbeam.Escalation do
         txn,
         """
         SELECT COUNT(*) FROM wakes
-        WHERE sessionKey = ?1 AND targetRole IS NULL AND origin = 'process:tightbeam'
+        WHERE targetRole IS NULL AND origin = 'process:tightbeam'
           AND prompt = ?2 AND consumer = 'prompt'
           AND conditionKind = 'escalation-ruled' AND conditionScope = ?3
           AND conditionAfterId < ?4 AND dueAt = ?5 AND targetGate = 0
@@ -3106,6 +3327,7 @@ defmodule Tightbeam.Escalation do
           AND ((?6 IS NULL AND creatorSessionKey IS NULL) OR creatorSessionKey = ?6)
           AND ((state = 'pending' AND firedAt IS NULL AND firedBy IS NULL)
                OR (state = 'fired' AND firedAt IS NOT NULL AND firedBy = 'condition'))
+          AND ((?7 = 0 AND sessionKey = ?1) OR (?7 = 1 AND sessionKey != ?1))
         """,
         [
           request.raiser_session_key,
@@ -3113,7 +3335,8 @@ defmodule Tightbeam.Escalation do
           request.id,
           request.ruling_fact_id,
           expected_due_at,
-          expected_creator
+          expected_creator,
+          if(late_route_marker_count_in_txn(txn, request.id) == 1, do: 1, else: 0)
         ]
       )
 

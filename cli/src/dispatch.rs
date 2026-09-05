@@ -584,6 +584,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             files,
             report_to,
             delivers_work_item,
+            succeeds,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -615,6 +616,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if *delivers_work_item {
                 params.push("\"deliversWorkItem\":true".to_owned());
             }
+            if let Some(value) = succeeds {
+                params.push(string_field("succeedsAssignmentId", value));
+            }
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
@@ -628,6 +632,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             idempotency_key,
             report_to,
             delivers_work_item,
+            succeeds,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
@@ -650,6 +655,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if *delivers_work_item {
                 params.push("\"deliversWorkItem\":true".to_owned());
+            }
+            if let Some(value) = succeeds {
+                params.push(string_field("succeedsAssignmentId", value));
             }
             Ok(request(
                 identity,
@@ -3287,6 +3295,32 @@ mod tests {
 
     #[test]
     fn builds_byte_exact_assignment_bodies() {
+        assert_eq!(
+            body(&[
+                "assign",
+                "--subject",
+                "continue",
+                "--session",
+                "agent:builder",
+                "--succeeds",
+                "asg_full",
+            ]),
+            r#"{"verb":"assign","sessionKey":"agent:builder","params":{"subject":"continue","succeedsAssignmentId":"asg_full"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "dispatch",
+                "--holder",
+                "agent:builder",
+                "--subject",
+                "continue",
+                "--brief",
+                "Continue it.",
+                "--succeeds",
+                "asg_full",
+            ]),
+            r#"{"verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"continue","brief":"Continue it.","succeedsAssignmentId":"asg_full"}}"#
+        );
         assert_eq!(
             body(&[
                 "assign",
