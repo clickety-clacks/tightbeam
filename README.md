@@ -293,7 +293,7 @@ runtime. Cleanup is conditional: keep intentional pins that the target supports.
    Keep the record private if other environment entries contain secrets.
 
 2. Record the current Tightbeam package/build, each effective harness executable
-   path and exact version, and each installed ACP adapter's exact package version.
+   path, exact version and SHA-256, and each installed ACP adapter's exact package version.
    Retain the prior runtime/package and service configuration for rollback.
    Check the target's release notes and compatibility evidence for those exact
    runtime/adapter combinations. Do not infer compatibility from a branch name
@@ -321,14 +321,28 @@ runtime. Cleanup is conditional: keep intentional pins that the target supports.
    idle boundary to affected remote adapters before their next start.
    Do not treat a successful unset or an active service as proof of activation.
 
-5. After activation, verify the effective executable path and exact runtime
-   version for each affected host/harness, plus the adapter package version.
+5. After activation, verify the effective executable path, exact runtime
+   version and SHA-256 for each affected host/harness, plus the adapter package version.
    Use the actual adapter launch/process information and the selected binary's
-   version output, not just the executable on your shell's PATH.
+   version output and file hash, not just the executable on your shell's PATH.
+   Package-managed vendor paths can move or contain different bytes after an
+   update; a saved path alone does not pin a runtime version.
    Run one real model turn per affected host/harness. Verify the expected hook
    fires and enforces its result, then resume an existing session and verify
    its conversation continues. Record the results before calling the upgrade
    successful. This checklist is not proof that an untested release works.
+
+**Recorded upgrade example (2026-09-05):** Gibson's Codex overlay was saved
+with reported runtime version `0.153.2` and SHA-256
+`f8786262ebc0fa1337448a2977332beadec66c8d0cda0ce973c7849766d7943c`.
+The prior overlay was absent. The saved override was not activated, and no
+production restart occurred. Its path points into the package-managed
+`@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`
+tree. For a 0.1.9 upgrade, review this override using the steps above: remove
+it only if obsolete, retain it if intentional and compatible, and verify
+the effective version and hash after activation. This record does not prove
+0.1.9 compatibility. A separate disposable gateway's partial test results
+do not establish production activation or complete gateway verification.
 
 If verification fails, stop the rollout. Restore each changed overlay to its
 recorded value with `tightbeam host-env-set --host <host> --harness <harness>
