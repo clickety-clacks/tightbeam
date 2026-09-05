@@ -44,17 +44,76 @@ defmodule Tightbeam.SchemaShapeTest do
     %{db: name}
   end
 
-  test "the exact v18 completion predecessor refuses through boot dispatch", %{db: db} do
+  test "the exact v18 predecessor gains the completion shape through boot dispatch", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    replace_completion_escalation_with_v18_stub(db)
+
+    assert table_columns(db, "completion_escalations") == ["id"]
+    assert table_columns(db, "completion_escalation_wakes") == ["wakeId", "completionId"]
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v18'")
+
+    # This is the sole boot-dispatch proof. Direct seam tests can pass while
+    # check_shape/1 still refuses the predecessor instead of wiring the rung.
     assert :ok = Schema.ensure_all(db)
 
-    assert {:ok, _} =
-             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
-               @completion_escalation_previous_shape
-             ])
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert "causeKind" in table_columns(db, "completion_escalations")
+    assert "recipientUserId" in table_columns(db, "completion_escalation_wakes")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM completion_escalations")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM completion_escalation_wakes")
+  end
 
-    assert_raise Tightbeam.Schema.ShapeError,
-                 ~r/predates terminal empty-epoch completion escalation.*stamped: coordination-fabric-v1-phase1-v18.*this build: coordination-fabric-v1-phase1-v19.*Move the database aside/s,
-                 fn -> Schema.ensure_all(db) end
+  test "the v18 completion seam refuses populated escalation rows with the exact count", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+    replace_completion_escalation_with_v18_stub(db)
+    :ok = DB.execute(db, "INSERT INTO completion_escalations (id) VALUES ('one'), ('two')")
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v18'")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.upgrade_completion_escalation_v1(db) end
+    assert error.message =~ "completion_escalations has 2 rows"
+    assert {:ok, [[2]]} = DB.query(db, "SELECT count(*) FROM completion_escalations")
+    assert table_columns(db, "completion_escalations") == ["id"]
+
+    assert {:ok, [[@completion_escalation_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the v18 completion seam refuses populated wake rows with the exact count", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    replace_completion_escalation_with_v18_stub(db)
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO completion_escalation_wakes (wakeId,completionId) VALUES ('one','c'), ('two','c'), ('three','c')"
+      )
+
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v18'")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.upgrade_completion_escalation_v1(db) end
+    assert error.message =~ "completion_escalation_wakes has 3 rows"
+    assert {:ok, [[3]]} = DB.query(db, "SELECT count(*) FROM completion_escalation_wakes")
+    assert table_columns(db, "completion_escalation_wakes") == ["wakeId", "completionId"]
+
+    assert {:ok, [[@completion_escalation_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "a failed v18 completion rebuild rolls back its tables and stamp together", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    replace_completion_escalation_with_v18_stub(db)
+    :ok = DB.execute(db, "CREATE TABLE completion_escalation_wakes_completion (collision TEXT)")
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v18'")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.upgrade_completion_escalation_v1(db) end
+    assert error.message =~ "incompatible_completion_escalation_v1: upgrade failed"
+    assert table_columns(db, "completion_escalations") == ["id"]
+    assert table_columns(db, "completion_escalation_wakes") == ["wakeId", "completionId"]
+
+    assert {:ok, [[@completion_escalation_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
   end
 
   test "a fresh database is created and stamped", %{db: db} do
@@ -565,6 +624,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v15"
     assert error.message =~ "this build: #{@shape}"
     assert error.message =~ "There is no migration"
+    assert error.message =~ @completion_escalation_previous_shape
 
     assert {:ok, [["coordination-fabric-v1-phase1-v15"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
@@ -1964,6 +2024,19 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS park_premises;
       DROP TABLE IF EXISTS premise_checks;
       DROP TABLE IF EXISTS premise_claims;
+      """)
+  end
+
+  defp replace_completion_escalation_with_v18_stub(db) do
+    :ok =
+      DB.execute(db, """
+      DROP TABLE completion_escalation_wakes;
+      DROP TABLE completion_escalations;
+      CREATE TABLE completion_escalations (id TEXT PRIMARY KEY);
+      CREATE TABLE completion_escalation_wakes (
+        wakeId TEXT PRIMARY KEY,
+        completionId TEXT
+      );
       """)
   end
 

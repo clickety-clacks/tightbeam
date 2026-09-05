@@ -119,6 +119,7 @@ defmodule Tightbeam.Schema do
   # v19, and a populated table is refused with its exact row count.
   @shape "coordination-fabric-v1-phase1-v19"
   @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
+  @completion_escalation_label "incompatible_completion_escalation_v1"
   @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
   @premise_gate_previous_shape "coordination-fabric-v1-phase1-v16"
   @premise_gate_label "incompatible_premise_gate_v1"
@@ -1998,6 +1999,65 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  @doc """
+  Move an empty `coordination-fabric-v1-phase1-v18` completion shape to v19.
+
+  Both completion-owned tables must be empty. The checks, rebuild, and stamp
+  advance share one transaction, so a failed rebuild restores the predecessor
+  tables and v18 stamp together. Populated tables are refused with their exact
+  row count; no historical row mapping is inferred.
+  """
+  @spec upgrade_completion_escalation_v1(DB.server()) :: :ok
+  def upgrade_completion_escalation_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@completion_escalation_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "#{@completion_escalation_label}: predecessor stamp #{inspect(rows)}"
+           end
+
+           Enum.each(["completion_escalations", "completion_escalation_wakes"], fn table ->
+             [[count]] = Txn.q(txn, "SELECT count(*) FROM #{table}")
+
+             if count != 0 do
+               raise ShapeError,
+                 message: "#{@completion_escalation_label}: #{table} has #{count} rows"
+             end
+           end)
+
+           :ok =
+             Tightbeam.Productions.CompletionEscalation.replace_empty_v18_tables_for_v19_in_txn(
+               txn
+             )
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @completion_escalation_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "#{@completion_escalation_label}: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "#{@completion_escalation_label}: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
   defp maybe_interrupt_nullable_effective_parent_migration!(opts, point) do
     if Keyword.get(opts, :fail_at) == point,
       do: raise("forced nullable-effective-parent migration interruption")
@@ -2245,15 +2305,7 @@ defmodule Tightbeam.Schema do
         :ok
 
       {:ok, [[@completion_escalation_previous_shape]]} ->
-        raise ShapeError, """
-        this Tightbeam database predates terminal empty-epoch completion escalation.
-
-          stamped: #{@completion_escalation_previous_shape}
-          this build: #{@shape}
-
-        No in-place migration is defined for this boundary.
-        Move the database aside and let this build recreate it.
-        """
+        upgrade_completion_escalation_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -2269,8 +2321,8 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration from #{found}. The exact completion predecessor
-        #{@completion_escalation_previous_shape} also requires recreation.
+        There is no migration from #{found}. The only supported upgrade source
+        is #{@completion_escalation_previous_shape}.
         Move this database aside and let it be recreated.
         """
 

@@ -213,6 +213,21 @@ defmodule Tightbeam.Productions.CompletionEscalation do
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
+  @doc false
+  @spec replace_empty_v18_tables_for_v19_in_txn(Txn.t()) :: :ok
+  def replace_empty_v18_tables_for_v19_in_txn(%Txn{} = txn) do
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP TABLE completion_escalation_wakes;
+        DROP TABLE completion_escalations;
+        """
+      )
+
+    Txn.exec(txn, @ddl)
+  end
+
   @doc "Create one admitted terminal record and its wakes in the assignment close transaction."
   @spec open_terminal_in_txn(Txn.t(), map(), String.t(), map()) :: map() | :no_empty_epoch
   def open_terminal_in_txn(%Txn{} = txn, assignment, cause_kind, cause)
