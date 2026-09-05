@@ -533,7 +533,8 @@ defmodule Tightbeam.AssignmentsTest do
     end
   end
 
-  test "assignment-get returns the full assignment row or not_found", ctx do
+  test "assignment-get returns the full assignment row plus reopening history or not_found",
+       ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "fetch me"))
 
     assert handle(
@@ -541,7 +542,7 @@ defmodule Tightbeam.AssignmentsTest do
              "assignment-get",
              assignment_get_call({:session, "other-session"}, assignment.id)
            ) ==
-             assignment
+             Map.put(assignment, :reopenings, [])
 
     assert handle(
              ctx,
@@ -566,8 +567,7 @@ defmodule Tightbeam.AssignmentsTest do
         work_item_call("work-item-create", {:user, "flynn"}, %{title: "Second"})
       )
 
-    linked =
-      handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", first.id))
+    linked = handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", first.id))
 
     assert linked.workItemId == first.id
 
@@ -1312,6 +1312,252 @@ defmodule Tightbeam.AssignmentsTest do
            ]
   end
 
+  test "reopen restores custody, records the close, and rearms every existing monitor", ctx do
+    item = create_work_item(ctx, "reopen lifecycle")
+
+    assignment =
+      assign_call({:user, "flynn"}, "reopen me", nil, item.id)
+      |> put_in([:params, :files], ["lib/tightbeam/assignments.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    closed = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+    assert closed.assignment.state == "closed"
+
+    assert {:ok, [[slate_wake_id]]} =
+             DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert is_binary(slate_wake_id)
+    assert Wakes.get(ctx.db, slate_wake_id).state == "pending"
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, assignment.id, "the assignment carries work again")
+      )
+
+    assert %{
+             state: "open",
+             outcome: nil,
+             closedAt: nil,
+             closedByUser: nil,
+             closedBySession: nil,
+             closingAttestId: nil
+           } = reopened
+
+    assert {:ok,
+            [
+              [
+                "completed",
+                prior_closed_at,
+                nil,
+                "holder",
+                prior_attest_id,
+                "flynn",
+                nil,
+                "the assignment carries work again"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT priorOutcome, priorClosedAt, priorClosedByUser, priorClosedBySession,
+                      priorClosingAttestId, reopenedByUser, reopenedBySession, reason
+               FROM assignment_reopenings WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert prior_closed_at == closed.assignment.closedAt
+    assert prior_attest_id == closed.assignment.closingAttestId
+
+    assert {:ok, [["armed", "assignment_open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,cause FROM supervision_entitlements WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[1, "canceled"], [2, "armed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [assignment.id]
+             )
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert Wakes.get(ctx.db, slate_wake_id).state == "canceled"
+    assert Assignments.declared_files(ctx.db, assignment.id) == ["lib/tightbeam/assignments.ex"]
+
+    assert marker_contents(ctx.db, "holder")
+           |> Enum.member?(
+             "[assignment reopened: #{assignment.id} by user:flynn — the assignment carries work again]"
+           )
+
+    fetched = handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+    assert [history] = fetched.reopenings
+    assert history.assignmentId == assignment.id
+    assert history.priorOutcome == "completed"
+    assert history.priorClosedAt == prior_closed_at
+    assert history.priorClosingAttestId == prior_attest_id
+    assert history.reopenedByUser == "flynn"
+    assert history.reopenedBySession == nil
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+  end
+
+  test "reopen authorization and refusals preserve every durable surface", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "authorization"))
+
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "why", "assignment_open")
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
+    assert_reopen_refused!(ctx, {:process, "cron"}, assignment.id, "why", "process_denied")
+    assert_reopen_refused!(ctx, {:user, "other"}, assignment.id, "why", "not_authorized")
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "holder"}, assignment.id, "holder repair")
+             )
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "admin"}, assignment.id, "admin repair")
+             )
+
+    assert %{code: "unknown_assignment"} =
+             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, "asg_missing", "why"))
+
+    retired = handle(ctx, "assign", assign_call({:user, "flynn"}, "retired holder"))
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, retired.id, "completion"))
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
+    assert_reopen_refused!(ctx, {:user, "flynn"}, retired.id, "why", "session_retired")
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='holder'")
+
+    item = create_work_item(ctx, "terminal item")
+    carded = handle(ctx, "assign", assign_call({:user, "flynn"}, "item card", nil, item.id))
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, carded.id, "completion"))
+
+    _ =
+      handle(
+        ctx,
+        "work-item-close",
+        work_item_call("work-item-close", {:user, "flynn"}, %{work_item_id: item.id})
+      )
+
+    assert_reopen_refused!(ctx, {:user, "flynn"}, carded.id, "why", "work_item_not_open")
+  end
+
+  test "reopen accepts all lawful close outcomes and keeps file declarations advisory", ctx do
+    surrendered = handle(ctx, "assign", assign_call({:user, "flynn"}, "surrender repair"))
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, surrendered.id, "surrender"))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "holder"}, surrendered.id, "the surrender was premature")
+             )
+
+    revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "revocation repair"))
+    _ = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked.id))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, revoked.id, "the revocation was mistaken")
+             )
+
+    assert {:ok, [["surrendered"], ["revoked"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT priorOutcome FROM assignment_reopenings WHERE assignmentId IN (?1,?2) ORDER BY id",
+               [surrendered.id, revoked.id]
+             )
+
+    first =
+      assign_call({:user, "flynn"}, "first file card")
+      |> put_in([:params, :files], ["lib/tightbeam/assignments.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
+
+    second =
+      assign_call({:user, "flynn"}, "second file card")
+      |> put_in([:params, :files], ["lib/tightbeam/assignments.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, first.id, "resume both lanes")
+             )
+
+    assert Assignments.open_assignments_touching(ctx.db, ["lib/tightbeam/assignments.ex"]) ==
+             Enum.sort([first.id, second.id])
+  end
+
+  test "reopen validates close shape and rolls back a post-audit failure", ctx do
+    malformed = handle(ctx, "assign", assign_call({:user, "flynn"}, "malformed close"))
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, malformed.id, "completion"))
+
+    assert :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=ON")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET closedAt=NULL WHERE id=?1", [malformed.id])
+
+    assert :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=OFF")
+
+    assert_reopen_refused!(
+      ctx,
+      {:user, "flynn"},
+      malformed.id,
+      "do not infer the close",
+      "unexpected_assignment_shape"
+    )
+
+    rollback = handle(ctx, "assign", assign_call({:user, "flynn"}, "transaction rollback"))
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, rollback.id, "completion"))
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO supervision_entitlements
+          (assignmentId,generation,dueAt,state,basisKind,basisId,cause,principal,
+           supervisionIntervalMs)
+        VALUES (?1,1,0,'armed','assignment_open',?1,'assignment_open','process:test',1000)
+        """,
+        [rollback.id]
+      )
+
+    before = reopen_mutation_snapshot(ctx.db, rollback.id)
+
+    assert_raise RuntimeError, ~r/invalid supervision transition result/, fn ->
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, rollback.id, "force a later transactional failure")
+      )
+    end
+
+    assert reopen_mutation_snapshot(ctx.db, rollback.id) == before
+  end
+
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
     user = handle(ctx, "assign", assign_call({:user, "holder"}, "user", "collision"))
     session = handle(ctx, "assign", assign_call({:session, "holder"}, "session", "collision"))
@@ -1425,8 +1671,7 @@ defmodule Tightbeam.AssignmentsTest do
   test "work lifecycle markers land in the actor transcript with exact event text", ctx do
     completed = handle(ctx, "assign", assign_call({:user, "flynn"}, "completed markers"))
 
-    progress =
-      handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "progress"))
+    progress = handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "progress"))
 
     verdict_call =
       attest_call({:session, "holder"}, completed.id, "verdict")
@@ -1487,8 +1732,7 @@ defmodule Tightbeam.AssignmentsTest do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "marker failure"))
     :ok = DB.execute(ctx.db, "DROP TABLE messages")
 
-    result =
-      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+    result = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
 
     assert result.assignment.id == assignment.id
     assert result.attest.kind == "progress"
@@ -1607,8 +1851,7 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:user, "flynn"}, verdict_assignment.id, "verdict")
       |> put_in([:params, :verdict_kind], "tests-passed")
 
-    assert {:ok, %{attest: verdict}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, verdict_call)
+    assert {:ok, %{attest: verdict}} = Dispatch.dispatch(ctx.db, ctx.handlers, verdict_call)
 
     assert verdict.verdictKind == "tests-passed"
 
@@ -1677,6 +1920,7 @@ defmodule Tightbeam.AssignmentsTest do
               "attest",
               "attests",
               "revoke-assignment",
+              "reopen-assignment",
               "assignments"
             ],
        do:
@@ -1686,7 +1930,7 @@ defmodule Tightbeam.AssignmentsTest do
            call
            |> Map.put(:verb, verb)
            |> then(fn routed ->
-             if verb in ["assign", "dispatch"],
+             if verb in ["assign", "dispatch", "reopen-assignment"],
                do: Map.put_new(routed, :supervision_interval_ms, 1_000),
                else: routed
            end)
@@ -1724,6 +1968,51 @@ defmodule Tightbeam.AssignmentsTest do
     count
   end
 
+  defp reopen_mutation_snapshot(db, assignment_id) do
+    {:ok, [assignment]} =
+      DB.query(
+        db,
+        "SELECT state,outcome,closedAt,closedByUser,closedBySession,closingAttestId " <>
+          "FROM assignments WHERE id=?1",
+        [assignment_id]
+      )
+
+    {:ok, [[reopening_count]]} =
+      DB.query(db, "SELECT count(*) FROM assignment_reopenings WHERE assignmentId=?1", [
+        assignment_id
+      ])
+
+    {:ok, supervision} =
+      DB.query(
+        db,
+        "SELECT generation,state,cause FROM supervision_entitlements WHERE assignmentId=?1",
+        [assignment_id]
+      )
+
+    {:ok, effort} =
+      DB.query(
+        db,
+        "SELECT generation,state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+        [assignment_id]
+      )
+
+    %{
+      assignment: assignment,
+      reopeningCount: reopening_count,
+      supervision: supervision,
+      effort: effort
+    }
+  end
+
+  defp assert_reopen_refused!(ctx, principal, assignment_id, reason, expected_code) do
+    before = reopen_mutation_snapshot(ctx.db, assignment_id)
+
+    assert %{code: ^expected_code} =
+             handle(ctx, "reopen-assignment", reopen_call(principal, assignment_id, reason))
+
+    assert reopen_mutation_snapshot(ctx.db, assignment_id) == before
+  end
+
   defp assign_call(principal, subject \\ "work", key \\ nil, work_item_id \\ nil) do
     call("assign", principal, "holder", %{
       subject: subject,
@@ -1753,6 +2042,9 @@ defmodule Tightbeam.AssignmentsTest do
 
   defp revoke_call(principal, id),
     do: call("revoke-assignment", principal, nil, %{assignment_id: id})
+
+  defp reopen_call(principal, id, reason),
+    do: call("reopen-assignment", principal, nil, %{assignment_id: id, reason: reason})
 
   defp query_call(principal, state, holder),
     do: call("assignments", principal, holder, %{state: state})
