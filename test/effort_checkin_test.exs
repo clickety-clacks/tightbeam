@@ -1303,7 +1303,6 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   test "A-05: a dismiss snapshot change refuses stale and a fresh retry rules once", ctx do
-    observer = session(ctx.db, "dismiss-observer", "h1", Placement.local_host_name())
     target = dispatch(ctx, {:session, "parent"}, "holder", "dismiss target")
     moving = dispatch(ctx, {:session, "parent"}, "holder", "concurrent holder motion")
     request_id = open_effort_request(ctx, target, "parent")
@@ -1334,7 +1333,7 @@ defmodule Tightbeam.EffortCheckinTest do
         System.cmd(hd(invocation), tl(invocation), stderr_to_stdout: true)
       end)
 
-    call = effort_rule_call(observer.session_key, request_id, "dismiss")
+    call = effort_rule_call(ctx.parent.session_key, request_id, "dismiss")
 
     assert %{code: "stale_effort_snapshot"} = EffortCheckin.rule(ctx.db, race_config, call)
     assert [["open", nil, nil]] = request_ruling(ctx.db, request_id)
@@ -1342,7 +1341,7 @@ defmodule Tightbeam.EffortCheckinTest do
     assert %{status: "ruled", decision: "dismiss", ruled_by: ruled_by} =
              EffortCheckin.rule(ctx.db, ctx.config, call)
 
-    assert ruled_by == "session:#{observer.session_key}"
+    assert ruled_by == "session:#{ctx.parent.session_key}"
     assert [["ruled", "dismiss", ^ruled_by]] = request_ruling(ctx.db, request_id)
 
     assert rows(
@@ -1353,8 +1352,8 @@ defmodule Tightbeam.EffortCheckinTest do
   end
 
   test "A-10: deadline and distinct-session rulings preserve one winner in both orders", ctx do
-    continuing = session(ctx.db, "continue-observer", "h1", Placement.local_host_name())
-    dismissing = session(ctx.db, "dismiss-observer-two", "h1", Placement.local_host_name())
+    continuing = ctx.parent
+    dismissing = ctx.main
 
     ruling_first = dispatch(ctx, {:session, "parent"}, "holder", "ruling wins first")
     continue_id = open_effort_request(ctx, ruling_first, "parent")
@@ -1409,6 +1408,96 @@ defmodule Tightbeam.EffortCheckinTest do
                "SELECT COUNT(*) FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
                [request_id]
              ) == [[0]]
+    end
+  end
+
+  test "R7: only active escalation-lineage sessions may rule, and the holder never may", ctx do
+    for action <- ["continue", "dismiss"] do
+      assignment = dispatch(ctx, {:session, "parent"}, "holder", "holder refused #{action}")
+      request_id = open_effort_request(ctx, assignment, "parent")
+      before = request_snapshot(ctx.db, request_id)
+
+      assert %{code: "not_authorized", message: "current expecter required"} =
+               EffortCheckin.rule(
+                 ctx.db,
+                 ctx.config,
+                 effort_rule_call("holder", request_id, action)
+               )
+
+      assert request_snapshot(ctx.db, request_id) == before
+    end
+
+    passed = dispatch(ctx, {:session, "parent"}, "holder", "passed lineage rung")
+    passed_id = open_effort_request(ctx, passed, ctx.main.session_key)
+    outsider = session(ctx.db, "lineage-outsider", "h1", Placement.local_host_name())
+    before = request_snapshot(ctx.db, passed_id)
+
+    assert %{code: "not_authorized"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call(outsider.session_key, passed_id, "continue")
+             )
+
+    assert request_snapshot(ctx.db, passed_id) == before
+
+    assert %{status: "ruled", decision: "continue", ruled_by: "session:parent"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call("parent", passed_id, "continue")
+             )
+  end
+
+  test "R7: the lineage walk steps past a retired rung and creates no session path from a user opener",
+       ctx do
+    retired =
+      session(ctx.db, "retired-lineage-rung", "h1", Placement.local_host_name(), %{
+        operational_parent: "parent"
+      })
+
+    assignment =
+      dispatch(ctx, {:session, retired.session_key}, "holder", "retired lineage rung")
+
+    request_id = open_effort_request(ctx, assignment, retired.session_key)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               retired.session_key
+             ])
+
+    before = request_snapshot(ctx.db, request_id)
+
+    assert %{code: "not_authorized"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call(retired.session_key, request_id, "dismiss")
+             )
+
+    assert request_snapshot(ctx.db, request_id) == before
+
+    assert %{status: "ruled", decision: "dismiss", ruled_by: "session:parent"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call("parent", request_id, "dismiss")
+             )
+
+    owner_opened = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "owner open"})
+    owner_request = open_effort_request(ctx, owner_opened, {:user, "h1"})
+    owner_before = request_snapshot(ctx.db, owner_request)
+    outsider = session(ctx.db, "owner-lineage-outsider", "h1", Placement.local_host_name())
+
+    for caller <- ["parent", ctx.main.session_key, outsider.session_key] do
+      assert %{code: "not_authorized"} =
+               EffortCheckin.rule(
+                 ctx.db,
+                 ctx.config,
+                 effort_rule_call(caller, owner_request, "continue")
+               )
+
+      assert request_snapshot(ctx.db, owner_request) == owner_before
     end
   end
 
@@ -2939,6 +3028,12 @@ defmodule Tightbeam.EffortCheckinTest do
         [[0]]
 
   defp open_effort_request(ctx, assignment, expecter_session_key) do
+    {expecter_session_key, expecter_user_id} =
+      case expecter_session_key do
+        {:user, user_id} -> {nil, user_id}
+        session_key -> {session_key, nil}
+      end
+
     [[generation]] =
       rows(
         ctx.db,
@@ -2948,7 +3043,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     deadline =
       Wakes.schedule(ctx.db, %{
-        session_key: expecter_session_key,
+        session_key: expecter_session_key || Org.personal_session_key(expecter_user_id),
         origin: "process:tightbeam",
         consumer: "effort_deadline",
         due_at: System.system_time(:millisecond) + 60_000,
@@ -2963,9 +3058,9 @@ defmodule Tightbeam.EffortCheckinTest do
                ctx.db,
                """
                INSERT INTO decision_requests
-                 (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
+                 (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,expecterUserId,lineageRung,
                   effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,options,context,status)
-               VALUES (?1,'effort','process:tightbeam','h1',?2,?3,1,?4,?5,?6,?7,
+               VALUES (?1,'effort','process:tightbeam','h1',?2,?3,?4,1,?5,?6,?7,?8,
                        'Continue or dismiss?','["continue","dismiss"]',
                        '{"actions":["continue","dismiss"]}','open')
                """,
@@ -2973,6 +3068,7 @@ defmodule Tightbeam.EffortCheckinTest do
                  request_id,
                  assignment.id,
                  expecter_session_key,
+                 expecter_user_id,
                  generation,
                  deadline.wake_id,
                  now,

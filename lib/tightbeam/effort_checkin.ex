@@ -517,7 +517,7 @@ defmodule Tightbeam.EffortCheckin do
       action not in ["continue", "dismiss"] ->
         error("invalid_action", "action must be continue or dismiss")
 
-      not authorized?(call.principal, request) ->
+      not authorized?({db, call.principal}, request) ->
         error("not_authorized", "current expecter required")
 
       request.status == "ruled" and request.decision == action and request.ruled_by == actor ->
@@ -834,7 +834,7 @@ defmodule Tightbeam.EffortCheckin do
     current = request_for_id(txn, request.id)
 
     cond do
-      not authorized?(principal, current) ->
+      not authorized?({txn, principal}, current) ->
         error("not_authorized", "current expecter required")
 
       current.status == "ruled" and current.decision == action and
@@ -1549,8 +1549,44 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp authorized?({:session, _key}, _request), do: true
-  defp authorized?({:user, user}, request), do: request.expecter_user_id == user
+  defp authorized?({%Txn{} = txn, {:session, key}}, request) do
+    assignment = assignment_in_txn(txn, request.assignment_id)
+
+    first_key =
+      cond do
+        assignment.opened_by_user ->
+          nil
+
+        assignment.opened_by_session == assignment.holder_key ->
+          session_in_txn(txn, assignment.holder_key).effective_parent
+
+        true ->
+          assignment.opened_by_session
+      end
+
+    first_key
+    |> Stream.unfold(fn
+      nil ->
+        nil
+
+      current_key ->
+        session = session_in_txn(txn, current_key)
+        next_key = if session.kind == "main", do: nil, else: session.effective_parent
+        {{current_key, session}, next_key}
+    end)
+    |> Enum.any?(fn {candidate, session} ->
+      candidate == key and candidate != assignment.holder_key and session.state == "active"
+    end)
+  end
+
+  defp authorized?({db, {:session, key}}, request) do
+    case DB.transaction(db, fn txn -> authorized?({txn, {:session, key}}, request) end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp authorized?({_source, {:user, user}}, request), do: request.expecter_user_id == user
   defp authorized?(_, _request), do: false
 
   defp visible_request?(_db, %{principal: {:session, _key}}, %{kind: "agent"}), do: true
