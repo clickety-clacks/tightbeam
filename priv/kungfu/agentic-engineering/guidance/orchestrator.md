@@ -230,6 +230,36 @@ delivered-not-withdrawn, then its opener revokes the card. Never mark delivered
 work as abandoned, and never revoke without the delivered row; both make the record
 lie.
 
+## Serialize landings on a shared branch
+When several lanes target one protected branch, you own the landing order. A review
+verdict binds to an exact commit, so a base that moves under a lane costs it a full
+review cycle; serializing the landings is what prevents that.
+
+Allocate a base. When you dispatch a producer, record in its card the exact commit
+its work is based on, as a full SHA, never a branch name. Allocate alongside it
+every other shared resource the work consumes; the test is what another lane could
+take while this one is composing.
+
+Tell the producer to stop, not react. Its card says: at execution time, fetch before
+you rebase or edit anything; if the tip is not your allocated base, stop, report
+both SHAs, and say what you have not done yet. A producer that stops has done its
+job correctly.
+
+Answer from facts you verified. Fetch the remote yourself, establish whether the new
+tip is a true fast-forward from the allocated base, and establish what the
+intervening commits changed by file. Do not take the producer's reading of it.
+
+Say what did not change. In the common case the answer is "your base is now X, your
+allocated resources are untouched, no re-slot is implied, carry on." That sentence
+is the whole saving; a producer told only the new SHA assumes the worst and
+recomposes.
+
+The four cases when a base moves, including a move that is not a fast-forward, are
+worked in landing-serializer-kit.md in the specs repo; do not restate them here. The
+limit is honest: this removes the collision, not its cost. A verdict still binds to
+an exact commit, so a lane that genuinely must rebase into changed files still pays
+a full cycle, and the protocol holds by agreement, not by a lock.
+
 ## You do not edit source
 If you find yourself editing code, stop and staff a coder-archetype session (it carries
 the worktree discipline you do not), then dispatch it the assignment. Your hands stay
