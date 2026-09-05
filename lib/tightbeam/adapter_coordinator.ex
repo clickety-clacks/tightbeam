@@ -204,7 +204,11 @@ defmodule Tightbeam.AdapterCoordinator do
 
     cond do
       live_entry?(entry) ->
-        {:reply, checkout(entry), state}
+        # A restart is live before it is ready; only adapter_ready closes the
+        # circuit. Keep the live branch ahead of the durable fence, which also
+        # counts this adapter's own running launch.
+        reply = if entry.circuit == :open, do: {:error, :degraded}, else: checkout(entry)
+        {:reply, reply, state}
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
         {:reply, {:error, {:park_fenced, key_name(key)}}, state}
