@@ -4288,9 +4288,24 @@ defmodule Tightbeam.Gateway do
   # skill files when it next runs, and apply neither confirms that it did nor
   # can. Ordinary prompt ordering decides when it lands. A failed submission
   # leaves the files and the stamp alone — they are already true.
+  #
+  # Delivery reports a prompt it declined to submit as `:skipped` and does not
+  # raise, so the return is read rather than discarded — a started session whose
+  # nudge never reached the ledger is not applied. `:duplicate` IS a submitted
+  # prompt (dedupe found the turn already there); `:conflict` and
+  # `:invalid_reply_reference` need a reply reference this call never passes.
+  #
+  # No state the substrate can reach today produces `:skipped` here: four of
+  # delivery's five skip sites need a `wake_id` this call never passes, and the
+  # fifth needs the session's row to be absent, which nothing deletes. The
+  # guard stays because the callee DECLARES `:skipped` as a failure return, and
+  # this call must not answer applied on one — not because it is seen. Do not
+  # read it as evidence that it happens, and build no defenses on top of it.
   defp identity_apply_nudge(config, db, session, revision) do
-    notify_session(config, db, session.session_key, identity_apply_prompt(revision))
-    :applied
+    case notify_session(config, db, session.session_key, identity_apply_prompt(revision)) do
+      :skipped -> {:error, identity_apply_failed(session, "the re-read prompt was not submitted")}
+      _submitted -> :applied
+    end
   rescue
     error -> {:error, identity_apply_failed(session, error)}
   end
@@ -4301,11 +4316,13 @@ defmodule Tightbeam.Gateway do
       "reload your current model context."
   end
 
-  defp identity_apply_failed(session, error) do
+  defp identity_apply_failed(session, error) when is_exception(error),
+    do: identity_apply_failed(session, Exception.message(error))
+
+  defp identity_apply_failed(session, reason) when is_binary(reason) do
     %{
       code: "apply_failed",
-      message:
-        "identity apply could not reach #{session.session_key}: #{Exception.message(error)}",
+      message: "identity apply could not reach #{session.session_key}: #{reason}",
       sessions: [session.session_key]
     }
   end
