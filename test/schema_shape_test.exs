@@ -48,13 +48,14 @@ defmodule Tightbeam.SchemaShapeTest do
   test "the exact v19 predecessor gains the principal duty through boot dispatch", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
-    {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('mike',0,'admin_add',1)"
-      )
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "principal-duty-migration",
+               claimed_name: "Mike",
+               platform: nil,
+               model: nil
+             })
 
-    ensure_main_session(db, "mike")
     mike_session = Org.personal_session_key("mike")
 
     direct =

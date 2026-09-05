@@ -2,6 +2,7 @@ defmodule Tightbeam.Stall410Test do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{DB, Model, Org, Wakes, WorkItems}
+  alias Tightbeam.DB.Txn
 
   setup do
     db = :stall_410_db
@@ -125,6 +126,7 @@ defmodule Tightbeam.Stall410Test do
         ] do
       item = create(ctx.db, {:user, "mike"}, "#{target} goal")
       horizon = boundary(ctx.db, item.id, "#{target} boundary", 1_000, "#{target}-horizon")
+      params = maybe_add_completion_fixture(ctx.db, verb, item.id, params)
 
       assert %{ok: true, workItem: %{state: ^target}} =
                WorkItems.__handle__(
@@ -185,7 +187,10 @@ defmodule Tightbeam.Stall410Test do
              WorkItems.__handle__(
                ctx.db,
                "work-item-close",
-               call({:user, "mike"}, %{work_item_id: delivered_first.id})
+               call({:user, "mike"}, %{
+                 work_item_id: delivered_first.id,
+                 completion_attest_id: completion_fixture!(ctx.db, delivered_first.id)
+               })
              )
 
     assert {:ok, [["escalated"]]} =
@@ -209,7 +214,10 @@ defmodule Tightbeam.Stall410Test do
              WorkItems.__handle__(
                ctx.db,
                "work-item-close",
-               call({:user, "mike"}, %{work_item_id: terminal_first.id})
+               call({:user, "mike"}, %{
+                 work_item_id: terminal_first.id,
+                 completion_attest_id: completion_fixture!(ctx.db, terminal_first.id)
+               })
              )
 
     for _ <- 1..2 do
@@ -265,6 +273,64 @@ defmodule Tightbeam.Stall410Test do
           idempotency_key: key
         })
       )
+
+  defp maybe_add_completion_fixture(db, "work-item-close", item_id, params),
+    do: Map.put(params, :completion_attest_id, completion_fixture!(db, item_id))
+
+  defp maybe_add_completion_fixture(_db, _verb, _item_id, params), do: params
+
+  defp completion_fixture!(db, work_item_id) do
+    {:ok, attest_id} =
+      DB.transaction(db, fn txn ->
+        suffix = Tightbeam.Id.uuid4()
+        assignment_id = "asg_" <> suffix
+        attest_id = "att_" <> suffix
+        holder = Org.personal_session_key("mike")
+        ts = System.system_time(:millisecond)
+
+        Txn.q(
+          txn,
+          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'terminal close fixture',?2,'mike',?3,'open',?4)",
+          [assignment_id, holder, ts, work_item_id]
+        )
+
+        :ok =
+          Tightbeam.DeliverableContract.bind_assignment_in_txn(
+            txn,
+            %{
+              id: assignment_id,
+              subject: "terminal close fixture",
+              holderKey: holder,
+              openedAt: ts,
+              workItemId: work_item_id
+            },
+            true
+          )
+
+        Txn.q(
+          txn,
+          "INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES (?1,?2,'completion',?3,?4)",
+          [attest_id, assignment_id, holder, ts]
+        )
+
+        Txn.q(
+          txn,
+          "UPDATE assignments SET state='closed',outcome='completed',closedAt=?2,closedBySession=?3,closingAttestId=?4 WHERE id=?1",
+          [assignment_id, ts, holder, attest_id]
+        )
+
+        :ok =
+          Tightbeam.DeliverableContract.record_completion_claim_in_txn(
+            txn,
+            assignment_id,
+            %{id: attest_id, ts: ts}
+          )
+
+        attest_id
+      end)
+
+    attest_id
+  end
 
   defp call(principal, params),
     do: %{verb: "work-item-duty", origin: "agent:duty", principal: principal, params: params}

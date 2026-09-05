@@ -10,7 +10,7 @@ defmodule Tightbeam.Firehose.CoreDetailA6Test do
       resource: "work-items",
       rest_resource: "work items",
       classes:
-        ~w(work_item.created work_item.updated work_item.iceboxed work_item.reopened work_item.closed work_item.failed),
+        ~w(work_item.created work_item.updated work_item.iceboxed work_item.reopened work_item.closed work_item.failed work_item.deprioritized work_item.boundary_declared),
       primary_refs: ["workItemId"]
     },
     %{
