@@ -1551,18 +1551,7 @@ defmodule Tightbeam.EffortCheckin do
 
   defp authorized?({%Txn{} = txn, {:session, key}}, request) do
     assignment = assignment_in_txn(txn, request.assignment_id)
-
-    first_key =
-      cond do
-        assignment.opened_by_user ->
-          nil
-
-        assignment.opened_by_session == assignment.holder_key ->
-          session_in_txn(txn, assignment.holder_key).effective_parent
-
-        true ->
-          assignment.opened_by_session
-      end
+    first_key = session_in_txn(txn, assignment.holder_key).effective_parent
 
     first_key
     |> Stream.unfold(fn

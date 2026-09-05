@@ -1449,12 +1449,14 @@ defmodule Tightbeam.EffortCheckinTest do
              )
   end
 
-  test "R7: the lineage walk steps past a retired rung and creates no session path from a user opener",
+  test "R7: the holder-parent walk skips retired rungs and ignores the assignment opener",
        ctx do
     retired =
       session(ctx.db, "retired-lineage-rung", "h1", Placement.local_host_name(), %{
         operational_parent: "parent"
       })
+
+    Org.set_operational_parent(ctx.db, "holder", retired.session_key)
 
     assignment =
       dispatch(ctx, {:session, retired.session_key}, "holder", "retired lineage rung")
@@ -1484,21 +1486,39 @@ defmodule Tightbeam.EffortCheckinTest do
                effort_rule_call("parent", request_id, "dismiss")
              )
 
+    outsider = session(ctx.db, "opener-outside-holder-chain", "h1", Placement.local_host_name())
+
+    outside_opened =
+      dispatch(ctx, {:session, outsider.session_key}, "holder", "opener outside holder chain")
+
+    outside_request = open_effort_request(ctx, outside_opened, outsider.session_key)
+    outside_before = request_snapshot(ctx.db, outside_request)
+
+    assert %{code: "not_authorized"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call(outsider.session_key, outside_request, "continue")
+             )
+
+    assert request_snapshot(ctx.db, outside_request) == outside_before
+
+    assert %{status: "ruled", ruled_by: "session:parent"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call("parent", outside_request, "continue")
+             )
+
     owner_opened = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "owner open"})
     owner_request = open_effort_request(ctx, owner_opened, {:user, "h1"})
-    owner_before = request_snapshot(ctx.db, owner_request)
-    outsider = session(ctx.db, "owner-lineage-outsider", "h1", Placement.local_host_name())
 
-    for caller <- ["parent", ctx.main.session_key, outsider.session_key] do
-      assert %{code: "not_authorized"} =
-               EffortCheckin.rule(
-                 ctx.db,
-                 ctx.config,
-                 effort_rule_call(caller, owner_request, "continue")
-               )
-
-      assert request_snapshot(ctx.db, owner_request) == owner_before
-    end
+    assert %{status: "ruled", ruled_by: "session:parent"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call("parent", owner_request, "continue")
+             )
   end
 
   test "an exact effort transition cancels its own deadline after supervision liveness disappears",

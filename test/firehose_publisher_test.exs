@@ -414,6 +414,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
       })
     end
 
+    Org.set_operational_parent(db, "effect-holder", "effect-observer")
+
     base_dir =
       Path.join(
         System.tmp_dir!(),
@@ -436,8 +438,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, assignment} =
              Dispatch.dispatch(db, handlers, %{
                verb: "dispatch",
-               origin: "agent:effect-observer",
-               principal: {:session, "effect-observer"},
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
                session_key: "effect-holder",
                target_role: nil,
                role_fallback: false,
