@@ -1824,12 +1824,12 @@ defmodule Tightbeam.DeliverableContractTest do
 
     # This migration lands the v16 stamp, which is now a predecessor of the
     # current shape rather than the current shape itself. The tail below
-    # exercises current-shape validation (ensure_schema validates a v18 stamp
-    # and refuses a corrupted deliverable), so advance the marker to the
-    # current shape first. The contract tables are byte-identical v16..v18,
-    # so this is a stamp advance with nothing to migrate.
+    # exercises predecessor-shape validation (ensure_schema validates a v19
+    # stamp and refuses a corrupted deliverable), so advance the marker to the
+    # current predecessor first. The contract tables are byte-identical
+    # v16..v20, so this is a stamp advance with nothing to migrate.
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v18'")
+      DB.query(ctx.db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v19'")
 
     assert :ok = DeliverableContract.ensure_schema(ctx.db)
 

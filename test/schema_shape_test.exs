@@ -32,9 +32,10 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision}
+  alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision, WorkItems}
 
-  @shape "coordination-fabric-v1-phase1-v19"
+  @shape "coordination-fabric-v1-phase1-v20"
+  @principal_duty_previous_shape "coordination-fabric-v1-phase1-v19"
   @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
   @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
 
@@ -44,7 +45,65 @@ defmodule Tightbeam.SchemaShapeTest do
     %{db: name}
   end
 
-  test "the exact v18 predecessor gains the completion shape through boot dispatch", %{db: db} do
+  test "the exact v19 predecessor gains the principal duty through boot dispatch", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('mike',0,'admin_add',1)"
+      )
+
+    ensure_main_session(db, "mike")
+    mike_session = Org.personal_session_key("mike")
+
+    direct =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:mike",
+        principal: {:user, "mike"},
+        params: %{title: "legacy direct principal ask"}
+      })
+
+    relayed =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "agent:#{mike_session}",
+        principal: {:session, mike_session},
+        params: %{title: "legacy relayed principal ask"}
+      })
+
+    drop_principal_duty(db)
+    :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v19'")
+
+    refute table?(db, "work_item_sources")
+    refute table?(db, "work_item_duty_receipts")
+    refute table?(db, "work_item_horizons")
+
+    # This is the sole boot-dispatch proof. Direct seam tests can pass while
+    # check_shape/1 still refuses the predecessor instead of wiring the rung.
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert_principal_duty_shape(db)
+
+    assert {:ok, [[direct_id, "mike", "direct", nil], [relayed_id, "mike", "relayed", source]]} =
+             DB.query(
+               db,
+               "SELECT workItemId,sourceUserId,sourceKind,sourceSessionKey FROM work_item_sources ORDER BY sourceKind"
+             )
+
+    assert direct_id == direct.id
+    assert relayed_id == relayed.id
+    assert source == mike_session
+
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM work_item_duty_receipts")
+    assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM work_item_horizons")
+  end
+
+  test "the v18 completion seam advances to the fixed v19 shape when called directly", %{
+    db: db
+  } do
     assert :ok = Schema.ensure_all(db)
     replace_completion_escalation_with_v18_stub(db)
 
@@ -52,11 +111,11 @@ defmodule Tightbeam.SchemaShapeTest do
     assert table_columns(db, "completion_escalation_wakes") == ["wakeId", "completionId"]
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v18'")
 
-    # This is the sole boot-dispatch proof. Direct seam tests can pass while
-    # check_shape/1 still refuses the predecessor instead of wiring the rung.
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = Schema.upgrade_completion_escalation_v1(db)
 
-    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[@principal_duty_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
     assert "causeKind" in table_columns(db, "completion_escalations")
     assert "recipientUserId" in table_columns(db, "completion_escalation_wakes")
     assert {:ok, [[0]]} = DB.query(db, "SELECT count(*) FROM completion_escalations")
@@ -125,6 +184,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert "completionReportToSessionKey" in table_columns(db, "assignments")
     assert table?(db, "completion_escalations")
     assert table?(db, "completion_escalation_wakes")
+    assert_principal_duty_shape(db)
 
     assert {:ok, [[wake_sql]]} =
              DB.query(db, "SELECT sql FROM sqlite_master WHERE type='table' AND name='wakes'")
@@ -594,7 +654,7 @@ defmodule Tightbeam.SchemaShapeTest do
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v16'")
 
     # v16 is no longer wired into boot dispatch: `check_shape` accepts only the
-    # v18 predecessor now, so a v16 stamp is migrated through the explicit seam,
+    # v19 predecessor now, so a v16 stamp is migrated through the explicit seam,
     # which stamps the frozen v17 successor.
     assert :ok = Schema.upgrade_premise_gate_v1(db)
 
@@ -624,7 +684,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ "stamped: coordination-fabric-v1-phase1-v15"
     assert error.message =~ "this build: #{@shape}"
     assert error.message =~ "There is no migration"
-    assert error.message =~ @completion_escalation_previous_shape
+    assert error.message =~ @principal_duty_previous_shape
 
     assert {:ok, [["coordination-fabric-v1-phase1-v15"]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
@@ -1945,6 +2005,17 @@ defmodule Tightbeam.SchemaShapeTest do
     rows
   end
 
+  defp assert_principal_duty_shape(db) do
+    assert table_columns(db, "work_item_sources") ==
+             ~w(workItemId sourceUserId sourceKind sourceSessionKey)
+
+    assert table_columns(db, "work_item_duty_receipts") ==
+             ~w(workItemId operation idempotencyKey request rowKind rowId createdAt)
+
+    assert table_columns(db, "work_item_horizons") ==
+             ~w(workItemId generation boundary dueAt wakeId state declaredAt escalatedAt)
+  end
+
   defp owned_activation_objects(db) do
     {:ok, rows} =
       DB.query(
@@ -2024,6 +2095,15 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS park_premises;
       DROP TABLE IF EXISTS premise_checks;
       DROP TABLE IF EXISTS premise_claims;
+      """)
+  end
+
+  defp drop_principal_duty(db) do
+    :ok =
+      DB.execute(db, """
+      DROP TABLE work_item_duty_receipts;
+      DROP TABLE work_item_horizons;
+      DROP TABLE work_item_sources;
       """)
   end
 

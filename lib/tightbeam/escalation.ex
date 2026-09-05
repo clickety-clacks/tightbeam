@@ -2500,7 +2500,8 @@ defmodule Tightbeam.Escalation do
     end
   end
 
-  defp operator_ask_in_txn(txn, call, session_key, owner_user_id, ask) do
+  @doc false
+  def operator_ask_in_txn(txn, call, session_key, owner_user_id, ask) do
     raiser_id = Map.fetch!(call, :origin)
     action_key = operator_action_key(ask)
 

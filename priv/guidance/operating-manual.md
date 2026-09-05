@@ -226,6 +226,14 @@ product-owner session can record an explicit narrower close. `work-item-update -
 changes display text only. It never changes the original deliverable name, id, or hash.
 If the original deliverable is wrong, fail or icebox the card and create a replacement.
 
+If you own a principal-sourced work item and must put it behind another open item,
+file the choice at that moment. Use one typed notice with the named item and a
+bounded pickup horizon, or one decision request that names both items and asks
+which wins. Triage is allowed. Quietly leaving the principal's ask behind other work is
+not. When you declare a goal boundary, give it a bounded horizon. Move the
+boundary before that horizon, or let its one-shot escalation make the stall
+visible; do not extend an unchanged boundary.
+
 Open the card against a role, never a bare session key. The card records the role it
 was opened against; opened against a session key alone it records none, and
 `assignments --role` — and every role-history question after it — cannot see it. A

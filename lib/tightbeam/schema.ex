@@ -114,10 +114,17 @@ defmodule Tightbeam.Schema do
   # now a frozen seam: the function remains public, but boot no longer wires it.
   #
   # The terminal empty-epoch and bounded-recipient revision changes the
-  # completion-owned tables again. Its v18 predecessor is the current one-step
-  # boot arm; only empty completion-owned tables can advance transactionally to
-  # v19, and a populated table is refused with its exact row count.
-  @shape "coordination-fabric-v1-phase1-v19"
+  # completion-owned tables again. Its v18 predecessor advances to the fixed
+  # v19 principal-duty predecessor only when both completion-owned tables are
+  # empty. The function remains a public seam, but boot no longer wires it.
+  #
+  # The Stall 4.10 principal duty adds immutable work-item provenance,
+  # exactly-once duty receipts, and bounded horizon state. Its v19 predecessor
+  # is the current one-step boot arm; the migration creates those additive
+  # objects, backfills existing work-item provenance, and stamps v20 in the same
+  # transaction.
+  @shape "coordination-fabric-v1-phase1-v20"
+  @principal_duty_previous_shape "coordination-fabric-v1-phase1-v19"
   @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
   @completion_escalation_label "incompatible_completion_escalation_v1"
   @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
@@ -2037,7 +2044,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @completion_escalation_previous_shape,
-             @shape,
+             @principal_duty_previous_shape,
              migration_time
            ])
 
@@ -2055,6 +2062,50 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "#{@completion_escalation_label}: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc """
+  Add the Stall 4.10 principal-duty objects to the exact v19 predecessor.
+
+  The new tables and the provenance backfill share one transaction with the
+  v20 stamp, so an incomplete migration cannot admit duty checks against
+  missing source rows.
+  """
+  @spec upgrade_principal_duty_v1(DB.server()) :: :ok
+  def upgrade_principal_duty_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@principal_duty_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_principal_duty_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.WorkItems.principal_duty_schema_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @principal_duty_previous_shape,
+             @shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_principal_duty_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_principal_duty_v1: migration failed: #{Exception.message(error)}"
     end
   end
 
@@ -2304,8 +2355,8 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
-      {:ok, [[@completion_escalation_previous_shape]]} ->
-        upgrade_completion_escalation_v1(db)
+      {:ok, [[@principal_duty_previous_shape]]} ->
+        upgrade_principal_duty_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -2322,7 +2373,7 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         There is no migration from #{found}. The only supported upgrade source
-        is #{@completion_escalation_previous_shape}.
+        is #{@principal_duty_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
