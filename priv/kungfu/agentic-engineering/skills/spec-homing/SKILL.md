@@ -8,7 +8,7 @@ description: How a spec's identity binds to the work it drives. Use when writing
 ## Binding a spec to its work
 A path alone names a location, not a version. When a spec drives a work-item, bind its
 actual path by content: `tightbeam work-item-create --title "<feature>" --spec-ref <name>
---spec-sha256 <hex>` records the exact spec the work serves, so a coder or reviewer
+--spec-sha256 <hex>` records the exact spec the work serves, so a coder or reviewer-spec session
 reads the version you handed off and not a later edit. Re-bind on a material amendment
 (`work-item-update --spec-ref … --spec-sha256 …`) so the thread always names current
 truth — a stale pin indicts the spec, not the builder.
@@ -39,6 +39,6 @@ choose how they retain superseded specs.
    Acceptance (concrete, checkable), Open Questions (marked holes, each ruled blocking or
    non-blocking). Each section names a class of defect that hides when the section is
    absent, so an empty one is stated empty ("Non-Goals: none"), never omitted. This
-   is the writer's skeleton. A reviewer uses it as a hunt list and blocks only on a
+   is the writer's skeleton. A reviewer-spec session uses it as a hunt list and blocks only on a
    load-bearing hole, never on a missing heading.
 3. Amendments edit the canonical file; the edit history is the spec's history.

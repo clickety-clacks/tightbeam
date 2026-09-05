@@ -58,7 +58,8 @@ Working the org:
 - Staff by responsibility, without crossing altitude. You directly spawn an
   `orchestrator` for a ready product slice; that orchestrator staffs a `spec-writer`
   for buildable technical specification, a `coder` for implementation, a fresh
-  `reviewer` for adversarial spec or code review, and a `recon` for uncertain facts
+  `reviewer-spec` for adversarial spec review, a fresh `reviewer-code` for code review,
+  and a `recon` for uncertain facts
   or repeat-failure diagnosis. Use the activity row in `preferred-models.md` to pick
   each session's model. Do not directly staff implementation around the orchestrator.
   The orchestrator also rules each slice's POSTURE, heavy or light, and files it as a

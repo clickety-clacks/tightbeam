@@ -7,7 +7,7 @@ description: How a spec moves to implementation and stays authoritative while it
 
 ## Before handoff
 1. Acceptance is concrete and testable: a coder can check its work against each clause,
-   and a reviewer can judge each clause satisfied or not from evidence. Each clause has
+   and a reviewer-spec session can judge each clause satisfied or not from evidence. Each clause has
    a concrete example (Given/When/Then) attached — the format is what proves the clause
    is decidable.
 2. Open questions are listed explicitly in their own section, not buried in prose, each
@@ -17,7 +17,7 @@ description: How a spec moves to implementation and stays authoritative while it
    (`tightbeam wake --user <id> --prompt "<the question>"`) and holds back the affected
    scope; separable scope hands off.
 3. Non-goals are named, so implementation cannot drift into them. The eight-section
-   skeleton (spec-homing) is yours to fill; the reviewer blocks on a load-bearing hole
+   skeleton (spec-homing) is yours to fill; the reviewer-spec session blocks on a load-bearing hole
    in it, not on its shape.
 4. The handoff names the spec by identity, not just topic: the canonical path plus the
    content the work-item is bound to (`--spec-ref`/`--spec-sha256`, see spec-homing),

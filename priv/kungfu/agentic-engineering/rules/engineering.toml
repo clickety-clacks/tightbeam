@@ -2,12 +2,12 @@
 
 # Flagship enforced loop (roadmap P7): producing effects require one independent review.
 # A holder attesting qualifying completion without a reviewed-clean verdict is not denied — the
-# substrate assigns a reviewer (the remedy), blocks the completion until the review
-# lands, and self-releases. This is the reviewer-loop worked example, enforced.
+# substrate assigns a reviewer-code session (the remedy), blocks the completion until the review
+# lands, and self-releases. This is the review loop worked example, enforced.
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
-text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide reviewer selection only"
+text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
 external_producer = false
 edges = ["verb"]
 effect = "remedy"
@@ -19,7 +19,7 @@ deny_when = [
 [rule.remedy]
 action = "assign"
 produces = "reviewed-clean"
-target_role = "reviewer"
+target_role = "reviewer-code"
 on_rule_denied = "surface"
 [rule.remedy.params]
 subject = "review of assignment {assignment_id}"

@@ -466,7 +466,7 @@ COMMANDS:
       --class elects the receiver's delivery policy. Without --class the wake
       follows the existing one-notice path. An explicit --after or --at keeps
       the sender's chosen delivery time.
-        tightbeam wake --role reviewer --prompt "review PR 12" --as coder
+        tightbeam wake --role reviewer-code --prompt "review PR 12" --as coder
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
         tightbeam wake --role owner --when-fact build-finished --when-scope app \
           --fallback-after 2h --prompt "re-read the work and decide" --as-process ci
@@ -489,7 +489,7 @@ COMMANDS:
       which is YOUR identity. --key makes the spawn idempotent
       (same key returns the same session). Omitted fields inherit the
       archetype's defaults.
-        tightbeam spawn --display "Reviewer" --name reviewer:x \
+        tightbeam spawn --display "Code reviewer" --name reviewer-code:x \
           --harness {{EXAMPLE_HARNESS}} --model <catalog-model> --effort <level> \
           --as orchestrator:news
       --host picks a machine WITHIN the archetype's allowed set (see list's

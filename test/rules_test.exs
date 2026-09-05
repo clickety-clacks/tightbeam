@@ -1237,12 +1237,12 @@ defmodule Tightbeam.RulesTest do
 
   test "shipped completion remedy waits for the holder receipt and creates one review", ctx do
     holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
-    reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer")
+    reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
 
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
 
-    Roles.create!(ctx.db, "reviewer", "flynn", reviewer.session_key)
+    Roles.create!(ctx.db, "reviewer-code", "flynn", reviewer.session_key)
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))

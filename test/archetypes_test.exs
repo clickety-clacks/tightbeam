@@ -240,7 +240,7 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(coder default orchestrator product-owner recon reviewer spec-writer)
+             ~w(coder default orchestrator product-owner recon reviewer-code reviewer-spec spec-writer)
 
     assert loaded["product-owner"].skills == [
              "worktree-session",
@@ -249,8 +249,31 @@ defmodule Tightbeam.ArchetypesTest do
              "human-communication"
            ]
 
-    for role <- ~w(coder orchestrator product-owner reviewer) do
+    for role <- ~w(coder orchestrator product-owner reviewer-code reviewer-spec) do
       assert "worktree-session" in loaded[role].skills
+    end
+
+    refute Map.has_key?(loaded, "reviewer")
+
+    for role <- ~w(reviewer-code reviewer-spec) do
+      refute Enum.any?(loaded[role].skills, &String.starts_with?(&1, "review"))
+      refute "spec-conformance" in loaded[role].skills
+    end
+
+    refute File.exists?(
+             Application.app_dir(
+               :tightbeam,
+               "priv/kungfu/agentic-engineering/archetypes/reviewer.toml"
+             )
+           )
+
+    for skill <- ~w(reviewing-code reviewing-specs) do
+      refute File.dir?(
+               Application.app_dir(
+                 :tightbeam,
+                 "priv/kungfu/agentic-engineering/skills/#{skill}"
+               )
+             )
     end
 
     coder =
@@ -331,32 +354,26 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  test "reviewer guidance serves the bounded verdict-note artifact remedy", ctx do
+  # V9 re-homes the verdict-note law in shared guidance for both review roles.
+  # The spec-conformance skill assertions drop because neither role elects it.
+  # The artifact requirement survives as the command, not the retired sentence.
+  test "both reviewing archetypes serve the bounded verdict-note law", ctx do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
              learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
-    reviewer =
-      Identity.snapshot_at!(
-        ctx.base_dir,
-        Identity.live_revision!(ctx.base_dir),
-        "reviewer",
-        :codex
-      )
+    revision = Identity.live_revision!(ctx.base_dir)
 
-    assert reviewer.guidance =~ "The verdict note has a 2,000-character cap"
-    assert reviewer.guidance =~ "record it as a report artifact on the work item"
-    assert reviewer.guidance =~ "report artifact's id and SHA-256"
-    assert reviewer.guidance =~ ~r/Do not copy the clause table into the\s+note/
+    for role <- ~w(reviewer-code reviewer-spec) do
+      guidance = Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).guidance
 
-    conformance = reviewer.skills["spec-conformance"]
-    assert conformance =~ "The verdict note has a 2,000-character cap"
-    assert conformance =~ "The full clause table is REQUIRED in the review document"
-    assert conformance =~ "tightbeam artifact-record --kind report"
-    assert conformance =~ "--sha256 <hex>"
-    assert conformance =~ "artifact's id and SHA-256"
-    assert conformance =~ "<summary + art_id + sha256>"
+      assert guidance =~ "The verdict note has a 2,000-character cap"
+      assert guidance =~ "report artifact's id and SHA-256"
+      assert guidance =~ ~r/Do not copy the clause table into the\s+note/
+      assert guidance =~ "tightbeam artifact-record --kind report"
+      assert guidance =~ "--work-item <workItemId>"
+    end
   end
 
   # Every archetype x both harnesses, and each `snapshot_at!` is a chain of

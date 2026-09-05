@@ -9,7 +9,7 @@ One work-item is the durable thread for the whole feature:
 `tightbeam work-item-create --title "<feature>"`. When a spec already exists at a
 canonical path, bind it to the work-item by content, not by memory:
 `--spec-ref <name> --spec-sha256 <hex>` records the exact spec version the work
-serves, so every coder and reviewer reads the same one. Every assignment below threads
+serves, so every coder, reviewer-code, and reviewer-spec session reads the same one. Every assignment below threads
 to the work-item (`--work-item <id>`). `tightbeam dispatch --to <holder> --subject "…"
 --brief "…" --work-item <id>` opens a plain card and wakes its holder in one atomic step;
 a card that includes an advisory file suggestion (`--files`) or links a review
@@ -37,11 +37,13 @@ per-feature, but your attention across features is the scarce resource.
    `preferred-models.md`. Try each candidate once; on an unavailable candidate, step
    right once. Send ambiguous qualification to your parent, and when the row is
    exhausted have the parent record `work-blocked` or surface the missing credential.
-   Spawn the selected reviewer as a fresh session. Link the review to the work it
+   Spawn the selected reviewer-spec session fresh. Link the review to the work it
    reviews so the substrate can witness the independence:
-   `tightbeam assign --subject "review of spec <id>" --role reviewer:<slug> --work-item <id> --reviews <specAssignmentId>`.
-   The reviewer works per `reviewing-specs`. On `changes-requested`, wake the
-   spec-writer to revise; repeat until `reviewed-clean`. The spec-writer then pins (or
+   `tightbeam assign --subject "review of spec <id>" --role reviewer-spec:<slug> --work-item <id> --reviews <specAssignmentId>`.
+   The reviewer-spec session follows its projected guidance. Its card ends after its
+   verdict. On `changes-requested`, wake the spec-writer to revise. Open a fresh
+   reviewer-spec card for the next review round; never reuse the prior card. Repeat
+   until `reviewed-clean`. The spec-writer then pins (or
    re-pins) the reviewed spec's hash on the work item (spec-handoff skill), so builders
    build from the cleared text.
 3. **Decompose.** Break the spec into focused, independently verifiable coding goals —
@@ -69,10 +71,10 @@ per-feature, but your attention across features is the scarce resource.
    unavailable candidate advances the selection one place to the right; never retry
    the same candidate. Send ambiguous qualification to your parent. If the row is
    exhausted, the parent records `work-blocked` or surfaces the credential need. Spawn
-   the selected reviewer as a fresh session with the capability the effect requires.
+   the selected reviewer-code session fresh with the capability the effect requires.
    Same model, provider, or harness remains eligible. Open one linked review card for
    the current review round:
-   `tightbeam assign --subject "review of <goal>" --role reviewer:<slug> --work-item <id> --reviews <coderAssignmentId>`.
+   `tightbeam assign --subject "review of <goal>" --role reviewer-code:<slug> --work-item <id> --reviews <coderAssignmentId>`.
    A review card ends after its holder files the verdict; do not reuse it for a later
    review round.
    The `--reviews` link and the verdict by that card's different-session holder are
@@ -81,16 +83,16 @@ per-feature, but your attention across features is the scarce resource.
    without the link is a claim the rows cannot confirm. On `changes-requested`, wake
    the producer to iterate. When it returns, judge whether the revision warrants a
    fresh review (orchestrator kernel, "Verifying without redoing"): real code changes
-   usually do and a cold reviewer is fine or better; a moved base, a rebuild onto green
+   usually do and a cold reviewer-code session is fine or better; a moved base, a rebuild onto green
    main, or a missing hash in a report are not new code and get no new review.
    Commission the review you want rather than letting a completion attest manufacture
    one. Under light posture the
-   reviewer's bar is "nothing egregiously wrong." A producer that believes a blocking
+   reviewer-code bar is "nothing egregiously wrong." A producer that believes a blocking
    finding is not needed for the ask contests it to you, and you rule on that one
    finding (orchestrator kernel, "Verifying without redoing"); you do not audit
    reviews that nobody contested.
    The product owner's spirit review (step 6) asks a different question, whether the
-   built thing is the product; the reviewer asks whether it is the ask. Nobody gates
+   built thing is the product; the reviewer-code session asks whether it is the ask. Nobody gates
    the same question twice, and spirit is judged once per work item (step 6), never
    once per slice.
 6. **Spirit review (substantial work items).** Spirit review happens once per work

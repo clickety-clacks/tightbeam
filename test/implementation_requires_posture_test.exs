@@ -35,7 +35,7 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
 
     coder = session(db, "posture-coder", "coder", "codex", "openai")
     orchestrator = session(db, "posture-orchestrator", "orchestrator", "codex", "openai")
-    reviewer = session(db, "posture-reviewer", "reviewer", "claude", "anthropic")
+    reviewer = session(db, "posture-reviewer", "reviewer-spec", "claude", "anthropic")
 
     base_dir =
       Path.join(

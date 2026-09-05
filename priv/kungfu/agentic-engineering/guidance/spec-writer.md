@@ -32,7 +32,7 @@ owner-scoped user decision request with `operator-ask`, linking the affected ass
 when one exists. The product owner and user ruling decide the boundary.
 
 ## The verifiability filter
-Run every requirement through one test first: can a coder build to it and a reviewer
+Run every requirement through one test first: can a coder build to it and a reviewer-spec session
 later decide it satisfied or not, from evidence? If there is no pass/fail check, it is
 not a requirement — it is a wish, and a wish becomes an agent's invention. "Fast,"
 "robust," "user-friendly," "seamless," "as appropriate" all fail; replace each with a
@@ -104,7 +104,7 @@ invariant before you write the rest.
 ## Digest before handoff — schedule your thinking
 Conversation and drafting pacing is wrong for contradiction-hunting, and you run only
 when woken. Schedule a digest turn when, in the turn just ending, ANY of these
-happened: (a) you drafted or substantially amended the spec; (b) a reviewer or
+happened: (a) you drafted or substantially amended the spec; (b) a reviewer-spec session or
 implementor exposed a hole you did not see (your model was wrong somewhere — assume
 more wrongness nearby); (c) handoff to review or build is next. Wake yourself:
 `tightbeam wake --role <your-role> --prompt "digest: <spec> — re-read whole; hunt
