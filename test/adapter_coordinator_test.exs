@@ -125,6 +125,87 @@ defmodule Tightbeam.AdapterCoordinatorTest do
              AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
   end
 
+  test "ordinary checkout refuses live generation six until its ready event", ctx do
+    key = {:claude, "default", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"open_live_#{System.unique_integer([:positive])}")
+    adapter = start_supervised!({Agent, fn -> nil end})
+
+    # Pin the observed restart-before-ready window without racing a restart
+    # timer or a harness handshake. This test exercises coordinator admission,
+    # not an external harness protocol.
+    :sys.replace_state(coordinator, fn state ->
+      entry = %{
+        pid: adapter,
+        monitor: make_ref(),
+        generation: 6,
+        failures: 5,
+        circuit: :open,
+        timer: nil,
+        ready: false,
+        last_failure: {5, :boot_failed},
+        context: []
+      }
+
+      put_in(state.adapters[key], entry)
+    end)
+
+    refute AdapterCoordinator.ready?(coordinator, key)
+    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert {:ok, ^adapter, 6} = AdapterCoordinator.adapter_for(coordinator, key, [])
+
+    send(coordinator, {:adapter_ready, key, self()})
+    refute AdapterCoordinator.ready?(coordinator, key)
+    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    send(coordinator, {:adapter_ready, key, adapter})
+    assert AdapterCoordinator.ready?(coordinator, key)
+    assert {:ok, ^adapter, 6} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert %{circuit: :closed, failures: 0, last_failure: nil, generation: 6} =
+             :sys.get_state(coordinator).adapters[key]
+  end
+
+  test "ordinary circuit correction preserves durable fence precedence", ctx do
+    key = {:claude, "default", "testhost"}
+    coordinator = start_fake_coordinator(ctx, :"open_fence_#{System.unique_integer([:positive])}")
+    adapter = start_supervised!({Agent, fn -> nil end})
+    assert {:ok, :no_launch} = Tightbeam.HarnessProcess.begin_park(ctx.db, key)
+
+    for circuit <- [:closed, :open], live? <- [false, true] do
+      :sys.replace_state(coordinator, fn state ->
+        entry = %{
+          pid: if(live?, do: adapter),
+          monitor: nil,
+          generation: 6,
+          failures: 5,
+          circuit: circuit,
+          timer: nil,
+          ready: false,
+          last_failure: nil,
+          context: []
+        }
+
+        put_in(state.adapters[key], entry)
+      end)
+
+      expected =
+        case {live?, circuit} do
+          {false, _} -> {:error, {:park_fenced, "claude:default@testhost"}}
+          {true, :closed} -> {:ok, adapter, 6}
+          {true, :open} -> {:error, :degraded}
+        end
+
+      assert AdapterCoordinator.adapter_for(coordinator, key) == expected
+
+      authoritative =
+        if live?,
+          do: {:ok, adapter, 6},
+          else: {:error, {:park_fenced, "claude:default@testhost"}}
+
+      assert AdapterCoordinator.adapter_for(coordinator, key, []) == authoritative
+    end
+  end
+
   test "adapter boot context is captured in the coordinator before lazy adapter opts", ctx do
     owner = self()
 
