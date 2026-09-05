@@ -936,9 +936,14 @@ COMMANDS:
   unlearn <bundle>
       Remove a learned kungfu bundle by its committed receipt.
   identity status [<archetype>]
-      Report the live revision, session revisions, staleness, and conflicts.
+      Report the live revision, session revisions, staleness, and conflicts. A
+      session's identityRevision is the revision its Tightbeam skill files were
+      last written from, not the revision any running context loaded.
   identity apply (<session> | --all)
-      Refresh selected sessions from the current live identity revision.
+      Best-effort update of the selected sessions' Tightbeam-owned skill files
+      to the current live identity revision, followed by an ordinary prompt
+      asking each started session to re-read them. It cannot confirm that a
+      session did, and it does not reload any running model context.
   onboard openai|anthropic [--api-key]
       Run this machine's credential onboarding flow. Without --api-key this is
       the interactive subscription ceremony. With it the flow is

@@ -4208,23 +4208,6 @@ defmodule Tightbeam.Gateway do
     do: %{code: "not_found", message: "no matching session"}
 
   defp identity_apply_sessions(config, db, sessions) do
-    # Busy means RUNNING, never merely queued (tenet T-CONCURRENCY). The hazard
-    # this guard exists for is work IN FLIGHT: instructions must not change under
-    # a turn whose world is already composed. A queued turn has composed nothing
-    # and reads live identity when it starts, which is indistinguishable from any
-    # turn started after the apply.
-    busy =
-      sessions
-      |> Enum.filter(&Ledger.running?(db, &1.session_key))
-      |> Enum.map(& &1.session_key)
-
-    identity_apply_at_boundary(config, db, sessions, busy)
-  end
-
-  defp identity_apply_at_boundary(_config, _db, _sessions, [_ | _] = busy),
-    do: turn_in_progress(busy)
-
-  defp identity_apply_at_boundary(config, db, sessions, []) do
     live = Identity.live_revision!(config.base_dir)
 
     sessions
@@ -4236,9 +4219,6 @@ defmodule Tightbeam.Gateway do
             broadcast(db, session.owner_user_id, Payloads.stream_updated(stream))
           end)
 
-          {:cont, [session.session_key | applied]}
-
-        :noop ->
           {:cont, [session.session_key | applied]}
 
         {:error, refusal} ->
@@ -4254,22 +4234,61 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  # Apply refreshes the Tightbeam-owned skill FILES and then asks the session to
+  # re-read them. It changes nothing a running turn has already composed, so
+  # there is no turn boundary to wait for and no session to refuse. A session
+  # with no current harness session has nobody to ask: the files and the stamp
+  # are the whole of its application.
   defp identity_apply_session(config, db, session, revision) do
-    case Org.current_pointer(db, session.session_key) do
-      # A session that has never started has no harness session to bounce AND no
-      # stamp to correct: it materializes from `tightbeam/live` at its first
-      # start (§Sessions stamp the revision they materialized from), so it is
-      # already on the applied revision by construction. Nothing to do is the
-      # true answer here, and the only place it is.
-      nil ->
-        harness = Harness.parse!(session.harness).id()
-        snapshot = served_snapshot(config, session, harness, revision)
-        stamp_session_identity(db, session.session_key, snapshot)
-        :applied
+    case identity_apply_files(config, db, session, revision) do
+      :applied ->
+        case Org.current_pointer(db, session.session_key) do
+          nil -> :applied
+          _pointer -> identity_apply_nudge(config, db, session, revision)
+        end
 
-      pointer ->
-        identity_apply_at_lane(config, db, session, revision, pointer)
+      {:error, refusal} ->
+        {:error, refusal}
     end
+  end
+
+  # Writer then stamp, in that order and only that order: the stamp asserts that
+  # the projection writer returned success for this revision, so a writer that
+  # raises leaves no stamp and no nudge. The failure is this session's refusal —
+  # nothing here retries, stages, or repairs.
+  defp identity_apply_files(config, db, session, revision) do
+    harness = Harness.parse!(session.harness).id()
+    snapshot = served_snapshot(config, session, harness, revision)
+    stamp_session_identity(db, session.session_key, snapshot)
+    :applied
+  rescue
+    error -> {:error, identity_apply_failed(session, error)}
+  end
+
+  # An ordinary prompt, submitted and never waited on: the session re-reads its
+  # skill files when it next runs, and apply neither confirms that it did nor
+  # can. Ordinary prompt ordering decides when it lands. A failed submission
+  # leaves the files and the stamp alone — they are already true.
+  defp identity_apply_nudge(config, db, session, revision) do
+    notify_session(config, db, session.session_key, identity_apply_prompt(revision))
+    :applied
+  rescue
+    error -> {:error, identity_apply_failed(session, error)}
+  end
+
+  defp identity_apply_prompt(revision) do
+    "Your Tightbeam-owned skill files changed to identity revision #{revision}.\n" <>
+      "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
+      "reload your current model context."
+  end
+
+  defp identity_apply_failed(session, error) do
+    %{
+      code: "apply_failed",
+      message:
+        "identity apply could not reach #{session.session_key}: #{Exception.message(error)}",
+      sessions: [session.session_key]
+    }
   end
 
   defp turn_in_progress(sessions) do
@@ -4278,91 +4297,6 @@ defmodule Tightbeam.Gateway do
       message: "identity apply requires a turn boundary",
       sessions: sessions
     }
-  end
-
-  # The busy check and this bounce are separated by adapter work, and the lane can
-  # claim a queued turn in that window — so sampling status in the gateway would
-  # leave apply reloading a session whose turn had just started. Claiming is
-  # serialized in the LANE, so the decision belongs in its mailbox: while it runs
-  # this call it cannot claim, and a nudge that arrives waits behind it.
-  #
-  # There is no direct path for a session that has no lane. "No lane exists" is a
-  # sample of a mutable fact, and a lane can be BORN inside the window — a
-  # delivery calls ensure_lane and the newborn claims on its own init nudge — so
-  # ensuring first leaves ONE path to keep correct. Either ordering then resolves
-  # inside the lane: if the init nudge claims first we get :busy and defer; if
-  # this call lands first, the nudge waits behind it.
-  #
-  # QUIET, deliberately: ensure_lane/2 also nudges, which would make an idle lane
-  # claim a queued turn and hand back the very refusal the queued/running boundary
-  # exists to remove. Apply must never manufacture the turn it then defers to.
-  defp identity_apply_at_lane(config, db, session, revision, pointer) do
-    bounce = fn -> identity_apply_started_session(config, db, session, revision, pointer) end
-    LaneManager.ensure_lane_quiet(config[:lane_manager] || LaneManager, session.session_key)
-
-    case Tightbeam.SessionLane.at_turn_boundary(session.session_key, bounce) do
-      {:ok, result} ->
-        result
-
-      :busy ->
-        {:error, turn_in_progress([session.session_key])}
-
-      # Unreachable once the lane is ensured — this is the lane dying in the gap,
-      # not a state to design around. Defer rather than bounce outside a lane:
-      # the point of the seam is that no bounce happens unowned.
-      :no_lane ->
-        {:error, turn_in_progress([session.session_key])}
-    end
-  end
-
-  defp identity_apply_started_session(config, db, session, revision, pointer) do
-    harness = Harness.parse!(session.harness).id()
-    key = {harness, "shared", session.host}
-    cwd = Placement.holder_workdir(config, session)
-    snapshot = served_snapshot(config, session, harness, revision)
-    mcp_servers = mcp_servers_for_archetype(session.archetype)
-
-    with {:ok, adapter, _generation} <-
-           AdapterCoordinator.adapter_for(Tightbeam.AdapterCoordinator, key),
-         # The adapter PROCESS is the authority on residency, the same way the
-         # start and tune paths ask it. A pointer row only records that a harness
-         # session once existed; after a gateway restart every pointer names a
-         # session no adapter holds, and bouncing it asks the harness to close
-         # something it has never heard of.
-         true <- Adapter.knows_session?(adapter, pointer.harness_session_id),
-         :ok <- Adapter.close_session(adapter, pointer.harness_session_id),
-         {:ok, _pushed_or_unknown} <-
-           Adapter.load_session(
-             adapter,
-             pointer.harness_session_id,
-             session.model,
-             cwd,
-             mcp_servers,
-             snapshot.guidance
-           ) do
-      Org.append_pointer(db, session.session_key, pointer.harness_session_id, "loaded")
-      stamp_session_identity(db, session.session_key, snapshot)
-      :applied
-    else
-      # No resident session to bounce, so the stamp IS the application. The next
-      # start reloads from `session.identity_revision`, not from `live`, so
-      # leaving the stamp behind would mean this session materialized stale
-      # forever while `identity status` kept calling it stale and apply kept
-      # reporting it applied. No pointer event is appended: nothing was loaded,
-      # and the pointer chain does not record things that did not happen.
-      false ->
-        stamp_session_identity(db, session.session_key, snapshot)
-        :applied
-
-      {:error, reason} ->
-        {:error,
-         %{
-           code: "apply_failed",
-           message:
-             "identity apply could not reach #{session.session_key}: #{apply_failure(reason)}",
-           sessions: [session.session_key]
-         }}
-    end
   end
 
   defp stamp_session_identity(db, session_key, snapshot) do
