@@ -228,7 +228,8 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
           {"TIGHTBEAM_BASE_DIR", base},
           # the exact incident vector, now aimed at a debug verb:
           {"RELEASE_NODE", "tightbeam_gateway_11373"},
-          {"TIGHTBEAM_NODE", "tightbeam_gateway_11373"}
+          {"TIGHTBEAM_NODE", "tightbeam_gateway_11373"},
+          {"RELEASE_COOKIE", "prod-shared-cookie"}
         ],
         stderr_to_stdout: true
       )
@@ -238,6 +239,10 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     assert out =~ ~r/^REL_NODE=custom_iso_node$/m
     # (b) incident-safety for the debug verbs: the inherited node did NOT redirect.
     refute out =~ ~r/^REL_NODE=tightbeam_gateway_11373$/m
+    # (c) R4/incident-safety on the cookie dimension: the inherited RELEASE_COOKIE
+    # does NOT override — rpc/remote use this install's baked releases/COOKIE.
+    assert out =~ ~r/^REL_COOKIE=baked-release-cookie$/m
+    refute out =~ ~r/prod-shared-cookie/
     # the debug argv is forwarded intact.
     assert out =~ ~r/^ARG=rpc$/m
     assert out =~ ~r/^ARG=Foo\.bar\(\)$/m
@@ -276,19 +281,30 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
   defp faked_release_shim! do
     root = Path.join(System.tmp_dir!(), "tb-rel-#{System.unique_integer([:positive])}")
     bin = Path.join(root, "release/bin")
-    rel_bin = Path.join(root, "release/release/bin")
+    rel = Path.join(root, "release/release")
     File.mkdir_p!(bin)
-    File.mkdir_p!(rel_bin)
+    File.mkdir_p!(Path.join(rel, "bin"))
+    File.mkdir_p!(Path.join(rel, "releases"))
+
+    # The baked cookie a real mix release reads when RELEASE_COOKIE is unset.
+    File.write!(Path.join(rel, "releases/COOKIE"), "baked-release-cookie")
 
     shim = Path.join(bin, "tightbeam-gateway")
     File.cp!(@shim, shim)
     File.chmod!(shim, 0o755)
 
-    fake = Path.join(rel_bin, "tightbeam_gateway")
+    fake = Path.join(rel, "bin/tightbeam_gateway")
 
+    # Models the release's cookie resolution: an inherited RELEASE_COOKIE is
+    # PREFERRED, else the baked releases/COOKIE — so REL_COOKIE is the cookie
+    # rpc/remote would ACTUALLY use, not merely whether the var is set.
     File.write!(
       fake,
-      "#!/bin/sh\nprintf 'REL_NODE=%s\\n' \"$RELEASE_NODE\"\nfor a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done\n"
+      "#!/bin/sh\n" <>
+        "printf 'REL_NODE=%s\\n' \"$RELEASE_NODE\"\n" <>
+        "cookie=\"${RELEASE_COOKIE:-$(cat \"$(dirname \"$0\")/../releases/COOKIE\")}\"\n" <>
+        "printf 'REL_COOKIE=%s\\n' \"$cookie\"\n" <>
+        "for a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done\n"
     )
 
     File.chmod!(fake, 0o755)

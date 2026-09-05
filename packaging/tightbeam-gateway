@@ -112,8 +112,7 @@ do_debug() { # $@: the full argv (rpc <expr> | remote)
   # RELEASE_NODE/TIGHTBEAM_NODE. Setting RELEASE_NODE from the descriptor makes
   # the descriptor node WIN over any inherited one — the same incident-safety
   # property `stop` has, now for the debug verbs too, and it preserves custom
-  # `TIGHTBEAM_NODE` instances (their real node is in the descriptor). The cookie
-  # stays the baked releases/COOKIE for Phase 1 (per-instance cookie is Phase 2).
+  # `TIGHTBEAM_NODE` instances (their real node is in the descriptor).
   require_descriptor "$1"
   _json="$(cat "$DESC_PATH")"
   _node="$(printf '%s' "$_json" | json_string node)"
@@ -122,6 +121,13 @@ do_debug() { # $@: the full argv (rpc <expr> | remote)
   fi
   RELEASE_NODE="$_node"
   export RELEASE_NODE
+  # R4: rpc/remote use this install's BAKED releases/COOKIE for Phase 1 (the
+  # per-instance cookie is Phase 2). The release runtime PREFERS an inherited
+  # RELEASE_COOKIE over the baked file, so drop it — the release then reads
+  # releases/COOKIE. This carries the incident-safety property onto the cookie
+  # dimension: an inherited/prod RELEASE_COOKIE cannot authenticate rpc/remote
+  # against anything but this install's own baked cookie.
+  unset RELEASE_COOKIE
   exec "$REL" "$@"
 }
 
