@@ -33,11 +33,11 @@ defmodule Tightbeam.MergeGateIsolationTest do
     refute capture =~ "Authoritative Mix gate:"
   end
 
-  test "the authoritative wrapper accepts a binary patch release of the pinned OTP line" do
+  test "the authoritative wrapper accepts OTP_VERSION 28.5.0.6 for pin 28.5" do
     # erlef/setup-beam installs OTP's binary patch releases: OTP_VERSION reads
-    # 28.5.0.5 for pin 28.5. That is the pinned release and must run directly,
+    # 28.5.0.6 for pin 28.5. That is the pinned release and must run directly,
     # with no Mise fallback (CI runners have none).
-    fake_bin = fake_toolchain_bin!(erlang: "28.5.0.5", mise: :failing)
+    fake_bin = fake_toolchain_bin!(erlang: "28.5.0.6", mise: :failing)
     wrapper = Path.expand("../scripts/verify_mix.sh", __DIR__)
 
     assert {capture, 0} =
@@ -50,8 +50,8 @@ defmodule Tightbeam.MergeGateIsolationTest do
     assert capture =~ "Authoritative Mix gate:"
   end
 
-  test "a different OTP line sharing the pin's digits is still refused" do
-    capture = capture_preflight_refusal!(erlang: "28.50", mise: :failing)
+  test "the authoritative wrapper refuses OTP_VERSION 28.6.0 for pin 28.5" do
+    capture = capture_preflight_refusal!(erlang: "28.6.0", mise: :failing)
 
     assert capture =~
              ~s(tightbeam-gate-preflight: {"schema":"tightbeam-gate-preflight-refusal/v1","cause":"pinned-beam-unavailable"})
