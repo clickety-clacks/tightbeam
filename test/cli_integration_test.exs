@@ -1644,8 +1644,13 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
-  test "real CLI exact-reads and rules an effort request from a non-expecter session", ctx do
-    continue_request = open_effort_request(ctx, "continue")
+  test "real CLI exact-reads from a bystander and rules an effort request from a lineage member",
+       ctx do
+    continue_request =
+      open_effort_request(ctx, "continue",
+        expecter_session_key: Org.personal_session_key("flynn")
+      )
+
     worker_dir = session_workdir!(ctx, ctx.worker)
 
     {requests, 0} =
@@ -1690,7 +1695,7 @@ defmodule Tightbeam.CliIntegrationTest do
         [continue_request]
       )
 
-    {continued, 0} =
+    {refused, refused_status} =
       System.cmd(
         ctx.binary,
         ["effort-rule", "--request", continue_request, "--action", "continue"],
@@ -1698,7 +1703,8 @@ defmodule Tightbeam.CliIntegrationTest do
         stderr_to_stdout: true
       )
 
-    assert continued =~ "continue"
+    assert refused_status != 0
+    assert refused =~ "not_authorized"
 
     assert_receive {:cli_call,
                     %{
@@ -1707,7 +1713,24 @@ defmodule Tightbeam.CliIntegrationTest do
                       params: %{request: ^continue_request, action: "continue"}
                     }}
 
-    {:ok, [["session:cli-worker"]]} =
+    {continued, 0} =
+      System.cmd(
+        ctx.binary,
+        ["effort-rule", "--request", continue_request, "--action", "continue"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert continued =~ "continue"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "effort-rule",
+                      principal: {:session, "cli-holder"},
+                      params: %{request: ^continue_request, action: "continue"}
+                    }}
+
+    {:ok, [["session:cli-holder"]]} =
       DB.query(ctx.db, "SELECT ruledBy FROM decision_requests WHERE id = ?1", [continue_request])
 
     {:ok, [[generations_after]]} =
@@ -1723,11 +1746,11 @@ defmodule Tightbeam.CliIntegrationTest do
       System.cmd(
         ctx.binary,
         ["effort-rule", "--request", continue_request, "--action", "continue"],
-        cd: worker_dir,
+        cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
-    assert retried =~ "session:cli-worker"
+    assert retried =~ "session:cli-holder"
 
     {:ok, [[^generations_after]]} =
       DB.query(
@@ -1736,16 +1759,16 @@ defmodule Tightbeam.CliIntegrationTest do
         [continue_request]
       )
 
-    {lost, status} =
+    {still_refused, status} =
       System.cmd(
         ctx.binary,
         ["effort-rule", "--request", continue_request, "--action", "continue"],
-        cd: ctx.workdir,
+        cd: worker_dir,
         stderr_to_stdout: true
       )
 
     assert status != 0
-    assert lost =~ "not_open"
+    assert still_refused =~ "not_authorized"
 
     dismiss_request = open_effort_request(ctx, "dismiss")
 
@@ -1953,8 +1976,9 @@ defmodule Tightbeam.CliIntegrationTest do
       )
     end
 
-    # One authenticated bystander session gains exact-id access and the three
-    # kind-matching response paths. The statute arm remains hidden.
+    # One authenticated bystander session gains exact-id access and the agent
+    # response paths. Effort ruling stays limited to the assignment lineage,
+    # and the statute arm remains hidden.
     agent_read = open_agent_request(ctx)
     effort_read = open_effort_request(ctx, "matrix-session-read")
     statute_read = open_statute_request(ctx, "other")
@@ -2002,7 +2026,13 @@ defmodule Tightbeam.CliIntegrationTest do
 
     effort_rule_id = open_effort_request(ctx, "matrix-session-rule")
 
-    assert {200, %{"result" => %{"ruledBy" => "session:cli-worker"}}} =
+    assert {403,
+            %{
+              "error" => %{
+                "code" => "not_authorized",
+                "message" => "current expecter required"
+              }
+            }} =
              invoke.(ctx.worker.cli_token, session_identity, "effort-rule", %{
                "request" => effort_rule_id,
                "action" => "continue"
