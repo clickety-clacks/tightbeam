@@ -136,6 +136,7 @@ pub enum Command {
         reviews: Option<String>,
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
+        succeeds: Option<String>,
     },
     Dispatch {
         identity: Identity,
@@ -146,6 +147,7 @@ pub enum Command {
         workdir_root: Option<String>,
         brief: String,
         idempotency_key: Option<String>,
+        succeeds: Option<String>,
     },
     EffortRule {
         identity: Identity,
@@ -574,13 +576,14 @@ COMMANDS:
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
-         [--files '["lib/a.ex","test/a_test.exs"]']
+         [--files '["lib/a.ex","test/a_test.exs"]'] [--succeeds <assignmentId>]
       Open an obligation held by a session; a work item is the durable thread
       across assignments. --files is an advisory suggestion that others can see;
       it reserves no path and does not limit the assignment's work.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
+           [--succeeds <assignmentId>]
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in whose complete id you hold. The
@@ -1077,6 +1080,12 @@ fn parse_with_optional_catalog(
     }
 
     let flags = &parsed.flags;
+    if flags.contains_key("succeeds") && !matches!(command, Some("assign" | "dispatch")) {
+        return Err("--succeeds is valid only with assign or dispatch".to_owned());
+    }
+    if matches!(flags.get("succeeds"), Some(value) if value.is_empty()) {
+        return Err("--succeeds requires a non-empty assignment id".to_owned());
+    }
     match command.expect("checked above") {
         "doctor" => {
             let base_dir = nonempty(flags, "base-dir");
@@ -1302,6 +1311,7 @@ fn parse_with_optional_catalog(
                 reviews: nonempty(flags, "reviews"),
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
+                succeeds: nonempty(flags, "succeeds"),
             })
         }
         "dispatch" => {
@@ -1324,6 +1334,7 @@ fn parse_with_optional_catalog(
                 workdir_root: nonempty(flags, "workdir-root"),
                 brief,
                 idempotency_key: nonempty(flags, "key"),
+                succeeds: nonempty(flags, "succeeds"),
             })
         }
         "effort-rule" => {
@@ -2222,6 +2233,55 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn successor_assignment_input_parses_and_missing_values_refuse_locally() {
+        assert!(matches!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "work",
+                "--session",
+                "child",
+                "--succeeds",
+                "asg_full",
+            ])),
+            Ok(Command::Assign {
+                succeeds: Some(value),
+                ..
+            }) if value == "asg_full"
+        ));
+
+        assert!(matches!(
+            parse(strings(&[
+                "dispatch",
+                "--subject",
+                "work",
+                "--brief",
+                "continue it",
+                "--to",
+                "child",
+                "--succeeds",
+                "asg_full",
+            ])),
+            Ok(Command::Dispatch {
+                succeeds: Some(value),
+                ..
+            }) if value == "asg_full"
+        ));
+
+        assert_eq!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "work",
+                "--session",
+                "child",
+                "--succeeds",
+            ])),
+            Err("--succeeds requires a non-empty assignment id".to_owned())
+        );
     }
 
     #[test]
