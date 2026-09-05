@@ -92,7 +92,7 @@ defmodule Tightbeam.StateResources do
     "users" => ~w(userId isAdmin createdAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
-      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
+      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 contentSha256Status recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
       ~w(id seq sessionKey role messageType content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq assignmentId jobRef harness provider model effort context rowVersion),
@@ -198,7 +198,7 @@ defmodule Tightbeam.StateResources do
     },
     "artifacts" => %{
       strings:
-        ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home),
+        ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 contentSha256Status recordedMessageId recordedTurnEvidence state home),
       integers: ~w(createdAt updatedAt rowVersion),
       booleans: [],
       nullable: ~w(description parentSession contentSha256 recordedMessageId home)
@@ -342,6 +342,7 @@ defmodule Tightbeam.StateResources do
     {"sessions", "mechanicalStatus"} => ~w(idle running),
     {"devices", "status"} => ~w(allowlisted pending denied),
     {"artifacts", "kind"} => ~w(spec report doc data other),
+    {"artifacts", "contentSha256Status"} => ~w(none verified attested-not-verified),
     {"artifacts", "recordedTurnEvidence"} => ~w(tool-call-observed session-concurrent none),
     {"artifacts", "state"} => ~w(in-workspace archived released),
     {"transcript messages", "role"} => ~w(user assistant),

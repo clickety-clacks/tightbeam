@@ -765,7 +765,9 @@ defmodule Tightbeam.Gateway do
           end
         end,
       {"facts-read", []} => fn call -> facts_read_result(db, call) end,
-      {"artifact-record", ["artifact.recorded"]} => fn call -> Artifacts.record(db, call) end,
+      {"artifact-record", ["artifact.recorded"]} => fn call ->
+        Artifacts.record(db, call, config)
+      end,
       {"artifact-get", []} => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
       end,

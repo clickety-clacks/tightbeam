@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{DB, Model, Org, Projection, Schema, Supervision, WorkItems}
 
-  @shape "coordination-fabric-v1-phase1-v20"
+  @shape "coordination-fabric-v1-phase1-v21"
   @principal_duty_previous_shape "coordination-fabric-v1-phase1-v19"
   @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
   @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
@@ -43,6 +43,75 @@ defmodule Tightbeam.SchemaShapeTest do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     %{db: name}
+  end
+
+  test "the v20 predecessor gains digest evidence atomically and preserves old claims", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:paired, _device} =
+             claim_org(db, %{
+               device_id: "artifact-digest-migration",
+               claimed_name: "Flynn",
+               platform: nil,
+               model: nil
+             })
+
+    _child = session(db, "child", "flynn")
+
+    work_item =
+      WorkItems.__handle__(db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        params: %{title: "Old artifact claim"}
+      })
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
+        INSERT INTO artifacts
+          (artifactId,kind,title,createdBySession,workItemId,originPath,contentSha256,
+           contentSha256Verified,recordedTurnEvidence,state,createdAt,updatedAt)
+        VALUES
+          ('art_old_claim','report','Old claim','child',?1,'remote:/report','abc123',
+           0,'none','released',1,1)
+        """,
+        [work_item.id]
+      )
+
+    downgrade_to_v20(db)
+
+    error =
+      assert_raise Schema.ShapeError, fn ->
+        Schema.upgrade_artifact_digest_integrity_v1(db, fail_at: :after_column)
+      end
+
+    assert error.message =~ "forced artifact digest integrity migration interruption"
+    refute "contentSha256Verified" in table_columns(db, "artifacts")
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v20"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [["coordination-fabric-v1-phase1-v21"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert Tightbeam.Artifacts.get(db, "art_old_claim").content_sha256_status ==
+             "attested-not-verified"
+  end
+
+  defp downgrade_to_v20(db) do
+    :ok = DB.execute(db, "ALTER TABLE artifacts DROP COLUMN contentSha256Verified")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v20', stampedAt=1"
+      )
+
+    :ok
   end
 
   test "the exact v19 predecessor gains the principal duty through boot dispatch", %{db: db} do
@@ -75,6 +144,7 @@ defmodule Tightbeam.SchemaShapeTest do
       })
 
     drop_principal_duty(db)
+    :ok = DB.execute(db, "ALTER TABLE artifacts DROP COLUMN contentSha256Verified")
     :ok = DB.execute(db, "UPDATE schema_stamp SET shape='coordination-fabric-v1-phase1-v19'")
 
     refute table?(db, "work_item_sources")

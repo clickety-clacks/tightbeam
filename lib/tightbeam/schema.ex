@@ -123,7 +123,10 @@ defmodule Tightbeam.Schema do
   # is the current one-step boot arm; the migration creates those additive
   # objects, backfills existing work-item provenance, and stamps v20 in the same
   # transaction.
-  @shape "coordination-fabric-v1-phase1-v20"
+  # Artifact digest evidence adds one bit in v21. Historical migration seams
+  # keep their fixed destinations; boot composes v19 through v20 to v21.
+  @shape "coordination-fabric-v1-phase1-v21"
+  @artifact_digest_previous_shape "coordination-fabric-v1-phase1-v20"
   @principal_duty_previous_shape "coordination-fabric-v1-phase1-v19"
   @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
   @completion_escalation_label "incompatible_completion_escalation_v1"
@@ -2088,7 +2091,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @principal_duty_previous_shape,
-             @shape,
+             @artifact_digest_previous_shape,
              System.system_time(:millisecond)
            ])
 
@@ -2106,6 +2109,58 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "incompatible_principal_duty_v1: migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_artifact_digest_integrity_v1(DB.server(), keyword()) :: :ok
+  def upgrade_artifact_digest_integrity_v1(db, opts \\ []) when is_list(opts) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@artifact_digest_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_artifact_digest_integrity_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           Txn.q(
+             txn,
+             """
+             ALTER TABLE artifacts ADD COLUMN contentSha256Verified INTEGER NOT NULL DEFAULT 0
+               CHECK (contentSha256Verified IN (0,1))
+               CHECK (contentSha256Verified = 0 OR contentSha256 IS NOT NULL)
+             """
+           )
+
+           if opts[:fail_at] == :after_column do
+             raise "forced artifact digest integrity migration interruption"
+           end
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@artifact_digest_previous_shape, @shape, System.system_time(:millisecond)]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError, message: "incompatible_artifact_digest_integrity_v1: stamp race"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_artifact_digest_integrity_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 
@@ -2356,7 +2411,11 @@ defmodule Tightbeam.Schema do
         :ok
 
       {:ok, [[@principal_duty_previous_shape]]} ->
-        upgrade_principal_duty_v1(db)
+        :ok = upgrade_principal_duty_v1(db)
+        upgrade_artifact_digest_integrity_v1(db)
+
+      {:ok, [[@artifact_digest_previous_shape]]} ->
+        upgrade_artifact_digest_integrity_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -2372,8 +2431,8 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        There is no migration from #{found}. The only supported upgrade source
-        is #{@principal_duty_previous_shape}.
+        There is no migration from #{found}. The supported upgrade sources are
+        #{@principal_duty_previous_shape} and #{@artifact_digest_previous_shape}.
         Move this database aside and let it be recreated.
         """
 

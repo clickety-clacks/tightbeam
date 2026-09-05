@@ -42,7 +42,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
-      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
+      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 contentSha256Status recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion)
   }
 
@@ -107,6 +107,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     {"sessions", "mechanicalStatus"} => ~w(idle running),
     {"devices", "status"} => ~w(allowlisted pending denied),
     {"artifacts", "kind"} => ~w(spec report doc data other),
+    {"artifacts", "contentSha256Status"} => ~w(none verified attested-not-verified),
     {"artifacts", "recordedTurnEvidence"} => ~w(tool-call-observed session-concurrent none),
     {"artifacts", "state"} => ~w(in-workspace archived released)
   }
@@ -1030,6 +1031,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   defp assert_populated_contract("artifacts", item) do
     assert item["contentSha256"] == String.duplicate("b", 64)
+    assert item["contentSha256Status"] == "attested-not-verified"
     assert item["recordedTurnEvidence"] == "session-concurrent"
     assert item["state"] == "archived"
     assert item["home"] == "/archive/雪"

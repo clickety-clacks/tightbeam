@@ -34,7 +34,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     "users" => ~w(userId isAdmin createdAt rowVersion),
     "devices" => ~w(deviceId userId claimedName status platform model createdAt rowVersion),
     "artifacts" =>
-      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
+      ~w(artifactId kind title description createdBySession workItemId parentSession originPath contentSha256 contentSha256Status recordedMessageId recordedTurnEvidence state home createdAt updatedAt rowVersion),
     "read markers" => ~w(userId scopeKey marker updatedAt rowVersion),
     "transcript messages" =>
       ~w(id seq sessionKey role messageType content at sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier turnSeq assignmentId jobRef harness provider model effort context rowVersion),

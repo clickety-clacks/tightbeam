@@ -151,15 +151,22 @@ defmodule Tightbeam.ArtifactCarrierTest do
   ## The live defect — R1
 
   test "an artifact-record over the real wire records instead of refusing", ctx do
-    result = record_over_wire(ctx, %{"kind" => "report", "title" => "Results"})
+    result =
+      record_over_wire(ctx, %{
+        "kind" => "report",
+        "title" => "Results",
+        "contentSha256" => "abc123"
+      })
 
     refute Map.has_key?(result, "code")
     assert result["recordedMessageId"] == nil
     assert result["recordedTurnEvidence"] == "none"
+    assert result["contentSha256Status"] == "attested-not-verified"
 
     assert [row] = Artifacts.list(ctx.db, %{session_key: ctx.coder.session_key})
     assert row.recorded_message_id == nil
     assert row.recorded_turn_evidence == "none"
+    assert row.content_sha256_status == "attested-not-verified"
   end
 
   ## The three evidence classes, each over the real path

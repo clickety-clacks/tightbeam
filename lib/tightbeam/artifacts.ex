@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, IdPrefix, Org, TurnObservations}
+  alias Tightbeam.{DB, IdPrefix, Org, Placement, TurnObservations}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -40,6 +40,9 @@ defmodule Tightbeam.Artifacts do
     parentSession     TEXT REFERENCES sessions(sessionKey),
     originPath        TEXT NOT NULL,
     contentSha256     TEXT,
+    contentSha256Verified INTEGER NOT NULL DEFAULT 0
+                          CHECK (contentSha256Verified IN (0,1))
+                          CHECK (contentSha256Verified = 0 OR contentSha256 IS NOT NULL),
     recordedMessageId TEXT REFERENCES messages(id),
     recordedTurnEvidence TEXT NOT NULL DEFAULT 'none'
                       CHECK (recordedTurnEvidence IN
@@ -81,64 +84,83 @@ defmodule Tightbeam.Artifacts do
   names it is strictly more truth than recording nothing.
   """
   @spec record(DB.server(), map()) :: map()
-  def record(db \\ Tightbeam.DB, call) do
+  def record(db \\ Tightbeam.DB, call), do: record(db, call, %{})
+
+  @doc false
+  @spec record(DB.server(), map(), map()) :: map()
+  def record(db, call, config) do
     case {call[:principal], call[:session_key], call[:params][:work_item_id]} do
       {{:session, session_key}, session_key, work_item_id}
       when is_binary(session_key) and is_binary(work_item_id) ->
         artifact_id = "art_" <> (:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower))
         {recorded_message_id, evidence} = turn_evidence(db, session_key)
+        digest_source = digest_source(db, config, session_key, call.params.origin_path)
+        digest = content_digest(digest_source, call.params[:content_sha256])
         now = now()
 
-        case DB.transaction(db, fn txn ->
-               case IdPrefix.resolve_in_txn(txn, :work_item, work_item_id) do
-                 {:ok, canonical_id} ->
-                   parent_session =
-                     Org.effective_parent_in_txn(txn, session_key).session_key
+        case digest do
+          {:ok, content_sha256, verified} ->
+            case DB.transaction(db, fn txn ->
+                   case IdPrefix.resolve_in_txn(txn, :work_item, work_item_id) do
+                     {:ok, canonical_id} ->
+                       parent_session =
+                         Org.effective_parent_in_txn(txn, session_key).session_key
 
-                   Txn.q(
-                     txn,
-                     """
-                     INSERT INTO artifacts
-                       (artifactId, kind, title, description, createdBySession, workItemId,
-                        parentSession, originPath, contentSha256, recordedMessageId,
-                        recordedTurnEvidence, state, home, createdAt, updatedAt)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                             'in-workspace', NULL, ?12, ?12)
-                     """,
-                     [
-                       artifact_id,
-                       call.params.kind,
-                       call.params.title,
-                       call.params[:description],
-                       session_key,
-                       canonical_id,
-                       parent_session,
-                       call.params.origin_path,
-                       call.params[:content_sha256],
-                       recorded_message_id,
-                       evidence,
-                       now
-                     ]
-                   )
+                       Txn.q(
+                         txn,
+                         """
+                         INSERT INTO artifacts
+                           (artifactId, kind, title, description, createdBySession, workItemId,
+                            parentSession, originPath, contentSha256, contentSha256Verified,
+                            recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                                 'in-workspace', NULL, ?13, ?13)
+                         """,
+                         [
+                           artifact_id,
+                           call.params.kind,
+                           call.params.title,
+                           call.params[:description],
+                           session_key,
+                           canonical_id,
+                           parent_session,
+                           call.params.origin_path,
+                           content_sha256,
+                           verified,
+                           recorded_message_id,
+                           evidence,
+                           now
+                         ]
+                       )
 
-                   [row] =
-                     Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [
-                       artifact_id
-                     ])
+                       [row] =
+                         Txn.q(
+                           txn,
+                           "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1",
+                           [artifact_id]
+                         )
 
-                   artifact = artifact(row)
-                   Publisher.maybe_accepted_in_txn(txn, call, artifact)
-                   artifact
+                       artifact = artifact(row)
+                       Publisher.maybe_accepted_in_txn(txn, call, artifact)
+                       artifact
 
-                 :unknown ->
-                   %{code: "unknown_work_item", message: "unknown work item: #{work_item_id}"}
+                     :unknown ->
+                       %{code: "unknown_work_item", message: "unknown work item: #{work_item_id}"}
 
-                 {:ambiguous, error} ->
-                   error
-               end
-             end) do
-          {:ok, result} -> result
-          {:error, reason} -> raise "artifact record transaction failed: #{inspect(reason)}"
+                     {:ambiguous, error} ->
+                       error
+                   end
+                 end) do
+              {:ok, result} -> result
+              {:error, reason} -> raise "artifact record transaction failed: #{inspect(reason)}"
+            end
+
+          {:error, expected, actual} ->
+            %{
+              code: "content_sha256_mismatch",
+              message:
+                "artifact content SHA-256 mismatch: supplied #{expected}, computed #{actual}"
+            }
         end
 
       {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->
@@ -176,6 +198,71 @@ defmodule Tightbeam.Artifacts do
   # then queried the ledger, and a turn terminalizing in the scheduling gap
   # between them made the row describe an instant neither read had seen.
   defp turn_evidence(db, session_key), do: TurnObservations.evidence(db, session_key)
+
+  # The digest status is substrate-authored. A readable path on the gateway's
+  # own host is hashed from its bytes. Every other supplied digest stays a
+  # caller attestation and is labelled as such on reads.
+  defp digest_source(db, config, session_key, origin_path) do
+    base_dir =
+      Map.get(config, :base_dir, Application.get_env(:tightbeam, :base_dir, System.tmp_dir!()))
+
+    hosts = Placement.hosts(base_dir, db)
+
+    case machine_path(origin_path) do
+      {:ok, host_name, path} ->
+        if hosts[host_name] && hosts[host_name].ssh == nil, do: {:local, path}, else: :unreadable
+
+      :not_machine_path ->
+        case Org.get(db, session_key) do
+          %{host: host_name} = session ->
+            if hosts[host_name] && hosts[host_name].ssh == nil do
+              path =
+                if Path.type(origin_path) == :absolute,
+                  do: origin_path,
+                  else:
+                    Path.join(
+                      Placement.workdir_path(%{base_dir: base_dir, db: db}, session),
+                      origin_path
+                    )
+
+              {:local, path}
+            else
+              :unreadable
+            end
+
+          nil ->
+            :unreadable
+        end
+    end
+  end
+
+  defp machine_path(origin_path) when is_binary(origin_path) do
+    case String.split(origin_path, ":", parts: 2) do
+      [host, path] when host != "" and path != "" ->
+        if Path.type(path) == :absolute, do: {:ok, host, path}, else: :not_machine_path
+
+      _ ->
+        :not_machine_path
+    end
+  end
+
+  defp machine_path(_origin_path), do: :not_machine_path
+
+  defp content_digest({:local, path}, supplied) do
+    case File.read(path) do
+      {:ok, bytes} ->
+        actual = :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+
+        if is_nil(supplied) or (is_binary(supplied) and String.downcase(supplied) == actual),
+          do: {:ok, actual, 1},
+          else: {:error, supplied, actual}
+
+      {:error, _reason} ->
+        {:ok, supplied, 0}
+    end
+  end
+
+  defp content_digest(:unreadable, supplied), do: {:ok, supplied, 0}
 
   @doc "Fetch one artifact row, or nil."
   @spec get(DB.server(), String.t()) :: map() | nil
@@ -503,7 +590,7 @@ defmodule Tightbeam.Artifacts do
   defp columns do
     """
     artifactId, kind, title, description, createdBySession, workItemId,
-    parentSession, originPath, contentSha256, recordedMessageId,
+    parentSession, originPath, contentSha256, contentSha256Verified, recordedMessageId,
     recordedTurnEvidence, state, home, createdAt, updatedAt
     """
   end
@@ -518,6 +605,7 @@ defmodule Tightbeam.Artifacts do
          parent_session,
          origin_path,
          content_sha256,
+         content_sha256_verified,
          recorded_message_id,
          recorded_turn_evidence,
          state,
@@ -535,6 +623,7 @@ defmodule Tightbeam.Artifacts do
       parent_session: parent_session,
       origin_path: origin_path,
       content_sha256: content_sha256,
+      content_sha256_status: content_sha256_status(content_sha256, content_sha256_verified),
       recorded_message_id: recorded_message_id,
       recorded_turn_evidence: recorded_turn_evidence,
       state: state,
@@ -543,6 +632,10 @@ defmodule Tightbeam.Artifacts do
       updated_at: updated_at
     }
   end
+
+  defp content_sha256_status(nil, _verified), do: "none"
+  defp content_sha256_status(_digest, 1), do: "verified"
+  defp content_sha256_status(_digest, 0), do: "attested-not-verified"
 
   defp now, do: System.system_time(:millisecond)
 end
