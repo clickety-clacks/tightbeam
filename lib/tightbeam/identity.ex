@@ -30,12 +30,10 @@ defmodule Tightbeam.Identity do
     "guidance/office-convention.md",
     "guidance/delegation-card.md",
     "guidance/directive-vocabulary.md",
-    "guidance/altitude-statute.md",
     "guidance/avasarala.md",
     "guidance/comms-discipline.md",
     "guidance/desk-playbook.md",
     "guidance/dispatch-rules.md",
-    "guidance/inception.md",
     "guidance/miller.md",
     "guidance/role-charter.md",
     "guidance/staffing.md"
