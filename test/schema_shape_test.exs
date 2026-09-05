@@ -1728,6 +1728,25 @@ defmodule Tightbeam.SchemaShapeTest do
         ('dr_effort','effort','process:tightbeam','flynn','asg_effort','flynn',0,1,'w_deadline',1,2,'effort check','{}','open');
       """)
 
+    # Boot dispatch runs full-schema validation at the end, which requires every
+    # open assignment to carry exactly one deliverable (deliverable_contract.ex
+    # validate_cardinality!). Production creates these when the deliverable
+    # contract migrates; these assignments are injected after that backfill, so
+    # mirror DeliverableContract.backfill_assignments/1 here — a deliverable whose
+    # sha256 is sha256(name), plus its 'assignment'-sourced binding row.
+    for {assignment, subject} <- [{"asg_effort", "effort holder"}, {"asg_decoy", "decoy holder"}] do
+      deliverable_id = "dlv_#{assignment}"
+
+      :ok =
+        DB.execute(db, """
+        INSERT INTO deliverables (id,name,sha256,createdAt)
+        VALUES ('#{deliverable_id}','#{subject}',
+                '#{:crypto.hash(:sha256, subject) |> Base.encode16(case: :lower)}',1);
+        INSERT INTO assignment_deliverables (assignmentId,deliverableId,sourceKind,sourceWorkItemId)
+        VALUES ('#{assignment}','#{deliverable_id}','assignment',NULL);
+        """)
+    end
+
     holder
   end
 
