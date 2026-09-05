@@ -17,7 +17,8 @@ defmodule Tightbeam.ConditionFacts do
   alias Tightbeam.DB.Txn
 
   @reserved_kinds ~w(
-    quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present
+    quota-recovered escalation-ruled operator-ruling-late-routed
+    assignment-successor-created user-alerted user-alert-cleared credential-present
     harness-auth-dead harness-auth-restored
     harness-rate-limit-dead harness-rate-limit-restored
     harness-adapter-unavailable harness-adapter-restored
