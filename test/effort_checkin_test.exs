@@ -1220,10 +1220,24 @@ defmodule Tightbeam.EffortCheckinTest do
     File.write!(Path.join(ctx.root, "released.md"), "released")
     released = artifact!(ctx.db, "holder", item.id, "released.md")
 
+    {:ok, prepared} = Tightbeam.ArtifactContent.prepare("released", nil)
+
     {:ok, _} =
-      DB.query(ctx.db, "UPDATE artifacts SET state='released' WHERE artifactId=?1", [
-        released.artifact_id
-      ])
+      DB.transaction(ctx.db, fn txn ->
+        :ok =
+          Tightbeam.ArtifactContent.store_in_txn(
+            txn,
+            released.artifact_id,
+            prepared,
+            System.system_time(:millisecond)
+          )
+
+        DB.Txn.q(
+          txn,
+          "UPDATE artifacts SET contentSha256=?2, state='released' WHERE artifactId=?1",
+          [released.artifact_id, prepared.sha256]
+        )
+      end)
 
     # Archived — archival moved these bytes into `home` itself, so originPath is
     # knowingly stale and stat-ing it would manufacture an absence we caused.

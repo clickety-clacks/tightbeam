@@ -6493,7 +6493,7 @@ defmodule Tightbeam.Gateway do
 
           %{owner_user_id: ^owner} = session ->
             if session.state == "active" do
-              {:ok, result} =
+              transaction =
                 DB.transaction(db, fn txn ->
                   result =
                     retire_cascade_in_txn(
@@ -6517,22 +6517,36 @@ defmodule Tightbeam.Gateway do
                   result
                 end)
 
-              Enum.each(result.retired, fn retired ->
-                broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
-                Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
+              case transaction do
+                {:ok, result} ->
+                  Enum.each(result.retired, fn retired ->
+                    broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
+                    Map.get(config, :on_retired, fn _ -> :ok end).(retired.session_key)
 
-                Enum.each(retired.assignments, fn assignment ->
-                  emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
-                end)
-              end)
+                    Enum.each(retired.assignments, fn assignment ->
+                      emit_assignment_change(db, assignment.assignment_id, assignment.from_state)
+                    end)
+                  end)
 
-              reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
+                  reap_retired_sessions(config, db, Enum.map(result.retired, & &1.session_key))
 
-              %{
-                deleted_session_key: session.session_key,
-                retired_session_keys: Enum.map(result.retired, & &1.session_key),
-                deferred: result.deferred
-              }
+                  %{
+                    deleted_session_key: session.session_key,
+                    retired_session_keys: Enum.map(result.retired, & &1.session_key),
+                    deferred: result.deferred
+                  }
+
+                {:error,
+                 %Tightbeam.ArtifactContent.RetirementBlockedError{artifact_ids: artifact_ids}} ->
+                  %{
+                    code: "artifact_content_not_durable",
+                    message: "session retirement requires durable artifact content",
+                    artifact_ids: artifact_ids
+                  }
+
+                {:error, error} ->
+                  raise error
+              end
             else
               %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []}
             end
@@ -6634,6 +6648,12 @@ defmodule Tightbeam.Gateway do
       end)
 
     if leased == [] do
+      :ok =
+        Tightbeam.ArtifactContent.ensure_retirement_ready_in_txn!(
+          txn,
+          Enum.map(subtree, & &1.session_key)
+        )
+
       retired =
         Enum.map(subtree, fn member ->
           assignments =

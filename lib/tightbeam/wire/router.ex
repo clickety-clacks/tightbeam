@@ -50,6 +50,7 @@ defmodule Tightbeam.Wire.Router do
   use Plug.Router
 
   alias Tightbeam.{
+    ArtifactContent,
     Assets,
     CliCompatibility,
     D1Read,
@@ -171,6 +172,30 @@ defmodule Tightbeam.Wire.Router do
       dispatch_response(conn, call, 200, &%{"result" => &1})
     else
       {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
+  post "/agent/artifact-record" do
+    with {:ok, auth} <- cli_auth(conn),
+         {:ok, body, content, conn} <- read_artifact_upload(conn),
+         "artifact-record" <- body["verb"],
+         {:ok, call} <- artifact_call(body, auth, conn) do
+      dispatch_response(conn, Map.put(call, :artifact_content, content), 200, &%{"result" => &1})
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+      _ -> error(conn, 400, "invalid_message", "artifact-record request required")
+    end
+  end
+
+  post "/agent/artifact-content" do
+    with {:ok, auth} <- cli_auth(conn),
+         {:ok, body, conn} <- read_json(conn),
+         "artifact-get" <- body["verb"],
+         {:ok, call} <- artifact_call(body, auth, conn) do
+      artifact_content_response(conn, call)
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+      _ -> error(conn, 400, "invalid_message", "artifact-get request required")
     end
   end
 
@@ -1210,6 +1235,82 @@ defmodule Tightbeam.Wire.Router do
     end
   rescue
     Plug.Parsers.RequestTooLargeError -> {:error, 413, "payload_too_large", nil}
+  end
+
+  defp read_artifact_upload(conn) do
+    conn = Plug.Parsers.call(conn, @multipart_opts)
+
+    with %Plug.Upload{} = upload <- conn.body_params["file"],
+         request when is_binary(request) <- conn.body_params["request"],
+         {:ok, body} when is_map(body) <- JSON.decode(request),
+         %{size: size, type: :regular} when size <= @max_upload_bytes <- File.stat!(upload.path),
+         {:ok, content} <- File.read(upload.path) do
+      {:ok, body, content, conn}
+    else
+      %{size: size} when size > @max_upload_bytes ->
+        {:error, 413, "payload_too_large", nil}
+
+      _ ->
+        {:error, 400, "invalid_message", "multipart fields 'request' and 'file' required"}
+    end
+  rescue
+    Plug.Parsers.RequestTooLargeError -> {:error, 413, "payload_too_large", nil}
+  end
+
+  defp artifact_call(body, auth, conn) do
+    verb = body["verb"]
+
+    with :ok <- allowed_agent_verb(verb),
+         {:ok, origin, principal} <- agent_identity(body, auth, conn),
+         {:ok, session_key, target_meta} <- typed_target(verb, body, conn) do
+      {:ok,
+       %{
+         verb: verb,
+         origin: origin,
+         principal: principal,
+         transport_session_key: authenticated_session_key(auth),
+         session_key: artifact_caller_session(verb, session_key, principal),
+         target_role: target_meta.role,
+         role_fallback: target_meta.fallback,
+         params: atomize_params(verb, body["params"] || %{})
+       }}
+    end
+  end
+
+  defp artifact_content_response(conn, call) do
+    case Dispatch.dispatch(db(conn), handlers(conn), call) do
+      {:ok, artifact} ->
+        send_artifact_content(conn, artifact)
+
+      {:error, %{code: "not_found"}} ->
+        error(conn, 404, "not_found", nil)
+
+      {:error, result} ->
+        dispatch_error(conn, call, error_status(result[:code]), result)
+
+      {:decision_pending, decision_request_id} ->
+        decision_pending(conn, decision_request_id)
+    end
+  end
+
+  defp send_artifact_content(conn, artifact) do
+    case ArtifactContent.fetch(db(conn), artifact.artifact_id) do
+      {:ok, stored} ->
+        conn
+        |> Plug.Conn.put_resp_content_type("application/octet-stream")
+        |> Plug.Conn.put_resp_header("x-tightbeam-artifact-id", artifact.artifact_id)
+        |> Plug.Conn.put_resp_header("x-tightbeam-content-sha256", stored.sha256)
+        |> Plug.Conn.send_resp(200, stored.content)
+
+      {:error, :not_released} ->
+        error(conn, 409, "content_not_released", "artifact content is not released")
+
+      {:error, :integrity_invalid} ->
+        error(conn, 500, "artifact_content_integrity_invalid", nil)
+
+      :not_found ->
+        error(conn, 404, "not_found", nil)
+    end
   end
 
   defp retire_target(key, body, device, conn) do

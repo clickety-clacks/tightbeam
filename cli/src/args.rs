@@ -83,6 +83,11 @@ pub enum Command {
         work_item_id: Option<String>,
         content_sha256: Option<String>,
     },
+    ArtifactContentFetch {
+        identity: Identity,
+        artifact_id: String,
+        output_path: String,
+    },
     Artifacts {
         identity: Identity,
         work_item_id: Option<String>,
@@ -477,7 +482,9 @@ COMMANDS:
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
-      Record a deliberate artifact pointer for the calling session.
+      Record artifact metadata. A readable local regular file is captured and released.
+  artifact-content-fetch <artifactId> --output <path>
+      Fetch verified released content without reading the recorded origin path.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
 
@@ -1197,6 +1204,20 @@ fn parse_with_optional_catalog(
                 content_sha256: nonempty(flags, "sha256"),
             })
         }
+        "artifact-content-fetch" => {
+            if parsed.positional.len() != 2 {
+                return Err(
+                    "usage: tightbeam artifact-content-fetch <artifactId> --output <path>"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::ArtifactContentFetch {
+                identity: identity(flags)?,
+                artifact_id: parsed.positional[1].clone(),
+                output_path: nonempty(flags, "output")
+                    .ok_or_else(|| "--output is required".to_owned())?,
+            })
+        }
         "tool-call-observed" => {
             if parsed.positional.len() != 1 || !flags.is_empty() {
                 return Err("usage: tightbeam tool-call-observed".to_owned());
@@ -1851,7 +1872,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2767,6 +2788,7 @@ mod tests {
                 "assimilate",
                 "assign",
                 "assignments",
+                "artifact-content-fetch",
                 "artifact-record",
                 "artifacts",
                 "attest",
@@ -3354,7 +3376,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
         );
     }
 

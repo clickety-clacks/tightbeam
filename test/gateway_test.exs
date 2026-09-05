@@ -908,7 +908,7 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:DOWN, ^monitor, :process, ^adapter, :normal}
   end
 
-  test "reap archives a local workspace with artifacts before adapter teardown", ctx do
+  test "reap removes a local workspace only after artifact content is durable", ctx do
     ensure_global_registry()
 
     base_dir =
@@ -959,6 +959,7 @@ defmodule Tightbeam.GatewayTest do
         principal: {:session, session.session_key},
         session_key: session.session_key,
         recorded_message_id: "msg_banana_artifact",
+        artifact_content: "banana",
         params: %{
           kind: "spec",
           title: "Banana spec",
@@ -972,6 +973,7 @@ defmodule Tightbeam.GatewayTest do
         principal: {:session, session.session_key},
         session_key: session.session_key,
         recorded_message_id: "msg_external_artifact",
+        artifact_content: "external",
         params: %{
           kind: "report",
           title: "External report",
@@ -990,15 +992,15 @@ defmodule Tightbeam.GatewayTest do
     assert result.retired_session_keys == [session.session_key]
     refute File.exists?(workspace)
 
-    [archive_dir] = Path.wildcard(Path.join(base_dir, "archive/artifact_writer-*"))
-    archived = Artifacts.get(ctx.db, artifact.artifact_id)
-    assert archived.state == "archived"
-    assert archived.home == Path.join(archive_dir, "specs/banana.md")
-    assert File.read!(archived.home) == "banana"
+    assert Artifacts.get(ctx.db, artifact.artifact_id).state == "released"
 
-    unchanged_external = Artifacts.get(ctx.db, external.artifact_id)
-    assert unchanged_external.state == "in-workspace"
-    assert unchanged_external.home == nil
+    assert {:ok, %{content: "banana"}} =
+             Tightbeam.ArtifactContent.fetch(ctx.db, artifact.artifact_id)
+
+    assert Artifacts.get(ctx.db, external.artifact_id).state == "released"
+
+    assert {:ok, %{content: "external"}} =
+             Tightbeam.ArtifactContent.fetch(ctx.db, external.artifact_id)
   end
 
   test "retiring with a live adapter sibling leaves the adapter up and records residency", ctx do

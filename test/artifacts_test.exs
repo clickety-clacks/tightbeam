@@ -2,7 +2,7 @@ defmodule Tightbeam.ArtifactsTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Artifacts, DB, Gateway, Ledger, Org, Projection, WorkItems}
+  alias Tightbeam.{ArtifactContent, Artifacts, DB, Gateway, Ledger, Org, Projection, WorkItems}
 
   setup do
     db = :"artifacts_db_#{System.unique_integer([:positive])}"
@@ -12,6 +12,7 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = WorkItems.ensure_schema(db)
     :ok = Ledger.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
+    :ok = ArtifactContent.ensure_schema(db)
 
     parent = session(db, "parent", nil)
     child = session(db, "child", parent.session_key)
@@ -247,315 +248,170 @@ defmodule Tightbeam.ArtifactsTest do
              )
   end
 
-  test "archives the exact artifact home and release clears custody location", ctx do
-    workspace =
-      Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
+  test "capture stores exact binary content and releases with the gateway hash", ctx do
+    content = <<0, 255, 10, 65, 0, 66>>
+    expected = :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
 
-    archive_root =
-      Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
+    row =
+      Artifacts.record(ctx.db, %{
+        principal: {:session, ctx.child.session_key},
+        session_key: ctx.child.session_key,
+        artifact_content: content,
+        params: %{
+          kind: "data",
+          title: "Exact bytes",
+          origin_path: "result.bin",
+          work_item_id: "wi_banana",
+          content_sha256: expected
+        }
+      })
 
-    File.mkdir_p!(Path.join(workspace, "reports"))
-    File.write!(Path.join(workspace, "reports/result.md"), "durable result")
+    assert row.state == "released"
+    assert row.content_sha256 == expected
 
-    on_exit(fn ->
-      File.rm_rf(workspace)
-      File.rm_rf(archive_root)
-    end)
+    assert {:ok, %{content: ^content, sha256: ^expected, size: 6}} =
+             ArtifactContent.fetch(ctx.db, row.artifact_id)
+  end
 
+  test "a caller hash mismatch refuses atomically", ctx do
+    before_count = artifact_count(ctx.db)
+
+    assert Artifacts.record(ctx.db, %{
+             principal: {:session, ctx.child.session_key},
+             session_key: ctx.child.session_key,
+             artifact_content: "actual",
+             params: %{
+               kind: "report",
+               title: "Mismatch",
+               origin_path: "result.md",
+               work_item_id: "wi_banana",
+               content_sha256: String.duplicate("0", 64)
+             }
+           }) == %{
+             code: "artifact_content_hash_mismatch",
+             message: "artifact content does not match contentSha256"
+           }
+
+    assert artifact_count(ctx.db) == before_count
+  end
+
+  test "released state is refused without matching durable content", ctx do
     row =
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
-        title: "Result",
-        origin_path: "reports/result.md",
-        work_item_id: "wi_banana"
+        title: "Pointer only",
+        origin_path: "result.md"
       })
 
-    assert :ok =
-             Artifacts.archive_session(
-               ctx.db,
-               ctx.child.session_key,
-               workspace,
-               archive_root
-             )
+    assert {:error, error} =
+             DB.query(ctx.db, "UPDATE artifacts SET state='released' WHERE artifactId=?1", [
+               row.artifact_id
+             ])
 
-    archived = Artifacts.get(ctx.db, row.artifact_id)
-    [archive_dir_name] = File.ls!(archive_root)
-
-    assert archived.state == "archived"
-    assert archived.home == Path.join([archive_root, archive_dir_name, "reports/result.md"])
-    assert File.read!(archived.home) == "durable result"
-    refute File.exists?(workspace)
-
-    released = Artifacts.release(ctx.db, row.artifact_id)
-    assert released.state == "released"
-    assert released.home == nil
-    assert released.artifact_id == row.artifact_id
+    assert Exception.message(error) =~ "artifact_content_not_durable"
+    assert Artifacts.get(ctx.db, row.artifact_id).state == "in-workspace"
   end
 
-  test "archive failure preserves in-workspace truth instead of inventing custody", ctx do
-    row =
-      record(ctx.db, ctx.child.session_key, %{
-        kind: "data",
-        title: "Dataset",
-        origin_path: "/missing/data.json"
-      })
-
-    archive_root =
-      Path.join(System.tmp_dir!(), "missing-artifacts-#{System.unique_integer([:positive])}")
-
-    assert_raise ArgumentError, "workspace is unavailable for artifact archival", fn ->
-      Artifacts.archive_session(
-        ctx.db,
-        ctx.child.session_key,
-        "/missing/workspace",
-        archive_root
-      )
-    end
-
-    unchanged = Artifacts.get(ctx.db, row.artifact_id)
-    assert unchanged.state == "in-workspace"
-    assert unchanged.home == nil
-    refute File.exists?(archive_root)
-  end
-
-  test "acceptance 7: an origin outside the workspace is external — released, and nothing raises",
-       ctx do
+  test "retirement cleanup removes the origin workspace but keeps fetchable content", ctx do
     workspace =
       Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
-
-    outside =
-      Path.join(System.tmp_dir!(), "outside-artifact-#{System.unique_integer([:positive])}.md")
-
-    archive_root =
-      Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
 
     File.mkdir_p!(workspace)
-    File.write!(outside, "not in workspace")
-
-    on_exit(fn ->
-      File.rm_rf(workspace)
-      File.rm(outside)
-      File.rm_rf(archive_root)
-    end)
-
-    row =
-      record(ctx.db, ctx.child.session_key, %{
-        kind: "doc",
-        title: "Outside",
-        origin_path: outside
-      })
-
-    # The work happened somewhere Tightbeam does not hold. The ROW is the
-    # record; there is nothing to take into custody, and nothing raises.
-    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
-
-    external = Artifacts.get(ctx.db, row.artifact_id)
-    assert external.state == "released"
-    assert external.home == nil
-    assert external.origin_path == outside
-    assert File.read!(outside) == "not in workspace"
-    refute File.exists?(workspace)
-    refute File.exists?(archive_root)
-  end
-
-  test "canonical custody accepts an internal symlink and records the archived target", ctx do
-    workspace =
-      Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
-
-    archive_root =
-      Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(Path.join(workspace, "data"))
-    File.write!(Path.join(workspace, "data/inside.md"), "inside")
-    File.ln_s!("data/inside.md", Path.join(workspace, "inside-link.md"))
-
-    on_exit(fn ->
-      File.rm_rf(workspace)
-      File.rm_rf(archive_root)
-    end)
-
-    row =
-      record(ctx.db, ctx.child.session_key, %{
-        kind: "doc",
-        title: "Internal symlink",
-        origin_path: "inside-link.md"
-      })
-
-    assert :ok =
-             Artifacts.archive_session(
-               ctx.db,
-               ctx.child.session_key,
-               workspace,
-               archive_root
-             )
-
-    [archive_dir_name] = File.ls!(archive_root)
-    archived = Artifacts.get(ctx.db, row.artifact_id)
-
-    assert archived.state == "archived"
-    assert archived.home == Path.join([archive_root, archive_dir_name, "data/inside.md"])
-    assert File.read!(archived.home) == "inside"
-    refute File.exists?(workspace)
-  end
-
-  test "a symlink to bytes outside the workspace is external, not custody", ctx do
-    workspace =
-      Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
-
-    outside =
-      Path.join(System.tmp_dir!(), "outside-artifact-#{System.unique_integer([:positive])}.md")
-
-    archive_root =
-      Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(workspace)
-    File.write!(outside, "outside")
-    File.ln_s!(outside, Path.join(workspace, "outside-link.md"))
-
-    on_exit(fn ->
-      File.rm_rf(workspace)
-      File.rm(outside)
-      File.rm_rf(archive_root)
-    end)
-
-    row =
-      record(ctx.db, ctx.child.session_key, %{
-        kind: "doc",
-        title: "External symlink",
-        origin_path: "outside-link.md"
-      })
-
-    # The bytes live outside the workspace, so the link is a pointer at external
-    # work — released, never claimed as custody Tightbeam does not have.
-    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
-
-    external = Artifacts.get(ctx.db, row.artifact_id)
-    assert external.state == "released"
-    assert external.home == nil
-    assert File.read!(outside) == "outside"
-    refute File.exists?(workspace)
-    refute File.exists?(archive_root)
-  end
-
-  test "valid artifacts archive beside each external and unreadable mixed-row class", ctx do
-    for invalid_kind <- [:outside, :missing, :external_symlink] do
-      suffix = "#{invalid_kind}-#{System.unique_integer([:positive])}"
-      session_key = "mixed-#{suffix}"
-      workspace = Path.join(System.tmp_dir!(), "artifact-workspace-#{suffix}")
-      archive_root = Path.join(System.tmp_dir!(), "artifact-archive-#{suffix}")
-      outside = Path.join(System.tmp_dir!(), "outside-artifact-#{suffix}.md")
-
-      session(ctx.db, session_key, nil)
-      seed_message(ctx.db, session_key)
-      File.mkdir_p!(Path.join(workspace, "reports"))
-      File.write!(Path.join(workspace, "reports/valid.md"), "valid #{invalid_kind}")
-      File.write!(outside, "outside #{invalid_kind}")
-
-      invalid_origin =
-        case invalid_kind do
-          :outside ->
-            outside
-
-          :missing ->
-            "reports/missing.md"
-
-          :external_symlink ->
-            File.ln_s!(outside, Path.join(workspace, "reports/escape.md"))
-            "reports/escape.md"
-        end
-
-      valid =
-        record(ctx.db, session_key, %{
-          kind: "report",
-          title: "Valid #{invalid_kind}",
-          origin_path: "reports/valid.md"
-        })
-
-      invalid =
-        record(ctx.db, session_key, %{
-          kind: "report",
-          title: "Invalid #{invalid_kind}",
-          origin_path: invalid_origin
-        })
-
-      assert :ok =
-               Artifacts.archive_session(
-                 ctx.db,
-                 session_key,
-                 workspace,
-                 archive_root
-               )
-
-      [archive_dir_name] = File.ls!(archive_root)
-      archived = Artifacts.get(ctx.db, valid.artifact_id)
-      other = Artifacts.get(ctx.db, invalid.artifact_id)
-
-      assert archived.state == "archived"
-
-      assert archived.home ==
-               Path.join([archive_root, archive_dir_name, "reports/valid.md"])
-
-      assert File.read!(archived.home) == "valid #{invalid_kind}"
-
-      # An origin OUTSIDE the workspace (directly or through a link) is external
-      # work, released. An origin inside the workspace that is not there at all
-      # is neither: nothing was released, so the row stays as recorded.
-      case invalid_kind do
-        :missing ->
-          assert other.state == "in-workspace"
-          assert other.home == nil
-
-        _external ->
-          assert other.state == "released"
-          assert other.home == nil
-      end
-
-      refute File.exists?(workspace)
-
-      File.rm_rf!(archive_root)
-      File.rm!(outside)
-    end
-  end
-
-  test "an origin that names a machine is external without ever touching the workspace", ctx do
-    workspace =
-      Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
-
-    archive_root =
-      Path.join(System.tmp_dir!(), "artifact-archive-#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "result.md"), "durable result")
     on_exit(fn -> File.rm_rf(workspace) end)
 
-    # The exact form the operating manual teaches for remote work. Resolving it
-    # against the workspace would make "shrdlu:" a missing directory and raise.
     row =
-      record(ctx.db, ctx.child.session_key, %{
-        kind: "report",
-        title: "Remote vhost",
-        origin_path: "shrdlu:/etc/nginx/sites-enabled/app"
+      Artifacts.record(ctx.db, %{
+        principal: {:session, ctx.child.session_key},
+        session_key: ctx.child.session_key,
+        artifact_content: "durable result",
+        params: %{
+          kind: "report",
+          title: "Result",
+          origin_path: "result.md",
+          work_item_id: "wi_banana"
+        }
       })
 
-    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive_root)
-
-    external = Artifacts.get(ctx.db, row.artifact_id)
-    assert external.state == "released"
-    assert external.home == nil
-    refute File.exists?(archive_root)
+    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, "/unused")
+    refute File.exists?(workspace)
+    assert {:ok, %{content: "durable result"}} = ArtifactContent.fetch(ctx.db, row.artifact_id)
   end
 
-  test "a remote session with only declared work archives with no reachable workspace", ctx do
+  test "released content survives author workspace removal and a database-owner restart" do
+    unique = System.unique_integer([:positive])
+    path = Path.join(System.tmp_dir!(), "artifact-content-restart-#{unique}.sqlite3")
+    first = :"artifact_content_before_#{unique}"
+    second = :"artifact_content_after_#{unique}"
+    workspace = Path.join(System.tmp_dir!(), "artifact-origin-#{unique}")
+
+    on_exit(fn ->
+      File.rm_rf(workspace)
+      File.rm(path)
+      File.rm("#{path}-shm")
+      File.rm("#{path}-wal")
+    end)
+
+    {:ok, first_pid} = DB.start_link(path: path, name: first)
+    :ok = Org.ensure_schema(first)
+    :ok = Projection.ensure_schema(first)
+    :ok = WorkItems.ensure_schema(first)
+    :ok = Ledger.ensure_schema(first)
+    :ok = Artifacts.ensure_schema(first)
+    :ok = ArtifactContent.ensure_schema(first)
+    author = session(first, "restart-author", nil)
+    seed_work_items(first)
+    seed_running_turn(first, author.session_key)
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "result.bin"), <<1, 2, 3, 255>>)
+
+    row =
+      Artifacts.record(first, %{
+        principal: {:session, author.session_key},
+        session_key: author.session_key,
+        artifact_content: <<1, 2, 3, 255>>,
+        params: %{
+          kind: "data",
+          title: "Restart proof",
+          origin_path: Path.join(workspace, "result.bin"),
+          work_item_id: "wi_banana"
+        }
+      })
+
+    File.rm_rf!(workspace)
+    :ok = GenServer.stop(first_pid)
+
+    {:ok, second_pid} = DB.start_link(path: path, name: second)
+
+    assert {:ok, %{content: <<1, 2, 3, 255>>}} =
+             ArtifactContent.fetch(second, row.artifact_id)
+
+    :ok = GenServer.stop(second_pid)
+  end
+
+  test "retirement cleanup refuses uncaptured metadata and preserves the workspace", ctx do
+    workspace =
+      Path.join(System.tmp_dir!(), "artifact-workspace-#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "result.md"), "only copy")
+    on_exit(fn -> File.rm_rf(workspace) end)
+
     row =
       record(ctx.db, ctx.child.session_key, %{
         kind: "report",
-        title: "Remote only",
-        origin_path: "eurisko:/srv/app/report.md"
+        title: "Pointer only",
+        origin_path: "result.md"
       })
 
-    # Reap passes nil for a workspace it cannot see (gateway archive_retired_workspace).
-    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, nil, "/unused")
+    error =
+      assert_raise ArtifactContent.RetirementBlockedError, fn ->
+        Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, "/unused")
+      end
 
-    assert Artifacts.get(ctx.db, row.artifact_id).state == "released"
+    assert error.artifact_ids == [row.artifact_id]
+    assert File.read!(Path.join(workspace, "result.md")) == "only copy"
+    assert Artifacts.get(ctx.db, row.artifact_id).state == "in-workspace"
   end
 
   test "removes an artifact-free workspace", ctx do
@@ -572,6 +428,11 @@ defmodule Tightbeam.ArtifactsTest do
              Artifacts.archive_session(ctx.db, ctx.parent.session_key, workspace, "/unused")
 
     refute File.exists?(workspace)
+  end
+
+  defp artifact_count(db) do
+    {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM artifacts")
+    count
   end
 
   # No `recorded_message_id`: the caller cannot supply one, so the fixture cannot

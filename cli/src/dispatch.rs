@@ -1,8 +1,12 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
 
@@ -10,6 +14,8 @@ use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
 pub struct RequestSpec {
     pub path: &'static str,
     pub body_json: String,
+    pub body_file: Option<PathBuf>,
+    pub output_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +115,8 @@ fn request(
     RequestSpec {
         path: "/agent/dispatch",
         body_json: object(body),
+        body_file: None,
+        output_file: None,
     }
 }
 
@@ -210,12 +218,29 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "artifacts", vec![], params))
         }
+        Command::ArtifactContentFetch {
+            identity,
+            artifact_id,
+            output_path,
+        } => {
+            let mut spec = request(
+                identity,
+                "artifact-get",
+                vec![],
+                vec![string_field("artifactId", artifact_id)],
+            );
+            spec.path = "/agent/artifact-content";
+            spec.output_file = Some(PathBuf::from(output_path));
+            Ok(spec)
+        }
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
         Command::ToolCallObserved => Ok(RequestSpec {
             path: "/agent/tool-call-observed",
             body_json: "{}".to_owned(),
+            body_file: None,
+            output_file: None,
         }),
         Command::Spawn {
             identity,
@@ -1265,20 +1290,115 @@ fn send_to_with_timeout(
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, String> {
-    let call = gateway_request("POST", endpoint, request.path, timeout)
-        .set("content-type", "application/json")
-        .send_string(&request.body_json);
+    let mut builder = gateway_request("POST", endpoint, request.path, timeout);
+    let call = if let Some(path) = &request.body_file {
+        let (content_type, body) = artifact_multipart(request, path)?;
+        builder = builder.set("content-type", &content_type);
+        builder.send_bytes(&body)
+    } else {
+        builder
+            .set("content-type", "application/json")
+            .send_string(&request.body_json)
+    };
 
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(status, response)) => (status, response),
         Err(ureq::Error::Transport(error)) => return Err(error.to_string()),
     };
+    if let Some(output) = &request.output_file {
+        return artifact_output_response(status, response, output);
+    }
+
     let encoded = response.into_string().map_err(|error| error.to_string())?;
     if !(200..300).contains(&status) && request.body_json.contains(r#""verb":"tune""#) {
         return Err(tune_refusal_json(&encoded));
     }
     parse_response(status, &encoded)
+}
+
+fn artifact_multipart(request: &RequestSpec, path: &Path) -> Result<(String, Vec<u8>), String> {
+    let content = fs::read(path).map_err(|error| error.to_string())?;
+    let boundary = format!("tightbeam-artifact-{}", std::process::id());
+    let mut body = Vec::with_capacity(request.body_json.len() + content.len() + 320);
+    write!(
+        body,
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\nContent-Type: application/json\r\n\r\n{}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"artifact\"\r\nContent-Type: application/octet-stream\r\n\r\n",
+        request.body_json
+    )
+    .map_err(|error| error.to_string())?;
+    body.extend_from_slice(&content);
+    write!(body, "\r\n--{boundary}--\r\n").map_err(|error| error.to_string())?;
+    Ok((format!("multipart/form-data; boundary={boundary}"), body))
+}
+
+fn artifact_output_response(
+    status: u16,
+    response: ureq::Response,
+    output: &Path,
+) -> Result<Option<Value>, String> {
+    if !(200..300).contains(&status) {
+        let encoded = response.into_string().map_err(|error| error.to_string())?;
+        return parse_response(status, &encoded);
+    }
+
+    let expected_sha = response
+        .header("x-tightbeam-content-sha256")
+        .ok_or_else(|| "artifact response omitted x-tightbeam-content-sha256".to_owned())?
+        .to_owned();
+    let expected_size = response
+        .header("content-length")
+        .and_then(|value| value.parse::<usize>().ok());
+    let mut content = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut content)
+        .map_err(|error| error.to_string())?;
+    let actual_sha = format!("{:x}", Sha256::digest(&content));
+
+    if actual_sha != expected_sha || expected_size.is_some_and(|size| size != content.len()) {
+        return Err("artifact_content_integrity_invalid".to_owned());
+    }
+
+    write_new_output(output, &content)?;
+    Ok(None)
+}
+
+fn write_new_output(output: &Path, content: &[u8]) -> Result<(), String> {
+    if output.exists() {
+        return Err(format!("output already exists: {}", output.display()));
+    }
+    let parent = output
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = output
+        .file_name()
+        .ok_or_else(|| "--output must name a file".to_owned())?;
+    let temporary = parent.join(format!(
+        ".{}.tightbeam-{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| error.to_string())?;
+    let result = (|| {
+        file.write_all(content).map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        if output.exists() {
+            return Err(format!("output already exists: {}", output.display()));
+        }
+        fs::rename(&temporary, output).map_err(|error| error.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn tune_refusal_json(encoded: &str) -> String {
@@ -1509,7 +1629,13 @@ where
             if let Some(identity) = command_identity(&command) {
                 require_session_endpoint(identity, &endpoint)?;
             }
-            let request = build_request(&command)?;
+            let mut request = build_request(&command)?;
+            if let Command::ArtifactRecord { origin_path, .. } = &command {
+                if let Some(path) = local_artifact_path(origin_path) {
+                    request.path = "/agent/artifact-record";
+                    request.body_file = Some(path);
+                }
+            }
             if let Some(result) = send_request(&endpoint, &request, None)? {
                 println!(
                     "{}",
@@ -1523,6 +1649,37 @@ where
 
 fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
     add_user_endpoint_matches_local(endpoint, &provisioned())
+}
+
+fn local_artifact_path(origin_path: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(origin_path);
+    let candidate = if direct.is_absolute() {
+        direct
+    } else if let Some((host, path)) = origin_path.split_once(':') {
+        if !path.starts_with('/') || local_hostname().as_deref() != Some(host) {
+            return None;
+        }
+        PathBuf::from(path)
+    } else {
+        direct
+    };
+
+    fs::metadata(&candidate)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|_| candidate)
+}
+
+fn local_hostname() -> Option<String> {
+    let mut buffer = [0_u8; 256];
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf8(buffer[..end].to_vec()).ok()
 }
 
 fn first_user_for_target<F>(local: bool, create: F) -> Result<crate::users::FirstUser, String>
@@ -1568,6 +1725,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
         | Command::ArtifactRecord { identity, .. }
+        | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
@@ -1662,6 +1820,51 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn artifact_content_fetch_uses_the_binary_route_and_preserves_the_output_choice() {
+        let request = build_request(&parse(&[
+            "artifact-content-fetch",
+            "art_12345678",
+            "--output",
+            "result.bin",
+            "--as",
+            "reader",
+        ]))
+        .unwrap();
+
+        assert_eq!(request.path, "/agent/artifact-content");
+        assert_eq!(request.output_file, Some(PathBuf::from("result.bin")));
+        assert_eq!(
+            request.body_json,
+            r#"{"as":"reader","verb":"artifact-get","params":{"artifactId":"art_12345678"}}"#
+        );
+    }
+
+    #[test]
+    fn local_regular_artifacts_are_captured_and_existing_outputs_are_preserved() {
+        let root = std::env::temp_dir().join(format!(
+            "tightbeam-artifact-cli-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        fs::write(&source, [0_u8, 255, 1]).unwrap();
+        assert_eq!(
+            local_artifact_path(source.to_str().unwrap()),
+            Some(source.clone())
+        );
+
+        let existing = root.join("existing.bin");
+        fs::write(&existing, b"keep").unwrap();
+        assert!(write_new_output(&existing, b"replace").is_err());
+        assert_eq!(fs::read(&existing).unwrap(), b"keep");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

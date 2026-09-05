@@ -9,6 +9,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.EventLog,
     Tightbeam.Assets,
     Tightbeam.Artifacts,
+    Tightbeam.ArtifactContent,
     Tightbeam.CausalEvents,
     Tightbeam.Devices,
     Tightbeam.Idempotency,
@@ -40,7 +41,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "liveness-progress-receipts-v1-019"
+  @shape "artifact-content-v1-019"
+  @artifact_content_previous_shape "liveness-progress-receipts-v1-019"
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
@@ -1190,6 +1192,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@artifact_content_previous_shape]]} ->
+        migrate_artifact_content_v1(db)
+
       {:ok, [[@liveness_progress_receipts_previous_shape]]} ->
         upgrade_liveness_progress_receipts_v1(db)
 
@@ -1233,12 +1238,13 @@ defmodule Tightbeam.Schema do
           stamped: #{found}
           this build: #{@shape}
 
-        This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
+        This build can migrate #{@artifact_content_previous_shape} directly.
+        It can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
         #{@effort_request_exit_previous_shape} to #{@shape}. It can also migrate
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
-        then #{@shape}.
+        then #{@artifact_content_previous_shape}, then #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1357,7 +1363,7 @@ defmodule Tightbeam.Schema do
 
              Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
                @liveness_progress_receipts_previous_shape,
-               @shape,
+               @artifact_content_previous_shape,
                migration_time
              ])
 
@@ -1378,7 +1384,7 @@ defmodule Tightbeam.Schema do
              end
            end) do
         {:ok, :ok} ->
-          :ok
+          migrate_artifact_content_v1(db)
 
         {:error, %ShapeError{} = error} ->
           raise error
@@ -1390,6 +1396,69 @@ defmodule Tightbeam.Schema do
       end
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp migrate_artifact_content_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@artifact_content_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_artifact_content_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           if Txn.q(
+                txn,
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='artifact_contents'"
+              ) != [] do
+             raise ShapeError,
+               message: "incompatible_artifact_content_v1: artifact_contents already exists"
+           end
+
+           :ok = Tightbeam.ArtifactContent.create_in_txn(txn)
+
+           Txn.q(
+             txn,
+             """
+             UPDATE artifacts
+             SET state = 'in-workspace', home = NULL, updatedAt = ?1
+             WHERE state = 'released'
+             """,
+             [migration_time]
+           )
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @artifact_content_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_artifact_content_v1: stamp race")
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_artifact_content_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_artifact_content_v1: upgrade failed: #{Exception.message(error)}"
     end
   end
 

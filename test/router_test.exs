@@ -1762,7 +1762,7 @@ defmodule Tightbeam.Wire.RouterTest do
         params: %{kind: "spec", title: "Design", originPath: "spec.md"}
       })
 
-    assert recorded.status == 200
+    assert recorded.status == 200, recorded.resp_body
 
     assert_receive {:call,
                     %{
@@ -1794,6 +1794,78 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert missing.status == 404
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_found"
+  end
+
+  test "artifact upload captures exact bytes and content fetch ignores the origin path", ctx do
+    session = create_session(ctx.db, "durable-writer", "flynn")
+    Roles.create!(ctx.db, "durable-writer", "flynn", session.session_key)
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: ctx.base_dir,
+        wake_scheduler: ctx.scheduler,
+        wake_tick_ms: 1_000
+      })
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    created =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "work-item-create",
+        asUser: "flynn",
+        params: %{title: "Durable artifact"}
+      })
+
+    work_item_id = JSON.decode!(created.resp_body)["result"]["id"]
+    content = <<0, 1, 255, 10, 65>>
+    upload_path = Path.join(ctx.base_dir, "artifact-upload.bin")
+    File.mkdir_p!(ctx.base_dir)
+    File.write!(upload_path, content)
+
+    request =
+      JSON.encode!(%{
+        verb: "artifact-record",
+        params: %{
+          kind: "data",
+          title: "Binary",
+          originPath: "/origin/that/will/not/be/read",
+          workItemId: work_item_id
+        }
+      })
+
+    upload = %Plug.Upload{
+      path: upload_path,
+      filename: "artifact.bin",
+      content_type: "application/octet-stream"
+    }
+
+    recorded =
+      conn(:post, "/agent/artifact-record", %{"request" => request, "file" => upload})
+      |> put_req_header("authorization", "Bearer #{session.cli_token}")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(ctx.opts))
+
+    assert recorded.status == 200, recorded.resp_body
+    artifact = JSON.decode!(recorded.resp_body)["result"]
+    assert artifact["state"] == "released"
+
+    fetched =
+      conn(
+        :post,
+        "/agent/artifact-content",
+        JSON.encode!(%{
+          verb: "artifact-get",
+          params: %{artifactId: artifact["artifactId"]}
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{session.cli_token}")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(ctx.opts))
+
+    assert fetched.status == 200, fetched.resp_body
+    assert fetched.resp_body == content
+    assert get_resp_header(fetched, "x-tightbeam-artifact-id") == [artifact["artifactId"]]
   end
 
   test "session bearer enforces the identity ladder and threads the normative principal seam",

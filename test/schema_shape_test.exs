@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "liveness-progress-receipts-v1-019"
+  @shape "artifact-content-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
   @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
@@ -143,6 +143,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    drop_artifact_content(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
 
@@ -318,6 +319,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "operator-decision migration classifies the complete predecessor census once", %{db: db} do
     :ok = Schema.ensure_all(db)
+    drop_artifact_content(db)
 
     :ok =
       DB.execute(db, """
@@ -485,6 +487,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     {:ok, first_pid} = DB.start_link(path: path, name: first)
     assert :ok = Schema.ensure_all(first)
+    drop_artifact_content(first)
 
     :ok =
       DB.execute(first, """
@@ -876,6 +879,7 @@ defmodule Tightbeam.SchemaShapeTest do
   test "the exact notice-batching predecessor widens effort cancellation and preserves the stamp",
        %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    drop_artifact_content(db)
 
     {:ok, [[current_ddl]]} =
       DB.query(
@@ -1044,6 +1048,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_decision_requests_to_model_identity(db) do
+    drop_artifact_content(db)
+
     :ok =
       DB.execute(db, """
       DROP INDEX decision_requests_owner;
@@ -1079,6 +1085,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_wakes_to_terminal_decision(db) do
+    drop_artifact_content(db)
+
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
@@ -1226,6 +1234,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp drop_liveness_activation(db) do
+    drop_artifact_content(db)
+
     :ok =
       DB.execute(db, """
       DROP TRIGGER IF EXISTS supervision_liveness_retirement_immutable_delete;
@@ -1252,6 +1262,16 @@ defmodule Tightbeam.SchemaShapeTest do
       DROP TABLE IF EXISTS supervision_liveness_epoch;
       DROP TABLE IF EXISTS supervision_liveness_migrations;
       DROP INDEX IF EXISTS wakes_cancellation_state;
+      """)
+  end
+
+  defp drop_artifact_content(db) do
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER IF EXISTS released_artifact_content_immutable_delete;
+      DROP TRIGGER IF EXISTS released_artifact_content_immutable_update;
+      DROP TRIGGER IF EXISTS artifacts_release_requires_content;
+      DROP TABLE IF EXISTS artifact_contents;
       """)
   end
 end
