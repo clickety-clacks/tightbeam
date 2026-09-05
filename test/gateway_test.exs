@@ -2,6 +2,9 @@ defmodule Tightbeam.GatewayTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
+  # The committed packaging shim, for the writer→consumer seam test below.
+  @shim Path.expand("../packaging/tightbeam-gateway", __DIR__)
+
   # How long a COLD runner Task is allowed to take to reach `Adapter.prompt`.
   #
   # One budget rather than three literals, because the three sites that wait on
@@ -1131,6 +1134,84 @@ defmodule Tightbeam.GatewayTest do
     assert first["cliToken"] == second["cliToken"]
     assert second["port"] == 5_432
     assert File.stat!(Path.join(base_dir, "gateway.json")).mode |> Bitwise.band(0o777) == 0o600
+  end
+
+  test "children writes the instance's ACTUAL RELEASE_NODE and owned pid into the descriptor, fresh every boot",
+       ctx do
+    base_dir = Path.join(System.tmp_dir!(), "gateway_node_#{System.unique_integer([:positive])}")
+    config = gateway_config(base_dir, ctx.db, 4_321)
+
+    original = System.get_env("RELEASE_NODE")
+
+    on_exit(fn ->
+      if original,
+        do: System.put_env("RELEASE_NODE", original),
+        else: System.delete_env("RELEASE_NODE")
+    end)
+
+    # R5: the descriptor records the node the instance ACTUALLY booted under, so
+    # the rpc/remote consumer resolves the real node (R1/R4). A hardcoded, null,
+    # or stale writer must NOT stay green — assert the exact value that was set.
+    System.put_env("RELEASE_NODE", "tightbeam_gateway_4321")
+    Gateway.children(config)
+    first = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+
+    assert first["node"] == "tightbeam_gateway_4321"
+    assert first["ownedPid"] == System.pid()
+    assert is_binary(first["ownedCommand"]) and first["ownedCommand"] != ""
+    # F1: the start time is the third leg of the identity the `stop` verb checks;
+    # without it a LATER same-command process is indistinguishable from this one.
+    assert is_binary(first["ownedStart"]) and first["ownedStart"] != ""
+
+    # Written FRESH every boot: a custom-node reboot replaces it (cliToken kept).
+    System.put_env("RELEASE_NODE", "custom_operator_node")
+    Gateway.children(config)
+    second = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+
+    assert second["node"] == "custom_operator_node"
+    assert second["cliToken"] == first["cliToken"]
+  end
+
+  test "the node the REAL writer persists is what rpc resolves; ambient node+cookie cannot override (writer→consumer seam)",
+       ctx do
+    base_dir = Path.join(System.tmp_dir!(), "gateway_seam_#{System.unique_integer([:positive])}")
+    config = gateway_config(base_dir, ctx.db, 4_321)
+
+    original = System.get_env("RELEASE_NODE")
+
+    on_exit(fn ->
+      if original,
+        do: System.put_env("RELEASE_NODE", original),
+        else: System.delete_env("RELEASE_NODE")
+    end)
+
+    # The REAL gateway.ex writer persists the instance's booted node into
+    # base_dir/gateway.json — not a hand-authored descriptor.
+    System.put_env("RELEASE_NODE", "seam_custom_node")
+    Gateway.children(config)
+
+    # A faked package layout whose committed shim reads THAT real descriptor.
+    shim = faked_release_shim!()
+
+    {out, status} =
+      System.cmd(shim, ["rpc", "Foo.bar()"],
+        env: [
+          {"TIGHTBEAM_BASE_DIR", base_dir},
+          # the incident vector aimed at a debug verb:
+          {"RELEASE_NODE", "tightbeam_gateway_11373"},
+          {"RELEASE_COOKIE", "prod-shared-cookie"}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, out
+    # seam: rpc resolved the node the REAL writer persisted, over the ambient one.
+    assert out =~ ~r/^REL_NODE=seam_custom_node$/m
+    refute out =~ ~r/^REL_NODE=tightbeam_gateway_11373$/m
+    # R4 (shim half, T2): the shim strips the inherited RELEASE_COOKIE; the real
+    # launcher's baked resolution is proven in release_cookie_resolution_test.exs.
+    assert out =~ ~r/^REL_COOKIE=<unset>$/m
+    refute out =~ ~r/prod-shared-cookie/
   end
 
   test "children recovers liveness before any runtime child can start", ctx do
@@ -9771,6 +9852,37 @@ defmodule Tightbeam.GatewayTest do
                       "type" => "stream_updated",
                       "stream" => %{"sessionKey" => ^key, "adopted" => false}
                     }}
+  end
+
+  # A temp copy of the packaged layout: the committed shim forwarding (per its
+  # own DIR resolution) to a raw FAKE release probe that echoes the RELEASE_NODE
+  # it was handed and the RAW inherited RELEASE_COOKIE — enough to prove the real
+  # writer→consumer node seam and that the shim strips the cookie. The real
+  # launcher's baked-cookie resolution is proven in release_cookie_resolution_test.
+  defp faked_release_shim! do
+    root = Path.join(System.tmp_dir!(), "tb-rel-#{System.unique_integer([:positive])}")
+    bin = Path.join(root, "release/bin")
+    rel_bin = Path.join(root, "release/release/bin")
+    File.mkdir_p!(bin)
+    File.mkdir_p!(rel_bin)
+
+    shim = Path.join(bin, "tightbeam-gateway")
+    File.cp!(@shim, shim)
+    File.chmod!(shim, 0o755)
+
+    fake = Path.join(rel_bin, "tightbeam_gateway")
+
+    File.write!(
+      fake,
+      "#!/bin/sh\n" <>
+        "printf 'REL_NODE=%s\\n' \"$RELEASE_NODE\"\n" <>
+        "printf 'REL_COOKIE=%s\\n' \"${RELEASE_COOKIE-<unset>}\"\n" <>
+        "for a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done\n"
+    )
+
+    File.chmod!(fake, 0o755)
+    on_exit(fn -> File.rm_rf!(root) end)
+    shim
   end
 
   defp gateway_config(base_dir, db, port) do

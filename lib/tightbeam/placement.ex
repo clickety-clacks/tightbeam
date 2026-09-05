@@ -828,6 +828,7 @@ defmodule Tightbeam.Placement do
 
     if String.starts_with?(name, "TIGHTBEAM_") or
          name in Tightbeam.Harness.Support.reserved_overlay_env_vars() or
+         Enum.any?(Tightbeam.ProductionIdentityEnv.prefixes(), &String.starts_with?(name, &1)) or
          name in credential_env_names do
       {:error,
        %{
