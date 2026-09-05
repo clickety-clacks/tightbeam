@@ -58,6 +58,7 @@ defmodule Tightbeam.Acp.Adapter do
     chunks: %{},
     progress: %{},
     subagent_tasks: %{},
+    subagent_session_roots: %{},
     known: MapSet.new(),
     models: %{},
     unprompted: MapSet.new(),
@@ -426,7 +427,10 @@ defmodule Tightbeam.Acp.Adapter do
            "initialize",
            %{
              protocolVersion: 1,
-             clientCapabilities: %{fs: %{readTextFile: false, writeTextFile: false}}
+             clientCapabilities: %{
+               fs: %{readTextFile: false, writeTextFile: false},
+               subagents: %{}
+             }
            },
            timeout: :infinity
          ) do
@@ -536,7 +540,11 @@ defmodule Tightbeam.Acp.Adapter do
             switchable_models: Map.delete(state.switchable_models, sid),
             config_options: Map.delete(state.config_options, sid),
             chunks: Map.delete(state.chunks, sid),
-            progress: Map.delete(state.progress, sid)
+            progress: Map.delete(state.progress, sid),
+            subagent_session_roots:
+              Map.reject(state.subagent_session_roots, fn {child_sid, root_sid} ->
+                child_sid == sid or root_sid == sid
+              end)
         }
 
         {:reply, :ok, state}
@@ -995,6 +1003,11 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   @impl true
+  def handle_info({:acp_notification, "_auth/status_update", params}, state) do
+    emit_auth_classification(state, params)
+    {:noreply, state}
+  end
+
   def handle_info({:acp_notification, "account/updated", params}, state) do
     emit_auth_classification(state, params)
     {:noreply, state}
@@ -1147,9 +1160,11 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp maybe_emit_subagent_event(state, sid, update) do
+    {root_sid, state} = subagent_root_session(state, sid, update)
+
     case state.on_subagent_event do
       handler when is_function(handler, 2) ->
-        case handler.(sid, update) do
+        case handler.(root_sid, update) do
           {:async, event_ref, pid, context} ->
             monitor = Process.monitor(pid)
 
@@ -1177,6 +1192,25 @@ defmodule Tightbeam.Acp.Adapter do
       _other ->
         state
     end
+  end
+
+  defp subagent_root_session(
+         state,
+         sid,
+         %{"sessionUpdate" => "subagent_spawned", "subagentSessionId" => child_sid}
+       ) do
+    root_sid = subagent_root_for(state, sid)
+    {root_sid, put_in(state.subagent_session_roots[child_sid], root_sid)}
+  end
+
+  defp subagent_root_session(state, sid, _update) do
+    {subagent_root_for(state, sid), state}
+  end
+
+  defp subagent_root_for(state, sid) do
+    if MapSet.member?(state.known, sid),
+      do: sid,
+      else: Map.get(state.subagent_session_roots, sid, sid)
   end
 
   defp clear_subagent_task(state, event_ref) do
