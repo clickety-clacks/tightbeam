@@ -532,6 +532,11 @@ defmodule Tightbeam.EscalationDeliveryTest do
               "recover_retired_target_in_txn/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4", "remove_override_result/3"} =>
                1,
+             # Identity apply asks a started session to re-read the Tightbeam
+             # skill files it has just rewritten. An ordinary prompt, submitted
+             # and never waited on, so it is a turn sink like any other.
+             {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4", "identity_apply_nudge/4"} =>
+               1,
              {"lib/tightbeam/assignments.ex", "Gateway.deliver_prompt_in_txn/5",
               "open_dispatch_result/2"} => 1,
              {"lib/tightbeam/wakes.ex", "Gateway.deliver_prompt_in_txn/5", "fire_in_txn/2"} => 1,
