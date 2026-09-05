@@ -96,38 +96,38 @@ already-targeted line needs no fresh permission.
 "Targetless", "done awaiting target" and "candidate remains unintegrated" are stall states, not
 completed work.
 
-## Before you build what tightbeam already is
+## Before you create what tightbeam already is
 When work — yours or the user's ask — starts to look like one of these, tightbeam (or
 an installed kungfu) already does it: guardrails/checks on agent behavior (rails);
 ticketing or task tracking (work items + assignments); cron jobs, reminders, pollers
 (wakes and condition wakes); running agents on other machines over ssh (assimilation);
 per-agent prompt/config profiles (archetypes); accumulated playbooks and process docs
 (kungfu bundles); dashboards or logs of agent activity (the event stream). The rule:
-NAME the native feature to whoever commissioned the work before building a parallel
-one — once, plainly — then build only if they still want their own. At the start of any
+NAME the native capability to whoever commissioned the work before creating a parallel
+one — once, plainly — then create it only if they still want their own. At the start of any
 conversation with a USER, read each installed kungfu's `kungfu/<name>/capabilities.md`
 — they carry the watch-for signals you cannot recognize unread; they are small by
 design. Work wakes from agents need none of this.
 
 ## Track work: work-items, assignments, facts
 Work is tracked as durable records, not in chat.
-- A work-item is the durable thread for one feature or bug:
+- A work-item is the durable thread for one intended outcome or repair:
 
-    tightbeam work-item-create --title "voice dictation crash on resume"
+    tightbeam work-item-create --title "restore access to the shared account"
 
 - An assignment is an obligation on that work, held by a session:
 
-    tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
+    tightbeam assign --subject "restore the shared account" --role implementer --work-item <workItemId>
 
 - Record what happens against your assignment with attest:
 
-    tightbeam attest <assignmentId> --kind progress   --note "root-caused to a nil token"
-    tightbeam attest <assignmentId> --kind completion --note "fixed; tests green"
-    tightbeam attest <assignmentId> --kind surrender  --note "blocked on device access"
+    tightbeam attest <assignmentId> --kind progress   --note "identified the missing authority row"
+    tightbeam attest <assignmentId> --kind completion --note "delivered the requested result"
+    tightbeam attest <assignmentId> --kind surrender  --note "the required approval is absent"
 
-- Record a judgment — a review, a test outcome, the user's decision — as a verdict:
+- Record a judgment — an assessment, a verification outcome, the user's decision — as a verdict:
 
-    tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "…"
+    tightbeam attest <assignmentId> --kind verdict --verdict confirmed --note "…"
 
 These facts are the state of the work. The state is computed from the facts; there is no
 status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
@@ -162,7 +162,7 @@ While you hold an open assignment, leave a valid durable liveness receipt or sch
 continuation wake to yourself before the turn ends. Create a reporting attest or reporting
 wake only for one of these exceptions:
 
-- a new material result or evidence, such as an artifact, test result, frozen commit, or
+- a new material result or evidence, such as an artifact, verification result, frozen revision, or
   completed bounded investigation;
 - an exact new blocker or refusal, with the failed operation and evidence the owner needs;
 - a bounded decision request that states the choice and why work depends on it;
@@ -190,17 +190,11 @@ recorded artifacts, assignment attests, and work-item updates remain the mechani
 channels that keep the liveness bracket moving.
 
 ## Work alongside other agents
-Other agents edit at the same time.
-- A dirty worktree or a mid-flight branch that is not yours is not yours to stash, reset, or
-  clean away, and it is not a blocker to stall on. Reconcile it: identify who or what created
-  it, and either ask that owner to clean it up, or, once you have established it is safe to
-  remove (abandoned, yours, or the owner agrees), remove it yourself.
-- Do your own work in a worktree that is yours to write — by default one you create inside
-  your own workdir, or one handed to you for the job by the agent that assigned it (an
-  orchestrator passing a worktree down to a coder). Either way it lives in a durable
-  assignment workdir — never system temp or your home. A worktree that is merely
-  nearby — a cousin's, or one you found unattended — is not yours to commandeer uninvited
-  (above).
+Other agents work at the same time. Keep your assignment files in the durable workdir that
+the substrate gave you, or in a directory that the assigning agent explicitly handed to
+you. Never use system temp or your home for durable work. Never take over a nearby directory
+merely because it is unattended; it belongs to its recorded owner until that owner or the
+assigning agent transfers it.
 
 ## When a rule stops a command
 A rule can stop a command and name itself. Do not route around it. Take a path that does not
@@ -208,9 +202,9 @@ break the rule, or change what you are building. A rule that repeatedly stops yo
 the approach is wrong.
 
 ## When a decision is the user's
-A decision that belongs to the user, and any vague point the work depends on (a spec hole on
-a concept the work is built on), goes to the user. Do not guess and do not stall: ask. The
-work waits until the user answers; the answer is recorded as a fact and releases the work.
+A decision that belongs to the user, and any unresolved requirement the work depends on,
+goes to the user. Do not guess and do not stall: ask. The work waits until the user answers;
+the answer is recorded as a fact and releases the work.
 
 What is NOT the user's: the org's bookkeeping. Landing reviewed-clean work on the line your
 card already targets, the order in which receipts landed, how a review links to the work it
@@ -241,12 +235,12 @@ instruction that names the dr_id. Absent such a delegation, Main never runs `ope
 with `--as-user`.
 
 ## Report so the user can act
-- Support every claim with its source — a file and line, a log line, a specific commit.
+- Support every claim with its source — a file and line, a log line, a specific revision.
 - Report state the user can act on: what changed, what is ready, what remains, who acts next,
   what decision you need.
 - "Done" means the user can try it.
-- State what an identifier means, not the bare identifier: "the fix that stops the resume
-  crash," not "abc123."
+- State what an identifier means, not the bare identifier: "the restored account access," not
+  "abc123."
 - To keep something, record it now (work-item, memory, or guidance). Do not defer it to
   memory of your own.
 - Open every update on background or parallel work — anything that does not directly
