@@ -131,7 +131,7 @@ on 2026-07-25:
 - **`feature_smoke.exs` is a LOCAL-HOST HERMETIC driver, and only that.** It
   runs one leg per registry harness, every one of them on
   `Placement.local_host_name()` — there is no host dimension. It also spawns
-  into the `reviewer` archetype and commits a rule fixture into the identity
+  into the `reviewer-code` archetype and commits a rule fixture into the identity
   repo as a side effect, so it wants an org it may mutate. **The satellite
   host×harness matrix is agent-driven through the journeys below, and
   deliberately has no script**: real-host e2e is a runbook plus a flexible

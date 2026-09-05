@@ -42,8 +42,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
     ensure_main_session(db, "flynn")
 
     holder = session(db, "vp-coder", "coder", "claude", "anthropic")
-    reviewer = session(db, "vp-reviewer", "reviewer", "codex", "openai")
-    Roles.create!(db, "reviewer", "flynn", reviewer.session_key)
+    reviewer = session(db, "vp-reviewer", "reviewer-code", "codex", "openai")
+    Roles.create!(db, "reviewer-code", "flynn", reviewer.session_key)
 
     test_pid = self()
 

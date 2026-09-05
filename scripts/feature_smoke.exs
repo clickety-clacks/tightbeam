@@ -121,7 +121,7 @@ defmodule FeatureSmoke do
 
     session =
       ok!(state, "spawn", %{
-        "archetype" => "reviewer",
+        "archetype" => "reviewer-code",
         "displayName" => "smoke-local-deploy-#{unique()}",
         "idempotencyKey" => "local-deploy-#{unique()}"
       })
@@ -162,12 +162,12 @@ defmodule FeatureSmoke do
         )
       end)
 
-      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer", harness)
+      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer-code", harness)
 
       assert(
         state,
         map_size(snapshot.skills) > 0,
-        "local deployment elected no skills for reviewer at #{cwd}"
+        "local deployment elected no skills for reviewer-code at #{cwd}"
       )
 
       ok!(state, "wake", %{
@@ -493,13 +493,13 @@ defmodule FeatureSmoke do
   defp check_flagship_review_loop(state) do
     u = unique()
     # A reviewer role bound to a live reviewer session (the remedy's assign target).
-    post(state, "role-create", %{"name" => "reviewer"})
+    post(state, "role-create", %{"name" => "reviewer-code"})
 
     reviewer =
       ok!(state, "spawn", %{"displayName" => "smoke-reviewer-#{u}", "idempotencyKey" => "rv-#{u}"})
 
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer", "sessionKey" => reviewer_key})
+    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
     reviewer_tok = session_token(state, reviewer_key)
 
     # A coder holding a work assignment.
@@ -663,10 +663,10 @@ defmodule FeatureSmoke do
     reviewer_leg = independent_leg(state)
     preflight_independent!(state, reviewer_leg)
 
-    post(state, "role-create", %{"name" => "reviewer"})
+    post(state, "role-create", %{"name" => "reviewer-code"})
 
     # The reviewer is spawned through the other SELECTED leg where this run has one. The
-    # `reviewer` bind does double duty: a session acting under its own credential needs a
+    # `reviewer-code` bind does double duty: a session acting under its own credential needs a
     # bound role or the router refuses it `no_role`, and `Roles.bind/3` REPLACES
     # `boundSessionKey`, which is what points the review statute's `target_role` at a live
     # session instead of whatever retired one a previous group left behind.
@@ -677,7 +677,7 @@ defmodule FeatureSmoke do
       })
 
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer", "sessionKey" => reviewer_key})
+    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
     reviewer_tok = session_token(state, reviewer_key)
 
     wi =
@@ -1667,11 +1667,11 @@ defmodule FeatureSmoke do
     ok!(state, "config", %{
       "action" => "set",
       "setting" => "default-archetype",
-      "value" => "reviewer"
+      "value" => "reviewer-code"
     })
 
     got = ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
-    assert(state, got == "reviewer", "config: set did not persist (#{inspect(got)})")
+    assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
 
     spawn =
       ok!(state, "spawn", %{
@@ -1687,7 +1687,7 @@ defmodule FeatureSmoke do
       "value" => original || "default"
     })
 
-    assert(state, arch in ["reviewer", nil], "config: spawn archetype was #{inspect(arch)}")
+    assert(state, arch in ["reviewer-code", nil], "config: spawn archetype was #{inspect(arch)}")
     retire(state, spawn)
     pass(state, "config default-archetype set/get persists and steers spawn")
   end

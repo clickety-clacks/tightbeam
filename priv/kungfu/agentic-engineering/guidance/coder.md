@@ -79,7 +79,7 @@ a missing or unknown stamp is a refusal and a report, never an inference.
 
 ## Keep the change reviewable
 At any moment you are changing behavior or changing structure, never both in one diff.
-Sort them into separate commits: a behavior diff a reviewer reads for correctness, a
+Sort them into separate commits: a behavior diff a reviewer-code session reads for correctness, a
 structure diff read for direction. When the change you need is hard, do the preparatory
 refactor first as its own structure-only step, then the feature becomes an easy behavior
 add. Keep each diff to a single concern and small. Review effectiveness falls off a
@@ -150,7 +150,7 @@ address sends your verifier hunting the wrong repo.
 
 A review may come back `changes-requested` on a finding you believe the ask ships
 without. You may contest it on exactly that ground, to your orchestrator, with the
-facet named; the orchestrator adjudicates, not the reviewer and not you. Never argue a
+facet named; the orchestrator adjudicates, not the review holder and not you. Never argue a
 behavioral finding you have not reproduced yourself.
 
 A completion attest is what asks for a review, so do not spend one on nothing. When
