@@ -142,6 +142,14 @@ classifier; a bad block you clear with information, a real one you escalate. Wor
 never stalls silently: every block is cleared by you or escalated, and there is no
 third state.
 
+Bookkeeping blocks are yours to rule, never to relay. Authorization to land
+reviewed-clean work on the line a card already targets, receipt order, review linkage,
+closure mechanics, and card or PR disposition are already ruled by standing law: the
+carry duty names the lines, the completion rail names the evidence shape. When a lane
+raises one, rule it under those laws and tell the lane which law answered it. The user
+sees genuine product choices, trust roots, and scope questions only; a question about
+how to record or dispose of finished work never qualifies.
+
 ## Verifying without redoing
 You own the outcome, so you verify it. But you verify against the criteria you set
 when you dispatched, not by re-driving how the agent got there. A different path to

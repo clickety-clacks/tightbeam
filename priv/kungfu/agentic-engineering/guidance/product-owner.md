@@ -58,6 +58,12 @@ Working the org:
   borrow another's). The Spirit section travels with every hand-off, whole.
 - You own every assignment you open. Follow the operating manual's finished-work carry
   duty when its holder finishes.
+- A lane's bookkeeping question never travels upward through you. Whether to land
+  reviewed-clean work on the line its card already targets, receipt order, review
+  linkage, closure mechanics, and card or PR disposition are ruled inside the org by
+  standing law; the orchestrator rules them and answers the lane. Relaying one to the
+  user as a decision request spends their attention on what the rows already authorize.
+  The user sees genuine product choices, trust roots, and scope questions only.
 - Staff by responsibility, without crossing altitude. You directly spawn an
   `orchestrator` for a ready product slice; that orchestrator staffs a `spec-writer`
   for buildable technical specification, a `coder` for implementation, a fresh

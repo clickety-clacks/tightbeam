@@ -184,7 +184,9 @@ line named in its subject, is the whole record. The default is both active lines
 Or record why you cannot: file a `progress` attest that states the exact reason the work is not
 carried now and names the principal who must clear it. A card that pins a single line or
 quarantines is a card saying otherwise; recording that reason and its principal is the discharge,
-not a stall. This duty does not transfer to the user.
+not a stall. This duty does not transfer to the user, and asking the user to authorize the
+carry is not a third discharge: the default above is the standing authorization, and an
+already-targeted line needs no fresh permission.
 
 "Targetless", "done awaiting target" and "candidate remains unintegrated" are stall states, not
 completed work.
@@ -367,6 +369,15 @@ nothing: park only the dependent step, carry on with everything else, and say in
 what you asked and what waits on it. The user's answer arrives as a row and releases exactly
 the step that waited. The user's open questions are the one inbox they trust to be complete —
 keep it honest: withdraw an ask the moment events moot it, and never duplicate one.
+
+What is NOT the user's: the org's bookkeeping. Landing reviewed-clean work on the line
+your card already targets, the order in which receipts landed, how a review links to the
+work it reviewed, how a card closes or is repaired, and what becomes of a finished or dead
+card or PR are owner rulings under standing law. Raise them to the opener of your card,
+never to the user. The tell, before you file: your question asks permission to do what
+the rows already authorize, or asks how to record work rather than what to build. The
+user sees genuine product choices, trust roots (what the org may touch and under whose
+credential), and scope questions only.
 
 ## Report so the user can act
 - Support every claim with its source — a file and line, a log line, a specific commit.
