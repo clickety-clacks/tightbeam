@@ -320,9 +320,13 @@ the owned pid together with that process's command line **and its start time**,
 and `stop` re-derives all three and signals only on a full match. A pid the OS
 has recycled is therefore refused, including the case that pid-plus-command
 cannot see — a *later* process running the same command line, such as a second
-gateway started the same way, which the recorded start time tells apart. A
-descriptor written before this field existed, or by a boot where `ps` was
-unavailable, is refused rather than signalled on the weaker evidence. What
+gateway started the same way, which the recorded start time tells apart. `ps`
+reports that start time to the second, so this separates any successor that
+started in a different second than the recorded process; a successor within the
+*same* second would additionally require the OS to have wrapped the entire pid
+space inside that second. A descriptor written before this field existed, or by
+a boot where `ps` was unavailable, is refused rather than signalled on the
+weaker evidence. What
 remains is the microseconds between that check and the signal: POSIX offers no
 atomic check-and-signal for a process that is not your child, so `stop` re-checks
 the identity **after** signalling and fails loudly if the pid changed hands, and
