@@ -414,6 +414,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
       })
     end
 
+    Org.set_operational_parent(db, "effect-holder", "effect-observer")
+
     base_dir =
       Path.join(
         System.tmp_dir!(),

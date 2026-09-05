@@ -1646,6 +1646,8 @@ defmodule Tightbeam.CliIntegrationTest do
 
   test "real CLI exact-reads from a bystander and rules an effort request from a lineage member",
        ctx do
+    Org.set_operational_parent(ctx.db, ctx.worker.session_key, ctx.session.session_key)
+
     continue_request =
       open_effort_request(ctx, "continue",
         expecter_session_key: Org.personal_session_key("flynn")
