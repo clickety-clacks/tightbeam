@@ -39,8 +39,8 @@ that blocks on every row is the other failure.
    the evidence each clause rested on. Calculate the document's SHA-256 and record the
    exact bytes first:
    `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId> --sha256 <hex>`.
-   Then file the verdict as an executive summary that names the artifact's id and
-   SHA-256, so the next reader can follow it to the table:
+   The verdict note has a 2,000-character cap. File it as an executive summary that
+   names the artifact's id and SHA-256, so the next reader can follow it to the table:
    `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<summary + art_id + sha256>"`
    when every must-have clause is satisfied or out-of-scope and no blocking finding
    remains. File `--verdict changes-requested` when any must-have clause is
