@@ -1205,8 +1205,9 @@ defmodule Tightbeam.GatewayTest do
     # seam: rpc resolved the node the REAL writer persisted, over the ambient one.
     assert out =~ ~r/^REL_NODE=seam_custom_node$/m
     refute out =~ ~r/^REL_NODE=tightbeam_gateway_11373$/m
-    # R4: the cookie ACTUALLY used is the baked one, not the inherited foreign one.
-    assert out =~ ~r/^REL_COOKIE=baked-release-cookie$/m
+    # R4 (shim half, T2): the shim strips the inherited RELEASE_COOKIE; the real
+    # launcher's baked resolution is proven in release_cookie_resolution_test.exs.
+    assert out =~ ~r/^REL_COOKIE=<unset>$/m
     refute out =~ ~r/prod-shared-cookie/
   end
 
@@ -9851,30 +9852,28 @@ defmodule Tightbeam.GatewayTest do
   end
 
   # A temp copy of the packaged layout: the committed shim forwarding (per its
-  # own DIR resolution) to a FAKE release binary that echoes the RELEASE_NODE it
-  # was handed and the cookie it would actually resolve (inherited RELEASE_COOKIE
-  # preferred, else the baked releases/COOKIE).
+  # own DIR resolution) to a raw FAKE release probe that echoes the RELEASE_NODE
+  # it was handed and the RAW inherited RELEASE_COOKIE — enough to prove the real
+  # writer→consumer node seam and that the shim strips the cookie. The real
+  # launcher's baked-cookie resolution is proven in release_cookie_resolution_test.
   defp faked_release_shim! do
     root = Path.join(System.tmp_dir!(), "tb-rel-#{System.unique_integer([:positive])}")
     bin = Path.join(root, "release/bin")
-    rel = Path.join(root, "release/release")
+    rel_bin = Path.join(root, "release/release/bin")
     File.mkdir_p!(bin)
-    File.mkdir_p!(Path.join(rel, "bin"))
-    File.mkdir_p!(Path.join(rel, "releases"))
-    File.write!(Path.join(rel, "releases/COOKIE"), "baked-release-cookie")
+    File.mkdir_p!(rel_bin)
 
     shim = Path.join(bin, "tightbeam-gateway")
     File.cp!(@shim, shim)
     File.chmod!(shim, 0o755)
 
-    fake = Path.join(rel, "bin/tightbeam_gateway")
+    fake = Path.join(rel_bin, "tightbeam_gateway")
 
     File.write!(
       fake,
       "#!/bin/sh\n" <>
         "printf 'REL_NODE=%s\\n' \"$RELEASE_NODE\"\n" <>
-        "cookie=\"${RELEASE_COOKIE:-$(cat \"$(dirname \"$0\")/../releases/COOKIE\")}\"\n" <>
-        "printf 'REL_COOKIE=%s\\n' \"$cookie\"\n" <>
+        "printf 'REL_COOKIE=%s\\n' \"${RELEASE_COOKIE-<unset>}\"\n" <>
         "for a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done\n"
     )
 

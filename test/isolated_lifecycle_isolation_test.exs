@@ -239,9 +239,11 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     assert out =~ ~r/^REL_NODE=custom_iso_node$/m
     # (b) incident-safety for the debug verbs: the inherited node did NOT redirect.
     refute out =~ ~r/^REL_NODE=tightbeam_gateway_11373$/m
-    # (c) R4/incident-safety on the cookie dimension: the inherited RELEASE_COOKIE
-    # does NOT override — rpc/remote use this install's baked releases/COOKIE.
-    assert out =~ ~r/^REL_COOKIE=baked-release-cookie$/m
+    # (c) R4 (shim half, T2): the shim STRIPS the inherited RELEASE_COOKIE from
+    # the rpc/remote environment, so the release falls back to its baked cookie.
+    # The real launcher's baked resolution is proven against the built artifact
+    # in release_cookie_resolution_test.exs (T1).
+    assert out =~ ~r/^REL_COOKIE=<unset>$/m
     refute out =~ ~r/prod-shared-cookie/
     # the debug argv is forwarded intact.
     assert out =~ ~r/^ARG=rpc$/m
@@ -281,29 +283,25 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
   defp faked_release_shim! do
     root = Path.join(System.tmp_dir!(), "tb-rel-#{System.unique_integer([:positive])}")
     bin = Path.join(root, "release/bin")
-    rel = Path.join(root, "release/release")
+    rel_bin = Path.join(root, "release/release/bin")
     File.mkdir_p!(bin)
-    File.mkdir_p!(Path.join(rel, "bin"))
-    File.mkdir_p!(Path.join(rel, "releases"))
-
-    # The baked cookie a real mix release reads when RELEASE_COOKIE is unset.
-    File.write!(Path.join(rel, "releases/COOKIE"), "baked-release-cookie")
+    File.mkdir_p!(rel_bin)
 
     shim = Path.join(bin, "tightbeam-gateway")
     File.cp!(@shim, shim)
     File.chmod!(shim, 0o755)
 
-    fake = Path.join(rel, "bin/tightbeam_gateway")
+    fake = Path.join(rel_bin, "tightbeam_gateway")
 
-    # Models the release's cookie resolution: an inherited RELEASE_COOKIE is
-    # PREFERRED, else the baked releases/COOKIE — so REL_COOKIE is the cookie
-    # rpc/remote would ACTUALLY use, not merely whether the var is set.
+    # A raw probe: echoes the node it was handed and the RAW inherited
+    # RELEASE_COOKIE — so the tests can prove the shim STRIPS the cookie on the
+    # rpc/remote path (T2). The REAL launcher's baked-cookie resolution is proven
+    # separately, against the built artifact, in release_cookie_resolution_test.
     File.write!(
       fake,
       "#!/bin/sh\n" <>
         "printf 'REL_NODE=%s\\n' \"$RELEASE_NODE\"\n" <>
-        "cookie=\"${RELEASE_COOKIE:-$(cat \"$(dirname \"$0\")/../releases/COOKIE\")}\"\n" <>
-        "printf 'REL_COOKIE=%s\\n' \"$cookie\"\n" <>
+        "printf 'REL_COOKIE=%s\\n' \"${RELEASE_COOKIE-<unset>}\"\n" <>
         "for a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done\n"
     )
 
