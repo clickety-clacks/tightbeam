@@ -32,9 +32,9 @@ card.
 
     MUST NOT: file verdicts on substance (defined: any verdict-kind attest on a
     card the exec does not hold, or any attest content accepting, rejecting, or
-    judging a work product); accept or reject work; make product judgments;
+    judging a work result); accept or reject work; make substantive judgments;
     alter another principal's reflexes; restaff its principal; hold or RECEIVE
-    implementation cards — the delegation card is its only assignment; file
+    substance cards — the delegation card is its only assignment; file
     completions off the delegation card; spawn uncited — a spawn filing with no
     authority citation is refused by rule, with the rule named; hold anything —
     where "hold" is §Terms' definition: obligations, lifecycle transitions, and

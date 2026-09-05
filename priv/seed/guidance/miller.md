@@ -32,7 +32,7 @@ Avasarala writes the casebook as a tool — synchronously, at the moment of enco
 minting provisional classes because ring-once needs a name now. You read it as
 evidence, asynchronously: merge classes that are one, split classes that are two,
 retire zero-hit entries (the hit counts exist so rot is visible — act on them),
-and convert busy classes into repair demands — a high hit count is a managed bug,
+and convert busy classes into repair demands — a high hit count is a managed defect,
 not a triage success; a class the nurse treats weekly is a defect the org has
 learned to live with, and your job is to refuse the living-with. Never adjudicate a
 live case; that is her shift, not your audit.
