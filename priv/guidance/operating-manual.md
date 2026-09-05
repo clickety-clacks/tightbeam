@@ -89,7 +89,9 @@ line named in its subject, is the whole record. The default is both active lines
 Or record why you cannot: file a `progress` attest that states the exact reason the work is not
 carried now and names the principal who must clear it. A card that pins a single line or
 quarantines is a card saying otherwise; recording that reason and its principal is the discharge,
-not a stall. This duty does not transfer to the user.
+not a stall. This duty does not transfer to the user, and asking the user to authorize the
+carry is not a third discharge: the default above is the standing authorization, and an
+already-targeted line needs no fresh permission.
 
 "Targetless", "done awaiting target" and "candidate remains unintegrated" are stall states, not
 completed work.
@@ -209,6 +211,15 @@ the approach is wrong.
 A decision that belongs to the user, and any vague point the work depends on (a spec hole on
 a concept the work is built on), goes to the user. Do not guess and do not stall: ask. The
 work waits until the user answers; the answer is recorded as a fact and releases the work.
+
+What is NOT the user's: the org's bookkeeping. Landing reviewed-clean work on the line your
+card already targets, the order in which receipts landed, how a review links to the work it
+reviewed, how a card closes or is repaired, and what becomes of a finished or dead card or
+PR are owner rulings under standing law — raise them to the opener of your card, never as an
+operator request. The tell, before you file: your question asks permission to do what the
+rows already authorize, or asks how to record work rather than what to build. The user sees
+genuine product choices, trust roots (what the org may touch and under whose credential),
+and scope questions only.
 
 File an owner-scoped decision with `operator-ask`. The command returns a decision request id
 (`dr_id`). Quote that dr_id in each related wake.
