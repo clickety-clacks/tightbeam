@@ -1468,9 +1468,68 @@ defmodule Tightbeam.Gateway do
           | {:conflict, map()}
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
-    case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-      nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
-      duplicate -> duplicate
+    case remedy_wake_delivery_admission_in_txn(txn, opts[:wake_id]) do
+      :skip ->
+        :skipped
+
+      :continue ->
+        case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
+          nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+          duplicate -> duplicate
+        end
+    end
+  end
+
+  defp remedy_wake_delivery_admission_in_txn(_txn, wake_id) when not is_binary(wake_id),
+    do: :continue
+
+  defp remedy_wake_delivery_admission_in_txn(txn, wake_id) do
+    case DB.Txn.q(txn, "SELECT origin, assignmentId FROM wakes WHERE wakeId = ?1", [wake_id]) do
+      [["remedy:" <> _ = origin, assignment_id]] ->
+        case assignment_id || legacy_remedy_assignment_id_in_txn(txn, wake_id, origin) do
+          nil ->
+            :continue
+
+          assignment_id ->
+            case DB.Txn.q(txn, "SELECT state FROM assignments WHERE id = ?1", [assignment_id]) do
+              [["open"]] -> :continue
+              _ -> :skip
+            end
+        end
+
+      _ ->
+        :continue
+    end
+  end
+
+  defp legacy_remedy_assignment_id_in_txn(txn, wake_id, origin) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT episode.subject
+           FROM rail_remedy_episodes episode
+           JOIN assignments assignment ON assignment.id = episode.subject
+           JOIN wire_idempotency idem
+             ON idem.ownerUserId = ?2
+            AND idem.operation = 'wake'
+            AND idem.sessionKey = ?1
+            AND (
+              substr(idem.idempotencyKey, 1,
+                length('rail-dispatch:' || episode.statute || ':' || episode.subject || ':')) =
+                'rail-dispatch:' || episode.statute || ':' || episode.subject || ':'
+              OR
+              substr(idem.idempotencyKey, 1,
+                length('rail-rewake:' || episode.statute || ':' || episode.subject || ':')) =
+                'rail-rewake:' || episode.statute || ':' || episode.subject || ':'
+            )
+           WHERE ?2 = 'remedy:' || episode.statute
+           ORDER BY episode.openedAt DESC, episode.subject
+           LIMIT 1
+           """,
+           [wake_id, origin]
+         ) do
+      [[assignment_id]] -> assignment_id
+      [] -> nil
     end
   end
 
@@ -4381,6 +4440,50 @@ defmodule Tightbeam.Gateway do
          condition_kind,
          condition_scope
        ) do
+    case revalidate_remedy_assignment_in_txn(txn, call) do
+      :ready ->
+        schedule_validated_wake_row_in_txn(
+          txn,
+          call,
+          session_key,
+          due_at,
+          condition_kind,
+          condition_scope
+        )
+
+      :assignment_not_open ->
+        %{
+          suppressed: true,
+          reason: :assignment_not_open,
+          assignment_id: wake_assignment_id_in_txn(txn, call)
+        }
+    end
+  end
+
+  defp revalidate_remedy_assignment_in_txn(
+         txn,
+         %{
+           principal: {:remedy, %{action: "wake"}},
+           bound_assignment_id: assignment_id
+         }
+       )
+       when is_binary(assignment_id) do
+    case DB.Txn.q(txn, "SELECT state FROM assignments WHERE id = ?1", [assignment_id]) do
+      [["open"]] -> :ready
+      _ -> :assignment_not_open
+    end
+  end
+
+  defp revalidate_remedy_assignment_in_txn(_txn, _call), do: :ready
+
+  defp schedule_validated_wake_row_in_txn(
+         txn,
+         call,
+         session_key,
+         due_at,
+         condition_kind,
+         condition_scope
+       ) do
     p = call.params
 
     wake =
@@ -4403,11 +4506,11 @@ defmodule Tightbeam.Gateway do
         # SUBSTRATE-ONLY carrier. `wake` is an agent-callable verb, so an arbitrary
         # params value here would let an agent stamp a conversational wake with any
         # assignment and have delivery promote that forged carrier into the turn and
-        # the trace — agent-authored attribution, which Law 0 forbids (F6). Only the
-        # substrate's own principal may set it; the router reserves
-        # process:tightbeam, so it cannot be claimed over the wire. Conversational
-        # and owner wakes stay NULL, as the spec requires.
-        assignment_id: substrate_assignment_id(call)
+        # the trace — agent-authored attribution, which Law 0 forbids (F6). Only
+        # Tightbeam's reserved process principal and a bound internal remedy principal
+        # may set it. Neither can be claimed over the wire. Conversational and owner
+        # wakes stay NULL, as the spec requires.
+        assignment_id: wake_assignment_id_in_txn(txn, call)
       })
 
     bind_liveness_checkpoint_in_txn(txn, call, wake)
@@ -4468,10 +4571,20 @@ defmodule Tightbeam.Gateway do
 
   defp schedule_supervision_controller_in_txn(_txn, _call, _wake), do: :ok
 
-  defp substrate_assignment_id(%{principal: {:process, "tightbeam"}} = call),
+  defp wake_assignment_id_in_txn(_txn, %{principal: {:process, "tightbeam"}} = call),
     do: call.params[:assignment_id]
 
-  defp substrate_assignment_id(_call), do: nil
+  defp wake_assignment_id_in_txn(
+         _txn,
+         %{
+           principal: {:remedy, %{action: "wake"}},
+           bound_assignment_id: assignment_id
+         }
+       )
+       when is_binary(assignment_id),
+       do: assignment_id
+
+  defp wake_assignment_id_in_txn(_txn, _call), do: nil
 
   defp creator_session_key({:session, key}), do: key
   defp creator_session_key(_principal), do: nil

@@ -51,7 +51,11 @@ defmodule Tightbeam.RailRemedy do
            {:ok, resolved} <- bind_target(db, rule.remedy.action, resolved) do
         route_episode(db, handlers, rule, subject, call, context, resolved)
       else
-        {:error, _unbound} -> %{outcome: "unbound", producer_id: nil}
+        {:error, {:assignment_not_open, _assignment_id}} ->
+          %{outcome: "assignment-not-open", producer_id: nil}
+
+        {:error, _unbound} ->
+          %{outcome: "unbound", producer_id: nil}
       end
 
     lifecycle(db, rule, subject, call, result)
@@ -82,6 +86,60 @@ defmodule Tightbeam.RailRemedy do
       """,
       [statute, subject, occurrence, now()]
     )
+  end
+
+  @doc false
+  @spec dispose_assignment_in_txn(Txn.t(), String.t(), map()) :: %{
+          canceled_wakes: non_neg_integer(),
+          closed_episodes: non_neg_integer()
+        }
+  def dispose_assignment_in_txn(%Txn{} = txn, assignment_id, cancellation)
+      when is_binary(assignment_id) and is_map(cancellation) do
+    specific_wake_id = Map.get(cancellation, :wake_id)
+
+    wake_ids =
+      Txn.q(
+        txn,
+        """
+        SELECT wakeId
+        FROM wakes
+        WHERE state = 'pending' AND origin LIKE 'remedy:%'
+          AND (assignmentId = ?1 OR (?2 IS NOT NULL AND wakeId = ?2))
+        ORDER BY wakeId
+        """,
+        [assignment_id, specific_wake_id]
+      )
+
+    canceled_wakes =
+      Enum.reduce(wake_ids, 0, fn [wake_id], count ->
+        case Wakes.cancel_in_txn(txn, Map.put(cancellation, :wake_id, wake_id)) do
+          true -> count + 1
+          other -> raise "remedy wake disposal failed for #{wake_id}: #{inspect(other)}"
+        end
+      end)
+
+    Txn.q(
+      txn,
+      """
+      UPDATE rail_remedy_episodes
+      SET status = 'closed', closedAt = ?2
+      WHERE subject = ?1 AND status != 'closed'
+      """,
+      [assignment_id, now()]
+    )
+
+    closed_episodes = Txn.changes(txn)
+
+    if canceled_wakes > 0 or closed_episodes > 0 do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "rail_remedy_disposed",
+        assignment_id,
+        JSON.encode!(%{canceled_wakes: canceled_wakes, closed_episodes: closed_episodes})
+      )
+    end
+
+    %{canceled_wakes: canceled_wakes, closed_episodes: closed_episodes}
   end
 
   @doc false
@@ -343,18 +401,20 @@ defmodule Tightbeam.RailRemedy do
         if is_binary(target) do
           principal = remedy_principal(rule.name, "wake", context.owner)
 
-          wake_call = %{
-            verb: "wake",
-            origin: "remedy:#{rule.name}",
-            principal: principal,
-            session_key: target,
-            params: %{
-              prompt: "Remedy #{rule.name} remains pending for #{subject}.",
-              after_ms: 0,
-              nudge: false,
-              idempotency_key: key
+          wake_call =
+            %{
+              verb: "wake",
+              origin: "remedy:#{rule.name}",
+              principal: principal,
+              session_key: target,
+              params: %{
+                prompt: "Remedy #{rule.name} remains pending for #{subject}.",
+                after_ms: 0,
+                nudge: false,
+                idempotency_key: key
+              }
             }
-          }
+            |> maybe_put(:bound_assignment_id, context.remedy_assignment_id)
 
           _ = Dispatch.dispatch(db, handlers, wake_call)
         end
@@ -427,14 +487,16 @@ defmodule Tightbeam.RailRemedy do
           |> rename_param(:after, :after_ms)
           |> Map.put(:idempotency_key, key)
 
-        call = %{
-          verb: "wake",
-          origin: origin,
-          principal: principal,
-          session_key: resolved.bound_session,
-          target_role: resolved.target[:target_role],
-          params: params
-        }
+        call =
+          %{
+            verb: "wake",
+            origin: origin,
+            principal: principal,
+            session_key: resolved.bound_session,
+            target_role: resolved.target[:target_role],
+            params: params
+          }
+          |> maybe_put(:bound_assignment_id, context.remedy_assignment_id)
 
         {:ok, call, resolved.bound_session}
 
@@ -487,6 +549,7 @@ defmodule Tightbeam.RailRemedy do
 
   defp producer_id("assign", %{id: id}, _hint), do: id
   defp producer_id("spawn", %{session_key: key}, _hint), do: key
+  defp producer_id("wake", %{suppressed: true}, _hint), do: nil
   defp producer_id("wake", _result, hint), do: hint
   defp producer_id(_action, _result, _hint), do: nil
 
@@ -600,17 +663,20 @@ defmodule Tightbeam.RailRemedy do
     case DB.query(
            db,
            """
-           SELECT a.id, a.workItemId, a.holderKey, a.holderRole, s.archetype, s.ownerUserId
+           SELECT a.id, a.workItemId, a.holderKey, a.holderRole, s.archetype, s.ownerUserId,
+                  a.state
            FROM assignments a
            JOIN sessions s ON s.sessionKey = a.holderKey
            WHERE a.id = ?1
            """,
            [assignment_id]
          ) do
-      {:ok, [[assignment_id, work_item_id, holder_key, holder_role, archetype, owner]]} ->
+      {:ok, [[assignment_id, work_item_id, holder_key, holder_role, archetype, owner, state]]}
+      when state == "open" or assignment_id != subject ->
         {:ok,
          %{
            assignment_id: assignment_id,
+           remedy_assignment_id: if(assignment_id == subject, do: assignment_id),
            work_item_id: work_item_id,
            holder_key: holder_key,
            holder_role: holder_role,
@@ -618,6 +684,9 @@ defmodule Tightbeam.RailRemedy do
            caller_origin: call.origin,
            owner: owner
          }}
+
+      {:ok, [[assignment_id, _work_item, _holder, _role, _archetype, _owner, _state]]} ->
+        {:error, {:assignment_not_open, assignment_id}}
 
       _ ->
         {:error, :unbound_assignment}
