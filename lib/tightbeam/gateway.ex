@@ -4194,11 +4194,15 @@ defmodule Tightbeam.Gateway do
     identity_apply_sessions(config, db, sessions)
   end
 
+  # A retired session is not a target. `Org.get/2` returns retired rows — retiring
+  # is a state flip, not a delete — so the selector has to say so itself; the
+  # `--all` query already filters to active. A retired key and an unknown key get
+  # the same answer, because apply has nothing to do for either.
   defp identity_apply_result(config, db, %{params: %{session_key: session_key}}) do
     sessions =
       case Org.get(db, session_key) do
-        nil -> []
-        session -> [session]
+        %{state: "active"} = session -> [session]
+        _retired_or_missing -> []
       end
 
     identity_apply_sessions(config, db, sessions)
@@ -4221,6 +4225,9 @@ defmodule Tightbeam.Gateway do
 
           {:cont, [session.session_key | applied]}
 
+        :skipped ->
+          {:cont, applied}
+
         {:error, refusal} ->
           {:halt, refusal}
       end
@@ -4239,7 +4246,19 @@ defmodule Tightbeam.Gateway do
   # there is no turn boundary to wait for and no session to refuse. A session
   # with no current harness session has nobody to ask: the files and the stamp
   # are the whole of its application.
+  #
+  # The row is re-read here, not trusted from selection: `--all` captures its set
+  # once, and a session that retires between that capture and its own update gets
+  # no file update and no nudge. This is a fresh read of a fact, not a lifecycle
+  # hold — nothing here keeps the row from retiring a moment later.
   defp identity_apply_session(config, db, session, revision) do
+    case Org.get(db, session.session_key) do
+      %{state: "active"} = session -> identity_apply_active(config, db, session, revision)
+      _retired_or_missing -> :skipped
+    end
+  end
+
+  defp identity_apply_active(config, db, session, revision) do
     case identity_apply_files(config, db, session, revision) do
       :applied ->
         case Org.current_pointer(db, session.session_key) do
