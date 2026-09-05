@@ -250,6 +250,12 @@ defmodule Tightbeam.ToplinesSchemaTest do
     :ok = DB.execute(db, altered)
   end
 
+  defp alter_object!(db, %{type: "trigger", name: name, sql: sql}) do
+    :ok = DB.execute(db, "DROP TRIGGER #{name}")
+    altered = String.replace(sql, "BEFORE INSERT", "BEFORE UPDATE", global: false)
+    :ok = DB.execute(db, altered)
+  end
+
   defp snapshot(db) do
     {:ok, schema} =
       DB.query(

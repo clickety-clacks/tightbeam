@@ -1727,4 +1727,18 @@ defmodule Tightbeam.CliIntegrationTest do
 
     request_id
   end
+
+  test "real CLI rejects closed or retired Topline shapes before router dispatch", ctx do
+    for args <- [
+          ["topline-create", "--title", "Ship", "--key", "closed-key", "--bogus", "ignored"],
+          ["toplines", "--tree"],
+          ["topline", "tl_probe", "--under", "wi_probe"],
+          ["topline-placement-list", "--history"]
+        ] do
+      {output, status} = System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      assert status != 0
+      assert output =~ "does not accept"
+      refute_receive {:cli_call, _call}
+    end
+  end
 end
