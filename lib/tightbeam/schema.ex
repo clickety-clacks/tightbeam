@@ -1727,8 +1727,7 @@ defmodule Tightbeam.Schema do
 
     if actual_indexes != expected_indexes do
       raise ShapeError,
-        message:
-          "incompatible_decision_carrier_return_v1_019: indexes #{inspect(actual_indexes)}"
+        message: "incompatible_decision_carrier_return_v1_019: indexes #{inspect(actual_indexes)}"
     end
 
     case Txn.q(txn, "PRAGMA foreign_key_check") do

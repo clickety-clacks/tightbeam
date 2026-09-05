@@ -2543,7 +2543,9 @@ defmodule Tightbeam.EscalationTest do
     assert ^not_found =
              Escalation.answer(
                ctx.db,
-               agent_call(stranger, %{request: statute_id, answer: "wrong kind"}, %{verb: "answer"})
+               agent_call(stranger, %{request: statute_id, answer: "wrong kind"}, %{
+                 verb: "answer"
+               })
              )
 
     assert ^not_found =
@@ -2634,7 +2636,9 @@ defmodule Tightbeam.EscalationTest do
     assert %{code: "not_open"} =
              Escalation.answer(
                ctx.db,
-               agent_call(asked, %{request: request.id, answer: "behind a flag"}, %{verb: "answer"})
+               agent_call(asked, %{request: request.id, answer: "behind a flag"}, %{
+                 verb: "answer"
+               })
              )
 
     assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
@@ -2721,11 +2725,17 @@ defmodule Tightbeam.EscalationTest do
     assert %{code: "not_open"} =
              Escalation.return_request(
                ctx.db,
-               agent_call(responder, %{request: request.id, reason: "different"}, %{verb: "return"})
+               agent_call(responder, %{request: request.id, reason: "different"}, %{
+                 verb: "return"
+               })
              )
 
     assert [listed] =
-             Escalation.list(ctx.db, agent_call(ctx.raiser, %{}, %{verb: "decision-requests"}), "returned")
+             Escalation.list(
+               ctx.db,
+               agent_call(ctx.raiser, %{}, %{verb: "decision-requests"}),
+               "returned"
+             )
 
     assert listed.id == returned.id
     assert listed.return_reason == returned.return_reason

@@ -678,7 +678,8 @@ defmodule Tightbeam.SchemaShapeTest do
              )
 
     before_triggers =
-      for name <- ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
+      for name <-
+            ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
           do: object_sql(db, "trigger", name)
 
     assert :ok = Schema.ensure_all(db)
@@ -714,7 +715,8 @@ defmodule Tightbeam.SchemaShapeTest do
              )
 
     after_triggers =
-      for name <- ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
+      for name <-
+            ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
           do: object_sql(db, "trigger", name)
 
     assert after_triggers == before_triggers
@@ -730,20 +732,26 @@ defmodule Tightbeam.SchemaShapeTest do
     refute table?(db, "decision_requests_agent_v1")
 
     assert :ok = Schema.ensure_all(db)
+
     assert {:ok, ^before_rows} =
              DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
   end
 
-  test "an interrupted carrier rebuild rolls back bytes and retries from the predecessor", %{db: db} do
+  test "an interrupted carrier rebuild rolls back bytes and retries from the predecessor", %{
+    db: db
+  } do
     assert :ok = Schema.ensure_all(db)
     seed_liveness_decision_requests(db)
     downgrade_decision_requests_to_liveness_predecessor(db)
 
     columns = liveness_request_columns()
-    assert {:ok, before_rows} = DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
+
+    assert {:ok, before_rows} =
+             DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
 
     before_triggers =
-      for name <- ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
+      for name <-
+            ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
           do: object_sql(db, "trigger", name)
 
     error =
@@ -752,6 +760,7 @@ defmodule Tightbeam.SchemaShapeTest do
       end
 
     assert error.message =~ "forced decision carrier migration interruption"
+
     assert {:ok, [[@decision_carrier_previous_shape]]} =
              DB.query(db, "SELECT shape FROM schema_stamp")
 
@@ -759,7 +768,8 @@ defmodule Tightbeam.SchemaShapeTest do
              DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
 
     after_rollback_triggers =
-      for name <- ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
+      for name <-
+            ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
           do: object_sql(db, "trigger", name)
 
     assert after_rollback_triggers == before_triggers
@@ -771,6 +781,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert :ok = Schema.ensure_all(db)
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
     assert {:ok, ^before_rows} =
              DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
   end
@@ -795,6 +806,7 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
     assert {:ok, [[7]]} = DB.query(second, "SELECT COUNT(*) FROM decision_requests")
     assert :ok = Schema.ensure_all(second)
+
     assert {:ok, [[7, @shape]]} =
              DB.query(
                second,
