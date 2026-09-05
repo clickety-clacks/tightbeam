@@ -404,6 +404,20 @@ pub enum Command {
         identity: Identity,
         selection: ToplineSelection,
     },
+    ToplineMutation {
+        identity: Identity,
+        verb: String,
+        params: Vec<(String, String)>,
+    },
+    DurableToplines {
+        identity: Identity,
+        state: Option<String>,
+    },
+    DurableTopline {
+        identity: Identity,
+        topline_id: String,
+        history: bool,
+    },
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
@@ -777,7 +791,7 @@ COMMANDS:
       Read the ordered lifecycle boundaries for one turn. The same owner-or-
       admin visibility rule as transcript applies; hidden and unknown turns
       both return not_found.
-  toplines [--origin user|session|all] [--owner <userId>] [--state <state>]
+  execution-map [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
            [--session <key>] [--tree] [--after <workItemId>] [--limit <n>]
       The work telemetry the substrate already knows: every work item you can
@@ -788,20 +802,35 @@ COMMANDS:
       concurrency, not proven causality — every node states its own
       epistemic status (linked, from_turn, no_turn_observed, unrecorded).
       No percentages and no completion estimates: the rows do not support them.
-        tightbeam toplines --origin user --state open --as-user flynn
+        tightbeam execution-map --origin user --state open --as-user flynn
       --after/--limit page the FLAT roster on a stable (createdAt, id) cursor;
       the response carries nextAfter and hasMoreAfter. They bound the RESPONSE,
       not the gateway's work — the reader still computes telemetry over every
       item you can see. They are refused with --tree, because a forest has no
       page boundary that is not also a wrong answer.
-        tightbeam toplines --quiet-over 2h --as-user flynn
-        tightbeam toplines --limit 25 --after wi_abc123 --as-user flynn
-  topline (--under <workItemId> [roster filters] | --assignments <id,...>)
+        tightbeam execution-map --quiet-over 2h --as-user flynn
+        tightbeam execution-map --limit 25 --after wi_abc123 --as-user flynn
+  execution-map-select (--under <workItemId> [roster filters] | --assignments <id,...>)
       --under walks one item's causal subtree (the anchor plus its visible
       linked descendants). --assignments names an explicit assignment set and
       reports the items they resolve to; an assignment belonging to no item
       comes back in noItem rather than being silently dropped.
-        tightbeam topline --under wi_abc123 --as-user flynn
+        tightbeam execution-map-select --under wi_abc123 --as-user flynn
+  toplines [--state open|closed|all]
+      List your visible durable Toplines.
+  topline <toplineId> [--history]
+      Read one visible durable Topline; --history includes its event history.
+  topline-create --title <text> --key <idempotencyKey>
+  topline-update <toplineId> --title <text> --reason <text> --key <idempotencyKey>
+  topline-close <toplineId> --reason <text> --key <idempotencyKey>
+  topline-reopen <toplineId> --reason <text> --key <idempotencyKey>
+  topline-link-work <toplineId> <workItemId> --reason <text> --key <idempotencyKey>
+  topline-unlink-work <membershipId> --reason <text> --key <idempotencyKey>
+  topline-concern-create <toplineId> --title <text> --key <idempotencyKey>
+  topline-concern-link-work <concernId> <workItemId> --reason <text> --key <idempotencyKey>
+  topline-concern-unlink-work <concernId> <workItemId> --reason <text> --key <idempotencyKey>
+  topline-work-leave-unlinked <workItemId> --reason <text> --key <idempotencyKey>
+  topline-placement-list [--state pending|resolved|all]
   coordination-share --session <key> --from <epochMs> --to <epochMs>
       What share of a session's turns were spent on coordination traffic over a
       window — every turn a wake materialized, classed or not, except an
@@ -1059,6 +1088,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "delivers-work-item",
     "dry-run",
     "help",
+    "history",
     "json",
     "manifest",
     "resolve",
@@ -1186,6 +1216,34 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
     }
 }
 
+/// Durable Topline commands are a closed public surface.  In particular, the
+/// retired Execution Map flags must fail at parsing rather than be silently
+/// dropped before dispatch.
+fn closed_topline_flags(
+    verb: &str,
+    flags: &HashMap<String, String>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut rejected = flags
+        .keys()
+        .filter(|flag| {
+            !matches!(flag.as_str(), "as" | "as-user" | "as-process")
+                && !allowed.contains(&flag.as_str())
+        })
+        .map(|flag| format!("--{flag}"))
+        .collect::<Vec<_>>();
+    rejected.sort();
+
+    if rejected.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "usage: tightbeam {verb} does not accept {}",
+            rejected.join(", ")
+        ))
+    }
+}
+
 pub fn parse_after(text: &str) -> Result<String, String> {
     parse_duration("after", text)
 }
@@ -1252,9 +1310,11 @@ const RETURN_USAGE: &str =
 const COORDINATION_SHARE_USAGE: &str =
     "usage: tightbeam coordination-share --session <key> --from <epochMs> --to <epochMs>";
 
-const TOPLINES_USAGE: &str = "usage: tightbeam toplines [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
+const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
 
-const TOPLINE_USAGE: &str = "usage: tightbeam topline (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+const TOPLINE_USAGE: &str = "usage: tightbeam execution-map-select (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+const DURABLE_TOPLINES_USAGE: &str = "usage: tightbeam toplines [--state open|closed|all]";
+const DURABLE_TOPLINE_USAGE: &str = "usage: tightbeam topline <toplineId> [--history]";
 
 /// Every roster-filter flag, in one place, so the assignment-mode refusal and the
 /// filter builder cannot drift apart.
@@ -1293,6 +1353,121 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
         spec: nonempty(flags, "spec"),
         spec_sha: nonempty(flags, "spec-sha"),
         session: nonempty(flags, "session"),
+    })
+}
+
+fn topline_mutation(
+    verb: &str,
+    positional: &[String],
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    let allowed = match verb {
+        "topline-create" => &["title", "key"][..],
+        "topline-update" => &["title", "reason", "key"][..],
+        "topline-close" | "topline-reopen" => &["reason", "key"][..],
+        "topline-link-work" => &["reason", "key"][..],
+        "topline-unlink-work" => &["reason", "key"][..],
+        "topline-concern-create" => &["title", "key"][..],
+        "topline-concern-link-work" => &["reason", "key"][..],
+        "topline-concern-unlink-work" => &["reason", "key"][..],
+        "topline-work-leave-unlinked" => &["reason", "key"][..],
+        _ => return Err(format!("unknown Topline operation: {verb}")),
+    };
+    closed_topline_flags(verb, flags, allowed)?;
+    let required = |name| nonempty(flags, name).ok_or_else(|| format!("{verb} requires --{name}"));
+    let exact = |count| {
+        if positional.len() == count {
+            Ok(())
+        } else {
+            Err(format!(
+                "usage: tightbeam {verb} has an invalid argument count"
+            ))
+        }
+    };
+    let key = || required("key").map(|value| ("idempotencyKey".to_owned(), value));
+    let reason = || required("reason").map(|value| ("reason".to_owned(), value));
+    let title = || required("title").map(|value| ("title".to_owned(), value));
+
+    let params = match verb {
+        "topline-create" => {
+            exact(1)?;
+            vec![title()?, key()?]
+        }
+        "topline-update" => {
+            exact(2)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                title()?,
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-close" | "topline-reopen" => {
+            exact(2)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-link-work" => {
+            exact(3)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                ("workItemId".to_owned(), positional[2].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-unlink-work" => {
+            exact(2)?;
+            vec![
+                ("membershipId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-concern-create" => {
+            exact(2)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                title()?,
+                key()?,
+            ]
+        }
+        "topline-concern-link-work" => {
+            exact(3)?;
+            vec![
+                ("concernId".to_owned(), positional[1].clone()),
+                ("workItemId".to_owned(), positional[2].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-concern-unlink-work" => {
+            exact(3)?;
+            vec![
+                ("concernId".to_owned(), positional[1].clone()),
+                ("workItemId".to_owned(), positional[2].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-work-leave-unlinked" => {
+            exact(2)?;
+            vec![
+                ("workItemId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        _ => unreachable!("closed above"),
+    };
+
+    Ok(Command::ToplineMutation {
+        identity: identity(flags)?,
+        verb: verb.to_owned(),
+        params,
     })
 }
 
@@ -2450,7 +2625,7 @@ fn parse_with_optional_catalog(
                     .ok_or_else(|| "turn-trace requires --seq <turnSeq>".to_owned())?,
             })
         }
-        "toplines" => {
+        "execution-map" => {
             if parsed.positional.len() != 1 {
                 return Err(TOPLINES_USAGE.to_owned());
             }
@@ -2473,7 +2648,7 @@ fn parse_with_optional_catalog(
                 limit,
             })
         }
-        "topline" => {
+        "execution-map-select" => {
             if parsed.positional.len() != 1 {
                 return Err(TOPLINE_USAGE.to_owned());
             }
@@ -2491,7 +2666,7 @@ fn parse_with_optional_catalog(
             let selection = match (under, assignments) {
                 (Some(_), Some(_)) | (None, None) => {
                     return Err(
-                        "topline requires exactly one of --under <workItemId> or --assignments <id,...>"
+                        "execution-map-select requires exactly one of --under <workItemId> or --assignments <id,...>"
                             .to_owned(),
                     )
                 }
@@ -2526,6 +2701,69 @@ fn parse_with_optional_catalog(
             Ok(Command::Topline {
                 identity: identity(flags)?,
                 selection,
+            })
+        }
+        "toplines" => {
+            closed_topline_flags("toplines", flags, &["state"])?;
+            if parsed.positional.len() != 1 {
+                return Err(DURABLE_TOPLINES_USAGE.to_owned());
+            }
+            let state = nonempty(flags, "state");
+            if let Some(value) = &state {
+                if !matches!(value.as_str(), "open" | "closed" | "all") {
+                    return Err(DURABLE_TOPLINES_USAGE.to_owned());
+                }
+            }
+            Ok(Command::DurableToplines {
+                identity: identity(flags)?,
+                state,
+            })
+        }
+        "topline" => {
+            closed_topline_flags("topline", flags, &["history"])?;
+            if parsed.positional.len() != 2 {
+                return Err(DURABLE_TOPLINE_USAGE.to_owned());
+            }
+            Ok(Command::DurableTopline {
+                identity: identity(flags)?,
+                topline_id: parsed.positional[1].clone(),
+                history: flags.contains_key("history"),
+            })
+        }
+        verb @ ("topline-create"
+        | "topline-update"
+        | "topline-close"
+        | "topline-reopen"
+        | "topline-link-work"
+        | "topline-unlink-work"
+        | "topline-concern-create"
+        | "topline-concern-link-work"
+        | "topline-concern-unlink-work"
+        | "topline-work-leave-unlinked") => topline_mutation(verb, &parsed.positional, flags),
+        "topline-placement-list" => {
+            closed_topline_flags("topline-placement-list", flags, &["state"])?;
+            if parsed.positional.len() != 1 {
+                return Err(
+                    "usage: tightbeam topline-placement-list [--state pending|resolved|all]"
+                        .to_owned(),
+                );
+            }
+            let state = nonempty(flags, "state");
+            if !matches!(
+                state.as_deref(),
+                None | Some("pending" | "resolved" | "all")
+            ) {
+                return Err(
+                    "usage: tightbeam topline-placement-list [--state pending|resolved|all]"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::ToplineMutation {
+                identity: identity(flags)?,
+                verb: "topline-placement-list".to_owned(),
+                params: state
+                    .map(|value| vec![("state".to_owned(), value)])
+                    .unwrap_or_default(),
             })
         }
         "work-item-icebox" => {
@@ -2818,7 +3056,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, turn-trace, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process"
         )),
     }
 }
@@ -3872,8 +4110,21 @@ mod tests {
                 "turn-trace",
                 "unlearn",
                 "visitor",
-                "topline",
+                "execution-map",
+                "execution-map-select",
                 "toplines",
+                "topline",
+                "topline-create",
+                "topline-update",
+                "topline-close",
+                "topline-reopen",
+                "topline-link-work",
+                "topline-unlink-work",
+                "topline-concern-create",
+                "topline-concern-link-work",
+                "topline-concern-unlink-work",
+                "topline-work-leave-unlinked",
+                "topline-placement-list",
                 "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",
@@ -4033,7 +4284,7 @@ mod tests {
             ("session", "agent:coder:app"),
         ] {
             let error = parse(strings(&[
-                "topline",
+                "execution-map-select",
                 "--assignments",
                 "asg_x",
                 &format!("--{flag}"),
@@ -4056,7 +4307,7 @@ mod tests {
     #[test]
     fn assignment_selection_sends_only_the_id_list() {
         let command = parse(strings(&[
-            "topline",
+            "execution-map-select",
             "--assignments",
             "asg_a,asg_b",
             "--as-user",
@@ -4104,7 +4355,7 @@ mod tests {
     #[test]
     fn under_selection_still_carries_roster_filters() {
         let command = parse(strings(&[
-            "topline",
+            "execution-map-select",
             "--under",
             "wi_abc",
             "--state",
@@ -4522,7 +4773,7 @@ mod tests {
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, turn-trace, toplines, topline, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, completion-notices, completion-disposition, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, ask, answer, return, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, breathing, attend, transcript, turn-trace, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, coordination-share, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, tune, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, activation-declare, activation-authority, activation-attempt, activation-observe, activation-reconcile, activation-withdraw, activation-renotify, activation-ack, activation-status, activations, config, host-env-set, host-env-list, host-env-unset, doctor, visitor, assimilate, harness-process".to_owned())
         );
     }
 
@@ -5220,5 +5471,34 @@ mod tests {
             command,
             Command::IdentityEdit { content: Some(content), .. } if content == "a\u{fffd}b"
         ));
+    }
+
+    #[test]
+    fn durable_topline_commands_refuse_closed_or_retired_flags_before_dispatch() {
+        for args in [
+            strings(&[
+                "topline-create",
+                "--title",
+                "Ship",
+                "--key",
+                "k",
+                "--bogus",
+                "ignored",
+                "--as-user",
+                "flynn",
+            ]),
+            strings(&["toplines", "--tree", "--as-user", "flynn"]),
+            strings(&[
+                "topline",
+                "tl_probe",
+                "--under",
+                "wi_probe",
+                "--as-user",
+                "flynn",
+            ]),
+            strings(&["topline-placement-list", "--history", "--as-user", "flynn"]),
+        ] {
+            assert!(parse(args).unwrap_err().contains("does not accept"));
+        }
     }
 }

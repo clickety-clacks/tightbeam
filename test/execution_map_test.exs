@@ -912,17 +912,17 @@ defmodule Tightbeam.ExecutionMapTest do
     assignment!(ctx.db, "asg_readonly", work_item_id: "wi_readonly", holder: "s_holder")
 
     handlers = %{
-      "toplines" => fn call -> ExecutionMap.roster(ctx.db, call) end,
-      "topline" => fn call -> ExecutionMap.topline(ctx.db, call) end
+      "execution-map" => fn call -> ExecutionMap.roster(ctx.db, call) end,
+      "execution-map-select" => fn call -> ExecutionMap.topline(ctx.db, call) end
     }
 
     before = snapshot(ctx.db)
 
     for {verb, params} <- [
-          {"toplines", %{}},
-          {"toplines", %{tree: true}},
-          {"topline", %{under: "wi_readonly"}},
-          {"topline", %{assignments: ["asg_readonly"]}}
+          {"execution-map", %{}},
+          {"execution-map", %{tree: true}},
+          {"execution-map-select", %{under: "wi_readonly"}},
+          {"execution-map-select", %{assignments: ["asg_readonly"]}}
         ] do
       assert {:ok, _result} =
                Dispatch.dispatch(ctx.db, handlers, %{
@@ -957,14 +957,14 @@ defmodule Tightbeam.ExecutionMapTest do
       db: ctx.db,
       base_dir: base_dir,
       handlers: %{
-        "toplines" => fn call -> ExecutionMap.roster(ctx.db, call) end,
-        "topline" => fn call -> ExecutionMap.topline(ctx.db, call) end
+        "execution-map" => fn call -> ExecutionMap.roster(ctx.db, call) end,
+        "execution-map-select" => fn call -> ExecutionMap.topline(ctx.db, call) end
       },
       cli_token: "tbc_toplines",
       session_status: fn _ -> nil end
     ]
 
-    ok = post_dispatch(opts, %{verb: "toplines", asUser: "flynn", params: %{}})
+    ok = post_dispatch(opts, %{verb: "execution-map", asUser: "flynn", params: %{}})
     assert ok.status == 200
     assert [%{"id" => "wi_routed"}] = JSON.decode!(ok.resp_body)["result"]["items"]
 
@@ -973,7 +973,7 @@ defmodule Tightbeam.ExecutionMapTest do
     # what stops the roster filter from becoming a session-existence oracle: an
     # unknown key, a real session and a foreign session are one answer.
     refusals =
-      for verb <- ["toplines", "topline"],
+      for verb <- ["execution-map", "execution-map-select"],
           key <- ["s_real", "s_does_not_exist"] do
         response =
           post_dispatch(opts, %{verb: verb, asUser: "flynn", sessionKey: key, params: %{}})
@@ -982,7 +982,7 @@ defmodule Tightbeam.ExecutionMapTest do
         {verb, JSON.decode!(response.resp_body)}
       end
 
-    for verb <- ["toplines", "topline"] do
+    for verb <- ["execution-map", "execution-map-select"] do
       bodies = for {^verb, body} <- refusals, do: body
       assert length(bodies) == 2
 
@@ -994,6 +994,21 @@ defmodule Tightbeam.ExecutionMapTest do
                  }
                }
              ]
+    end
+
+    for verb <-
+          ~w(toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list) do
+      response =
+        post_dispatch(opts, %{verb: verb, asUser: "flynn", sessionKey: "s_real", params: %{}})
+
+      assert response.status == 400
+
+      assert %{
+               "error" => %{
+                 "code" => "invalid_message",
+                 "message" => ^verb <> " takes no typed target"
+               }
+             } = JSON.decode!(response.resp_body)
     end
   end
 
