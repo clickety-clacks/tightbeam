@@ -1484,6 +1484,26 @@ defmodule Tightbeam.EffortCheckinTest do
                effort_rule_call("parent", request_id, "dismiss")
              )
 
+    outsider_opener =
+      session(ctx.db, "opener-outside-holder-chain", "h1", Placement.local_host_name())
+
+    outside_opened =
+      dispatch(
+        ctx,
+        {:session, outsider_opener.session_key},
+        "holder",
+        "opener outside holder chain"
+      )
+
+    outside_request = open_effort_request(ctx, outside_opened, outsider_opener.session_key)
+
+    assert %{status: "ruled", ruled_by: "session:opener-outside-holder-chain"} =
+             EffortCheckin.rule(
+               ctx.db,
+               ctx.config,
+               effort_rule_call(outsider_opener.session_key, outside_request, "continue")
+             )
+
     owner_opened = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "owner open"})
     owner_request = open_effort_request(ctx, owner_opened, {:user, "h1"})
     owner_before = request_snapshot(ctx.db, owner_request)
