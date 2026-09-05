@@ -31,8 +31,8 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
   # ── Case 1 — shim/pid-stop, the exact incident repro (Phase 1) ─────────────
 
   test "stop SIGTERMs only the descriptor's owned pid — production survives the poisoned env" do
-    {prod_port, prod_pid, _prod_cmd} = spawn_standin()
-    {iso_port, iso_pid, iso_cmd} = spawn_standin()
+    {prod_port, prod_pid, _prod_cmd, _prod_start} = spawn_standin()
+    {iso_port, iso_pid, iso_cmd, iso_start} = spawn_standin()
 
     iso_dir = Path.join(System.tmp_dir!(), "tb-iso-#{System.unique_integer([:positive])}")
 
@@ -40,7 +40,8 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
       port: 11_484,
       cliToken: "tbc_iso",
       ownedPid: to_string(iso_pid),
-      ownedCommand: iso_cmd
+      ownedCommand: iso_cmd,
+      ownedStart: iso_start
     })
 
     on_exit(fn ->
@@ -78,7 +79,7 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
   end
 
   test "stop refuses on a recycled pid rather than signalling somebody else's process" do
-    {port, pid, _cmd} = spawn_standin()
+    {port, pid, _cmd, start} = spawn_standin()
     iso_dir = Path.join(System.tmp_dir!(), "tb-iso-#{System.unique_integer([:positive])}")
 
     # The pid is live but its command no longer matches the descriptor: the OS
@@ -87,7 +88,8 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
       port: 11_484,
       cliToken: "tbc_iso",
       ownedPid: to_string(pid),
-      ownedCommand: "some-other-process --that-we-never-booted"
+      ownedCommand: "some-other-process --that-we-never-booted",
+      ownedStart: start
     })
 
     on_exit(fn ->
@@ -102,6 +104,111 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
     assert status != 0, "stop must refuse a recycled pid"
     assert out =~ "recycled"
     assert process_command(pid) != "", "the recycled pid's process must survive"
+  end
+
+  # ── F1 (review att_d3e5cff7) — the case pid+command equality CANNOT see ─────
+  #
+  # The reviewer's probe: a STALE descriptor whose recorded process is gone and
+  # whose pid is now held by a LATER process running the SAME command line (a
+  # second gateway started the same way). Command equality passes, and `stop`
+  # exited 0 and killed that distinct stand-in. The start time is what tells the
+  # two apart, so this asserts the refusal AND the survival of the stand-in.
+  test "F1: stop refuses a LATER same-command process on the owned pid (stale descriptor)" do
+    {port, pid, cmd, start} = spawn_standin()
+    iso_dir = Path.join(System.tmp_dir!(), "tb-iso-#{System.unique_integer([:positive])}")
+
+    on_exit(fn ->
+      File.rm_rf!(iso_dir)
+      kill(pid)
+      safe_close(port)
+    end)
+
+    # Pid and command are EXACTLY this live process's. Only the start time is the
+    # earlier, dead process's — precisely the stale-descriptor state.
+    earlier = "Thu Jan  1 00:00:00 2026"
+    refute earlier == start, "the fixture start must differ from the live process's"
+
+    write_descriptor(iso_dir, %{
+      port: 11_484,
+      cliToken: "tbc_iso",
+      ownedPid: to_string(pid),
+      ownedCommand: cmd,
+      ownedStart: earlier
+    })
+
+    {out, status} =
+      System.cmd(@shim, ["stop"], env: [{"TIGHTBEAM_BASE_DIR", iso_dir}], stderr_to_stdout: true)
+
+    assert status != 0, "stop must refuse when only the command matches, got: #{out}"
+    assert out =~ "recycled"
+    assert out =~ "start time"
+
+    assert process_command(pid) != "",
+           "the later same-command process must survive — this is the F1 failure"
+  end
+
+  test "F1: stop refuses a descriptor with no ownedStart rather than signalling on command alone" do
+    {port, pid, cmd, _start} = spawn_standin()
+    iso_dir = Path.join(System.tmp_dir!(), "tb-iso-#{System.unique_integer([:positive])}")
+
+    on_exit(fn ->
+      File.rm_rf!(iso_dir)
+      kill(pid)
+      safe_close(port)
+    end)
+
+    # A pre-upgrade descriptor, or one written by a boot where `ps` was absent
+    # (ownedStart null). Weaker evidence is refused, never accepted.
+    write_descriptor(iso_dir, %{
+      port: 11_484,
+      cliToken: "tbc_iso",
+      ownedPid: to_string(pid),
+      ownedCommand: cmd
+    })
+
+    {out, status} =
+      System.cmd(@shim, ["stop"], env: [{"TIGHTBEAM_BASE_DIR", iso_dir}], stderr_to_stdout: true)
+
+    assert status != 0, "stop must refuse a descriptor with no ownedStart"
+    assert out =~ "ownedStart"
+    assert process_command(pid) != "", "nothing may be signalled on a refused descriptor"
+  end
+
+  # `lstart` is locale-formatted on macOS, so a stop run under an operator's
+  # non-C locale would otherwise compare two spellings of one instant and refuse
+  # a VALID stop. Both sides force LC_ALL=C; this holds them to it.
+  test "F1: the identity check is locale-independent — a non-C operator locale still stops" do
+    {port, pid, cmd, start} = spawn_standin()
+    iso_dir = Path.join(System.tmp_dir!(), "tb-iso-#{System.unique_integer([:positive])}")
+
+    on_exit(fn ->
+      File.rm_rf!(iso_dir)
+      kill(pid)
+      safe_close(port)
+    end)
+
+    write_descriptor(iso_dir, %{
+      port: 11_484,
+      cliToken: "tbc_iso",
+      ownedPid: to_string(pid),
+      ownedCommand: cmd,
+      ownedStart: start
+    })
+
+    {out, status} =
+      System.cmd(@shim, ["stop"],
+        env: [
+          {"TIGHTBEAM_BASE_DIR", iso_dir},
+          {"LC_ALL", "de_DE.UTF-8"},
+          {"LC_TIME", "de_DE.UTF-8"}
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert status == 0, "a non-C operator locale must not refuse a valid stop, got: #{out}"
+
+    assert wait_until(fn -> process_command(pid) == "" end),
+           "the owned pid should have been SIGTERMed"
   end
 
   # ── R1 — resolve from $TIGHTBEAM_BASE_DIR ONLY, refuse on absent (Phase 1) ──
@@ -319,11 +426,20 @@ defmodule Tightbeam.IsolatedLifecycleIsolationTest do
 
     {:os_pid, pid} = Port.info(port, :os_pid)
     assert wait_until(fn -> process_command(pid) != "" end), "stand-in process failed to start"
-    {port, pid, process_command(pid)}
+    {port, pid, process_command(pid), process_start(pid)}
   end
 
-  defp process_command(pid) do
-    case System.cmd("ps", ["-ww", "-o", "command=", "-p", to_string(pid)], stderr_to_stdout: true) do
+  defp process_command(pid), do: ps_field(pid, "command")
+
+  # The descriptor's ownedStart, as the shim re-derives it: LC_ALL=C because
+  # `lstart` is locale-formatted on macOS.
+  defp process_start(pid), do: ps_field(pid, "lstart")
+
+  defp ps_field(pid, field) do
+    case System.cmd("ps", ["-ww", "-o", field <> "=", "-p", to_string(pid)],
+           env: [{"LC_ALL", "C"}],
+           stderr_to_stdout: true
+         ) do
       {out, 0} -> String.trim(out)
       _ -> ""
     end

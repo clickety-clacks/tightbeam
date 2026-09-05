@@ -1159,6 +1159,9 @@ defmodule Tightbeam.GatewayTest do
     assert first["node"] == "tightbeam_gateway_4321"
     assert first["ownedPid"] == System.pid()
     assert is_binary(first["ownedCommand"]) and first["ownedCommand"] != ""
+    # F1: the start time is the third leg of the identity the `stop` verb checks;
+    # without it a LATER same-command process is indistinguishable from this one.
+    assert is_binary(first["ownedStart"]) and first["ownedStart"] != ""
 
     # Written FRESH every boot: a custom-node reboot replaces it (cliToken kept).
     System.put_env("RELEASE_NODE", "custom_operator_node")

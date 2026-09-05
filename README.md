@@ -308,12 +308,25 @@ give two instances the same port, or to pin them to the same name by hand.
 The lifecycle verbs `tightbeam-gateway stop`, `remote` and `pid` FIND a running
 gateway through its descriptor at `<base_dir>/gateway.json` — resolved from
 `TIGHTBEAM_BASE_DIR` ONLY, never from an ambient port or inherited node. `stop`
-SIGTERMs the owned OS pid the descriptor records (identity-checked, so a recycled
-pid is never signalled — no Erlang node or cookie is consulted); `remote` and
-`pid` read the same descriptor. So **point them at the same `TIGHTBEAM_BASE_DIR`
-you started the instance with**. With no `TIGHTBEAM_BASE_DIR` set, `stop` REFUSES
-rather than guess a target — set `TIGHTBEAM_BASE_DIR=<dir>` for the instance you
-mean, or use `systemctl stop tightbeam` for the managed gateway.
+SIGTERMs the owned OS pid the descriptor records — no Erlang node or cookie is
+consulted; `remote` and `pid` read the same descriptor. So **point them at the
+same `TIGHTBEAM_BASE_DIR` you started the instance with**. With no
+`TIGHTBEAM_BASE_DIR` set, `stop` REFUSES rather than guess a target — set
+`TIGHTBEAM_BASE_DIR=<dir>` for the instance you mean, or use
+`systemctl stop tightbeam` for the managed gateway.
+
+What `stop`'s identity check does and does not guarantee: the descriptor records
+the owned pid together with that process's command line **and its start time**,
+and `stop` re-derives all three and signals only on a full match. A pid the OS
+has recycled is therefore refused, including the case that pid-plus-command
+cannot see — a *later* process running the same command line, such as a second
+gateway started the same way, which the recorded start time tells apart. A
+descriptor written before this field existed, or by a boot where `ps` was
+unavailable, is refused rather than signalled on the weaker evidence. What
+remains is the microseconds between that check and the signal: POSIX offers no
+atomic check-and-signal for a process that is not your child, so `stop` re-checks
+the identity **after** signalling and fails loudly if the pid changed hands, and
+does not claim to have prevented it.
 
 The `restart` verb was removed: for an isolated instance run `stop` then `start`;
 for the managed gateway use `systemctl restart tightbeam`. (A SIGTERM-then-boot

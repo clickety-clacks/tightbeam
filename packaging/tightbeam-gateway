@@ -67,10 +67,17 @@ json_number() { # stdin: JSON; $1: key -> value of "key":<digits>
   sed -n "s/.*\"$1\":\\([0-9][0-9]*\\).*/\\1/p"
 }
 
-process_command() { # $1: pid -> its current command line, or empty
-  # Strip leading and trailing whitespace so this matches the descriptor's
-  # ownedCommand, which gateway.ex captures with the same `ps` and String.trim.
-  ps -ww -o command= -p "$1" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d'
+process_field() { # $1: pid, $2: ps field name -> that field's current value, or empty
+  # Strip leading and trailing whitespace so this matches the descriptor, which
+  # gateway.ex captures with the same `ps` and String.trim (macOS pads `lstart`
+  # with trailing blanks).
+  #
+  # LC_ALL=C is load-bearing, not tidiness: `lstart` is locale-formatted on macOS
+  # (measured on eezo — LC_TIME=de_DE.UTF-8 renders "Fr.  4 Sep. 23:20:39 2026"
+  # for the instant the C locale renders "Fri Sep  4 23:20:39 2026"). The writer
+  # in gateway.ex forces C too, so both sides compare one spelling; an operator
+  # shell in another locale must not be able to refuse a valid stop.
+  LC_ALL=C ps -ww -o "$2=" -p "$1" 2>/dev/null | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d'
 }
 
 do_stop() {
@@ -78,21 +85,66 @@ do_stop() {
   _json="$(cat "$DESC_PATH")"
   _pid="$(printf '%s' "$_json" | json_string ownedPid)"
   _cmd="$(printf '%s' "$_json" | json_string ownedCommand)"
-  if [ -z "$_pid" ] || [ -z "$_cmd" ]; then
-    refuse "refusing to stop: descriptor has no ownedPid/ownedCommand (pre-upgrade or malformed)."
+  _start="$(printf '%s' "$_json" | json_string ownedStart)"
+  if [ -z "$_pid" ] || [ -z "$_cmd" ] || [ -z "$_start" ]; then
+    refuse "refusing to stop: descriptor has no ownedPid/ownedCommand/ownedStart (pre-upgrade or malformed)."
   fi
-  _now="$(process_command "$_pid")"
-  if [ -z "$_now" ]; then
+
+  # IDENTITY IS THE TRIPLE pid + command + START TIME, and the START TIME is what
+  # makes it an identity. A pid is a reusable name; pid + command is still not an
+  # identity, because a LATER process can carry the same command line — a second
+  # gateway started the same way is the ordinary case, not a contrived one — and
+  # command equality cannot tell it from the process the descriptor recorded. Its
+  # start time can: a successor to a pid necessarily started later than the
+  # process that held that pid before it.
+  #
+  # The window that matters is descriptor-WRITE to stop (boot until an operator
+  # runs `stop` — minutes to days, and long enough for the OS to wrap the pid
+  # space), and the start time closes it. The check-to-signal window below is the
+  # microseconds between this `ps` and the `kill` on the next line, which no pid
+  # wrap can fit inside; it is not closable in POSIX sh (that needs pidfd), so it
+  # is re-checked AFTER the signal instead and reported loudly if it ever fires.
+  _now_cmd="$(process_field "$_pid" command)"
+  if [ -z "$_now_cmd" ]; then
     refuse "refusing to stop: owned pid $_pid is not running (already stopped)."
   fi
-  if [ "$_now" != "$_cmd" ]; then
+  _now_start="$(process_field "$_pid" lstart)"
+  if [ "$_now_cmd" != "$_cmd" ]; then
     # The pid has been recycled onto an unrelated process. Signalling it would
     # kill somebody else's work — the exact failure the identity gate prevents.
     refuse "refusing to stop: owned pid $_pid was recycled (command no longer matches the descriptor)."
   fi
+  if [ "$_now_start" != "$_start" ]; then
+    # Same command line, different process: a stale descriptor pointing at a
+    # LATER same-command process. Command equality alone would have signalled it.
+    refuse "refusing to stop: owned pid $_pid was recycled (start time '$_now_start' is not the descriptor's '$_start'; a later process carries the same command line)."
+  fi
+
   # SIGTERM triggers the same OTP graceful shutdown (prep_stop) as `systemctl
   # stop`. No node, no cookie, no restart follow-on.
-  exec kill -TERM "$_pid"
+  if ! kill -TERM "$_pid"; then
+    printf 'tightbeam-gateway: failed to signal owned pid %s.\n' "$_pid" >&2
+    exit 70
+  fi
+
+  # Post-signal identity re-check: report dirt, never accommodate it. A process
+  # still holding the pid must still be OUR process — either mid-graceful-shutdown
+  # (identity unchanged) or already gone. Anything else means the pid was recycled
+  # across the signal and we may have reached a stranger, which is a loud failure,
+  # never a silent exit 0. This DETECTS the residual check-to-signal race; it
+  # cannot prevent it.
+  _after_cmd="$(process_field "$_pid" command)"
+  if [ -n "$_after_cmd" ]; then
+    _after_start="$(process_field "$_pid" lstart)"
+    if [ "$_after_cmd" != "$_cmd" ] || [ "$_after_start" != "$_start" ]; then
+      printf 'tightbeam-gateway: SIGTERM to pid %s may have reached the WRONG process.\n' "$_pid" >&2
+      printf '  The pid was recycled between the identity check and the signal:\n' >&2
+      printf '  it now runs %s (started %s), not the descriptor'\''s process.\n' "$_after_cmd" "$_after_start" >&2
+      printf '  Check that process, and report this — it should be unreachable.\n' >&2
+      exit 70
+    fi
+  fi
+  exit 0
 }
 
 do_pid() {
