@@ -213,7 +213,9 @@ sha256sum -c SHA256SUMS --ignore-missing
 shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
-Install the verified package:
+For an existing installation, complete the review in
+[UPGRADING AN EARLIER INSTALLATION](#upgrading-an-earlier-installation) before
+installing the verified package. For a fresh installation:
 
 ```sh
 npm install -g ./tightbeam-<version>-<os>-<arch>-build<N>.tgz
@@ -247,6 +249,70 @@ refuses. `npm install -g` installs both in npm's global bin directory. If you
 want easy access to the Tightbeam CLI, make sure npm's global bin directory is
 in your `PATH`. Tightbeam does not change your `PATH` for you. Nothing else is
 added to the machine, and neither Elixir nor Rust is needed to run either one.
+
+### UPGRADING AN EARLIER INSTALLATION
+
+Review runtime overrides before replacing an existing installation. A persisted
+override can select an older executable instead of a new adapter's bundled
+runtime. Cleanup is conditional: keep intentional pins that the target supports.
+
+1. Inventory every host and harness before the upgrade. As an admin, run:
+
+   ```sh
+   tightbeam host-env-list --as-user <adminUserId>
+   ```
+
+   Record each persisted `CODEX_PATH` and `CLAUDE_CODE_EXECUTABLE` value,
+   including its host and harness. Separately inspect the gateway service's
+   environment: systemd unit, drop-ins and environment files, or launchd plist.
+   Record those values too; your interactive shell is not the service environment.
+   Keep the record private if other environment entries contain secrets.
+
+2. Record the current Tightbeam package/build, each effective harness executable
+   path and exact version, and each installed ACP adapter's exact package version.
+   Retain the prior runtime/package and service configuration for rollback.
+   Check the target's release notes and compatibility evidence for those exact
+   runtime/adapter combinations. Do not infer compatibility from a branch name
+   or assume an upgrade refreshes every adapter.
+
+3. Keep each intentional, supported pin. Remove an override only when you confirm
+   it was temporary, is obsolete for the target, and its replacement is compatible.
+   For a persisted host/harness overlay, use the matching command below; replace
+   the placeholders with the recorded host and admin user:
+
+   ```sh
+   tightbeam host-env-unset --host <host> --harness codex CODEX_PATH --as-user <adminUserId>
+   tightbeam host-env-unset --host <host> --harness claude CLAUDE_CODE_EXECUTABLE --as-user <adminUserId>
+   ```
+
+   These commands remove only the named overlay. They do not edit a service's
+   environment. Remove an obsolete service override separately from its recorded
+   configuration source, using that service manager's configuration reload procedure.
+   Removing one source can expose a value from another; inspect both.
+
+4. Wait until affected sessions finish their turns before activation. An overlay
+   change takes effect on the next adapter start; it does not replace a running
+   adapter. Install the verified target package using the release instructions
+   above, then restart the installed service as documented there. Apply the same
+   idle boundary to affected remote adapters before their next start.
+   Do not treat a successful unset or an active service as proof of activation.
+
+5. After activation, verify the effective executable path and exact runtime
+   version for each affected host/harness, plus the adapter package version.
+   Use the actual adapter launch/process information and the selected binary's
+   version output, not just the executable on your shell's PATH.
+   Run one real model turn per affected host/harness. Verify the expected hook
+   fires and enforces its result, then resume an existing session and verify
+   its conversation continues. Record the results before calling the upgrade
+   successful. This checklist is not proof that an untested release works.
+
+If verification fails, stop the rollout. Restore each changed overlay to its
+recorded value with `tightbeam host-env-set --host <host> --harness <harness>
+'NAME=previous-value' --as-user <adminUserId>`. Restore the prior service
+environment and compatible runtime/adapter versions through the supported
+installation procedure. Use the same idle/restart boundary and repeat verification.
+Check the target's state-migration rollback restrictions before reverting a
+Tightbeam package; restoring an executable alone does not undo a database migration.
 
 ### Cutting a release
 
