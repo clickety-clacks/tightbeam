@@ -260,7 +260,7 @@ defmodule Tightbeam.IdentityTest do
              "kungfu/agentic-engineering/preferred-models.md"
            ) == table
 
-    for name <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
+    for name <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
       manifest_path = "archetypes/#{name}.toml"
       guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance
 
@@ -299,7 +299,7 @@ defmodule Tightbeam.IdentityTest do
     activity_table = File.read!(Path.join(shipped, "preferred-models.md"))
 
     assert :crypto.hash(:sha256, activity_table) |> Base.encode16(case: :lower) ==
-             "e2a517e6b8f33cd3cde1056ccf42fb16c12b3f1893cdb140cbde133bffbec219"
+             "cb83022d922c887ada0ea035d33436a226daaec1f0c38109799076952a82d423"
 
     refute File.exists?(Path.join(guidance_dir, "model-policy.md"))
 
@@ -332,7 +332,7 @@ defmodule Tightbeam.IdentityTest do
     base = Path.join(ctx.root, "model-selection-source")
     assert {:ok, revision} = learn!(base, "agentic-engineering", "operator")
 
-    for name <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
+    for name <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
       guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance
       assert occurrence_count(guidance, activity_table) == 1
       refute guidance =~ "# Model policy"
@@ -401,7 +401,7 @@ defmodule Tightbeam.IdentityTest do
     refute git_path_exists?(identity_dir, revision, "guidance/model-policy.md")
     refute File.read!(Path.join(identity_dir, "guidance/preferred-models.md")) =~ "claude-fable-5"
 
-    for name <- ~w(coder orchestrator product-owner recon reviewer spec-writer) do
+    for name <- ~w(coder orchestrator product-owner recon reviewer-code reviewer-spec spec-writer) do
       guidance = Identity.snapshot_at!(base, revision, name, :codex).guidance
       refute guidance =~ "# Model policy"
       refute guidance =~ "| Task class |"
@@ -599,7 +599,8 @@ defmodule Tightbeam.IdentityTest do
     assert occurrence_count(pinned.guidance, table) == 1
   end
 
-  test "shipped engineering bundle imports the test receipt rule and coder guidance", ctx do
+  test "shipped engineering bundle imports the test receipt rule and split review guidance",
+       ctx do
     shipped = Path.expand("priv/kungfu/agentic-engineering")
     Application.put_env(:tightbeam, :identity_source_dir, shipped)
     base = Path.join(ctx.root, "shipped-runtime")
@@ -609,6 +610,21 @@ defmodule Tightbeam.IdentityTest do
     engineering_rule = File.read!(Path.join(base, "identity/rules/engineering.toml"))
     assert engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
     assert engineering_rule =~ ~s(on_rule_denied = "surface")
+    assert engineering_rule =~ ~s(target_role = "reviewer-code")
+    refute engineering_rule =~ ~s(target_role = "reviewer")
+
+    for {role, present_axis, absent_axis} <- [
+          {"reviewer-code", "## Analysis axes: code", "## Analysis axes: spec"},
+          {"reviewer-spec", "## Analysis axes: spec", "## Analysis axes: code"}
+        ] do
+      review = Identity.snapshot!(base, role, :codex)
+      assert review.guidance =~ "# Review"
+      assert review.guidance =~ present_axis
+      refute review.guidance =~ absent_axis
+      refute Regex.match?(~r/^#include/m, review.guidance)
+
+      assert Map.keys(review.skills) == ~w(human-communication worktree-session)
+    end
 
     coder = Identity.snapshot!(base, "coder", :codex)
     assert coder.guidance =~ "Before the ready-for-review progress attest"

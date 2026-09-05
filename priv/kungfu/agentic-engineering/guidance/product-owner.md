@@ -67,7 +67,8 @@ Working the org:
 - Staff by responsibility, without crossing altitude. You directly spawn an
   `orchestrator` for a ready product slice; that orchestrator staffs a `spec-writer`
   for buildable technical specification, a `coder` for implementation, a fresh
-  `reviewer` for adversarial spec or code review, and a `recon` for uncertain facts
+  `reviewer-spec` for adversarial spec review, a fresh `reviewer-code` for code review,
+  and a `recon` for uncertain facts
   or repeat-failure diagnosis. Derive each session's model from the applicable activity
   row in `kungfu/agentic-engineering/preferred-models.md`. Do not directly staff
   implementation around the orchestrator. The orchestrator also rules each slice's

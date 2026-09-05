@@ -20,7 +20,7 @@ prompt = "Your completion of {assignment_id} is blocked: no verification verdict
 # Widened 2026-08-18 from coder-only to the other archetypes whose deliverable is
 # a FILE. The shape was right and already proven; only its reach was short, and
 # the loss concentrated exactly where it did not reach. Production measurement showed that
-# day, closed assignments carrying NO artifact on their work item: reviewer
+# day, closed assignments carrying NO artifact on their work item: review sessions
 # 456/682, spec-writer 35/71, recon 34/148 — against coder's 118/397, the one
 # archetype this rule already covered.
 #
@@ -29,7 +29,7 @@ prompt = "Your completion of {assignment_id} is blocked: no verification verdict
 # holds only if the verdict can carry the review. It cannot: the note field caps
 # at 2000 characters, and reviewers already route around it in the open — "FULL
 # CLAUSE TABLE + EVIDENCE: art_xxxxxxx, the 2000-char note cap forced the card's
-# clause table". So a reviewer that files a verdict and records nothing has kept
+# clause table". So a review holder that files a verdict and records nothing has kept
 # the DECISION and dropped the REASONING behind it. The review document is the
 # verdict's substance, not an optional companion to it.
 #
@@ -54,7 +54,7 @@ effect = "remedy"
 text = "completion requires a recorded results artifact from the holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.holder_archetype", op = "in", value = ["coder", "reviewer", "spec-writer", "recon"] },
+  { fact = "assignment.holder_archetype", op = "in", value = ["coder", "reviewer-code", "reviewer-spec", "spec-writer", "recon"] },
   { fact = "assignment.artifact_kinds", op = "not_in", value = ["report", "spec", "doc", "data", "other"] },
 ]
 [rule.remedy]

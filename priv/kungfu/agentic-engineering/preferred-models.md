@@ -50,7 +50,7 @@ capsule; `tightbeam list` shows the live legal forms.
 | Guidance / law authoring                         | wisdom-grade writing                | fable[high], opus[high], sol[xhigh]                                             |
 
 For code review, independence means a fresh session with the capability required by
-the effect. A same-model, same-provider, or same-harness reviewer remains qualified
+the effect. A same-model, same-provider, or same-harness reviewer-code session remains qualified
 when it is the first permitted candidate left in this ordered row; those differences
 are useful selection evidence, not gates on the verdict.
 

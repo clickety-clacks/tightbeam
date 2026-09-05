@@ -17,7 +17,7 @@ that blocks on every row is the other failure.
    invariant, every acceptance item, every stated behavior. Non-goals enter the list
    as exclusions to verify.
 2. Mark each clause must-have or post-mvp before you look at the code: can the ask
-   ship without it? This is the facet adjudication from `reviewing-code` step 1,
+   ship without it? This is the facet adjudication from `reviewer-code.md`,
    carried down to clause grain.
 3. Classify each clause with evidence:
    - **satisfied**: the implementation meets it, and you can cite the code, test, or

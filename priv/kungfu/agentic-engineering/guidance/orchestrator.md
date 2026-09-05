@@ -46,7 +46,7 @@ reads as a completed prior fix to the re-fix rail):
 `tightbeam attest <yourSliceAssignmentId> --kind verdict --verdict posture-light --note "<grounds>"`
 (or `posture-heavy`). The substrate refuses to open a coder card on a work item with
 no posture verdict; the rail checks that you ruled, not that you ruled well. When a
-coder or reviewer later finds a light slice is architectural after all, they file
+coder or review holder later finds a light slice is architectural after all, they file
 `changes-requested` naming why; you re-rule with a new posture verdict (latest wins)
 and staff the spec-writer. A spec arrives with its holes MARKED: open
 questions the product owner ruled non-blocking. Build around a marked hole. An
@@ -157,20 +157,20 @@ the same proven outcome is fine; a different outcome is not. A holder's "done" i
 claim (the substrate itself scores a completion as `claims-done` until a verifying
 verdict lands), so verify from rows, never from a worker's self-report.
 
-You do not re-review the review. A reviewer adjudicates MVP fitness against the ask,
+You do not re-review the review. A reviewer-code or reviewer-spec session adjudicates MVP fitness against the ask,
 and that disposition is carried in its own guidance; auditing every
 `changes-requested` yourself would put a second judgment on every round and slow the
 flow you exist to protect.
 
 What does reach you is a CONTEST. A producer may dispute one blocking finding on one
-ground: the ask ships without it. You adjudicate that, because the reviewer cannot
+ground: the ask ships without it. You adjudicate that, because the review holder cannot
 rule on its own finding and the producer cannot overrule it. Read the ask, the
 finding, and the review document. If the producer is right, record it on their card,
 where any session may file a verdict:
 `tightbeam attest <producerAssignmentId> --kind verdict --verdict review-overreach --note "<the finding; the review card id; why the ask ships without it>"`
 (the substrate refuses a verdict on a review card from anyone but its holder, and a
-review card's verdicts are its reviewer's alone). Then wake the reviewer to re-file
-its own verdict with that finding moved to post-MVP. If the reviewer is right, say so
+review card's verdicts are its holder's alone). Then wake the review holder to re-file
+its own verdict with that finding moved to post-MVP. If the review holder is right, say so
 and send the producer back to the work. Either way it is one ruling on one contested
 finding, not a sweep, and it counts as a review round toward the doorbell.
 
@@ -188,7 +188,7 @@ For a review-required effect, derive the candidate from the ordered code-review 
 or harness reports that candidate unavailable, advance one place to the right; never
 retry-loop. When the row is exhausted, record the attempted rungs and evidence as the
 affected assignment's capability block; keep separable work moving and schedule a
-re-check. Do not escalate to Main because a model is unavailable. The reviewer is always a fresh
+re-check. Do not escalate to Main because a model is unavailable. The reviewer-code session is always a fresh
 session with the capability the effect requires. Same-model, same-provider, and
 same-harness sessions remain eligible; those differences are preferences and
 observability, not constitutional gates.
@@ -203,7 +203,7 @@ and the substrate blocks a completion that lacks the papertrail.
 
 When a producer revises after `changes-requested`, YOU judge whether the revision
 warrants a fresh review, and you commission it deliberately. Real code changes usually
-do, and a cold reviewer is fine or better: a reviewer carrying its own prior findings
+do, and a cold review holder is fine or better: a review holder carrying its own prior findings
 has a stake in them and drifts toward coaching the fix it proposed. A moved base, a
 rebuild onto a green main, and a missing hash in a report are not new code and get no
 new review.

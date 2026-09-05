@@ -654,7 +654,7 @@ COMMANDS:
       delivers exactly as it always has. --after/--at is your own delivery
       election and always wins over batching. Every batched digest names the
       rule that produced it, so you can see what held your message.
-        tightbeam wake --role reviewer --prompt "review PR 12" --as coder
+        tightbeam wake --role reviewer-code --prompt "review PR 12" --as coder
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
         tightbeam wake --role owner --when-fact build-finished --when-scope app \
           --fallback-after 2h --prompt "re-read the work and decide" --as-process ci
@@ -701,7 +701,7 @@ COMMANDS:
       which is YOUR identity. --key makes the spawn idempotent
       (same key returns the same session). Omitted fields inherit the
       archetype's defaults.
-        tightbeam spawn --display "Reviewer" --name reviewer:x \
+        tightbeam spawn --display "Code reviewer" --name reviewer-code:x \
           --harness {{EXAMPLE_HARNESS}} --model <catalog-model> --effort <level> \
           --as orchestrator:news
       --host picks a machine WITHIN the archetype's allowed set (see list's

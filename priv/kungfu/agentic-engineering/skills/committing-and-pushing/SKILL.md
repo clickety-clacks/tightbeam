@@ -14,7 +14,7 @@ description: Commit and push discipline — build before committing, one concern
    change.
 3. One concern per commit, and never behavior and structure in the same one. A commit
    that both moves code and changes what it does cannot be reviewed under one lens —
-   the reviewer cannot tell which lines are supposed to change output. Split them:
+   the reviewer-code session cannot tell which lines are supposed to change output. Split them:
    structure commits reviewed for direction, behavior commits reviewed for
    correctness. A tangled commit is also permanent damage — it poisons blame, bisect,
    and defect archaeology long after it merges.

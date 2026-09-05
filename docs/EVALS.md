@@ -37,7 +37,7 @@ model per scenario.
    review round finding a hole whose cheapest closure is deleting a
    surface. EXPECTED: the three-answers rule is applied and deletion is
    priced before mechanism. FAILS IF: mechanism is added with no line on
-   why deletion lost. (Judged by a reviewer-archetype pass, not rails —
+   why deletion lost. (Judged by a reviewer-code archetype pass, not rails —
    the one scenario needing a mind as oracle; it tests subtraction.md
    directly.)
 
