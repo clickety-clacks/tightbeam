@@ -101,15 +101,19 @@ defmodule Tightbeam.Schema do
   #
   # The strict false-premise park gate adds three NEW tables — `premise_claims`,
   # `premise_checks`, `park_premises` — and widens nothing that already exists.
-  # That is the one case SQLite can carry forward in place, so v16 is the one
-  # exact predecessor `upgrade_premise_gate_v1/1` accepts, and v17 is what this
-  # build writes. A v16 database is migrated in place on boot: `check_shape`
-  # dispatches the exact v16 stamp to `upgrade_premise_gate_v1/1`, which creates
-  # the three tables and advances the stamp transactionally — the same one-step
-  # ladder every lane walks (its immediate predecessor, nothing older). Every
-  # non-predecessor shape, v15 included, is still refused by name; the reading
-  # is the stamp itself, never a boot-path inference about the shape.
-  @shape "coordination-fabric-v1-phase1-v17"
+  # It advances the exact v16 predecessor to v17. It is now a FROZEN seam:
+  # `upgrade_premise_gate_v1/1` still exists and stamps a FIXED v17 target
+  # (`@effort_generator_retirement_previous_shape`), but `check_shape` no longer
+  # dispatches to it — a v16 database is refused by name, exactly as v15 is. The
+  # seam test exercises it directly; boot walks only the immediate predecessor.
+  #
+  # The effort-generator-retirement rebuild adds the four nullable retirement
+  # fields and the all-or-none retirement CHECK on `effort_checkin_generations`,
+  # plus the `effort_checkin_wake_ownership` relation, advancing the exact v17
+  # predecessor transactionally to v18 — the current one-step boot arm. The
+  # reading is the stamp itself, never a boot-path inference about the shape.
+  @shape "coordination-fabric-v1-phase1-v18"
+  @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
   @premise_gate_previous_shape "coordination-fabric-v1-phase1-v16"
   @premise_gate_label "incompatible_premise_gate_v1"
   @completion_previous_shape "coordination-fabric-v1-phase1-v14"
@@ -1732,6 +1736,12 @@ defmodule Tightbeam.Schema do
   Move a `coordination-fabric-v1-phase1-v16` database to v17 by activating the
   strict false-premise park gate.
 
+  FROZEN SEAM. `check_shape` no longer dispatches to this function — v18 is the
+  current shape and v17 its only boot arm. This stamps a FIXED v17 target
+  (`@effort_generator_retirement_previous_shape`), never `@shape`, so a later
+  rung bump cannot silently turn its v16 stamp into a skip-migration. Reached
+  only by its exact-predecessor seam test.
+
   Purely additive: three new tables and their indexes and immutability
   triggers. No existing table is rebuilt, no CHECK widened, no NOT NULL
   relaxed, and no row is read, rewritten, or reclassified — historical parks
@@ -1781,7 +1791,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @premise_gate_previous_shape,
-             @shape,
+             @effort_generator_retirement_previous_shape,
              migration_time
            ])
 
@@ -1799,6 +1809,186 @@ defmodule Tightbeam.Schema do
       {:error, error} ->
         raise ShapeError,
           message: "#{@premise_gate_label}: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_effort_generator_retirement_v1(DB.server()) :: :ok
+  def upgrade_effort_generator_retirement_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@effort_generator_retirement_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_effort_generator_retirement_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           # Rebuild effort_checkin_generations to add the four nullable
+           # retirement fields and the all-or-none retirement CHECK. SQLite
+           # cannot add that table-level CHECK in place, so rename → recreate →
+           # copy → drop, preserving every existing column value.
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE effort_checkin_generations RENAME TO effort_checkin_generations_retirement_v1"
+             )
+
+           :ok =
+             Txn.exec(txn, """
+             CREATE TABLE effort_checkin_generations (
+               assignmentId TEXT NOT NULL REFERENCES assignments(id),
+               generation INTEGER NOT NULL,
+               state TEXT NOT NULL CHECK (state IN ('armed','probed','canceled')),
+               baseHorizonMs INTEGER NOT NULL,
+               multiplier INTEGER NOT NULL CHECK (multiplier IN (1,2,4)),
+               armedAt INTEGER NOT NULL,
+               terminalSeqWatermark INTEGER NOT NULL,
+               holderKey TEXT NOT NULL,
+               host TEXT NOT NULL,
+               root TEXT NOT NULL,
+               baseline TEXT NOT NULL,
+               wakeId TEXT NOT NULL,
+               evidence TEXT,
+               agentProdded INTEGER NOT NULL DEFAULT 0,
+               artifactWatermark INTEGER NOT NULL DEFAULT 0,
+               attestWatermark INTEGER NOT NULL DEFAULT 0,
+               workItemWatermark INTEGER NOT NULL DEFAULT 0,
+               retiredAt INTEGER,
+               retiredOutcome TEXT,
+               retiredCause TEXT,
+               retiredPrincipal TEXT,
+               PRIMARY KEY (assignmentId, generation),
+               CHECK (
+                 (retiredAt IS NULL AND retiredOutcome IS NULL AND retiredCause IS NULL
+                  AND retiredPrincipal IS NULL)
+                 OR
+                 (retiredAt IS NOT NULL AND retiredOutcome IS NOT NULL AND retiredCause IS NOT NULL
+                  AND retiredPrincipal IS NOT NULL
+                  AND state IN ('probed','canceled')
+                  AND retiredOutcome IN ('completed','surrendered','revoked')
+                  AND retiredCause = 'assignment-terminal:' || retiredOutcome || ':' || assignmentId)
+               )
+             )
+             """)
+
+           :ok =
+             Txn.exec(txn, """
+             CREATE INDEX IF NOT EXISTS effort_checkin_wake
+               ON effort_checkin_generations (wakeId, state)
+             """)
+
+           columns =
+             "assignmentId,generation,state,baseHorizonMs,multiplier,armedAt," <>
+               "terminalSeqWatermark,holderKey,host,root,baseline,wakeId,evidence," <>
+               "agentProdded,artifactWatermark,attestWatermark,workItemWatermark"
+
+           :ok =
+             Txn.exec(
+               txn,
+               "INSERT INTO effort_checkin_generations (#{columns}) SELECT #{columns} FROM effort_checkin_generations_retirement_v1"
+             )
+
+           :ok = Txn.exec(txn, "DROP TABLE effort_checkin_generations_retirement_v1")
+
+           # Add the ownership relation (EGR-1 store).
+           :ok =
+             Txn.exec(txn, """
+             CREATE TABLE effort_checkin_wake_ownership (
+               wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
+               assignmentId TEXT NOT NULL,
+               generation INTEGER NOT NULL,
+               role TEXT NOT NULL CHECK (role IN (
+                 'probe','holder_checkin','parent_escalation','decision_deadline','decision_notification'
+               )),
+               FOREIGN KEY (assignmentId, generation)
+                 REFERENCES effort_checkin_generations (assignmentId, generation)
+             )
+             """)
+
+           # Backfill ownership only for legacy structurally-owned wakes, by exact
+           # foreign-key equality (EGR-9): each generation's probe wake, and each
+           # effort decision request's deadline wake. Nothing is inferred from
+           # prompt text, origin, holder, or time.
+           :ok =
+             Txn.exec(txn, """
+             INSERT INTO effort_checkin_wake_ownership (wakeId, assignmentId, generation, role)
+             SELECT wakeId, assignmentId, generation, 'probe'
+             FROM effort_checkin_generations
+             """)
+
+           :ok = Tightbeam.Escalation.migrate_effort_deadline_ownership_v1_in_txn(txn)
+
+           # EGR-9 preflight. Before the new stamp commits, refuse if any
+           # ambiguous legacy prompt wake exists: a pending prompt wake from
+           # process:tightbeam attributed to an assignment that has effort
+           # history but carries no ownership row. The substrate cannot prove
+           # such a wake is not an effort wake, so it names the ids and rolls
+           # back — it does not inspect prompts, classify, cancel, or advance the
+           # stamp. An operator retries after predecessor behavior settles each
+           # named wake to fired or canceled.
+           case Txn.q(txn, """
+                SELECT w.wakeId FROM wakes w
+                WHERE w.state = 'pending'
+                  AND w.consumer = 'prompt'
+                  AND w.origin = 'process:tightbeam'
+                  AND w.assignmentId IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM effort_checkin_generations g
+                    WHERE g.assignmentId = w.assignmentId
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM effort_checkin_wake_ownership o
+                    WHERE o.wakeId = w.wakeId
+                  )
+                ORDER BY w.wakeId
+                """) do
+             [] ->
+               :ok
+
+             rows ->
+               ids = rows |> List.flatten() |> Enum.join(", ")
+
+               raise ShapeError,
+                 message: "incompatible_effort_wake_provenance: #{ids}"
+           end
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @effort_generator_retirement_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_effort_generator_retirement_v1: stamp race"
+               )
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_effort_generator_retirement_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_effort_generator_retirement_v1: migration failed: #{Exception.message(error)}"
     end
   end
 
@@ -2048,8 +2238,8 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
-      {:ok, [[@premise_gate_previous_shape]]} ->
-        upgrade_premise_gate_v1(db)
+      {:ok, [[@effort_generator_retirement_previous_shape]]} ->
+        upgrade_effort_generator_retirement_v1(db)
 
       {:ok, []} ->
         # No stamp. Either a database this build is about to create, or one
@@ -2066,7 +2256,7 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         There is no migration from #{found}. The only supported upgrade source
-        is #{@premise_gate_previous_shape}.
+        is #{@effort_generator_retirement_previous_shape}.
         Move this database aside and let it be recreated.
         """
 
