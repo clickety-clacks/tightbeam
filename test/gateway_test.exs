@@ -10181,7 +10181,8 @@ defmodule Tightbeam.GatewayTest do
     assert Org.current_pointer(ctx.db, session.session_key) == nil
 
     # The applied branch, so the stream push; but nobody to nudge, so no turn.
-    assert_receive {:push, %{"type" => "stream_updated", "stream" => %{"sessionKey" => ^session_key}}}
+    assert_receive {:push,
+                    %{"type" => "stream_updated", "stream" => %{"sessionKey" => ^session_key}}}
 
     assert Ledger.pending_count(ctx.db, session.session_key) == 0
     refute_received {:ensure_lane, _}
@@ -10254,7 +10255,9 @@ defmodule Tightbeam.GatewayTest do
 
     assert session_key == selected.session_key
 
-    assert File.read!(Path.join(selected_cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
+    assert File.read!(
+             Path.join(selected_cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+           ) ==
              "only the selected session gets this"
 
     assert File.read!(product) == "product source"
@@ -10446,6 +10449,431 @@ defmodule Tightbeam.GatewayTest do
 
     for [prompt] <- rows do
       assert prompt =~ "Re-read your Tightbeam skills before you continue work."
+    end
+  end
+
+  # R-02: a retired session is not a target. Retiring is a state flip, not a
+  # delete, so the row is still readable — and being readable is not the same as
+  # being writable. A retired key answers exactly as an unknown key does, because
+  # apply has nothing to do for either.
+  test "identity apply gives a retired session no file update and no nudge", ctx do
+    base_dir = role_test_base("identity-apply-retired")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-retired",
+        display_name: "Identity apply retired",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-retired", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+    old_body = File.read!(skill)
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "worktree-session", false},
+      "not for the retired",
+      "test"
+    )
+
+    Org.retire(ctx.db, session.session_key, "test:gateway", 1_000)
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{code: "not_found"} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert File.read!(skill) == old_body
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+  end
+
+  # R-02 again, at the other end: `--all` captures its set ONCE, and a session can
+  # retire inside the pass. The row is re-read at ITS update, so the retirement is
+  # observed rather than raced past. Nothing holds the row still — this asserts a
+  # fresh read, not a lock, and a session retiring one instruction later would be
+  # updated, which is the honest boundary of a best-effort refresh.
+  test "identity apply --all skips a session that retires between capture and update",
+       ctx do
+    base_dir = role_test_base("identity-apply-mid-retire")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    make = fn key, order ->
+      session =
+        Org.create(ctx.db, %{
+          session_key: key,
+          display_name: key,
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "coder",
+          identity_name: "coder",
+          identity_revision: revision,
+          order_index: order,
+          host: "testhost",
+          harness: "codex",
+          provider: "openai",
+          model: Model.new("gpt-5.6-sol", effort: "medium")
+        })
+
+      Org.append_pointer(ctx.db, key, "thread-#{order}", "created")
+      cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+      Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+      {session, Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")}
+    end
+
+    # `--all` orders by orderIndex, so first is updated before second.
+    {first, _first_skill} = make.("agent:apply-mid-first", 1)
+    {second, second_skill} = make.("agent:apply-mid-second", 2)
+    old_second = File.read!(second_skill)
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "mid-pass guidance",
+        "test"
+      )
+
+    # The injection: the second session retires exactly while the first is being
+    # stamped — inside the window between the capture and the second's own update.
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER identity_apply_retire_mid_pass
+      AFTER UPDATE OF identityRevision ON sessions
+      WHEN NEW.sessionKey = '#{first.session_key}'
+      BEGIN
+        UPDATE sessions SET state = 'retired' WHERE sessionKey = '#{second.session_key}';
+      END;
+      """)
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{applied: applied, identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{all: true}})
+
+    assert first.session_key in applied
+    refute second.session_key in applied
+
+    # The one that retired got nothing: no file update, no stamp, no nudge. The
+    # pass is not refused for it either — the other sessions are still served.
+    assert File.read!(second_skill) == old_second
+    assert Org.get(ctx.db, second.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, second.session_key) == 0
+    assert Org.get(ctx.db, first.session_key).identity_revision == next
+  end
+
+  # A-03/A-04: a writer that fails BETWEEN two skill files leaves a partial file
+  # set, and that is allowed. Apply makes no atomic-snapshot and no single-revision
+  # claim, so nothing rolls the written file back and nothing repairs it; the
+  # unwritten one stays as it was and the prior stamp stands.
+  test "a failure between two skill writes leaves the partial file set and no stamp", ctx do
+    base_dir = role_test_base("identity-apply-partial")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-partial",
+        display_name: "Identity apply partial",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-partial", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+
+    skills = Path.join(cwd, ".codex/skills")
+    alpha = Path.join(skills, "tightbeam__committing-and-pushing/SKILL.md")
+    beta_dir = Path.join(skills, "tightbeam__worktree-session")
+    beta = Path.join(beta_dir, "SKILL.md")
+    old_beta = File.read!(beta)
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "committing-and-pushing", false},
+      "alpha next",
+      "test"
+    )
+
+    identity_edit!(base_dir, "coder", {:skill, "worktree-session", false}, "beta next", "test")
+
+    # The injection: the writer rewrites the elected skills in name order, so a
+    # directory it cannot replace stops it PARTWAY — alpha rewritten, beta not.
+    File.chmod!(beta_dir, 0o500)
+    on_exit(fn -> File.chmod(beta_dir, 0o700) end)
+
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "identity-apply-partial-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert session_key == session.session_key
+
+    # Partial, and left partial: the file that landed is the new one, the file
+    # that did not is untouched, and the stamp still names the prior revision.
+    assert File.read!(alpha) == "alpha next"
+    assert File.read!(beta) == old_beta
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+    refute_receive {:push, %{"type" => "stream_updated"}}, 200
+  end
+
+  # A-04: the stamp is the second step, and its failure is the writer's failure —
+  # files new, stamp old, no nudge. There is nothing to re-read on ANOTHER
+  # session's behalf and nothing to undo: a stamp that did not move is a stamp
+  # that will be moved by the retry.
+  test "a stamp failure after the files land sends no nudge and moves no stamp", ctx do
+    base_dir = role_test_base("identity-apply-stamp-fail")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-stamp-fail",
+        display_name: "Identity apply stamp fail",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-stamp-fail", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "stamp-fail served skill",
+        "test"
+      )
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER identity_apply_stamp_failure
+      BEFORE UPDATE OF identityRevision ON sessions
+      BEGIN SELECT RAISE(ABORT, 'injected-stamp-failure'); END;
+      """)
+
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "identity-apply-stamp-fail-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert session_key == session.session_key
+
+    assert File.read!(skill) == "stamp-fail served skill"
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+    refute_receive {:push, %{"type" => "stream_updated"}}, 200
+
+    # The retry converges once the injected failure is gone: same files, and now
+    # the stamp. No recovery protocol ran; the operator simply asked again.
+    :ok = DB.execute(ctx.db, "DROP TRIGGER identity_apply_stamp_failure")
+
+    assert %{applied: [_], identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+  end
+
+  # A-04: the nudge is the third step, and its failure is the LEAST consequential
+  # one — the files and the stamp are already true, so nothing is undone. What the
+  # caller gets is a named per-session refusal, not a silent success.
+  test "a prompt-submission failure keeps the files and the stamp and names the session",
+       ctx do
+    base_dir = role_test_base("identity-apply-nudge-fail")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-nudge-fail",
+        display_name: "Identity apply nudge fail",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-nudge-fail", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "nudge-fail served skill",
+        "test"
+      )
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER identity_apply_nudge_failure
+      BEFORE INSERT ON turns
+      BEGIN SELECT RAISE(ABORT, 'injected-nudge-failure'); END;
+      """)
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert session_key == session.session_key
+    assert result.message =~ session.session_key
+
+    # Both earlier steps stand. The prompt is the only thing missing, and the
+    # operator's move is the same retry as for any other step.
+    assert File.read!(skill) == "nudge-fail served skill"
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER identity_apply_nudge_failure")
+
+    assert %{applied: [_], identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+  end
+
+  # A-04, the last failure window: the prompt was ACCEPTED and the caller lost the
+  # response, so it retries a call that already fully succeeded. A second nudge is
+  # the correct outcome, not a defect to deduplicate — the prompt is idempotent
+  # advice, and suppressing it would need exactly the delivery bookkeeping this
+  # design refuses to carry.
+  test "a retry after a lost response converges and a duplicate nudge is permitted", ctx do
+    base_dir = role_test_base("identity-apply-lost-response")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-lost-response",
+        display_name: "Identity apply lost response",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-lost-response", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "worktree-session", false},
+        "lost-response served skill",
+        "test"
+      )
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
+
+    # The call that succeeded, whose response the caller never saw.
+    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+
+    # The retry, issued because the caller cannot tell success from silence.
+    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+
+    assert File.read!(skill) == "lost-response served skill"
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert Ledger.pending_count(ctx.db, session.session_key) == 2
+
+    assert {:ok, rows} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
+               session.session_key
+             ])
+
+    assert length(rows) == 2
+
+    for [prompt] <- rows do
+      assert prompt ==
+               "[from process:tightbeam]\n\n" <>
+                 "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
+                 "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
+                 "reload your current model context."
     end
   end
 
