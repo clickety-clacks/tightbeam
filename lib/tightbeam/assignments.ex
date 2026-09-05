@@ -6,7 +6,17 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
+
+  alias Tightbeam.{
+    EffortCheckin,
+    EventLog,
+    Org,
+    Placement,
+    Projection,
+    RailRemedy,
+    Supervision,
+    Wakes
+  }
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
@@ -198,15 +208,15 @@ defmodule Tightbeam.Assignments do
         requester_id: "tightbeam:retirement"
       })
 
-      EffortCheckin.cancel_in_txn(
-        txn,
-        assignment_id,
+      disposition =
         assignment_disposition_command(
           assignment_id,
           "tightbeam:retirement",
           liveness_trigger
         )
-      )
+
+      RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+      EffortCheckin.cancel_in_txn(txn, assignment_id, disposition)
     end)
 
     assignments
@@ -1214,15 +1224,15 @@ defmodule Tightbeam.Assignments do
                   requester_id: "tightbeam:assignments"
                 })
 
-                EffortCheckin.cancel_in_txn(
-                  txn,
-                  assignment_id,
+                disposition =
                   assignment_disposition_command(
                     assignment_id,
                     "tightbeam:assignments",
                     liveness_trigger
                   )
-                )
+
+                RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+                EffortCheckin.cancel_in_txn(txn, assignment_id, disposition)
 
                 append_attest_marker(txn, attest)
                 append_assignment_marker(txn, closed_assignment, :closed)
@@ -1308,15 +1318,15 @@ defmodule Tightbeam.Assignments do
               requester_id: "tightbeam:assignments"
             })
 
-            EffortCheckin.cancel_in_txn(
-              txn,
-              assignment_id,
+            disposition =
               assignment_disposition_command(
                 assignment_id,
                 "tightbeam:assignments",
                 liveness_trigger
               )
-            )
+
+            RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+            EffortCheckin.cancel_in_txn(txn, assignment_id, disposition)
 
             append_assignment_marker(txn, revoked_assignment, :revoked)
             revoked_assignment
