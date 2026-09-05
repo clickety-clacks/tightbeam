@@ -436,8 +436,8 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, assignment} =
              Dispatch.dispatch(db, handlers, %{
                verb: "dispatch",
-               origin: "user:flynn",
-               principal: {:user, "flynn"},
+               origin: "agent:effect-observer",
+               principal: {:session, "effect-observer"},
                session_key: "effect-holder",
                target_role: nil,
                role_fallback: false,
