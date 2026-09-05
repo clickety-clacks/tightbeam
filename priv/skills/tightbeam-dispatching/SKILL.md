@@ -8,7 +8,7 @@ obligation as a row — `tightbeam assign --subject "..."
 (--session K | --role R) [--work-item <id>]` — and wake the worker
 with a brief of AT MOST ONE SENTENCE plus the references:
 
-    tightbeam wake --role coder:x --prompt \
+    tightbeam wake --session "agent:role:name" --prompt \
       "You hold asg_123 (wi_456): fix the picker titles — read the \
       assignment, its attests, and the work-item from the substrate."
 
@@ -35,6 +35,10 @@ Do not file "still working," "unchanged," "waiting," or "no update."
 Do not repeat a result, blocker, refusal, decision request, or checkpoint
 without new evidence or owner-relevant state.
 
+When a holder needs more time, the receipt that earns it carries evidence of what
+moved: the row, commit or artifact, not an assertion of effort. A receipt with no
+evidence in it is not a receipt.
+
 Ask another agent only when answering is that agent's normal work. If its
 answer is necessary and does not arrive, keep the question and evidence as
 your assignment's exact blocker, continue separable work, and schedule a
@@ -43,8 +47,8 @@ normal lifecycle routing is the substrate's job.
 
 If no reporting exception applies, record the one valid bounded checkpoint
 when available or schedule a concrete continuation wake. Never manufacture
-a generic progress attest. Completion and surrender remain truthful terminal
-receipts. A qualifying progress row resets the prod countdown; scheduled
+a generic progress attest. Completion remains the holder's truthful terminal
+receipt. A qualifying progress row resets the prod countdown; scheduled
 wakes pause it; words do neither. If you stall, prods arrive from
 process:tightbeam and escalate up your spawner chain after N misses.
 

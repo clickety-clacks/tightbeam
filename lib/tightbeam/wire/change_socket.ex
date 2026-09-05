@@ -3,7 +3,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   @behaviour WebSock
 
-  alias Tightbeam.Devices
+  alias Tightbeam.{Devices, ModelCatalog}
   alias Tightbeam.Firehose.{Hub, Publisher}
 
   @max_subscriptions 100
@@ -37,6 +37,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   @impl true
   def handle_info({:firehose_notice, notice}, %{phase: :live} = state) do
+    await_delivery_release(state, notice)
     Hub.delivered(hub(state), self())
     push(notice, state)
   end
@@ -198,7 +199,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
     do: %{"type" => "auth_result", "success" => false, "reason" => reason}
 
   defp push(%{"class" => _class} = payload, state),
-    do: {:push, {:text, Publisher.encode_wire_notice(payload)}, state}
+    do: {:push, {:text, Publisher.encode_wire_notice(payload, model_catalog(state))}, state}
 
   defp push(payload, state), do: {:push, {:text, JSON.encode!(payload)}, state}
 
@@ -209,7 +210,23 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp string(_value), do: ""
   defp db(state), do: Map.get(state.deps, :db, Tightbeam.DB)
   defp hub(state), do: Map.get(state.deps, :firehose_hub, Hub)
+
+  defp model_catalog(state) do
+    case Map.get(state.deps, :model_catalog) || ModelCatalog do
+      catalog when is_map(catalog) -> catalog
+      server -> ModelCatalog.get(server)
+    end
+  end
+
   defp heartbeat_ms(state), do: Map.get(state.deps, :firehose_heartbeat_ms, 15_000)
+
+  defp await_delivery_release(state, notice) do
+    case Map.get(state.deps, :firehose_delivery_barrier) do
+      barrier when is_function(barrier, 1) -> barrier.(notice)
+      nil -> :ok
+    end
+  end
+
   defp cancel_timer(nil), do: :ok
   defp cancel_timer(timer), do: Process.cancel_timer(timer, async: true, info: false)
 end

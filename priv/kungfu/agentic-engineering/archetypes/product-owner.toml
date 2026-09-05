@@ -3,6 +3,10 @@ skills = ["worktree-session", "tightbeam-dispatching", "product-discovery", "hum
 
 [guidance]
 text = """
+#include "golden-rule.md"
+
+#include "scope-and-architecture.md"
+
 #include "wisdom-core.md"
 
 #include "engineering-tenets.md"
@@ -10,8 +14,6 @@ text = """
 #include "subtraction.md"
 
 #include "preferred-models.md"
-
-#include "model-policy.md"
 
 #include "product-owner.md"
 

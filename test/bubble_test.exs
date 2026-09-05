@@ -1,7 +1,17 @@
 defmodule Tightbeam.Productions.BubbleTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConditionFacts, ConnRegistry, DB, Ledger, Model, Org}
+  alias Tightbeam.{
+    Assignments,
+    ConditionFacts,
+    ConnRegistry,
+    DB,
+    HarnessHealth,
+    Ledger,
+    Model,
+    Org
+  }
+
   alias Tightbeam.Productions.Bubble
 
   defmodule LaneDoorbell do
@@ -33,7 +43,10 @@ defmodule Tightbeam.Productions.BubbleTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+      )
 
     main = session(db, Org.personal_session_key("flynn"), nil, true)
     supervisor = session(db, "supervisor", main.session_key)
@@ -56,6 +69,7 @@ defmodule Tightbeam.Productions.BubbleTest do
         host: "testhost",
         model: Model.new("fable"),
         spawned_by: spawned_by,
+        operational_parent: spawned_by,
         is_built_in: built_in?
       })
 
@@ -88,6 +102,92 @@ defmodule Tightbeam.Productions.BubbleTest do
     rows
   end
 
+  defp fail_assigned_turn!(db, session_key, assignment_id) do
+    {:ok, seq} =
+      Ledger.enqueue(db, %{
+        session_key: session_key,
+        message_id: "assigned-cause-#{System.unique_integer([:positive])}",
+        origin: "user:flynn",
+        prompt: "assigned work",
+        assignment_id: assignment_id
+      })
+
+    assert {:ok, %{owner_lease: owner_lease}} =
+             Ledger.claim_next(db, session_key, "assigned-cause")
+
+    assert :ok =
+             Ledger.finish(db, seq, "failed", "assigned failure", owner_lease: owner_lease)
+
+    seq
+  end
+
+  defp insert_controller!(db, wake_id, assignment_id, root_turn_seq, recipient, status) do
+    ended_at = if status in ["delivered", "failed", "failed_unknown", "canceled"], do: 2
+
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO wakes
+          (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,
+           reresolve,reresolveSeed,reresolveRung,assignmentId)
+        VALUES
+          ('#{wake_id}','#{recipient}','process:tightbeam','controller','prompt',0,'pending',1,
+           'lineage','holder',1,'#{assignment_id}');
+        INSERT INTO supervision_liveness_sidecar
+          (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,
+           chargedGeneration,rootTurnSeq)
+        VALUES
+          ('#{wake_id}','#{assignment_id}','scheduled','escalation','settled',1,
+           #{root_turn_seq});
+        INSERT INTO turns
+          (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
+        VALUES
+          ('#{recipient}','message-#{wake_id}','#{wake_id}','process:tightbeam','controller',
+           '#{assignment_id}','#{status}',1,#{ended_at || "NULL"});
+        UPDATE wakes SET state='fired',firedAt=2 WHERE wakeId='#{wake_id}';
+        """
+      )
+  end
+
+  defp insert_pending_controller!(db, wake_id, assignment_id, root_turn_seq, recipient) do
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO wakes
+          (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,
+           reresolve,reresolveSeed,reresolveRung,assignmentId)
+        VALUES
+          ('#{wake_id}','#{recipient}','process:tightbeam','controller','prompt',0,'pending',1,
+           'lineage','holder',1,'#{assignment_id}');
+        INSERT INTO supervision_liveness_sidecar
+          (wakeId,assignmentId,controllerOrigin,wakeKind,controllerState,
+           chargedGeneration,rootTurnSeq)
+        VALUES
+          ('#{wake_id}','#{assignment_id}','scheduled','escalation','pending',1,
+           #{root_turn_seq});
+        """
+      )
+  end
+
+  defp deliver_controller!(db, wake_id, assignment_id, recipient) do
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT INTO turns
+          (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
+        VALUES
+          ('#{recipient}','message-#{wake_id}','#{wake_id}','process:tightbeam','controller',
+           '#{assignment_id}','delivered',1,2);
+        UPDATE supervision_liveness_sidecar
+        SET controllerState='settled' WHERE wakeId='#{wake_id}';
+        UPDATE wakes SET state='fired',firedAt=2 WHERE wakeId='#{wake_id}';
+        """
+      )
+  end
+
   test "a spawned session's failed turn produces one deduped notice to its parent", ctx do
     seq = fail_turn!(ctx.db, "holder")
 
@@ -105,6 +205,72 @@ defmodule Tightbeam.Productions.BubbleTest do
     # deterministic wakeId absorbs it. One notice, not two.
     :ok = Bubble.recognize_terminal(ctx.db, seq)
     assert [_] = notice_turn(ctx.db, "supervisor")
+  end
+
+  test "terminal coverage binds to one assignment root and only skips a failed recipient", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt)
+        VALUES ('asg_exact_root','exact root','holder','flynn',1)
+        """
+      )
+
+    exact = fail_assigned_turn!(ctx.db, "holder", "asg_exact_root")
+
+    :ok =
+      insert_pending_controller!(
+        ctx.db,
+        "w_exact_root",
+        "asg_exact_root",
+        exact,
+        "supervisor"
+      )
+
+    :ok = Bubble.recognize_terminal(ctx.db, exact)
+    assert notice_turn(ctx.db, "supervisor") == []
+    assert notice_turn(ctx.db, ctx.main.session_key) == []
+
+    :ok = deliver_controller!(ctx.db, "w_exact_root", "asg_exact_root", "supervisor")
+    :ok = Bubble.recognize_terminal(ctx.db, exact)
+    assert notice_turn(ctx.db, "supervisor") == []
+
+    different = fail_assigned_turn!(ctx.db, "holder", "asg_exact_root")
+    :ok = Bubble.recognize_terminal(ctx.db, different)
+    different_ref = "bubble:#{different}"
+
+    assert [[_, ^different_ref, _, _, _]] = notice_turn(ctx.db, "supervisor")
+
+    :ok =
+      insert_controller!(
+        ctx.db,
+        "w_action_first",
+        "asg_exact_root",
+        different,
+        "supervisor",
+        "delivered"
+      )
+
+    :ok = Bubble.recognize_terminal(ctx.db, different)
+    assert [[_, ^different_ref, _, _, _]] = notice_turn(ctx.db, "supervisor")
+
+    prior = fail_assigned_turn!(ctx.db, "holder", "asg_exact_root")
+
+    :ok =
+      insert_controller!(
+        ctx.db,
+        "w_prior_root",
+        "asg_exact_root",
+        prior,
+        "supervisor",
+        "failed"
+      )
+
+    :ok = Bubble.recognize_terminal(ctx.db, prior)
+    prior_ref = "bubble:#{prior}"
+
+    assert [[_, ^prior_ref, _, _, _]] = notice_turn(ctx.db, ctx.main.session_key)
   end
 
   test "a failed turn bubbles to the operational parent, not the spawning session", ctx do
@@ -126,6 +292,48 @@ defmodule Tightbeam.Productions.BubbleTest do
              notice_turn(ctx.db, operational_supervisor.session_key)
 
     assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+  end
+
+  test "an open incident suppresses only its affected harness", ctx do
+    assert {:opened, _incident} =
+             HarnessHealth.observe(ctx.db, %{
+               correlation_id: "bubble-rate-limit",
+               harness: "claude",
+               host: "testhost",
+               failure_class: "rate-limit-dead",
+               evidence_kind: "authoritative-provider",
+               session_key: ctx.holder.session_key,
+               assignment_id: nil,
+               observed_at: 1,
+               cause: "provider rate limit",
+               principal: "process:tightbeam"
+             })
+
+    affected_seq = fail_turn!(ctx.db, ctx.holder.session_key)
+    :ok = Bubble.recognize_terminal(ctx.db, affected_seq)
+    assert notice_turn(ctx.db, ctx.supervisor.session_key) == []
+
+    healthy =
+      Org.create(ctx.db, %{
+        session_key: "healthy-holder",
+        display_name: "Healthy holder",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        host: "healthy-host",
+        model: Model.new("fable"),
+        spawned_by: ctx.supervisor.session_key,
+        operational_parent: ctx.supervisor.session_key
+      })
+
+    healthy_seq = fail_turn!(ctx.db, healthy.session_key)
+    :ok = Bubble.recognize_terminal(ctx.db, healthy_seq)
+    healthy_ref = "bubble:#{healthy_seq}"
+
+    assert [[_, ^healthy_ref, _, _, _]] =
+             notice_turn(ctx.db, ctx.supervisor.session_key)
   end
 
   test "a canceled cause turn never bubbles — cancellation is a decision", ctx do
@@ -182,10 +390,10 @@ defmodule Tightbeam.Productions.BubbleTest do
 
     assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
 
-    {:ok, [[alert_content]]} =
+    {:ok, [[alert_content, "substrate"]]} =
       DB.query(
         ctx.db,
-        "SELECT content FROM messages WHERE sessionKey = ?1 AND content LIKE '[no agent can act]%'",
+        "SELECT content,messageType FROM messages WHERE sessionKey = ?1 AND content LIKE '[no agent can act]%'",
         [ctx.main.session_key]
       )
 
@@ -409,5 +617,52 @@ defmodule Tightbeam.Productions.BubbleTest do
       end)
 
     assert {:error, %{code: "reserved_kind"}} = refused
+  end
+
+  test "terminal lineage exhaustion transfers cannot-proceed disposition to the alerted user",
+       ctx do
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "agent:#{ctx.main.session_key}",
+        principal: {:session, ctx.main.session_key},
+        session_key: "holder",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "terminal disposer transfer", idempotency_key: nil, work_item_id: nil}
+      })
+
+    blocked =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        origin: "agent:holder",
+        principal: {:session, "holder"},
+        session_key: nil,
+        params: %{
+          assignment_id: assignment.id,
+          kind: "cannot-proceed",
+          note: "the opener lineage is exhausted"
+        }
+      })
+
+    cause_seq = fail_assigned_turn!(ctx.db, ctx.main.session_key, assignment.id)
+    assert :ok = Bubble.recognize_terminal(ctx.db, cause_seq)
+
+    assert {:ok, [["user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert %{outcome: "revoked"} =
+             Assignments.__handle__(ctx.db, "revoke-assignment", %{
+               verb: "revoke-assignment",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: nil,
+               params: %{assignment_id: assignment.id, reason: "terminal disposition"}
+             })
   end
 end

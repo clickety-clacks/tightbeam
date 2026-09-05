@@ -34,12 +34,16 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     })
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+      )
 
     ensure_main_session(db, "flynn")
 
     holder = session(db, "impl-holder", "coder", "claude", "anthropic")
     owner = session(db, "po-holder", "product-owner", "codex", "openai")
+    orchestrator = session(db, "slice-orchestrator", "orchestrator", "codex", "openai")
     Roles.create!(db, "product-owner", "flynn", owner.session_key)
 
     start_supervised!(
@@ -63,7 +67,15 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       :persistent_term.erase(Archetypes)
     end)
 
-    %{db: db, handlers: handlers, holder: holder, owner: owner, rules: rules, base_dir: base_dir}
+    %{
+      db: db,
+      handlers: handlers,
+      holder: holder,
+      owner: owner,
+      orchestrator: orchestrator,
+      rules: rules,
+      base_dir: base_dir
+    }
   end
 
   defp session(db, key, archetype, harness, provider) do
@@ -94,10 +106,40 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
           }),
         else: params
 
-    WorkItems.__handle__(ctx.db, "work-item-create", %{
-      principal: {:user, "flynn"},
-      params: params
-    })
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, "flynn"},
+        params: params
+      })
+
+    rule_posture!(ctx, item)
+    item
+  end
+
+  # The posture gate (implementation-requires-posture) refuses a coder card on a
+  # work item nobody has ruled heavy or light. These tests are about the SPIRIT
+  # edge and the doorbell, so the org's orchestrator rules posture up front, as it
+  # would in life.
+  defp rule_posture!(ctx, item) do
+    {:ok, slice} =
+      Dispatch.dispatch(ctx.db, ctx.handlers, %{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: ctx.orchestrator.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "orchestrate #{item.id}", work_item_id: item.id}
+      })
+
+    {:ok, _} =
+      Dispatch.dispatch(
+        ctx.db,
+        ctx.handlers,
+        verdict_call(ctx.orchestrator.session_key, slice.id, "posture-light", "test slice")
+      )
+
+    :ok
   end
 
   defp dispatch_call(holder_key, item_id, subject) do

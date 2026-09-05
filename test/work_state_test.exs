@@ -22,7 +22,7 @@ defmodule Tightbeam.WorkStateTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1), ('other', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
     Enum.each(~w(flynn other), &ensure_main_session(db, &1))
@@ -404,6 +404,7 @@ defmodule Tightbeam.WorkStateTest do
     result =
       handlers["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: "retiring",
         params: %{}
       })
@@ -496,7 +497,7 @@ defmodule Tightbeam.WorkStateTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{assignment_id: assignment_id},
+      params: %{assignment_id: assignment_id, reason: "test revocation"},
       on_assignment_change: ctx.assignment_change
     })
   end

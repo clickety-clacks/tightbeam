@@ -5,7 +5,7 @@ WALLS, not wisdom: never rely on a desk's judgment to know its own boundary. Thi
 document is the seed's rule template for desk-archetype sessions — an org arms it
 as ordinary law, and may loosen it the same way. The archetype-keyed enforcement
 mechanism (deterministic refusal by session + archetype, rule named) is substrate
-work that arrives with its own build card; until it lands, this matrix binds as
+work that arrives with its own work card; until it lands, this matrix binds as
 written law: the org refuses by convention, and every breach is specimen material
 Miller's probes count.
 
@@ -21,20 +21,20 @@ the seed exec archetype:
   is refused, rule named. Initiative stays with minds.
 - **No verdict-kind attests off-card.** No verdict-kind attest on any card the
   desk does not hold.
-- **No implementation cards.** A desk neither holds nor is assigned implementation
+- **No substance cards.** A desk neither holds nor is assigned substantive
   work. A card offering it substance is refused, not triaged.
 - **No completions off the delegation card.** The only lifecycle attests a desk
   files are its own, on its own card.
 
 One prohibition stays OUTSIDE the matrix on purpose: the semantic one. "No filing
-whose content accepts, rejects, or judges a work product" cannot be a rule without
+whose content accepts, rejects, or judges a work result" cannot be a rule without
 the substrate parsing content for judgment, so it binds as law-as-text — written
 on the delegation card, kept by the desk, audited by Miller's probes with breaches
 filed as specimens. A rule for the structure, a mind for the meaning.
 
 Three layers make the containment environmental, so no layer asks the desk to be
 wise: PROVISIONING — desk-class homes ship with no repository and only throwaway
-scratch (the archetype manifest's provisioning election; specced at fabric r5,
-lands with its build card); LAW — this matrix; AUDIT — desk overreach is a specimen
+scratch (the archetype manifest's provisioning election; defined at fabric r5,
+lands with its work card); LAW — this matrix; AUDIT — desk overreach is a specimen
 class, probed and counted. Loosening any line of the matrix is a lawful org
 amendment, made on the record — never a desk's own reading of its card.

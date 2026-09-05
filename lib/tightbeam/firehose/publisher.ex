@@ -3,7 +3,44 @@ defmodule Tightbeam.Firehose.Publisher do
 
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.{Hub, Registry}
-  alias Tightbeam.StateResources
+  alias Tightbeam.{ModelCatalog, StateResources}
+
+  @work_item_public_shape MapSet.new(
+                            ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason createdByUser createdBySession createdAt priority rowVersion)
+                          )
+
+  # Preserve only the exact result-shaped payloads already emitted on current main.
+  # Any additive drift still refuses at the shared Publisher boundary.
+  @message_public_shape MapSet.new(
+                          ~w(id seq sessionKey role messageType content timestamp sender deviceId clientMessageId replyToMessageId replyToClientMessageId llmVisibleMessageId attachments attentionTier rowVersion)
+                        )
+  @message_public_shape_without_type MapSet.delete(@message_public_shape, "messageType")
+  @session_public_shape MapSet.new(
+                          ~w(sessionKey displayName kind orderIndex isBuiltIn adopted ownerUserId origin spawnedBy handle archetype overrides identityName identityRevision harness provider model thinkingLevel modelContext host clearedThroughSeq state createdAt updatedAt mechanicalStatus rowVersion)
+                        )
+  @role_public_shape MapSet.new(
+                       ~w(role name boundSessionKey ownerUserId createdAt updatedAt rowVersion)
+                     )
+  @role_removed_shape MapSet.new(~w(removed))
+  @legacy_partial_shapes %{
+    "work_item.created" => [
+      MapSet.new(~w(id rowVersion)),
+      @work_item_public_shape
+    ],
+    "work_item.updated" => [
+      MapSet.new(~w(id ownerUserId rowVersion)),
+      MapSet.new(~w(id title ownerUserId updatedAt rowVersion)),
+      @work_item_public_shape
+    ],
+    "work_item.iceboxed" => [@work_item_public_shape],
+    "work_item.reopened" => [@work_item_public_shape],
+    "work_item.closed" => [@work_item_public_shape],
+    "work_item.failed" => [@work_item_public_shape],
+    "message.created" => [@message_public_shape, @message_public_shape_without_type],
+    "session.updated" => [@session_public_shape],
+    "role.created" => [@role_public_shape],
+    "role.removed" => [@role_public_shape, @role_removed_shape]
+  }
 
   @state_verbs %{
     "work-item-create" => {"work_item.created", &StateResources.work_item/1},
@@ -12,6 +49,8 @@ defmodule Tightbeam.Firehose.Publisher do
     "work-item-reopen" => {"work_item.reopened", &StateResources.work_item/1},
     "work-item-close" => {"work_item.closed", &StateResources.work_item/1},
     "work-item-fail" => {"work_item.failed", &StateResources.work_item/1},
+    "work-item-deprioritize" => {"work_item.deprioritized", &StateResources.work_item/1},
+    "work-item-boundary" => {"work_item.boundary_declared", &StateResources.work_item/1},
     "assign" => {"assignment.opened", &StateResources.assignment/1},
     "dispatch" => {"assignment.opened", &StateResources.assignment/1},
     "reopen-assignment" => {"assignment.reopened", &StateResources.assignment/1},
@@ -24,6 +63,9 @@ defmodule Tightbeam.Firehose.Publisher do
     "answer" => {"decision_request.ruled", &StateResources.decision_request/1},
     "rule" => {"decision_request.ruled", &StateResources.decision_request/1},
     "effort-rule" => {"decision_request.ruled", &StateResources.decision_request/1},
+    "operator-ask" => {"decision_request.opened", &StateResources.decision_request/1},
+    "operator-rule" => {"decision_request.ruled", &StateResources.decision_request/1},
+    "operator-withdraw" => {"decision_request.withdrawn", &StateResources.decision_request/1},
     "return" => {"decision_request.returned", &StateResources.decision_request/1},
     "withdraw" => {"decision_request.withdrawn", &StateResources.decision_request/1},
     "approve-device" => {"device.approved", &StateResources.device/1},
@@ -33,7 +75,6 @@ defmodule Tightbeam.Firehose.Publisher do
     "role-bind" => {"role.bound", &StateResources.role/1},
     "role-rm" => {"role.removed", &StateResources.role/1},
     "spawn" => {"session.spawned", &StateResources.session/1},
-    "retire" => {"session.retired", &StateResources.session/1},
     "add-user" => {"user.added", &StateResources.user/1},
     "read-marker-set" => {"read_marker.updated", &StateResources.read_marker/1},
     "read-marker-clear" => {"read_marker.updated", &StateResources.read_marker/1},
@@ -41,14 +82,14 @@ defmodule Tightbeam.Firehose.Publisher do
   }
 
   @transactional_verbs MapSet.new(
-                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer return rule effort-rule withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
+                         ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail work-item-deprioritize work-item-boundary assign dispatch attest reopen-assignment revoke-assignment wake condition artifact-record read-marker-set read-marker-clear critical role-create role-bind role-rm spawn retire ask answer return rule effort-rule operator-ask operator-rule operator-withdraw withdraw approve-device deny-device revoke-device add-user promote-user config host-env-set host-env-unset register-host identity-edit identity-relearn learn unlearn kungfu-scaffold)
                        )
 
   @spec accepted(map(), term()) :: :ok
-  def accepted(call, result), do: Hub.accepted(nil, call, result)
+  def accepted(call, result), do: Hub.accepted(hub(call), nil, call, result)
 
   @spec accepted(GenServer.server(), map(), term()) :: :ok
-  def accepted(db, call, result), do: Hub.accepted(db, call, result)
+  def accepted(db, call, result), do: Hub.accepted(hub(call), db, call, result)
 
   @spec transactional_verb?(String.t()) :: boolean()
   def transactional_verb?(verb), do: MapSet.member?(@transactional_verbs, verb)
@@ -63,8 +104,22 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
-    Txn.handoff(txn, Hub, {:accepted, nil, call, result})
+    Txn.handoff(txn, hub(call), {:accepted, nil, call, canonical_in_txn(txn, call, result)})
   end
+
+  defp canonical_in_txn(txn, %{verb: verb} = call, result)
+       when verb in ~w(work-item-create work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail) do
+    id = result[:id] || result["id"] || call.params[:work_item_id]
+    StateResources.query_work_item(txn, id, call) || result
+  end
+
+  defp canonical_in_txn(txn, %{verb: verb} = call, result)
+       when verb in ~w(assign dispatch reopen-assignment revoke-assignment) do
+    id = result[:id] || result["id"] || result[:assignment_id] || call.params[:assignment_id]
+    StateResources.query_assignment(txn, id, call) || result
+  end
+
+  defp canonical_in_txn(_txn, _call, result), do: result
 
   @spec maybe_accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def maybe_accepted_in_txn(%Txn{} = txn, %{firehose_in_txn: true} = call, result),
@@ -74,7 +129,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec observed_accepted_in_txn(Txn.t(), map()) :: :ok
   def observed_accepted_in_txn(%Txn{} = txn, call) do
-    Txn.handoff(txn, Hub, {:publish, observation_notice("verb.accepted", call)})
+    Txn.handoff(txn, hub(call), {:publish, observation_notice("verb.accepted", call)})
   end
 
   @spec maybe_observed_accepted_in_txn(Txn.t(), map()) :: :ok
@@ -95,15 +150,16 @@ defmodule Tightbeam.Firehose.Publisher do
   def capture_before(_db, call), do: call
 
   @spec denied(map(), map()) :: :ok
-  def denied(call, error), do: Hub.denied(call, error)
+  def denied(call, error), do: Hub.denied(hub(call), call, error)
 
   @spec denied_in_txn(Txn.t(), map(), map()) :: :ok
   def denied_in_txn(%Txn{} = txn, call, error) do
-    Txn.handoff(txn, Hub, {:denied, call, error})
+    Txn.handoff(txn, hub(call), {:denied, call, error})
   end
 
   @spec observed_accepted(map()) :: :ok
-  def observed_accepted(call), do: Hub.publish(observation_notice("verb.accepted", call))
+  def observed_accepted(call),
+    do: Hub.publish(hub(call), observation_notice("verb.accepted", call))
 
   @spec accepted_notices(GenServer.server() | nil, map(), term()) :: [map()]
   def accepted_notices(db, call, result) do
@@ -116,7 +172,17 @@ defmodule Tightbeam.Firehose.Publisher do
     case {call.verb, result} do
       {"attest", %{assignment: %{state: "closed", outcome: outcome} = assignment}}
       when outcome in ~w(completed surrendered revoked) ->
-        primary ++ [build("assignment.closed", call, assignment, &StateResources.assignment/1)]
+        canonical_assignment = canonical_assignment_result(db, call, assignment)
+
+        primary ++
+          [
+            build(
+              "assignment.closed",
+              call,
+              canonical_assignment,
+              &StateResources.assignment/1
+            )
+          ]
 
       _ ->
         primary
@@ -141,6 +207,66 @@ defmodule Tightbeam.Firehose.Publisher do
   @spec committed_in_txn(Txn.t(), String.t(), map(), map()) :: :ok
   def committed_in_txn(%Txn{} = txn, class, payload, refs \\ %{}) do
     Txn.handoff(txn, Hub, {:committed, class, payload, refs})
+  end
+
+  @doc "Queue one exact source-invalidation notice on its committing transaction."
+  @spec source_invalidation_in_txn(
+          Txn.t(),
+          GenServer.server(),
+          String.t(),
+          pos_integer(),
+          integer(),
+          map()
+        ) :: :ok
+  def source_invalidation_in_txn(
+        %Txn{} = txn,
+        hub,
+        class,
+        source_version,
+        occurred_at,
+        refs
+      ) do
+    Txn.handoff(
+      txn,
+      hub,
+      {:publish, source_invalidation_notice(class, source_version, occurred_at, refs)}
+    )
+  end
+
+  @doc false
+  @spec source_invalidation_notice(String.t(), pos_integer(), integer(), map()) :: map()
+  def source_invalidation_notice(class, source_version, occurred_at, refs)
+      when is_binary(class) and is_integer(source_version) and source_version > 0 and
+             is_integer(occurred_at) and is_map(refs) do
+    row =
+      case Registry.fetch_invalidation(class) do
+        {:ok, row} -> row
+        :error -> raise ArgumentError, "unregistered firehose source invalidation: #{class}"
+      end
+
+    actual_ref_set = refs |> Map.keys() |> Enum.sort()
+
+    unless actual_ref_set in row.ref_sets and
+             Enum.all?(refs, fn {_key, value} -> is_binary(value) and value != "" end) do
+      raise ArgumentError,
+            "firehose #{class} invalidation refs do not match the registry: " <>
+              "got=#{inspect(actual_ref_set)} allowed=#{inspect(row.ref_sets)}"
+    end
+
+    %{
+      "class" => class,
+      "op" => row.op,
+      "occurredAt" => occurred_at,
+      "refs" => refs,
+      "payload" => %{"sourceVersion" => source_version}
+    }
+  end
+
+  def source_invalidation_notice(class, source_version, occurred_at, refs) do
+    raise ArgumentError,
+          "invalid firehose source invalidation: class=#{inspect(class)} " <>
+            "sourceVersion=#{inspect(source_version)} occurredAt=#{inspect(occurred_at)} " <>
+            "refs=#{inspect(refs)}"
   end
 
   @doc "Queue the existing message-created notice on the transaction that appended it."
@@ -206,20 +332,60 @@ defmodule Tightbeam.Firehose.Publisher do
     Txn.handoff(txn, Hub, {:publish, notice})
   end
 
+  @doc "Queue one observational notice with the mutation's durable occurrence time."
+  @spec observation_in_txn(Txn.t(), String.t(), map(), map(), integer()) :: :ok
+  def observation_in_txn(%Txn{} = txn, class, payload, refs, occurred_at)
+      when is_integer(occurred_at) do
+    notice = %{
+      "class" => class,
+      "op" => "observe",
+      "occurredAt" => occurred_at,
+      "refs" => refs,
+      "payload" => StateResources.observation(payload)
+    }
+
+    Txn.handoff(txn, Hub, {:publish, notice})
+  end
+
   @doc false
-  def encode_wire_notice(%{"class" => class, "payload" => payload} = notice) do
+  def encode_wire_notice(notice), do: encode_wire_notice(notice, ModelCatalog.get())
+
+  @doc false
+  def encode_wire_notice(%{"class" => class, "payload" => payload} = notice, catalog)
+      when is_map(catalog) do
     case Registry.fetch(class) do
+      {:ok, %{resource: "productions"}} ->
+        JSON.encode!(notice)
+
       {:ok, %{resource: resource}} when is_map(payload) ->
-        if StateResources.admin_resource?(resource) do
-          bytes = StateResources.encode_admin_item(resource, payload)
-          JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
-        else
-          JSON.encode!(notice)
+        # Some current-main producers still publish result-shaped partial maps. Only a closed
+        # R7/R7a item is eligible for RawJSON; the shared encoder remains strict for REST parity.
+        cond do
+          StateResources.item_has_secret_fields?(payload) ->
+            raise ArgumentError, "#{resource} Publisher payload has a forbidden field"
+
+          StateResources.item_shape_complete?(resource, payload) ->
+            bytes = StateResources.encode_item(resource, payload, catalog)
+            JSON.encode!(Map.put(notice, "payload", %StateResources.RawJSON{bytes: bytes}))
+
+          permitted_legacy_payload?(class, payload) ->
+            JSON.encode!(notice)
+
+          true ->
+            raise ArgumentError,
+                  "#{resource} Publisher payload has no permitted legacy partial shape"
         end
 
       _ ->
         JSON.encode!(notice)
     end
+  end
+
+  def encode_wire_notice(notice, _catalog), do: JSON.encode!(notice)
+
+  defp permitted_legacy_payload?(class, payload) do
+    keys = MapSet.new(Map.keys(payload))
+    Enum.any?(Map.get(@legacy_partial_shapes, class, []), &MapSet.equal?(&1, keys))
   end
 
   @spec committed_notice(String.t(), map(), map()) :: map()
@@ -232,7 +398,7 @@ defmodule Tightbeam.Firehose.Publisher do
         Map.put_new(
           resolved,
           primary_ref,
-          projection[primary_ref] || projection["id"]
+          projection_primary_ref(projection, primary_ref)
         )
       end)
       |> Map.reject(fn {_key, value} -> is_nil(value) end)
@@ -248,6 +414,12 @@ defmodule Tightbeam.Firehose.Publisher do
       "payload" => projection
     }
   end
+
+  defp projection_primary_ref(projection, "turnSeq"),
+    do: projection["turnSeq"] || projection["seq"]
+
+  defp projection_primary_ref(projection, primary_ref),
+    do: projection[primary_ref] || projection["id"]
 
   @spec state_notice(map(), term()) :: map() | nil
   def state_notice(call, result), do: state_notice(nil, call, result)
@@ -282,6 +454,12 @@ defmodule Tightbeam.Firehose.Publisher do
 
   defp canonical_result(db, %{verb: verb} = call, result)
        when verb in ~w(assign dispatch reopen-assignment revoke-assignment) do
+    canonical_assignment_result(db, call, result)
+  end
+
+  defp canonical_assignment_result(nil, _call, result), do: result
+
+  defp canonical_assignment_result(db, call, result) do
     id = result[:id] || result["id"] || result[:assignment_id] || call.params[:assignment_id]
     StateResources.query_assignment(db, id, call) || result
   end
@@ -449,6 +627,8 @@ defmodule Tightbeam.Firehose.Publisher do
   defp principal({kind, value}) when is_binary(value), do: "#{kind}:#{value}"
   defp principal(value) when is_binary(value), do: value
   defp principal(_value), do: nil
+
+  defp hub(call), do: Map.get(call, :firehose_hub, Hub)
 
   defp require_primary_refs!(class, primary_refs, refs) do
     missing = Enum.reject(primary_refs, &(is_binary(refs[&1]) or is_integer(refs[&1])))

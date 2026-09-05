@@ -34,7 +34,10 @@ defmodule Tightbeam.VerificationPapertrailTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+      )
 
     ensure_main_session(db, "flynn")
 
@@ -330,7 +333,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     refute Enum.any?(
              EventLog.lifecycle_events(ctx.db),
-             &(&1.detail =~ "verification" or &1.kind =~ "verification")
+             &((is_binary(&1.detail) and &1.detail =~ "verification") or
+                 &1.kind =~ "verification")
            )
   end
 
@@ -349,6 +353,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
              "refix-requires-diagnosis",
              "code-review-requires-passing-tests",
              "spec-dispatch-requires-spirit",
+             "implementation-requires-posture",
+             "implementation-dispatch-requires-posture",
              "review-rounds-doorbell",
              @verification_rule,
              @artifact_rule

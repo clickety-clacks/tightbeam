@@ -106,7 +106,10 @@ defmodule Tightbeam.IdPrefixOperationsTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
+      )
 
     ensure_main_session(db, "flynn")
 
@@ -172,12 +175,17 @@ defmodule Tightbeam.IdPrefixOperationsTest do
         "INSERT INTO work_items (id, title, ownerUserId, createdByUser, createdAt) VALUES ('wi_race_alpha', 'alpha', 'flynn', 'flynn', 1)"
       )
 
+    completion_attest_id = completion_fixture!(ctx.db, "wi_race_alpha", "alpha")
+
     call = %{
       verb: "work-item-close",
       origin: "user:flynn",
       session_key: nil,
       principal: {:user, "flynn"},
-      params: %{work_item_id: "wi_race"},
+      params: %{
+        work_item_id: "wi_race",
+        completion_attest_id: completion_attest_id
+      },
       on_id_resolved_in_txn: fn txn, :work_item, "wi_race_alpha" ->
         Txn.q(
           txn,
@@ -206,6 +214,8 @@ defmodule Tightbeam.IdPrefixOperationsTest do
         )
     end
 
+    close_attest_id = completion_fixture!(ctx.db, "wi_life_close", "wi_life_close")
+
     call = fn verb, prefix, params ->
       WorkItems.__handle__(ctx.db, verb, %{
         verb: verb,
@@ -223,7 +233,9 @@ defmodule Tightbeam.IdPrefixOperationsTest do
              call.("work-item-reopen", "wi_life_i", %{})
 
     assert %{workItem: %{id: "wi_life_close", state: "closed"}} =
-             call.("work-item-close", "wi_life_c", %{})
+             call.("work-item-close", "wi_life_c", %{
+               completion_attest_id: close_attest_id
+             })
 
     assert %{workItem: %{id: "wi_life_fail", state: "failed", failReason: "broken"}} =
              call.("work-item-fail", "wi_life_f", %{reason: "broken"})
@@ -270,6 +282,58 @@ defmodule Tightbeam.IdPrefixOperationsTest do
     assert %{code: "unknown_work_item"} = call.("wi_missing")
     assert snapshot.() == before
     refute_received :unexpected_callback
+  end
+
+  defp completion_fixture!(db, work_item_id, title) do
+    {:ok, attest_id} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.create_work_item_in_txn(txn, work_item_id, title, 1)
+        suffix = Tightbeam.Id.uuid4()
+        assignment_id = "asg_" <> suffix
+        attest_id = "att_" <> suffix
+
+        Txn.q(
+          txn,
+          "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'close fixture','holder','flynn',1,'open',?2)",
+          [assignment_id, work_item_id]
+        )
+
+        :ok =
+          Tightbeam.DeliverableContract.bind_assignment_in_txn(
+            txn,
+            %{
+              id: assignment_id,
+              subject: "close fixture",
+              holderKey: "holder",
+              openedAt: 1,
+              workItemId: work_item_id
+            },
+            true
+          )
+
+        Txn.q(
+          txn,
+          "INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES (?1,?2,'completion','holder',2)",
+          [attest_id, assignment_id]
+        )
+
+        Txn.q(
+          txn,
+          "UPDATE assignments SET state='closed',outcome='completed',closedAt=2,closedBySession='holder',closingAttestId=?2 WHERE id=?1",
+          [assignment_id, attest_id]
+        )
+
+        :ok =
+          Tightbeam.DeliverableContract.record_completion_claim_in_txn(
+            txn,
+            assignment_id,
+            %{id: attest_id, ts: 2}
+          )
+
+        attest_id
+      end)
+
+    attest_id
   end
 
   test "public wake cancellation resolves only the caller's visible prefix", ctx do

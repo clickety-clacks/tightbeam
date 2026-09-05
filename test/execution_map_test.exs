@@ -48,6 +48,7 @@ defmodule Tightbeam.ExecutionMapTest do
   # telemetry builder reddens proof 2 rather than sliding in unreviewed.
   @node_keys Enum.sort(
                ~w(active assignments attests bracket1_armed closing_attests creation_context
+                  deliverableContract deliverable cardProductOwner closure
                   fail_reason fan_out finished_at id jobs minds open_decision_requests
                   origin parent since_progress_ms spec_ref_name spec_ref_sha256 started_at
                   state title turns)a
@@ -73,7 +74,7 @@ defmodule Tightbeam.ExecutionMapTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1),('kay',0,1),('root',1,1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
     Enum.each(~w(flynn kay root), &ensure_main_session(db, &1))
@@ -452,13 +453,53 @@ defmodule Tightbeam.ExecutionMapTest do
     # Driven through the real disposition writer, so the causal event under test
     # is the one production appends.
     item!(ctx.db, "wi_cycle")
+
+    {:ok, _deliverable_id} =
+      DB.transaction(ctx.db, fn txn ->
+        Tightbeam.DeliverableContract.create_work_item_in_txn(
+          txn,
+          "wi_cycle",
+          "Item wi_cycle",
+          @default_created
+        )
+      end)
+
     assert %{workItem: %{state: "iceboxed"}} = dispose(ctx.db, "work-item-icebox", "wi_cycle")
     assert %{workItem: %{state: "open"}} = dispose(ctx.db, "work-item-reopen", "wi_cycle")
 
     assert node(roster(ctx), "wi_cycle").finished_at == nil,
            "an OPEN item is unfinished even with prior transitions"
 
-    assert %{workItem: %{state: "closed"}} = dispose(ctx.db, "work-item-close", "wi_cycle")
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        principal: {:user, "flynn"},
+        origin: "user:flynn",
+        session_key: "s_holder",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{
+          subject: "finish cycle",
+          work_item_id: "wi_cycle",
+          delivers_work_item: true
+        }
+      })
+
+    completion =
+      Assignments.__handle__(ctx.db, "attest", %{
+        verb: "attest",
+        principal: {:session, "s_holder"},
+        origin: "agent:s_holder",
+        session_key: nil,
+        params: %{assignment_id: assignment.id, kind: "completion"}
+      })
+
+    assert %{workItem: %{state: "closed"}} =
+             dispose(ctx.db, "work-item-close", "wi_cycle", %{
+               completion_attest_id: completion.attest.id
+             })
+
     closed = node(roster(ctx), "wi_cycle")
     assert is_integer(closed.finished_at)
     assert closed.finished_at == disposition_at(ctx.db, "wi_cycle", "closed")
@@ -904,9 +945,17 @@ defmodule Tightbeam.ExecutionMapTest do
     session!(ctx.db, "s_real", "flynn")
     item!(ctx.db, "wi_routed")
 
+    base_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-toplines-router-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
     opts = [
       db: ctx.db,
-      base_dir: System.tmp_dir!(),
+      base_dir: base_dir,
       handlers: %{
         "toplines" => fn call -> ExecutionMap.roster(ctx.db, call) end,
         "topline" => fn call -> ExecutionMap.topline(ctx.db, call) end
@@ -1116,6 +1165,32 @@ defmodule Tightbeam.ExecutionMapTest do
   end
 
   defp close!(db, id, outcome, closing_attest_id) do
+    if outcome == "revoked" do
+      revocation_id = "revocation:#{id}"
+
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO assignment_revocations
+            (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+          VALUES (?1, ?2, ?3, 'flynn', NULL, 'execution-map test revocation')
+          """,
+          [revocation_id, id, @default_created + 1]
+        )
+
+      {:ok, _} =
+        DB.query(
+          db,
+          """
+          INSERT INTO assignment_revocation_generations
+            (revocationId, assignmentId, reopeningId)
+          VALUES (?1, ?2, NULL)
+          """,
+          [revocation_id, id]
+        )
+    end
+
     {:ok, _} =
       DB.query(
         db,
@@ -1247,13 +1322,13 @@ defmodule Tightbeam.ExecutionMapTest do
     key
   end
 
-  defp dispose(db, verb, id) do
+  defp dispose(db, verb, id, extra_params \\ %{}) do
     WorkItems.__handle__(db, verb, %{
       verb: verb,
       principal: {:user, "flynn"},
       origin: "user:flynn",
       session_key: nil,
-      params: %{work_item_id: id}
+      params: Map.put(extra_params, :work_item_id, id)
     })
   end
 

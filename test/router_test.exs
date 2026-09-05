@@ -32,7 +32,7 @@ defmodule Tightbeam.Wire.RouterTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
     ensure_main_session(db, device.user_id)
 
@@ -74,6 +74,17 @@ defmodule Tightbeam.Wire.RouterTest do
           do: %{code: call.params.return_code},
           else: %{workItem: %{id: call.params.work_item_id}, assignments: []}
       end,
+      "breathing" => fn call ->
+        send(parent, {:call, call})
+
+        %{
+          schema: "breathing-v1",
+          target: %{kind: call.params.target_kind, id: call.params.target_id},
+          breathing: false,
+          reason: "no_current_path",
+          evidence: %{}
+        }
+      end,
       "work-item-trace" => fn call ->
         send(parent, {:call, call})
         %{workItem: %{id: call.params.work_item_id}, assignments: [], timeline: []}
@@ -100,6 +111,18 @@ defmodule Tightbeam.Wire.RouterTest do
       "artifacts" => fn call ->
         send(parent, {:call, call})
         %{artifacts: []}
+      end,
+      "activation-status" => fn call ->
+        send(parent, {:call, call})
+        %{activation_id: call.params.activation_id, state: "declared", events: []}
+      end,
+      "activation-renotify" => fn call ->
+        send(parent, {:call, call})
+        %{event: %{kind: "notice-requeued"}}
+      end,
+      "activation-ack" => fn call ->
+        send(parent, {:call, call})
+        %{event: %{kind: "acknowledged"}}
       end,
       "identity-status" => fn call ->
         send(parent, {:call, call})
@@ -134,6 +157,12 @@ defmodule Tightbeam.Wire.RouterTest do
         base_dir: base_dir,
         handlers: handlers,
         cli_token: "tbc_test",
+        defaults: %{
+          host: "testhost",
+          harness: :claude,
+          provider: :anthropic,
+          model: Model.new("fable")
+        },
         session_status: fn _ -> nil end
       ]
     }
@@ -197,10 +226,89 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.status == 403
 
     assert JSON.decode!(response.resp_body) == %{
-             "error" => %{"code" => "forbidden", "message" => "admin required"}
+             "error" => %{
+               "code" => "forbidden",
+               "message" => "admin required"
+             }
            }
 
     assert Devices.user(db, "first") == nil
+  end
+
+  test "an empty org cannot use role or process identity to claim the first user", ctx do
+    {db, opts} = empty_router(ctx, "identity_bootstrap")
+
+    cases = [
+      {%{as: "unbound"}, 400,
+       %{"code" => "invalid_message", "message" => "unknown or unbound role: unbound"}},
+      {%{asProcess: "tightbeam"}, 403,
+       %{
+         "code" => "reserved_origin",
+         "message" => "process:tightbeam is reserved to the substrate"
+       }},
+      {%{asProcess: "installer"}, 403, %{"code" => "forbidden", "message" => "admin required"}}
+    ]
+
+    for {identity, status, error} <- cases do
+      response =
+        dispatch_cli(
+          %{ctx | opts: opts},
+          "tbc_test",
+          Map.merge(identity, %{verb: "add-user", params: %{userId: "first", isAdmin: true}})
+        )
+
+      assert response.status == status
+      assert JSON.decode!(response.resp_body) == %{"error" => error}
+      assert Devices.user(db, "first") == nil
+      assert Org.get(db, Org.personal_session_key("first")) == nil
+    end
+  end
+
+  test "loopback add-user reserves the first user and Main through the gateway", ctx do
+    {db, opts} = empty_router(ctx, "loopback_bootstrap")
+
+    response =
+      dispatch_cli(%{ctx | opts: opts}, "tbc_test", %{
+        verb: "add-user",
+        params: %{userId: "alice"}
+      })
+
+    assert response.status == 200
+
+    assert %{
+             "result" => %{
+               "phase" => "reserved",
+               "userId" => "alice",
+               "isAdmin" => true,
+               "rootSessionKey" => root
+             }
+           } = JSON.decode!(response.resp_body)
+
+    assert root == Org.personal_session_key("alice")
+    assert Devices.user(db, "alice").creation_kind == "gateway_local_bootstrap"
+  end
+
+  test "non-loopback add-user refuses before any database write", ctx do
+    {db, opts} = empty_router(ctx, "remote_bootstrap")
+
+    response =
+      conn(
+        :post,
+        "/agent/dispatch",
+        JSON.encode!(%{verb: "add-user", params: %{userId: "alice"}})
+      )
+      |> Map.put(:remote_ip, {10, 0, 0, 8})
+      |> put_req_header("authorization", "Bearer tbc_test")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 403
+
+    assert JSON.decode!(response.resp_body) == %{
+             "error" => %{"code" => "forbidden", "message" => "local bootstrap required"}
+           }
+
+    assert Devices.user(db, "alice") == nil
   end
 
   test "authenticated harness projection route returns the registry bytes", ctx do
@@ -234,6 +342,127 @@ defmodule Tightbeam.Wire.RouterTest do
     assert is_integer(body["build"]) and body["build"] > 0
     assert body["build"] == Tightbeam.BuildStamp.build()
     assert body["sha"] == Tightbeam.BuildStamp.sha()
+    assert body["protocolVersion"] == 1
+    assert body["features"] == ["activation-events-v1"]
+  end
+
+  test "activation wire verbs are non-target calls with camel-case params", ctx do
+    response =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-status",
+        asUser: "flynn",
+        params: %{activationId: "act_example"}
+      })
+
+    assert response.status == 200
+    assert_receive {:call, call}
+    assert call.verb == "activation-status"
+    assert call.principal == {:user, "flynn"}
+    assert call.params == %{activation_id: "act_example"}
+
+    refused =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-status",
+        asUser: "flynn",
+        sessionKey: Org.personal_session_key("flynn"),
+        params: %{activationId: "act_example"}
+      })
+
+    assert refused.status == 400
+    assert JSON.decode!(refused.resp_body)["error"]["code"] == "invalid_message"
+  end
+
+  test "activation wire rejects substrate-owned fields and accepts the two wake references",
+       ctx do
+    actual_status =
+      Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})
+      |> Map.take(["activation-status"])
+
+    actual_ctx = %{
+      ctx
+      | opts:
+          Keyword.update!(ctx.opts, :handlers, fn handlers ->
+            Map.merge(handlers, actual_status)
+          end)
+    }
+
+    owned_fields = [
+      %{eventId: "aev_forged"},
+      %{bySession: "forged-session"},
+      %{byUser: "forged-user"},
+      %{principal: "user:forged"},
+      %{workItemId: "wi_forged"},
+      %{requestSha256: String.duplicate("a", 64)},
+      %{noticeWakeId: "w_forged"},
+      %{seq: 7},
+      %{ts: 8}
+    ]
+
+    Enum.each(owned_fields, fn supplied ->
+      response =
+        dispatch_cli(actual_ctx, "tbc_test", %{
+          verb: "activation-status",
+          asUser: "flynn",
+          params: Map.merge(%{activationId: "act_example"}, supplied)
+        })
+
+      assert response.status == 400
+      assert JSON.decode!(response.resp_body)["error"]["code"] == "invalid_activation_payload"
+    end)
+
+    renotify =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-renotify",
+        asUser: "flynn",
+        params: %{
+          activationId: "act_example",
+          predecessorEventId: "aev_head",
+          noticedEventId: "aev_noticed",
+          replacesWakeId: "w_canceled",
+          idempotencyKey: "renotify-key"
+        }
+      })
+
+    assert renotify.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "activation-renotify",
+                      params: %{
+                        activation_id: "act_example",
+                        predecessor_event_id: "aev_head",
+                        noticed_event_id: "aev_noticed",
+                        replaces_wake_id: "w_canceled",
+                        idempotency_key: "renotify-key"
+                      }
+                    }}
+
+    acknowledged =
+      dispatch_cli(ctx, "tbc_test", %{
+        verb: "activation-ack",
+        asUser: "flynn",
+        params: %{
+          activationId: "act_example",
+          predecessorEventId: "aev_requeued",
+          noticedEventId: "aev_noticed",
+          acknowledgedWakeId: "w_fired",
+          idempotencyKey: "ack-key"
+        }
+      })
+
+    assert acknowledged.status == 200
+
+    assert_receive {:call,
+                    %{
+                      verb: "activation-ack",
+                      params: %{
+                        activation_id: "act_example",
+                        predecessor_event_id: "aev_requeued",
+                        noticed_event_id: "aev_noticed",
+                        acknowledged_wake_id: "w_fired",
+                        idempotency_key: "ack-key"
+                      }
+                    }}
   end
 
   test "the change socket requires protocolVersion 1 at upgrade", ctx do
@@ -1045,7 +1274,7 @@ defmodule Tightbeam.Wire.RouterTest do
       })
 
     assert union.status == 400
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM events")
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM events")
 
     forbidden =
       dispatch_cli(ctx, "tbc_test", %{
@@ -1629,6 +1858,20 @@ defmodule Tightbeam.Wire.RouterTest do
     |> put_req_header("authorization", "Bearer #{bearer}")
     |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp empty_router(ctx, label) do
+    db = :"#{label}_#{System.unique_integer([:positive])}"
+    start_supervised!(%{id: db, start: {DB, :start_link, [[path: ":memory:", name: db]]}})
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    opts =
+      Keyword.merge(ctx.opts,
+        db: db,
+        handlers: Gateway.handlers(%{db: db, base_dir: ctx.base_dir})
+      )
+
+    {db, opts}
   end
 
   # INVARIANT: a non-ok session-control response always carries a code.

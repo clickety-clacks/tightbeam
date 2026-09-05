@@ -1,7 +1,7 @@
 defmodule Tightbeam.JobTrace do
   @moduledoc "Pinned, read-only work-item trace artifact."
 
-  alias Tightbeam.{CausalEvents, DB, Escalation}
+  alias Tightbeam.{Activations, CausalEvents, DB, Escalation}
 
   defmodule MissingCancellationProvenance do
     @moduledoc false
@@ -22,24 +22,32 @@ defmodule Tightbeam.JobTrace do
     "wake_canceled" => 3,
     "decision_request" => 4,
     "causal_event" => 5,
-    "effort_generation" => 6,
-    "attest" => 7,
-    "turn_end" => 8
+    "activation_event" => 6,
+    "effort_generation" => 7,
+    "attest" => 8,
+    "completion_escalation" => 9,
+    "completion_escalation_event" => 10,
+    "turn_end" => 11
   }
 
   @spec build(DB.server(), map()) :: map()
   def build(db, item) do
     assignments = assignments(db, item.id)
     assignment_ids = Enum.map(assignments, & &1.id)
+    {completion_entries, completion_ids} = completion_entries(db, item.id, assignment_ids)
 
-    %{
-      workItem: %{
+    work_item =
+      %{
         id: item.id,
         ownerUserId: item.ownerUserId,
         state: item.state,
         failReason: item.failReason,
         title: item.title
-      },
+      }
+      |> Map.merge(Tightbeam.DeliverableContract.work_item_projection(db, item.id))
+
+    %{
+      workItem: work_item,
       assignments: assignments,
       timeline:
         (turn_entries(db, item.id) ++
@@ -47,12 +55,157 @@ defmodule Tightbeam.JobTrace do
            wake_entries(db, item.id, assignment_ids) ++
            decision_entries(db, assignment_ids) ++
            effort_entries(db, assignment_ids) ++
-           causal_entries(db, item.id, assignment_ids))
+           causal_entries(db, item.id, assignment_ids) ++
+           Activations.trace_entries(db, item.id) ++
+           completion_entries ++
+           completion_event_entries(db, completion_ids))
         |> Enum.sort_by(fn entry ->
           {entry.at, Map.fetch!(@type_rank, entry.type), entry.id}
         end)
     }
   end
+
+  defp completion_entries(db, work_item_id, assignment_ids) do
+    {assignment_filter, params} =
+      case assignment_ids do
+        [] ->
+          {"0", [work_item_id]}
+
+        ids ->
+          clause =
+            ids
+            |> Enum.with_index(2)
+            |> Enum.map_join(", ", fn {_id, index} -> "?#{index}" end)
+
+          {"assignmentId IN (#{clause})", [work_item_id | ids]}
+      end
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, assignmentId, workItemId, causeKind, causeId, closingAttestId,
+               revocationId, outcome, childSessionKey, causeBySession, causeByUser,
+               status, currentRecipientSessionKey, currentRecipientUserId,
+               recipientGeneration, recipientReissueCount, recipientReissueLimit,
+               decision, actedBySession, actedByUser, supersededReason,
+               supersededByAssignmentId, createdAt, actedAt, supersededAt
+        FROM completion_escalations
+        WHERE workItemId=?1 OR #{assignment_filter}
+        ORDER BY createdAt,id
+        """,
+        params
+      )
+
+    entries =
+      Enum.flat_map(rows, fn [
+                               id,
+                               assignment_id,
+                               item_id,
+                               cause_kind,
+                               cause_id,
+                               attest_id,
+                               revocation_id,
+                               outcome,
+                               child,
+                               cause_session,
+                               cause_user,
+                               status,
+                               recipient_session,
+                               recipient_user,
+                               recipient_generation,
+                               recipient_reissue_count,
+                               recipient_reissue_limit,
+                               decision,
+                               acted_session,
+                               acted_user,
+                               superseded_reason,
+                               superseded_assignment,
+                               created_at,
+                               acted_at,
+                               superseded_at
+                             ] ->
+        base = %{
+          type: "completion_escalation",
+          completionId: id,
+          assignmentId: assignment_id,
+          workItemId: item_id,
+          causeKind: cause_kind,
+          causeId: cause_id,
+          closingAttestId: attest_id,
+          revocationId: revocation_id,
+          outcome: outcome,
+          childSessionKey: child,
+          causePrincipal: acting_principal(cause_session, cause_user),
+          currentStatus: status,
+          currentRecipient: acting_principal(recipient_session, recipient_user),
+          recipientGeneration: recipient_generation,
+          recipientReissueCount: recipient_reissue_count,
+          recipientReissueLimit: recipient_reissue_limit,
+          decision: decision,
+          actingPrincipal: acting_principal(acted_session, acted_user),
+          supersededReason: superseded_reason,
+          supersededByAssignmentId: superseded_assignment
+        }
+
+        opened = Map.merge(base, %{id: "#{id}:opened", at: created_at, phase: "opened"})
+
+        terminal =
+          case status do
+            "superseded" ->
+              [Map.merge(base, %{id: "#{id}:superseded", at: superseded_at, phase: "superseded"})]
+
+            terminal when terminal in ["acknowledged", "retained_root"] ->
+              [Map.merge(base, %{id: "#{id}:#{terminal}", at: acted_at, phase: terminal})]
+
+            _ ->
+              []
+          end
+
+        [opened | terminal]
+      end)
+
+    {entries, Enum.map(rows, &hd/1)}
+  end
+
+  defp completion_event_entries(_db, []), do: []
+
+  defp completion_event_entries(db, completion_ids) do
+    {clause, params} = in_clause(completion_ids)
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id,ts,subject,kind,detail
+        FROM lifecycle_events
+        WHERE subject IN (#{clause})
+          AND kind IN ('completion_escalation_opened','completion_escalation_reissued',
+                       'completion_escalation_superseded','completion_escalation_acknowledged',
+                       'completion_escalation_undeliverable',
+                       'completion_escalation_cross_owner_lineage',
+                       'completion_escalation_state_inconsistent',
+                       'completion_escalation_retire_deferred',
+                       'completion_escalation_park_failed')
+        """,
+        params
+      )
+
+    Enum.map(rows, fn [id, at, completion_id, kind, detail] ->
+      %{
+        id: "le:#{id}",
+        at: at,
+        type: "completion_escalation_event",
+        completionId: completion_id,
+        kind: kind,
+        detail: detail
+      }
+    end)
+  end
+
+  defp acting_principal(session, nil) when is_binary(session), do: "session:#{session}"
+  defp acting_principal(nil, user) when is_binary(user), do: "user:#{user}"
+  defp acting_principal(nil, nil), do: nil
 
   # causal_events carry their own monotonic seq; `seqTiebreak` exposes it so two
   # events sharing a millisecond still read in commit order.
@@ -96,7 +249,7 @@ defmodule Tightbeam.JobTrace do
       )
 
     Enum.map(rows, fn [id, holder, opened_user, opened_session, state, reviews] ->
-      %{
+      assignment = %{
         id: id,
         holderKey: holder,
         openerRef: opener_ref(opened_user, opened_session),
@@ -104,6 +257,11 @@ defmodule Tightbeam.JobTrace do
         files: assignment_files(db, id),
         reviewsAssignmentId: reviews
       }
+
+      Map.merge(
+        assignment,
+        Tightbeam.DeliverableContract.assignment_projection(db, id)
+      )
     end)
   end
 
@@ -180,7 +338,7 @@ defmodule Tightbeam.JobTrace do
       )
 
     Enum.map(rows, fn [id, assignment_id, kind, verdict, commit_refs, at] ->
-      %{
+      entry = %{
         at: at,
         type: "attest",
         id: id,
@@ -189,6 +347,12 @@ defmodule Tightbeam.JobTrace do
         verdict: verdict,
         commitRefs: decode(commit_refs)
       }
+
+      Map.put(
+        entry,
+        :deliverableClaim,
+        Tightbeam.DeliverableContract.attest_claim_projection(db, id)
+      )
     end)
   end
 
@@ -204,7 +368,8 @@ defmodule Tightbeam.JobTrace do
                c.replacementWakeId, c.dispositionKind, c.dispositionId,
                c.primaryWorkKind, c.primaryWorkId, c.workImpactKind,
                c.livenessTriggerKind, c.livenessTriggerId, c.actionNeeded,
-               (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0)
+               (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0),
+               (SELECT o.role FROM effort_checkin_wake_ownership AS o WHERE o.wakeId = w.wakeId)
         FROM (
           SELECT w.*, w.rowid AS rid,
                  CASE WHEN w.firedBy = 'condition' THEN (
@@ -261,7 +426,8 @@ defmodule Tightbeam.JobTrace do
                    c.replacementWakeId, c.dispositionKind, c.dispositionId,
                    c.primaryWorkKind, c.primaryWorkId, c.workImpactKind,
                    c.livenessTriggerKind, c.livenessTriggerId, c.actionNeeded,
-                   (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0)
+                   (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0),
+                   (SELECT o.role FROM effort_checkin_wake_ownership AS o WHERE o.wakeId = w.wakeId)
             FROM wakes AS w
             JOIN links ON links.wakeId = w.wakeId
             LEFT JOIN wake_cancellations AS c ON c.wakeId=w.wakeId
@@ -270,7 +436,50 @@ defmodule Tightbeam.JobTrace do
           )
       end
 
-    (item_wakes ++ assignment_wakes)
+    {completion_filter, completion_params} =
+      case assignment_ids do
+        [] ->
+          {"ce.workItemId=?1", [work_item_id]}
+
+        ids ->
+          clause =
+            ids
+            |> Enum.with_index(2)
+            |> Enum.map_join(", ", fn {_id, index} -> "?#{index}" end)
+
+          {"(ce.workItemId=?1 OR ce.assignmentId IN (#{clause}))", [work_item_id | ids]}
+      end
+
+    completion_wakes =
+      wake_rows(
+        db,
+        """
+        SELECT w.wakeId, ce.assignmentId, w.createdAt, w.dueAt, w.firedAt, w.firedBy,
+               CASE WHEN w.firedBy = 'condition' THEN (
+                 SELECT f.ts FROM condition_facts AS f
+                 WHERE f.id > w.conditionAfterId
+                   AND f.kind = w.conditionKind
+                   AND (w.conditionScope IS NULL OR f.scope = w.conditionScope)
+                 ORDER BY f.id ASC LIMIT 1
+               ) END,
+               w.canceledAt, w.rowid, w.origin,
+               c.canceledAt, c.requesterKind, c.requesterId, c.reasonKind,
+               c.causalSourceKind, c.causalSourceId, c.outcomeKind,
+               c.replacementWakeId, c.dispositionKind, c.dispositionId,
+               c.primaryWorkKind, c.primaryWorkId, c.workImpactKind,
+               c.livenessTriggerKind, c.livenessTriggerId, c.actionNeeded,
+               (SELECT activatedAt FROM supervision_liveness_epoch WHERE id=0),
+               (SELECT o.role FROM effort_checkin_wake_ownership AS o WHERE o.wakeId = w.wakeId)
+        FROM completion_escalation_wakes AS cew
+        JOIN completion_escalations AS ce ON ce.id=cew.completionId
+        JOIN wakes AS w ON w.wakeId=cew.wakeId
+        LEFT JOIN wake_cancellations AS c ON c.wakeId=w.wakeId
+        WHERE #{completion_filter}
+        """,
+        completion_params
+      )
+
+    (item_wakes ++ assignment_wakes ++ completion_wakes)
     |> Map.new(fn {wake_id, entries} -> {wake_id, entries} end)
     |> Map.values()
     |> List.flatten()
@@ -306,14 +515,16 @@ defmodule Tightbeam.JobTrace do
                         liveness_trigger_kind,
                         liveness_trigger_id,
                         action_needed,
-                        activated_at
+                        activated_at,
+                        effort_role
                       ] ->
       scheduled = %{
         at: created,
         type: "wake_scheduled",
         id: id,
         assignmentId: assignment_id,
-        dueAt: due
+        dueAt: due,
+        effortRole: effort_role
       }
 
       fired_entry =
@@ -325,7 +536,8 @@ defmodule Tightbeam.JobTrace do
               id: id,
               assignmentId: assignment_id,
               firedBy: fired_by,
-              matchedFactAt: matched_fact_at
+              matchedFactAt: matched_fact_at,
+              effortRole: effort_role
             }
           ]
         else
@@ -365,7 +577,8 @@ defmodule Tightbeam.JobTrace do
               type: "wake_canceled",
               id: id,
               assignmentId: assignment_id,
-              reason: nil
+              reason: nil,
+              effortRole: effort_role
             })
           ]
         else
@@ -517,21 +730,36 @@ defmodule Tightbeam.JobTrace do
       DB.query(
         db,
         """
-        SELECT assignmentId, generation, state, evidence, armedAt
+        SELECT assignmentId, generation, state, evidence, armedAt,
+               retiredAt, retiredOutcome, retiredCause, retiredPrincipal
         FROM effort_checkin_generations
         WHERE assignmentId IN (#{clause})
         """,
         params
       )
 
-    Enum.map(rows, fn [assignment_id, generation, state, evidence, at] ->
+    Enum.map(rows, fn [
+                        assignment_id,
+                        generation,
+                        state,
+                        evidence,
+                        at,
+                        retired_at,
+                        retired_outcome,
+                        retired_cause,
+                        retired_principal
+                      ] ->
       %{
         at: at,
         type: "effort_generation",
         id: "gen:#{assignment_id}:#{generation}",
         assignmentId: assignment_id,
         state: state,
-        evidence: decode(evidence)
+        evidence: decode(evidence),
+        retiredAt: retired_at,
+        retiredOutcome: retired_outcome,
+        retiredCause: retired_cause,
+        retiredPrincipal: retired_principal
       }
     end)
   end

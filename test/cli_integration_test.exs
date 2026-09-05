@@ -5,17 +5,10 @@ defmodule Tightbeam.CliIntegrationTest do
   @moduletag :cli_integration
 
   alias Tightbeam.{
-    Assets,
     Archetypes,
-    Assignments,
     CliCompatibility,
-    ConditionFacts,
     DB,
-    Devices,
-    Escalation,
-    EventLog,
     Gateway,
-    Idempotency,
     Ledger,
     Org,
     Projection,
@@ -23,9 +16,7 @@ defmodule Tightbeam.CliIntegrationTest do
     Rails,
     Roles,
     Rules,
-    Wakes,
-    WorkItems,
-    WorkState
+    Wakes
   }
 
   alias Tightbeam.Wire.Router
@@ -74,7 +65,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
       )
 
     main_key = Org.personal_session_key("flynn")
@@ -200,6 +191,283 @@ defmodule Tightbeam.CliIntegrationTest do
     assert version == CliCompatibility.required_version()
   end
 
+  test "A22 real completion smoke delivers both notices and retains from the exact parent", ctx do
+    main_key = Org.personal_session_key("flynn")
+
+    parent =
+      completion_session!(ctx.db, "a22-parent", main_key)
+
+    child =
+      completion_session!(ctx.db, "a22-child", parent.session_key)
+
+    report =
+      completion_session!(ctx.db, "a22-report", main_key)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('a22-admin',1,'admin_add',1)"
+      )
+
+    child_dir = session_workdir!(ctx, child)
+    parent_dir = session_workdir!(ctx, parent)
+    report_dir = session_workdir!(ctx, report)
+
+    {work_json, 0} =
+      System.cmd(ctx.binary, ["work-item-create", "--title", "A22 real completion smoke"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    work_item_id = JSON.decode!(work_json)["id"]
+
+    dispatch_args = [
+      "dispatch",
+      "--holder",
+      child.session_key,
+      "--subject",
+      "Complete the A22 smoke",
+      "--brief",
+      "File completion so the exact parent can retain.",
+      "--work-item",
+      work_item_id,
+      "--key",
+      "a22-real-completion",
+      "--report-to",
+      report.session_key
+    ]
+
+    {rumination_json, 0} =
+      System.cmd(ctx.binary, dispatch_args, cd: ctx.workdir, stderr_to_stdout: true)
+
+    assert JSON.decode!(rumination_json)["ruminationRequired"]
+
+    assert {:ok, [[rumination_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wakes WHERE rumination=1 AND work_item_id=?1 AND creatorSessionKey=?2",
+               [work_item_id, ctx.session.session_key]
+             )
+
+    deliver_completion_wake!(ctx, rumination_wake_id)
+
+    {assignment_json, 0} =
+      System.cmd(ctx.binary, dispatch_args, cd: ctx.workdir, stderr_to_stdout: true)
+
+    assignment_response = JSON.decode!(assignment_json)
+    assignment_id = assignment_response["id"] || assignment_response["assignment"]["id"]
+    assert is_binary(assignment_id), inspect(assignment_response)
+
+    {completion_json, 0} =
+      System.cmd(ctx.binary, ["attest", assignment_id, "--kind", "completion"],
+        cd: child_dir,
+        stderr_to_stdout: true
+      )
+
+    closing_attest_id = JSON.decode!(completion_json)["attest"]["id"]
+    parent_key = parent.session_key
+    report_key = report.session_key
+
+    assert {:ok,
+            [
+              [
+                completion_id,
+                ^closing_attest_id,
+                "open",
+                ^parent_key,
+                ^report_key
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT id,closingAttestId,status,parentSessionKey,reportToSessionKey FROM completion_escalations WHERE assignmentId=?1",
+               [assignment_id]
+             )
+
+    assert {:ok, wake_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT kind,wakeId FROM completion_escalation_wakes WHERE completionId=?1",
+               [completion_id]
+             )
+
+    wake_ids = Map.new(wake_rows, fn [kind, wake_id] -> {kind, wake_id} end)
+    deadline_wake_id = wake_ids["deadline"]
+    deliver_completion_wake!(ctx, wake_ids["parent-notice"])
+    deliver_completion_wake!(ctx, wake_ids["report-to-notice"])
+
+    {parent_read, 0} =
+      System.cmd(ctx.binary, ["completion-notices", "--status", "open"],
+        cd: parent_dir,
+        stderr_to_stdout: true
+      )
+
+    {report_read, 0} =
+      System.cmd(ctx.binary, ["completion-notices", "--status", "open"],
+        cd: report_dir,
+        stderr_to_stdout: true
+      )
+
+    {child_read, 0} =
+      System.cmd(ctx.binary, ["completion-notices", "--status", "open"],
+        cd: child_dir,
+        stderr_to_stdout: true
+      )
+
+    {owner_read, 0} = completion_notices_as_user(ctx, "flynn")
+    {admin_read, 0} = completion_notices_as_user(ctx, "a22-admin")
+
+    for body <- [parent_read, report_read, child_read, owner_read, admin_read] do
+      assert body =~ completion_id
+    end
+
+    {opener_read, 0} =
+      System.cmd(ctx.binary, ["completion-notices", "--status", "open"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    refute opener_read =~ completion_id
+
+    {report_denial, 1} =
+      System.cmd(
+        ctx.binary,
+        ["completion-disposition", completion_id, "--decision", "retain"],
+        cd: report_dir,
+        stderr_to_stdout: true
+      )
+
+    assert report_denial =~ "not_authorized"
+
+    {retained_json, 0} =
+      System.cmd(
+        ctx.binary,
+        ["completion-disposition", completion_id, "--decision", "retain"],
+        cd: parent_dir,
+        stderr_to_stdout: true
+      )
+
+    retained = JSON.decode!(retained_json)
+    assert retained["request"]["status"] == "acknowledged"
+    assert retained["request"]["decision"] == "retain"
+
+    {assignment_projection, 0} =
+      System.cmd(ctx.binary, ["assignments", "--session", child.session_key, "--state", "all"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert assignment_projection =~ assignment_id
+    assert assignment_projection =~ closing_attest_id
+
+    {trace_json, 0} =
+      System.cmd(ctx.binary, ["work-item-trace", work_item_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    timeline = JSON.decode!(trace_json)["timeline"]
+    completion_wake_ids = Map.values(wake_ids)
+
+    assert Enum.map(
+             Enum.filter(timeline, &(&1["type"] == "completion_escalation")),
+             & &1["phase"]
+           ) == ["opened", "acknowledged"]
+
+    assert Enum.map(
+             Enum.filter(timeline, &(&1["type"] == "completion_escalation_event")),
+             & &1["kind"]
+           ) == ["completion_escalation_opened", "completion_escalation_acknowledged"]
+
+    assert timeline
+           |> Enum.filter(&(&1["type"] == "wake_fired" and &1["id"] in completion_wake_ids))
+           |> Enum.map(& &1["id"])
+           |> Enum.sort() ==
+             Enum.sort([wake_ids["parent-notice"], wake_ids["report-to-notice"]])
+
+    assert timeline
+           |> Enum.filter(&(&1["type"] == "wake_canceled" and &1["id"] in completion_wake_ids))
+           |> Enum.map(& &1["id"]) == [wake_ids["deadline"]]
+
+    assert {:ok, message_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey,content FROM messages WHERE content LIKE ?1 ORDER BY sessionKey",
+               ["%completionId=#{completion_id}%"]
+             )
+
+    assert Enum.map(message_rows, &hd/1) == Enum.sort([parent.session_key, report.session_key])
+    refute Enum.any?(message_rows, &(hd(&1) == ctx.session.session_key))
+
+    assert {:ok, turn_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,sessionKey FROM turns WHERE wakeId IN (?1,?2) ORDER BY wakeId",
+               [wake_ids["parent-notice"], wake_ids["report-to-notice"]]
+             )
+
+    assert Enum.sort(Enum.map(turn_rows, &List.last/1)) ==
+             Enum.sort([parent.session_key, report.session_key])
+
+    assert {:ok, wake_states} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId,state FROM wakes WHERE wakeId IN (?1,?2,?3) ORDER BY wakeId",
+               [wake_ids["parent-notice"], wake_ids["report-to-notice"], wake_ids["deadline"]]
+             )
+
+    assert Map.new(wake_states, fn [wake_id, state] -> {wake_id, state} end) == %{
+             wake_ids["parent-notice"] => "fired",
+             wake_ids["report-to-notice"] => "fired",
+             wake_ids["deadline"] => "canceled"
+           }
+
+    assert {:ok, [[^deadline_wake_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT wakeId FROM wake_cancellations WHERE wakeId IN (?1,?2,?3)",
+               [wake_ids["parent-notice"], wake_ids["report-to-notice"], wake_ids["deadline"]]
+             )
+
+    assert {:ok, lifecycle_rows} =
+             DB.query(
+               ctx.db,
+               "SELECT kind,subject FROM lifecycle_events WHERE subject=?1 ORDER BY rowid",
+               [completion_id]
+             )
+
+    assert lifecycle_rows == [
+             ["completion_escalation_opened", completion_id],
+             ["completion_escalation_acknowledged", completion_id]
+           ]
+
+    IO.puts(
+      "A22_CAPTURE " <>
+        JSON.encode!(%{
+          assignmentId: assignment_id,
+          assignmentProjection: JSON.decode!(assignment_projection),
+          closingAttestId: closing_attest_id,
+          completionId: completion_id,
+          lifecycle: lifecycle_rows,
+          messages: message_rows,
+          retain: retained,
+          trace: timeline,
+          turns: turn_rows,
+          visibility: %{
+            admin: JSON.decode!(admin_read),
+            child: JSON.decode!(child_read),
+            opener: JSON.decode!(opener_read),
+            owner: JSON.decode!(owner_read),
+            parent: JSON.decode!(parent_read),
+            reportTo: JSON.decode!(report_read),
+            reportToDisposition: report_denial
+          },
+          wakes: wake_states,
+          workItemId: work_item_id
+        })
+    )
+  end
+
   test "version refusal is distinguishable from auth and network failures", ctx do
     session_file = Path.join(ctx.base_dir, "work/session/.tightbeam-session")
 
@@ -283,7 +551,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('other', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('other', 0, 'admin_add', 1)"
       )
 
     other_main_key = Org.personal_session_key("other")
@@ -371,7 +639,14 @@ defmodule Tightbeam.CliIntegrationTest do
     {revoked, 0} =
       System.cmd(
         ctx.binary,
-        ["revoke-assignment", assignment_id, "--as-user", "flynn"],
+        [
+          "revoke-assignment",
+          assignment_id,
+          "--reason",
+          "operator cleanup",
+          "--as-user",
+          "flynn"
+        ],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -502,7 +777,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {revoked, 0} =
-      System.cmd(ctx.binary, ["revoke-assignment", dispatch_id],
+      System.cmd(ctx.binary, ["revoke-assignment", dispatch_id, "--reason", "worker cleanup"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -510,7 +785,10 @@ defmodule Tightbeam.CliIntegrationTest do
     assert revoked =~ "revoked"
 
     assert_receive {:cli_call,
-                    %{verb: "revoke-assignment", params: %{assignment_id: ^dispatch_id}}}
+                    %{
+                      verb: "revoke-assignment",
+                      params: %{assignment_id: ^dispatch_id, reason: "worker cleanup"}
+                    }}
 
     {listed, 0} =
       System.cmd(ctx.binary, ["assignments", "--session", "cli-worker", "--state", "all"],
@@ -610,6 +888,62 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     item_id = JSON.decode!(created)["id"]
+
+    # The posture gate refuses a coder card on an unpostured work item, so the
+    # org's orchestrator rules the slice first, through the same real CLI.
+    orchestrator =
+      Org.create(ctx.db, %{
+        session_key: "cli-orchestrator",
+        display_name: "CLI Orchestrator",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "orchestrator",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("test")
+      })
+
+    Roles.create!(ctx.db, "cli-orchestrator", "flynn", orchestrator.session_key)
+
+    {slice, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "orchestrate the slice",
+          "--session",
+          "cli-orchestrator",
+          "--work-item",
+          item_id,
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    slice_id = JSON.decode!(slice)["id"]
+
+    {_postured, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          slice_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "posture-light",
+          "--note",
+          "e2e: the input is the spec",
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
 
     {assigned, 0} =
       System.cmd(
@@ -977,6 +1311,241 @@ defmodule Tightbeam.CliIntegrationTest do
     dir
   end
 
+  defp completion_session!(db, session_key, parent_session_key) do
+    session =
+      Org.create(db, %{
+        session_key: session_key,
+        display_name: session_key,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        spawned_by: parent_session_key,
+        operational_parent: parent_session_key,
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    Roles.create!(db, session_key, "flynn", session.session_key)
+    session
+  end
+
+  defp completion_notices_as_user(ctx, user_id) do
+    System.cmd(
+      ctx.binary,
+      ["completion-notices", "--status", "open", "--as-user", user_id],
+      cd: ctx.outside,
+      stderr_to_stdout: true,
+      env: [
+        {"TIGHTBEAM_URL", "ws://127.0.0.1:#{ctx.port}"},
+        {"TIGHTBEAM_TOKEN", "tbc_cli_integration"},
+        {"TIGHTBEAM_BASE_DIR", nil},
+        {"TIGHTBEAM_HOME", nil}
+      ]
+    )
+  end
+
+  defp deliver_completion_wake!(ctx, wake_id) do
+    wake = Wakes.get(ctx.db, wake_id)
+
+    assert {:ok, {:appended, _owner, _message, _opts}} =
+             DB.transaction(ctx.db, fn txn ->
+               Gateway.deliver_prompt_in_txn(txn, wake.session_key, wake.origin, wake.prompt,
+                 db: ctx.db,
+                 wake_id: wake.wake_id,
+                 sender: wake.origin,
+                 principal: {:process, "tightbeam"},
+                 target_gate: wake,
+                 fire_wake_in_txn: true
+               )
+             end)
+  end
+
+  defp raw_agent_dispatch(ctx, token, body) do
+    {:ok, {{_version, status, _reason}, _headers, raw_body}} =
+      :httpc.request(
+        :post,
+        {~c"http://127.0.0.1:#{ctx.port}/agent/dispatch",
+         [
+           {~c"authorization", ~c"Bearer #{token}"},
+           {~c"x-tightbeam-cli-version", String.to_charlist(CliCompatibility.required_version())}
+         ], ~c"application/json", JSON.encode!(body)},
+        [],
+        []
+      )
+
+    {status, raw_body |> to_string() |> JSON.decode!()}
+  end
+
+  defp seed_terminal_response_fixtures!(ctx) do
+    now = 1_780_000_000_000
+    deadline = now + 86_400_000
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_request_terminal_epoch SET legacyRulingFactMaxId=90000 WHERE id=0"
+             )
+
+    for {id, scope} <- [
+          {90_000, "dr_00000000-0000-4000-8000-000000000005"},
+          {90_001, "dr_00000000-0000-4000-8000-000000000002"},
+          {90_002, "dr_00000000-0000-4000-8000-000000000007"}
+        ] do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES (?1,?2,'escalation-ruled',?3,'process:tightbeam')",
+                 [id, now + id, scope]
+               )
+    end
+
+    common = fn id, owner, raiser_session, status ->
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO decision_requests (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,actionKey,question,options,context,status) VALUES (?1,'operator','agent:capture',?2,?3,?4,?5,?6,?7,'[{\"label\":\"accept\"},{\"label\":\"dismiss\"}]','{\"capture\":true}',?8)",
+                 [
+                   id,
+                   raiser_session,
+                   owner,
+                   now,
+                   deadline,
+                   "capture:#{id}",
+                   "Capture #{id}?",
+                   status
+                 ]
+               )
+    end
+
+    common.("dr_00000000-0000-4000-8000-000000000001", "flynn", ctx.session.session_key, "open")
+
+    common.(
+      "dr_00000000-0000-4000-8000-000000000003",
+      "flynn",
+      ctx.session.session_key,
+      "withdrawn"
+    )
+
+    common.(
+      "dr_00000000-0000-4000-8000-000000000004",
+      "flynn",
+      ctx.session.session_key,
+      "superseded"
+    )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET withdrawnBy='user:flynn',withdrawnReason='capture complete',withdrawnAt=?2 WHERE id=?1",
+               ["dr_00000000-0000-4000-8000-000000000003", now + 20]
+             )
+
+    common.("dr_00000000-0000-4000-8000-000000000005", "flynn", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000002", "flynn", ctx.session.session_key, "open")
+    common.("dr_00000000-0000-4000-8000-000000000007", "flynn", ctx.session.session_key, "open")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET status='ruled',decision='accept',rationale=NULL,ruledBy='user:flynn',ruledViaPrincipal='user:flynn',ruledViaSessionState='none',ruledAt=?2,rulingFactId=90000 WHERE id=?1",
+               ["dr_00000000-0000-4000-8000-000000000005", now + 100]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE decision_requests SET ruledViaPrincipal=NULL,ruledViaSessionState=NULL WHERE id='dr_00000000-0000-4000-8000-000000000005'"
+             )
+
+    for {id, fact_id, ruled_at, status, consumed_at} <- [
+          {"dr_00000000-0000-4000-8000-000000000002", 90_001, now + 200, "ruled", nil},
+          {"dr_00000000-0000-4000-8000-000000000007", 90_002, now + 300, "consumed", now + 400}
+        ] do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE decision_requests SET status=?2,decision='accept',rationale='captured',ruledBy='user:flynn',ruledViaPrincipal='user:flynn',ruledViaSessionState='none',ruledAt=?3,rulingFactId=?4,consumedAt=?5 WHERE id=?1",
+                 [id, status, ruled_at, fact_id, consumed_at]
+               )
+    end
+
+    for id <- [
+          "dr_00000000-0000-4000-8000-000000000005",
+          "dr_00000000-0000-4000-8000-000000000002",
+          "dr_00000000-0000-4000-8000-000000000007"
+        ] do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO lifecycle_events (ts,kind,subject,detail) VALUES (?1,'decision_request_ruled',?2,NULL)",
+                 [now + 500, id]
+               )
+    end
+
+    for {id, cursor, ruled_at} <- [
+          {"dr_00000000-0000-4000-8000-000000000002", 90_000, now + 200},
+          {"dr_00000000-0000-4000-8000-000000000007", 90_001, now + 300}
+        ] do
+      prompt =
+        "Decision request #{id} was ruled. Read it with tightbeam decision-request --request #{id}."
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO wakes (wakeId,sessionKey,origin,prompt,consumer,dueAt,state,createdAt,conditionKind,conditionScope,conditionAfterId,creatorSessionKey,targetGate) VALUES (?1,?2,'process:tightbeam',?3,'prompt',?4,'pending',?5,'escalation-ruled',?6,?7,NULL,0)",
+                 [
+                   "w_capture_#{id}",
+                   ctx.session.session_key,
+                   prompt,
+                   ruled_at + 86_400_000,
+                   now,
+                   id,
+                   cursor
+                 ]
+               )
+    end
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES ('capture-other',0,'admin_add',1)"
+             )
+
+    ensure_main_session(ctx.db, "capture-other")
+
+    hidden =
+      Org.create(ctx.db, %{
+        session_key: "cli-capture-hidden",
+        display_name: "Hidden capture",
+        owner_user_id: "capture-other",
+        origin: "user:capture-other",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    common.(
+      "dr_00000000-0000-4000-8000-000000000006",
+      "capture-other",
+      hidden.session_key,
+      "open"
+    )
+
+    [
+      {"open", "dr_00000000-0000-4000-8000-000000000001"},
+      {"ruled", "dr_00000000-0000-4000-8000-000000000002"},
+      {"withdrawn", "dr_00000000-0000-4000-8000-000000000003"},
+      {"superseded", "dr_00000000-0000-4000-8000-000000000004"},
+      {"legacy", "dr_00000000-0000-4000-8000-000000000005"},
+      {"hidden", "dr_00000000-0000-4000-8000-000000000006"},
+      {"impossibleConsumed", "dr_00000000-0000-4000-8000-000000000007"}
+    ]
+  end
+
   # Regression, found by smoke group 12. `Dispatch.dispatch/3` declares three
   # returns and the router's dispatch_response served two, so an escalating verb
   # reached `case` with no clause: CaseClauseError, an empty body from Bandit,
@@ -1075,22 +1644,73 @@ defmodule Tightbeam.CliIntegrationTest do
     end
   end
 
-  test "real CLI lists decisions and rules effort continue and dismiss", ctx do
-    continue_request = open_effort_request(ctx, "continue")
+  test "real CLI exact-reads from a bystander and rules an effort request from a lineage member",
+       ctx do
+    continue_request =
+      open_effort_request(ctx, "continue",
+        expecter_session_key: Org.personal_session_key("flynn")
+      )
+
+    worker_dir = session_workdir!(ctx, ctx.worker)
 
     {requests, 0} =
       System.cmd(ctx.binary, ["decision-requests", "--status", "open"],
-        cd: ctx.workdir,
+        cd: worker_dir,
         stderr_to_stdout: true
       )
 
-    assert requests =~ continue_request
+    refute requests =~ continue_request
 
     assert_receive {:cli_call,
                     %{
                       verb: "decision-requests",
-                      principal: {:session, "cli-holder"},
+                      principal: {:session, "cli-worker"},
                       params: %{status: "open"}
+                    }}
+
+    {exact, 0} =
+      System.cmd(
+        ctx.binary,
+        ["decision-request", "--request", continue_request],
+        cd: worker_dir,
+        stderr_to_stdout: true
+      )
+
+    exact = JSON.decode!(exact)["decisionRequest"]
+    assert exact["id"] == continue_request
+    assert exact["kind"] == "effort"
+    assert exact["question"] == "Continue or dismiss?"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "decision-request",
+                      principal: {:session, "cli-worker"},
+                      params: %{request: ^continue_request}
+                    }}
+
+    {:ok, [[generations_before]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = (SELECT assignmentId FROM decision_requests WHERE id = ?1)",
+        [continue_request]
+      )
+
+    {refused, refused_status} =
+      System.cmd(
+        ctx.binary,
+        ["effort-rule", "--request", continue_request, "--action", "continue"],
+        cd: worker_dir,
+        stderr_to_stdout: true
+      )
+
+    assert refused_status != 0
+    assert refused =~ "not_authorized"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "effort-rule",
+                      principal: {:session, "cli-worker"},
+                      params: %{request: ^continue_request, action: "continue"}
                     }}
 
     {continued, 0} =
@@ -1110,6 +1730,46 @@ defmodule Tightbeam.CliIntegrationTest do
                       params: %{request: ^continue_request, action: "continue"}
                     }}
 
+    {:ok, [["session:cli-holder"]]} =
+      DB.query(ctx.db, "SELECT ruledBy FROM decision_requests WHERE id = ?1", [continue_request])
+
+    {:ok, [[generations_after]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = (SELECT assignmentId FROM decision_requests WHERE id = ?1)",
+        [continue_request]
+      )
+
+    assert generations_after == generations_before + 1
+
+    {retried, 0} =
+      System.cmd(
+        ctx.binary,
+        ["effort-rule", "--request", continue_request, "--action", "continue"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert retried =~ "session:cli-holder"
+
+    {:ok, [[^generations_after]]} =
+      DB.query(
+        ctx.db,
+        "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId = (SELECT assignmentId FROM decision_requests WHERE id = ?1)",
+        [continue_request]
+      )
+
+    {still_refused, status} =
+      System.cmd(
+        ctx.binary,
+        ["effort-rule", "--request", continue_request, "--action", "continue"],
+        cd: worker_dir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert still_refused =~ "not_authorized"
+
     dismiss_request = open_effort_request(ctx, "dismiss")
 
     {dismissed, 0} =
@@ -1128,6 +1788,419 @@ defmodule Tightbeam.CliIntegrationTest do
                       principal: {:session, "cli-holder"},
                       params: %{request: ^dismiss_request, action: "dismiss"}
                     }}
+  end
+
+  test "real CLI rejects duplicate exact-request flags before dispatch", ctx do
+    first_request = "dr_11111111-1111-4111-8111-111111111111"
+    second_request = "dr_22222222-2222-4222-8222-222222222222"
+
+    {output, status} =
+      System.cmd(
+        ctx.binary,
+        ["decision-request", "--request", first_request, "--request", second_request],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert status != 0
+    assert output =~ "usage: tightbeam decision-request --request <decisionRequestId>"
+    refute_receive {:cli_call, _call}
+  end
+
+  test "A-27 checked fixture is captured from release CLI and real HTTP responses", ctx do
+    baseline =
+      __DIR__
+      |> then(&Path.expand("fixtures/terminal_operator_real_gateway_baseline.json", &1))
+      |> File.read!()
+      |> JSON.decode!()
+
+    assert baseline["sourceRevision"] == "d38cd7823511a4b6ee5bb3d8180a1628fcb2ac3b"
+
+    assert Enum.sort(Map.keys(baseline["capture"])) ==
+             ~w(hidden impossibleConsumed legacy open ruled superseded withdrawn)
+
+    assert Enum.all?(baseline["capture"], fn {_name, captured} ->
+             captured["http"] == %{
+               "status" => 404,
+               "body" => %{
+                 "error" => %{
+                   "code" => "not_found",
+                   "message" => "decision request not found"
+                 }
+               }
+             } and captured["releaseCli"]["status"] == 1
+           end)
+
+    fixture_ids = seed_terminal_response_fixtures!(ctx)
+
+    actual =
+      Map.new(fixture_ids, fn {name, request_id} ->
+        {http_status, http_body} =
+          raw_agent_dispatch(ctx, ctx.session.cli_token, %{
+            "verb" => "decision-request",
+            "params" => %{"request" => request_id}
+          })
+
+        {cli_output, cli_status} =
+          System.cmd(ctx.binary, ["decision-request", "--request", request_id],
+            cd: ctx.workdir,
+            stderr_to_stdout: true
+          )
+
+        {name,
+         %{
+           "requestId" => request_id,
+           "http" => %{"status" => http_status, "body" => http_body},
+           "releaseCli" => %{"status" => cli_status, "output" => cli_output}
+         }}
+      end)
+
+    fixture_path =
+      Path.expand("fixtures/terminal_operator_real_gateway_candidate.json", __DIR__)
+
+    if File.exists?(fixture_path) do
+      assert actual == fixture_path |> File.read!() |> JSON.decode!()
+    else
+      flunk("capture fixture missing; real response was:\n#{JSON.encode!(actual)}")
+    end
+  end
+
+  test "A-14 raw HTTP pins exact-read and response refusal envelopes", ctx do
+    effort_id = open_effort_request(ctx, "wire-refusal")
+    agent_id = "dr_wire_agent_#{System.unique_integer([:positive])}"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,raiserSessionKey,ownerUserId,expecterSessionKey,
+                  expecterUserId,raisedAt,question,context,status)
+               VALUES (?1,'agent','session:cli-holder','cli-holder','flynn','cli-holder',
+                       'flynn',?2,'Which path?','{}','open')
+               """,
+               [agent_id, now]
+             )
+
+    assert {200,
+            %{
+              "result" => %{
+                "decisionRequest" => %{"id" => ^effort_id, "kind" => "effort"}
+              }
+            }} =
+             raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+               "verb" => "decision-request",
+               "params" => %{"request" => effort_id}
+             })
+
+    not_found = %{
+      "error" => %{"code" => "not_found", "message" => "decision request not found"}
+    }
+
+    assert {404, ^not_found} =
+             raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+               "verb" => "decision-request",
+               "params" => %{"request" => "dr_absent"}
+             })
+
+    for verb <- ["answer", "return"] do
+      params =
+        if verb == "answer",
+          do: %{"request" => effort_id, "answer" => "not an agent question"},
+          else: %{"request" => effort_id, "reason" => "not an agent question"}
+
+      assert {404, ^not_found} =
+               raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+                 "verb" => verb,
+                 "params" => params
+               })
+    end
+
+    assert {400,
+            %{
+              "error" => %{
+                "code" => "invalid",
+                "message" => "effort-rule requires an effort request"
+              }
+            }} =
+             raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+               "verb" => "effort-rule",
+               "params" => %{"request" => agent_id, "action" => "continue"}
+             })
+
+    assert {403,
+            %{
+              "error" => %{
+                "code" => "not_authorized",
+                "message" => "current expecter required"
+              }
+            }} =
+             raw_agent_dispatch(ctx, ctx.worker.cli_token, %{
+               "asUser" => "flynn",
+               "verb" => "effort-rule",
+               "params" => %{"request" => effort_id, "action" => "continue"}
+             })
+
+    for {verb, params} <- [
+          {"decision-request", %{"request" => effort_id}},
+          {"answer", %{"request" => agent_id, "answer" => "yes"}},
+          {"return", %{"request" => agent_id, "reason" => "unclear"}},
+          {"effort-rule", %{"request" => effort_id, "action" => "continue"}}
+        ] do
+      assert {401, %{"error" => %{"code" => "auth_failed"}}} =
+               raw_agent_dispatch(ctx, "not-a-token", %{"verb" => verb, "params" => params})
+    end
+  end
+
+  test "A-15 exact-id security matrix preserves every principal boundary", ctx do
+    for user_id <- ["nobody", "other"] do
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "INSERT INTO users (userId,isAdmin,creationKind,createdAt) VALUES (?1,0,'admin_add',1)",
+                 [user_id]
+               )
+    end
+
+    session_identity = %{}
+    user_identity = %{"asUser" => "nobody"}
+    process_identity = %{"asProcess" => "ci"}
+    role_identity = %{"as" => "cli-holder"}
+
+    invoke = fn token, identity, verb, params ->
+      raw_agent_dispatch(
+        ctx,
+        token,
+        identity |> Map.merge(%{"verb" => verb, "params" => params})
+      )
+    end
+
+    # One authenticated bystander session gains exact-id access and the agent
+    # response paths. Effort ruling stays limited to the assignment lineage,
+    # and the statute arm remains hidden.
+    agent_read = open_agent_request(ctx)
+    effort_read = open_effort_request(ctx, "matrix-session-read")
+    statute_read = open_statute_request(ctx, "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"id" => ^agent_read}}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => agent_read
+             })
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"id" => ^effort_read}}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => effort_read
+             })
+
+    assert {404, %{"error" => %{"code" => "not_found", "message" => _}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => statute_read
+             })
+
+    assert {404, absent_read_envelope} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => "dr_matrix_session_absent"
+             })
+
+    assert {404, ^absent_read_envelope} =
+             invoke.(ctx.worker.cli_token, session_identity, "decision-request", %{
+               "request" => statute_read
+             })
+
+    answer_id = open_agent_request(ctx)
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"answeredBy" => "session:cli-worker"}}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "answer", %{
+               "request" => answer_id,
+               "answer" => "session answer"
+             })
+
+    return_id = open_agent_request(ctx)
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"returnedBy" => "session:cli-worker"}}}} =
+             invoke.(ctx.worker.cli_token, session_identity, "return", %{
+               "request" => return_id,
+               "reason" => "session needs context"
+             })
+
+    effort_rule_id = open_effort_request(ctx, "matrix-session-rule")
+
+    assert {403,
+            %{
+              "error" => %{
+                "code" => "not_authorized",
+                "message" => "current expecter required"
+              }
+            }} =
+             invoke.(ctx.worker.cli_token, session_identity, "effort-rule", %{
+               "request" => effort_rule_id,
+               "action" => "continue"
+             })
+
+    # The bystander session's direct standing remains kind-scoped. Every
+    # wrong-kind hidden row is indistinguishable from an absent id.
+    before_session_refusals = security_counts(ctx.db)
+
+    for {verb, params_for} <- [
+          {"answer", fn request -> %{"request" => request, "answer" => "wrong kind"} end},
+          {"return", fn request -> %{"request" => request, "reason" => "wrong kind"} end}
+        ] do
+      assert {404, absent_envelope} =
+               invoke.(
+                 ctx.worker.cli_token,
+                 session_identity,
+                 verb,
+                 params_for.("dr_matrix_session_absent")
+               )
+
+      for hidden_id <- [effort_read, statute_read] do
+        assert {404, ^absent_envelope} =
+                 invoke.(
+                   ctx.worker.cli_token,
+                   session_identity,
+                   verb,
+                   params_for.(hidden_id)
+                 )
+      end
+    end
+
+    assert {400,
+            %{
+              "error" => %{
+                "code" => "invalid",
+                "message" => "effort-rule requires an effort request"
+              }
+            }} =
+             invoke.(ctx.worker.cli_token, session_identity, "effort-rule", %{
+               "request" => agent_read,
+               "action" => "continue"
+             })
+
+    assert {404, absent_effort_envelope} =
+             invoke.(ctx.worker.cli_token, session_identity, "effort-rule", %{
+               "request" => "dr_matrix_session_absent",
+               "action" => "continue"
+             })
+
+    assert {404, ^absent_effort_envelope} =
+             invoke.(ctx.worker.cli_token, session_identity, "effort-rule", %{
+               "request" => statute_read,
+               "action" => "continue"
+             })
+
+    assert security_counts(ctx.db) == before_session_refusals
+
+    # User, process, role-without-session, and unauthenticated callers acquire
+    # no standing. Every refused group leaves requests, events, wakes, and
+    # monitor generations byte-for-byte at the same counts.
+    for {token, identity, authenticated?} <- [
+          {"tbc_cli_integration", user_identity, true},
+          {"tbc_cli_integration", process_identity, true},
+          {"tbc_cli_integration", role_identity, true},
+          {"not-a-token", %{}, false}
+        ] do
+      agent_id = open_agent_request(ctx)
+      effort_id = open_effort_request(ctx, "matrix-refused")
+      statute_id = open_statute_request(ctx, "other")
+      absent_id = "dr_matrix_absent_#{System.unique_integer([:positive])}"
+      before = security_counts(ctx.db)
+
+      targets = %{agent: agent_id, effort: effort_id, statute: statute_id, absent: absent_id}
+
+      for {verb, params_for} <- [
+            {"decision-request", fn request -> %{"request" => request} end},
+            {"answer", fn request -> %{"request" => request, "answer" => "must refuse"} end},
+            {"return", fn request -> %{"request" => request, "reason" => "must refuse"} end},
+            {"effort-rule", fn request -> %{"request" => request, "action" => "continue"} end}
+          ] do
+        absent_result = invoke.(token, identity, verb, params_for.(targets.absent))
+        expected_absent_status = if authenticated?, do: 404, else: 401
+        assert {^expected_absent_status, %{"error" => %{"code" => _}}} = absent_result
+
+        for kind <- [:agent, :effort, :statute] do
+          result = invoke.(token, identity, verb, params_for.(Map.fetch!(targets, kind)))
+
+          if authenticated? and verb == "effort-rule" and kind == :effort do
+            assert {403,
+                    %{
+                      "error" => %{
+                        "code" => "not_authorized",
+                        "message" => "current expecter required"
+                      }
+                    }} = result
+          else
+            assert result == absent_result
+          end
+        end
+      end
+
+      assert security_counts(ctx.db) == before
+
+      assert request_statuses(ctx.db, [agent_id, effort_id, statute_id]) == [
+               "open",
+               "open",
+               "open"
+             ]
+    end
+
+    # Existing stamped human expecters retain their old standing and no more.
+    expecter_identity = %{"asUser" => "other"}
+    user_agent_read = open_agent_request(ctx, expecter_user_id: "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"id" => ^user_agent_read}}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "decision-request", %{
+               "request" => user_agent_read
+             })
+
+    user_answer = open_agent_request(ctx, expecter_user_id: "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"answeredBy" => "user:other"}}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "answer", %{
+               "request" => user_answer,
+               "answer" => "human answer"
+             })
+
+    user_return = open_agent_request(ctx, expecter_user_id: "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"returnedBy" => "user:other"}}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "return", %{
+               "request" => user_return,
+               "reason" => "human needs context"
+             })
+
+    user_effort =
+      open_effort_request(ctx, "matrix-user-rule",
+        expecter_session_key: nil,
+        expecter_user_id: "other"
+      )
+
+    assert {200, %{"result" => %{"ruledBy" => "user:other"}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "effort-rule", %{
+               "request" => user_effort,
+               "action" => "continue"
+             })
+
+    user_statute = open_statute_request(ctx, "other")
+
+    assert {200, %{"result" => %{"decisionRequest" => %{"id" => ^user_statute}}}} =
+             invoke.("tbc_cli_integration", expecter_identity, "decision-request", %{
+               "request" => user_statute
+             })
+
+    before_statute_refusals = security_counts(ctx.db)
+
+    for {verb, params, status} <- [
+          {"answer", %{"request" => user_statute, "answer" => "wrong kind"}, 404},
+          {"return", %{"request" => user_statute, "reason" => "wrong kind"}, 404},
+          {"effort-rule", %{"request" => user_statute, "action" => "continue"}, 400}
+        ] do
+      assert {^status, _envelope} =
+               invoke.("tbc_cli_integration", expecter_identity, verb, params)
+    end
+
+    assert security_counts(ctx.db) == before_statute_refusals
+    assert request_statuses(ctx.db, [user_statute]) == ["open"]
   end
 
   test "real CLI returns an insufficient question and removes it from the open queue", ctx do
@@ -1305,7 +2378,376 @@ defmodule Tightbeam.CliIntegrationTest do
     assert pairing =~ "supplied together"
   end
 
-  defp open_effort_request(ctx, action) do
+  test "real CLI composes priority and metadata in one work-item update", ctx do
+    sha = String.duplicate("a", 64)
+    sha2 = String.duplicate("b", 64)
+
+    {created, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-create",
+          "--title",
+          "Before",
+          "--spec-ref",
+          "governing.md",
+          "--spec-sha256",
+          sha,
+          "--priority",
+          "4"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    work_item_id = JSON.decode!(created)["id"]
+    assert_receive {:cli_call, %{verb: "work-item-create"}}
+
+    {priority_only, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--priority", "5"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "title" => "Before",
+             "priority" => 5,
+             "specRefName" => "governing.md",
+             "specRefSha256" => ^sha
+           } = JSON.decode!(priority_only)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{work_item_id: ^work_item_id, priority: 5}
+                    }}
+
+    {metadata_only, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--title", "After"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"title" => "After", "priority" => 5, "specRefSha256" => ^sha} =
+             JSON.decode!(metadata_only)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{work_item_id: ^work_item_id, title: "After"}
+                    }}
+
+    {combined, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--spec-sha256", sha2, "--priority", "6"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "title" => "After",
+             "priority" => 6,
+             "specRefName" => "governing.md",
+             "specRefSha256" => ^sha2
+           } = JSON.decode!(combined)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        spec_ref_sha256: ^sha2,
+                        priority: 6
+                      }
+                    }}
+
+    {noop, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(noop) == JSON.decode!(combined)
+
+    assert_receive {:cli_call,
+                    %{verb: "work-item-update", params: %{work_item_id: ^work_item_id}}}
+
+    {cleared, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--clear-spec-ref"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"priority" => 6, "specRefName" => nil, "specRefSha256" => nil} =
+             JSON.decode!(cleared)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        spec_ref_name: nil,
+                        spec_ref_sha256: nil
+                      }
+                    }}
+
+    {incomplete, 1} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--spec-ref", "next.md"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert incomplete =~ "invalid_spec_ref"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{work_item_id: ^work_item_id, spec_ref_name: "next.md"}
+                    }}
+
+    {set, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-update",
+          work_item_id,
+          "--spec-ref",
+          "next.md",
+          "--spec-sha256",
+          sha
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"specRefName" => "next.md", "specRefSha256" => ^sha} = JSON.decode!(set)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        spec_ref_name: "next.md",
+                        spec_ref_sha256: ^sha
+                      }
+                    }}
+
+    {replayed, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-update",
+          work_item_id,
+          "--spec-ref",
+          "next.md",
+          "--spec-sha256",
+          sha
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(replayed) == JSON.decode!(set)
+    assert_receive {:cli_call, %{verb: "work-item-update"}}
+
+    {conflict, 1} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--clear-spec-ref", "--spec-ref", "next.md"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert conflict =~ "conflicts"
+    refute_receive {:cli_call, %{verb: "work-item-update"}}, 50
+
+    {got, 0} =
+      System.cmd(ctx.binary, ["work-item-get", work_item_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "workItem" => %{
+               "priority" => 6,
+               "specRefName" => "next.md",
+               "specRefSha256" => ^sha
+             }
+           } = JSON.decode!(got)
+
+    assert_receive {:cli_call, %{verb: "work-item-get"}}
+
+    {combined, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-update",
+          work_item_id,
+          "--title",
+          "Together",
+          "--spec-ref",
+          "combined.md",
+          "--spec-sha256",
+          sha2,
+          "--priority",
+          "7"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "title" => "Together",
+             "specRefName" => "combined.md",
+             "specRefSha256" => ^sha2,
+             "priority" => 7
+           } = JSON.decode!(combined)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        title: "Together",
+                        spec_ref_name: "combined.md",
+                        spec_ref_sha256: ^sha2,
+                        priority: 7
+                      }
+                    }}
+  end
+
+  test "real CLI returns typed breathing answers with the exact exit contract", ctx do
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO turns (sessionKey,messageId,origin,prompt,status,adapterGen,createdAt,startedAt) VALUES ('cli-holder','m_breathing','user:flynn','work','running',4,10,11)"
+      )
+
+    {output, 0} =
+      System.cmd(ctx.binary, ["breathing", "session", "cli-holder"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "schema" => "breathing-v1",
+             "target" => %{"kind" => "session", "id" => "cli-holder"},
+             "breathing" => true,
+             "reason" => "running_turn",
+             "evidence" => %{"turn" => %{"seq" => _}}
+           } = JSON.decode!(output)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "breathing",
+                      params: %{target_kind: "session", target_id: "cli-holder"}
+                    }}
+
+    assert {:ok, [[payload]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload FROM events WHERE kind='verb' AND verb='breathing' ORDER BY id DESC LIMIT 1"
+             )
+
+    {audit, []} = Code.eval_string(payload)
+
+    assert %{
+             elided: true,
+             count: 0,
+             params: %{target_kind: "session", target_id: "cli-holder"}
+           } = audit
+
+    refute payload =~ "running_turn"
+    refute payload =~ ~s("breathing":true)
+
+    {missing, 0} =
+      System.cmd(ctx.binary, ["breathing", "session", "missing"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"breathing" => false, "reason" => "session_missing"} = JSON.decode!(missing)
+
+    {usage, 1} =
+      System.cmd(ctx.binary, ["breathing", "session"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert usage =~ "usage: tightbeam breathing session|assignment|work-item <id>"
+  end
+
+  defp open_agent_request(ctx, opts \\ []) do
+    request_id = "dr_agent_#{System.unique_integer([:positive])}"
+    expecter_session_key = Keyword.get(opts, :expecter_session_key, "cli-holder")
+    expecter_user_id = Keyword.get(opts, :expecter_user_id, "other")
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,raiserSessionKey,ownerUserId,expecterSessionKey,
+                  expecterUserId,raisedAt,question,context,status)
+               VALUES (?1,'agent','session:cli-holder','cli-holder','flynn',?2,?3,?4,
+                       'Which path?','{}','open')
+               """,
+               [request_id, expecter_session_key, expecter_user_id, now]
+             )
+
+    request_id
+  end
+
+  defp open_statute_request(ctx, owner_user_id) do
+    request_id = "dr_statute_#{System.unique_integer([:positive])}"
+    now = System.system_time(:millisecond)
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,
+                  question,context,status)
+               VALUES (?1,'statute','session:cli-holder',?2,?3,?4,'deploy-gate',?5,
+                       'May this ship?','{}','open')
+               """,
+               [request_id, owner_user_id, now, now + 60_000, "action-#{request_id}"]
+             )
+
+    request_id
+  end
+
+  defp security_counts(db) do
+    assert {:ok, [counts]} =
+             DB.query(
+               db,
+               """
+               SELECT
+                 (SELECT COUNT(*) FROM decision_requests),
+                 (SELECT COUNT(*) FROM lifecycle_events),
+                 (SELECT COUNT(*) FROM wakes),
+                 (SELECT COUNT(*) FROM effort_checkin_generations)
+               """
+             )
+
+    counts
+  end
+
+  defp request_statuses(db, request_ids) do
+    Enum.map(request_ids, fn request_id ->
+      assert {:ok, [[status]]} =
+               DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
+
+      status
+    end)
+  end
+
+  defp open_effort_request(ctx, action, opts \\ []) do
+    expecter_session_key = Keyword.get(opts, :expecter_session_key, "cli-holder")
+    expecter_user_id = Keyword.get(opts, :expecter_user_id)
     key = "effort-#{action}-#{System.unique_integer([:positive])}"
 
     {dispatched, 0} =
@@ -1344,7 +2786,7 @@ defmodule Tightbeam.CliIntegrationTest do
         [assignment_id]
       )
 
-    request_id = "dr_#{action}_#{System.unique_integer([:positive])}"
+    request_id = "dr_" <> Tightbeam.Id.uuid4()
     now = System.system_time(:millisecond)
 
     {:ok, _} =
@@ -1353,14 +2795,16 @@ defmodule Tightbeam.CliIntegrationTest do
         """
         INSERT INTO decision_requests
           (id, kind, raiserId, ownerUserId, assignmentId, expecterSessionKey,
-           lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
+           expecterUserId, lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt,
            question, options, context, status)
-        VALUES (?1, 'effort', 'process:tightbeam', 'flynn', ?2, 'cli-holder',
-                1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'open')
+        VALUES (?1, 'effort', 'process:tightbeam', 'flynn', ?2, ?3, ?4,
+                1, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'open')
         """,
         [
           request_id,
           assignment_id,
+          expecter_session_key,
+          expecter_user_id,
           generation,
           wake_id,
           now,

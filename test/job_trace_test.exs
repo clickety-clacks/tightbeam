@@ -18,7 +18,7 @@ defmodule Tightbeam.JobTraceTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('owner',0,1),('admin',1,1),('other',0,1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('owner', 0, 'admin_add', 1),('admin', 1, 'admin_add', 1),('other', 0, 'admin_add', 1)"
       )
 
     Enum.each(~w(owner admin other), &ensure_main_session(db, &1))
@@ -93,11 +93,37 @@ defmodule Tightbeam.JobTraceTest do
 
       INSERT INTO decision_requests
         (id, kind, raiserId, ownerUserId, assignmentId, raisedAt, deadlineAt,
-         statuteName, actionKey, question, context, status, decision)
+         statuteName, actionKey, question, context, status, decision, ruledBy, ruledAt)
       VALUES
         ('dr_trace', 'statute', 'user:owner', 'owner', 'asg_direct', 100, 500,
-         'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow');
+         'trace-rule', 'trace-action', 'Choose', '{}', 'ruled', 'allow', 'user:owner', 100);
       """)
+
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.DeliverableContract.create_work_item_in_txn(txn, "wi_trace", "Trace me", 1)
+
+        for {id, subject, holder, opened_at, work_item_id} <- [
+              {"asg_direct", "direct", "holder", 2, "wi_trace"},
+              {"asg_bad", "invalid ref", "holder", 3, "wi_trace"},
+              {"asg_review", "review", "reviewer", 4, nil}
+            ] do
+          :ok =
+            Tightbeam.DeliverableContract.bind_assignment_in_txn(
+              txn,
+              %{
+                id: id,
+                subject: subject,
+                holderKey: holder,
+                openedAt: opened_at,
+                workItemId: work_item_id
+              },
+              false
+            )
+        end
+
+        :ok
+      end)
 
     %{db: db}
   end
@@ -162,14 +188,18 @@ defmodule Tightbeam.JobTraceTest do
     assert %{code: "not_found"} = trace(db, {:user, "owner"}, "wi_missing")
 
     assert_keys(trace, ~w(assignments timeline workItem)a)
-    assert_keys(trace.workItem, ~w(failReason id ownerUserId state title)a)
+
+    assert_keys(
+      trace.workItem,
+      ~w(cardProductOwner closure deliverable deliverableContract failReason id ownerUserId state title)a
+    )
 
     assert Enum.map(trace.assignments, & &1.id) == ["asg_bad", "asg_direct", "asg_review"]
 
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
         assignment,
-        ~w(files holderKey id openerRef reviewsAssignmentId state)a
+        ~w(deliverable deliverableContract files holderKey id openerRef productLineage reviewsAssignmentId state)a
       )
     end)
 
@@ -325,19 +355,29 @@ defmodule Tightbeam.JobTraceTest do
           ~w(assignmentId at context effort harness id jobRef model status type)a
 
         "attest" ->
-          ~w(assignmentId at commitRefs id kind type verdict)a
+          ~w(assignmentId at commitRefs deliverableClaim id kind type verdict)a
 
         "wake_scheduled" ->
-          ~w(assignmentId at dueAt id type)a
+          ~w(assignmentId at dueAt id type effortRole)a
 
         "wake_fired" ->
-          ~w(assignmentId at firedBy id matchedFactAt type)a
+          ~w(assignmentId at firedBy id matchedFactAt type effortRole)a
 
         "decision_request" ->
           ~w(assignmentId at id ruling state type)a
 
         "effort_generation" ->
-          ~w(assignmentId at evidence id state type)a
+          ~w(assignmentId at evidence id state type
+             retiredAt retiredOutcome retiredCause retiredPrincipal)a
+
+        "completion_escalation" ->
+          ~w(actingPrincipal assignmentId at childSessionKey closingAttestId completionId
+             causeId causeKind causePrincipal currentRecipient currentStatus decision id
+             outcome phase recipientGeneration recipientReissueCount recipientReissueLimit
+             revocationId supersededByAssignmentId supersededReason type workItemId)a
+
+        "completion_escalation_event" ->
+          ~w(at completionId detail id kind type)a
 
         # job-forensics-v2 §3 — pinned EXACTLY: every key always present,
         # nullable where the spec marks it, so a consumer never has to
@@ -346,7 +386,7 @@ defmodule Tightbeam.JobTraceTest do
           ~w(assignmentId at detail id jobRef kind seqTiebreak sessionKey type)a
 
         "wake_canceled" ->
-          ~w(assignmentId at id reason seqTiebreak type)a
+          ~w(assignmentId at id reason seqTiebreak type effortRole)a
       end
 
     assert_keys(entry, keys)

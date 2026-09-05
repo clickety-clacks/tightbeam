@@ -1,10 +1,10 @@
 ---
 name: tightbeam-harnesses
-description: Per-harness feature support matrix (claude vs codex) — what works where and by what mechanism. Consult before promising or relying on a harness-specific feature.
+description: Per-harness capability support matrix (claude vs codex) — what works where and by what mechanism. Consult before promising or relying on a harness-specific capability.
 ---
 
-Per-harness feature support: FACTS, not guesses. Consult this before
-promising any feature on a specific harness; a feature not listed here
+Per-harness capability support: FACTS, not guesses. Consult this before
+promising any capability on a specific harness; a capability not listed here
 diverges nowhere. Never say "probably" about a row below.
 
 Canonical capability IDs (the full proof references live in
@@ -15,9 +15,8 @@ Canonical capability IDs (the full proof references live in
   `DIV-MODEL-CLAUDE-ENVIRONMENT` because its offered set can depend on cwd and
   settings. A refusal must preserve a loaded session.
 - CAP-003 slash commands: PARITY passthrough. Claude `/clear /compact /model`
-  are verified. Codex vocabulary is known:
-  `/status /mcp /skills /review /review-branch /review-commit /compact
-  /logout /new /clear`, plus configured skills.
+  are verified. Codex vocabulary includes `/status /mcp /skills /review
+  /compact /logout /new /clear`, plus configured skills and domain commands.
 - CAP-004 projected identity: PARITY through Claude system-prompt metadata and
   Codex developer-instruction metadata.
 - CAP-005 native skills: PARITY progressive disclosure under

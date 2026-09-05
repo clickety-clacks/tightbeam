@@ -53,6 +53,7 @@ defmodule Tightbeam.TestCase do
           catalog_reply: 1,
           catalog_reply: 2,
           catalog_probe_harness: 1,
+          claim_org: 2,
           ensure_all_schemas: 1,
           ensure_main_session: 2
         ]
@@ -83,7 +84,37 @@ defmodule Tightbeam.TestCase do
   @doc "Create the complete production schema for a unit-test database."
   def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
 
-  @doc "Create the canonical self-parented Main fixture for an owner when absent."
+  @doc "Atomically detach a per-test directory before recursively removing it."
+  def cleanup_dir!(dir) do
+    isolated = "#{dir}.cleanup-#{System.unique_integer([:positive])}"
+
+    case File.rename(dir, isolated) do
+      :ok ->
+        File.rm_rf!(isolated)
+        :ok
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error,
+          reason: reason,
+          action: "isolate test directory for cleanup",
+          path: dir
+    end
+  end
+
+  @doc "Claim a fresh test org through the production cold-start coordinator."
+  def claim_org(db, input) do
+    Tightbeam.ColdStart.pair(db, input, %{
+      host: "testhost",
+      harness: :claude,
+      provider: fn -> :anthropic end,
+      model: Tightbeam.Model.new("fable")
+    })
+  end
+
+  @doc "Create the canonical nullable-parent Main fixture for an owner when absent."
   def ensure_main_session(db, owner) do
     key = Tightbeam.Org.personal_session_key(owner)
 
@@ -103,7 +134,12 @@ defmodule Tightbeam.TestCase do
           host: "testhost"
         })
 
-      %{kind: "main", operational_parent: ^key} = session ->
+      %{
+        kind: "main",
+        operational_parent: nil,
+        effective_parent: ^key,
+        effective_parent_source: :owner_main
+      } = session ->
         session
 
       session ->

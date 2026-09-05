@@ -4,6 +4,7 @@ defmodule Tightbeam.AssignmentsTest do
 
   alias Tightbeam.{
     Assignments,
+    ConditionFacts,
     DB,
     Dispatch,
     Gateway,
@@ -34,7 +35,7 @@ defmodule Tightbeam.AssignmentsTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('admin', 1, 1), ('flynn', 0, 1), ('other', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('admin', 1, 'admin_add', 1), ('flynn', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
     Enum.each(~w(admin flynn other), &ensure_main_session(db, &1))
@@ -65,8 +66,19 @@ defmodule Tightbeam.AssignmentsTest do
 
     Enum.each(invalid, fn values ->
       assert {:error, %DB.Error{message: message}} = DB.query(db, base <> values)
-      assert message =~ "CHECK constraint"
+
+      assert message =~ "CHECK constraint" or
+               message =~ "revoked assignment requires revocation provenance"
     end)
+
+    assert {:error, %DB.Error{message: trigger_error}} =
+             DB.query(
+               db,
+               base <>
+                 "('a10','x','holder',NULL,0,'flynn',NULL,1,'closed','revoked',2,'flynn',NULL,NULL)"
+             )
+
+    assert trigger_error =~ "revoked assignment requires revocation provenance"
 
     assert {:error, %DB.Error{}} =
              DB.query(
@@ -1499,8 +1511,11 @@ defmodule Tightbeam.AssignmentsTest do
     _ =
       handle(
         ctx,
-        "work-item-close",
-        work_item_call("work-item-close", {:user, "flynn"}, %{work_item_id: item.id})
+        "work-item-fail",
+        work_item_call("work-item-fail", {:user, "flynn"}, %{
+          work_item_id: item.id,
+          reason: "terminal fixture"
+        })
       )
 
     assert_reopen_refused!(ctx, {:user, "flynn"}, carded.id, "why", "work_item_not_open")
@@ -1835,29 +1850,422 @@ defmodule Tightbeam.AssignmentsTest do
              )
   end
 
-  test "reopen-assignment repairs a surrendered card (Sol xhigh review, finding 7)", ctx do
-    assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "surrender then repair"))
+  test "new surrender writes are refused while a historical surrendered card remains readable",
+       ctx do
+    assignment =
+      handle(ctx, "assign", assign_call({:session, "holder"}, "legacy surrender repair"))
 
-    surrendered =
-      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "surrender"))
+    assert %{code: "invalid_kind"} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "surrender"))
 
-    assert surrendered.assignment.outcome == "surrendered"
-
-    reopened =
-      handle(
-        ctx,
-        "reopen-assignment",
-        reopen_call({:session, "holder"}, assignment.id, "the surrender was premature")
-      )
-
-    assert reopened.state == "open"
-
-    assert {:ok, [["surrendered"]]} =
+    assert {:ok, _} =
              DB.query(
                ctx.db,
-               "SELECT priorOutcome FROM assignment_reopenings WHERE assignmentId = ?1",
+               "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_legacy_surrender', ?1, 'surrender', 'historical', 'holder', 10)",
                [assignment.id]
              )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed', outcome='surrendered', closedAt=10, closedBySession='holder', closingAttestId='att_legacy_surrender' WHERE id=?1",
+               [assignment.id]
+             )
+
+    historical =
+      handle(ctx, "assignment-get", assignment_get_call({:session, "holder"}, assignment.id))
+
+    assert historical.outcome == "surrendered"
+
+    assert [%{kind: "surrender", note: "historical"}] =
+             Assignments.list_attests(ctx.db, assignment.id)
+  end
+
+  test "cannot-proceed is holder-only, idempotent, pauses one card, and releases on its exact fact",
+       ctx do
+    first = handle(ctx, "assign", assign_call({:user, "flynn"}, "first blocked card"))
+    second = handle(ctx, "assign", assign_call({:session, "holder"}, "second runnable card"))
+
+    missing_reason = attest_call({:session, "holder"}, first.id, "cannot-proceed")
+    assert %{code: "missing_reason"} = handle(ctx, "attest", missing_reason)
+
+    wrong_holder =
+      attest_call({:session, "other-session"}, first.id, "cannot-proceed")
+      |> put_in([:params, :note], "not mine")
+
+    assert %{code: "not_holder"} = handle(ctx, "attest", wrong_holder)
+
+    filing =
+      attest_call({:session, "holder"}, first.id, "cannot-proceed")
+      |> put_in([:params, :note], "waiting for the exact release fact")
+      |> put_in([:params, :release_fact_kind], "dependency-ready")
+      |> put_in([:params, :release_fact_scope], first.id)
+      |> put_in([:params, :release_fact_principal_ref], "agent:holder")
+
+    filed = handle(ctx, "attest", filing)
+    replay = handle(ctx, "attest", filing)
+
+    assert filed.assignment.state == "open"
+    assert replay.replayed
+    assert replay.cannotProceed.id == filed.cannotProceed.id
+    assert Assignments.attest_count(ctx.db, first.id) == 1
+    assert filed.decisionRequest.assignment_id == first.id
+    assert filed.decisionRequest.expecter_session_key == Org.personal_session_key("flynn")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM decision_requests WHERE assignmentId=?1 AND status='open'",
+               [first.id]
+             )
+
+    assert %{code: "cannot_proceed_standing"} =
+             Tightbeam.Escalation.answer(
+               ctx.db,
+               call("answer", {:session, "other-session"}, nil, %{
+                 request: filed.decisionRequest.id,
+                 answer: "try again"
+               })
+             )
+
+    assert %{code: "cannot_proceed_standing"} =
+             Tightbeam.Escalation.return_request(
+               ctx.db,
+               call("return", {:session, "other-session"}, nil, %{
+                 request: filed.decisionRequest.id,
+                 reason: "more detail"
+               })
+             )
+
+    assert %{code: "cannot_proceed_standing"} =
+             Tightbeam.Escalation.withdraw(
+               ctx.db,
+               call("withdraw", {:session, "holder"}, nil, %{
+                 request: filed.decisionRequest.id,
+                 reason: "take it back"
+               })
+             )
+
+    assert :ok = Tightbeam.Escalation.withdraw_for_retired(ctx.db, "holder")
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [
+               filed.decisionRequest.id
+             ])
+
+    assert Assignments.oldest_prod_eligible(ctx.db, "holder").id == second.id
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:session, "holder"}, second.id))
+
+    assert {:ok, fact} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "dependency-ready",
+                 scope: first.id,
+                 origin: "agent:holder"
+               })
+             end)
+
+    assert is_integer(fact.fact_id)
+    assert Assignments.oldest_prod_eligible(ctx.db, "holder").id == first.id
+
+    released_replay = handle(ctx, "attest", filing)
+    assert released_replay.replayed
+    assert released_replay.cannotProceed.id == filed.cannotProceed.id
+    assert released_replay.cannotProceed.state == "settled"
+    assert Assignments.attest_count(ctx.db, first.id) == 1
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM decision_requests WHERE assignmentId=?1", [
+               first.id
+             ])
+
+    assert {:ok, [["withdrawn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT status FROM decision_requests WHERE id=?1",
+               [filed.decisionRequest.id]
+             )
+
+    terminal = handle(ctx, "assign", assign_call({:session, "holder"}, "terminal race"))
+
+    terminal_block =
+      attest_call({:session, "holder"}, terminal.id, "cannot-proceed")
+      |> put_in([:params, :note], "may finish concurrently")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert %{code: "cannot_proceed_standing"} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "completion"))
+
+    assert handle(ctx, "assignment-get", assignment_get_call({:session, "holder"}, terminal.id)).state ==
+             "open"
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:session, "holder"}, terminal.id))
+
+    assert Wakes.get(ctx.db, terminal_block.decisionWake.wake_id).state == "canceled"
+
+    assert {:ok, [["settled", "disposed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind FROM assignment_cannot_proceed WHERE id=?1",
+               [terminal_block.cannotProceed.id]
+             )
+
+    disposed = handle(ctx, "assign", assign_call({:user, "flynn"}, "opener disposition"))
+
+    disposed_block =
+      attest_call({:session, "holder"}, disposed.id, "cannot-proceed")
+      |> put_in([:params, :note], "opener must dispose")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert %{code: "not_authorized"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "admin"}, disposed.id))
+
+    revoked =
+      handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, disposed.id))
+
+    assert revoked.outcome == "revoked"
+    assert Wakes.get(ctx.db, disposed_block.decisionWake.wake_id).state == "canceled"
+  end
+
+  test "cannot-proceed disposition follows an existing dead-opener fault bubble", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "bubbled disposition"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the opener is unavailable")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns
+                 (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
+               VALUES
+                 (?1,'cannot-proceed-cause',?2,'process:tightbeam','parent decision',?3,
+                  'failed',1,2)
+               """,
+               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
+             )
+
+    assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns
+                 (sessionKey,messageId,origin,prompt,assignmentId,status,requestRef,createdAt)
+               VALUES
+                 ('other-session','cannot-proceed-bubble','process:tightbeam','fault bubble',?1,
+                  'delivered',?2,3)
+               """,
+               [assignment.id, "bubble:#{cause_seq}"]
+             )
+
+    assert %{code: "not_authorized"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:session, "other-session"}, assignment.id)
+             )
+  end
+
+  test "failed cannot-proceed bubble recipients gain no disposition authority", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "failed bubble"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the opener is unavailable")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns
+                 (sessionKey,messageId,wakeId,origin,prompt,assignmentId,status,createdAt,endedAt)
+               VALUES
+                 (?1,'cannot-proceed-failed-cause',?2,'process:tightbeam','parent decision',?3,
+                  'failed',1,2)
+               """,
+               [Org.personal_session_key("flynn"), blocked.decisionWake.wake_id, assignment.id]
+             )
+
+    assert {:ok, [[cause_seq]]} = DB.query(ctx.db, "SELECT last_insert_rowid()")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO turns
+                 (sessionKey,messageId,origin,prompt,assignmentId,status,requestRef,createdAt,endedAt)
+               VALUES
+                 ('other-session','cannot-proceed-failed-bubble','process:tightbeam','fault bubble',
+                  ?1,'failed',?2,3,4)
+               """,
+               [assignment.id, "bubble:#{cause_seq}"]
+             )
+
+    assert %{code: "not_authorized"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:session, "other-session"}, assignment.id)
+             )
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+  end
+
+  test "holder retirement leaves a standing cannot-proceed assignment with its disposer", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "blocked at retirement"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the opener must decide")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert {:ok, []} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "flynn",
+                 "user:flynn"
+               )
+             end)
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id=?1", [
+               assignment.id
+             ])
+
+    assert {:ok, [["standing", "user:flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT status FROM decision_requests WHERE id=?1", [
+               blocked.decisionRequest.id
+             ])
+
+    assert Wakes.get(ctx.db, blocked.decisionWake.wake_id).state == "pending"
+  end
+
+  test "a release fact that wins an overlapping revoke leaves no revoke side effects", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "release race"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "wait for release")
+      |> put_in([:params, :release_fact_kind], "dependency-ready")
+      |> put_in([:params, :release_fact_scope], assignment.id)
+      |> put_in([:params, :release_fact_principal_ref], "user:flynn")
+      |> then(&handle(ctx, "attest", &1))
+
+    parent = self()
+
+    fact_task =
+      Task.async(fn ->
+        DB.transaction(ctx.db, fn txn ->
+          fact =
+            ConditionFacts.file_in_txn(txn, %{
+              kind: "dependency-ready",
+              scope: assignment.id,
+              origin: "user:flynn"
+            })
+
+          send(parent, {:fact_written_inside_transaction, self()})
+
+          receive do
+            :commit_fact -> fact
+          end
+        end)
+      end)
+
+    assert_receive {:fact_written_inside_transaction, transaction_pid}
+
+    revoke_task =
+      Task.async(fn ->
+        send(parent, :revoke_started_during_fact_transaction)
+        handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+      end)
+
+    assert_receive :revoke_started_during_fact_transaction
+    send(transaction_pid, :commit_fact)
+
+    assert {:ok, %{fact_id: fact_id}} = Task.await(fact_task)
+    assert %{code: "cannot_proceed_released"} = Task.await(revoke_task)
+
+    assert {:ok, [["settled", "release-fact", ^fact_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,settlementKind,settlementFactId FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert {:ok, [["open", nil, 0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT state,outcome,
+                 (SELECT count(*) FROM assignment_revocations WHERE assignmentId=assignments.id)
+               FROM assignments WHERE id=?1
+               """,
+               [assignment.id]
+             )
+
+    assert %{code: "cannot_proceed_released"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "later ordinary revocation")
+             )
+  end
+
+  test "the terminal user alert transfers a retired session opener to its owner", ctx do
+    assignment =
+      handle(ctx, "assign", assign_call({:session, "other-session"}, "dead opener alert"))
+
+    blocked =
+      attest_call({:session, "holder"}, assignment.id, "cannot-proceed")
+      |> put_in([:params, :note], "the opener is gone")
+      |> then(&handle(ctx, "attest", &1))
+
+    assert %{state: "retired"} = Org.retire(ctx.db, "other-session", "user:other", 1_000)
+
+    assert {:ok, %{kind: "user-alerted", scope: "other"}} =
+             DB.transaction(ctx.db, fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "user-alerted",
+                 scope: "other",
+                 origin: "process:tightbeam"
+               })
+             end)
+
+    assert {:ok, [["user:other"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT disposerRef FROM assignment_cannot_proceed WHERE id=?1",
+               [blocked.cannotProceed.id]
+             )
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "other"}, assignment.id))
   end
 
   test "reopen-assignment repairs a revoked card (Sol xhigh review, finding 7)", ctx do
@@ -1880,24 +2288,372 @@ defmodule Tightbeam.AssignmentsTest do
                "SELECT priorOutcome FROM assignment_reopenings WHERE assignmentId = ?1",
                [assignment.id]
              )
+
+    assert {:ok, [[1, "test revocation"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*), min(reason)
+               FROM assignment_revocations WHERE assignmentId = ?1
+               """,
+               [assignment.id]
+             )
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "second revocation")
+             )
+
+    assert %{revocationReason: "second revocation"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[2, "second revocation", "test revocation"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*), min(reason), max(reason)
+               FROM assignment_revocations WHERE assignmentId = ?1
+               """,
+               [assignment.id]
+             )
   end
 
-  test "a failure after the history insert rolls back the whole reopen (Sol xhigh review, finding 7)",
+  test "reopened same-millisecond revocations bind reads and replay to the exact generation",
+       ctx do
+    assignment =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "generation identity")
+        |> put_in([:params, :files], [
+          "lib/tightbeam/state_resources.ex",
+          "test/assignments_test.exs"
+        ])
+      )
+
+    assignment_id = assignment.id
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "first reason")
+             )
+
+    assert {:ok, [[first_id, closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id, revokedAt FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "the first close was mistaken")
+             )
+
+    # The first immutable row has the same actor and timestamp as the target
+    # close below, but belongs to the initial generation. It cannot satisfy the
+    # post-reopen close trigger.
+    assert {:error, %DB.Error{message: old_generation_error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id, closed_at]
+             )
+
+    assert old_generation_error =~ "revoked assignment requires revocation provenance"
+
+    assert {:ok, [[reopening_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT id FROM assignment_reopenings WHERE assignmentId=?1 ORDER BY id DESC LIMIT 1",
+               [assignment.id]
+             )
+
+    second_id = "revocation-second-generation"
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_revocations
+                 (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+               VALUES (?1, ?2, ?3, 'flynn', NULL, 'second reason')
+               """,
+               [second_id, assignment.id, closed_at]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_revocation_generations
+                 (revocationId, assignmentId, reopeningId)
+               VALUES (?1, ?2, ?3)
+               """,
+               [second_id, assignment.id, reopening_id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id, closed_at]
+             )
+
+    assert %{revocationReason: "second reason"} =
+             current =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert %{assignment: %{revocationReason: "second reason"}} =
+             WorkState.detail(ctx.db, assignment.id)
+
+    notice =
+      Tightbeam.Firehose.Publisher.state_notice(
+        ctx.db,
+        call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+        current
+      )
+
+    assert %{
+             "class" => "assignment.closed",
+             "payload" => %{
+               "files" => [
+                 "lib/tightbeam/state_resources.ex",
+                 "test/assignments_test.exs"
+               ],
+               "derivedStatus" => "abandoned"
+             }
+           } = notice
+
+    assert Map.keys(notice["payload"]) |> Enum.sort() ==
+             ~w(closedAt closedBySession closedByUser closingAttestId derivedStatus effectKind files holderFallback holderHarness holderKey holderProvider holderRole id openedAt openedBySession openedByUser outcome reviewsAssignmentId rowVersion state subject workItemId)
+
+    refute Map.has_key?(notice["payload"], "reopenings")
+    refute Map.has_key?(notice["payload"], "revocationReason")
+    refute Map.has_key?(notice["payload"], "priority")
+
+    catalog = %{
+      {"eezo", "claude"} => [
+        %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    item_bytes =
+      Tightbeam.StateResources.encode_item("assignments", notice["payload"], catalog)
+
+    wire = Tightbeam.Firehose.Publisher.encode_wire_notice(notice, catalog)
+    assert wire =~ ~s("payload":#{item_bytes})
+    assert JSON.decode!(wire) == notice
+
+    assert %{id: ^assignment_id, revocationReason: "second reason"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               call("revoke-assignment", {:user, "flynn"}, nil, %{
+                 assignment_id: assignment.id,
+                 reason: "second reason"
+               })
+             )
+
+    assert {:ok, [[^second_id, ^reopening_id]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revocationId, reopeningId
+               FROM assignment_revocation_generations
+               WHERE assignmentId=?1 AND reopeningId IS NOT NULL
+               """,
+               [assignment.id]
+             )
+
+    assert {:ok, [[^first_id, nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revocationId, reopeningId
+               FROM assignment_revocation_generations
+               WHERE assignmentId=?1 AND reopeningId IS NULL
+               """,
+               [assignment.id]
+             )
+  end
+
+  test "completion and historical surrender notices use the exact shared assignment bytes", ctx do
+    catalog = %{
+      {"eezo", "claude"} => [
+        %{family: "fable", context: "1m", efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    assert_notice = fn attest_call, result, derived_status ->
+      notice =
+        ctx.db
+        |> Tightbeam.Firehose.Publisher.accepted_notices(attest_call, result)
+        |> Enum.find(&(&1["class"] == "assignment.closed"))
+
+      assert %{
+               "payload" => %{
+                 "derivedStatus" => ^derived_status,
+                 "files" => [
+                   "lib/tightbeam/firehose/publisher.ex",
+                   "test/assignments_test.exs"
+                 ]
+               }
+             } = notice
+
+      assert Map.keys(notice["payload"]) |> Enum.sort() ==
+               ~w(closedAt closedBySession closedByUser closingAttestId derivedStatus effectKind files holderFallback holderHarness holderKey holderProvider holderRole id openedAt openedBySession openedByUser outcome reviewsAssignmentId rowVersion state subject workItemId)
+
+      refute Map.has_key?(notice["payload"], "reopenings")
+      refute Map.has_key?(notice["payload"], "revocationReason")
+      refute Map.has_key?(notice["payload"], "priority")
+
+      item_bytes =
+        Tightbeam.StateResources.encode_item("assignments", notice["payload"], catalog)
+
+      wire = Tightbeam.Firehose.Publisher.encode_wire_notice(notice, catalog)
+      assert wire =~ ~s("payload":#{item_bytes})
+      assert JSON.decode!(wire) == notice
+    end
+
+    completion =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "completion assignment projection")
+        |> put_in([:params, :files], [
+          "lib/tightbeam/firehose/publisher.ex",
+          "test/assignments_test.exs"
+        ])
+      )
+
+    completion_call = attest_call({:session, "holder"}, completion.id, "completion")
+    completion_result = handle(ctx, "attest", completion_call)
+    assert_notice.(completion_call, completion_result, "claims-done")
+
+    historical =
+      handle(
+        ctx,
+        "assign",
+        assign_call({:user, "flynn"}, "historical surrender assignment projection")
+        |> put_in([:params, :files], [
+          "lib/tightbeam/firehose/publisher.ex",
+          "test/assignments_test.exs"
+        ])
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests (id, assignmentId, kind, note, bySession, ts) VALUES ('att_historical_projection', ?1, 'surrender', 'historical', 'holder', 10)",
+               [historical.id]
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed', outcome='surrendered', closedAt=10, closedBySession='holder', closingAttestId='att_historical_projection' WHERE id=?1",
+               [historical.id]
+             )
+
+    historical_assignment =
+      handle(ctx, "assignment-get", assignment_get_call({:session, "holder"}, historical.id))
+
+    [historical_attest] = Assignments.list_attests(ctx.db, historical.id)
+
+    historical_call = attest_call({:session, "holder"}, historical.id, "surrender")
+
+    assert_notice.(
+      historical_call,
+      %{attest: historical_attest, assignment: historical_assignment},
+      "abandoned"
+    )
+  end
+
+  test "generation upgrade replaces the predecessor tuple trigger before a reopened close", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade generation"))
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[closed_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedAt FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "upgrade needs a new generation")
+             )
+
+    # Simulate the exact predecessor: no generation table and the former
+    # timestamp/actor trigger body under its stable trigger name.
+    :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocation_generations")
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TRIGGER assignments_revocation_reason_required
+        BEFORE UPDATE OF state, outcome, closedAt, closedByUser, closedBySession ON assignments
+        WHEN NEW.state = 'closed' AND NEW.outcome = 'revoked'
+          AND NOT EXISTS (
+            SELECT 1 FROM assignment_revocations r
+            WHERE r.assignmentId = NEW.id
+              AND r.revokedAt = NEW.closedAt
+              AND r.revokedByUser IS NEW.closedByUser
+              AND r.revokedBySession IS NEW.closedBySession
+          )
+        BEGIN
+          SELECT RAISE(ABORT, 'revoked assignment requires revocation provenance');
+        END
+        """
+      )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:error, %DB.Error{message: error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=?2, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id, closed_at]
+             )
+
+    assert error =~ "revoked assignment requires revocation provenance"
+  end
+
+  test "reopen replaces stale pacing in the same transaction",
        ctx do
     assignment =
       handle(ctx, "assign", assign_call({:session, "holder"}, "post-insert failure"))
 
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
 
-    # `terminal_disposition` DELETEs the supervision_entitlements row on close,
-    # so there is normally none left to conflict with by the time a card
-    # reopens. Forcing one back makes `apply_reopen`'s later
-    # `supervision_transition!(:armed, ...)` observe `:duplicate` (the INSERT's
-    # `ON CONFLICT(assignmentId) DO NOTHING` fires) instead of `:armed` — an
-    # uncaught raise landing AFTER the INSERT into `assignment_reopenings` and
-    # the UPDATE to the `assignments` row, proving the whole transaction —
-    # history row included — rolls back together rather than leaving an
-    # orphaned papertrail row behind a card the code never actually reopened.
     {:ok, _} =
       DB.query(
         ctx.db,
@@ -1905,22 +2661,148 @@ defmodule Tightbeam.AssignmentsTest do
         INSERT INTO supervision_entitlements
           (assignmentId, generation, dueAt, state, basisKind, basisId, cause, principal,
            supervisionIntervalMs)
-        VALUES (?1, 1, 0, 'armed', 'assignment_open', ?1, 'assignment_open', 'process:test', 1000)
+        VALUES (?1, 9, NULL, 'terminus', 'assignment_open', ?1, 'terminus', 'process:test', NULL)
         """,
         [assignment.id]
       )
 
-    before = reopen_mutation_snapshot(ctx.db, assignment.id)
+    assignment_id = assignment.id
 
-    assert_raise RuntimeError, ~r/invalid supervision transition result/, fn ->
-      handle(
-        ctx,
-        "reopen-assignment",
-        reopen_call({:session, "holder"}, assignment.id, "racing supervision state")
-      )
-    end
+    assert %{id: ^assignment_id, state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "holder"}, assignment.id, "replace stale pacing", 80_000)
+               |> Map.put(:supervision_interval_ms, 60_000)
+             )
 
-    assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
+    assert {:ok, [[1, 140_000, "armed", nil, nil, nil, "assignment_open", "assignment_open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,dueAt,state,lastAttemptGeneration,claimClock,terminusAt,basisKind,cause FROM supervision_entitlements WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  test "reopen fixed-clock matrix replaces absent armed claimed and terminus pacing", ctx do
+    Enum.each(Enum.with_index(~w(absent armed claimed terminus), 1), fn {stale_state, index} ->
+      assignment =
+        handle(
+          ctx,
+          "assign",
+          assign_call({:session, "holder"}, "reopen #{stale_state} #{index}")
+        )
+
+      _ =
+        handle(
+          ctx,
+          "attest",
+          attest_call({:session, "holder"}, assignment.id, "completion")
+        )
+
+      if stale_state != "absent" do
+        {due_at, last_attempt, claim_clock, terminus_at, interval} =
+          case stale_state do
+            "armed" -> {70_000, nil, nil, nil, 60_000}
+            "claimed" -> {70_000, 9, 70_000, nil, 60_000}
+            "terminus" -> {nil, nil, nil, 70_000, nil}
+          end
+
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "INSERT INTO supervision_entitlements (assignmentId,generation,dueAt,state,lastAttemptGeneration,claimClock,basisKind,basisId,terminusAt,cause,principal,supervisionIntervalMs) VALUES (?1,9,?2,?3,?4,?5,'assignment_open',?1,?6,'terminus','process:test',?7)",
+            [
+              assignment.id,
+              due_at,
+              stale_state,
+              last_attempt,
+              claim_clock,
+              terminus_at,
+              interval
+            ]
+          )
+      end
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "INSERT INTO supervision_watermarks (sessionKey,lastEvaluatedTerminal,pendingBranch,pendingAssignment,pendingK,pendingN) VALUES ('holder',?1,'prod',?2,1,2) ON CONFLICT(sessionKey) DO UPDATE SET lastEvaluatedTerminal=excluded.lastEvaluatedTerminal,pendingBranch='prod',pendingAssignment=excluded.pendingAssignment,pendingK=1,pendingN=2",
+          [index, assignment.id]
+        )
+
+      assert {:ok, [[receipt_cursor_before]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT attestCursor FROM supervision_liveness_receipt_state WHERE assignmentId=?1",
+                 [assignment.id]
+               )
+
+      assert %{state: "open"} =
+               handle(
+                 ctx,
+                 "reopen-assignment",
+                 reopen_call(
+                   {:session, "holder"},
+                   assignment.id,
+                   "fixed #{stale_state}",
+                   80_000
+                 )
+                 |> Map.put(:supervision_interval_ms, 60_000)
+               )
+
+      assert {:ok,
+              [
+                [
+                  1,
+                  140_000,
+                  "armed",
+                  nil,
+                  nil,
+                  nil,
+                  "assignment_open",
+                  ^receipt_cursor_before
+                ]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT e.generation,e.dueAt,e.state,e.lastAttemptGeneration,e.claimClock,e.terminusAt,e.basisKind,r.attestCursor FROM supervision_entitlements e JOIN supervision_liveness_receipt_state r ON r.assignmentId=e.assignmentId WHERE e.assignmentId=?1",
+                 [assignment.id]
+               )
+
+      assert {:ok, [[1, nil, nil, nil, nil]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT (SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1),pendingBranch,pendingAssignment,pendingK,pendingN FROM supervision_watermarks WHERE sessionKey='holder'",
+                 [assignment.id]
+               )
+
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "DELETE FROM supervision_entitlements WHERE assignmentId=?1 AND EXISTS (SELECT 1 FROM assignments WHERE id=?1 AND state='closed')",
+                 [assignment.id]
+               )
+
+      assert %{code: "assignment_open"} =
+               handle(
+                 ctx,
+                 "reopen-assignment",
+                 reopen_call(
+                   {:session, "holder"},
+                   assignment.id,
+                   "losing reopen",
+                   90_000
+                 )
+               )
+
+      assert {:ok, [[1, 140_000, "armed"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT generation,dueAt,state FROM supervision_entitlements WHERE assignmentId=?1",
+                 [assignment.id]
+               )
+    end)
   end
 
   test "prefixed idempotency scopes disjoint equal user and session strings", ctx do
@@ -2021,16 +2903,17 @@ defmodule Tightbeam.AssignmentsTest do
     assert count in [0, 1]
     assert (winner[:attest] && count == 1) || (!winner[:attest] && count == 0)
 
-    terminal = handle(ctx, "assign", assign_call({:session, "holder"}, "terminal"))
-    closed = handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "surrender"))
-    assert closed.assignment.outcome == "surrendered"
-    assert closed.assignment.closingAttestId == closed.attest.id
+    paused = handle(ctx, "assign", assign_call({:session, "holder"}, "paused"))
 
-    assert %{code: "assignment_closed"} =
-             handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "progress"))
+    cannot_proceed =
+      attest_call({:session, "holder"}, paused.id, "cannot-proceed")
+      |> put_in([:params, :note], "needs an opener decision")
+      |> then(&handle(ctx, "attest", &1))
 
-    assert %{code: "assignment_closed"} =
-             handle(ctx, "attest", attest_call({:session, "holder"}, terminal.id, "verdict"))
+    assert cannot_proceed.assignment.state == "open"
+    assert cannot_proceed.attest.kind == "cannot-proceed"
+    assert cannot_proceed.cannotProceed.state == "standing"
+    assert cannot_proceed.decisionWake.assignment_id == paused.id
   end
 
   test "work lifecycle markers land in the actor transcript with exact event text", ctx do
@@ -2058,10 +2941,12 @@ defmodule Tightbeam.AssignmentsTest do
     completion =
       handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "completion"))
 
-    surrendered = handle(ctx, "assign", assign_call({:user, "flynn"}, "surrender markers"))
+    paused = handle(ctx, "assign", assign_call({:user, "flynn"}, "cannot-proceed markers"))
 
-    surrender =
-      handle(ctx, "attest", attest_call({:session, "holder"}, surrendered.id, "surrender"))
+    cannot_proceed =
+      attest_call({:session, "holder"}, paused.id, "cannot-proceed")
+      |> put_in([:params, :note], "needs input")
+      |> then(&handle(ctx, "attest", &1))
 
     revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "revoke markers"))
     revocation = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked.id))
@@ -2072,9 +2957,8 @@ defmodule Tightbeam.AssignmentsTest do
              "[verdict filed: reviewed-clean on #{completed.id}]",
              "[completion filed on #{completed.id}]",
              "[assignment closed: #{completed.id} — completed]",
-             "[assignment opened: #{surrendered.id}]",
-             "[surrendered #{surrendered.id} — needs user input]",
-             "[assignment closed: #{surrendered.id} — surrendered]",
+             "[assignment opened: #{paused.id}]",
+             "[cannot-proceed filed on #{paused.id}: needs input]",
              "[assignment opened: #{revoked.id}]",
              "[assignment revoked: #{revoked.id}]"
            ]
@@ -2084,13 +2968,13 @@ defmodule Tightbeam.AssignmentsTest do
     assert user_verdict.attest.byUser == "flynn"
     assert completion.assignment.outcome == "completed"
     assert completion.assignment.closingAttestId == completion.attest.id
-    assert surrender.assignment.outcome == "surrendered"
-    assert surrender.assignment.closingAttestId == surrender.attest.id
+    assert cannot_proceed.assignment.state == "open"
     assert revocation.outcome == "revoked"
     assert revocation.closingAttestId == nil
 
     assert Enum.all?(Projection.list_after(ctx.db, "holder", nil, 100), fn marker ->
-             marker.role == "assistant" and marker.sender == "process:tightbeam"
+             marker.role == "assistant" and marker.sender == "process:tightbeam" and
+               marker.message_type == "substrate"
            end)
   end
 
@@ -2130,6 +3014,477 @@ defmodule Tightbeam.AssignmentsTest do
              handle(ctx, "revoke-assignment", revoke_call(nil, assignment.id))
 
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM attests")
+  end
+
+  test "revocation requires one durable bounded reason and projects its provenance", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reason required"))
+
+    for params <- [
+          %{assignment_id: assignment.id},
+          %{assignment_id: assignment.id, reason: "   "},
+          %{assignment_id: assignment.id, reason: "\t"},
+          %{assignment_id: assignment.id, reason: "\u00A0"},
+          %{assignment_id: assignment.id, reason: "\u3000"},
+          %{assignment_id: assignment.id, reason: String.duplicate("x", 2001)},
+          %{assignment_id: assignment.id, reason: 7}
+        ] do
+      assert %{code: code} =
+               handle(
+                 ctx,
+                 "revoke-assignment",
+                 call("revoke-assignment", {:user, "flynn"}, nil, params)
+               )
+
+      assert code in ["missing_reason", "invalid_reason"]
+    end
+
+    assert %{state: "open", revocationReason: nil} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId = ?1",
+               [
+                 assignment.id
+               ]
+             )
+
+    for {reason, suffix} <- [{"\t", "tab"}, {"\u00A0", "nbsp"}, {"\u3000", "ideographic"}] do
+      assert {:error, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                 VALUES (?1, ?2, 1, 'flynn', NULL, ?3)
+                 """,
+                 ["revocation-whitespace-#{suffix}", assignment.id, reason]
+               )
+    end
+
+    revoked =
+      handle(
+        ctx,
+        "revoke-assignment",
+        call("revoke-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: "the work moved to its replacement"
+        })
+      )
+
+    assert revoked.revocationReason == "the work moved to its replacement"
+    assert revoked.closedByUser == "flynn"
+
+    assert %{revocationReason: "the work moved to its replacement"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert %{
+             "class" => "assignment.closed",
+             "payload" => %{"closedByUser" => "flynn", "outcome" => "revoked"} = payload
+           } =
+             Tightbeam.Firehose.Publisher.state_notice(
+               ctx.db,
+               call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+               revoked
+             )
+
+    refute Map.has_key?(payload, "reopenings")
+    refute Map.has_key?(payload, "revocationReason")
+    refute Map.has_key?(payload, "priority")
+
+    assert {:ok, [["flynn", nil, closed_at, "the work moved to its replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedByUser, revokedBySession, revokedAt, reason FROM assignment_revocations WHERE assignmentId = ?1",
+               [assignment.id]
+             )
+
+    assert closed_at == revoked.closedAt
+
+    replayed =
+      handle(
+        ctx,
+        "revoke-assignment",
+        call("revoke-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: "the work moved to its replacement"
+        })
+      )
+
+    assert replayed.id == assignment.id
+    assert replayed.revocationReason == "the work moved to its replacement"
+
+    admin_revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "admin revocation"))
+
+    assert %{closedByUser: "admin"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "admin"}, admin_revoked.id)
+             )
+
+    assert %{code: "assignment_closed"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, admin_revoked.id)
+             )
+
+    assert %{code: "assignment_closed"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               call("revoke-assignment", {:user, "flynn"}, nil, %{
+                 assignment_id: assignment.id,
+                 reason: "a conflicting reason"
+               })
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId = ?1",
+               [
+                 assignment.id
+               ]
+             )
+  end
+
+  test "legacy revoked assignments migrate only to the explicit unknown sentinel", ctx do
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required_insert")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignments
+                 (id, subject, holderKey, holderFallback, openedByUser, openedAt, state, outcome,
+                  closedAt, closedByUser)
+               VALUES ('asg_legacy_reason', 'legacy', 'holder', 0, 'flynn', 1, 'closed', 'revoked', 2, 'flynn')
+               """
+             )
+
+    :ok = Assignments.ensure_schema(ctx.db)
+
+    assert %{revocationReason: "legacy_unknown", closedByUser: "flynn", closedAt: 2} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:user, "flynn"}, "asg_legacy_reason")
+             )
+
+    assert {:ok, [["legacy:asg_legacy_reason:2", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revocationId, reopeningId
+               FROM assignment_revocation_generations
+               WHERE assignmentId='asg_legacy_reason'
+               """
+             )
+  end
+
+  test "schema restart preserves one recorded revocation reason without a legacy sentinel", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "restart provenance"))
+
+    assert %{outcome: "revoked", revocationReason: "recorded reason"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, assignment.id)
+               |> put_in([:params, :reason], "recorded reason")
+             )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:ok, [[1, "recorded reason"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT count(*), min(reason)
+               FROM assignment_revocations WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert %{revocationReason: "recorded reason"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+  end
+
+  test "revocation replay emits no second state callback or accepted handoff", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "replay notices"))
+
+    call =
+      revoke_call({:user, "flynn"}, assignment.id)
+      |> Map.merge(%{
+        firehose_in_txn: true,
+        firehose_hub: self(),
+        on_assignment_change: fn _, _ -> send(self(), :assignment_changed) end
+      })
+
+    assert %{id: assignment_id} = handle(ctx, "revoke-assignment", call)
+    assert assignment_id == assignment.id
+    assert_receive {:"$gen_cast", {:accepted, nil, %{verb: "revoke-assignment"}, _}}
+    assert_receive :assignment_changed
+
+    assert %{id: ^assignment_id} = handle(ctx, "revoke-assignment", call)
+    refute_received {:"$gen_cast", {:accepted, nil, %{verb: "revoke-assignment"}, _}}
+    refute_received :assignment_changed
+  end
+
+  test "retirement attributes revocation provenance to the acting session", ctx do
+    caller = session(ctx.db, "agent:retirement-caller", "flynn")
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "retirement actor"))
+
+    assert {:ok, [_]} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "flynn",
+                 caller.session_key
+               )
+             end)
+
+    assert {:ok, [[nil, "agent:retirement-caller", "holder session retired"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT revokedByUser, revokedBySession, reason
+               FROM assignment_revocations WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert {:ok, [[nil, "agent:retirement-caller"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT closedByUser, closedBySession FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+  end
+
+  test "revocation provenance cannot be rewritten or deleted", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "immutable provenance"))
+
+    assert %{outcome: "revoked"} =
+             handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+    assert {:error, %DB.Error{message: update_error}} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_revocations SET reason='rewritten reason' WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert update_error =~ "revocation provenance is immutable"
+
+    assert {:error, %DB.Error{message: delete_error}} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert delete_error =~ "revocation provenance is immutable"
+
+    assert {:error, %DB.Error{message: generation_update_error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignment_revocation_generations
+               SET reopeningId=1 WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert generation_update_error =~ "revocation generation is immutable"
+
+    assert {:error, %DB.Error{message: generation_delete_error}} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_revocation_generations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert generation_delete_error =~ "revocation generation is immutable"
+
+    assert {:ok, [["test revocation"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reason FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  test "process retirement refuses rather than attributing the holder owner", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "recovery provenance"))
+
+    assert {:error, %ArgumentError{message: message}} =
+             DB.transaction(ctx.db, fn txn ->
+               Assignments.interrupt_for_retire_in_txn(
+                 txn,
+                 "holder",
+                 "flynn",
+                 "process:tightbeam"
+               )
+             end)
+
+    assert message =~ "requires a representable user or session principal"
+
+    assert {:ok, [["open", 0]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT state,
+                 (SELECT count(*) FROM assignment_revocations WHERE assignmentId=assignments.id)
+               FROM assignments WHERE id=?1
+               """,
+               [assignment.id]
+             )
+  end
+
+  test "upgrade rebuilds revocation provenance with the Unicode whitespace constraint", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "upgrade reason"))
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER assignments_revocation_reason_required")
+    :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocation_generations")
+    :ok = DB.execute(ctx.db, "DROP TABLE assignment_revocations")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        CREATE TABLE assignment_revocations (
+          id TEXT PRIMARY KEY,
+          assignmentId TEXT NOT NULL REFERENCES assignments(id),
+          revokedAt INTEGER NOT NULL,
+          revokedByUser TEXT NULL REFERENCES users(userId),
+          revokedBySession TEXT NULL REFERENCES sessions(sessionKey),
+          reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 2000 AND length(trim(reason)) >= 1),
+          CHECK((revokedByUser IS NOT NULL) != (revokedBySession IS NOT NULL))
+        );
+        CREATE INDEX assignment_revocations_assignment
+          ON assignment_revocations (assignmentId, revokedAt, id);
+        DELETE FROM assignment_revocation_migrations;
+        """
+      )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               """
+               INSERT INTO assignment_revocations
+                 (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+               VALUES ('revocation-pre-upgrade', ?1, 42, 'flynn', NULL, 'superseded')
+               """,
+               [assignment.id]
+             )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:ok, [["superseded", 42, "flynn", nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT reason, revokedAt, revokedByUser, revokedBySession
+               FROM assignment_revocations
+               WHERE id='revocation-pre-upgrade'
+               """
+             )
+
+    assert {:error, %DB.Error{message: immutable_error}} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_revocations SET reason='rewritten' WHERE id='revocation-pre-upgrade'"
+             )
+
+    assert immutable_error =~ "revocation provenance is immutable"
+
+    assert {:error, %DB.Error{message: trigger_error}} =
+             DB.query(
+               ctx.db,
+               """
+               UPDATE assignments
+               SET state='closed', outcome='revoked', closedAt=43, closedByUser='flynn'
+               WHERE id=?1
+               """,
+               [assignment.id]
+             )
+
+    assert trigger_error =~ "revoked assignment requires revocation provenance"
+
+    for code_point <- [
+          9,
+          10,
+          11,
+          12,
+          13,
+          32,
+          133,
+          160,
+          5760,
+          8192,
+          8193,
+          8194,
+          8195,
+          8196,
+          8197,
+          8198,
+          8199,
+          8200,
+          8201,
+          8202,
+          8232,
+          8233,
+          8239,
+          8287,
+          12288
+        ] do
+      assert {:error, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                 VALUES (?1, ?2, 43, 'flynn', NULL, ?3)
+                 """,
+                 [
+                   "revocation-upgrade-whitespace-#{code_point}",
+                   assignment.id,
+                   <<code_point::utf8>>
+                 ]
+               )
+    end
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT count(*) FROM assignment_revocation_migrations
+                  WHERE migrationId='0.2.0/revocation-reason-unicode-whitespace-v1'),
+                 (SELECT count(*) FROM assignment_revocations
+                  WHERE id='revocation-pre-upgrade')
+               """
+             )
+
+    assert :ok = Assignments.ensure_schema(ctx.db)
+
+    assert {:ok, [[1, 1]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT
+                 (SELECT count(*) FROM assignment_revocation_migrations
+                  WHERE migrationId='0.2.0/revocation-reason-unicode-whitespace-v1'),
+                 (SELECT count(*) FROM assignment_revocations
+                  WHERE id='revocation-pre-upgrade')
+               """
+             )
   end
 
   test "query filters, deterministic ordering, role-resolved holder input, and open_count", ctx do
@@ -2399,12 +3754,15 @@ defmodule Tightbeam.AssignmentsTest do
     do: call("assignment-get", principal, nil, %{assignment_id: id})
 
   defp revoke_call(principal, id),
-    do: call("revoke-assignment", principal, nil, %{assignment_id: id})
+    do: call("revoke-assignment", principal, nil, %{assignment_id: id, reason: "test revocation"})
 
   defp reopen_call(principal, id, reason),
     do:
       call("reopen-assignment", principal, nil, %{assignment_id: id, reason: reason})
       |> Map.put(:supervision_interval_ms, 1_000)
+
+  defp reopen_call(principal, id, reason, clock),
+    do: reopen_call(principal, id, reason) |> Map.put(:clock, clock)
 
   defp query_call(principal, state, holder),
     do: call("assignments", principal, holder, %{state: state})

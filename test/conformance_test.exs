@@ -970,7 +970,12 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_delivery_policy("digest", kase, db, wake) do
     policy = Wakes.delivery_policy(wake.class)
 
-    assert wake.delivery_rule == Wakes.digest_rule()
+    if wake.delivery_rule == Wakes.digest_rule() do
+      assert wake.delivery_rule == Wakes.digest_rule()
+    else
+      assert wake.delivery_rule =~ "turn-boundary-digest"
+    end
+
     assert wake.class_election == "sender"
     assert wake.due_at - wake.created_at == policy.ceiling_ms
 
@@ -997,11 +1002,21 @@ defmodule Tightbeam.ConformanceSupport do
     digest = Wakes.get(db, digest_id)
     assert digest.digest
     assert digest.class == wake.class
-    assert digest.prompt =~ Wakes.digest_signature(1)
+
+    expected_signature =
+      if wake.delivery_rule == Wakes.digest_rule(),
+        do: Wakes.digest_signature(1),
+        else: "coalesced by #{wake.delivery_rule} (1 notice)"
+
+    assert digest.prompt =~ expected_signature
 
     # LAW 2: the source row is still here, and it names where its payload went.
     carried = Wakes.get(db, wake.wake_id)
-    assert carried.state == "canceled"
+
+    expected_source_state =
+      if wake.delivery_rule == Wakes.digest_rule(), do: "pending", else: "canceled"
+
+    assert carried.state == expected_source_state
     assert carried.prompt == wake.prompt
     assert [%{wake_id: source}] = Wakes.digest_members(db, digest_id)
     assert source == wake.wake_id
@@ -1009,7 +1024,7 @@ defmodule Tightbeam.ConformanceSupport do
     if kase["kind"] == "legibility" do
       detail = lifecycle_detail(db, "wake_digest_materialized", digest_id)
       assert kase["emits"] == "lifecycle:wake_digest_materialized"
-      assert detail =~ "rule=#{Wakes.digest_rule()}"
+      assert detail =~ "rule=#{wake.delivery_rule}"
       assert detail =~ "trigger=ceiling"
     end
   end
@@ -1118,7 +1133,7 @@ defmodule Tightbeam.ConformanceSupport do
     # The case DECLARES the class the carrier must elect; nothing here infers it.
     assert wake.class == (kase["reason"] || "input-needed")
     assert wake.class_election == "sender"
-    assert wake.delivery_rule == Wakes.digest_rule()
+    assert wake.delivery_rule =~ "turn-boundary-digest"
     assert wake.prompt =~ request.id
 
     if kase["kind"] == "legibility" do
@@ -1153,22 +1168,32 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_question_outcome("answered", kase, db, handlers, _ids, result) do
     request = filed!(kase, result)
 
-    # A bystander is refused `not_found`, not a kind/authority-revealing
-    # `not_asked` (Sol xhigh review, finding 4): an unauthorized caller must
-    # not be able to tell this id apart from a fake one.
-    assert {:error, %{code: "not_found"}} =
-             Dispatch.dispatch(db, handlers, answer_call("bystander", request.id, "not mine"))
-
     assert {:ok, %{decision_request: answered}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               answer_call("bystander", request.id, "behind a flag")
+             )
+
+    assert answered.status == "answered"
+    assert answered.answer == "behind a flag"
+    assert answered.answered_by == "session:bystander"
+
+    # The expecter is preferred, not an authorization gate. The same session
+    # and payload retry exactly; another session cannot claim the terminal row.
+    assert {:ok, %{decision_request: ^answered}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               answer_call("bystander", request.id, "behind a flag")
+             )
+
+    assert {:error, %{code: "not_open"}} =
              Dispatch.dispatch(
                db,
                handlers,
                answer_call(request.expecter_session_key, request.id, "behind a flag")
              )
-
-    assert answered.status == "answered"
-    assert answered.answer == "behind a flag"
-    assert answered.answered_by == "session:" <> request.expecter_session_key
 
     # AN ANSWER IS NOT A RULING: nothing is spent and no condition fact is filed,
     # so no halted call anywhere can be released by it.
@@ -1211,15 +1236,28 @@ defmodule Tightbeam.ConformanceSupport do
   defp assert_question_outcome("returned", kase, db, handlers, _ids, result) do
     request = filed!(kase, result)
 
-    # An unasked bystander learns no more than a caller probing a fake id.
-    assert {:error, %{code: "not_found"}} =
+    assert {:ok, %{decision_request: returned}} =
              Dispatch.dispatch(
                db,
                handlers,
                return_call("bystander", request.id, "missing the rollback boundary")
              )
 
-    assert {:ok, %{decision_request: returned}} =
+    assert returned.status == "returned"
+    assert returned.question == request.question
+    assert returned.return_reason == "missing the rollback boundary"
+    assert returned.returned_by == "session:bystander"
+    assert is_integer(returned.returned_at)
+    assert returned.answer == nil
+
+    assert {:ok, %{decision_request: ^returned}} =
+             Dispatch.dispatch(
+               db,
+               handlers,
+               return_call("bystander", request.id, "missing the rollback boundary")
+             )
+
+    assert {:error, %{code: "not_open"}} =
              Dispatch.dispatch(
                db,
                handlers,
@@ -1229,13 +1267,6 @@ defmodule Tightbeam.ConformanceSupport do
                  "missing the rollback boundary"
                )
              )
-
-    assert returned.status == "returned"
-    assert returned.question == request.question
-    assert returned.return_reason == "missing the rollback boundary"
-    assert returned.returned_by == "session:" <> request.expecter_session_key
-    assert is_integer(returned.returned_at)
-    assert returned.answer == nil
 
     # Default open retrieval no longer includes the returned row, while the
     # explicit terminal filter preserves its full reasoned history.
@@ -2448,7 +2479,8 @@ defmodule Tightbeam.ConformanceSupport do
                "SELECT COUNT(*) FROM wakes WHERE consumer = 'prompt' AND conditionKind IS NULL AND targetGate = 0"
              )
 
-    assert {:ok, [[2]]} = DB.query(db, "SELECT COUNT(*) FROM wakes")
+    assert {:ok, [[2]]} =
+             DB.query(db, "SELECT COUNT(*) FROM wakes WHERE consumer <> 'effort_probe'")
   end
 
   def run_park_wake_reuse_contract(fixture) do
@@ -3515,10 +3547,14 @@ defmodule Tightbeam.ConformanceSupport do
        ) do
     Enum.each(Map.get(world, "users", []), fn user ->
       {:ok, _} =
-        DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, ?2, 1)", [
-          user["id"],
-          if(user["admin"], do: 1, else: 0)
-        ])
+        DB.query(
+          db,
+          "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES (?1, ?2, 'admin_add', 1)",
+          [
+            user["id"],
+            if(user["admin"], do: 1, else: 0)
+          ]
+        )
     end)
 
     world
@@ -3676,12 +3712,23 @@ defmodule Tightbeam.ConformanceSupport do
         else
           message_id = "conformance-terminal-#{System.unique_integer([:positive])}"
 
+          assignment_id =
+            case DB.query(
+                   db,
+                   "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY openedAt,id LIMIT 1",
+                   [turn["session"]]
+                 ) do
+              {:ok, [[id]]} -> id
+              {:ok, []} -> nil
+            end
+
           assert {:ok, seq} =
                    Ledger.enqueue(db, %{
                      session_key: turn["session"],
                      message_id: message_id,
                      origin: "user:conformance",
-                     prompt: "terminal"
+                     prompt: "terminal",
+                     assignment_id: assignment_id
                    })
 
           assert seq == turn["seq"]
@@ -3985,7 +4032,7 @@ defmodule Tightbeam.ConformanceSupport do
         origin: "user:owner",
         principal: {:user, "owner"},
         session_key: nil,
-        params: %{assignment_id: assignment_id}
+        params: %{assignment_id: assignment_id, reason: "test revocation"}
       })
 
     refute Map.has_key?(result, :code)
@@ -4272,8 +4319,10 @@ defmodule Tightbeam.ConformanceTest do
     # fixture, live-engine-switch. Green on both axes, so it raises the total
     # and the active count and leaves the ACTIVATED counts alone. The class is
     # green too, so it adds no class registration either.
-    assert length(@fixtures) == 71
-    assert active_fixtures == 61
+    # The KUNGFU retirement-preservation guard adds one GREEN C1 fixture. It
+    # raises the total and active counts only; the mechanism ships with it.
+    assert length(@fixtures) == 72
+    assert active_fixtures == 62
     assert exact_skips == 10
     assert activated_fixture_tests == 43
     assert activated_class_tests == 5

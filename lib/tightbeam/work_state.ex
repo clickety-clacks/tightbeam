@@ -34,6 +34,13 @@ defmodule Tightbeam.WorkState do
   a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
   a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
   a.closedAt, a.closedByUser, a.closedBySession, a.closingAttestId,
+  (SELECT r.reason FROM assignment_revocation_generations g
+    JOIN assignment_revocations r ON r.id = g.revocationId
+    WHERE g.assignmentId = a.id AND g.reopeningId IS (
+      SELECT reopening.id FROM assignment_reopenings reopening
+      WHERE reopening.assignmentId = a.id
+      ORDER BY reopening.id DESC LIMIT 1
+    )),
   a.workItemId, s.state,
   CASE
     WHEN a.state = 'closed' AND a.outcome IN ('surrendered', 'revoked') THEN 'abandoned'
@@ -47,7 +54,12 @@ defmodule Tightbeam.WorkState do
       SELECT 1 FROM attests f WHERE f.assignmentId = a.id
     ) THEN 'open'
     ELSE 'active'
-  END
+  END,
+  COALESCE(
+    (SELECT priority FROM assignment_priorities WHERE assignmentId=a.id),
+    (SELECT priority FROM work_item_priorities WHERE workItemId=a.workItemId),
+    CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+  )
   """
 
   @doc "Create both observability doorbell tables."
@@ -67,7 +79,11 @@ defmodule Tightbeam.WorkState do
   @spec list(DB.server(), map()) :: %{work: [map()], cursor: non_neg_integer()}
   def list(db, filters) do
     transaction(db, fn txn ->
-      work = txn |> assignment_rows(filters) |> Enum.map(&assignment/1)
+      work =
+        txn
+        |> assignment_rows(filters)
+        |> Enum.map(fn row -> row |> assignment() |> project_assignment(txn) end)
+
       %{work: work, cursor: cursor(txn, "work_state_events")}
     end)
   end
@@ -81,7 +97,7 @@ defmodule Tightbeam.WorkState do
           nil
 
         [row] ->
-          assignment = assignment(row)
+          assignment = row |> assignment() |> project_assignment(txn)
 
           %{
             assignment: assignment,
@@ -102,7 +118,7 @@ defmodule Tightbeam.WorkState do
         txn
         |> item_rows(filters)
         |> Enum.map(fn row ->
-          item = work_item(row)
+          item = row |> work_item() |> project_work_item(txn)
           %{workItem: item, assignments: assignments_for_item(txn, item.id)}
         end)
 
@@ -120,7 +136,7 @@ defmodule Tightbeam.WorkState do
 
         [row] ->
           %{
-            workItem: work_item(row),
+            workItem: row |> work_item() |> project_work_item(txn),
             assignments: assignments_for_item(txn, work_item_id),
             cursor: cursors(txn)
           }
@@ -221,7 +237,7 @@ defmodule Tightbeam.WorkState do
 
   defp assignments_for_item(txn, work_item_id) do
     Txn.q(txn, assignment_query("a.workItemId = ?1"), [work_item_id])
-    |> Enum.map(&assignment/1)
+    |> Enum.map(fn row -> row |> assignment() |> project_assignment(txn) end)
   end
 
   defp assignment_owner(txn, assignment_id) do
@@ -265,7 +281,8 @@ defmodule Tightbeam.WorkState do
         note: note,
         bySession: by_session,
         byUser: by_user,
-        ts: ts
+        ts: ts,
+        deliverableClaim: Tightbeam.DeliverableContract.attest_claim_projection_in_txn(txn, id)
       }
     end)
   end
@@ -326,7 +343,10 @@ defmodule Tightbeam.WorkState do
   defp item_columns,
     do:
       "id, title, specRefName, specRefSha256, isBug, ownerUserId, state, failReason, " <>
-        "createdByUser, createdBySession, createdAt"
+        "createdByUser, createdBySession, createdAt, " <>
+        "COALESCE((SELECT priority FROM work_item_priorities p WHERE p.workItemId=work_items.id), " <>
+        "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)), " <>
+        "COALESCE((SELECT rowVersion FROM work_item_versions WHERE workItemId=work_items.id), createdAt)"
 
   defp assignment([
          id,
@@ -343,9 +363,11 @@ defmodule Tightbeam.WorkState do
          closed_by_user,
          closed_by_session,
          closing_attest_id,
+         revocation_reason,
          work_item_id,
          holder_state,
-         status
+         status,
+         priority
        ]) do
     %{
       id: id,
@@ -362,9 +384,11 @@ defmodule Tightbeam.WorkState do
       closedByUser: closed_by_user,
       closedBySession: closed_by_session,
       closingAttestId: closing_attest_id,
+      revocationReason: revocation_reason,
       workItemId: work_item_id,
       holderState: holder_state,
-      status: status
+      status: status,
+      priority: priority
     }
   end
 
@@ -379,7 +403,9 @@ defmodule Tightbeam.WorkState do
          fail_reason,
          user,
          session,
-         created_at
+         created_at,
+         priority,
+         row_version
        ]) do
     %{
       id: id,
@@ -392,8 +418,24 @@ defmodule Tightbeam.WorkState do
       failReason: fail_reason,
       createdByUser: user,
       createdBySession: session,
-      createdAt: created_at
+      createdAt: created_at,
+      priority: priority,
+      rowVersion: row_version
     }
+  end
+
+  defp project_assignment(assignment, txn) do
+    Map.merge(
+      assignment,
+      Tightbeam.DeliverableContract.assignment_projection_in_txn(txn, assignment.id)
+    )
+  end
+
+  defp project_work_item(item, txn) do
+    Map.merge(
+      item,
+      Tightbeam.DeliverableContract.work_item_projection_in_txn(txn, item.id)
+    )
   end
 
   defp transaction(db, fun) do

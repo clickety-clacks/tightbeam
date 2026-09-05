@@ -10,11 +10,13 @@ defmodule Tightbeam.Assignments do
 
   alias Tightbeam.{
     EffortCheckin,
+    Escalation,
     EventLog,
     IdPrefix,
     Org,
     Placement,
     Projection,
+    Productions.CompletionEscalation,
     Supervision,
     Wakes
   }
@@ -61,6 +63,7 @@ defmodule Tightbeam.Assignments do
     closingAttestId TEXT NULL REFERENCES attests(id),
     workItemId TEXT NULL REFERENCES work_items(id),
     reviewsAssignmentId TEXT NULL REFERENCES assignments(id),
+    completionReportToSessionKey TEXT NULL REFERENCES sessions(sessionKey),
     holderHarness TEXT NULL,
     holderProvider TEXT NULL,
     CHECK(holderRole IS NOT NULL OR holderFallback = 0),
@@ -81,7 +84,7 @@ defmodule Tightbeam.Assignments do
   CREATE TABLE IF NOT EXISTS attests (
     id TEXT PRIMARY KEY,
     assignmentId TEXT NOT NULL REFERENCES assignments(id),
-    kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
+    kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'cannot-proceed', 'verdict')),
     verdictKind TEXT NULL,
     note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
     bySession TEXT NULL REFERENCES sessions(sessionKey),
@@ -93,7 +96,7 @@ defmodule Tightbeam.Assignments do
     commitRefs TEXT NULL,
     ts INTEGER NOT NULL,
     CHECK(
-      (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
+      (kind IN ('progress', 'completion', 'surrender', 'cannot-proceed') AND bySession IS NOT NULL AND
        byUser IS NULL AND verdictKind IS NULL)
       OR
       (kind = 'verdict' AND verdictKind IS NOT NULL AND
@@ -104,6 +107,55 @@ defmodule Tightbeam.Assignments do
     CHECK(byHarness IS NULL OR kind = 'verdict'),
     CHECK(byProvider IS NULL OR kind = 'verdict')
   )
+  """
+
+  @cannot_proceed_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_cannot_proceed (
+    id TEXT PRIMARY KEY,
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    attestId TEXT NOT NULL UNIQUE REFERENCES attests(id),
+    decisionRequestId TEXT NOT NULL UNIQUE,
+    decisionWakeId TEXT NOT NULL UNIQUE REFERENCES wakes(wakeId),
+    openerRef TEXT NOT NULL,
+    disposerRef TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 2000),
+    releaseFactKind TEXT NULL,
+    releaseFactScope TEXT NULL,
+    releaseFactPrincipalRef TEXT NULL,
+    state TEXT NOT NULL CHECK(state IN ('standing', 'settled')),
+    createdAt INTEGER NOT NULL,
+    settledAt INTEGER NULL,
+    settlementKind TEXT NULL CHECK(settlementKind IN ('release-fact', 'disposed')),
+    settlementFactId INTEGER NULL REFERENCES condition_facts(id),
+    settledBy TEXT NULL,
+    CHECK(
+      (releaseFactKind IS NULL AND releaseFactScope IS NULL AND releaseFactPrincipalRef IS NULL)
+      OR
+      (releaseFactKind IS NOT NULL AND releaseFactScope IS NOT NULL AND
+       releaseFactPrincipalRef IS NOT NULL)
+    ),
+    CHECK(
+      (state = 'standing' AND settledAt IS NULL AND settlementKind IS NULL AND
+       settlementFactId IS NULL AND settledBy IS NULL)
+      OR
+      (state = 'settled' AND settledAt IS NOT NULL AND settlementKind IS NOT NULL AND
+       settledBy IS NOT NULL)
+    )
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS assignment_cannot_proceed_standing
+    ON assignment_cannot_proceed(assignmentId) WHERE state='standing';
+  CREATE INDEX IF NOT EXISTS assignment_cannot_proceed_release
+    ON assignment_cannot_proceed(releaseFactKind, releaseFactScope, releaseFactPrincipalRef)
+    WHERE state='standing' AND releaseFactKind IS NOT NULL;
+  """
+
+  @cannot_proceed_release_observations_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_cannot_proceed_release_observations (
+    conditionId TEXT PRIMARY KEY REFERENCES assignment_cannot_proceed(id),
+    principal TEXT NOT NULL,
+    reason TEXT NOT NULL CHECK(length(trim(reason)) BETWEEN 1 AND 2000),
+    observedAt INTEGER NOT NULL
+  );
   """
 
   @assignment_files_ddl """
@@ -122,6 +174,13 @@ defmodule Tightbeam.Assignments do
   )
   """
 
+  @assignment_priorities_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_priorities (
+    assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
+    priority INTEGER NOT NULL
+  )
+  """
+
   @interruptions_ddl """
   CREATE TABLE IF NOT EXISTS assignment_interruptions (
     assignmentId TEXT PRIMARY KEY REFERENCES assignments(id),
@@ -129,6 +188,171 @@ defmodule Tightbeam.Assignments do
     reason       TEXT NOT NULL CHECK(reason = 'interrupted-by-retire'),
     ts           INTEGER NOT NULL
   );
+  """
+
+  # A revocation is a terminal fact, not an attest: the revoker is not the
+  # holder and does not owe a verdict. Keep its provenance in its own
+  # append-only row so reopening does not erase an earlier revocation.
+  @revocations_table_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_revocations (
+    id TEXT PRIMARY KEY,
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    revokedAt INTEGER NOT NULL,
+    revokedByUser TEXT NULL REFERENCES users(userId),
+    revokedBySession TEXT NULL REFERENCES sessions(sessionKey),
+    -- Match String.trim/1's Unicode whitespace contract. SQLite's one-argument
+    -- trim only removes ASCII spaces, so a tab-only reason would otherwise be
+    -- a durable but content-free revocation motive.
+    reason TEXT NOT NULL CHECK(
+      length(reason) BETWEEN 1 AND 2000
+      AND length(trim(reason,
+        char(9) || char(10) || char(11) || char(12) || char(13) || ' ' ||
+        char(133) || char(160) || char(5760) ||
+        char(8192) || char(8193) || char(8194) || char(8195) || char(8196) ||
+        char(8197) || char(8198) || char(8199) || char(8200) || char(8201) ||
+        char(8202) || char(8232) || char(8233) || char(8239) || char(8287) ||
+        char(12288)
+      )) >= 1
+    ),
+    CHECK((revokedByUser IS NOT NULL) != (revokedBySession IS NOT NULL))
+  )
+  """
+
+  @revocations_index_ddl """
+  CREATE INDEX IF NOT EXISTS assignment_revocations_assignment
+    ON assignment_revocations (assignmentId, revokedAt, id)
+  """
+
+  # A reopened assignment can be revoked again by the same actor in the same
+  # clock millisecond. The provenance timestamp is therefore not a generation
+  # identity. Bind every revocation row to the exact reopen generation it
+  # closes; both the initial generation and each later reopening allow exactly
+  # one immutable provenance row.
+  @revocation_generations_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_revocation_generations (
+    revocationId TEXT PRIMARY KEY REFERENCES assignment_revocations(id),
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    reopeningId INTEGER NULL REFERENCES assignment_reopenings(id)
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS assignment_revocation_generation_initial
+    ON assignment_revocation_generations (assignmentId)
+    WHERE reopeningId IS NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS assignment_revocation_generation_reopened
+    ON assignment_revocation_generations (assignmentId, reopeningId)
+    WHERE reopeningId IS NOT NULL;
+  """
+
+  # The first revision of this table used SQLite's one-argument trim(), which
+  # did not reject every String.trim/1 whitespace code point. A receipt makes
+  # this a one-time upgrade rather than a startup repair loop: migrate the
+  # known predecessor once, then refuse malformed historic provenance instead
+  # of silently inventing a reason for it.
+  @revocation_migrations_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_revocation_migrations (
+    migrationId TEXT PRIMARY KEY,
+    appliedAt INTEGER NOT NULL,
+    affectedRows INTEGER NOT NULL CHECK(affectedRows >= 0),
+    cause TEXT NOT NULL CHECK(cause = 'release_upgrade'),
+    principal TEXT NOT NULL CHECK(principal = 'process:tightbeam')
+  )
+  """
+
+  @revocation_reason_constraint_migration_id "0.2.0/revocation-reason-unicode-whitespace-v1"
+
+  # The assignments row remains the terminal-state authority. This trigger
+  # makes a revoked close impossible unless the same transaction first wrote a
+  # provenance row with the exact closer and timestamp it is about to publish.
+  @revocation_trigger_ddl """
+  CREATE TRIGGER IF NOT EXISTS assignments_revocation_reason_required
+  BEFORE UPDATE OF state, outcome, closedAt, closedByUser, closedBySession ON assignments
+  WHEN NEW.state = 'closed' AND NEW.outcome = 'revoked'
+    AND NOT EXISTS (
+      SELECT 1 FROM assignment_revocation_generations g
+      JOIN assignment_revocations r ON r.id = g.revocationId
+      WHERE g.assignmentId = NEW.id
+        AND g.reopeningId IS (
+          SELECT reopening.id FROM assignment_reopenings reopening
+          WHERE reopening.assignmentId = NEW.id
+          ORDER BY reopening.id DESC LIMIT 1
+        )
+        AND r.revokedAt = NEW.closedAt
+        AND r.revokedByUser IS NEW.closedByUser
+        AND r.revokedBySession IS NEW.closedBySession
+    )
+  BEGIN
+    SELECT RAISE(ABORT, 'revoked assignment requires revocation provenance');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignments_revocation_reason_required_insert
+  BEFORE INSERT ON assignments
+  WHEN NEW.state = 'closed' AND NEW.outcome = 'revoked'
+    AND NOT EXISTS (
+      SELECT 1 FROM assignment_revocation_generations g
+      JOIN assignment_revocations r ON r.id = g.revocationId
+      WHERE g.assignmentId = NEW.id
+        AND g.reopeningId IS (
+          SELECT reopening.id FROM assignment_reopenings reopening
+          WHERE reopening.assignmentId = NEW.id
+          ORDER BY reopening.id DESC LIMIT 1
+        )
+        AND r.revokedAt = NEW.closedAt
+        AND r.revokedByUser IS NEW.closedByUser
+        AND r.revokedBySession IS NEW.closedBySession
+    )
+  BEGIN
+    SELECT RAISE(ABORT, 'revoked assignment requires revocation provenance');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocations_immutable_update
+  BEFORE UPDATE ON assignment_revocations
+  BEGIN
+    SELECT RAISE(ABORT, 'revocation provenance is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocations_immutable_delete
+  BEFORE DELETE ON assignment_revocations
+  BEGIN
+    SELECT RAISE(ABORT, 'revocation provenance is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocation_generations_match_provenance
+  BEFORE INSERT ON assignment_revocation_generations
+  WHEN NOT EXISTS (
+    SELECT 1 FROM assignment_revocations r
+    WHERE r.id = NEW.revocationId AND r.assignmentId = NEW.assignmentId
+  ) OR NEW.reopeningId IS NOT (
+    SELECT reopening.id FROM assignment_reopenings reopening
+    WHERE reopening.assignmentId = NEW.assignmentId
+    ORDER BY reopening.id DESC LIMIT 1
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'revocation generation requires current matching provenance');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocation_generations_immutable_update
+  BEFORE UPDATE ON assignment_revocation_generations
+  BEGIN
+    SELECT RAISE(ABORT, 'revocation generation is immutable');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS assignment_revocation_generations_immutable_delete
+  BEFORE DELETE ON assignment_revocation_generations
+  BEGIN
+    SELECT RAISE(ABORT, 'revocation generation is immutable');
+  END;
+  """
+
+  # Trigger names are stable across the predecessor schema. Recreate them on
+  # every boot so an upgraded database cannot retain the old tuple-inference
+  # body under CREATE IF NOT EXISTS.
+  @revocation_trigger_drop_ddl """
+  DROP TRIGGER IF EXISTS assignments_revocation_reason_required;
+  DROP TRIGGER IF EXISTS assignments_revocation_reason_required_insert;
+  DROP TRIGGER IF EXISTS assignment_revocations_immutable_update;
+  DROP TRIGGER IF EXISTS assignment_revocations_immutable_delete;
+  DROP TRIGGER IF EXISTS assignment_revocation_generations_match_provenance;
+  DROP TRIGGER IF EXISTS assignment_revocation_generations_immutable_update;
+  DROP TRIGGER IF EXISTS assignment_revocation_generations_immutable_delete;
   """
 
   # The `reopen-assignment` papertrail. The assignments CHECK forces an OPEN row
@@ -165,11 +389,236 @@ defmodule Tightbeam.Assignments do
     # SQLite permits the referenced table to arrive in the following DDL.
     :ok = DB.execute(db, @assignments_ddl)
     :ok = DB.execute(db, @attests_ddl)
+    :ok = DB.execute(db, @cannot_proceed_ddl)
+    :ok = DB.execute(db, @cannot_proceed_release_observations_ddl)
     :ok = DB.execute(db, @assignment_files_ddl)
     :ok = DB.execute(db, @assignment_effects_ddl)
+    :ok = DB.execute(db, @assignment_priorities_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
     :ok = DB.execute(db, @reopenings_ddl)
+    :ok = DB.execute(db, @revocations_table_ddl)
+    :ok = DB.execute(db, @revocations_index_ddl)
+    :ok = DB.execute(db, @revocation_migrations_ddl)
+    :ok = migrate_revocation_reason_constraint(db)
+    :ok = DB.execute(db, @revocation_generations_ddl)
+    :ok = migrate_legacy_revocations(db)
+    :ok = migrate_revocation_generations(db)
+    :ok = DB.execute(db, @revocation_trigger_drop_ddl)
+    :ok = DB.execute(db, @revocation_trigger_ddl)
     Tightbeam.EffortCheckin.ensure_schema(db)
+  end
+
+  @doc false
+  def migrate_cannot_proceed_v1_in_txn(txn) do
+    if Txn.q(txn, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='attests'") == [] do
+      :ok = Txn.exec(txn, @attests_ddl)
+      :ok = Txn.exec(txn, @cannot_proceed_ddl)
+      :ok = Txn.exec(txn, @cannot_proceed_release_observations_ddl)
+      :ok
+    else
+      rebuild_attests_for_cannot_proceed_in_txn(txn)
+    end
+  end
+
+  defp rebuild_attests_for_cannot_proceed_in_txn(txn) do
+    migrated_attests_ddl =
+      String.replace(
+        @attests_ddl,
+        "CREATE TABLE IF NOT EXISTS attests",
+        "CREATE TABLE attests_cannot_proceed_v1",
+        global: false
+      )
+
+    :ok = Txn.exec(txn, migrated_attests_ddl)
+
+    columns =
+      "id,assignmentId,kind,verdictKind,note,bySession,byUser,producer," <>
+        "producerCommand,byHarness,byProvider,commitRefs,ts"
+
+    :ok =
+      Txn.exec(
+        txn,
+        "INSERT INTO attests_cannot_proceed_v1 (#{columns}) SELECT #{columns} FROM attests"
+      )
+
+    [[before_count]] = Txn.q(txn, "SELECT count(*) FROM attests")
+    [[after_count]] = Txn.q(txn, "SELECT count(*) FROM attests_cannot_proceed_v1")
+
+    if before_count != after_count,
+      do: raise("cannot-proceed attest migration count mismatch")
+
+    :ok = Txn.exec(txn, "DROP TABLE attests")
+    :ok = Txn.exec(txn, "ALTER TABLE attests_cannot_proceed_v1 RENAME TO attests")
+    :ok = Txn.exec(txn, @cannot_proceed_ddl)
+    :ok = Txn.exec(txn, @cannot_proceed_release_observations_ddl)
+    :ok
+  end
+
+  @doc false
+  @spec ensure_cannot_proceed_schema(DB.server()) :: :ok | {:error, term()}
+  def ensure_cannot_proceed_schema(db) do
+    with :ok <- DB.execute(db, @cannot_proceed_ddl) do
+      DB.execute(db, @cannot_proceed_release_observations_ddl)
+    end
+  end
+
+  defp migrate_revocation_reason_constraint(db) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  "SELECT 1 FROM assignment_revocation_migrations WHERE migrationId=?1",
+                  [@revocation_reason_constraint_migration_id]
+                ) do
+             [[1]] ->
+               :ok
+
+             [] ->
+               # A trigger can retain the renamed table name while SQLite
+               # rebuilds it, so remove it before the swap and recreate it
+               # after this transaction commits through ensure_schema/1.
+               :ok =
+                 Txn.exec(txn, "DROP TRIGGER IF EXISTS assignments_revocation_reason_required")
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "DROP TRIGGER IF EXISTS assignments_revocation_reason_required_insert"
+                 )
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "ALTER TABLE assignment_revocations RENAME TO assignment_revocations_before_unicode_whitespace_v1"
+                 )
+
+               :ok = Txn.exec(txn, @revocations_table_ddl)
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   """
+                   INSERT INTO assignment_revocations
+                     (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                   SELECT id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason
+                   FROM assignment_revocations_before_unicode_whitespace_v1
+                   """
+                 )
+
+               affected_rows = Txn.changes(txn)
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "DROP TABLE assignment_revocations_before_unicode_whitespace_v1"
+                 )
+
+               :ok = Txn.exec(txn, @revocations_index_ddl)
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocation_migrations
+                   (migrationId, appliedAt, affectedRows, cause, principal)
+                 VALUES (?1, ?2, ?3, 'release_upgrade', 'process:tightbeam')
+                 """,
+                 [@revocation_reason_constraint_migration_id, now(), affected_rows]
+               )
+
+               if Txn.changes(txn) != 1,
+                 do: raise("revocation reason constraint migration receipt race")
+
+               :ok
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  # Historical revoked rows predate a required reason. The explicit sentinel
+  # records that absence without manufacturing a motive. A matching durable
+  # provenance row is already the reason for this close, so restart must never
+  # add a second synthetic legacy fact beside it.
+  defp migrate_legacy_revocations(db) do
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT OR IGNORE INTO assignment_revocations
+          (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+        SELECT 'legacy:' || id || ':' || closedAt, id, closedAt, closedByUser,
+          closedBySession, 'legacy_unknown'
+        FROM assignments
+        WHERE state = 'closed' AND outcome = 'revoked'
+          AND NOT EXISTS (
+            SELECT 1 FROM assignment_revocations r
+            WHERE r.assignmentId = assignments.id
+              AND r.revokedAt IS assignments.closedAt
+              AND r.revokedByUser IS assignments.closedByUser
+              AND r.revokedBySession IS assignments.closedBySession
+          )
+        """
+      )
+  end
+
+  # A predecessor schema has durable provenance but no link from a current
+  # revoked close to the exact row that explains it. Backfill only when one
+  # row matches the stamped closer tuple; ambiguous legacy history is refused
+  # rather than ordered by UUID or assigned an invented motive.
+  defp migrate_revocation_generations(db) do
+    :ok =
+      DB.execute(
+        db,
+        """
+        INSERT OR IGNORE INTO assignment_revocation_generations
+          (revocationId, assignmentId, reopeningId)
+        SELECT r.id, a.id,
+          (
+            SELECT reopening.id FROM assignment_reopenings reopening
+            WHERE reopening.assignmentId = a.id
+            ORDER BY reopening.id DESC LIMIT 1
+          )
+        FROM assignments a
+        JOIN assignment_revocations r
+          ON r.assignmentId = a.id
+          AND r.revokedAt IS a.closedAt
+          AND r.revokedByUser IS a.closedByUser
+          AND r.revokedBySession IS a.closedBySession
+        WHERE a.state = 'closed' AND a.outcome = 'revoked'
+          AND (
+            SELECT count(*) FROM assignment_revocations candidate
+            WHERE candidate.assignmentId = a.id
+              AND candidate.revokedAt IS a.closedAt
+              AND candidate.revokedByUser IS a.closedByUser
+              AND candidate.revokedBySession IS a.closedBySession
+          ) = 1
+        """
+      )
+
+    case DB.query(
+           db,
+           """
+           SELECT a.id FROM assignments a
+           WHERE a.state = 'closed' AND a.outcome = 'revoked'
+             AND NOT EXISTS (
+               SELECT 1 FROM assignment_revocation_generations g
+               WHERE g.assignmentId = a.id
+                 AND g.reopeningId IS (
+                   SELECT reopening.id FROM assignment_reopenings reopening
+                   WHERE reopening.assignmentId = a.id
+                   ORDER BY reopening.id DESC LIMIT 1
+                 )
+             )
+           ORDER BY a.id LIMIT 1
+           """
+         ) do
+      {:ok, []} ->
+        :ok
+
+      {:ok, [[assignment_id]]} ->
+        raise ArgumentError,
+              "revocation generation migration cannot bind current close for #{assignment_id} without inventing provenance"
+    end
   end
 
   @doc "Close every open assignment held by a retiring session and record why."
@@ -183,6 +632,10 @@ defmodule Tightbeam.Assignments do
         SELECT a.id, EXISTS(SELECT 1 FROM attests f WHERE f.assignmentId=a.id), a.workItemId
         FROM assignments a
         WHERE a.holderKey=?1 AND a.state='open'
+          AND NOT EXISTS (
+            SELECT 1 FROM assignment_cannot_proceed cp
+            WHERE cp.assignmentId=a.id AND cp.state='standing'
+          )
         ORDER BY a.openedAt, a.id
         """,
         [session_key]
@@ -198,14 +651,41 @@ defmodule Tightbeam.Assignments do
     Enum.each(assignments, fn %{assignment_id: assignment_id, work_item_id: work_item_id} ->
       ts = now()
 
+      reopening_id = current_reopening_id(txn, assignment_id)
+
+      {revoked_by_user, revoked_by_session} =
+        retirement_provenance_actor(txn, principal, owner_user_id)
+
+      revocation_id = id("rev_")
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO assignment_revocations
+          (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+        VALUES (?1, ?2, ?3, ?4, ?5, 'holder session retired')
+        """,
+        [revocation_id, assignment_id, ts, revoked_by_user, revoked_by_session]
+      )
+
+      Txn.q(
+        txn,
+        """
+        INSERT INTO assignment_revocation_generations
+          (revocationId, assignmentId, reopeningId)
+        VALUES (?1, ?2, ?3)
+        """,
+        [revocation_id, assignment_id, reopening_id]
+      )
+
       Txn.q(
         txn,
         """
         UPDATE assignments SET state='closed', outcome='revoked', closedAt=?2,
-          closedByUser=?3
+          closedByUser=?3, closedBySession=?4
         WHERE id=?1 AND state='open'
         """,
-        [assignment_id, ts, owner_user_id]
+        [assignment_id, ts, revoked_by_user, revoked_by_session]
       )
 
       if Txn.changes(txn) != 1, do: raise(TransitionRace)
@@ -216,7 +696,15 @@ defmodule Tightbeam.Assignments do
         [assignment_id, session_key, ts]
       )
 
-      append_marker(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
+      revoked_assignment = fetch_assignment!(txn, assignment_id)
+
+      CompletionEscalation.open_terminal_in_txn(txn, revoked_assignment, "revocation", %{
+        id: revocation_id,
+        by_user: revoked_by_user,
+        by_session: revoked_by_session
+      })
+
+      append_notice(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
       Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
 
       liveness_trigger = disposition_liveness_trigger!(txn, work_item_id)
@@ -247,6 +735,31 @@ defmodule Tightbeam.Assignments do
     raise ArgumentError, "retirement interruption requires a durable principal"
   end
 
+  # Retirement receives the caller's durable origin string from Gateway. A
+  # session origin is its actual sessions primary key (often `agent:...`), so
+  # preserve it instead of replacing it with the holder's owner. Process-owned
+  # recovery has no representable user-or-session actor in this schema, so it
+  # refuses before recording a false user principal.
+  defp retirement_provenance_actor(_txn, "user:" <> user_id, _owner_user_id),
+    do: {user_id, nil}
+
+  defp retirement_provenance_actor(txn, "session:" <> session_key, owner_user_id),
+    do: retirement_session_or_owner(txn, session_key, owner_user_id)
+
+  defp retirement_provenance_actor(txn, principal, owner_user_id),
+    do: retirement_session_or_owner(txn, principal, owner_user_id)
+
+  defp retirement_session_or_owner(txn, session_key, _owner_user_id) do
+    case Txn.q(txn, "SELECT sessionKey FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[^session_key]] ->
+        {nil, session_key}
+
+      [] ->
+        raise ArgumentError,
+              "retirement interruption requires a representable user or session principal; got #{inspect(session_key)}"
+    end
+  end
+
   @doc "Count open assignments pinned to a holder session."
   @spec open_count(DB.server(), String.t()) :: non_neg_integer()
   def open_count(db, session_key) do
@@ -269,9 +782,185 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
+      [row] -> assignment(row) |> project_assignment(db)
+      [] -> nil
+    end
+  end
+
+  @doc "Return the oldest open assignment not paused by a standing cannot-proceed record."
+  @spec oldest_prod_eligible(DB.server(), String.t()) :: map() | nil
+  def oldest_prod_eligible(db, session_key) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT #{columns()} FROM assignments
+        WHERE assignments.holderKey = ?1 AND assignments.state = 'open'
+          AND NOT EXISTS (
+            SELECT 1 FROM assignment_cannot_proceed cp
+            WHERE cp.assignmentId=assignments.id AND cp.state='standing'
+          )
+        ORDER BY assignments.openedAt ASC, assignments.id ASC LIMIT 1
+        """,
+        [session_key]
+      )
+
+    case rows do
       [row] -> assignment(row)
       [] -> nil
     end
+  end
+
+  @doc false
+  def cannot_proceed_standing_in_txn?(txn, assignment_id) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing' LIMIT 1",
+      [assignment_id]
+    ) != []
+  end
+
+  @doc false
+  def release_cannot_proceed_in_txn(txn, fact) do
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT id, assignmentId, decisionRequestId, decisionWakeId FROM assignment_cannot_proceed
+        WHERE state='standing' AND releaseFactKind=?1 AND releaseFactScope=?2
+          AND releaseFactPrincipalRef=?3
+        ORDER BY createdAt, id
+        """,
+        [fact.kind, fact.scope, fact.origin]
+      )
+
+    Enum.each(rows, fn [condition_id, assignment_id, request_id, wake_id] ->
+      Txn.q(
+        txn,
+        """
+        UPDATE assignment_cannot_proceed
+        SET state='settled', settledAt=?2, settlementKind='release-fact',
+            settlementFactId=?3, settledBy=?4
+        WHERE id=?1 AND state='standing'
+        """,
+        [condition_id, fact.ts, fact.fact_id, fact.origin]
+      )
+
+      if Txn.changes(txn) == 1 do
+        :ok =
+          Escalation.settle_agent_request_in_txn(
+            txn,
+            request_id,
+            "process:tightbeam",
+            "cannot-proceed released by condition fact #{fact.fact_id}"
+          )
+
+        case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]) do
+          [["pending"]] ->
+            {:ok, liveness_trigger} =
+              Supervision.liveness_trigger_in_txn(txn, {:assignment, assignment_id})
+
+            true =
+              Wakes.cancel_in_txn(txn, %{
+                wake_id: wake_id,
+                requester: %{kind: "process", id: "tightbeam:assignments"},
+                reason_kind: "cannot_proceed_released",
+                causal_source: %{kind: "condition_fact", id: to_string(fact.fact_id)},
+                outcome: %{kind: "no_replacement", liveness_trigger: liveness_trigger}
+              })
+
+          [[state]] when state in ["fired", "canceled"] ->
+            :ok
+        end
+
+        case fetch_assignment(txn, assignment_id) do
+          %{holderKey: holder} ->
+            append_notice(
+              txn,
+              holder,
+              "[cannot-proceed released: #{assignment_id} by #{fact.kind}/#{fact.scope}]"
+            )
+
+          nil ->
+            :ok
+        end
+      end
+    end)
+
+    :ok
+  end
+
+  @doc false
+  def transfer_cannot_proceed_disposer_to_user_in_txn(
+        %Txn{} = txn,
+        assignment_id,
+        user_id,
+        cause_seq
+      )
+      when is_binary(assignment_id) and is_binary(user_id) do
+    disposer_ref = "user:" <> user_id
+
+    Txn.q(
+      txn,
+      "UPDATE assignment_cannot_proceed SET disposerRef=?2 WHERE assignmentId=?1 AND state='standing' AND disposerRef != ?2",
+      [assignment_id, disposer_ref]
+    )
+
+    if Txn.changes(txn) == 1 do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "cannot_proceed_disposer_transferred",
+        assignment_id,
+        "disposer=#{disposer_ref} cause_seq=#{cause_seq}"
+      )
+    end
+
+    :ok
+  end
+
+  def transfer_cannot_proceed_disposer_to_user_in_txn(
+        %Txn{},
+        _assignment_id,
+        _user_id,
+        _cause_seq
+      ),
+      do: :ok
+
+  @doc false
+  def transfer_retired_cannot_proceed_disposers_to_user_in_txn(%Txn{} = txn, user_id)
+      when is_binary(user_id) do
+    assignment_ids =
+      Txn.q(
+        txn,
+        "SELECT assignmentId FROM assignment_cannot_proceed WHERE state='standing' ORDER BY createdAt, id"
+      )
+
+    Enum.each(assignment_ids, fn [assignment_id] ->
+      case cannot_proceed_disposer_ref_in_txn(txn, assignment_id) do
+        "session:" <> session_key ->
+          case Txn.q(
+                 txn,
+                 "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='retired'",
+                 [session_key, user_id]
+               ) do
+            [[1]] ->
+              transfer_cannot_proceed_disposer_to_user_in_txn(
+                txn,
+                assignment_id,
+                user_id,
+                "user-alerted"
+              )
+
+            [] ->
+              :ok
+          end
+
+        _other ->
+          :ok
+      end
+    end)
+
+    :ok
   end
 
   @doc "Count attest rows for an assignment."
@@ -307,7 +996,7 @@ defmodule Tightbeam.Assignments do
       )
 
     Enum.map(rows, fn row ->
-      assignment = assignment(row)
+      assignment = assignment(row) |> project_assignment(db)
       Map.put(assignment, :files, declared_files(db, assignment.id))
     end)
   end
@@ -350,41 +1039,56 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc """
-  Return the latest linked review round holder's qualifying verdict kind.
+  Return `["reviewed-clean"]` when the producing card's most recent REVIEW
+  CONCLUSION concludes clean on an independent card, else `[]`.
 
-  HOLDER-VERDICT-WINS (fabric §13 Phase 0, wi_1b0237fe wedge class): the round
-  is selected among the linked review cards THAT CARRY A HOLDER-FILED VERDICT,
-  never by assignment-lifecycle recency alone. A review card holding no verdict
-  by its own holder carries no judgment, so it may not displace the standing
-  judgment of an earlier round — and a card CLOSED without one never can carry
-  one (`attest` refuses a verdict on a closed assignment), which is exactly the
-  state that wedged with no lawful exit. Verdict rows beat lifecycle rows.
+  REVIEW-CONCLUSION POOL (owner-decision-request-relief-v1 R6): the judgment is
+  read from the pool of every HOLDER-FILED REVIEW-CONCLUSION verdict across EVERY
+  one of the producing card's `--reviews`-linked review cards. A review-conclusion
+  verdict is one whose kind is drawn from the closed set
+  {`reviewed-clean`, `changes-requested`} — the only two kinds that state what a
+  review round CONCLUDED about the reviewed work. A holder-filed verdict of any
+  other kind seen on review cards (`verified`, `merged`, `release-approved`,
+  `spirit-approved`, `spec-reviewed`, `spirit-reviewed`,
+  `no-landing`, `work-blocked`, `pass`, or any novel kind) is a statement about
+  the reviewer's OWN card, never a conclusion about the reviewed work; it is
+  ignored here — it neither qualifies a card nor retracts a qualification. The
+  set is closed because this fact's definition names it, never because storage
+  constrains `verdictKind` (which is open text).
 
-  The tiebreak is the RECENCY OF THE LATEST HOLDER-FILED VERDICT itself (verdict
-  row `ts` DESC, then verdict row `rowid` DESC) — never `r.openedAt`. Ordering by
-  when the round was OPENED, rather than when its verdict was FILED, is exactly
-  the lifecycle-recency mistake this function exists to refuse: `reopen-assignment`
-  lets an OLDER round receive a fresh verdict after a chronologically YOUNGER
-  round already closed, and a card that reopens to file the newest judgment must
-  win the selection even though it opened first (Sol xhigh review, finding 1).
+  This function used to make two mistakes it no longer makes. It selected only
+  ONE linked review card, whichever carried the most recent holder-filed verdict
+  row (CARD COLLAPSE), and on that one card it read the most recent holder-filed
+  verdict of ANY kind, so a later `verified` filed to satisfy
+  `completion-requires-verification` hid an earlier `reviewed-clean` (KIND
+  COLLAPSE). Both discarded a `reviewed-clean` that was on the record. The pool
+  above removes both: no card is dropped and no non-conclusion kind is read.
 
-  What this deliberately does NOT relax: once the selected round is the latest
-  VERDICT-CARRYING one, the pre-existing independence guard still applies to it
-  verbatim — a self-held latest round still disqualifies, so a holder cannot
-  launder its own verdict past an earlier independent one.
+  WINNER RECENCY: order the pool by the VERDICT ROW's own recency — `v.ts` DESC,
+  then `v.rowid` DESC, so two verdicts filed in the same millisecond still have
+  exactly one winner — and take the single most recent verdict. Never
+  `r.openedAt`: a reopened OLDER round can receive a fresh verdict after a
+  chronologically younger round closed, and the newest JUDGMENT must win the
+  selection even though its card opened first.
 
-  SINGLE SOURCE OF TRUTH FOR THE WINNING VERDICT (Sol xhigh review round 2):
-  reopening lets ONE card carry more than one verdict over its life — file
-  reviewed-clean, close, reopen, file changes-requested — so "which round"
-  and "which verdict on that round" cannot be two independently-computed
-  answers; a query that picks the round by its latest verdict and then
-  RE-DERIVES a kind by scanning that round's verdicts again is a second
-  computation that has to agree with the first by construction rather than by
-  identity. Each candidate round is joined to the exact `attests` ROW its
-  ordering was computed from (`latestVerdictRowid`), and `latestVerdictKind`
-  is read off that same row — not recomputed. A round with no holder verdict
-  fails the join (the correlated subquery returns NULL, which no rowid
-  equals) exactly where the old `EXISTS` clause excluded it.
+  INDEPENDENCE ON THE WINNER: the producing card qualifies if and only if that
+  single winning verdict's kind is `reviewed-clean` AND the review card the
+  winner sits on is held by a session other than the producing card's holder.
+  The independence test is applied to the WINNER — it is NOT a filter that
+  strips self-held cards from the pool before the winner is chosen. That
+  ordering is load-bearing: a self-held LATEST round still disqualifies, so a
+  holder cannot launder its own stale verdict past an earlier independent one
+  (this is the third collapse R6 deliberately preserves). A later
+  `changes-requested` — on this card or any sibling review card — likewise wins
+  the pool and denies the parent, so a round that found problems still bites.
+
+  SINGLE SOURCE OF TRUTH: the winning kind and the holder it is tested against
+  are read from the SAME `attests` row. `v` is the winning verdict row and `r`
+  is the card it was filed on (`r.id = v.assignmentId`); the kind is `v.verdictKind`
+  and the independence holder is `r.holderKey` off that one row, never a second
+  scan that must agree by construction. An empty pool — no linked card carries
+  any holder-filed review-conclusion verdict — yields nothing and the rail denies
+  exactly as before.
   """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
@@ -392,32 +1096,24 @@ defmodule Tightbeam.Assignments do
       DB.query(
         db,
         """
-        WITH latest_review AS (
+        WITH winning_verdict AS (
           SELECT
-            r.id,
-            r.holderKey,
-            lv.ts AS latestVerdictTs,
-            lv.rowid AS latestVerdictRowid,
-            lv.verdictKind AS latestVerdictKind
-          FROM assignments AS r
-          JOIN attests AS lv
-            ON lv.rowid = (
-              SELECT v.rowid
-              FROM attests AS v
-              WHERE v.assignmentId = r.id
-                AND v.kind = 'verdict'
-                AND v.bySession = r.holderKey
-              ORDER BY v.ts DESC, v.rowid DESC
-              LIMIT 1
-            )
+            r.holderKey AS reviewHolderKey,
+            v.verdictKind AS verdictKind
+          FROM attests AS v
+          JOIN assignments AS r
+            ON r.id = v.assignmentId
           WHERE r.reviewsAssignmentId = ?1
-          ORDER BY latestVerdictTs DESC, latestVerdictRowid DESC
+            AND v.kind = 'verdict'
+            AND v.bySession = r.holderKey
+            AND v.verdictKind IN ('reviewed-clean', 'changes-requested')
+          ORDER BY v.ts DESC, v.rowid DESC
           LIMIT 1
         )
-        SELECT latestVerdictKind
-        FROM latest_review AS r
-        WHERE r.holderKey != ?2
-          AND latestVerdictKind = 'reviewed-clean'
+        SELECT verdictKind
+        FROM winning_verdict
+        WHERE reviewHolderKey != ?2
+          AND verdictKind = 'reviewed-clean'
         """,
         [assignment_id, assignment_holder_key]
       )
@@ -492,7 +1188,15 @@ defmodule Tightbeam.Assignments do
         [assignment_id | range_params] ++ limit_params
       )
 
-    Enum.map(rows, &attest/1)
+    Enum.map(rows, fn row ->
+      filed = attest(row)
+
+      Map.put(
+        filed,
+        :deliverableClaim,
+        Tightbeam.DeliverableContract.attest_claim_projection(db, filed.id)
+      )
+    end)
   end
 
   # Row-value comparison written out longhand rather than `(ts, id) > (?, ?)`:
@@ -553,7 +1257,7 @@ defmodule Tightbeam.Assignments do
         [work_item_id]
       )
 
-    Enum.map(rows, &assignment/1)
+    Enum.map(rows, &(assignment(&1) |> project_assignment(db)))
   end
 
   @doc "Resolve an assignment's story membership without changing direct ownership readers."
@@ -615,10 +1319,15 @@ defmodule Tightbeam.Assignments do
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
 
   defp assign_result(db, call) do
+    config = effort_config(db, call)
+
     open_assignment_result(
       db,
       call,
-      fn _txn, assignment -> {:created, assignment, nil} end,
+      fn txn, assignment ->
+        EffortCheckin.arm_in_txn(txn, config, assignment)
+        {:created, assignment, nil}
+      end,
       fn -> :ok end,
       "assign"
     )
@@ -642,7 +1351,9 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
-         {:ok, _files} <- assignment_files(verb, call.params) do
+         :ok <- valid_delivers_work_item(call.params),
+         {:ok, _files} <- assignment_files(verb, call.params),
+         :ok <- valid_report_to(db, call.session_key, call.params[:report_to_session_key]) do
       key = call.params[:idempotency_key]
       replay = if is_binary(key), do: replayed_assignment(db, call), else: nil
 
@@ -739,6 +1450,7 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, "dispatch"),
          :ok <- valid_subject(call.params[:subject]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
+         :ok <- valid_delivers_work_item(call.params),
          {:ok, _files} <- assignment_files("dispatch", call.params),
          :ok <- valid_brief(call.params[:brief]),
          :ok <- normalize_root_validation(call.params[:workdir_root]) do
@@ -803,7 +1515,9 @@ defmodule Tightbeam.Assignments do
          :ok <- valid_supervision_interval(call[:supervision_interval_ms]),
          :ok <- valid_idempotency_key(call.params[:idempotency_key]),
          :ok <- valid_effect_kind(call.params[:effect_kind]),
+         :ok <- valid_delivers_work_item(call.params),
          {:ok, files} <- assignment_files(verb, call.params),
+         :ok <- valid_report_to(db, call.session_key, call.params[:report_to_session_key]),
          :ok <- extra_validation.() do
       owner = principal_id(call.principal)
       key = call.params[:idempotency_key]
@@ -855,6 +1569,7 @@ defmodule Tightbeam.Assignments do
   rescue
     error in UnknownWorkItem -> error("unknown_work_item", Exception.message(error))
     error in UnknownReviewTarget -> error("unknown_review_target", Exception.message(error))
+    error in Tightbeam.DeliverableContract.MutationError -> error.response
   end
 
   defp finalize_created_assignment(call, assignment, delivery) do
@@ -905,6 +1620,17 @@ defmodule Tightbeam.Assignments do
 
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
+         :ok <- valid_attest_idempotency(call.params[:kind], call.params[:idempotency_key]) do
+      if call.params[:kind] == "completion" and is_binary(call.params[:idempotency_key]) do
+        keyed_completion_result(db, call)
+      else
+        unkeyed_attest_result(db, call)
+      end
+    end
+  end
+
+  defp unkeyed_attest_result(db, call) do
+    with :ok <- completion_filing_allowed(db, call),
          :ok <- commit_ref_filing_allowed(db, call),
          :ok <- valid_commit_refs(db, call.params[:kind], call.params[:commit_refs]) do
       supplied = call.params[:assignment_id]
@@ -941,8 +1667,9 @@ defmodule Tightbeam.Assignments do
                 error
             end
 
-          if is_map(result) and not Map.has_key?(result, :code),
-            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+          if is_map(result) and not Map.has_key?(result, :code) and
+               not Map.get(result, :revocation_replayed, false),
+             do: Publisher.maybe_accepted_in_txn(txn, call, result)
 
           result
         end)
@@ -957,6 +1684,7 @@ defmodule Tightbeam.Assignments do
       # checked is a fact about the check, not a verdict on the attest.
       case result do
         %{assignment: assignment} ->
+          project_completion_markers(db, result)
           Map.put(result, :referents, referents(db, call, assignment, artifact_cursor))
 
         _ ->
@@ -965,7 +1693,149 @@ defmodule Tightbeam.Assignments do
     end
   rescue
     TransitionRace -> assignment_closed()
+    error in Tightbeam.DeliverableContract.MutationError -> error.response
   end
+
+  defp keyed_completion_result(db, call) do
+    supplied = call.params[:assignment_id]
+
+    case IdPrefix.resolve(db, :assignment, supplied) do
+      {:ok, assignment_id} ->
+        fingerprint =
+          Tightbeam.DeliverableContract.completion_fingerprint(
+            assignment_id,
+            call.params[:note],
+            call.params[:commit_refs]
+          )
+
+        preflight =
+          transaction(db, fn txn ->
+            assignment = fetch_assignment(txn, assignment_id)
+
+            cond do
+              is_nil(assignment) ->
+                error("unknown_assignment", "unknown assignment: #{supplied}")
+
+              call.principal != {:session, assignment.holderKey} ->
+                error("not_holder", "assignment is held by session #{assignment.holderKey}")
+
+              true ->
+                Tightbeam.DeliverableContract.completion_receipt_in_txn(
+                  txn,
+                  call.principal,
+                  call.params.idempotency_key,
+                  fingerprint
+                )
+            end
+          end)
+
+        case preflight do
+          {:replay, response} ->
+            add_referents(db, call, response, artifact_cursor(db))
+
+          :miss ->
+            with :ok <- completion_filing_allowed(db, call),
+                 :ok <- commit_ref_filing_allowed(db, call),
+                 :ok <- valid_commit_refs(db, "completion", call.params[:commit_refs]) do
+              artifact_cursor = artifact_cursor(db)
+
+              result =
+                transaction(db, fn txn ->
+                  resolved_call = put_in(call, [:params, :assignment_id], assignment_id)
+                  assignment = fetch_assignment(txn, assignment_id)
+
+                  cond do
+                    is_nil(assignment) ->
+                      error("unknown_assignment", "unknown assignment: #{supplied}")
+
+                    call.principal != {:session, assignment.holderKey} ->
+                      error("not_holder", "assignment is held by session #{assignment.holderKey}")
+
+                    true ->
+                      case Tightbeam.DeliverableContract.completion_receipt_in_txn(
+                             txn,
+                             call.principal,
+                             call.params.idempotency_key,
+                             fingerprint
+                           ) do
+                        {:replay, response} ->
+                          {:replayed, response}
+
+                        %{code: _} = conflict ->
+                          conflict
+
+                        :miss ->
+                          with :ok <- commit_ref_filing_allowed_in_txn(txn, resolved_call) do
+                            response = attest_in_txn(txn, resolved_call)
+
+                            if is_map(response) and not Map.has_key?(response, :code) do
+                              Tightbeam.DeliverableContract.store_completion_receipt_in_txn(
+                                txn,
+                                call.principal,
+                                call.params.idempotency_key,
+                                fingerprint,
+                                response
+                              )
+
+                              Publisher.maybe_accepted_in_txn(txn, call, response)
+                              {:committed, response}
+                            else
+                              response
+                            end
+                          end
+                      end
+                  end
+                end)
+
+              case result do
+                {:committed, response} ->
+                  project_completion_markers(db, response)
+                  add_referents(db, call, response, artifact_cursor)
+
+                {:replayed, response} ->
+                  add_referents(db, call, response, artifact_cursor)
+
+                other ->
+                  add_referents(db, call, other, artifact_cursor)
+              end
+            end
+
+          other ->
+            other
+        end
+
+      :unknown ->
+        error("unknown_assignment", "unknown assignment: #{supplied}")
+
+      {:ambiguous, error} ->
+        error
+    end
+  rescue
+    TransitionRace -> assignment_closed()
+    error in Tightbeam.DeliverableContract.MutationError -> error.response
+    ArgumentError -> error("invalid_commit_refs", "commitRefs must use repo and commit strings")
+  end
+
+  defp add_referents(db, call, %{assignment: assignment} = result, artifact_cursor) do
+    Map.put(result, :referents, referents(db, call, assignment, artifact_cursor))
+  end
+
+  defp add_referents(_db, _call, result, _artifact_cursor), do: result
+
+  defp project_completion_markers(
+         db,
+         %{assignment: assignment, attest: %{kind: "completion"} = attest}
+       ) do
+    best_effort(fn -> transaction(db, fn txn -> append_attest_marker(txn, attest) end) end)
+
+    best_effort(fn ->
+      transaction(db, fn txn -> append_assignment_marker(txn, assignment, :closed) end)
+    end)
+
+    :ok
+  end
+
+  defp project_completion_markers(_db, _result), do: :ok
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
   # "Artifacts are the referents" — an attest's referents are the artifacts the
@@ -1142,18 +2012,20 @@ defmodule Tightbeam.Assignments do
                 error
             end
 
-          if is_map(result) and not Map.has_key?(result, :code),
-            do: Publisher.maybe_accepted_in_txn(txn, call, result)
+          if is_map(result) and not Map.has_key?(result, :code) and
+               not Map.get(result, :revocation_replayed, false),
+             do: Publisher.maybe_accepted_in_txn(txn, call, result)
 
           result
         end)
 
-      if not Map.has_key?(result, :code) and match?({_id, {:ok, _}}, from) do
+      if not Map.has_key?(result, :code) and not Map.get(result, :revocation_replayed, false) and
+           match?({_id, {:ok, _}}, from) do
         {assignment_id, {:ok, prior_state}} = from
         best_effort(fn -> notify(call, :on_assignment_change, assignment_id, prior_state) end)
       end
 
-      result
+      Map.delete(result, :revocation_replayed)
     end
   rescue
     TransitionRace -> assignment_closed()
@@ -1184,6 +2056,34 @@ defmodule Tightbeam.Assignments do
           {:ok, id} -> {id, best_effort_value(fn -> Tightbeam.WorkState.status(db, id) end)}
           _ -> {supplied, :error}
         end
+
+      effort_config = effort_config(db, call)
+
+      prepared_effort_arm =
+        case from do
+          {assignment_id, {:ok, _}} ->
+            may_prepare? =
+              transaction(db, fn txn ->
+                case fetch_assignment(txn, assignment_id) do
+                  %{state: "closed"} = assignment ->
+                    reopen_allowed?(txn, call.principal, assignment)
+
+                  _ ->
+                    false
+                end
+              end)
+
+            if may_prepare?,
+              do: EffortCheckin.prepare_reopen_arm(db, effort_config, assignment_id)
+
+          _ ->
+            nil
+        end
+
+      call =
+        call
+        |> Map.put(:effort_config, effort_config)
+        |> Map.put(:prepared_effort_arm, prepared_effort_arm)
 
       result =
         transaction(db, fn txn ->
@@ -1223,6 +2123,9 @@ defmodule Tightbeam.Assignments do
   rescue
     TransitionRace ->
       error("transition_race", "assignment changed state during the reopen; read it and retry")
+
+    error in Tightbeam.DeliverableContract.MutationError ->
+      error.response
   end
 
   defp reopen_in_txn(txn, call) do
@@ -1252,7 +2155,7 @@ defmodule Tightbeam.Assignments do
 
   defp apply_reopen(txn, call, assignment) do
     assignment_id = assignment.id
-    now = now()
+    now = Map.get(call, :clock, now())
     {reopened_user, reopened_session} = opener(call.principal)
 
     # The close is written down BEFORE it is cleared. Order matters: a crash
@@ -1280,6 +2183,10 @@ defmodule Tightbeam.Assignments do
       ]
     )
 
+    # A legacy terminal assignment acquires its subordinate binding before
+    # the guarded UPDATE makes it open again.
+    Tightbeam.DeliverableContract.ensure_reopen_binding_in_txn(txn, assignment)
+
     Txn.q(
       txn,
       """
@@ -1293,11 +2200,22 @@ defmodule Tightbeam.Assignments do
     if Txn.changes(txn) != 1, do: raise(TransitionRace)
     reopened = fetch_assignment!(txn, assignment_id)
 
-    # A terminal disposition DELETEs the entitlement row, so this arms a fresh
-    # generation exactly as `assign` does — a reopened card is watched like any
-    # other open card rather than living unsupervised.
+    CompletionEscalation.supersede_open_for_assignment_in_txn(
+      txn,
+      reopened.holderKey,
+      assignment_id
+    )
+
+    EffortCheckin.arm_reopened_in_txn(
+      txn,
+      call.effort_config,
+      reopened,
+      call.prepared_effort_arm
+    )
+
+    # Reopen replaces every stale closed-lifecycle pacing state in one upsert.
     supervision_transition!(txn, :armed, %{
-      kind: "assignment_open",
+      kind: "assignment_reopen",
       assignment_id: assignment_id,
       opened_at: now,
       supervision_interval_ms: call.supervision_interval_ms,
@@ -1425,6 +2343,25 @@ defmodule Tightbeam.Assignments do
   defp valid_reopen_reason(_),
     do: error("invalid_reason", "reason must be text")
 
+  defp valid_revocation_reason(reason) when is_binary(reason) do
+    # SQLite counts Unicode code points for this CHECK, so the application
+    # guard uses the same unit and always returns a named refusal first.
+    length_in_code_points = length(String.to_charlist(reason))
+
+    if length_in_code_points in 1..2000 and String.trim(reason) != "",
+      do: :ok,
+      else:
+        error(
+          "invalid_reason",
+          "reason must be 1..2000 non-blank characters naming the revocation"
+        )
+  end
+
+  defp valid_revocation_reason(nil),
+    do: error("missing_reason", "revocation requires a reason naming why this card is revoked")
+
+  defp valid_revocation_reason(_), do: error("invalid_reason", "reason must be text")
+
   defp assignments_result(db, call) do
     with :ok <- principal_allowed(call.principal, "assignments"),
          :ok <- valid_state(call.params[:state]) do
@@ -1445,7 +2382,10 @@ defmodule Tightbeam.Assignments do
           # assignment must be able to answer "why is this open again", not just
           # "database" — this is that answer, in the same list-of-rows shape
           # `attests` already reads via `list_attests/2`.
-          Map.put(assignment(row), :reopenings, list_reopenings(db, assignment_id))
+          row
+          |> assignment()
+          |> project_assignment(db)
+          |> Map.put(:reopenings, list_reopenings(db, assignment_id))
 
         {:ok, []} ->
           error("not_found", "unknown assignment: #{assignment_id}")
@@ -1531,13 +2471,23 @@ defmodule Tightbeam.Assignments do
     do: {:error, error("invalid", "--after takes an attest id")}
 
   defp create_assignment(txn, call, owner, key, files, verb) do
-    case Txn.q(txn, "SELECT state, harness, provider FROM sessions WHERE sessionKey = ?1", [
-           call.session_key
-         ]) do
-      [["retired", _harness, _provider]] ->
+    case Txn.q(
+           txn,
+           "SELECT state, harness, provider, ownerUserId FROM sessions WHERE sessionKey = ?1",
+           [
+             call.session_key
+           ]
+         ) do
+      [["retired", _harness, _provider, _holder_owner]] ->
         error("session_retired", "assignments require an active holder session")
 
-      [["active", harness, provider]] ->
+      [["active", harness, provider, holder_owner]] ->
+        report_to = call.params[:report_to_session_key]
+
+        if not valid_report_to_in_txn?(txn, report_to, holder_owner) do
+          throw({:invalid_report_to, report_to})
+        end
+
         # F7 amendment: dispatch persists workItemId exactly as assign does.
         supplied_work_item_id = call.params[:work_item_id]
 
@@ -1621,8 +2571,8 @@ defmodule Tightbeam.Assignments do
           INSERT INTO assignments
             (id, subject, holderKey, holderRole, holderFallback, openedByUser,
              openedBySession, openedAt, workItemId, reviewsAssignmentId,
-             holderHarness, holderProvider)
-          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             completionReportToSessionKey, holderHarness, holderProvider)
+          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
           """,
           [
             id,
@@ -1635,6 +2585,7 @@ defmodule Tightbeam.Assignments do
             now,
             work_item_id,
             reviews_assignment_id,
+            report_to,
             harness,
             provider
           ]
@@ -1646,6 +2597,12 @@ defmodule Tightbeam.Assignments do
           [id, effective_effect_kind(reviews_assignment_id, call.params[:effect_kind])]
         )
 
+        Txn.q(
+          txn,
+          "INSERT INTO assignment_priorities (assignmentId, priority) VALUES (?1, ?2)",
+          [id, inherited_priority_in_txn(txn, work_item_id)]
+        )
+
         Enum.each(files, fn path ->
           Txn.q(
             txn,
@@ -1653,6 +2610,12 @@ defmodule Tightbeam.Assignments do
             [id, path]
           )
         end)
+
+        CompletionEscalation.supersede_open_for_assignment_in_txn(
+          txn,
+          call.session_key,
+          id
+        )
 
         supervision_transition!(txn, :armed, %{
           kind: "assignment_open",
@@ -1688,6 +2651,24 @@ defmodule Tightbeam.Assignments do
           )
         end
 
+        case Tightbeam.DeliverableContract.bind_assignment_in_txn(
+               txn,
+               %{
+                 id: id,
+                 subject: call.params.subject,
+                 holderKey: call.session_key,
+                 workItemId: work_item_id,
+                 openedAt: now
+               },
+               Map.get(call.params, :delivers_work_item, false)
+             ) do
+          :ok ->
+            :ok
+
+          contract_error ->
+            raise Tightbeam.DeliverableContract.MutationError, response: contract_error
+        end
+
         assignment = fetch_assignment!(txn, id)
         append_assignment_marker(txn, assignment, :opened)
         assignment
@@ -1710,6 +2691,9 @@ defmodule Tightbeam.Assignments do
 
     :review_of_review ->
       error("review_of_review", "a review assignment cannot itself be reviewed")
+
+    {:invalid_report_to, report_to} ->
+      invalid_report_to(report_to)
   end
 
   defp resolve_optional_in_txn(_txn, _type, nil), do: {:ok, nil}
@@ -1783,64 +2767,317 @@ defmodule Tightbeam.Assignments do
           true ->
             with :ok <- valid_kind(call.params[:kind]),
                  :ok <- valid_note(call.params[:note]),
-                 :ok <- absent_verdict_kind(call.params[:verdict_kind]) do
+                 :ok <- valid_cannot_proceed_reason(call.params),
+                 :ok <- absent_verdict_kind(call.params[:verdict_kind]),
+                 :ok <- valid_release_tuple_for_kind(call.params) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
                  do: raise(TransitionRace)
 
-              attest = insert_attest(txn, call, assignment_id)
+              case call.params.kind do
+                "cannot-proceed" ->
+                  case latest_cannot_proceed(txn, assignment_id) do
+                    nil -> insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
+                    prior -> cannot_proceed_replay(call.params, assignment, prior)
+                  end
 
-              if call.params.kind == "progress" do
-                append_attest_marker(txn, attest)
-                %{assignment: assignment, attest: attest}
-              else
-                outcome =
-                  if call.params.kind == "completion", do: "completed", else: "surrendered"
+                "completion" ->
+                  case standing_cannot_proceed(txn, assignment_id) do
+                    nil ->
+                      insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
 
-                Txn.q(
-                  txn,
-                  """
-                  UPDATE assignments SET state = 'closed', outcome = ?2, closedAt = ?3,
-                    closedBySession = ?4, closingAttestId = ?5
-                  WHERE id = ?1 AND state = 'open'
-                  """,
-                  [assignment_id, outcome, attest.ts, holder, attest.id]
-                )
+                    _standing ->
+                      error(
+                        "cannot_proceed_standing",
+                        "assignment completion is blocked while cannot-proceed is standing"
+                      )
+                  end
 
-                if Txn.changes(txn) != 1, do: raise(TransitionRace)
-                closed_assignment = fetch_assignment!(txn, assignment_id)
-                Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
-
-                liveness_trigger =
-                  disposition_liveness_trigger!(txn, closed_assignment.workItemId)
-
-                supervision_transition!(txn, :terminal_disposition, %{
-                  kind: "terminal_disposition",
-                  assignment_id: assignment_id,
-                  cause: "terminal_disposition",
-                  principal: principal_id(call.principal),
-                  requester_id: "tightbeam:assignments"
-                })
-
-                EffortCheckin.cancel_in_txn(
-                  txn,
-                  assignment_id,
-                  assignment_disposition_command(
-                    assignment_id,
-                    "tightbeam:assignments",
-                    liveness_trigger
-                  )
-                )
-
-                append_attest_marker(txn, attest)
-                append_assignment_marker(txn, closed_assignment, :closed)
-                %{assignment: closed_assignment, attest: attest}
+                _other ->
+                  insert_and_apply_lifecycle_attest(txn, call, assignment, holder)
               end
             end
         end
     end
   end
+
+  defp insert_and_apply_lifecycle_attest(txn, call, assignment, holder) do
+    attest = insert_attest(txn, call, assignment.id)
+    apply_lifecycle_attest(txn, call, assignment, attest, holder)
+  end
+
+  defp apply_lifecycle_attest(txn, %{params: %{kind: "progress"}}, assignment, attest, _holder) do
+    append_attest_marker(txn, attest)
+    %{assignment: assignment, attest: attest}
+  end
+
+  defp apply_lifecycle_attest(
+         txn,
+         %{params: %{kind: "cannot-proceed"}} = call,
+         assignment,
+         attest,
+         _holder
+       ),
+       do: cannot_proceed_in_txn(txn, call, assignment, attest)
+
+  defp apply_lifecycle_attest(txn, call, assignment, attest, holder) do
+    attest =
+      case Tightbeam.DeliverableContract.record_completion_claim_in_txn(
+             txn,
+             assignment.id,
+             attest
+           ) do
+        :ok ->
+          Map.put(
+            attest,
+            :deliverableClaim,
+            Tightbeam.DeliverableContract.attest_claim_projection_in_txn(txn, attest.id)
+          )
+
+        contract_error ->
+          raise Tightbeam.DeliverableContract.MutationError, response: contract_error
+      end
+
+    Txn.q(
+      txn,
+      """
+      UPDATE assignments SET state = 'closed', outcome = 'completed', closedAt = ?2,
+        closedBySession = ?3, closingAttestId = ?4
+      WHERE id = ?1 AND state = 'open'
+      """,
+      [assignment.id, attest.ts, holder, attest.id]
+    )
+
+    if Txn.changes(txn) != 1, do: raise(TransitionRace)
+    closed_assignment = fetch_assignment!(txn, assignment.id)
+
+    if call.params.kind == "completion" do
+      CompletionEscalation.open_terminal_in_txn(txn, closed_assignment, "attest", attest)
+    end
+
+    Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
+    liveness_trigger = disposition_liveness_trigger!(txn, closed_assignment.workItemId)
+
+    supervision_transition!(txn, :terminal_disposition, %{
+      kind: "terminal_disposition",
+      assignment_id: assignment.id,
+      cause: "terminal_disposition",
+      principal: "session:" <> holder,
+      requester_id: "tightbeam:assignments"
+    })
+
+    EffortCheckin.cancel_in_txn(
+      txn,
+      assignment.id,
+      assignment_disposition_command(assignment.id, "tightbeam:assignments", liveness_trigger)
+    )
+
+    %{assignment: closed_assignment, attest: attest}
+  end
+
+  defp cannot_proceed_in_txn(txn, call, assignment, attest) do
+    with :ok <- valid_release_tuple(call.params) do
+      release_kind = call.params[:release_fact_kind]
+      release_scope = call.params[:release_fact_scope]
+      release_principal = call.params[:release_fact_principal_ref]
+
+      case latest_cannot_proceed(txn, assignment.id) do
+        nil ->
+          condition_id = id("cp_")
+          opener_ref = assignment_opener_ref(assignment)
+          target = assignment_opener_session(assignment)
+
+          [[asker_owner]] =
+            Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [
+              assignment.holderKey
+            ])
+
+          [[target_owner]] =
+            Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [target])
+
+          %{request: request, wake: wake} =
+            Escalation.file_agent_request_in_txn(txn, %{
+              asker_session_key: assignment.holderKey,
+              owner_user_id: asker_owner,
+              asked: %{session_key: target, owner_user_id: target_owner},
+              asked_of_role: nil,
+              role_fallback: false,
+              question:
+                "Assignment #{assignment.id} cannot proceed: #{attest.note}. " <>
+                  "Resolve or dispose this exact assignment; condition #{condition_id} remains standing until then.",
+              assignment_id: assignment.id,
+              verb: "cannot-proceed"
+            })
+
+          Txn.q(
+            txn,
+            """
+            INSERT INTO assignment_cannot_proceed
+              (id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+               disposerRef, reason,
+               releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state, createdAt)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, 'standing', ?11)
+            """,
+            [
+              condition_id,
+              assignment.id,
+              attest.id,
+              request.id,
+              wake.wake_id,
+              opener_ref,
+              attest.note,
+              release_kind,
+              release_scope,
+              release_principal,
+              attest.ts
+            ]
+          )
+
+          append_attest_marker(txn, attest)
+
+          %{
+            assignment: assignment,
+            attest: attest,
+            cannotProceed: cannot_proceed_row(txn, condition_id),
+            decisionRequest: request,
+            decisionWake: wake
+          }
+
+        prior ->
+          # The insert above is reachable only for a first filing. A retry is
+          # handled before attest insertion so it cannot manufacture a second
+          # lifecycle fact or opener decision.
+          raise "cannot-proceed replay reached after attest insertion: #{prior.id}"
+      end
+    end
+  end
+
+  defp cannot_proceed_replay(params, assignment, prior) do
+    supplied =
+      {params[:note], params[:release_fact_kind], params[:release_fact_scope],
+       params[:release_fact_principal_ref]}
+
+    recorded =
+      {prior.reason, prior.releaseFactKind, prior.releaseFactScope, prior.releaseFactPrincipalRef}
+
+    if supplied == recorded do
+      %{assignment: assignment, cannotProceed: prior, replayed: true}
+    else
+      error(
+        "cannot_proceed_conflict",
+        "assignment already has a different cannot-proceed record"
+      )
+    end
+  end
+
+  defp latest_cannot_proceed(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+                  disposerRef, reason,
+                  releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state,
+                  createdAt, settledAt, settlementKind, settlementFactId, settledBy
+           FROM assignment_cannot_proceed
+           WHERE assignmentId=?1
+           ORDER BY createdAt DESC, id DESC
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      [row] -> cannot_proceed(row)
+      [] -> nil
+    end
+  end
+
+  defp standing_cannot_proceed(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+                  disposerRef, reason,
+                  releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state,
+                  createdAt, settledAt, settlementKind, settlementFactId, settledBy
+           FROM assignment_cannot_proceed
+           WHERE assignmentId=?1 AND state='standing'
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      [row] -> cannot_proceed(row)
+      [] -> nil
+    end
+  end
+
+  defp cannot_proceed_row(txn, condition_id) do
+    [row] =
+      Txn.q(
+        txn,
+        """
+        SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+               disposerRef, reason,
+               releaseFactKind, releaseFactScope, releaseFactPrincipalRef, state,
+               createdAt, settledAt, settlementKind, settlementFactId, settledBy
+        FROM assignment_cannot_proceed WHERE id=?1
+        """,
+        [condition_id]
+      )
+
+    cannot_proceed(row)
+  end
+
+  defp cannot_proceed(row) do
+    [
+      id,
+      assignment_id,
+      attest_id,
+      decision_request_id,
+      decision_wake_id,
+      opener_ref,
+      disposer_ref,
+      reason,
+      release_kind,
+      release_scope,
+      release_principal,
+      state,
+      created_at,
+      settled_at,
+      settlement_kind,
+      settlement_fact_id,
+      settled_by
+    ] = row
+
+    %{
+      id: id,
+      assignmentId: assignment_id,
+      attestId: attest_id,
+      decisionRequestId: decision_request_id,
+      decisionWakeId: decision_wake_id,
+      openerRef: opener_ref,
+      disposerRef: disposer_ref,
+      reason: reason,
+      releaseFactKind: release_kind,
+      releaseFactScope: release_scope,
+      releaseFactPrincipalRef: release_principal,
+      state: state,
+      createdAt: created_at,
+      settledAt: settled_at,
+      settlementKind: settlement_kind,
+      settlementFactId: settlement_fact_id,
+      settledBy: settled_by
+    }
+  end
+
+  defp assignment_opener_ref(%{openedBySession: session}) when is_binary(session),
+    do: "session:" <> session
+
+  defp assignment_opener_ref(%{openedByUser: user}) when is_binary(user), do: "user:" <> user
+
+  defp assignment_opener_session(%{openedBySession: session}) when is_binary(session), do: session
+
+  defp assignment_opener_session(%{openedByUser: user}) when is_binary(user),
+    do: Org.personal_session_key(user)
 
   defp verdict_in_txn(txn, call) do
     assignment_id = call.params[:assignment_id]
@@ -1884,52 +3121,232 @@ defmodule Tightbeam.Assignments do
       assignment ->
         cond do
           not revoke_allowed?(txn, call.principal, assignment) ->
-            error("not_authorized", "assignment revocation requires its opener or an admin")
+            if cannot_proceed_standing_in_txn?(txn, assignment.id) do
+              error("not_authorized", "cannot-proceed revocation requires its current disposer")
+            else
+              error("not_authorized", "assignment revocation requires its opener or an admin")
+            end
 
           assignment.state != "open" ->
-            assignment_closed()
+            with :ok <- valid_revocation_reason(call.params[:reason]) do
+              if assignment.outcome == "revoked" and
+                   assignment.revocationReason == call.params[:reason] and
+                   revoked_by?(assignment, call.principal) do
+                Map.put(assignment, :revocation_replayed, true)
+              else
+                assignment_closed()
+              end
+            end
 
           true ->
-            {closed_user, closed_session} = opener(call.principal)
+            with :ok <- valid_revocation_reason(call.params[:reason]) do
+              case released_cannot_proceed(txn, assignment_id) do
+                %{settlementFactId: fact_id} = released ->
+                  case observe_release_before_disposition_in_txn(txn, released, call) do
+                    :new_intent ->
+                      revoke_open_assignment_in_txn(txn, call, assignment_id)
 
-            Txn.q(
-              txn,
-              """
-              UPDATE assignments SET state = 'closed', outcome = 'revoked', closedAt = ?2,
-                closedByUser = ?3, closedBySession = ?4
-              WHERE id = ?1 AND state = 'open'
-              """,
-              [assignment_id, now(), closed_user, closed_session]
-            )
+                    :release_won ->
+                      error(
+                        "cannot_proceed_released",
+                        "cannot-proceed was already released by condition fact #{fact_id}; a later ordinary revoke must state a new reason"
+                      )
+                  end
 
-            if Txn.changes(txn) != 1, do: raise(TransitionRace)
-            revoked_assignment = fetch_assignment!(txn, assignment_id)
-            Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
-
-            liveness_trigger =
-              disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
-
-            supervision_transition!(txn, :terminal_disposition, %{
-              kind: "terminal_disposition",
-              assignment_id: assignment_id,
-              cause: "terminal_disposition",
-              principal: principal_id(call.principal),
-              requester_id: "tightbeam:assignments"
-            })
-
-            EffortCheckin.cancel_in_txn(
-              txn,
-              assignment_id,
-              assignment_disposition_command(
-                assignment_id,
-                "tightbeam:assignments",
-                liveness_trigger
-              )
-            )
-
-            append_assignment_marker(txn, revoked_assignment, :revoked)
-            revoked_assignment
+                nil ->
+                  revoke_open_assignment_in_txn(txn, call, assignment_id)
+              end
+            end
         end
+    end
+  end
+
+  defp revoke_open_assignment_in_txn(txn, call, assignment_id) do
+    {closed_user, closed_session} = opener(call.principal)
+    closed_at = now()
+    revocation_id = id("rev_")
+    reopening_id = current_reopening_id(txn, assignment_id)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_revocations
+        (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+      """,
+      [
+        revocation_id,
+        assignment_id,
+        closed_at,
+        closed_user,
+        closed_session,
+        call.params[:reason]
+      ]
+    )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_revocation_generations
+        (revocationId, assignmentId, reopeningId)
+      VALUES (?1, ?2, ?3)
+      """,
+      [revocation_id, assignment_id, reopening_id]
+    )
+
+    Txn.q(
+      txn,
+      """
+      UPDATE assignments SET state = 'closed', outcome = 'revoked', closedAt = ?2,
+        closedByUser = ?3, closedBySession = ?4
+      WHERE id = ?1 AND state = 'open'
+      """,
+      [assignment_id, closed_at, closed_user, closed_session]
+    )
+
+    if Txn.changes(txn) != 1, do: raise(TransitionRace)
+    revoked_assignment = fetch_assignment!(txn, assignment_id)
+
+    CompletionEscalation.open_terminal_in_txn(txn, revoked_assignment, "revocation", %{
+      id: revocation_id,
+      by_user: closed_user,
+      by_session: closed_session
+    })
+
+    Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
+
+    liveness_trigger = disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
+
+    settle_cannot_proceed_by_disposition_in_txn(
+      txn,
+      assignment_id,
+      principal_id(call.principal),
+      closed_at,
+      liveness_trigger
+    )
+
+    supervision_transition!(txn, :terminal_disposition, %{
+      kind: "terminal_disposition",
+      assignment_id: assignment_id,
+      cause: "terminal_disposition",
+      principal: principal_id(call.principal),
+      requester_id: "tightbeam:assignments"
+    })
+
+    EffortCheckin.cancel_in_txn(
+      txn,
+      assignment_id,
+      assignment_disposition_command(
+        assignment_id,
+        "tightbeam:assignments",
+        liveness_trigger
+      )
+    )
+
+    append_assignment_marker(txn, revoked_assignment, :revoked)
+    revoked_assignment
+  end
+
+  defp released_cannot_proceed(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT id, assignmentId, attestId, decisionRequestId, decisionWakeId, openerRef,
+                  disposerRef, reason, releaseFactKind, releaseFactScope,
+                  releaseFactPrincipalRef, state, createdAt, settledAt, settlementKind,
+                  settlementFactId, settledBy
+           FROM assignment_cannot_proceed
+           WHERE assignmentId=?1 AND state='settled' AND settlementKind='release-fact'
+           ORDER BY settledAt DESC, id DESC LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      [row] -> cannot_proceed(row)
+      [] -> nil
+    end
+  end
+
+  defp observe_release_before_disposition_in_txn(txn, released, call) do
+    principal = principal_id(call.principal)
+    reason = call.params[:reason]
+
+    case Txn.q(
+           txn,
+           "SELECT principal,reason FROM assignment_cannot_proceed_release_observations WHERE conditionId=?1",
+           [released.id]
+         ) do
+      [] ->
+        Txn.q(
+          txn,
+          "INSERT INTO assignment_cannot_proceed_release_observations (conditionId,principal,reason,observedAt) VALUES (?1,?2,?3,?4)",
+          [released.id, principal, reason, now()]
+        )
+
+        :release_won
+
+      [[^principal, ^reason]] ->
+        :release_won
+
+      [[_prior_principal, _prior_reason]] ->
+        :new_intent
+    end
+  end
+
+  defp settle_cannot_proceed_by_disposition_in_txn(
+         txn,
+         assignment_id,
+         principal,
+         settled_at,
+         liveness_trigger
+       ) do
+    case Txn.q(
+           txn,
+           "SELECT id, decisionRequestId, decisionWakeId FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing'",
+           [assignment_id]
+         ) do
+      [[condition_id, request_id, wake_id]] ->
+        Txn.q(
+          txn,
+          """
+          UPDATE assignment_cannot_proceed
+          SET state='settled', settledAt=?2, settlementKind='disposed', settledBy=?3
+          WHERE id=?1 AND state='standing'
+          """,
+          [condition_id, settled_at, principal]
+        )
+
+        if Txn.changes(txn) != 1, do: raise(TransitionRace)
+
+        :ok =
+          Escalation.settle_agent_request_in_txn(
+            txn,
+            request_id,
+            principal,
+            "cannot-proceed assignment disposed"
+          )
+
+        case Txn.q(txn, "SELECT state FROM wakes WHERE wakeId=?1", [wake_id]) do
+          [["pending"]] ->
+            true =
+              Wakes.cancel_in_txn(txn, %{
+                wake_id: wake_id,
+                requester: %{kind: "process", id: "tightbeam:assignments"},
+                reason_kind: "obligation_disposed",
+                causal_source: %{kind: "assignment_transition", id: assignment_id},
+                outcome: %{
+                  kind: "disposition",
+                  disposition_kind: "assignment_transition",
+                  disposition_id: assignment_id,
+                  liveness_trigger: liveness_trigger
+                }
+              })
+
+          [[state]] when state in ["fired", "canceled"] ->
+            :ok
+        end
+
+      [] ->
+        :ok
     end
   end
 
@@ -1947,19 +3364,22 @@ defmodule Tightbeam.Assignments do
         "surrender" ->
           "[surrendered #{attest.assignmentId} — needs user input]"
 
+        "cannot-proceed" ->
+          "[cannot-proceed filed on #{attest.assignmentId}: #{attest.note}]"
+
         "progress" ->
           "[progress filed on #{attest.assignmentId}]"
       end
 
-    append_marker(txn, attest.bySession, text)
+    append_notice(txn, attest.bySession, text)
   end
 
   defp append_assignment_marker(txn, assignment, :opened) do
-    append_marker(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
+    append_notice(txn, assignment.holderKey, "[assignment opened: #{assignment.id}]")
   end
 
   defp append_assignment_marker(txn, assignment, :closed) do
-    append_marker(
+    append_notice(
       txn,
       assignment.holderKey,
       "[assignment closed: #{assignment.id} — #{assignment.outcome}]"
@@ -1967,7 +3387,7 @@ defmodule Tightbeam.Assignments do
   end
 
   defp append_assignment_marker(txn, assignment, :revoked) do
-    append_marker(txn, assignment.holderKey, "[assignment revoked: #{assignment.id}]")
+    append_notice(txn, assignment.holderKey, "[assignment revoked: #{assignment.id}]")
   end
 
   # Carries actor + reason (Sol xhigh review, finding 6) — the plain
@@ -1975,24 +3395,65 @@ defmodule Tightbeam.Assignments do
   # an agent reading its own transcript unable to answer "who reopened this and
   # why" without a separate read, even though the database has both answers.
   defp append_assignment_marker(txn, assignment, :reopened, actor, reason) do
-    append_marker(
+    append_notice(
       txn,
       assignment.holderKey,
       "[assignment reopened: #{assignment.id} by #{actor} — #{reason}]"
     )
   end
 
-  defp append_marker(txn, session_key, text) do
-    best_effort(fn -> Projection.append_marker_in_txn(txn, session_key, text) end)
+  defp append_notice(txn, session_key, text) do
+    best_effort(fn -> Projection.append_substrate_in_txn(txn, session_key, text) end)
   end
 
   defp revoke_allowed?(txn, {:user, user}, assignment) do
-    assignment.openedByUser == user or
-      match?([[1]], Txn.q(txn, "SELECT isAdmin FROM users WHERE userId = ?1", [user]))
+    case cannot_proceed_disposer_ref_in_txn(txn, assignment.id) do
+      nil ->
+        assignment.openedByUser == user or
+          match?([[1]], Txn.q(txn, "SELECT isAdmin FROM users WHERE userId = ?1", [user]))
+
+      disposer_ref ->
+        disposer_ref == "user:" <> user
+    end
   end
 
-  defp revoke_allowed?(_txn, {:session, session}, assignment),
-    do: assignment.openedBySession == session
+  defp revoke_allowed?(txn, {:session, session}, assignment) do
+    case cannot_proceed_disposer_ref_in_txn(txn, assignment.id) do
+      nil -> assignment.openedBySession == session
+      disposer_ref -> disposer_ref == "session:" <> session
+    end
+  end
+
+  defp cannot_proceed_disposer_ref_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           "SELECT disposerRef, decisionWakeId FROM assignment_cannot_proceed WHERE assignmentId=?1 AND state='standing'",
+           [assignment_id]
+         ) do
+      [[disposer_ref, wake_id]] ->
+        case Txn.q(
+               txn,
+               """
+               SELECT bubbled.sessionKey
+               FROM turns cause
+               JOIN turns bubbled ON bubbled.requestRef='bubble:' || cause.seq
+               WHERE cause.wakeId=?1
+                 AND bubbled.status='delivered'
+               ORDER BY bubbled.seq DESC LIMIT 1
+               """,
+               [wake_id]
+             ) do
+          [[session_key]] -> "session:" <> session_key
+          [] -> disposer_ref
+        end
+
+      [] ->
+        nil
+    end
+  end
+
+  defp revoked_by?(assignment, {:user, user}), do: assignment.closedByUser == user
+  defp revoked_by?(assignment, {:session, session}), do: assignment.closedBySession == session
 
   defp insert_attest(txn, call, assignment_id) do
     {by_user, by_session} = opener(call.principal)
@@ -2099,19 +3560,33 @@ defmodule Tightbeam.Assignments do
       )
 
     case rows do
-      [row] -> assignment(row)
+      [row] -> assignment(row) |> project_assignment(db)
       [] -> nil
     end
   end
 
   defp fetch_assignment(txn, id) do
     case Txn.q(txn, "SELECT #{columns()} FROM assignments WHERE id = ?1", [id]) do
-      [row] -> assignment(row)
+      [row] -> assignment(row) |> project_assignment_in_txn(txn)
       [] -> nil
     end
   end
 
   defp fetch_assignment!(txn, id), do: fetch_assignment(txn, id) || raise("missing assignment")
+
+  defp project_assignment(assignment, db) do
+    Map.merge(
+      assignment,
+      Tightbeam.DeliverableContract.assignment_projection(db, assignment.id)
+    )
+  end
+
+  defp project_assignment_in_txn(assignment, txn) do
+    Map.merge(
+      assignment,
+      Tightbeam.DeliverableContract.assignment_projection_in_txn(txn, assignment.id)
+    )
+  end
 
   defp principal_allowed({:process, _}, _verb),
     do: error("process_denied", "process principals cannot use assignment verbs")
@@ -2179,7 +3654,7 @@ defmodule Tightbeam.Assignments do
       db: db,
       port: Application.get_env(:tightbeam, :port, 11_373),
       effort_checkin_horizon_ms:
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000)
+        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 14_400_000)
     }
 
     Map.merge(defaults, Map.get(call, :effort_config, %{}))
@@ -2242,6 +3717,51 @@ defmodule Tightbeam.Assignments do
 
       {_kind, _refs} ->
         :ok
+    end
+  end
+
+  defp completion_filing_allowed(_db, %{params: %{kind: kind}}) when kind != "completion",
+    do: :ok
+
+  defp completion_filing_allowed(db, call) do
+    supplied = call.params[:assignment_id]
+
+    case IdPrefix.resolve(db, :assignment, supplied) do
+      {:ok, assignment_id} ->
+        {:ok, rows} =
+          DB.query(
+            db,
+            """
+            SELECT a.holderKey,a.state,s.state
+            FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+            WHERE a.id=?1
+            """,
+            [assignment_id]
+          )
+
+        case rows do
+          [] ->
+            error("unknown_assignment", "unknown assignment: #{supplied}")
+
+          [[holder, _assignment_state, _session_state]]
+          when call.principal != {:session, holder} ->
+            error("not_holder", "assignment is held by session #{holder}")
+
+          [[_holder, _assignment_state, session_state]] when session_state != "active" ->
+            error("session_retired", "completion requires an active holder session")
+
+          [[_holder, assignment_state, _session_state]] when assignment_state != "open" ->
+            assignment_closed()
+
+          [[_holder, "open", "active"]] ->
+            :ok
+        end
+
+      :unknown ->
+        error("unknown_assignment", "unknown assignment: #{supplied}")
+
+      {:ambiguous, error} ->
+        error
     end
   end
 
@@ -2376,8 +3896,60 @@ defmodule Tightbeam.Assignments do
 
   defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"
 
-  defp valid_kind(kind) when kind in ["progress", "completion", "surrender"], do: :ok
-  defp valid_kind(_), do: error("invalid_kind", "kind must be progress, completion, or surrender")
+  defp valid_kind(kind) when kind in ["progress", "completion", "cannot-proceed"], do: :ok
+
+  defp valid_kind(_),
+    do: error("invalid_kind", "kind must be progress, completion, or cannot-proceed")
+
+  defp valid_release_tuple_for_kind(%{kind: "cannot-proceed"} = params),
+    do: valid_release_tuple(params)
+
+  defp valid_release_tuple_for_kind(params) do
+    if Enum.any?(
+         [:release_fact_kind, :release_fact_scope, :release_fact_principal_ref],
+         &(not is_nil(params[&1]))
+       ),
+       do:
+         error(
+           "invalid_release_tuple",
+           "release fact fields are only valid when kind is cannot-proceed"
+         ),
+       else: :ok
+  end
+
+  defp valid_release_tuple(params) do
+    values =
+      Enum.map(
+        [:release_fact_kind, :release_fact_scope, :release_fact_principal_ref],
+        &params[&1]
+      )
+
+    cond do
+      Enum.all?(values, &is_nil/1) ->
+        :ok
+
+      Enum.all?(values, &(is_binary(&1) and String.trim(&1) != "")) ->
+        :ok
+
+      true ->
+        error(
+          "invalid_release_tuple",
+          "releaseFactKind, releaseFactScope, and releaseFactPrincipalRef must be supplied together"
+        )
+    end
+  end
+
+  defp valid_cannot_proceed_reason(%{kind: "cannot-proceed", note: note})
+       when is_binary(note) do
+    if String.trim(note) == "",
+      do: error("missing_reason", "cannot-proceed requires a non-empty note"),
+      else: :ok
+  end
+
+  defp valid_cannot_proceed_reason(%{kind: "cannot-proceed"}),
+    do: error("missing_reason", "cannot-proceed requires a non-empty note")
+
+  defp valid_cannot_proceed_reason(_params), do: :ok
 
   defp absent_verdict_kind(nil), do: :ok
 
@@ -2418,6 +3990,20 @@ defmodule Tightbeam.Assignments do
 
   defp valid_idempotency_key(_),
     do: error("invalid_idempotency_key", "idempotencyKey must be text")
+
+  defp valid_attest_idempotency("completion", key), do: valid_idempotency_key(key)
+  defp valid_attest_idempotency(_kind, nil), do: :ok
+
+  defp valid_attest_idempotency(_kind, _key),
+    do: error("idempotency_key_not_applicable", "idempotencyKey is only valid for completion")
+
+  defp valid_delivers_work_item(params) do
+    case Map.fetch(params, :delivers_work_item) do
+      :error -> :ok
+      {:ok, value} when is_boolean(value) -> :ok
+      {:ok, _value} -> error("invalid_delivers_work_item", "deliversWorkItem must be boolean")
+    end
+  end
 
   defp valid_files(nil), do: {:ok, []}
 
@@ -2557,12 +4143,31 @@ defmodule Tightbeam.Assignments do
 
   defp now, do: System.system_time(:millisecond)
 
+  defp current_reopening_id(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           "SELECT id FROM assignment_reopenings WHERE assignmentId=?1 ORDER BY id DESC LIMIT 1",
+           [assignment_id]
+         ) do
+      [[reopening_id]] -> reopening_id
+      [] -> nil
+    end
+  end
+
   defp columns do
     "id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, " <>
-      "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId" <>
-      ", workItemId, reviewsAssignmentId, holderHarness, holderProvider, " <>
+      "openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId, " <>
+      "(SELECT r.reason FROM assignment_revocation_generations g " <>
+      "JOIN assignment_revocations r ON r.id = g.revocationId " <>
+      "WHERE g.assignmentId = assignments.id AND g.reopeningId IS " <>
+      "(SELECT reopening.id FROM assignment_reopenings reopening " <>
+      "WHERE reopening.assignmentId = assignments.id ORDER BY reopening.id DESC LIMIT 1))" <>
+      ", workItemId, reviewsAssignmentId, completionReportToSessionKey, holderHarness, holderProvider, " <>
       "COALESCE((SELECT effectKind FROM assignment_effects WHERE assignmentId = assignments.id), " <>
-      "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)"
+      "CASE WHEN reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END), " <>
+      "COALESCE((SELECT priority FROM assignment_priorities WHERE assignmentId=assignments.id), " <>
+      "(SELECT priority FROM work_item_priorities WHERE workItemId=assignments.workItemId), " <>
+      "CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER))"
   end
 
   defp assignment([
@@ -2580,11 +4185,14 @@ defmodule Tightbeam.Assignments do
          closed_by_user,
          closed_by_session,
          closing_attest_id,
+         revocation_reason,
          work_item_id,
          reviews_assignment_id,
+         completion_report_to_session_key,
          holder_harness,
          holder_provider,
-         effect_kind
+         effect_kind,
+         priority
        ]) do
     %{
       id: id,
@@ -2601,12 +4209,65 @@ defmodule Tightbeam.Assignments do
       closedByUser: closed_by_user,
       closedBySession: closed_by_session,
       closingAttestId: closing_attest_id,
+      revocationReason: revocation_reason,
       workItemId: work_item_id,
       reviewsAssignmentId: reviews_assignment_id,
+      reportToSessionKey: completion_report_to_session_key,
       holderHarness: holder_harness,
       holderProvider: holder_provider,
-      effectKind: effect_kind
+      effectKind: effect_kind,
+      priority: priority
     }
+  end
+
+  defp valid_report_to(_db, _holder_key, nil), do: :ok
+
+  defp valid_report_to(db, holder_key, report_to) when is_binary(report_to) and report_to != "" do
+    case DB.query(
+           db,
+           """
+           SELECT 1
+           FROM sessions holder
+           JOIN sessions target ON target.sessionKey=?2
+           WHERE holder.sessionKey=?1
+             AND target.state='active'
+             AND target.ownerUserId=holder.ownerUserId
+           """,
+           [holder_key, report_to]
+         ) do
+      {:ok, [[1]]} -> :ok
+      _ -> invalid_report_to(report_to)
+    end
+  end
+
+  defp valid_report_to(_db, _holder_key, report_to), do: invalid_report_to(report_to)
+
+  defp valid_report_to_in_txn?(_txn, nil, _holder_owner), do: true
+
+  defp valid_report_to_in_txn?(txn, report_to, holder_owner) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM sessions WHERE sessionKey=?1 AND state='active' AND ownerUserId=?2",
+      [report_to, holder_owner]
+    ) == [[1]]
+  end
+
+  defp invalid_report_to(report_to),
+    do: %{code: "invalid_report_to", reportToSessionKey: report_to}
+
+  defp inherited_priority_in_txn(txn, work_item_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(
+             (SELECT priority FROM work_item_priorities WHERE workItemId=?1),
+             CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+           )
+           """,
+           [work_item_id]
+         ) do
+      [[priority]] -> priority
+    end
   end
 
   defp attest([

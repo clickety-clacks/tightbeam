@@ -24,6 +24,12 @@ description: Commit and push discipline — build before committing, one concern
 
 ## Merging your branch into main
 Merging is a semantic integration problem, not a text-selection problem.
+
+When a lane pins an authorized target commit, hold that exact target until the reviewed
+candidate lands. If the target moves for unrelated work, stop and report the hold
+violation. Do not reconcile or rebuild on the moved target unless the owner explicitly
+changes the pin.
+
 1. Merge main into your branch first. Every conflict is resolved on your branch.
 2. Resolve conflicts semantically. Never resolve by wholesale accepting ours, theirs,
    or the newer block. For each conflict, determine what each side contributes — read
@@ -45,5 +51,8 @@ Merging is a semantic integration problem, not a text-selection problem.
    (`git merge-base --is-ancestor main <branch>`), then advance main from the
    branch — fast-forward, because the reconciliation already happened on the
    branch.
-6. When main moved during reconciliation, merge it in again and re-prove before
-   advancing.
+6. When main moves during reconciliation, that is a hold violation to report, not a
+   reason to reconcile again. Stop and tell the owner the pinned target moved; do not
+   merge the new tip in and re-prove unless the owner changes the pin. Chasing a moving
+   target invalidates the review that just cleared your work, and on a busy target that
+   loop never ends: reconcile, review goes stale, re-review, target moves, reconcile.

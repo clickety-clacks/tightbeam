@@ -20,9 +20,9 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
     base_dir = options[:base_dir] || base_dir()
 
-    guidance_path = working_set_path(base_dir)
+    working_set_path = working_set_path(base_dir)
 
-    working_set = read_working_set!(guidance_path)
+    working_set = read_working_set!(working_set_path)
 
     inventories =
       case fetch_live(base_dir) do
@@ -44,7 +44,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
 
   @doc false
   def working_set_path(base_dir) do
-    Path.join([base_dir, "identity", "guidance", "preferred-models.md"])
+    Path.join([base_dir, "identity", "kungfu", "agentic-engineering", "preferred-models.md"])
   end
 
   @doc false
@@ -81,8 +81,8 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   end
 
   @doc false
-  def evaluate(inventories, guidance_path) do
-    evaluate_working_set(inventories, read_working_set!(guidance_path))
+  def evaluate(inventories, working_set_path) do
+    evaluate_working_set(inventories, read_working_set!(working_set_path))
   end
 
   defp evaluate_working_set(inventories, working_set) do
@@ -170,8 +170,8 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
   defp settled?({:unavailable, reason}), do: reason != :not_derived
   defp settled?(_state), do: false
 
-  defp read_working_set!(guidance_path) do
-    guidance_path
+  defp read_working_set!(working_set_path) do
+    working_set_path
     |> read_working_set_source!()
     |> String.split("\n")
     |> Enum.drop_while(&(&1 != "## Working set (capsules)"))
@@ -181,8 +181,8 @@ defmodule Mix.Tasks.Tightbeam.Catalog.Diff do
     end
   end
 
-  defp read_working_set_source!(guidance_path) do
-    case File.read(guidance_path) do
+  defp read_working_set_source!(working_set_path) do
+    case File.read(working_set_path) do
       {:ok, contents} ->
         contents
 

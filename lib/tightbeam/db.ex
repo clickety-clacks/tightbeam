@@ -11,6 +11,10 @@ defmodule Tightbeam.DB do
   the port spec). Reads share the same serialized connection in E1; a read
   pool is a later, additive concern.
 
+  `transaction_then/3` is the one bounded exception to short database-only
+  calls: it retains the owner as a writer fence while a committed marker guards
+  one external publication.
+
   A function running inside a caller's transaction must never re-enter the DB
   owner by opening another connection or transaction. By convention,
   `*_in_txn(txn, ...)` helpers write only through the supplied transaction and
@@ -67,6 +71,26 @@ defmodule Tightbeam.DB do
   end
 
   @doc """
+  Commit one transaction, then run `after_commit` before releasing the DB owner.
+
+  This is the publication fence for an external mutation that requires durable
+  database evidence first. `prepare` receives a `Txn`; its result reaches
+  `after_commit` only after COMMIT. Other database calls remain queued until
+  `after_commit` returns. A prepare failure rolls back. An after-commit failure
+  returns an error without rolling back the already durable transaction.
+  """
+  @spec transaction_then(
+          server(),
+          (Tightbeam.DB.Txn.t() -> prepared),
+          (prepared -> result)
+        ) :: {:ok, result} | {:error, Exception.t()}
+        when prepared: term(), result: term()
+  def transaction_then(server \\ __MODULE__, prepare, after_commit)
+      when is_function(prepare, 1) and is_function(after_commit, 1) do
+    GenServer.call(server, {:transaction_then, prepare, after_commit})
+  end
+
+  @doc """
   Run one atomic SQLite table rebuild while foreign-key enforcement is paused.
 
   The DB owner changes the pragma, transaction, integrity check, and restoration
@@ -88,13 +112,30 @@ defmodule Tightbeam.DB do
     process — never hold one outside the callback. Errors RAISE (rolling the
     transaction back) rather than returning tuples.
     """
-    @type t :: %__MODULE__{conn: reference(), outbox: reference()}
-    defstruct [:conn, :outbox]
+    @type t :: %__MODULE__{conn: reference(), outbox: reference(), query_trace: term()}
+    defstruct [:conn, :outbox, :query_trace]
+
+    @doc false
+    def observe_queries(%__MODULE__{} = txn, trace), do: %{txn | query_trace: trace}
 
     @doc "Run one SQL statement inside the transaction; returns rows (positional lists)."
     @spec q(t(), String.t(), [term()]) :: [Tightbeam.DB.row()]
-    def q(%__MODULE__{conn: conn}, sql, params \\ []),
-      do: Tightbeam.DB.run_query(conn, sql, params)
+    def q(%__MODULE__{conn: conn, query_trace: trace}, sql, params \\ []) do
+      trace_query(trace, sql, params)
+      Tightbeam.DB.run_query(conn, sql, params)
+    end
+
+    defp trace_query(nil, _sql, _params), do: :ok
+
+    defp trace_query(pid, sql, params) when is_pid(pid) do
+      send(pid, {:core_detail_trace, {:sql_query, sql, params}})
+      :ok
+    end
+
+    defp trace_query(trace, sql, params) when is_function(trace, 1) do
+      trace.({:sql_query, sql, params})
+      :ok
+    end
 
     @doc "Execute a statement without results inside the transaction."
     @spec exec(t(), String.t()) :: :ok
@@ -139,6 +180,8 @@ defmodule Tightbeam.DB do
       :ok = Sqlite3.execute(conn, pragma)
     end
 
+    :ok = load_topline_unicode(conn)
+
     {:ok, %{conn: conn}}
   end
 
@@ -180,6 +223,43 @@ defmodule Tightbeam.DB do
       {:rolled_back, error} ->
         {:reply, {:error, error}, state}
     end
+  end
+
+  def handle_call({:transaction_then, prepare, after_commit}, _from, %{conn: conn} = state) do
+    outbox = make_ref()
+    outbox_key = {Txn, outbox}
+    Process.put(outbox_key, [])
+    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+    prepared =
+      try do
+        result = prepare.(%Txn{conn: conn, outbox: outbox})
+        :ok = Sqlite3.execute(conn, "COMMIT")
+        {:committed, result, Process.get(outbox_key, []) |> Enum.reverse()}
+      rescue
+        error ->
+          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          {:rolled_back, error}
+      after
+        Process.delete(outbox_key)
+      end
+
+    reply =
+      case prepared do
+        {:committed, result, handoffs} ->
+          Enum.each(handoffs, &deliver_handoff/1)
+
+          try do
+            {:ok, after_commit.(result)}
+          rescue
+            error -> {:error, error}
+          end
+
+        {:rolled_back, error} ->
+          {:error, error}
+      end
+
+    {:reply, reply, state}
   end
 
   def handle_call({:foreign_key_rebuild, fun}, _from, %{conn: conn} = state) do
@@ -242,6 +322,21 @@ defmodule Tightbeam.DB do
       {:row, row} -> collect(conn, stmt, [row | acc])
       :done -> Enum.reverse(acc)
       {:error, reason} -> raise Error, message: to_string(reason)
+    end
+  end
+
+  defp load_topline_unicode(conn) do
+    extension = if match?({:unix, :darwin}, :os.type()), do: ".dylib", else: ".so"
+    path = Application.app_dir(:tightbeam, "priv/topline_unicode#{extension}")
+    :ok = Sqlite3.enable_load_extension(conn, true)
+
+    try do
+      [[nil]] =
+        run_query(conn, "SELECT load_extension(?1, 'sqlite3_topline_unicode_init')", [path])
+
+      :ok
+    after
+      :ok = Sqlite3.enable_load_extension(conn, false)
     end
   end
 end

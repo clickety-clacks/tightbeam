@@ -67,8 +67,8 @@ defmodule Tightbeam.Application do
       # LAST, deliberately: Bandit's "Running ... (http)" has already been
       # logged by now, and that line reads as a verdict. On an org that cannot
       # run a single turn it was the wrong one, so the real verdict goes after
-      # it. Assembled from what boot already knows; it starts nothing and
-      # cannot fail the boot.
+      # it. Assembled from what boot already knows; it starts nothing and cannot
+      # fail the boot.
       report_readiness(config)
 
       {:ok, supervisor}
@@ -260,7 +260,7 @@ defmodule Tightbeam.Application do
       escalation_decision_deadline_ms:
         Application.get_env(:tightbeam, :escalation_decision_deadline_ms, 86_400_000),
       effort_checkin_horizon_ms:
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000),
+        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 14_400_000),
       critical_lease_hard_cap_ms:
         Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000),
       onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000)

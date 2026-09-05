@@ -40,6 +40,7 @@ defmodule Tightbeam.AdminProjectionTest do
     Gateway,
     Harness,
     Identity,
+    Model,
     Org,
     Placement,
     Roles,
@@ -64,15 +65,25 @@ defmodule Tightbeam.AdminProjectionTest do
     :ok = Schema.ensure_all(db)
     :ok = AdminProjection.bootstrap_served(db, base_dir)
 
-    Devices.add_user(db, "flynn", true)
+    {:paired, _device} =
+      claim_org(db, %{
+        device_id: "admin-projection-device",
+        claimed_name: "flynn",
+        platform: nil,
+        model: nil
+      })
+
     Devices.add_user(db, "operator", false)
 
     start_supervised!({Hub, name: Hub})
     :ok = Hub.register(Hub, self())
 
+    harness = hd(Harness.all()).wire_name()
+    catalog = %{{Placement.local_host_name(), harness} => []}
+
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
-    %{base_dir: base_dir, db: db}
+    %{base_dir: base_dir, db: db, catalog: catalog}
   end
 
   test "A1 maps every ruled class both ways and A6 uses the exact shared item bytes", ctx do
@@ -220,8 +231,8 @@ defmodule Tightbeam.AdminProjectionTest do
       row = Map.fetch!(Registry.rows(), expected.class)
       detail_item = apply(StateResources, row.serializer, [expected.raw])
       notice_item = expected.notice["payload"]
-      detail_bytes = StateResources.encode_admin_item(expected.resource, detail_item)
-      notice_bytes = StateResources.encode_admin_item(expected.resource, notice_item)
+      detail_bytes = StateResources.encode_item(expected.resource, detail_item, ctx.catalog)
+      notice_bytes = StateResources.encode_item(expected.resource, notice_item, ctx.catalog)
 
       assert row.resource == expected.resource
       assert row.op == "upsert"
@@ -232,7 +243,10 @@ defmodule Tightbeam.AdminProjectionTest do
       assert row.version_source == expected.version_source
       assert Enum.sort(Map.keys(detail_item)) == Enum.sort(expected.fields)
       assert detail_bytes == notice_bytes
-      assert Publisher.encode_wire_notice(expected.notice) =~ ~s("payload":#{detail_bytes})
+
+      assert Publisher.encode_wire_notice(expected.notice, ctx.catalog) =~
+               ~s("payload":#{detail_bytes})
+
       assert_field_order(detail_bytes, expected.fields)
 
       assert expected.notice["refs"]
@@ -428,13 +442,14 @@ defmodule Tightbeam.AdminProjectionTest do
              ) ==
                detail_item
 
-      assert StateResources.encode_admin_item(test_case.resource, detail_item) ==
-               StateResources.encode_admin_item(
+      assert StateResources.encode_item(test_case.resource, detail_item, ctx.catalog) ==
+               StateResources.encode_item(
                  test_case.resource,
                  Enum.find(
                    collection_items,
                    &(test_case.primary.(&1) == test_case.primary.(detail_item))
-                 )
+                 ),
+                 ctx.catalog
                )
 
       Enum.each(test_case.filters, fn filters ->
@@ -473,7 +488,7 @@ defmodule Tightbeam.AdminProjectionTest do
         Enum.map(test_case.collection.(%{}), fn row ->
           row
           |> test_case.serializer.()
-          |> then(&StateResources.encode_admin_item(test_case.resource, &1))
+          |> then(&StateResources.encode_item(test_case.resource, &1, ctx.catalog))
         end)
       end)
       |> Enum.join("\n")
@@ -903,7 +918,7 @@ defmodule Tightbeam.AdminProjectionTest do
         end) <> "}"
 
     item = StateResources.identity(raw)
-    item_bytes = StateResources.encode_admin_item("identity", item)
+    item_bytes = StateResources.encode_item("identity", item)
     notice = Publisher.committed_notice("identity.updated", raw, %{"name" => "served"})
     wire_bytes = Publisher.encode_wire_notice(notice)
 
@@ -1190,17 +1205,205 @@ defmodule Tightbeam.AdminProjectionTest do
     handler =
       Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-edit"]
 
-    assert_raise ArgumentError, "tightbeam/live cannot fast-forward to main", fn ->
-      handler.(
-        firehose_call("identity-edit", %{
-          archetype: "default",
-          content: "# unpublished identity change\n"
-        })
-      )
-    end
+    call =
+      firehose_call("identity-edit", %{
+        archetype: "default",
+        content: "# unpublished identity change\n"
+      })
+      |> Map.put(:invocation_id, "identity-non-fast-forward-replay")
+
+    assert %{code: "identity_publication_non_fast_forward", expected: ^divergent} =
+             denial =
+             handler.(call)
+
+    assert handler.(call) == denial
 
     assert hydrated_identity!(ctx.db, "served") == before
     refute_receive {:firehose_notice, _notice}
+  end
+
+  test "pending identity markers recover both sides of the live-ref move", ctx do
+    handler = Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-edit"]
+
+    for {suffix, move_first?} <- [{"before", false}, {"after", true}] do
+      invocation = "identity-crash-#{suffix}"
+
+      candidate =
+        Identity.edit!(
+          ctx.base_dir,
+          "default",
+          :guidance,
+          "# recovered #{suffix}\n",
+          "user:flynn"
+        )
+
+      assert {:ok, %{state: "pending"}} =
+               AdminProjection.begin_identity_publication(
+                 ctx.db,
+                 invocation,
+                 candidate,
+                 "user:flynn"
+               )
+
+      if move_first?,
+        do: assert({:ok, _revision} = Identity.publish_live!(ctx.base_dir, candidate))
+
+      call =
+        firehose_call("identity-edit", %{archetype: "default", content: "ignored on replay"})
+        |> Map.put(:invocation_id, invocation)
+
+      assert %{live_revision: revision} = handler.(call)
+      assert revision == candidate.candidate_revision
+
+      assert %{state: "accepted", candidate_revision: ^revision} =
+               AdminProjection.identity_publication_marker(
+                 ctx.db,
+                 invocation,
+                 candidate.expected_prior
+               )
+    end
+  end
+
+  test "invalid include denial is fingerprinted, immutable, and commit-free", ctx do
+    handler = Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-edit"]
+    invocation = "identity-invalid-replay"
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    main = git!(identity_dir, ["rev-parse", "main"])
+    live = git!(identity_dir, ["rev-parse", "tightbeam/live"])
+
+    call =
+      firehose_call("identity-edit", %{
+        archetype: "operating-model",
+        content: "#include \"missing.md\"\n"
+      })
+      |> Map.put(:invocation_id, invocation)
+
+    assert %{code: "identity_include_invalid", message: message} = denial = handler.(call)
+    assert message =~ "origin=guidance/operating-model.md"
+    assert message =~ "at=guidance/operating-model.md:line 1"
+    assert message =~ "chain=missing.md"
+
+    assert %{
+             state: "denied",
+             cause: "missing_fragment",
+             denial_code: "identity_include_invalid",
+             denial_message: ^message,
+             candidate_revision: nil,
+             tree_fingerprint: fingerprint
+           } = AdminProjection.identity_publication_marker(ctx.db, invocation, live)
+
+    assert byte_size(fingerprint) == 64
+    assert git!(identity_dir, ["rev-parse", "main"]) == main
+    assert git!(identity_dir, ["rev-parse", "tightbeam/live"]) == live
+
+    assert handler.(call) == denial
+    assert git!(identity_dir, ["rev-parse", "main"]) == main
+  end
+
+  test "pending replay denies an unrelated live ref and denial remains immutable", ctx do
+    handler = Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-edit"]
+    invocation = "identity-pending-conflict"
+    identity_dir = Path.join(ctx.base_dir, "identity")
+    candidate = Identity.edit!(ctx.base_dir, "default", :guidance, "candidate\n", "user:flynn")
+
+    assert {:ok, %{state: "pending"}} =
+             AdminProjection.begin_identity_publication(
+               ctx.db,
+               invocation,
+               candidate,
+               "user:flynn"
+             )
+
+    divergent =
+      git!(identity_dir, [
+        "-c",
+        "user.name=projection-test",
+        "-c",
+        "user.email=projection@test.invalid",
+        "commit-tree",
+        "#{candidate.expected_prior}^{tree}",
+        "-m",
+        "unrelated publication"
+      ])
+
+    git!(identity_dir, [
+      "update-ref",
+      "refs/heads/tightbeam/live",
+      divergent,
+      candidate.expected_prior
+    ])
+
+    call =
+      firehose_call("identity-edit", %{archetype: "default", content: "ignored"})
+      |> Map.put(:invocation_id, invocation)
+
+    expected = candidate.expected_prior
+
+    assert %{
+             code: "identity_publication_conflict",
+             expected: ^expected,
+             actual: ^divergent
+           } = denial = handler.(call)
+
+    assert %{
+             state: "denied",
+             cause: "identity_publication_conflict",
+             denial_code: "identity_publication_conflict",
+             denial_message: nil,
+             denial_expected: ^expected,
+             denial_actual: ^divergent
+           } =
+             AdminProjection.identity_publication_marker(
+               ctx.db,
+               invocation,
+               candidate.expected_prior
+             )
+
+    assert handler.(call) == denial
+    assert git!(identity_dir, ["rev-parse", "tightbeam/live"]) == divergent
+  end
+
+  test "identity status reports each render-stamp stale reason", ctx do
+    live = Identity.live_revision!(ctx.base_dir)
+    expected = Identity.snapshot_at!(ctx.base_dir, live, "default", :codex)
+
+    for {key, stamp} <- [
+          {"legacy-render", nil},
+          {"revision-render",
+           {"old-revision", expected.render_contract, expected.guidance_digest}},
+          {"contract-render", {live, "older-contract", expected.guidance_digest}},
+          {"digest-render", {live, expected.render_contract, String.duplicate("0", 64)}}
+        ] do
+      Org.create(ctx.db, %{
+        session_key: key,
+        display_name: key,
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        identity_name: "default",
+        identity_revision: live,
+        host: "local",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+      if stamp do
+        {revision, contract, digest} = stamp
+        Org.set_identity_stamp(ctx.db, key, revision, contract, digest)
+      end
+    end
+
+    result =
+      Tightbeam.Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir})["identity-status"].(
+        firehose_call("identity-status", %{})
+      )
+
+    sessions = Map.new(result.sessions, &{&1.session_key, &1.identity_stale_reasons})
+    assert sessions["legacy-render"] == ["missing_render_stamp"]
+    assert sessions["revision-render"] == ["revision_mismatch"]
+    assert sessions["contract-render"] == ["contract_mismatch"]
+    assert sessions["digest-render"] == ["guidance_digest_mismatch"]
   end
 
   test "fresh queries and buffered notices converge by primary key and rowVersion", ctx do
@@ -1302,7 +1505,8 @@ defmodule Tightbeam.AdminProjectionTest do
          StateResources.kungfu(StateResources.query_kungfu(ctx.db, "rebuild-demo"))}
       ]
       |> Map.new(fn {resource, key, item} ->
-        {{resource, key}, {item["rowVersion"], StateResources.encode_admin_item(resource, item)}}
+        {{resource, key},
+         {item["rowVersion"], StateResources.encode_item(resource, item, ctx.catalog)}}
       end)
 
     buffered =
@@ -1312,7 +1516,9 @@ defmodule Tightbeam.AdminProjectionTest do
         resource = notice["resource"]
         item = notice["payload"]
         key = notice_primary_key(notice)
-        candidate = {item["rowVersion"], StateResources.encode_admin_item(resource, item)}
+
+        candidate =
+          {item["rowVersion"], StateResources.encode_item(resource, item, ctx.catalog)}
 
         Map.update(model, {resource, key}, candidate, fn {version, _bytes} = current ->
           if item["rowVersion"] > version, do: candidate, else: current
@@ -1449,7 +1655,7 @@ defmodule Tightbeam.AdminProjectionTest do
 
     raw_item = Map.put(item, "rowVersion", 1)
     shared_item = StateResources.kungfu(raw_item)
-    shared_bytes = StateResources.encode_admin_item("kungfu", shared_item)
+    shared_bytes = StateResources.encode_item("kungfu", shared_item)
 
     notice =
       Publisher.committed_notice("kungfu.updated", raw_item, %{

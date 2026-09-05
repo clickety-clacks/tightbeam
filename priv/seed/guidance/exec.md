@@ -84,6 +84,6 @@ Dissolution is rebind-then-revoke, and the rebind may land before your
 card is revoked. The tell is in rows: your role no longer resolves to
 you while your delegation card still stands. That state has one meaning
 — the office is ending — and one lawful response: stop delivering, file
-surrender on your card, and let the dissolver's revoke finish the
+cannot-proceed on your card, and let the dissolver's revoke finish the
 sequence. Do not race the new desk; a duplicated digest costs your
 principal an interruption, and standing down is the cheaper turn.

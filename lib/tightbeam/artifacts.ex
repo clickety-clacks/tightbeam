@@ -93,7 +93,6 @@ defmodule Tightbeam.Artifacts do
       {{:session, session_key}, session_key, work_item_id}
       when is_binary(session_key) and is_binary(work_item_id) ->
         artifact_id = "art_" <> (:crypto.strong_rand_bytes(4) |> Base.encode16(case: :lower))
-        parent_session = parent_session(db, session_key)
         {recorded_message_id, evidence} = turn_evidence(db, session_key)
         digest_source = digest_source(db, config, session_key, call.params.origin_path)
         digest = content_digest(digest_source, call.params[:content_sha256])
@@ -104,6 +103,9 @@ defmodule Tightbeam.Artifacts do
             case DB.transaction(db, fn txn ->
                    case IdPrefix.resolve_in_txn(txn, :work_item, work_item_id) do
                      {:ok, canonical_id} ->
+                       parent_session =
+                         Org.effective_parent_in_txn(txn, session_key).session_key
+
                        Txn.q(
                          txn,
                          """
@@ -268,6 +270,15 @@ defmodule Tightbeam.Artifacts do
     case DB.query(db, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [artifact_id]) do
       {:ok, [row]} -> artifact(row)
       {:ok, []} -> nil
+    end
+  end
+
+  @doc false
+  @spec get_in_txn(Txn.t(), String.t() | nil) :: map() | nil
+  def get_in_txn(%Txn{} = txn, artifact_id) do
+    case Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [artifact_id]) do
+      [row] -> artifact(row)
+      [] -> nil
     end
   end
 
@@ -571,15 +582,6 @@ defmodule Tightbeam.Artifacts do
 
       {:error, _reason} ->
         raise ArgumentError, "artifact origin is missing from its session workspace"
-    end
-  end
-
-  defp parent_session(db, session_key) do
-    case DB.query(db, "SELECT operationalParent FROM sessions WHERE sessionKey = ?1", [
-           session_key
-         ]) do
-      {:ok, [[parent]]} -> parent
-      {:ok, []} -> nil
     end
   end
 

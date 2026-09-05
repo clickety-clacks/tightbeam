@@ -16,10 +16,10 @@ A complete bundle ships:
 4. **`kungfu/<name>/capabilities.md`** — the capability matrix: what adopting this
    bundle gives an org + conversation watch-fors per capability (readable without
    election; the general agent offers capabilities from it).
-5. **`kungfu/<name>/preferred-models.md`** — the ACTIVITY table: each activity the
-   bundle's roles perform -> what it demands -> capsule+effort from the org's working
-   set -> ladder -> floor. Capsules themselves live in the substrate's
-   guidance/preferred-models.md; archetype preferences derive from these rows.
+5. **`kungfu/<name>/preferred-models.md`** — the model catalog and ACTIVITY table:
+   each capsule's characterization plus each activity the bundle's roles perform -> what
+   it demands -> capsule+effort -> ladder -> floor. Keep every model selection and
+   ring-down in this document; archetype guidance may only point to it.
 6. **`kungfu/<name>/intake.md`** — the operational questions only the operator can
    answer, each naming where its answer lands (preferred-models rows, producer
    commands, workspace roots, stances). Learning the bundle = install + walking the
@@ -29,13 +29,13 @@ A complete bundle ships:
    things nobody can see by looking at the folder.
    - **purpose** — what capability adopting this bundle gives an org, in plain language
      a user would recognize from describing their own work. Not an inventory of the
-     bundle's parts: "turn product ideas and bug reports into shipped software, with
-     tracked work, independent review, and verification" is a purpose; "7 archetypes,
+     bundle's parts: "turn field observations and instrument readings into validated
+     findings, with tracked work, independent review, and verification" is a purpose; "7 archetypes,
      13 guidance fragments" is a contents listing. The general agent matches a user's
      stated goal against this, so write it the way a user would say it.
    - **phrases** — short, natural things a USER would say that mean this bundle would
      help. Written from their side, describing the problem or the wish, never our
-     feature names. THEY MUST DISCRIMINATE: if a bundle from a different domain could
+     capability names. THEY MUST DISCRIMINATE: if a bundle from a different domain could
      honestly claim the same phrase, it is too generic and buys nothing. "I keep losing
      track of what I asked for" fits every bundle ever written; "I want my code reviewed
      before it merges" could only be this one. Test each phrase by asking whether a

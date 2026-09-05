@@ -29,7 +29,7 @@ defmodule Tightbeam.RailRemedyTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1)"
       )
 
     ensure_main_session(db, "flynn")
@@ -171,7 +171,11 @@ defmodule Tightbeam.RailRemedyTest do
     assert {:error, %{producer: ^review_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, first)
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE COALESCE(consumer, '') != 'effort_probe'"
+             )
 
     assert %{rewake_count: 0} =
              RailRemedy.episode(ctx.db, "completion-needs-review", assignment.id)
@@ -191,7 +195,11 @@ defmodule Tightbeam.RailRemedyTest do
                [assignment.id]
              )
 
-    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM wakes")
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE COALESCE(consumer, '') != 'effort_probe'"
+             )
 
     assert {:ok, [[1]]} =
              DB.query(
@@ -1342,7 +1350,7 @@ defmodule Tightbeam.RailRemedyTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{assignment_id: assignment_id}
+      params: %{assignment_id: assignment_id, reason: "test revocation"}
     })
   end
 

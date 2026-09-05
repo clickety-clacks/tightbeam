@@ -52,7 +52,7 @@ defmodule Tightbeam.TranscriptTest do
     :ok =
       DB.execute(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn',0,1),('kay',0,1),('root',1,1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1),('kay', 0, 'admin_add', 1),('root', 1, 'admin_add', 1)"
       )
 
     Enum.each(~w(flynn kay root), &ensure_main_session(db, &1))
@@ -60,7 +60,12 @@ defmodule Tightbeam.TranscriptTest do
     owned = session!(db, "owned", "flynn", "Coder Session")
     foreign = session!(db, "foreign", "kay", "Kay Session")
 
-    %{db: db, owned: owned, foreign: foreign}
+    base_dir =
+      Path.join(System.tmp_dir!(), "tightbeam-transcript-#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+
+    %{db: db, owned: owned, foreign: foreign, base_dir: base_dir}
   end
 
   ## Proof 1 — tail default
@@ -750,7 +755,7 @@ defmodule Tightbeam.TranscriptTest do
   defp router_opts(ctx) do
     [
       db: ctx.db,
-      base_dir: System.tmp_dir!(),
+      base_dir: ctx.base_dir,
       handlers: %{"transcript" => fn call -> Transcript.read(ctx.db, call) end},
       cli_token: "tbc_transcript",
       session_status: fn _ -> nil end

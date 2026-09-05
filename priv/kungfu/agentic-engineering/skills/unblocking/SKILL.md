@@ -15,16 +15,20 @@ missing.
 1. **Detect stalls.** Sweep your own obligations with
    `tightbeam assignments --role <your-role>`, and the assignments you opened for your
    agents by their recorded ids with `tightbeam attests <assignmentId>`. An assignment
-   with no new fact since your last sweep and no answer to a wake is a stall — and an
-   escalation wake from the substrate's patrol means it noticed before you did. On
+   with no new fact since your last sweep and no answer to a wake is a stall. Judge that
+   from the deliverable, not from whether a receipt exists: a receipt naming what moved
+   is evidence of life, a receipt reporting only effort is not. On
    every sweep, each active goal is fed or shot — advanced, or retired with a reason;
    nothing sits half-alive.
-2. **Classify the block.** Read the surrender or the last progress attest and decide
+2. **Classify the block.** Read the cannot-proceed or last progress attest and decide
    which kind it is:
    - **Wrong assumption** — the agent believes something false about the code, the
      spec, or the environment. Correct it with evidence and wake the agent.
    - **Unneeded gate** — the agent waits for permission or input the work does not
-     require. Name the authority it already holds and wake it.
+     require. Name the authority it already holds and wake it. A review holding work
+     for a facet the ask ships without is this class, and it reaches you as the
+     producer's contest rather than as your own audit (orchestrator kernel,
+     "Verifying without redoing").
    - **Refused workaround** — a viable path that breaks no rule exists and the agent
      has not taken it. State the path and wake the agent to take it.
    - **Real block** — the work cannot proceed without a decision that belongs to the

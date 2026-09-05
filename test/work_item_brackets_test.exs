@@ -74,7 +74,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1), ('dana', 0, 1), ('eve', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1), ('dana', 0, 'admin_add', 1), ('eve', 0, 'admin_add', 1)"
       )
 
     # Owners are always users; bracket wakes target the owner's personal session.
@@ -358,11 +358,11 @@ defmodule Tightbeam.WorkItemBracketsTest do
     assert is_binary(slate2)
     assert slate2 != slate
 
-    # Surrender path.
-    surrender_item = create(ctx, {:user, "flynn"}, %{title: "Surrendered"})
-    {:ok, sa} = disp_assign(ctx, {:user, "flynn"}, "holder", "sw", surrender_item.id)
-    surrender(ctx, "holder", sa.id)
-    assert is_binary(slate_wake_id(ctx.db, surrender_item.id))
+    # cannot-proceed keeps the assignment open, so it must not arm a slate wake.
+    blocked_item = create(ctx, {:user, "flynn"}, %{title: "Blocked"})
+    {:ok, blocked} = disp_assign(ctx, {:user, "flynn"}, "holder", "blocked", blocked_item.id)
+    cannot_proceed(ctx, "holder", blocked.id)
+    assert slate_wake_id(ctx.db, blocked_item.id) == nil
 
     # Revoke path.
     revoke_item = create(ctx, {:user, "flynn"}, %{title: "Revoked"})
@@ -795,8 +795,77 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   defp dispose(ctx, verb, principal, id, extra \\ %{}) do
+    extra =
+      if verb == "work-item-close" and not Map.has_key?(extra, :completion_attest_id) do
+        Map.put(extra, :completion_attest_id, completion_fixture!(ctx.db, id))
+      else
+        extra
+      end
+
     params = Map.put(extra, :work_item_id, id)
     ctx.handlers[verb].(work_item_call(verb, principal, params))
+  end
+
+  defp completion_fixture!(db, work_item_id) do
+    {:ok, attest_id} =
+      DB.transaction(db, fn txn ->
+        case Txn.q(
+               txn,
+               "SELECT completionAttestId FROM work_item_closures WHERE workItemId=?1",
+               [work_item_id]
+             ) do
+          [[attest_id]] ->
+            attest_id
+
+          [] ->
+            suffix = Tightbeam.Id.uuid4()
+            assignment_id = "asg_" <> suffix
+            attest_id = "att_" <> suffix
+            ts = System.system_time(:millisecond)
+
+            Txn.q(
+              txn,
+              "INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES (?1,'terminal close fixture','holder','flynn',?2,'open',?3)",
+              [assignment_id, ts, work_item_id]
+            )
+
+            :ok =
+              Tightbeam.DeliverableContract.bind_assignment_in_txn(
+                txn,
+                %{
+                  id: assignment_id,
+                  subject: "terminal close fixture",
+                  holderKey: "holder",
+                  openedAt: ts,
+                  workItemId: work_item_id
+                },
+                true
+              )
+
+            Txn.q(
+              txn,
+              "INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES (?1,?2,'completion','holder',?3)",
+              [attest_id, assignment_id, ts]
+            )
+
+            Txn.q(
+              txn,
+              "UPDATE assignments SET state='closed',outcome='completed',closedAt=?2,closedBySession='holder',closingAttestId=?3 WHERE id=?1",
+              [assignment_id, ts, attest_id]
+            )
+
+            :ok =
+              Tightbeam.DeliverableContract.record_completion_claim_in_txn(
+                txn,
+                assignment_id,
+                %{id: attest_id, ts: ts}
+              )
+
+            attest_id
+        end
+      end)
+
+    attest_id
   end
 
   defp get(ctx, id),
@@ -869,7 +938,20 @@ defmodule Tightbeam.WorkItemBracketsTest do
   end
 
   defp complete(ctx, holder, assignment_id), do: attest(ctx, holder, assignment_id, "completion")
-  defp surrender(ctx, holder, assignment_id), do: attest(ctx, holder, assignment_id, "surrender")
+
+  defp cannot_proceed(ctx, holder, assignment_id) do
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:#{holder}",
+      principal: {:session, holder},
+      session_key: nil,
+      params: %{
+        assignment_id: assignment_id,
+        kind: "cannot-proceed",
+        note: "needs its opener"
+      }
+    })
+  end
 
   defp attest(ctx, holder, assignment_id, kind) do
     Assignments.__handle__(ctx.db, "attest", %{
@@ -887,7 +969,7 @@ defmodule Tightbeam.WorkItemBracketsTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{assignment_id: assignment_id}
+      params: %{assignment_id: assignment_id, reason: "test revocation"}
     })
   end
 

@@ -187,7 +187,7 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
+        INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
         INSERT INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness,
@@ -254,12 +254,25 @@ defmodule Tightbeam.WakesTest do
       DB.query(
         db,
         """
+        INSERT INTO turns
+          (sessionKey,messageId,origin,prompt,assignmentId,status,createdAt,endedAt)
+        VALUES
+          ('retiring','root-retarget','user:flynn','root','asg_retarget','delivered',1,2)
+        """
+      )
+
+    assert {:ok, [[root_turn_seq]]} = DB.query(db, "SELECT last_insert_rowid()")
+
+    {:ok, _} =
+      DB.query(
+        db,
+        """
         INSERT INTO supervision_liveness_sidecar
           (wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-           chargedGeneration)
-        VALUES (?1, 'asg_retarget', 'scheduled', 'escalation', 'pending', 2)
+           chargedGeneration, rootTurnSeq)
+        VALUES (?1, 'asg_retarget', 'scheduled', 'escalation', 'pending', 2, ?2)
         """,
-        [original.wake_id]
+        [original.wake_id, root_turn_seq]
       )
 
     assert {:ok, replacement} =
@@ -316,14 +329,16 @@ defmodule Tightbeam.WakesTest do
     assert {:ok, sidecars} =
              DB.query(
                db,
-               "SELECT wakeId, controllerState, chargedGeneration FROM supervision_liveness_sidecar"
+               "SELECT wakeId, controllerState, chargedGeneration, rootTurnSeq FROM supervision_liveness_sidecar"
              )
 
     states =
-      Map.new(sidecars, fn [wake_id, state, generation] -> {wake_id, {state, generation}} end)
+      Map.new(sidecars, fn [wake_id, state, generation, root] ->
+        {wake_id, {state, generation, root}}
+      end)
 
-    assert states[original.wake_id] == {"settled", 2}
-    assert states[replacement.wake_id] == {"pending", 2}
+    assert states[original.wake_id] == {"settled", 2, root_turn_seq}
+    assert states[replacement.wake_id] == {"pending", 2, root_turn_seq}
   end
 
   test "O1: retarget carries the sender's class election AND the original ceiling verbatim — never restarts it",
@@ -342,7 +357,7 @@ defmodule Tightbeam.WakesTest do
 
     assert original.class == "fyi"
     assert original.class_election == "sender"
-    assert original.delivery_rule == Wakes.digest_rule()
+    assert original.delivery_rule == "turn-boundary-digest r1"
     refute original.digest
     refute original.summon
 
@@ -385,7 +400,7 @@ defmodule Tightbeam.WakesTest do
     # handled dynamically, by grouping on the row's new `sessionKey` at the
     # next materialization pass — nothing here needs to move `dueAt` for
     # that to be true.
-    assert replacement.delivery_rule == Wakes.digest_rule()
+    assert replacement.delivery_rule == original.delivery_rule
     assert replacement.due_at == original_due_at
     assert replacement.due_at == original.due_at
     refute replacement.due_at == replacement.created_at + ceiling
@@ -465,7 +480,7 @@ defmodule Tightbeam.WakesTest do
       DB.execute(
         db,
         """
-        INSERT OR IGNORE INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1);
+        INSERT OR IGNORE INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1);
         INSERT OR IGNORE INTO sessions
           (sessionKey, displayName, kind, isBuiltIn, ownerUserId, origin,
            operationalParent, archetype, harness, provider, model, host, state,

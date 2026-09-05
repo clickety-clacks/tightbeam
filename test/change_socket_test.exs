@@ -1,7 +1,7 @@
 defmodule Tightbeam.Wire.ChangeSocketTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Devices, Gateway}
+  alias Tightbeam.{DB, Gateway}
   alias Tightbeam.Firehose.{Hub, Registry}
   alias Tightbeam.Wire.ChangeSocket
 
@@ -13,7 +13,7 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
     :ok = Tightbeam.Schema.ensure_all(db)
 
     {:paired, device} =
-      Devices.pair(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
+      claim_org(db, %{device_id: "d1", claimed_name: "Flynn", platform: nil, model: nil})
 
     {:ok, state} =
       ChangeSocket.init(%{db: db, firehose_hub: hub, firehose_heartbeat_ms: 60_000})
@@ -212,7 +212,12 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
            end)
 
     assert Enum.all?(Registry.observational_classes(), &match?(:error, Registry.fetch(&1)))
-    assert Enum.sort(Map.keys(rows) ++ Registry.observational_classes()) == Registry.classes()
+
+    assert Enum.sort(
+             Map.keys(rows) ++
+               Map.keys(Registry.invalidation_rows()) ++ Registry.observational_classes()
+           ) == Registry.classes()
+
     assert Map.keys(handlers) |> Enum.sort() == Map.keys(handler_effects) |> Enum.sort()
     assert_registry_match!(handler_effects, rows)
 

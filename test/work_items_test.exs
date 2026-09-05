@@ -25,7 +25,7 @@ defmodule Tightbeam.WorkItemsTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1), ('other', 0, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 0, 'admin_add', 1), ('other', 0, 'admin_add', 1)"
       )
 
     Enum.each(~w(flynn other), &ensure_main_session(db, &1))
@@ -94,6 +94,28 @@ defmodule Tightbeam.WorkItemsTest do
     assert Enum.any?(assignment_fks, fn [_id, _seq, table, from, to | _] ->
              table == "work_items" and from == "workItemId" and to == "id"
            end)
+
+    assert {:ok, priority_columns} = DB.query(db, "PRAGMA table_info(work_item_priorities)")
+
+    assert Enum.map(priority_columns, fn [_cid, name | _] -> name end) == [
+             "workItemId",
+             "priority"
+           ]
+
+    assert {:ok, version_columns} = DB.query(db, "PRAGMA table_info(work_item_versions)")
+
+    assert Enum.map(version_columns, fn [_cid, name | _] -> name end) == [
+             "workItemId",
+             "rowVersion"
+           ]
+
+    assert {:ok, assignment_priority_columns} =
+             DB.query(db, "PRAGMA table_info(assignment_priorities)")
+
+    assert Enum.map(assignment_priority_columns, fn [_cid, name | _] -> name end) == [
+             "assignmentId",
+             "priority"
+           ]
   end
 
   test "create validates every field and records session or user creator", ctx do
@@ -140,6 +162,16 @@ defmodule Tightbeam.WorkItemsTest do
     assert session.specRefName == "spec.md"
     assert session.specRefSha256 == @sha
     assert session.isBug
+
+    assert user.priority == 4
+
+    explicit = create(ctx, {:user, "flynn"}, %{title: "Urgent", priority: 7})
+    assert explicit.priority == 7
+
+    for invalid <- [-1, 9, "4"] do
+      assert %{code: "invalid_priority"} =
+               create(ctx, {:user, "flynn"}, %{title: "Invalid priority", priority: invalid})
+    end
   end
 
   test "Proof 1: an item created during a running turn carries that seq with known = 1; created with no running turn carries NULL with known = 1",
@@ -227,6 +259,28 @@ defmodule Tightbeam.WorkItemsTest do
     assert titled.specRefSha256 == @sha2
     assert update(ctx, {:user, "flynn"}, pinned.id, %{title: "Retitled"}) == titled
 
+    reprioritized = update(ctx, {:user, "flynn"}, pinned.id, %{priority: 6})
+    assert reprioritized.priority == 6
+
+    inherited = assign(ctx, "holder", "priority inheritance", pinned.id)
+    assert inherited.priority == 6
+
+    assert %{code: "invalid_priority"} =
+             update(ctx, {:user, "flynn"}, pinned.id, %{priority: 10})
+
+    combined =
+      update(ctx, {:user, "flynn"}, pinned.id, %{
+        title: "Combined",
+        spec_ref_name: "combined.md",
+        spec_ref_sha256: @sha,
+        priority: 3
+      })
+
+    assert combined.title == "Combined"
+    assert combined.specRefName == "combined.md"
+    assert combined.specRefSha256 == @sha
+    assert combined.priority == 3
+
     assert %{code: "invalid_spec_ref"} =
              update(ctx, {:user, "flynn"}, pinned.id, %{
                spec_ref_name: nil,
@@ -257,6 +311,50 @@ defmodule Tightbeam.WorkItemsTest do
              "Retitled again"
 
     refute_received :work_item_change
+  end
+
+  test "gateway serializes concurrent full re-pins without a torn governing-spec pair", ctx do
+    item =
+      create(ctx, {:user, "flynn"}, %{
+        title: "Concurrent current-spec pin",
+        spec_ref_name: "initial.md",
+        spec_ref_sha256: @sha
+      })
+
+    parent = self()
+
+    tasks =
+      for {name, sha} <- [{"first.md", @sha}, {"second.md", @sha2}] do
+        Task.async(fn ->
+          send(parent, {:update_ready, self()})
+
+          receive do
+            :apply_update ->
+              ctx.handlers["work-item-update"].(
+                update_call({:user, "flynn"}, item.id, %{
+                  spec_ref_name: name,
+                  spec_ref_sha256: sha
+                })
+              )
+          end
+        end)
+      end
+
+    task_pids =
+      for _ <- tasks do
+        assert_receive {:update_ready, pid}
+        pid
+      end
+
+    Enum.each(task_pids, &send(&1, :apply_update))
+    results = Task.await_many(tasks)
+
+    expected = MapSet.new([{"first.md", @sha}, {"second.md", @sha2}])
+    returned = MapSet.new(results, &{&1.specRefName, &1.specRefSha256})
+    assert returned == expected
+
+    current = get(ctx, {:user, "flynn"}, item.id).workItem
+    assert MapSet.member?(expected, {current.specRefName, current.specRefSha256})
   end
 
   test "get and list return deterministic eras, aspects, and ordering", ctx do
@@ -417,7 +515,9 @@ defmodule Tightbeam.WorkItemsTest do
     Assignments.__handle__(ctx.db, "assign", assignment_call)
   end
 
-  defp revoke_call(id), do: call("revoke-assignment", {:user, "flynn"}, %{assignment_id: id})
+  defp revoke_call(id),
+    do:
+      call("revoke-assignment", {:user, "flynn"}, %{assignment_id: id, reason: "test revocation"})
 
   defp dispatch!(ctx, call) do
     assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)

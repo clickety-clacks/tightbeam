@@ -4,8 +4,9 @@ defmodule Tightbeam.Org do
   and append-only harness-session pointer chains.
   """
 
-  alias Tightbeam.{AdminProjection, DB, Supervision, Wakes}
+  alias Tightbeam.{AdminProjection, DB, EventLog, NoticeBatcher, Supervision, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Model
 
   @type db :: GenServer.server()
@@ -26,12 +27,16 @@ defmodule Tightbeam.Org do
           owner_user_id: String.t(),
           origin: String.t(),
           spawned_by: String.t() | nil,
-          operational_parent: String.t(),
+          operational_parent: String.t() | nil,
+          effective_parent: String.t(),
+          effective_parent_source: :explicit | :owner_main,
           handle: String.t() | nil,
           archetype: String.t(),
           overrides: map() | nil,
           identity_name: String.t(),
           identity_revision: String.t() | nil,
+          identity_render_contract: String.t() | nil,
+          identity_guidance_digest: String.t() | nil,
           cli_token: String.t() | nil,
           harness: String.t(),
           provider: String.t(),
@@ -39,6 +44,7 @@ defmodule Tightbeam.Org do
           host: String.t(),
           cleared_through_seq: integer(),
           state: String.t(),
+          mechanical_status: String.t(),
           created_at: integer(),
           updated_at: integer()
         }
@@ -71,12 +77,14 @@ defmodule Tightbeam.Org do
     ownerUserId   TEXT NOT NULL,
     origin        TEXT NOT NULL,
     spawnedBy     TEXT,
-    operationalParent TEXT NOT NULL REFERENCES sessions(sessionKey),
+    operationalParent TEXT REFERENCES sessions(sessionKey),
     handle        TEXT UNIQUE,
     archetype     TEXT NOT NULL,
     overrides     TEXT,
     identityName  TEXT,
     identityRevision TEXT,
+    identityRenderContract TEXT,
+    identityGuidanceDigest TEXT,
     cliToken      TEXT,
     harness       TEXT NOT NULL CHECK (harness IN (__TIGHTBEAM_HARNESSES__)),
     provider      TEXT NOT NULL CHECK (provider IN (__TIGHTBEAM_PROVIDERS__)),
@@ -86,6 +94,8 @@ defmodule Tightbeam.Org do
     host          TEXT NOT NULL DEFAULT 'local',
     clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
     state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+    mechanicalStatus TEXT NOT NULL DEFAULT 'idle'
+                     CHECK (mechanicalStatus IN ('idle','running')),
     createdAt     INTEGER NOT NULL,
     updatedAt     INTEGER NOT NULL
   );
@@ -200,10 +210,15 @@ defmodule Tightbeam.Org do
     harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
 
     replacement_ddl =
-      @sessions_ddl
+      legacy_sessions_ddl()
       |> String.replace(
         "CREATE TABLE IF NOT EXISTS sessions",
         "CREATE TABLE sessions_operational_parent_v1",
+        global: false
+      )
+      |> String.replace(
+        "operationalParent TEXT REFERENCES",
+        "operationalParent TEXT NOT NULL REFERENCES",
         global: false
       )
       |> String.replace("__TIGHTBEAM_HARNESSES__", harnesses)
@@ -277,6 +292,75 @@ defmodule Tightbeam.Org do
     end
   end
 
+  @doc false
+  @spec migrate_nullable_effective_parent_in_txn(Txn.t(), keyword()) :: :ok
+  def migrate_nullable_effective_parent_in_txn(txn, opts \\ [])
+
+  def migrate_nullable_effective_parent_in_txn(%Txn{} = txn, opts) when is_list(opts) do
+    case Txn.q(txn, "SELECT type FROM sqlite_master WHERE name='sessions_effective_parent_v1'") do
+      [] -> :ok
+      _ -> raise "incompatible_nullable_effective_parent_v1: migration object already exists"
+    end
+
+    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+
+    replacement_ddl =
+      legacy_sessions_ddl()
+      |> String.replace(
+        "CREATE TABLE IF NOT EXISTS sessions",
+        "CREATE TABLE sessions_effective_parent_v1",
+        global: false
+      )
+      |> String.replace("__TIGHTBEAM_HARNESSES__", harnesses)
+      |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
+
+    :ok = Txn.exec(txn, replacement_ddl)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO sessions_effective_parent_v1
+        (sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+         ownerUserId, origin, spawnedBy, operationalParent, handle, archetype,
+         overrides, identityName, identityRevision, cliToken, harness, provider,
+         model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
+         createdAt, updatedAt)
+      SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+             ownerUserId, origin, spawnedBy, operationalParent, handle, archetype,
+             overrides, identityName, identityRevision, cliToken, harness, provider,
+             model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
+             createdAt, updatedAt
+      FROM sessions
+      ORDER BY createdAt, sessionKey
+      """
+    )
+
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_copy)
+    :ok = Txn.exec(txn, "DROP TABLE sessions")
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_drop)
+    :ok = Txn.exec(txn, "ALTER TABLE sessions_effective_parent_v1 RENAME TO sessions")
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_rename)
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise "incompatible_nullable_effective_parent_v1: foreign key check #{inspect(rows)}"
+    end
+  end
+
+  def migrate_nullable_effective_parent_in_txn(%Txn{}, _opts) do
+    raise ArgumentError, "nullable-effective-parent migration options must be a keyword list"
+  end
+
+  defp maybe_interrupt_nullable_effective_parent_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point,
+      do: raise("forced nullable-effective-parent migration interruption")
+
+    :ok
+  end
+
   @doc "Read an organization setting, or nil when it is unset."
   @spec get_setting(db(), String.t()) :: String.t() | nil
   def get_setting(db \\ Tightbeam.DB, key) do
@@ -327,6 +411,89 @@ defmodule Tightbeam.Org do
     %{changed: changed, projection: Tightbeam.StateResources.query_config(txn, key)}
   end
 
+  @doc false
+  @spec apply_notice_batching_lane_policy(
+          map(),
+          boolean(),
+          String.t(),
+          String.t(),
+          String.t(),
+          non_neg_integer()
+        ) :: map()
+  def apply_notice_batching_lane_policy(
+        recipient_lane,
+        enabled,
+        policy_ref,
+        selected_by,
+        cause,
+        at
+      ) do
+    transaction!(Tightbeam.DB, fn txn ->
+      apply_notice_batching_lane_policy_in_txn(
+        txn,
+        recipient_lane,
+        enabled,
+        policy_ref,
+        selected_by,
+        cause,
+        at
+      )
+    end)
+  end
+
+  @doc false
+  @spec apply_notice_batching_lane_policy_in_txn(
+          Txn.t(),
+          map(),
+          boolean(),
+          String.t(),
+          String.t(),
+          String.t(),
+          non_neg_integer()
+        ) :: map()
+  def apply_notice_batching_lane_policy_in_txn(
+        %Txn{} = txn,
+        recipient_lane,
+        enabled,
+        policy_ref,
+        selected_by,
+        cause,
+        at
+      ) do
+    policy =
+      NoticeBatcher.apply_lane_policy_in_txn(
+        txn,
+        recipient_lane,
+        enabled,
+        policy_ref,
+        selected_by,
+        cause,
+        at
+      )
+
+    projection_key = [policy.recipient_address, policy.visibility_scope]
+
+    row_version =
+      AdminProjection.allocate_in_txn(
+        txn,
+        "notice batching lane policies",
+        projection_key,
+        at,
+        item: JSON.encode!(policy)
+      )
+
+    EventLog.lifecycle_in_txn(
+      txn,
+      "notice_batching_lane_policy_applied",
+      policy_ref,
+      "recipientAddress=#{policy.recipient_address} visibilityScope=#{policy.visibility_scope} " <>
+        "enabled=#{enabled} revision=#{policy.policy_revision} selectedBy=#{selected_by} " <>
+        "cause=#{cause} selectedAt=#{at}"
+    )
+
+    Map.put(policy, :row_version, row_version)
+  end
+
   @doc """
   Create a session. Required: `:display_name`, `:owner_user_id`, `:origin`,
   `:archetype`, `:harness`, `:provider`, `:model`. `:session_key` defaults to
@@ -350,10 +517,7 @@ defmodule Tightbeam.Org do
     owner_user_id = Map.fetch!(input, :owner_user_id)
     spawned_by = Map.get(input, :spawned_by)
 
-    operational_parent =
-      if Map.get(input, :kind, "custom") == "main",
-        do: session_key,
-        else: spawned_by || personal_session_key(owner_user_id)
+    operational_parent = Map.get(input, :operational_parent)
 
     Txn.q(
       txn,
@@ -395,27 +559,57 @@ defmodule Tightbeam.Org do
     must_get(txn, session_key)
   end
 
+  @doc """
+  Read the source session in the caller's database transaction. If
+  operationalParent is non-null, return that exact key with source explicit.
+  Otherwise return canonical Main key derived from ownerUserId with source
+  owner_main. Do not read spawnedBy. Do not write.
+  """
+  @spec effective_parent_in_txn(Txn.t(), String.t()) :: %{
+          session_key: String.t(),
+          source: :explicit | :owner_main,
+          owner_user_id: String.t()
+        }
+  def effective_parent_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, "SELECT ownerUserId, operationalParent FROM sessions WHERE sessionKey=?1", [
+           session_key
+         ]) do
+      [[owner_user_id, nil]] ->
+        %{
+          session_key: personal_session_key(owner_user_id),
+          source: :owner_main,
+          owner_user_id: owner_user_id
+        }
+
+      [[owner_user_id, operational_parent]] ->
+        %{
+          session_key: operational_parent,
+          source: :explicit,
+          owner_user_id: owner_user_id
+        }
+
+      [] ->
+        raise ArgumentError, "unknown session: #{session_key}"
+    end
+  end
+
   @doc "Fetch an active session by its CLI token, or nil."
   @spec by_cli_token(db(), String.t()) :: session() | nil
   def by_cli_token(db \\ Tightbeam.DB, token) do
-    {:ok, rows} =
-      DB.query(db, select_session_sql() <> " WHERE cliToken = ?1 AND state = 'active'", [token])
-
-    case rows do
-      [row] -> to_session(row)
-      [] -> nil
-    end
+    transaction!(db, fn txn ->
+      case Txn.q(txn, select_session_sql() <> " WHERE cliToken = ?1 AND state = 'active'", [
+             token
+           ]) do
+        [row] -> to_effective_session(txn, row)
+        [] -> nil
+      end
+    end)
   end
 
   @doc "Fetch a session by key, or nil."
   @spec get(db(), String.t()) :: session() | nil
   def get(db \\ Tightbeam.DB, session_key) do
-    {:ok, rows} = DB.query(db, select_session_sql() <> " WHERE sessionKey = ?1", [session_key])
-
-    case rows do
-      [row] -> to_session(row)
-      [] -> nil
-    end
+    transaction!(db, fn txn -> get_in_txn(txn, session_key) end)
   end
 
   @doc """
@@ -429,7 +623,25 @@ defmodule Tightbeam.Org do
   @spec get_in_txn(Txn.t(), String.t()) :: session() | nil
   def get_in_txn(%Txn{} = txn, session_key) do
     case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
-      [row] -> to_session(row)
+      [row] -> to_effective_session(txn, row)
+      [] -> nil
+    end
+  end
+
+  @doc false
+  @spec owner_user_id_in_txn(Txn.t(), String.t() | nil) :: String.t() | nil
+  def owner_user_id_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
+      [[owner_user_id]] -> owner_user_id
+      [] -> nil
+    end
+  end
+
+  @doc false
+  @spec get_legacy_in_txn(Txn.t(), String.t()) :: session() | nil
+  def get_legacy_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, legacy_select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
+      [row] -> to_effective_session(txn, insert_legacy_mechanical_status(row))
       [] -> nil
     end
   end
@@ -449,17 +661,21 @@ defmodule Tightbeam.Org do
         {"ownerUserId = ?1 AND state = 'active'", [user_id], "orderIndex, createdAt"}
       end
 
-    {:ok, rows} =
-      DB.query(db, select_session_sql() <> " WHERE #{where} ORDER BY #{order}", params)
-
-    Enum.map(rows, &to_session/1)
+    transaction!(db, fn txn ->
+      txn
+      |> Txn.q(select_session_sql() <> " WHERE #{where} ORDER BY #{order}", params)
+      |> Enum.map(&to_effective_session(txn, &1))
+    end)
   end
 
   @doc "Every session, including retired rows, in deterministic creation order."
   @spec list_all(db()) :: [session()]
   def list_all(db \\ Tightbeam.DB) do
-    {:ok, rows} = DB.query(db, select_session_sql() <> " ORDER BY createdAt, sessionKey")
-    Enum.map(rows, &to_session/1)
+    transaction!(db, fn txn ->
+      txn
+      |> Txn.q(select_session_sql() <> " ORDER BY createdAt, sessionKey")
+      |> Enum.map(&to_effective_session(txn, &1))
+    end)
   end
 
   @doc "An active session carrying an effective identity name, or nil."
@@ -474,28 +690,28 @@ defmodule Tightbeam.Org do
   @doc "All active sessions carrying an effective identity name."
   @spec active_all_by_identity_name(db(), String.t()) :: [session()]
   def active_all_by_identity_name(db \\ Tightbeam.DB, identity_name) do
-    {:ok, rows} =
-      DB.query(
-        db,
+    transaction!(db, fn txn ->
+      txn
+      |> Txn.q(
         select_session_sql() <>
           " WHERE identityName = ?1 AND state = 'active' ORDER BY createdAt, sessionKey",
         [identity_name]
       )
-
-    Enum.map(rows, &to_session/1)
+      |> Enum.map(&to_effective_session(txn, &1))
+    end)
   end
 
   @doc "Every session carrying an identity name, including retired rows."
   @spec all_by_identity_name(db(), String.t()) :: [session()]
   def all_by_identity_name(db \\ Tightbeam.DB, identity_name) do
-    {:ok, rows} =
-      DB.query(
-        db,
+    transaction!(db, fn txn ->
+      txn
+      |> Txn.q(
         select_session_sql() <> " WHERE identityName = ?1 ORDER BY createdAt, sessionKey",
         [identity_name]
       )
-
-    Enum.map(rows, &to_session/1)
+      |> Enum.map(&to_effective_session(txn, &1))
+    end)
   end
 
   @doc "Whether any session row still references an effective identity name."
@@ -582,37 +798,70 @@ defmodule Tightbeam.Org do
         {expected_model, expected_harness},
         {%Model{} = model, harness, provider}
       ) do
-    current = must_get(txn, session_key)
+    swap_model_in_txn(
+      txn,
+      session_key,
+      {expected_model, expected_harness},
+      {model, harness, provider},
+      []
+    )
+  end
 
-    if current.model == model and current.harness == harness do
+  @doc "Serialized model/harness change with optional same-commit session fields."
+  @spec swap_model_in_txn(
+          Txn.t(),
+          String.t(),
+          {Model.t() | nil, String.t()},
+          {Model.t(), String.t(), String.t()},
+          keyword()
+        ) :: {:ok, session()} | {:duplicate, session()} | :stale
+  def swap_model_in_txn(
+        %Txn{} = txn,
+        session_key,
+        {expected_model, expected_harness},
+        {%Model{} = model, harness, provider},
+        opts
+      ) do
+    current = must_get(txn, session_key)
+    cleared_through = Keyword.get(opts, :cleared_through, current.cleared_through_seq)
+
+    if current.model == model and current.harness == harness and
+         current.cleared_through_seq == cleared_through do
       {:duplicate, current}
     else
       expected = expected_model || %Model{family: nil}
 
-      Txn.q(
-        txn,
-        """
-        UPDATE sessions SET model=?4, thinkingLevel=?8, modelContext=?9, harness=?5,
-          provider=?6, updatedAt=?7
-        WHERE sessionKey=?1 AND model IS ?2 AND thinkingLevel IS ?10
-          AND modelContext IS ?11 AND harness=?3
-        """,
-        [
-          session_key,
-          expected.family,
-          expected_harness,
-          model.family,
-          harness,
-          provider,
-          now(),
-          model.effort,
-          model.context,
-          expected.effort,
-          expected.context
-        ]
-      )
+      mutate_session_in_txn(txn, session_key, fn ->
+        Txn.q(
+          txn,
+          """
+          UPDATE sessions SET model=?4, thinkingLevel=?7, modelContext=?8, harness=?5,
+            provider=?6, clearedThroughSeq=?11
+          WHERE sessionKey=?1 AND model IS ?2 AND thinkingLevel IS ?9
+            AND modelContext IS ?10 AND harness=?3
+          """,
+          [
+            session_key,
+            expected.family,
+            expected_harness,
+            model.family,
+            harness,
+            provider,
+            model.effort,
+            model.context,
+            expected.effort,
+            expected.context,
+            cleared_through
+          ]
+        )
 
-      if Txn.changes(txn) == 1, do: {:ok, must_get(txn, session_key)}, else: :stale
+        Txn.changes(txn)
+      end)
+      |> case do
+        {:changed, session, 1} -> {:ok, session}
+        {:unchanged, _session, 0} -> :stale
+        {:unchanged, session, 1} -> {:duplicate, session}
+      end
     end
   end
 
@@ -631,13 +880,7 @@ defmodule Tightbeam.Org do
   @doc "Transaction-owned host recorder for workspace-motion compositions."
   @spec set_host_in_txn(Txn.t(), String.t(), String.t()) :: session()
   def set_host_in_txn(%Txn{} = txn, session_key, host) do
-    Txn.q(
-      txn,
-      "UPDATE sessions SET host = ?2, updatedAt = ?3 WHERE sessionKey = ?1",
-      [session_key, host, now()]
-    )
-
-    must_get(txn, session_key)
+    update_in_txn(txn, session_key, "host = ?2", [host])
   end
 
   @doc "Change a session's operational parent without rewriting its spawn provenance."
@@ -682,6 +925,16 @@ defmodule Tightbeam.Org do
     update(db, session_key, "identityRevision = ?2", [revision])
   end
 
+  @doc "Stamp the complete immutable served render provisioned into a session."
+  def set_identity_stamp(db \\ Tightbeam.DB, session_key, revision, contract, digest) do
+    update(
+      db,
+      session_key,
+      "identityRevision = ?2, identityRenderContract = ?3, identityGuidanceDigest = ?4",
+      [revision, contract, digest]
+    )
+  end
+
   @doc """
   Record the history barrier: replay serves only messages with seq > this.
   Rows are never deleted — the chat's past remains in the store (and in any
@@ -694,17 +947,24 @@ defmodule Tightbeam.Org do
   end
 
   @doc false
-  @spec set_cleared_through_in_txn(Txn.t(), String.t(), integer()) :: session()
-  def set_cleared_through_in_txn(%Txn{} = txn, session_key, seq) do
-    must_get(txn, session_key)
+  @spec sync_mechanical_status_in_txn(Txn.t(), String.t()) :: session() | nil
+  def sync_mechanical_status_in_txn(%Txn{} = txn, session_key) do
+    case get_in_txn(txn, session_key) do
+      nil ->
+        nil
 
-    Txn.q(
-      txn,
-      "UPDATE sessions SET clearedThroughSeq = ?2, updatedAt = ?3 WHERE sessionKey = ?1",
-      [session_key, seq, now()]
-    )
+      _session ->
+        [[pending]] =
+          Txn.q(
+            txn,
+            "SELECT COUNT(*) FROM turns WHERE sessionKey = ?1 AND status IN ('queued','running')",
+            [session_key]
+          )
 
-    must_get(txn, session_key)
+        status = if pending == 0, do: "idle", else: "running"
+
+        update_in_txn(txn, session_key, "mechanicalStatus = ?2", [status])
+    end
   end
 
   @doc """
@@ -759,15 +1019,26 @@ defmodule Tightbeam.Org do
 
     Txn.q(
       txn,
-      "UPDATE sessions SET state = 'retired', updatedAt = ?2 WHERE sessionKey = ?1 AND state = 'active'",
-      [session_key, retirement_epoch]
+      """
+      UPDATE sessions
+      SET state = 'retired',
+          mechanicalStatus = CASE WHEN EXISTS (
+            SELECT 1 FROM turns
+            WHERE turns.sessionKey = sessions.sessionKey
+              AND turns.status IN ('queued','running')
+          ) THEN 'running' ELSE 'idle' END
+      WHERE sessionKey = ?1 AND state = 'active'
+      """,
+      [session_key]
     )
 
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
 
     cancel_retirement_wakes_in_txn(txn, session_key)
 
-    must_get(txn, session_key)
+    session = stamp_session_change_in_txn(txn, session_key, retirement_epoch)
+    publish_session_in_txn(txn, "session.retired", session)
+    session
   end
 
   defp cancel_retirement_wakes_in_txn(txn, session_key) do
@@ -775,11 +1046,14 @@ defmodule Tightbeam.Org do
       txn,
       """
       SELECT w.wakeId, w.sessionKey, w.targetRole, w.reresolve, w.reresolveSeed,
-             w.reresolveRung, w.work_item_id, w.assignmentId
+             w.reresolveRung, w.work_item_id, w.assignmentId, w.consumer
       FROM wakes w
       LEFT JOIN roles r ON r.name=w.targetRole
       WHERE w.state='pending' AND w.targetGate=1
         AND (w.sessionKey=?1 OR r.boundSessionKey=?1)
+        AND NOT EXISTS (
+          SELECT 1 FROM completion_escalation_wakes cew WHERE cew.wakeId=w.wakeId
+        )
       ORDER BY w.createdAt, w.wakeId
       """,
       [session_key]
@@ -800,7 +1074,8 @@ defmodule Tightbeam.Org do
            reresolve_seed,
            reresolve_rung,
            work_item_id,
-           assignment_id
+           assignment_id,
+           consumer
          ]
        ) do
     command =
@@ -820,13 +1095,26 @@ defmodule Tightbeam.Org do
           reresolve_seed,
           reresolve_rung,
           work_item_id,
-          assignment_id
+          assignment_id,
+          consumer
         )
       end
+
+    {after_cancellation, command} = Map.pop(command, :after_cancellation)
 
     if not Wakes.cancel_in_txn(txn, Map.put(command, :wake_id, wake_id)) do
       raise "typed retirement cancellation refused for #{wake_id}"
     end
+
+    if consumer == "effort_probe" do
+      Txn.q(
+        txn,
+        "UPDATE effort_checkin_generations SET state='canceled' WHERE wakeId=?1 AND state='armed'",
+        [wake_id]
+      )
+    end
+
+    finalize_retirement_replacement_in_txn!(txn, after_cancellation)
   end
 
   defp retirement_assignment_disposition?(_txn, nil, _session_key), do: false
@@ -873,7 +1161,8 @@ defmodule Tightbeam.Org do
          reresolve_seed,
          reresolve_rung,
          work_item_id,
-         assignment_id
+         assignment_id,
+         _consumer
        ) do
     outcome =
       case retirement_replacement_target_for_work(
@@ -894,19 +1183,69 @@ defmodule Tightbeam.Org do
         replacement_target ->
           case Wakes.retarget_in_txn(txn, wake_id, replacement_target) do
             %{wake_id: replacement_wake_id} ->
-              %{kind: "replacement", replacement_wake_id: replacement_wake_id}
+              after_cancellation =
+                case NoticeBatcher.preserve_retargeted_source_in_txn(
+                       txn,
+                       wake_id,
+                       replacement_wake_id
+                     ) do
+                  :not_batched ->
+                    nil
+
+                  %{member_id: _, batch_id: _} ->
+                    nil
+
+                  {:immutable_delivery, %{delivery_wake_id: delivery_wake_id}} ->
+                    {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+
+                  {:immutable_delivery_pending, %{batch_id: _batch_id}} ->
+                    nil
+
+                  {:error, refusal} ->
+                    raise "retirement replacement batching refused: #{inspect(refusal)}"
+                end
+
+              %{
+                kind: "replacement",
+                replacement_wake_id: replacement_wake_id,
+                after_cancellation: after_cancellation
+              }
 
             :error ->
               raise "retirement replacement refused for #{wake_id}"
           end
       end
 
+    {after_cancellation, outcome} = Map.pop(outcome, :after_cancellation)
+
     %{
       requester: %{kind: "process", id: "tightbeam:retirement"},
       reason_kind: "target_retired",
       causal_source: %{kind: "session_transition", id: session_key},
-      outcome: outcome
+      outcome: outcome,
+      after_cancellation: after_cancellation
     }
+  end
+
+  defp finalize_retirement_replacement_in_txn!(_txn, nil), do: :ok
+
+  defp finalize_retirement_replacement_in_txn!(
+         txn,
+         {:supersede_by_carrier, replacement_wake_id, delivery_wake_id}
+       ) do
+    command = %{
+      wake_id: replacement_wake_id,
+      requester: %{kind: "process", id: "tightbeam:batcher"},
+      reason_kind: "superseded",
+      causal_source: %{kind: "wake", id: delivery_wake_id},
+      outcome: %{kind: "replacement", replacement_wake_id: delivery_wake_id}
+    }
+
+    if Wakes.cancel_in_txn(txn, command) do
+      :ok
+    else
+      raise "retirement replacement carrier supersession refused for #{replacement_wake_id}"
+    end
   end
 
   defp retirement_replacement_target_for_work(
@@ -1064,18 +1403,27 @@ defmodule Tightbeam.Org do
 
         if session.state == "retired" or
              (allow_permanent? and (session.kind == "main" or session.is_built_in)) do
-          Txn.q(
-            txn,
-            """
-            UPDATE sessions
-            SET archetype = ?2, overrides = NULL, identityName = ?2,
-                identityRevision = NULL, updatedAt = ?3
-            WHERE sessionKey = ?1
-            """,
-            [session_key, archetype, now()]
-          )
+          result =
+            mutate_session_in_txn(txn, session_key, fn ->
+              Txn.q(
+                txn,
+                """
+                UPDATE sessions
+                SET archetype = ?2, overrides = NULL, identityName = ?2,
+                    identityRevision = NULL, identityRenderContract = NULL,
+                    identityGuidanceDigest = NULL
+                WHERE sessionKey = ?1
+                """,
+                [session_key, archetype]
+              )
 
-          {:ok, must_get(txn, session_key)}
+              Txn.changes(txn)
+            end)
+
+          case result do
+            {:changed, session, _changes} -> {:ok, session}
+            {:unchanged, session, _changes} -> {:ok, session}
+          end
         else
           {:error, :not_repointable}
         end
@@ -1087,19 +1435,36 @@ defmodule Tightbeam.Org do
 
   Each enumerated reference carries the supported command sequence that clears
   it. The enumeration and its remedies therefore cannot acquire separate case
-  lists. `release` runs inside the DB owner's transaction when no references
-  remain, fencing every session and setting writer behind the publication.
+  lists. `prepare` runs inside the DB owner's transaction when no references
+  remain. The transaction commits before `release` runs, and the DB owner keeps
+  every session and setting writer fenced until `release` returns.
   """
-  @spec release_archetypes(db(), [String.t()], (-> result)) ::
+  @spec release_archetypes(
+          db(),
+          [String.t()],
+          (Txn.t() -> prepared),
+          (prepared -> result)
+        ) ::
           {:referenced, [map()]} | {:released, result}
-        when result: term()
-  def release_archetypes(db \\ Tightbeam.DB, archetypes, release) when is_function(release, 0) do
-    transaction!(db, fn txn ->
-      case archetype_references_in_txn(txn, archetypes) do
-        [] -> {:released, release.()}
-        references -> {:referenced, references}
-      end
-    end)
+        when prepared: term(), result: term()
+  def release_archetypes(db \\ Tightbeam.DB, archetypes, prepare, release)
+      when is_function(prepare, 1) and is_function(release, 1) do
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             case archetype_references_in_txn(txn, archetypes) do
+               [] -> {:prepared, prepare.(txn)}
+               references -> {:referenced, references}
+             end
+           end,
+           fn
+             {:prepared, prepared} -> {:released, release.(prepared)}
+             {:referenced, references} -> {:referenced, references}
+           end
+         ) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
   end
 
   defp archetype_references_in_txn(txn, archetypes) do
@@ -1297,19 +1662,52 @@ defmodule Tightbeam.Org do
   end
 
   defp update_in_txn(txn, session_key, sets, values) do
-    must_get(txn, session_key)
+    mutate_session_in_txn(txn, session_key, fn ->
+      Txn.q(txn, "UPDATE sessions SET #{sets} WHERE sessionKey = ?1", [session_key | values])
+      Txn.changes(txn)
+    end)
+    |> then(fn {_outcome, session, _changes} -> session end)
+  end
 
-    params = [session_key | values] ++ [now()]
-    updated_at_index = length(params)
+  # Every public session change passes this seam. It compares the canonical
+  # item without its version, advances the durable per-session version once,
+  # and queues exactly one post-commit state notice. A duplicate write does
+  # none of those things.
+  defp mutate_session_in_txn(txn, session_key, mutation) do
+    before = must_get(txn, session_key)
+    result = mutation.()
+    after_mutation = must_get(txn, session_key)
 
-    Txn.q(
-      txn,
-      "UPDATE sessions SET #{sets}, updatedAt = ?#{updated_at_index} WHERE sessionKey = ?1",
-      params
-    )
+    if session_projection(before) == session_projection(after_mutation) do
+      {:unchanged, after_mutation, result}
+    else
+      session = stamp_session_change_in_txn(txn, session_key, now())
+      publish_session_in_txn(txn, "session.updated", session)
+      {:changed, session, result}
+    end
+  end
+
+  defp stamp_session_change_in_txn(txn, session_key, occurred_at) do
+    [[current]] =
+      Txn.q(txn, "SELECT updatedAt FROM sessions WHERE sessionKey = ?1", [session_key])
+
+    next_version = max(occurred_at, current + 1)
+
+    Txn.q(txn, "UPDATE sessions SET updatedAt = ?2 WHERE sessionKey = ?1", [
+      session_key,
+      next_version
+    ])
 
     must_get(txn, session_key)
   end
+
+  defp publish_session_in_txn(txn, class, session) do
+    Publisher.committed_in_txn(txn, class, session, %{
+      "sessionKey" => session.session_key
+    })
+  end
+
+  defp session_projection(session), do: Map.drop(session, [:updated_at, :cli_token])
 
   defp operational_cycle?(txn, current, target, visited) do
     cond do
@@ -1320,26 +1718,17 @@ defmodule Tightbeam.Org do
         raise ArgumentError, "existing operational parent cycle at #{current}"
 
       true ->
-        case Txn.q(
-               txn,
-               "SELECT kind, operationalParent FROM sessions WHERE sessionKey=?1",
-               [current]
-             ) do
-          [["main", ^current]] ->
-            false
+        parent = effective_parent_in_txn(txn, current).session_key
 
-          [[_kind, parent]] ->
-            operational_cycle?(txn, parent, target, MapSet.put(visited, current))
-
-          [] ->
-            raise ArgumentError, "unknown operational parent: #{current}"
-        end
+        if parent == current,
+          do: false,
+          else: operational_cycle?(txn, parent, target, MapSet.put(visited, current))
     end
   end
 
   defp must_get(txn, session_key) do
     case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
-      [row] -> to_session(row)
+      [row] -> to_effective_session(txn, row)
       [] -> raise ArgumentError, "unknown session: #{session_key}"
     end
   end
@@ -1348,11 +1737,25 @@ defmodule Tightbeam.Org do
     """
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, operationalParent, handle, archetype, overrides, identityName,
-           identityRevision, cliToken, harness, provider,
+           identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
+           model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
+           mechanicalStatus, createdAt, updatedAt
+    FROM sessions
+    """
+  end
+
+  defp legacy_select_session_sql do
+    """
+    SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+           ownerUserId, origin, spawnedBy, operationalParent, handle, archetype, overrides, identityName,
+           identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
            model, thinkingLevel, modelContext, host, clearedThroughSeq, state, createdAt, updatedAt
     FROM sessions
     """
   end
+
+  defp insert_legacy_mechanical_status(row),
+    do: List.insert_at(row, length(row) - 2, "idle")
 
   defp to_session([
          session_key,
@@ -1370,6 +1773,8 @@ defmodule Tightbeam.Org do
          overrides,
          identity_name,
          identity_revision,
+         identity_render_contract,
+         identity_guidance_digest,
          cli_token,
          harness,
          provider,
@@ -1379,6 +1784,7 @@ defmodule Tightbeam.Org do
          host,
          cleared_through_seq,
          state,
+         mechanical_status,
          created_at,
          updated_at
        ]) do
@@ -1398,6 +1804,8 @@ defmodule Tightbeam.Org do
       overrides: decode_overrides(overrides),
       identity_name: identity_name || archetype,
       identity_revision: identity_revision,
+      identity_render_contract: identity_render_contract,
+      identity_guidance_digest: identity_guidance_digest,
       cli_token: cli_token,
       harness: harness,
       provider: provider,
@@ -1405,9 +1813,19 @@ defmodule Tightbeam.Org do
       host: host,
       cleared_through_seq: cleared_through_seq,
       state: state,
+      mechanical_status: mechanical_status,
       created_at: created_at,
       updated_at: updated_at
     }
+  end
+
+  defp to_effective_session(txn, row) do
+    session = to_session(row)
+    effective = effective_parent_in_txn(txn, session.session_key)
+
+    session
+    |> Map.put(:effective_parent, effective.session_key)
+    |> Map.put(:effective_parent_source, effective.source)
   end
 
   defp transaction!(db, fun) do
@@ -1415,6 +1833,14 @@ defmodule Tightbeam.Org do
       {:ok, result} -> result
       {:error, error} -> raise error
     end
+  end
+
+  defp legacy_sessions_ddl do
+    Regex.replace(
+      ~r/\s*mechanicalStatus TEXT NOT NULL DEFAULT 'idle'\s+CHECK \(mechanicalStatus IN \('idle','running'\)\),/,
+      @sessions_ddl,
+      ""
+    )
   end
 
   defp now, do: System.system_time(:millisecond)

@@ -91,7 +91,10 @@ defmodule Tightbeam.ArtifactCarrierTest do
     on_exit(fn -> File.rm_rf!(base_dir) end)
 
     {:ok, _} =
-      DB.query(db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
+      )
 
     main_key = Org.personal_session_key("flynn")
 

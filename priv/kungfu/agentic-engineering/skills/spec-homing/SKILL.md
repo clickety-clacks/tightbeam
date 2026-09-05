@@ -38,5 +38,7 @@ choose how they retain superseded specs.
    relies on, stated so they can be falsified), Invariants, Architecture (the design),
    Acceptance (concrete, checkable), Open Questions (marked holes, each ruled blocking or
    non-blocking). Each section names a class of defect that hides when the section is
-   absent, so an empty one is stated empty ("Non-Goals: none"), never omitted.
+   absent, so an empty one is stated empty ("Non-Goals: none"), never omitted. This
+   is the writer's skeleton. A reviewer uses it as a hunt list and blocks only on a
+   load-bearing hole, never on a missing heading.
 3. Amendments edit the canonical file; the edit history is the spec's history.

@@ -1,8 +1,12 @@
 name = "spec-writer"
-skills = ["drafting-requirements", "spec-homing", "spec-handoff", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
+skills = ["worktree-session", "drafting-requirements", "spec-homing", "spec-handoff", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
 
 [guidance]
 text = """
+#include "golden-rule.md"
+
+#include "scope-and-architecture.md"
+
 #include "wisdom-core.md"
 
 #include "wisdom-meta.md"
@@ -12,8 +16,6 @@ text = """
 #include "subtraction.md"
 
 #include "preferred-models.md"
-
-#include "model-policy.md"
 
 #include "spec-writer.md"
 """

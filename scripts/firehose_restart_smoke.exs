@@ -7,7 +7,8 @@ defmodule Tightbeam.FirehoseRestartSmoke do
     base_dir =
       Path.join(
         System.tmp_dir!(),
-        "tightbeam-firehose-restart-#{System.unique_integer([:positive])}"
+        # LegGateway recognizes this marker as a run-local tree it may remove after a clean stop.
+        "tightbeam-client-e2e-firehose-restart-#{System.unique_integer([:positive])}"
       )
 
     port = 12_800 + rem(System.unique_integer([:positive]), 500)
@@ -27,7 +28,7 @@ defmodule Tightbeam.FirehoseRestartSmoke do
       {:ok, pre_auth_ws} =
         WS.connect("127.0.0.1", port, "/ws/changes?protocolVersion=1")
 
-      first = create_item(port, cli_token, "Before gateway restart")
+      first = create_item(port, cli_token, device.user_id, "Before gateway restart")
       {first_notice, ws} = recv_change(ws)
       first_model = %{first_notice["refs"]["workItemId"] => first_notice["payload"]}
       true = Map.has_key?(first_model, first)
@@ -39,14 +40,14 @@ defmodule Tightbeam.FirehoseRestartSmoke do
       Process.put(:firehose_restart_gateway, restarted)
 
       ws = connect(port, device.token)
-      rebuilt = snapshot(port, cli_token)
+      rebuilt = snapshot(port, cli_token, device.user_id)
       true = Map.has_key?(rebuilt, first)
 
-      second = create_item(port, cli_token, "After gateway restart")
+      second = create_item(port, cli_token, device.user_id, "After gateway restart")
       {second_notice, ws} = recv_change(ws)
       rebuilt = Map.put(rebuilt, second_notice["refs"]["workItemId"], second_notice["payload"])
       true = Map.has_key?(rebuilt, second)
-      true = rebuilt == snapshot(port, cli_token)
+      true = rebuilt == snapshot(port, cli_token, device.user_id)
       :ok = WS.close(ws)
 
       IO.puts(
@@ -114,20 +115,22 @@ defmodule Tightbeam.FirehoseRestartSmoke do
     end
   end
 
-  defp create_item(port, token, title) do
+  defp create_item(port, token, user_id, title) do
     %{"result" => %{"id" => id}} =
-      dispatch(port, token, "work-item-create", %{"title" => title})
+      dispatch(port, token, user_id, "work-item-create", %{"title" => title})
 
     id
   end
 
-  defp snapshot(port, token) do
-    %{"result" => %{"workItems" => items}} = dispatch(port, token, "work-item-list", %{})
+  defp snapshot(port, token, user_id) do
+    %{"result" => %{"workItems" => items}} =
+      dispatch(port, token, user_id, "work-item-list", %{})
+
     Map.new(items, &{&1["id"], Tightbeam.StateResources.work_item(&1)})
   end
 
-  defp dispatch(port, token, verb, params) do
-    body = JSON.encode!(%{"verb" => verb, "asUser" => "flynn", "params" => params})
+  defp dispatch(port, token, user_id, verb, params) do
+    body = JSON.encode!(%{"verb" => verb, "asUser" => user_id, "params" => params})
     url = ~c"http://127.0.0.1:#{port}/agent/dispatch"
 
     {:ok, {{_version, 200, _reason}, _headers, response}} =

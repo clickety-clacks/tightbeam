@@ -33,13 +33,14 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)"
+        "INSERT INTO users (userId, isAdmin, creationKind, createdAt) VALUES ('flynn', 1, 'admin_add', 1)"
       )
 
     ensure_main_session(db, "flynn")
 
     holder = session(db, "fix-holder", "coder", "claude", "anthropic")
     recon = session(db, "recon-holder", "recon", "codex", "openai")
+    orchestrator = session(db, "slice-orchestrator", "orchestrator", "codex", "openai")
     Roles.create!(db, "recon", "flynn", recon.session_key)
 
     base_dir =
@@ -57,7 +58,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
     rules = Rules.load!(base_dir, Map.keys(handlers))
 
     on_exit(fn ->
-      File.rm_rf!(base_dir)
+      Tightbeam.TestCase.cleanup_dir!(base_dir)
       :persistent_term.erase(Rules)
       :persistent_term.erase(Archetypes)
     end)
@@ -68,6 +69,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       db: db,
       handlers: handlers,
       holder: holder,
+      orchestrator: orchestrator,
       recon: recon,
       rules: rules
     }
@@ -79,6 +81,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
              "refix-requires-diagnosis",
              "code-review-requires-passing-tests",
              "spec-dispatch-requires-spirit",
+             "implementation-requires-posture",
+             "implementation-dispatch-requires-posture",
              "review-rounds-doorbell",
              "completion-requires-verification",
              "completion-requires-results-artifact"
@@ -208,7 +212,12 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
        ctx do
     for verb <- ["work-item-close", "work-item-fail", "work-item-icebox"] do
       item = work_item(ctx, true)
-      _prior = completed_fix(ctx, item.id)
+      prior = completed_fix(ctx, item.id)
+
+      params =
+        if verb == "work-item-close",
+          do: %{work_item_id: item.id, completion_attest_id: prior.closingAttestId},
+          else: %{work_item_id: item.id}
 
       # Dispose the item (its prior fix is closed, so zero open assignments).
       assert %{ok: true} =
@@ -217,7 +226,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
                  origin: "user:flynn",
                  principal: {:user, "flynn"},
                  session_key: nil,
-                 params: %{work_item_id: item.id}
+                 params: params
                })
 
       # Dispatching the refix flow against the disposed item is refused by the
@@ -235,16 +244,58 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   end
 
   defp work_item(ctx, is_bug) do
-    WorkItems.__handle__(ctx.db, "work-item-create", %{
-      principal: {:user, "flynn"},
-      params: %{title: "Bug #{System.unique_integer([:positive])}", is_bug: is_bug}
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, "flynn"},
+        params: %{title: "Bug #{System.unique_integer([:positive])}", is_bug: is_bug}
+      })
+
+    rule_posture!(ctx, item)
+    item
+  end
+
+  # The posture gate (implementation-requires-posture) refuses a coder card on a
+  # work item nobody has ruled heavy or light. These tests are about the
+  # re-fix edge, so the org's orchestrator rules posture up front, as it would
+  # in life.
+  defp rule_posture!(ctx, item) do
+    slice = assign(ctx, ctx.orchestrator.session_key, item.id, "orchestrate #{item.id}")
+
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:#{ctx.orchestrator.session_key}",
+      principal: {:session, ctx.orchestrator.session_key},
+      session_key: nil,
+      params: %{
+        assignment_id: slice.id,
+        kind: "verdict",
+        verdict_kind: "posture-light",
+        note: "test slice"
+      }
     })
+
+    # The ruling is the verdict row, which outlives its card. Revoke the card so
+    # the disposal proofs see zero open assignments, and so it never reads as a
+    # completed prior fix (revoked, not completed).
+    revoked =
+      Assignments.__handle__(ctx.db, "revoke-assignment", %{
+        verb: "revoke-assignment",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{assignment_id: slice.id, reason: "posture ruled; slice card not needed"}
+      })
+
+    refute match?(%{code: _}, revoked)
+
+    :ok
   end
 
   defp completed_fix(ctx, work_item_id) do
-    assignment = assign(ctx, ctx.holder.session_key, work_item_id, "completed fix")
-    complete(ctx, ctx.holder.session_key, assignment.id)
-    assignment
+    assignment =
+      assign(ctx, ctx.holder.session_key, work_item_id, "completed fix", delivers_work_item: true)
+
+    complete(ctx, ctx.holder.session_key, assignment.id).assignment
   end
 
   defp assign(ctx, holder_key, work_item_id, subject, opts \\ []) do
@@ -259,7 +310,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       params: %{
         subject: subject,
         work_item_id: work_item_id,
-        reviews_assignment_id: opts[:reviews_assignment_id]
+        reviews_assignment_id: opts[:reviews_assignment_id],
+        delivers_work_item: Keyword.get(opts, :delivers_work_item, false)
       }
     })
   end

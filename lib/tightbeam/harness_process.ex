@@ -203,36 +203,62 @@ defmodule Tightbeam.HarnessProcess do
   @spec begin_park(DB.server(), tuple()) :: {:ok, row() | :no_launch}
   def begin_park(db, key) do
     :ok = ensure_schema(db)
-    at = now()
+    DB.transaction(db, &begin_park_in_txn(&1, key))
+  end
 
-    {:ok, row} =
-      DB.transaction(db, fn txn ->
+  @doc "Establish the park fence as part of a caller-owned incident transaction."
+  @spec begin_park_in_txn(DB.Txn.t(), tuple()) :: row() | :no_launch
+  def begin_park_in_txn(%DB.Txn{} = txn, key) do
+    at = now()
+    adapter_key = key_name(key)
+
+    DB.Txn.q(
+      txn,
+      "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
+      [adapter_key, at]
+    )
+
+    case latest_unresolved_in_txn(txn, adapter_key) do
+      nil ->
+        :no_launch
+
+      row ->
         DB.Txn.q(
           txn,
-          "INSERT OR IGNORE INTO harness_park_fences (adapterKey, requestedAt) VALUES (?1, ?2)",
-          [key_name(key), at]
+          """
+          UPDATE harness_processes
+             SET state = 'park_requested', parkRequestedAt = COALESCE(parkRequestedAt, ?2)
+           WHERE launchId = ?1 AND resolvedAt IS NULL
+          """,
+          [row.launch_id, at]
         )
 
-        case latest_unresolved_in_txn(txn, key_name(key)) do
-          nil ->
-            :no_launch
+        %{row | state: "park_requested", park_requested_at: row.park_requested_at || at}
+    end
+  end
 
-          row ->
-            DB.Txn.q(
-              txn,
-              """
-              UPDATE harness_processes
-                 SET state = 'park_requested', parkRequestedAt = COALESCE(parkRequestedAt, ?2)
-               WHERE launchId = ?1 AND resolvedAt IS NULL
-              """,
-              [row.launch_id, at]
-            )
+  @doc "True only while an explicit durable park request stands for the key."
+  @spec parked?(DB.server(), tuple()) :: boolean()
+  def parked?(db, key) do
+    :ok = ensure_schema(db)
 
-            %{row | state: "park_requested", park_requested_at: row.park_requested_at || at}
-        end
-      end)
+    {:ok, [[count]]} =
+      DB.query(db, "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1", [
+        key_name(key)
+      ])
 
-    {:ok, row}
+    count > 0
+  end
+
+  @doc "Read the explicit durable park fence inside a caller-owned transaction."
+  @spec parked_in_txn?(DB.Txn.t(), tuple()) :: boolean()
+  def parked_in_txn?(%DB.Txn{} = txn, key) do
+    [[count]] =
+      DB.Txn.q(txn, "SELECT COUNT(*) FROM harness_park_fences WHERE adapterKey = ?1", [
+        key_name(key)
+      ])
+
+    count > 0
   end
 
   @doc "True while any unresolved durable launch or park request fences the key."
@@ -260,8 +286,15 @@ defmodule Tightbeam.HarnessProcess do
   @doc "Release the per-key fence after the park has reached a terminal state."
   @spec complete_park(DB.server(), tuple()) :: :ok
   def complete_park(db, key) do
-    {:ok, _} =
-      DB.query(db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
+    {:ok, :ok} = DB.transaction(db, &complete_park_in_txn(&1, key))
+
+    :ok
+  end
+
+  @doc "Release the park fence as part of a caller-owned recovery transaction."
+  @spec complete_park_in_txn(DB.Txn.t(), tuple()) :: :ok
+  def complete_park_in_txn(%DB.Txn{} = txn, key) do
+    DB.Txn.q(txn, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [key_name(key)])
 
     :ok
   end
@@ -285,7 +318,7 @@ defmodule Tightbeam.HarnessProcess do
       :ok = ensure_fence(db, row.adapter_key)
 
       if reconcile_row(db, row) == :ok do
-        :ok = complete_park_name(db, row.adapter_key)
+        :ok = complete_reconciled_park_name(db, row.adapter_key)
       end
     end)
 
@@ -852,14 +885,26 @@ defmodule Tightbeam.HarnessProcess do
     :ok
   end
 
-  defp complete_park_name(db, adapter_key) do
+  defp complete_reconciled_park_name(db, adapter_key) do
+    incident_guard = rate_limit_incident_guard(db)
+
     {:ok, _} =
-      DB.query(db, "DELETE FROM harness_park_fences WHERE adapterKey = ?1", [adapter_key])
+      DB.query(
+        db,
+        """
+        DELETE FROM harness_park_fences
+         WHERE adapterKey = ?1
+         #{incident_guard}
+        """,
+        [adapter_key]
+      )
 
     :ok
   end
 
   defp clear_orphan_fences(db) do
+    incident_guard = rate_limit_incident_guard(db)
+
     {:ok, _} =
       DB.query(
         db,
@@ -872,10 +917,37 @@ defmodule Tightbeam.HarnessProcess do
               AND state IN ('launching','running','park_requested','kill_failed')
               AND resolvedAt IS NULL
          )
+         #{incident_guard}
         """
       )
 
     :ok
+  end
+
+  defp rate_limit_incident_guard(db) do
+    if harness_health_schema?(db) do
+      """
+      AND NOT EXISTS (
+        SELECT 1
+          FROM harness_health_incidents
+         WHERE state = 'open'
+           AND failureClass = 'rate-limit-dead'
+           AND harness || ':shared@' || host = harness_park_fences.adapterKey
+      )
+      """
+    else
+      ""
+    end
+  end
+
+  defp harness_health_schema?(db) do
+    {:ok, [[count]]} =
+      DB.query(
+        db,
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='harness_health_incidents'"
+      )
+
+    count == 1
   end
 
   defp resolve(db, row, state) do

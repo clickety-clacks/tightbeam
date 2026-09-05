@@ -17,13 +17,46 @@ defmodule Tightbeam.ConditionFacts do
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
-  @reserved_kinds ~w(quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present)
+  @reserved_kinds ~w(
+    quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present
+    harness-auth-dead harness-auth-restored
+    harness-rate-limit-dead harness-rate-limit-restored
+    harness-adapter-unavailable harness-adapter-restored
+    harness-model-unavailable harness-model-restored
+    harness-task-crash harness-task-restored
+    harness-interrupted-outcome-unknown harness-interrupted-outcome-reconciled
+  )
   @agent_only_kinds ~w(work-blocked work-unblocked)
 
   @standing_pairs %{
     "work-blocked" => "work-unblocked",
-    "user-alerted" => "user-alert-cleared"
+    "user-alerted" => "user-alert-cleared",
+    "harness-auth-dead" => "harness-auth-restored",
+    "harness-rate-limit-dead" => "harness-rate-limit-restored",
+    "harness-adapter-unavailable" => "harness-adapter-restored",
+    "harness-model-unavailable" => "harness-model-restored",
+    "harness-task-crash" => "harness-task-restored",
+    "harness-interrupted-outcome-unknown" => "harness-interrupted-outcome-reconciled"
   }
+
+  @harness_health_kinds %{
+    {"auth-dead", :assert} => "harness-auth-dead",
+    {"auth-dead", :retract} => "harness-auth-restored",
+    {"rate-limit-dead", :assert} => "harness-rate-limit-dead",
+    {"rate-limit-dead", :retract} => "harness-rate-limit-restored",
+    {"adapter_unavailable", :assert} => "harness-adapter-unavailable",
+    {"adapter_unavailable", :retract} => "harness-adapter-restored",
+    {"model_unavailable", :assert} => "harness-model-unavailable",
+    {"model_unavailable", :retract} => "harness-model-restored",
+    {"task_crash", :assert} => "harness-task-crash",
+    {"task_crash", :retract} => "harness-task-restored",
+    {"interrupted-outcome-unknown", :assert} => "harness-interrupted-outcome-unknown",
+    {"interrupted-outcome-unknown", :retract} => "harness-interrupted-outcome-reconciled"
+  }
+  @harness_failure_classes ~w(
+    auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
+    interrupted-outcome-unknown
+  )
 
   @ddl """
   CREATE TABLE IF NOT EXISTS condition_facts (
@@ -38,7 +71,11 @@ defmodule Tightbeam.ConditionFacts do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @ddl) do
+      Tightbeam.Assignments.ensure_cannot_proceed_schema(db)
+    end
+  end
 
   @spec file(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file(db, scheduler, input) do
@@ -67,6 +104,11 @@ defmodule Tightbeam.ConditionFacts do
     ts = System.system_time(:millisecond)
     scope = Map.get(input, :scope)
 
+    if kind == "user-alerted" and is_binary(scope) do
+      :ok =
+        Tightbeam.Assignments.transfer_retired_cannot_proceed_disposers_to_user_in_txn(txn, scope)
+    end
+
     Txn.q(
       txn,
       "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (?1, ?2, ?3, ?4)",
@@ -75,6 +117,9 @@ defmodule Tightbeam.ConditionFacts do
 
     [[fact_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
 
+    fact = %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    :ok = Tightbeam.Assignments.release_cannot_proceed_in_txn(txn, fact)
+
     EventLog.lifecycle_in_txn(
       txn,
       "condition_fact_filed",
@@ -82,7 +127,7 @@ defmodule Tightbeam.ConditionFacts do
       "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
     )
 
-    %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    fact
   end
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
@@ -209,6 +254,62 @@ defmodule Tightbeam.ConditionFacts do
       )
 
     match?([[^assert_kind]], rows)
+  end
+
+  @doc "The literal condition scope for one shared harness process."
+  @spec harness_scope(String.t(), String.t()) :: String.t()
+  def harness_scope(harness, host)
+      when is_binary(harness) and harness != "" and is_binary(host) and host != "" do
+    JSON.encode!([harness, host])
+  end
+
+  @doc "Whether one failure class currently stands for a shared harness process."
+  @spec harness_failure_standing?(DB.server(), String.t(), String.t(), String.t()) :: boolean()
+  def harness_failure_standing?(db, harness, host, failure_class) do
+    standing?(
+      db,
+      Map.fetch!(@harness_health_kinds, {failure_class, :assert}),
+      harness_scope(harness, host)
+    )
+  end
+
+  @doc "Whether either distinct harness failure class currently stands."
+  @spec harness_unavailable?(DB.server(), String.t(), String.t()) :: boolean()
+  def harness_unavailable?(db, harness, host) do
+    Enum.any?(
+      @harness_failure_classes,
+      fn failure_class ->
+        harness_failure_standing?(db, harness, host, failure_class)
+      end
+    )
+  end
+
+  @doc "The transaction-owned form of the all-class harness availability gate."
+  @spec harness_unavailable_in_txn?(Txn.t(), String.t(), String.t()) :: boolean()
+  def harness_unavailable_in_txn?(%Txn{} = txn, harness, host) do
+    scope = harness_scope(harness, host)
+
+    Enum.any?(@harness_failure_classes, fn failure_class ->
+      assert_kind = Map.fetch!(@harness_health_kinds, {failure_class, :assert})
+      standing_in_txn?(txn, assert_kind, scope)
+    end)
+  end
+
+  @doc "File one harness-health assertion or retraction inside its incident transaction."
+  @spec file_harness_health_in_txn(
+          Txn.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          :assert | :retract
+        ) :: map()
+  def file_harness_health_in_txn(%Txn{} = txn, harness, host, failure_class, transition)
+      when transition in [:assert, :retract] do
+    file_in_txn(txn, %{
+      kind: Map.fetch!(@harness_health_kinds, {failure_class, transition}),
+      scope: harness_scope(harness, host),
+      origin: "process:tightbeam"
+    })
   end
 
   @doc """

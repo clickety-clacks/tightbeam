@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
+use crate::args::{ActivationCommand, Command, Identity, Target, ToplineSelection, TuneControl};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestSpec {
+    pub method: &'static str,
     pub path: &'static str,
     pub body_json: String,
 }
@@ -70,6 +71,240 @@ fn string_field(name: &str, value: &str) -> String {
     format!("\"{name}\":{}", quoted(value))
 }
 
+fn json_field(name: &str, value: &Value) -> String {
+    format!(
+        "\"{name}\":{}",
+        serde_json::to_string(value).expect("parsed JSON serializes")
+    )
+}
+
+fn optional_string_field(fields: &mut Vec<String>, name: &str, value: &Option<String>) {
+    if let Some(value) = value {
+        fields.push(string_field(name, value));
+    }
+}
+
+fn activation_request(identity: &Identity, command: &ActivationCommand) -> RequestSpec {
+    let (verb, params) = match command {
+        ActivationCommand::Declare {
+            assignment,
+            owner,
+            domain,
+            correlation,
+            input,
+            target,
+            prior,
+            relation,
+            key,
+        } => {
+            let mut params = vec![
+                string_field("rootAssignmentId", assignment),
+                string_field("ownerUserId", owner),
+                string_field("domain", domain),
+                string_field("correlationKey", correlation),
+                json_field("preparedInput", input),
+                json_field("target", target),
+                string_field("idempotencyKey", key),
+            ];
+            optional_string_field(&mut params, "priorActivationId", prior);
+            optional_string_field(&mut params, "relation", relation);
+            ("activation-declare", params)
+        }
+        ActivationCommand::Authority {
+            activation,
+            after,
+            assignment,
+            authorizer,
+            basis,
+            decision,
+            key,
+        } => {
+            let mut params = vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                json_field("authorizer", authorizer),
+                json_field("basis", basis),
+                json_field("decision", decision),
+                string_field("idempotencyKey", key),
+            ];
+            optional_string_field(&mut params, "actorAssignmentId", assignment);
+            ("activation-authority", params)
+        }
+        ActivationCommand::Attempt {
+            activation,
+            after,
+            assignment,
+            authority_events,
+            executor,
+            external_attempt,
+            target_state_before,
+            key,
+        } => (
+            "activation-attempt",
+            vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                string_field("actorAssignmentId", assignment),
+                json_field("authorityEventIds", &serde_json::json!(authority_events)),
+                json_field("executor", executor),
+                json_field("externalAttempt", external_attempt),
+                json_field("targetStateBefore", target_state_before),
+                string_field("idempotencyKey", key),
+            ],
+        ),
+        ActivationCommand::Observe {
+            activation,
+            after,
+            assignment,
+            attempt,
+            certainty,
+            result,
+            target_state_after,
+            outputs,
+            evidence,
+            external_occurred_at,
+            key,
+        } => {
+            let mut params = recovery_params(
+                activation,
+                after,
+                assignment,
+                certainty,
+                result,
+                target_state_after,
+                outputs,
+                evidence,
+                external_occurred_at,
+                key,
+            );
+            params.push(string_field("attemptEventId", attempt));
+            ("activation-observe", params)
+        }
+        ActivationCommand::Reconcile {
+            activation,
+            after,
+            assignment,
+            observation,
+            certainty,
+            result,
+            target_state_after,
+            outputs,
+            evidence,
+            external_occurred_at,
+            key,
+        } => {
+            let mut params = recovery_params(
+                activation,
+                after,
+                assignment,
+                certainty,
+                result,
+                target_state_after,
+                outputs,
+                evidence,
+                external_occurred_at,
+                key,
+            );
+            params.push(string_field("observedEventId", observation));
+            ("activation-reconcile", params)
+        }
+        ActivationCommand::Withdraw {
+            activation,
+            after,
+            assignment,
+            reason,
+            basis,
+            key,
+        } => {
+            let mut params = vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                json_field("reason", reason),
+                json_field("basis", basis),
+                string_field("idempotencyKey", key),
+            ];
+            optional_string_field(&mut params, "actorAssignmentId", assignment);
+            ("activation-withdraw", params)
+        }
+        ActivationCommand::Renotify {
+            activation,
+            after,
+            noticed_event,
+            replaces_wake,
+            key,
+        } => (
+            "activation-renotify",
+            vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                string_field("noticedEventId", noticed_event),
+                string_field("replacesWakeId", replaces_wake),
+                string_field("idempotencyKey", key),
+            ],
+        ),
+        ActivationCommand::Ack {
+            activation,
+            after,
+            noticed_event,
+            wake,
+            key,
+        } => (
+            "activation-ack",
+            vec![
+                string_field("activationId", activation),
+                string_field("predecessorEventId", after),
+                string_field("noticedEventId", noticed_event),
+                string_field("acknowledgedWakeId", wake),
+                string_field("idempotencyKey", key),
+            ],
+        ),
+        ActivationCommand::Status { activation } => (
+            "activation-status",
+            vec![string_field("activationId", activation)],
+        ),
+        ActivationCommand::List {
+            assignment,
+            work_item,
+            correlation,
+        } => {
+            let mut params = Vec::new();
+            optional_string_field(&mut params, "assignmentId", assignment);
+            optional_string_field(&mut params, "workItemId", work_item);
+            optional_string_field(&mut params, "correlationKey", correlation);
+            ("activations", params)
+        }
+    };
+    request(identity, verb, vec![], params)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recovery_params(
+    activation: &str,
+    after: &str,
+    assignment: &Option<String>,
+    certainty: &str,
+    result: &Value,
+    target_state_after: &Value,
+    outputs: &Value,
+    evidence: &Value,
+    external_occurred_at: &Value,
+    key: &str,
+) -> Vec<String> {
+    let mut params = vec![
+        string_field("activationId", activation),
+        string_field("predecessorEventId", after),
+        string_field("certainty", certainty),
+        json_field("result", result),
+        json_field("targetStateAfter", target_state_after),
+        json_field("outputs", outputs),
+        json_field("evidence", evidence),
+        json_field("externalOccurredAtMs", external_occurred_at),
+        string_field("idempotencyKey", key),
+    ];
+    optional_string_field(&mut params, "actorAssignmentId", assignment);
+    params
+}
+
 /// Roster filters, shared verbatim by `toplines` and `topline --under` — the
 /// spec says "the same roster filters", so there is one builder, not two lists.
 fn filter_params(filters: &crate::args::ToplineFilters) -> Vec<String> {
@@ -107,6 +342,7 @@ fn request(
     body.append(&mut fields);
     body.push(params_field(params));
     RequestSpec {
+        method: "POST",
         path: "/agent/dispatch",
         body_json: object(body),
     }
@@ -117,7 +353,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
+        | Command::VisitorKeyringInit { .. }
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => {
             Err("command does not dispatch through /agent/dispatch".to_owned())
@@ -209,10 +447,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "artifacts", vec![], params))
         }
+        Command::Activation { identity, command } => Ok(activation_request(identity, command)),
         // Not a verb and not on /agent/dispatch: it changes no domain state, it
         // tells the gateway to look at this session's running turn NOW, while the
         // command it observed has not run yet.
         Command::ToolCallObserved => Ok(RequestSpec {
+            method: "POST",
             path: "/agent/tool-call-observed",
             body_json: "{}".to_owned(),
         }),
@@ -342,6 +582,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             reviews,
             effect_kind,
             files,
+            report_to,
+            delivers_work_item,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -367,6 +609,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     serde_json::to_string(value).expect("strings are JSON serializable")
                 ));
             }
+            if let Some(value) = report_to {
+                params.push(string_field("reportToSessionKey", value));
+            }
+            if *delivers_work_item {
+                params.push("\"deliversWorkItem\":true".to_owned());
+            }
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
@@ -378,6 +626,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             workdir_root,
             brief,
             idempotency_key,
+            report_to,
+            delivers_work_item,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
@@ -394,6 +644,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
+            }
+            if let Some(value) = report_to {
+                params.push(string_field("reportToSessionKey", value));
+            }
+            if *delivers_work_item {
+                params.push("\"deliversWorkItem\":true".to_owned());
             }
             Ok(request(
                 identity,
@@ -415,6 +671,72 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("action", action),
             ],
         )),
+        Command::OperatorAsk {
+            identity,
+            question,
+            note,
+            options,
+            assignment_id,
+            deadline_ms,
+            supersedes,
+        } => {
+            let mut params = vec![string_field("question", question)];
+            if let Some(value) = note {
+                params.push(string_field("note", value));
+            }
+            if let Some(labels) = options {
+                let options = labels
+                    .iter()
+                    .map(|label| serde_json::json!({"label": label}))
+                    .collect::<Vec<_>>();
+                params.push(format!(
+                    "\"options\":{}",
+                    serde_json::to_string(&options).expect("operator option labels serialize")
+                ));
+            }
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignment", value));
+            }
+            if let Some(value) = deadline_ms {
+                params.push(format!("\"deadline\":{value}"));
+            }
+            if let Some(value) = supersedes {
+                params.push(string_field("supersedes", value));
+            }
+            Ok(request(identity, "operator-ask", vec![], params))
+        }
+        Command::OperatorRule {
+            identity,
+            request_id,
+            decision,
+            response,
+            rationale,
+        } => {
+            let mut params = vec![string_field("request", request_id)];
+            if let Some(value) = decision {
+                params.push(string_field("decision", value));
+            }
+            if let Some(value) = response {
+                params.push(string_field("response", value));
+            }
+            if let Some(value) = rationale {
+                params.push(string_field("rationale", value));
+            }
+            Ok(request(identity, "operator-rule", vec![], params))
+        }
+        Command::OperatorWithdraw {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "operator-withdraw",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::DecisionRequests { identity, status } => {
             let mut params = Vec::new();
             if let Some(value) = status {
@@ -422,6 +744,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "decision-requests", vec![], params))
         }
+        Command::DecisionRequest {
+            identity,
+            request_id,
+        } => Ok(request(
+            identity,
+            "decision-request",
+            vec![],
+            vec![string_field("request", request_id)],
+        )),
         // `ask` carries a TYPED TARGET, exactly like `wake`: the gateway resolves
         // a role's binding (and its fallback) once, at the door.
         Command::Ask {
@@ -473,11 +804,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::RevokeAssignment {
             identity,
             assignment_id,
+            reason,
         } => Ok(request(
             identity,
             "revoke-assignment",
             vec![],
-            vec![string_field("assignmentId", assignment_id)],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
         )),
         Command::ReopenAssignment {
             identity,
@@ -492,11 +827,43 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("reason", reason),
             ],
         )),
+        Command::RepairAssignment {
+            identity,
+            assignment_id,
+            action,
+            model,
+            effort,
+            context,
+            outcome,
+            turn_seq,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("assignmentId", assignment_id),
+                string_field("action", action),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+            for (name, value) in [
+                ("model", model),
+                ("effort", effort),
+                ("context", context),
+                ("outcome", outcome),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            if let Some(value) = turn_seq {
+                params.push(format!("\"turnSeq\":{value}"));
+            }
+            Ok(request(identity, "repair-assignment", vec![], params))
+        }
         Command::WorkItemCreate {
             identity,
             title,
             spec_ref_name,
             spec_ref_sha256,
+            priority,
             idempotency_key,
         } => {
             let mut params = vec![string_field("title", title)];
@@ -506,10 +873,42 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = spec_ref_sha256 {
                 params.push(string_field("specRefSha256", value));
             }
+            if let Some(value) = priority {
+                params.push(format!("\"priority\":{value}"));
+            }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
             }
             Ok(request(identity, "work-item-create", vec![], params))
+        }
+        Command::WorkItemUpdate {
+            identity,
+            work_item_id,
+            title,
+            spec_ref_name,
+            spec_ref_sha256,
+            clear_spec_ref,
+            priority,
+        } => {
+            let mut params = vec![string_field("workItemId", work_item_id)];
+            if let Some(value) = title {
+                params.push(string_field("title", value));
+            }
+            if *clear_spec_ref {
+                params.push("\"specRefName\":null".to_owned());
+                params.push("\"specRefSha256\":null".to_owned());
+            } else {
+                if let Some(value) = spec_ref_name {
+                    params.push(string_field("specRefName", value));
+                }
+                if let Some(value) = spec_ref_sha256 {
+                    params.push(string_field("specRefSha256", value));
+                }
+            }
+            if let Some(value) = priority {
+                params.push(format!("\"priority\":{value}"));
+            }
+            Ok(request(identity, "work-item-update", vec![], params))
         }
         Command::WorkItemGet {
             identity,
@@ -519,6 +918,19 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             "work-item-get",
             vec![],
             vec![string_field("workItemId", work_item_id)],
+        )),
+        Command::Breathing {
+            identity,
+            target_kind,
+            target_id,
+        } => Ok(request(
+            identity,
+            "breathing",
+            vec![],
+            vec![
+                string_field("targetKind", target_kind),
+                string_field("targetId", target_id),
+            ],
         )),
         Command::WorkItemTrace {
             identity,
@@ -659,12 +1071,22 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemClose {
             identity,
             work_item_id,
-        } => Ok(request(
-            identity,
-            "work-item-close",
-            vec![],
-            vec![string_field("workItemId", work_item_id)],
-        )),
+            completion_attest_id,
+            owner_ruling_reason,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("workItemId", work_item_id),
+                string_field("completionAttestId", completion_attest_id),
+            ];
+            if let Some(value) = owner_ruling_reason {
+                params.push(string_field("ownerRulingReason", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
+            }
+            Ok(request(identity, "work-item-close", vec![], params))
+        }
         Command::WorkItemFail {
             identity,
             work_item_id,
@@ -683,6 +1105,10 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             verdict,
             note,
             commit_refs,
+            release_fact_kind,
+            release_fact_scope,
+            release_fact_principal_ref,
+            idempotency_key,
         } => {
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
@@ -699,6 +1125,18 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     "\"commitRefs\":{}",
                     serde_json::to_string(value).expect("commit refs are JSON serializable")
                 ));
+            }
+            if let Some(value) = release_fact_kind {
+                params.push(string_field("releaseFactKind", value));
+            }
+            if let Some(value) = release_fact_scope {
+                params.push(string_field("releaseFactScope", value));
+            }
+            if let Some(value) = release_fact_principal_ref {
+                params.push(string_field("releaseFactPrincipalRef", value));
+            }
+            if let Some(value) = idempotency_key {
+                params.push(string_field("idempotencyKey", value));
             }
             Ok(request(identity, "attest", vec![], params))
         }
@@ -761,6 +1199,30 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 .unwrap_or_default();
             Ok(request(identity, "assignments", fields, params))
         }
+        Command::CompletionNotices {
+            identity,
+            status,
+            session_key,
+        } => {
+            let mut params = vec![string_field("status", status)];
+            if let Some(value) = session_key {
+                params.push(string_field("sessionKey", value));
+            }
+            Ok(request(identity, "completion-notices", vec![], params))
+        }
+        Command::CompletionDisposition {
+            identity,
+            completion_id,
+            decision,
+        } => Ok(request(
+            identity,
+            "completion-disposition",
+            vec![],
+            vec![
+                string_field("completionId", completion_id),
+                string_field("decision", decision),
+            ],
+        )),
         Command::CancelWake { identity, wake_id } => Ok(request(
             identity,
             "wake",
@@ -877,16 +1339,23 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             setting,
             value,
-        } => Ok(request(
-            identity,
-            "config",
-            vec![],
-            vec![
-                string_field("action", "set"),
-                string_field("setting", setting),
-                string_field("value", value),
-            ],
-        )),
+        } => {
+            let encoded_value = if setting == "default-priority" {
+                format!("\"value\":{value}")
+            } else {
+                string_field("value", value)
+            };
+            Ok(request(
+                identity,
+                "config",
+                vec![],
+                vec![
+                    string_field("action", "set"),
+                    string_field("setting", setting),
+                    encoded_value,
+                ],
+            ))
+        }
         Command::HostEnvSet {
             identity,
             host,
@@ -1203,6 +1672,12 @@ pub fn send(request: &RequestSpec) -> Result<Option<Value>, String> {
     send_to(&endpoint, request)
 }
 
+pub(crate) fn cold_start_for_doctor(base_dir: &Path) -> Result<Value, String> {
+    let endpoint = discover_from(base_dir)?;
+    let request = request(&Identity::Session, "cold-start-state", vec![], vec![]);
+    send_to(&endpoint, &request)?.ok_or_else(|| "cold-start-state returned no result".to_owned())
+}
+
 pub(crate) fn send_to(endpoint: &Endpoint, request: &RequestSpec) -> Result<Option<Value>, String> {
     send_to_with_deadline(endpoint, request, None)
 }
@@ -1259,9 +1734,13 @@ fn send_once(
     request: &RequestSpec,
     timeout: Option<Duration>,
 ) -> Result<Option<Value>, SendAttemptError> {
-    let call = gateway_request("POST", endpoint, request.path, timeout)
-        .set("content-type", "application/json")
-        .send_string(&request.body_json);
+    let builder = gateway_request(request.method, endpoint, request.path, timeout)
+        .set("content-type", "application/json");
+    let call = if request.method == "GET" {
+        builder.call()
+    } else {
+        builder.send_string(&request.body_json)
+    };
 
     let (status, response) = match call {
         Ok(response) => (response.status(), response),
@@ -1276,7 +1755,24 @@ fn send_once(
     let encoded = response
         .into_string()
         .map_err(|error| SendAttemptError::Final(error.to_string()))?;
-    parse_response(status, &encoded).map_err(SendAttemptError::Final)
+    if request.path == "/version" {
+        parse_version_response(status, &encoded).map_err(SendAttemptError::Final)
+    } else {
+        parse_response(status, &encoded).map_err(SendAttemptError::Final)
+    }
+}
+
+fn parse_version_response(status: u16, encoded: &str) -> Result<Option<Value>, String> {
+    let value: Value = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+    if (200..300).contains(&status) {
+        Ok(Some(value))
+    } else {
+        Err(value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("undefined")
+            .to_owned())
+    }
 }
 
 pub(crate) fn gateway_request(
@@ -1327,6 +1823,13 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
             .and_then(Value::as_str)
             .unwrap_or("undefined");
         let message = json.pointer("/error/message").and_then(Value::as_str);
+        if code == "activation_head_changed" {
+            let current = json
+                .pointer("/error/currentHead")
+                .and_then(Value::as_str)
+                .unwrap_or("undefined");
+            return Err(format!("activation_head_changed: currentHead={current}"));
+        }
         return Err(match message {
             Some(message) if !message.is_empty() => format!("{code}: {message}"),
             _ => code.to_owned(),
@@ -1363,8 +1866,7 @@ pub fn run(command: Command) -> Result<(), String> {
     // `command_identity`; it is nonetheless a session call and only a session
     // call, and saying so here makes a run from outside a workdir fail with the
     // reason rather than with a 403 from the org token.
-    let session_identity = matches!(command, Command::ToolCallObserved)
-        || command_identity(&command).is_some_and(|identity| matches!(identity, Identity::Session));
+    let session_identity = requires_session_discovery(&command);
     run_with(
         command,
         move || {
@@ -1378,6 +1880,21 @@ pub fn run(command: Command) -> Result<(), String> {
         send_to_with_deadline,
         crate::harnesses::load_optional_from,
     )
+}
+
+fn requires_session_discovery(command: &Command) -> bool {
+    if matches!(
+        command,
+        Command::AddUser {
+            identity: Identity::Session,
+            ..
+        }
+    ) {
+        return false;
+    }
+
+    matches!(command, Command::ToolCallObserved)
+        || command_identity(command).is_some_and(|identity| matches!(identity, Identity::Session))
 }
 
 fn run_with<D, S, H>(
@@ -1395,58 +1912,47 @@ where
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
         }
+        Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
+        Command::VisitorKeyringInit { base_dir } => crate::visitor::keyring_init(base_dir),
         Command::AddUser {
             identity,
             user_id,
             admin,
         } => {
-            // Resolve the requested org before inspecting or mutating local state. An
-            // explicit remote endpoint must not get a user inserted into whichever
-            // empty state.db happens to exist on this machine.
             let endpoint = discover_endpoint()?;
-            let first_user = first_user_for_target(add_user_target_is_local(&endpoint), || {
-                crate::users::create_first_if_local(&user_id, admin)
-            })?;
-            match first_user {
-                crate::users::FirstUser::Created {
-                    user_id,
-                    is_admin,
-                    created_at,
-                } => {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "user": {
-                                "userId": user_id,
-                                "isAdmin": is_admin,
-                                "createdAt": created_at
-                            }
-                        }))
-                        .expect("JSON value serializes")
+            let request = if matches!(identity, Identity::Session) {
+                if !add_user_target_is_local(&endpoint) {
+                    return Err(
+                        "bootstrap requires a locally discovered loopback gateway".to_owned()
                     );
-                    Ok(())
                 }
-                crate::users::FirstUser::Dispatch => {
-                    require_session_endpoint(&identity, &endpoint)?;
-                    let request = request(
-                        &identity,
-                        "add-user",
-                        vec![],
-                        vec![
-                            string_field("userId", &user_id),
-                            format!("\"isAdmin\":{admin}"),
-                        ],
-                    );
-                    if let Some(result) = send_request(&endpoint, &request, None)? {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&result).expect("JSON value serializes")
-                        );
-                    }
-                    Ok(())
-                }
+
+                request(
+                    &identity,
+                    "add-user",
+                    vec![],
+                    vec![string_field("userId", &user_id)],
+                )
+            } else {
+                request(
+                    &identity,
+                    "add-user",
+                    vec![],
+                    vec![
+                        string_field("userId", &user_id),
+                        format!("\"isAdmin\":{admin}"),
+                    ],
+                )
+            };
+
+            if let Some(result) = send_request(&endpoint, &request, None)? {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                );
             }
+            Ok(())
         }
         Command::UpdateClients { as_user } => crate::ceremonies::update_clients(&as_user),
         Command::Assimilate(args) => crate::ceremonies::assimilate(args),
@@ -1471,6 +1977,26 @@ where
             if let Some(identity) = command_identity(&command) {
                 require_session_endpoint(identity, &endpoint)?;
             }
+            if matches!(command, Command::Activation { .. }) {
+                let version = RequestSpec {
+                    method: "GET",
+                    path: "/version",
+                    body_json: String::new(),
+                };
+                let advertised = send_request(&endpoint, &version, None)?;
+                let present = advertised
+                    .as_ref()
+                    .and_then(|value| value.get("features"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|features| {
+                        features
+                            .iter()
+                            .any(|feature| feature.as_str() == Some("activation-events-v1"))
+                    });
+                if !present {
+                    return Err("capability_missing: activation-events-v1".to_owned());
+                }
+            }
             let request = build_request(&command)?;
             if let Some(result) = send_request(&endpoint, &request, None)? {
                 println!(
@@ -1487,24 +2013,7 @@ fn add_user_target_is_local(endpoint: &Endpoint) -> bool {
     add_user_endpoint_matches_local(endpoint, &provisioned())
 }
 
-fn first_user_for_target<F>(local: bool, create: F) -> Result<crate::users::FirstUser, String>
-where
-    F: FnOnce() -> Result<crate::users::FirstUser, String>,
-{
-    if local {
-        create()
-    } else {
-        Ok(crate::users::FirstUser::Dispatch)
-    }
-}
-
-/// The one case that may create a user without asking a gateway: this machine IS the
-/// gateway host, and the request resolved to it because nothing else was named.
-///
-/// Both halves are provenance, not comparison. `Origin::Named` and `Origin::Session` each
-/// say an endpoint was chosen deliberately, and a deliberate choice is honoured as made
-/// even when it resolves to the same address and the same token as the local gateway --
-/// which is precisely the case that used to fall through to a local mutation.
+/// Bare add-user is available only through this host's provisioned gateway.
 fn add_user_endpoint_matches_local(endpoint: &Endpoint, provisioned: &Provisioned) -> bool {
     matches!(provisioned, Provisioned::GatewayHost)
         && matches!(endpoint.origin, Origin::Provisioned)
@@ -1531,6 +2040,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Condition { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::Artifacts { identity, .. }
+        | Command::Activation { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Tune { identity, .. }
@@ -1538,14 +2048,21 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
+        | Command::OperatorAsk { identity, .. }
+        | Command::OperatorRule { identity, .. }
+        | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }
+        | Command::DecisionRequest { identity, .. }
         | Command::Ask { identity, .. }
         | Command::Answer { identity, .. }
         | Command::ReturnRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
+        | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
+        | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
+        | Command::Breathing { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
@@ -1561,6 +2078,8 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Attest { identity, .. }
         | Command::Attests { identity, .. }
         | Command::Assignments { identity, .. }
+        | Command::CompletionNotices { identity, .. }
+        | Command::CompletionDisposition { identity, .. }
         | Command::CancelWake { identity, .. }
         | Command::IdentityEdit { identity, .. }
         | Command::IdentityStatus { identity, .. }
@@ -1580,11 +2099,54 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
+        | Command::VisitorKeyringInit { .. }
         | Command::ToolCallObserved
         | Command::UpdateClients { .. }
         | Command::Assimilate(_) => None,
     }
+}
+
+fn print_current_session_identity() -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let session_key = current_session_key_from(&cwd)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"sessionKey": session_key}))
+            .expect("session identity serializes")
+    );
+    Ok(())
+}
+
+fn current_session_key_from(cwd: &Path) -> Result<String, String> {
+    for directory in cwd.ancestors() {
+        let path = directory.join(".tightbeam-session");
+        if !path.exists() {
+            continue;
+        }
+
+        let encoded = fs::read_to_string(&path)
+            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+        let config: Value = serde_json::from_str(&encoded)
+            .map_err(|error| format!("malformed session file '{}': {error}", path.display()))?;
+        return config
+            .get("sessionKey")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "malformed session file '{}': missing sessionKey",
+                    path.display()
+                )
+            });
+    }
+
+    Err(format!(
+        "session identity unavailable: no .tightbeam-session was found walking up from '{}' to the filesystem root",
+        cwd.display()
+    ))
 }
 
 #[cfg(test)]
@@ -1600,6 +2162,428 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn builds_closed_activation_request_bodies() {
+        assert_eq!(
+            body(&[
+                "activation-declare",
+                "--assignment",
+                "asg_1",
+                "--owner",
+                "owner",
+                "--domain",
+                "example",
+                "--correlation",
+                "c1",
+                "--input",
+                r#"{"namespace":"x","id":"i","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                "--target",
+                r#"{"namespace":"x","id":"t","sha256":null}"#,
+                "--key",
+                "k1",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"activation-declare","params":{"rootAssignmentId":"asg_1","ownerUserId":"owner","domain":"example","correlationKey":"c1","preparedInput":{"id":"i","namespace":"x","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"target":{"id":"t","namespace":"x","sha256":null},"idempotencyKey":"k1"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "activation-status",
+                "--activation",
+                "act_1",
+                "--as-user",
+                "owner"
+            ]),
+            r#"{"asUser":"owner","verb":"activation-status","params":{"activationId":"act_1"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_every_activation_verb_and_query_with_exact_parameter_names() {
+        let cases: Vec<(&[&str], &str, &[&str])> = vec![
+            (
+                &[
+                    "activation-declare",
+                    "--assignment",
+                    "asg_root",
+                    "--owner",
+                    "owner",
+                    "--domain",
+                    "example",
+                    "--correlation",
+                    "correlation",
+                    "--input",
+                    r#"{"namespace":"x","id":"input","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                    "--target",
+                    r#"{"namespace":"x","id":"target","sha256":null}"#,
+                    "--prior",
+                    "act_prior",
+                    "--relation",
+                    "supersedes",
+                    "--key",
+                    "key",
+                    "--as-user",
+                    "owner",
+                ],
+                "activation-declare",
+                &[
+                    "correlationKey",
+                    "domain",
+                    "idempotencyKey",
+                    "ownerUserId",
+                    "preparedInput",
+                    "priorActivationId",
+                    "relation",
+                    "rootAssignmentId",
+                    "target",
+                ],
+            ),
+            (
+                &[
+                    "activation-authority",
+                    "--activation",
+                    "act_1",
+                    "--after",
+                    "aev_1",
+                    "--assignment",
+                    "asg_actor",
+                    "--authorizer",
+                    r#"{"namespace":"x","id":"authorizer"}"#,
+                    "--basis",
+                    r#"{"namespace":"x","id":"basis","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                    "--decision",
+                    r#"{"namespace":"x","code":"authorized"}"#,
+                    "--key",
+                    "key",
+                    "--as-user",
+                    "owner",
+                ],
+                "activation-authority",
+                &[
+                    "activationId",
+                    "actorAssignmentId",
+                    "authorizer",
+                    "basis",
+                    "decision",
+                    "idempotencyKey",
+                    "predecessorEventId",
+                ],
+            ),
+            (
+                &[
+                    "activation-attempt",
+                    "--activation",
+                    "act_1",
+                    "--after",
+                    "aev_1",
+                    "--assignment",
+                    "asg_actor",
+                    "--authority-events",
+                    "aev_authority_1,aev_authority_2",
+                    "--executor",
+                    r#"{"namespace":"x","id":"executor"}"#,
+                    "--external-attempt",
+                    r#"{"namespace":"x","id":"attempt","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                    "--target-state-before",
+                    r#"{"namespace":"x","id":"before","sha256":null}"#,
+                    "--key",
+                    "key",
+                    "--as-user",
+                    "owner",
+                ],
+                "activation-attempt",
+                &[
+                    "activationId",
+                    "actorAssignmentId",
+                    "authorityEventIds",
+                    "executor",
+                    "externalAttempt",
+                    "idempotencyKey",
+                    "predecessorEventId",
+                    "targetStateBefore",
+                ],
+            ),
+            (
+                &[
+                    "activation-observe",
+                    "--activation",
+                    "act_1",
+                    "--after",
+                    "aev_1",
+                    "--assignment",
+                    "asg_actor",
+                    "--attempt",
+                    "aev_attempt",
+                    "--certainty",
+                    "determinate",
+                    "--result",
+                    r#"{"namespace":"x","code":"observed"}"#,
+                    "--target-state-after",
+                    r#"{"namespace":"x","id":"after","sha256":null}"#,
+                    "--outputs",
+                    r#"[{"namespace":"x","id":"output","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                    "--evidence",
+                    r#"{"namespace":"x","id":"evidence","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                    "--external-occurred-at",
+                    "123",
+                    "--key",
+                    "key",
+                    "--as-user",
+                    "owner",
+                ],
+                "activation-observe",
+                &[
+                    "activationId",
+                    "actorAssignmentId",
+                    "attemptEventId",
+                    "certainty",
+                    "evidence",
+                    "externalOccurredAtMs",
+                    "idempotencyKey",
+                    "outputs",
+                    "predecessorEventId",
+                    "result",
+                    "targetStateAfter",
+                ],
+            ),
+            (
+                &[
+                    "activation-reconcile",
+                    "--activation",
+                    "act_1",
+                    "--after",
+                    "aev_1",
+                    "--assignment",
+                    "asg_actor",
+                    "--observation",
+                    "aev_observation",
+                    "--certainty",
+                    "irrecoverable",
+                    "--result",
+                    r#"{"namespace":"x","code":"reconciled"}"#,
+                    "--target-state-after",
+                    "null",
+                    "--outputs",
+                    "[]",
+                    "--evidence",
+                    r#"{"namespace":"x","id":"evidence","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                    "--external-occurred-at",
+                    "null",
+                    "--key",
+                    "key",
+                    "--as-user",
+                    "owner",
+                ],
+                "activation-reconcile",
+                &[
+                    "activationId",
+                    "actorAssignmentId",
+                    "certainty",
+                    "evidence",
+                    "externalOccurredAtMs",
+                    "idempotencyKey",
+                    "observedEventId",
+                    "outputs",
+                    "predecessorEventId",
+                    "result",
+                    "targetStateAfter",
+                ],
+            ),
+            (
+                &[
+                    "activation-withdraw",
+                    "--activation",
+                    "act_1",
+                    "--after",
+                    "aev_1",
+                    "--assignment",
+                    "asg_actor",
+                    "--reason",
+                    r#"{"namespace":"x","code":"withdrawn"}"#,
+                    "--basis",
+                    r#"{"namespace":"x","id":"basis","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+                    "--key",
+                    "key",
+                    "--as-user",
+                    "owner",
+                ],
+                "activation-withdraw",
+                &[
+                    "activationId",
+                    "actorAssignmentId",
+                    "basis",
+                    "idempotencyKey",
+                    "predecessorEventId",
+                    "reason",
+                ],
+            ),
+            (
+                &[
+                    "activation-renotify",
+                    "--activation",
+                    "act_1",
+                    "--after",
+                    "aev_1",
+                    "--noticed-event",
+                    "aev_noticed",
+                    "--replaces-wake",
+                    "w_old",
+                    "--key",
+                    "key",
+                    "--as-user",
+                    "owner",
+                ],
+                "activation-renotify",
+                &[
+                    "activationId",
+                    "idempotencyKey",
+                    "noticedEventId",
+                    "predecessorEventId",
+                    "replacesWakeId",
+                ],
+            ),
+            (
+                &[
+                    "activation-ack",
+                    "--activation",
+                    "act_1",
+                    "--after",
+                    "aev_1",
+                    "--noticed-event",
+                    "aev_noticed",
+                    "--wake",
+                    "w_fired",
+                    "--key",
+                    "key",
+                    "--as-user",
+                    "owner",
+                ],
+                "activation-ack",
+                &[
+                    "acknowledgedWakeId",
+                    "activationId",
+                    "idempotencyKey",
+                    "noticedEventId",
+                    "predecessorEventId",
+                ],
+            ),
+            (
+                &[
+                    "activation-status",
+                    "--activation",
+                    "act_1",
+                    "--as-user",
+                    "owner",
+                ],
+                "activation-status",
+                &["activationId"],
+            ),
+            (&["activations", "--as-user", "owner"], "activations", &[]),
+            (
+                &["activations", "--assignment", "asg_1", "--as-user", "owner"],
+                "activations",
+                &["assignmentId"],
+            ),
+            (
+                &["activations", "--work-item", "wi_1", "--as-user", "owner"],
+                "activations",
+                &["workItemId"],
+            ),
+            (
+                &[
+                    "activations",
+                    "--correlation",
+                    "correlation",
+                    "--as-user",
+                    "owner",
+                ],
+                "activations",
+                &["correlationKey"],
+            ),
+        ];
+
+        for (arguments, expected_verb, expected_param_names) in cases {
+            let request: Value = serde_json::from_str(&body(arguments)).unwrap();
+            assert_eq!(request["asUser"], "owner", "arguments: {arguments:?}");
+            assert_eq!(request["verb"], expected_verb, "arguments: {arguments:?}");
+
+            let mut actual_param_names = request["params"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            actual_param_names.sort_unstable();
+            assert_eq!(
+                actual_param_names, expected_param_names,
+                "arguments: {arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn activation_dispatch_requires_the_advertised_capability_first() {
+        let command = parse(&[
+            "activation-status",
+            "--activation",
+            "act_1",
+            "--as-user",
+            "owner",
+        ]);
+        let endpoint = || {
+            Ok(Endpoint {
+                base: "https://gateway".to_owned(),
+                token: "tbc_test".to_owned(),
+                origin: Origin::Named,
+            })
+        };
+
+        let error = run_with(
+            command.clone(),
+            endpoint,
+            |_, request, _| {
+                assert_eq!(request.path, "/version");
+                assert_eq!(request.method, "GET");
+                Ok(Some(serde_json::json!({"protocolVersion": 1})))
+            },
+            |_, _| panic!("harness loader must not be called"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "capability_missing: activation-events-v1");
+
+        let calls = std::cell::RefCell::new(Vec::new());
+        run_with(
+            command,
+            endpoint,
+            |_, request, _| {
+                calls.borrow_mut().push(request.path);
+                if request.path == "/version" {
+                    Ok(Some(serde_json::json!({
+                        "protocolVersion": 1,
+                        "features": ["activation-events-v1"]
+                    })))
+                } else {
+                    Ok(None)
+                }
+            },
+            |_, _| panic!("harness loader must not be called"),
+        )
+        .unwrap();
+        assert_eq!(calls.into_inner(), ["/version", "/agent/dispatch"]);
+    }
+
+    #[test]
+    fn stale_activation_head_reports_the_winning_head() {
+        assert_eq!(
+            parse_response(
+                409,
+                r#"{"error":{"code":"activation_head_changed","currentHead":"aev_winner"}}"#
+            ),
+            Err("activation_head_changed: currentHead=aev_winner".to_owned())
+        );
     }
 
     #[test]
@@ -1734,6 +2718,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn bare_add_user_discovers_the_provisioned_gateway_without_a_session_identity() {
+        let command = Command::AddUser {
+            identity: Identity::Session,
+            user_id: "alice".to_owned(),
+            admin: false,
+        };
+
+        assert!(!requires_session_discovery(&command));
+        assert!(requires_session_discovery(&Command::List {
+            identity: Identity::Session,
+        }));
+    }
+
     /// The case the value comparison could not see.
     ///
     /// `--url` naming a remote gateway that happens to share the local token -- one org's
@@ -1781,10 +2779,6 @@ mod tests {
                 machine: Some("worker".to_owned())
             }
         ));
-        assert_eq!(
-            first_user_for_target(false, || panic!("remote target attempted local mutation")),
-            Ok(crate::users::FirstUser::Dispatch)
-        );
     }
 
     #[test]
@@ -2310,10 +3304,13 @@ mod tests {
                 "policy",
                 "--files",
                 "[\"lib/a.ex\",\"test/a_test.exs\"]",
+                "--report-to",
+                "agent:report s_1",
+                "--delivers-work-item",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","effectKind":"policy","files":["lib/a.ex","test/a_test.exs"]}}"#
+            r#"{"asUser":"flynn","verb":"assign","role":"builder","params":{"subject":"ship","idempotencyKey":"idem","workItemId":"wi_1","reviews":"asg_parent","effectKind":"policy","files":["lib/a.ex","test/a_test.exs"],"reportToSessionKey":"agent:report s_1","deliversWorkItem":true}}"#
         );
         assert_eq!(
             body(&[
@@ -2332,10 +3329,13 @@ mod tests {
                 "checkout",
                 "--key",
                 "idem",
+                "--report-to",
+                "agent:report s_1",
+                "--delivers-work-item",
                 "--as-user",
                 "flynn",
             ]),
-            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem"}}"#
+            r#"{"asUser":"flynn","verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"ship","brief":"Please ship it.","workItemId":"wi_1","effectKind":"release","workdirRoot":"checkout","idempotencyKey":"idem","reportToSessionKey":"agent:report s_1","deliversWorkItem":true}}"#
         );
         assert_eq!(
             body(&[
@@ -2354,8 +3354,25 @@ mod tests {
             r#"{"as":"parent","verb":"decision-requests","params":{"status":"open"}}"#
         );
         assert_eq!(
-            body(&["revoke-assignment", "asg_1", "--as", "parent",]),
-            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
+            body(&[
+                "decision-request",
+                "--request",
+                "dr_12345678-1234-4234-9234-123456789abc",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"decision-request","params":{"request":"dr_12345678-1234-4234-9234-123456789abc"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "revoke-assignment",
+                "asg_1",
+                "--reason",
+                "superseded by a new assignment",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1","reason":"superseded by a new assignment"}}"#
         );
         assert_eq!(
             body(&[
@@ -2380,6 +3397,29 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"assignments","sessionKey":"s1","params":{"state":"all"}}"#
         );
+        assert_eq!(
+            body(&[
+                "completion-notices",
+                "--status",
+                "open",
+                "--session",
+                "agent:child s_1",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"completion-notices","params":{"status":"open","sessionKey":"agent:child s_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "completion-disposition",
+                "cn_1",
+                "--decision",
+                "retain",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"completion-disposition","params":{"completionId":"cn_1","decision":"retain"}}"#
+        );
     }
 
     #[test]
@@ -2389,13 +3429,35 @@ mod tests {
                 "attest",
                 "asg_1",
                 "--kind",
-                "completion",
+                "cannot-proceed",
                 "--note",
-                "ready",
+                "waiting",
+                "--release-fact-kind",
+                "dependency-ready",
+                "--release-fact-scope",
+                "asg_1",
+                "--release-fact-principal-ref",
+                "agent:holder",
                 "--as",
                 "builder",
             ]),
-            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","note":"ready"}}"#
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"cannot-proceed","note":"waiting","releaseFactKind":"dependency-ready","releaseFactScope":"asg_1","releaseFactPrincipalRef":"agent:holder"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "completion",
+                "--note",
+                "ready",
+                "--key",
+                "completion-key",
+                "--as",
+                "builder",
+            ]),
+            r#"{"as":"builder","verb":"attest","params":{"assignmentId":"asg_1","kind":"completion","note":"ready","idempotencyKey":"completion-key"}}"#
         );
         assert_eq!(
             body(&[
@@ -2432,6 +3494,7 @@ mod tests {
     #[test]
     fn builds_byte_exact_work_item_bodies() {
         let sha = "a".repeat(64);
+        let class_a_sha = "d4e8260c8a82faf07ab2659e1f317bef961441af6ba43a4b9d1ef62fa01d4b86";
         assert_eq!(
             body(&[
                 "work-item-create",
@@ -2453,6 +3516,73 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
+            body(&["work-item-update", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "Retitled",
+                "--spec-sha256",
+                &sha,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Retitled","specRefSha256":"{sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "Together",
+                "--spec-ref",
+                "governing.md",
+                "--spec-sha256",
+                &sha,
+                "--priority",
+                "7",
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Together","specRefName":"governing.md","specRefSha256":"{sha}","priority":7}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_6d418db1-26b4-4ad0-9886-86e757e93342",
+                "--spec-ref",
+                "patrol-failure-classification-and-escalation-v1.md",
+                "--spec-sha256",
+                class_a_sha,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_6d418db1-26b4-4ad0-9886-86e757e93342","specRefName":"patrol-failure-classification-and-escalation-v1.md","specRefSha256":"{class_a_sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null}}"#
+        );
+        assert_eq!(
+            body(&["breathing", "assignment", "asg_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"breathing","params":{"targetKind":"assignment","targetId":"asg_1"}}"#
+        );
+        assert_eq!(
             body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-trace","params":{"workItemId":"wi_1"}}"#
         );
@@ -2469,6 +3599,41 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Ship","idempotencyKey":"k1"}}"#
         );
         assert_eq!(
+            body(&[
+                "work-item-create",
+                "--title",
+                "Urgent",
+                "--priority",
+                "7",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Urgent","priority":7}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--priority",
+                "2",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","priority":2}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--priority",
+                "1",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null,"priority":1}}"#
+        );
+        assert_eq!(
             body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-icebox","params":{"workItemId":"wi_1"}}"#
         );
@@ -2477,8 +3642,19 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-reopen","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
-            body(&["work-item-close", "wi_1", "--as-user", "flynn"]),
-            r#"{"asUser":"flynn","verb":"work-item-close","params":{"workItemId":"wi_1"}}"#
+            body(&[
+                "work-item-close",
+                "wi_1",
+                "--completion-attest",
+                "att_1",
+                "--owner-ruling-reason",
+                "accept the narrower claim",
+                "--key",
+                "close-key",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-close","params":{"workItemId":"wi_1","completionAttestId":"att_1","ownerRulingReason":"accept the narrower claim","idempotencyKey":"close-key"}}"#
         );
         assert_eq!(
             body(&[
@@ -2509,6 +3685,21 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
+        );
+        assert_eq!(
+            body(&["config", "get", "default-priority", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"default-priority"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "default-priority",
+                "6",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-priority","value":6}}"#
         );
     }
 
@@ -2946,6 +4137,71 @@ mod tests {
                     .display()
                     .to_string()
             )
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_identity_reads_only_the_nearest_session_key() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_identity_{unique}"));
+        let cwd = root.join("nested").join("work");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"url":"https://ancestor.example","token":"ancestor-must-not-escape","sessionKey":"agent:coder:x s_ancestor"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("nested").join(".tightbeam-session"),
+            r#"{"url":"https://nested.example","token":"nested-must-not-escape","sessionKey":"agent:coder:x s_nested"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            current_session_key_from(&cwd),
+            Ok("agent:coder:x s_nested".to_owned())
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_identity_refuses_missing_or_malformed_session_identity() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tightbeam_cli_bad_identity_{unique}"));
+        let cwd = root.join("nested");
+        fs::create_dir_all(&cwd).unwrap();
+
+        assert!(
+            current_session_key_from(&cwd)
+                .unwrap_err()
+                .starts_with("session identity unavailable")
+        );
+
+        fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"url":"https://gateway.example","token":"must-not-escape"}"#,
+        )
+        .unwrap();
+        assert!(
+            current_session_key_from(&cwd)
+                .unwrap_err()
+                .contains("missing sessionKey")
+        );
+
+        fs::write(root.join(".tightbeam-session"), "{").unwrap();
+        assert!(
+            current_session_key_from(&cwd)
+                .unwrap_err()
+                .starts_with("malformed session file")
         );
 
         fs::remove_dir_all(root).unwrap();

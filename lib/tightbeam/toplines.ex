@@ -2,11 +2,9 @@ defmodule Tightbeam.Toplines do
   @moduledoc """
   Durable human-intent Toplines and explicit Work membership.
 
-  This module is the only runtime writer for the Topline rows in this tranche.
-  `ensure_schema/1` is intentionally callable by focused tests and integration;
-  production boot registration and the packaged Unicode 15.1 SQLite functions
-  are a later, separately owned seam. Until that seam lands, validation here is
-  authoritative for runtime writes and these tables are not exposed at boot.
+  This module owns the runtime Topline persistence seam. Production boot calls
+  the closed V5 schema activator after the database connection registers the
+  deterministic Unicode title functions.
 
   The old read-only work telemetry remains byte-compatible through `roster/2`
   and `topline/2`, which delegate to `Tightbeam.ExecutionMap`.
@@ -14,6 +12,14 @@ defmodule Tightbeam.Toplines do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
+  alias Tightbeam.Toplines.Schema, as: ToplinesSchema
+
+  @firehose_sources %{
+    "topline_created" => "topline.created",
+    "work_linked" => "topline_work_membership.linked",
+    "work_unlinked" => "topline_work_membership.unlinked"
+  }
 
   @white_space [
     0x0009,
@@ -43,101 +49,178 @@ defmodule Tightbeam.Toplines do
     0x3000
   ]
 
-  @ddl """
-  CREATE TABLE IF NOT EXISTS toplines (
-    id               TEXT PRIMARY KEY CHECK (substr(id, 1, 3) = 'tl_'),
-    ownerUserId      TEXT NOT NULL REFERENCES users(userId),
-    title            TEXT NOT NULL CHECK (typeof(title) = 'text' AND length(title) BETWEEN 1 AND 2000),
-    state            TEXT NOT NULL CHECK (state IN ('open','closed')),
-    createdActorKind TEXT NOT NULL CHECK (createdActorKind IN ('user','session')),
-    createdActorRef  TEXT NOT NULL CHECK (length(trim(createdActorRef)) > 0),
-    createdAt        INTEGER NOT NULL CHECK (typeof(createdAt) = 'integer'),
-    updatedAt        INTEGER NOT NULL CHECK (typeof(updatedAt) = 'integer' AND updatedAt >= createdAt),
-    closedAt         INTEGER,
-    CHECK (
-      (state = 'open' AND closedAt IS NULL) OR
-      (state = 'closed' AND typeof(closedAt) = 'integer' AND closedAt >= createdAt)
-    )
-  );
+  @spec ensure_schema(DB.server()) :: :ok | {:error, map()}
+  def ensure_schema(db \\ Tightbeam.DB), do: ToplinesSchema.activate(db)
 
-  CREATE UNIQUE INDEX IF NOT EXISTS toplines_id_owner
-    ON toplines (id, ownerUserId);
-  CREATE UNIQUE INDEX IF NOT EXISTS work_items_id_owner
-    ON work_items (id, ownerUserId);
-
-  CREATE TABLE IF NOT EXISTS topline_work_memberships (
-    id                TEXT PRIMARY KEY CHECK (substr(id, 1, 4) = 'tlm_'),
-    toplineId         TEXT NOT NULL,
-    workItemId        TEXT NOT NULL,
-    ownerUserId       TEXT NOT NULL,
-    linkReason        TEXT NOT NULL CHECK (length(trim(linkReason)) BETWEEN 1 AND 4000),
-    linkedActorKind   TEXT NOT NULL CHECK (linkedActorKind IN ('user','session')),
-    linkedActorRef    TEXT NOT NULL CHECK (length(trim(linkedActorRef)) > 0),
-    linkedAt          INTEGER NOT NULL CHECK (typeof(linkedAt) = 'integer'),
-    unlinkReason      TEXT,
-    unlinkedActorKind TEXT,
-    unlinkedActorRef  TEXT,
-    unlinkedAt        INTEGER,
-    FOREIGN KEY (toplineId, ownerUserId) REFERENCES toplines(id, ownerUserId),
-    FOREIGN KEY (workItemId, ownerUserId) REFERENCES work_items(id, ownerUserId),
-    CHECK (
-      (unlinkedAt IS NULL AND unlinkReason IS NULL AND unlinkedActorKind IS NULL AND unlinkedActorRef IS NULL) OR
-      (unlinkedAt IS NOT NULL AND unlinkReason IS NOT NULL AND
-       unlinkedActorKind IS NOT NULL AND unlinkedActorRef IS NOT NULL AND
-       typeof(unlinkedAt) = 'integer' AND unlinkedAt >= linkedAt AND
-       length(trim(unlinkReason)) BETWEEN 1 AND 4000 AND
-       unlinkedActorKind IN ('user','session') AND length(trim(unlinkedActorRef)) > 0)
-    )
-  );
-
-  CREATE UNIQUE INDEX IF NOT EXISTS topline_memberships_active_pair
-    ON topline_work_memberships (toplineId, workItemId)
-    WHERE unlinkedAt IS NULL;
-  CREATE UNIQUE INDEX IF NOT EXISTS topline_memberships_id_topline
-    ON topline_work_memberships (id, toplineId);
-  CREATE INDEX IF NOT EXISTS topline_memberships_work_active
-    ON topline_work_memberships (workItemId)
-    WHERE unlinkedAt IS NULL;
-
-  CREATE TABLE IF NOT EXISTS topline_events (
-    toplineId   TEXT NOT NULL REFERENCES toplines(id),
-    seq         INTEGER NOT NULL CHECK (typeof(seq) = 'integer' AND seq >= 1),
-    kind        TEXT NOT NULL CHECK (kind IN ('topline_created','work_linked','work_unlinked')),
-    membershipId TEXT,
-    actorKind   TEXT NOT NULL CHECK (actorKind IN ('user','session')),
-    actorRef    TEXT NOT NULL CHECK (length(trim(actorRef)) > 0),
-    reason      TEXT,
-    eventAt     INTEGER NOT NULL CHECK (typeof(eventAt) = 'integer'),
-    detail      TEXT NOT NULL CHECK (json_valid(detail) AND json_type(detail) = 'object'),
-    PRIMARY KEY (toplineId, seq),
-    FOREIGN KEY (membershipId, toplineId)
-      REFERENCES topline_work_memberships(id, toplineId),
-    CHECK (
-      (kind = 'topline_created' AND membershipId IS NULL AND reason IS NULL) OR
-      (kind IN ('work_linked','work_unlinked') AND membershipId IS NOT NULL AND
-       length(trim(reason)) BETWEEN 1 AND 4000)
-    )
-  );
-
-  CREATE TABLE IF NOT EXISTS topline_idempotency (
-    callerUserId       TEXT NOT NULL REFERENCES users(userId),
-    operation          TEXT NOT NULL CHECK (operation IN ('topline-create','topline-link-work','topline-unlink-work')),
-    idempotencyKey     TEXT NOT NULL CHECK (length(trim(idempotencyKey)) BETWEEN 1 AND 200),
-    requestFingerprint TEXT NOT NULL CHECK (length(requestFingerprint) = 64),
-    canonicalResponse  TEXT NOT NULL CHECK (json_valid(canonicalResponse)),
-    PRIMARY KEY (callerUserId, operation, idempotencyKey)
-  );
-  """
-
-  @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  @doc false
+  @spec firehose_sources() :: %{String.t() => String.t()}
+  def firehose_sources, do: @firehose_sources
 
   @doc false
   def __handle__(db, "topline-create", call), do: create(db, call)
+  def __handle__(db, "topline-update", call), do: update(db, call)
+  def __handle__(db, "topline-close", call), do: close(db, call)
+  def __handle__(db, "topline-reopen", call), do: reopen(db, call)
   def __handle__(db, "topline-link-work", call), do: link_work(db, call)
   def __handle__(db, "topline-unlink-work", call), do: unlink_work(db, call)
+  def __handle__(db, "topline-concern-create", call), do: create_concern(db, call)
+  def __handle__(db, "topline-concern-update", call), do: update_concern(db, call)
+  def __handle__(db, "topline-concern-resolve", call), do: resolve_concern(db, call)
+  def __handle__(db, "topline-concern-reopen", call), do: reopen_concern(db, call)
+  def __handle__(db, "topline-concern-link-work", call), do: link_concern_work(db, call)
+  def __handle__(db, "topline-concern-unlink-work", call), do: unlink_concern_work(db, call)
   def __handle__(db, "toplines", call), do: list(db, call)
   def __handle__(db, "topline", call), do: get(db, call)
+
+  @doc "Query visible durable Toplines for the shared REST read seam."
+  @spec query_public(DB.server(), map()) :: [map()] | map()
+  def query_public(db, selection) when is_map(selection) do
+    principal = Map.get(selection, :principal)
+    states = Map.get(selection, :state)
+
+    with {:ok, caller} <- caller(db, principal),
+         {:ok, states} <- public_states(states) do
+      {owner_sql, owner_params} = owner_filter(caller, "t")
+      {state_sql, state_params} = public_state_filter(states, length(owner_params) + 1)
+
+      {:ok, rows} =
+        DB.query(
+          db,
+          summary_sql("WHERE 1 = 1 #{owner_sql} #{state_sql} ORDER BY t.createdAt ASC, t.id ASC"),
+          owner_params ++ state_params
+        )
+
+      Enum.map(rows, fn row ->
+        item = summary(row)
+
+        %{
+          topline: item,
+          work_memberships: active_memberships(db, item.id),
+          concerns: concerns(db, item.id),
+          dependency_vector: dependency_vector(db, item.id)
+        }
+      end)
+    end
+  end
+
+  @doc "Project one queried Topline to the closed REST state item."
+  @spec public_item(map()) :: map()
+  def public_item(%{
+        topline: topline,
+        work_memberships: memberships,
+        concerns: concerns,
+        dependency_vector: vector
+      }) do
+    %{
+      id: topline.id,
+      ownerUserId: topline.ownerUserId,
+      title: topline.title,
+      state: topline.state,
+      createdActor: topline.createdActor,
+      createdAt: topline.createdAt,
+      updatedAt: topline.updatedAt,
+      closedAt: topline.closedAt,
+      activeWorkCount: topline.activeWorkCount,
+      openConcernCount: topline.openConcernCount,
+      workMemberships: memberships,
+      concerns:
+        Enum.map(concerns, fn concern ->
+          %{
+            id: concern.id,
+            kind: concern.state,
+            note: concern.title,
+            createdAt: concern.createdAt
+          }
+        end),
+      dependencyVersion: sha256(canonical_json(vector))
+    }
+  end
+
+  @doc "Insert one placement episode through Lane 1's frozen transaction seam."
+  @spec open_placement_in_txn(Txn.t(), map()) :: map()
+  def open_placement_in_txn(%Txn{} = txn, attrs) when is_map(attrs) do
+    source_seq = Map.get(attrs, :source_causal_event_seq)
+    cause = Map.fetch!(attrs, :cause)
+    work_item_id = Map.fetch!(attrs, :work_item_id)
+
+    if cause == "reopened" do
+      require_reopen_source!(txn, source_seq, work_item_id)
+    end
+
+    [[history_seq]] = Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM causal_events")
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO topline_placement_obligations
+        (id, workItemId, ownerUserId, cause, causeRef, sourceCausalEventSeq,
+         historyCausalSeq, openedActorKind, openedActorRef, state,
+         openedAt, dueAt, promptWakeId)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?10, ?10, ?11)
+      """,
+      [
+        Map.fetch!(attrs, :id),
+        work_item_id,
+        Map.fetch!(attrs, :owner_user_id),
+        cause,
+        Map.fetch!(attrs, :cause_ref),
+        source_seq,
+        history_seq,
+        Map.fetch!(attrs, :actor_kind),
+        Map.fetch!(attrs, :actor_ref),
+        Map.fetch!(attrs, :at),
+        Map.fetch!(attrs, :prompt_wake_id)
+      ]
+    )
+
+    placement_in_txn(txn, Map.fetch!(attrs, :id))
+  end
+
+  @doc "Resolve a pending placement through Lane 1's frozen transaction seam."
+  @spec resolve_placement_in_txn(Txn.t(), map()) :: map() | nil
+  def resolve_placement_in_txn(%Txn{} = txn, attrs) when is_map(attrs) do
+    work_item_id = Map.fetch!(attrs, :work_item_id)
+    resolution_seq = Map.get(attrs, :resolution_causal_event_seq)
+
+    if Map.fetch!(attrs, :actor_kind) == "process" do
+      require_terminal_source!(txn, resolution_seq, work_item_id, Map.fetch!(attrs, :reason))
+    end
+
+    [[history_seq]] = Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM causal_events")
+
+    case Txn.q(
+           txn,
+           "SELECT id FROM topline_placement_obligations WHERE workItemId = ?1 AND state = 'pending'",
+           [work_item_id]
+         ) do
+      [] ->
+        nil
+
+      [[id]] ->
+        Txn.q(
+          txn,
+          """
+          UPDATE topline_placement_obligations
+          SET state = ?2, resolutionActorKind = ?3, resolutionActorRef = ?4,
+              resolutionReason = ?5, resolvedAt = ?6,
+              resolutionCausalEventSeq = ?7, historyCausalSeq = ?8
+          WHERE id = ?1 AND state = 'pending'
+          """,
+          [
+            id,
+            Map.fetch!(attrs, :state),
+            Map.fetch!(attrs, :actor_kind),
+            Map.fetch!(attrs, :actor_ref),
+            Map.fetch!(attrs, :reason),
+            Map.fetch!(attrs, :at),
+            resolution_seq,
+            history_seq
+          ]
+        )
+
+        placement_in_txn(txn, id)
+    end
+  end
 
   @spec roster(DB.server(), map()) :: map()
   defdelegate roster(db, call), to: Tightbeam.ExecutionMap
@@ -181,8 +264,143 @@ defmodule Tightbeam.Toplines do
                 [topline_id, caller.user, title, caller.actor_kind, caller.actor_ref, now]
               )
 
-              append_event(txn, topline_id, "topline_created", nil, caller, nil, now, %{
-                title: title
+              append_event(
+                txn,
+                firehose_hub(call),
+                topline_id,
+                "topline_created",
+                nil,
+                nil,
+                nil,
+                caller,
+                nil,
+                now,
+                %{title: title}
+              )
+
+              response = %{topline: summary_in_txn(txn, topline_id)}
+              remember(txn, caller.user, operation, key, fingerprint, response)
+              response
+          end
+        end
+      end)
+    end
+  end
+
+  @spec update(DB.server(), map()) :: map()
+  def update(db, call) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:idempotency_key, :reason, :title, :topline_id]),
+         :ok <- valid_id(param(params, :topline_id), "tl_"),
+         {:ok, title} <- canonical_title(param(params, :title)),
+         :ok <- valid_reason(param(params, :reason)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      topline_id = param(params, :topline_id)
+      reason = param(params, :reason)
+      key = param(params, :idempotency_key)
+
+      fingerprint =
+        fingerprint("topline-update", %{reason: reason, title: title, toplineId: topline_id})
+
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, topline} <- visible_topline(txn, topline_id, caller) do
+          case replay(txn, caller.user, "topline-update", key, fingerprint) do
+            {:ok, response} ->
+              response
+
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+            :new when title == topline.title ->
+              error("no_change", "no change")
+
+            :new when topline.state != "open" ->
+              error("topline_closed", "topline is closed")
+
+            :new ->
+              now = mutation_time(call)
+
+              Txn.q(txn, "UPDATE toplines SET title = ?2, updatedAt = ?3 WHERE id = ?1", [
+                topline_id,
+                title,
+                now
+              ])
+
+              append_event(
+                txn,
+                topline_id,
+                "topline_renamed",
+                nil,
+                nil,
+                nil,
+                caller,
+                reason,
+                now,
+                %{
+                  fromTitle: topline.title,
+                  toTitle: title
+                }
+              )
+
+              response = %{topline: summary_in_txn(txn, topline_id)}
+              remember(txn, caller.user, "topline-update", key, fingerprint, response)
+              response
+          end
+        end
+      end)
+    end
+  end
+
+  @spec close(DB.server(), map()) :: map()
+  def close(db, call), do: change_state(db, call, "topline-close", "open", "closed")
+
+  @spec reopen(DB.server(), map()) :: map()
+  def reopen(db, call), do: change_state(db, call, "topline-reopen", "closed", "open")
+
+  defp change_state(db, call, operation, from_state, to_state) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:idempotency_key, :reason, :topline_id]),
+         :ok <- valid_id(param(params, :topline_id), "tl_"),
+         :ok <- valid_reason(param(params, :reason)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      topline_id = param(params, :topline_id)
+      reason = param(params, :reason)
+      key = param(params, :idempotency_key)
+      fingerprint = fingerprint(operation, %{reason: reason, toplineId: topline_id})
+
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, topline} <- visible_topline(txn, topline_id, caller) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
+
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+            :new when topline.state != from_state ->
+              error("invalid_transition", "invalid state transition")
+
+            :new ->
+              now = mutation_time(call)
+              closed_at = if to_state == "closed", do: now, else: nil
+
+              Txn.q(
+                txn,
+                "UPDATE toplines SET state = ?2, updatedAt = ?3, closedAt = ?4 WHERE id = ?1",
+                [topline_id, to_state, now, closed_at]
+              )
+
+              kind = if to_state == "closed", do: "topline_closed", else: "topline_reopened"
+
+              append_event(txn, topline_id, kind, nil, nil, nil, caller, reason, now, %{
+                fromState: from_state,
+                toState: to_state
               })
 
               response = %{topline: summary_in_txn(txn, topline_id)}
@@ -265,9 +483,12 @@ defmodule Tightbeam.Toplines do
 
                   append_event(
                     txn,
+                    firehose_hub(call),
                     topline_id,
                     "work_linked",
                     membership_id,
+                    nil,
+                    nil,
                     caller,
                     reason,
                     now,
@@ -319,6 +540,8 @@ defmodule Tightbeam.Toplines do
               else
                 now = mutation_time(call)
 
+                references = active_concern_references_for_membership(txn, membership_id)
+
                 Txn.q(
                   txn,
                   """
@@ -334,17 +557,31 @@ defmodule Tightbeam.Toplines do
 
                 append_event(
                   txn,
+                  firehose_hub(call),
                   membership.topline_id,
                   "work_unlinked",
                   membership_id,
+                  nil,
+                  nil,
                   caller,
                   reason,
                   now,
                   %{workItemId: membership.work_item_id, unlinkReason: reason}
                 )
 
+                Enum.each(references, fn reference ->
+                  end_concern_reference(
+                    txn,
+                    reference,
+                    caller,
+                    reason,
+                    now,
+                    "membership_unlinked"
+                  )
+                end)
+
                 response = %{
-                  endedConcernReferenceIds: [],
+                  endedConcernReferenceIds: Enum.map(references, & &1.id),
                   membership: membership_in_txn(txn, membership_id),
                   openedPlacement: nil
                 }
@@ -352,6 +589,364 @@ defmodule Tightbeam.Toplines do
                 remember(txn, caller.user, operation, key, fingerprint, response)
                 response
               end
+          end
+        end
+      end)
+    end
+  end
+
+  @spec create_concern(DB.server(), map()) :: map()
+  def create_concern(db, call) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:idempotency_key, :title, :topline_id]),
+         :ok <- valid_id(param(params, :topline_id), "tl_"),
+         {:ok, title} <- canonical_title(param(params, :title)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      topline_id = param(params, :topline_id)
+      key = param(params, :idempotency_key)
+      operation = "topline-concern-create"
+      fingerprint = fingerprint(operation, %{title: title, toplineId: topline_id})
+
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, topline} <- visible_topline(txn, topline_id, caller) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
+
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+            :new when topline.state != "open" ->
+              error("topline_closed", "topline is closed")
+
+            :new ->
+              now = mutation_time(call)
+              concern_id = id("tlc_")
+
+              Txn.q(
+                txn,
+                """
+                INSERT INTO topline_concerns
+                  (id, toplineId, title, state, createdActorKind, createdActorRef,
+                   createdAt, updatedAt)
+                VALUES (?1, ?2, ?3, 'open', ?4, ?5, ?6, ?6)
+                """,
+                [concern_id, topline_id, title, caller.actor_kind, caller.actor_ref, now]
+              )
+
+              touch_topline(txn, topline_id, now)
+
+              append_event(
+                txn,
+                topline_id,
+                "concern_created",
+                nil,
+                concern_id,
+                nil,
+                caller,
+                nil,
+                now,
+                %{title: title}
+              )
+
+              response = %{concern: concern_in_txn(txn, concern_id)}
+              remember(txn, caller.user, operation, key, fingerprint, response)
+              response
+          end
+        end
+      end)
+    end
+  end
+
+  @spec update_concern(DB.server(), map()) :: map()
+  def update_concern(db, call) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:concern_id, :idempotency_key, :reason, :title]),
+         :ok <- valid_id(param(params, :concern_id), "tlc_"),
+         {:ok, title} <- canonical_title(param(params, :title)),
+         :ok <- valid_reason(param(params, :reason)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      concern_id = param(params, :concern_id)
+      reason = param(params, :reason)
+      key = param(params, :idempotency_key)
+      operation = "topline-concern-update"
+
+      fingerprint =
+        fingerprint(operation, %{concernId: concern_id, reason: reason, title: title})
+
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, concern} <- visible_concern(txn, concern_id, caller) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
+
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+            :new when concern.topline_state != "open" ->
+              error("topline_closed", "topline is closed")
+
+            :new when concern.title == title ->
+              error("no_change", "no change")
+
+            :new when concern.state != "open" ->
+              error("invalid_transition", "invalid state transition")
+
+            :new ->
+              now = mutation_time(call)
+
+              Txn.q(txn, "UPDATE topline_concerns SET title = ?2, updatedAt = ?3 WHERE id = ?1", [
+                concern_id,
+                title,
+                now
+              ])
+
+              touch_topline(txn, concern.topline_id, now)
+
+              append_event(
+                txn,
+                concern.topline_id,
+                "concern_renamed",
+                nil,
+                concern_id,
+                nil,
+                caller,
+                reason,
+                now,
+                %{fromTitle: concern.title, toTitle: title}
+              )
+
+              response = %{concern: concern_in_txn(txn, concern_id)}
+              remember(txn, caller.user, operation, key, fingerprint, response)
+              response
+          end
+        end
+      end)
+    end
+  end
+
+  @spec resolve_concern(DB.server(), map()) :: map()
+  def resolve_concern(db, call),
+    do: change_concern_state(db, call, "topline-concern-resolve", "open", "resolved")
+
+  @spec reopen_concern(DB.server(), map()) :: map()
+  def reopen_concern(db, call),
+    do: change_concern_state(db, call, "topline-concern-reopen", "resolved", "open")
+
+  defp change_concern_state(db, call, operation, from_state, to_state) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:concern_id, :idempotency_key, :reason]),
+         :ok <- valid_id(param(params, :concern_id), "tlc_"),
+         :ok <- valid_reason(param(params, :reason)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      concern_id = param(params, :concern_id)
+      reason = param(params, :reason)
+      key = param(params, :idempotency_key)
+      fingerprint = fingerprint(operation, %{concernId: concern_id, reason: reason})
+
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, concern} <- visible_concern(txn, concern_id, caller) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
+
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+            :new when to_state == "open" and concern.topline_state != "open" ->
+              error("topline_closed", "topline is closed")
+
+            :new when concern.state != from_state ->
+              error("invalid_transition", "invalid state transition")
+
+            :new ->
+              now = mutation_time(call)
+
+              if to_state == "resolved" do
+                Txn.q(
+                  txn,
+                  """
+                  UPDATE topline_concerns
+                  SET state = 'resolved', updatedAt = ?2, resolveReason = ?3,
+                      resolvedActorKind = ?4, resolvedActorRef = ?5, resolvedAt = ?2
+                  WHERE id = ?1
+                  """,
+                  [concern_id, now, reason, caller.actor_kind, caller.actor_ref]
+                )
+              else
+                Txn.q(
+                  txn,
+                  """
+                  UPDATE topline_concerns
+                  SET state = 'open', updatedAt = ?2, resolveReason = NULL,
+                      resolvedActorKind = NULL, resolvedActorRef = NULL, resolvedAt = NULL
+                  WHERE id = ?1
+                  """,
+                  [concern_id, now]
+                )
+              end
+
+              touch_topline(txn, concern.topline_id, now)
+              kind = if to_state == "resolved", do: "concern_resolved", else: "concern_reopened"
+
+              append_event(
+                txn,
+                concern.topline_id,
+                kind,
+                nil,
+                concern_id,
+                nil,
+                caller,
+                reason,
+                now,
+                %{fromState: from_state, toState: to_state}
+              )
+
+              response = %{concern: concern_in_txn(txn, concern_id)}
+              remember(txn, caller.user, operation, key, fingerprint, response)
+              response
+          end
+        end
+      end)
+    end
+  end
+
+  @spec link_concern_work(DB.server(), map()) :: map()
+  def link_concern_work(db, call) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:concern_id, :idempotency_key, :membership_id, :reason]),
+         :ok <- valid_id(param(params, :concern_id), "tlc_"),
+         :ok <- valid_id(param(params, :membership_id), "tlm_"),
+         :ok <- valid_reason(param(params, :reason)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      concern_id = param(params, :concern_id)
+      membership_id = param(params, :membership_id)
+      reason = param(params, :reason)
+      key = param(params, :idempotency_key)
+      operation = "topline-concern-link-work"
+
+      fingerprint =
+        fingerprint(operation, %{
+          concernId: concern_id,
+          membershipId: membership_id,
+          reason: reason
+        })
+
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, concern} <- visible_concern(txn, concern_id, caller),
+             {:ok, membership} <- visible_membership(txn, membership_id, caller),
+             :ok <- same_topline(concern, membership) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
+
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+            :new when concern.topline_state != "open" ->
+              error("topline_closed", "topline is closed")
+
+            :new when concern.state != "open" or not is_nil(membership.unlinked_at) ->
+              error("invalid_transition", "invalid state transition")
+
+            :new ->
+              if active_concern_reference?(txn, concern_id, membership_id) do
+                error("concern_reference_exists", "active concern reference already exists")
+              else
+                now = mutation_time(call)
+                reference_id = id("tlcr_")
+
+                Txn.q(
+                  txn,
+                  """
+                  INSERT INTO topline_concern_refs
+                    (id, toplineId, concernId, membershipId, linkReason,
+                     linkedActorKind, linkedActorRef, linkedAt)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                  """,
+                  [
+                    reference_id,
+                    concern.topline_id,
+                    concern_id,
+                    membership_id,
+                    reason,
+                    caller.actor_kind,
+                    caller.actor_ref,
+                    now
+                  ]
+                )
+
+                touch_topline(txn, concern.topline_id, now)
+
+                append_event(
+                  txn,
+                  concern.topline_id,
+                  "concern_work_linked",
+                  membership_id,
+                  concern_id,
+                  reference_id,
+                  caller,
+                  reason,
+                  now,
+                  %{membershipId: membership_id, linkReason: reason}
+                )
+
+                response = %{concernReference: concern_reference_in_txn(txn, reference_id)}
+                remember(txn, caller.user, operation, key, fingerprint, response)
+                response
+              end
+          end
+        end
+      end)
+    end
+  end
+
+  @spec unlink_concern_work(DB.server(), map()) :: map()
+  def unlink_concern_work(db, call) do
+    params = Map.get(call, :params, %{})
+
+    with {:ok, caller} <- caller(db, Map.get(call, :principal)),
+         :ok <- valid_shape(params, [:concern_ref_id, :idempotency_key, :reason]),
+         :ok <- valid_id(param(params, :concern_ref_id), "tlcr_"),
+         :ok <- valid_reason(param(params, :reason)),
+         :ok <- valid_key(param(params, :idempotency_key)) do
+      reference_id = param(params, :concern_ref_id)
+      reason = param(params, :reason)
+      key = param(params, :idempotency_key)
+      operation = "topline-concern-unlink-work"
+      fingerprint = fingerprint(operation, %{concernRefId: reference_id, reason: reason})
+
+      transaction!(db, fn txn ->
+        with {:ok, caller} <- reauthorize(txn, caller),
+             {:ok, reference} <- visible_concern_reference(txn, reference_id, caller) do
+          case replay(txn, caller.user, operation, key, fingerprint) do
+            {:ok, response} ->
+              response
+
+            :conflict ->
+              error("idempotency_conflict", "idempotency key conflicts with a prior request")
+
+            :new when not is_nil(reference.unlinked_at) ->
+              error("concern_reference_ended", "concern reference is already ended")
+
+            :new ->
+              now = mutation_time(call)
+              end_concern_reference(txn, reference, caller, reason, now, "explicit")
+              response = %{concernReference: concern_reference_in_txn(txn, reference_id)}
+              remember(txn, caller.user, operation, key, fingerprint, response)
+              response
           end
         end
       end)
@@ -406,7 +1001,7 @@ defmodule Tightbeam.Toplines do
             row
             |> summary()
             |> Map.put(:workMemberships, active_memberships(db, topline_id))
-            |> Map.put(:concerns, [])
+            |> Map.put(:concerns, concerns(db, topline_id))
 
           detail =
             if param(params, :history) == true,
@@ -423,7 +1018,9 @@ defmodule Tightbeam.Toplines do
     SELECT t.id, t.ownerUserId, t.title, t.state, t.createdActorKind,
            t.createdActorRef, t.createdAt, t.updatedAt, t.closedAt,
            (SELECT COUNT(*) FROM topline_work_memberships m
-            WHERE m.toplineId = t.id AND m.unlinkedAt IS NULL)
+            WHERE m.toplineId = t.id AND m.unlinkedAt IS NULL),
+           (SELECT COUNT(*) FROM topline_concerns c
+            WHERE c.toplineId = t.id AND c.state = 'open')
     FROM toplines t
     #{where}
     """
@@ -434,7 +1031,62 @@ defmodule Tightbeam.Toplines do
     summary(row)
   end
 
-  defp summary([id, owner, title, state, actor_kind, actor_ref, created, updated, closed, count]) do
+  defp dependency_vector(db, topline_id) do
+    {:ok, [[topline_version]]} =
+      DB.query(
+        db,
+        "SELECT COALESCE(MAX(seq), 0) FROM topline_events WHERE toplineId = ?1",
+        [topline_id]
+      )
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT m.id,
+               (SELECT seq FROM topline_events e
+                WHERE e.toplineId = m.toplineId AND e.membershipId = m.id
+                  AND e.kind = 'work_linked'),
+               wi.id,
+               COALESCE((SELECT rowVersion FROM work_item_versions v
+                         WHERE v.workItemId = wi.id), wi.createdAt)
+        FROM topline_work_memberships m
+        JOIN work_items wi ON wi.id = m.workItemId
+        WHERE m.toplineId = ?1 AND m.unlinkedAt IS NULL
+        ORDER BY m.id ASC
+        """,
+        [topline_id]
+      )
+
+    membership_entries =
+      Enum.map(rows, fn [membership_id, version, _work_id, _work_item_row_version] ->
+        ["topline work memberships", membership_id, version]
+      end)
+
+    work_entries =
+      rows
+      |> Enum.map(fn [_membership_id, _version, work_id, work_item_row_version] ->
+        ["work items", work_id, work_item_row_version]
+      end)
+      |> Enum.uniq()
+
+    [["toplines", topline_id, topline_version] | membership_entries ++ work_entries]
+    |> Enum.sort()
+  end
+
+  defp summary([
+         id,
+         owner,
+         title,
+         state,
+         actor_kind,
+         actor_ref,
+         created,
+         updated,
+         closed,
+         work_count,
+         concern_count
+       ]) do
     %{
       id: id,
       ownerUserId: owner,
@@ -444,8 +1096,8 @@ defmodule Tightbeam.Toplines do
       createdAt: created,
       updatedAt: updated,
       closedAt: closed,
-      activeWorkCount: count,
-      openConcernCount: 0
+      activeWorkCount: work_count,
+      openConcernCount: concern_count
     }
   end
 
@@ -511,13 +1163,215 @@ defmodule Tightbeam.Toplines do
     }
   end
 
+  defp concern_in_txn(txn, concern_id) do
+    [row] = Txn.q(txn, concern_sql("WHERE c.id = ?1"), [concern_id])
+    concern(row)
+  end
+
+  defp concerns(db, topline_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        concern_sql("WHERE c.toplineId = ?1 ORDER BY c.createdAt ASC, c.id ASC"),
+        [topline_id]
+      )
+
+    Enum.map(rows, &concern/1)
+  end
+
+  defp concern_sql(where) do
+    """
+    SELECT c.id, c.toplineId, c.title, c.state, c.createdActorKind,
+           c.createdActorRef, c.createdAt, c.updatedAt, c.resolveReason,
+           c.resolvedActorKind, c.resolvedActorRef, c.resolvedAt,
+           COALESCE((SELECT json_group_array(id) FROM (
+             SELECT r.id AS id FROM topline_concern_refs r
+             WHERE r.concernId = c.id AND r.unlinkedAt IS NULL ORDER BY r.id ASC
+           )), '[]')
+    FROM topline_concerns c
+    #{where}
+    """
+  end
+
+  defp concern([
+         id,
+         topline_id,
+         title,
+         state,
+         created_kind,
+         created_ref,
+         created_at,
+         updated_at,
+         resolve_reason,
+         resolved_kind,
+         resolved_ref,
+         resolved_at,
+         reference_ids
+       ]) do
+    %{
+      activeConcernReferenceIds: JSON.decode!(reference_ids),
+      createdActor: actor(created_kind, created_ref),
+      createdAt: created_at,
+      id: id,
+      resolveReason: resolve_reason,
+      resolvedActor: actor(resolved_kind, resolved_ref),
+      resolvedAt: resolved_at,
+      state: state,
+      title: title,
+      toplineId: topline_id,
+      updatedAt: updated_at
+    }
+  end
+
+  defp concern_reference_in_txn(txn, reference_id) do
+    [row] = Txn.q(txn, concern_reference_sql("WHERE r.id = ?1"), [reference_id])
+    concern_reference(row)
+  end
+
+  defp concern_reference_sql(where) do
+    """
+    SELECT r.id, r.toplineId, r.concernId, r.membershipId, r.linkReason,
+           r.linkedActorKind, r.linkedActorRef, r.linkedAt, r.unlinkReason,
+           r.unlinkedActorKind, r.unlinkedActorRef, r.unlinkedAt
+    FROM topline_concern_refs r
+    #{where}
+    """
+  end
+
+  defp concern_reference([
+         id,
+         topline_id,
+         concern_id,
+         membership_id,
+         link_reason,
+         linked_kind,
+         linked_ref,
+         linked_at,
+         unlink_reason,
+         unlinked_kind,
+         unlinked_ref,
+         unlinked_at
+       ]) do
+    %{
+      concernId: concern_id,
+      id: id,
+      linkReason: link_reason,
+      linkedActor: actor(linked_kind, linked_ref),
+      linkedAt: linked_at,
+      membershipId: membership_id,
+      toplineId: topline_id,
+      unlinkReason: unlink_reason,
+      unlinkedActor: actor(unlinked_kind, unlinked_ref),
+      unlinkedAt: unlinked_at
+    }
+  end
+
+  defp placement_in_txn(txn, id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT p.cause, p.causeRef, p.dueAt, p.id, p.openedActorKind,
+                  p.openedActorRef, p.openedAt, p.ownerUserId, p.promptWakeId,
+                  w.state, p.resolutionActorKind, p.resolutionActorRef,
+                  p.resolutionReason, p.resolvedAt, p.state, p.workItemId, wi.title
+           FROM topline_placement_obligations p
+           JOIN wakes w ON w.wakeId = p.promptWakeId
+           JOIN work_items wi ON wi.id = p.workItemId
+           WHERE p.id = ?1
+           """,
+           [id]
+         ) do
+      [
+        [
+          cause,
+          cause_ref,
+          due_at,
+          placement_id,
+          opened_kind,
+          opened_ref,
+          opened_at,
+          owner,
+          wake_id,
+          wake_state,
+          resolution_kind,
+          resolution_ref,
+          resolution_reason,
+          resolved_at,
+          state,
+          work_item_id,
+          work_title
+        ]
+      ] ->
+        %{
+          cause: cause,
+          causeRef: cause_ref,
+          dueAt: due_at,
+          id: placement_id,
+          openedActor: actor(opened_kind, opened_ref),
+          openedAt: opened_at,
+          ownerUserId: owner,
+          promptWake: %{id: wake_id, state: wake_state},
+          resolutionActor: actor(resolution_kind, resolution_ref),
+          resolutionReason: resolution_reason,
+          resolvedAt: resolved_at,
+          state: state,
+          workItemId: work_item_id,
+          workItemTitle: work_title
+        }
+
+      [] ->
+        nil
+    end
+  end
+
+  defp require_reopen_source!(txn, seq, work_item_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT 1 FROM causal_events
+           WHERE seq = ?1 AND jobRef = ?2 AND kind = 'disposition_transition'
+             AND json_extract(detail, '$.workItemId') = ?2
+             AND json_extract(detail, '$.fromState') = 'iceboxed'
+             AND json_extract(detail, '$.toState') = 'open'
+           """,
+           [seq, work_item_id]
+         ) do
+      [[1]] -> :ok
+      [] -> raise "reopened placement source causal event does not match the work item"
+    end
+  end
+
+  defp require_terminal_source!(txn, seq, work_item_id, reason) do
+    to_state =
+      case reason do
+        "reupgrade_terminal_reconciliation_closed" -> "closed"
+        "reupgrade_terminal_reconciliation_failed" -> "failed"
+        "reupgrade_terminal_reconciliation_iceboxed" -> "iceboxed"
+        _ -> raise "invalid process placement resolution reason"
+      end
+
+    case Txn.q(
+           txn,
+           """
+           SELECT 1 FROM causal_events
+           WHERE seq = ?1 AND jobRef = ?2 AND kind = 'disposition_transition'
+             AND json_extract(detail, '$.workItemId') = ?2
+             AND json_extract(detail, '$.toState') = ?3
+           """,
+           [seq, work_item_id, to_state]
+         ) do
+      [[1]] -> :ok
+      [] -> raise "terminal placement source causal event does not match the work item"
+    end
+  end
+
   defp history(db, topline_id) do
     {:ok, rows} =
       DB.query(
         db,
         """
-        SELECT toplineId, seq, kind, membershipId, actorKind, actorRef,
-               reason, eventAt, detail
+        SELECT toplineId, seq, kind, membershipId, concernId, concernReferenceId,
+               actorKind, actorRef, reason, eventAt, detail
         FROM topline_events
         WHERE toplineId = ?1
         ORDER BY seq ASC
@@ -528,12 +1382,24 @@ defmodule Tightbeam.Toplines do
     Enum.map(rows, &event/1)
   end
 
-  defp event([topline_id, seq, kind, membership_id, actor_kind, actor_ref, reason, at, detail]) do
+  defp event([
+         topline_id,
+         seq,
+         kind,
+         membership_id,
+         concern_id,
+         concern_reference_id,
+         actor_kind,
+         actor_ref,
+         reason,
+         at,
+         detail
+       ]) do
     %{
       actor: actor(actor_kind, actor_ref),
       at: at,
-      concernId: nil,
-      concernReferenceId: nil,
+      concernId: concern_id,
+      concernReferenceId: concern_reference_id,
       detail: atomize_keys(JSON.decode!(detail)),
       kind: kind,
       membershipId: membership_id,
@@ -543,7 +1409,18 @@ defmodule Tightbeam.Toplines do
     }
   end
 
-  defp append_event(txn, topline_id, kind, membership_id, caller, reason, at, detail) do
+  defp append_event(
+         txn,
+         topline_id,
+         kind,
+         membership_id,
+         concern_id,
+         concern_reference_id,
+         caller,
+         reason,
+         at,
+         detail
+       ) do
     [[seq]] =
       Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) + 1 FROM topline_events WHERE toplineId = ?1", [
         topline_id
@@ -553,20 +1430,75 @@ defmodule Tightbeam.Toplines do
       txn,
       """
       INSERT INTO topline_events
-        (toplineId, seq, kind, membershipId, actorKind, actorRef, reason, eventAt, detail)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        (toplineId, seq, kind, membershipId, concernId, concernReferenceId,
+         actorKind, actorRef, reason, eventAt, detail)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
       """,
       [
         topline_id,
         seq,
         kind,
         membership_id,
+        concern_id,
+        concern_reference_id,
         caller.actor_kind,
         caller.actor_ref,
         reason,
         at,
         canonical_json(detail)
       ]
+    )
+
+    seq
+  end
+
+  defp append_event(
+         txn,
+         hub,
+         topline_id,
+         kind,
+         membership_id,
+         concern_id,
+         concern_reference_id,
+         caller,
+         reason,
+         at,
+         detail
+       ) do
+    seq =
+      append_event(
+        txn,
+        topline_id,
+        kind,
+        membership_id,
+        concern_id,
+        concern_reference_id,
+        caller,
+        reason,
+        at,
+        detail
+      )
+
+    refs =
+      case kind do
+        "topline_created" ->
+          %{"toplineId" => topline_id}
+
+        kind when kind in ["work_linked", "work_unlinked"] ->
+          %{
+            "toplineId" => topline_id,
+            "membershipId" => membership_id,
+            "workItemId" => Map.fetch!(detail, :workItemId)
+          }
+      end
+
+    Publisher.source_invalidation_in_txn(
+      txn,
+      hub,
+      Map.fetch!(@firehose_sources, kind),
+      seq,
+      at,
+      refs
     )
   end
 
@@ -576,13 +1508,13 @@ defmodule Tightbeam.Toplines do
     rows =
       Txn.q(
         txn,
-        "SELECT id, ownerUserId, state FROM toplines WHERE id = ?1 #{shifted_owner_filter(owner_sql, 1)}",
+        "SELECT id, ownerUserId, title, state FROM toplines WHERE id = ?1 #{shifted_owner_filter(owner_sql, 1)}",
         [id | owner_params]
       )
 
     case rows do
-      [[topline_id, owner, state]] ->
-        {:ok, %{id: topline_id, owner_user_id: owner, state: state}}
+      [[topline_id, owner, title, state]] ->
+        {:ok, %{id: topline_id, owner_user_id: owner, title: title, state: state}}
 
       [] ->
         error("not_found", "record not found")
@@ -635,6 +1567,125 @@ defmodule Tightbeam.Toplines do
     end
   end
 
+  defp visible_concern(txn, id, caller) do
+    {owner_sql, owner_params} = owner_filter(caller, "t")
+
+    case Txn.q(
+           txn,
+           """
+           SELECT c.id, c.toplineId, c.title, c.state, t.state
+           FROM topline_concerns c
+           JOIN toplines t ON t.id = c.toplineId
+           WHERE c.id = ?1 #{shifted_owner_filter(owner_sql, 1)}
+           """,
+           [id | owner_params]
+         ) do
+      [[concern_id, topline_id, title, state, topline_state]] ->
+        {:ok,
+         %{
+           id: concern_id,
+           topline_id: topline_id,
+           title: title,
+           state: state,
+           topline_state: topline_state
+         }}
+
+      [] ->
+        error("not_found", "record not found")
+    end
+  end
+
+  defp visible_concern_reference(txn, id, caller) do
+    {owner_sql, owner_params} = owner_filter(caller, "t")
+
+    case Txn.q(
+           txn,
+           """
+           SELECT r.id, r.toplineId, r.concernId, r.membershipId, r.unlinkedAt
+           FROM topline_concern_refs r
+           JOIN toplines t ON t.id = r.toplineId
+           WHERE r.id = ?1 #{shifted_owner_filter(owner_sql, 1)}
+           """,
+           [id | owner_params]
+         ) do
+      [[reference_id, topline_id, concern_id, membership_id, unlinked_at]] ->
+        {:ok,
+         %{
+           id: reference_id,
+           topline_id: topline_id,
+           concern_id: concern_id,
+           membership_id: membership_id,
+           unlinked_at: unlinked_at
+         }}
+
+      [] ->
+        error("not_found", "record not found")
+    end
+  end
+
+  defp active_concern_reference?(txn, concern_id, membership_id) do
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM topline_concern_refs WHERE concernId = ?1 AND membershipId = ?2 AND unlinkedAt IS NULL",
+           [concern_id, membership_id]
+         ) do
+      [[1]] -> true
+      [] -> false
+    end
+  end
+
+  defp active_concern_references_for_membership(txn, membership_id) do
+    txn
+    |> Txn.q(
+      """
+      SELECT id, toplineId, concernId, membershipId, unlinkedAt
+      FROM topline_concern_refs
+      WHERE membershipId = ?1 AND unlinkedAt IS NULL
+      ORDER BY id ASC
+      """,
+      [membership_id]
+    )
+    |> Enum.map(fn [id, topline_id, concern_id, membership_id, unlinked_at] ->
+      %{
+        id: id,
+        topline_id: topline_id,
+        concern_id: concern_id,
+        membership_id: membership_id,
+        unlinked_at: unlinked_at
+      }
+    end)
+  end
+
+  defp end_concern_reference(txn, reference, caller, reason, now, cause) do
+    Txn.q(
+      txn,
+      """
+      UPDATE topline_concern_refs
+      SET unlinkReason = ?2, unlinkedActorKind = ?3,
+          unlinkedActorRef = ?4, unlinkedAt = ?5
+      WHERE id = ?1 AND unlinkedAt IS NULL
+      """,
+      [reference.id, reason, caller.actor_kind, caller.actor_ref, now]
+    )
+
+    touch_topline(txn, reference.topline_id, now)
+
+    append_event(
+      txn,
+      reference.topline_id,
+      "concern_work_unlinked",
+      reference.membership_id,
+      reference.concern_id,
+      reference.id,
+      caller,
+      reason,
+      now,
+      %{membershipId: reference.membership_id, unlinkReason: reason, cause: cause}
+    )
+
+    :ok
+  end
+
   defp active_membership?(txn, topline_id, work_item_id) do
     case Txn.q(
            txn,
@@ -653,6 +1704,9 @@ defmodule Tightbeam.Toplines do
 
   defp same_owner(%{owner_user_id: owner}, %{owner_user_id: owner}), do: :ok
   defp same_owner(_, _), do: error("owner_mismatch", "topline and work item owners differ")
+
+  defp same_topline(%{topline_id: topline_id}, %{topline_id: topline_id}), do: :ok
+  defp same_topline(_, _), do: error("topline_mismatch", "concern and membership toplines differ")
 
   defp replay(txn, user, operation, key, fingerprint) do
     case Txn.q(
@@ -831,6 +1885,32 @@ defmodule Tightbeam.Toplines do
   defp state_filter("all", _position), do: {"", []}
   defp state_filter(state, position), do: {"AND t.state = ?#{position}", [state]}
 
+  defp public_states(nil), do: {:ok, nil}
+
+  defp public_states(states) when is_list(states) do
+    normalized =
+      states
+      |> Enum.uniq()
+      |> Enum.sort_by(fn state -> Enum.find_index(~w(open closed), &(&1 == state)) end)
+
+    if normalized != [] and Enum.all?(normalized, &(&1 in ~w(open closed))),
+      do: {:ok, normalized},
+      else: error("invalid_message", "invalid message")
+  end
+
+  defp public_states(_), do: error("invalid_message", "invalid message")
+
+  defp public_state_filter(nil, _position), do: {"", []}
+
+  defp public_state_filter(states, position) do
+    placeholders =
+      states
+      |> Enum.with_index(position)
+      |> Enum.map_join(",", fn {_state, index} -> "?#{index}" end)
+
+    {"AND t.state IN (#{placeholders})", states}
+  end
+
   defp list_state(nil), do: {:ok, "open"}
   defp list_state(state) when state in ~w(open closed all), do: {:ok, state}
   defp list_state(_), do: error("invalid_message", "invalid message")
@@ -856,6 +1936,8 @@ defmodule Tightbeam.Toplines do
 
   defp param_key(key) when is_atom(key), do: key
   defp param_key("idempotencyKey"), do: :idempotency_key
+  defp param_key("concernId"), do: :concern_id
+  defp param_key("concernRefId"), do: :concern_ref_id
   defp param_key("membershipId"), do: :membership_id
   defp param_key("toplineId"), do: :topline_id
   defp param_key("workItemId"), do: :work_item_id
@@ -870,6 +1952,8 @@ defmodule Tightbeam.Toplines do
   end
 
   defp camel_key(:idempotency_key), do: "idempotencyKey"
+  defp camel_key(:concern_id), do: "concernId"
+  defp camel_key(:concern_ref_id), do: "concernRefId"
   defp camel_key(:membership_id), do: "membershipId"
   defp camel_key(:topline_id), do: "toplineId"
   defp camel_key(:work_item_id), do: "workItemId"
@@ -933,8 +2017,16 @@ defmodule Tightbeam.Toplines do
   defp actor(nil, nil), do: nil
   defp actor(kind, ref), do: %{kind: kind, ref: ref}
 
-  defp mutation_time(_call), do: System.system_time(:millisecond)
+  defp mutation_time(call) do
+    case Map.get(call, :now) do
+      now when is_integer(now) and now >= 0 -> now
+      _ -> System.system_time(:millisecond)
+    end
+  end
+
   defp id(prefix), do: prefix <> Tightbeam.Id.uuid4()
+  defp firehose_hub(call), do: Map.get(call, :firehose_hub, Tightbeam.Firehose.Hub)
+  defp sha256(value), do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do

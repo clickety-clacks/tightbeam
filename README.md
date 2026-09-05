@@ -34,6 +34,21 @@ Three properties make that safe to trust:
 Tightbeam is a standalone service: install it and run it, the way you would
 a database.
 
+## External-agent operation skill
+
+Choose one transport edition for an external agent:
+
+- [Current-line CLI edition](priv/skills/tightbeam-cli/SKILL.md)
+- [REST 0.2.0 edition](priv/skills/tightbeam-rest-0-2-0/SKILL.md)
+
+Copy that edition's whole directory to `.codex/skills/<skill-name>/` or
+`.claude/skills/<skill-name>/` in the external agent's project. Keep the directory name
+and `SKILL.md` filename unchanged. Start a fresh agent session after the copy so the agent
+rediscovers the skill metadata.
+
+The skill does not install Tightbeam, create a session, supply a credential, operate a
+kungfu bundle, or change a Tightbeam identity. Provision those prerequisites separately.
+
 ## Two ways to install
 
 **From a release package** (below) — a per-platform npm tarball carrying the
@@ -222,7 +237,9 @@ sha256sum -c SHA256SUMS --ignore-missing
 shasum -a 256 -c SHA256SUMS --ignore-missing
 ```
 
-Install the verified package:
+For an existing installation, complete the review in
+[UPGRADING AN EARLIER INSTALLATION](#upgrading-an-earlier-installation) before
+installing the verified package. For a fresh installation:
 
 ```sh
 npm install -g ./tightbeam-<version>-<os>-<arch>-<commit>.tgz
@@ -256,6 +273,84 @@ refuses. `npm install -g` installs both in npm's global bin directory. If you
 want easy access to the Tightbeam CLI, make sure npm's global bin directory is
 in your `PATH`. Tightbeam does not change your `PATH` for you. Nothing else is
 added to the machine, and neither Elixir nor Rust is needed to run either one.
+
+### UPGRADING AN EARLIER INSTALLATION
+
+Review runtime overrides before replacing an existing installation. A persisted
+override can select an older executable instead of a new adapter's bundled
+runtime. Cleanup is conditional: keep intentional pins that the target supports.
+
+1. Inventory every host and harness before the upgrade. As an admin, run:
+
+   ```sh
+   tightbeam host-env-list --as-user <adminUserId>
+   ```
+
+   Record each persisted `CODEX_PATH` and `CLAUDE_CODE_EXECUTABLE` value,
+   including its host and harness. Separately inspect the gateway service's
+   environment: systemd unit, drop-ins and environment files, or launchd plist.
+   Record those values too; your interactive shell is not the service environment.
+   Keep the record private if other environment entries contain secrets.
+
+2. Record the current Tightbeam package/build, each effective harness executable
+   path, exact version and SHA-256, and each installed ACP adapter's exact package version.
+   Retain the prior runtime/package and service configuration for rollback.
+   Check the target's release notes and compatibility evidence for those exact
+   runtime/adapter combinations. Do not infer compatibility from a branch name
+   or assume an upgrade refreshes every adapter.
+
+3. Keep each intentional, supported pin. Remove an override only when you confirm
+   it was temporary, is obsolete for the target, and its replacement is compatible.
+   For a persisted host/harness overlay, use the matching command below; replace
+   the placeholders with the recorded host and admin user:
+
+   ```sh
+   tightbeam host-env-unset --host <host> --harness codex CODEX_PATH --as-user <adminUserId>
+   tightbeam host-env-unset --host <host> --harness claude CLAUDE_CODE_EXECUTABLE --as-user <adminUserId>
+   ```
+
+   These commands remove only the named overlay. They do not edit a service's
+   environment. Remove an obsolete service override separately from its recorded
+   configuration source, using that service manager's configuration reload procedure.
+   Removing one source can expose a value from another; inspect both.
+
+4. Wait until affected sessions finish their turns before activation. An overlay
+   change takes effect on the next adapter start; it does not replace a running
+   adapter. Install the verified target package using the release instructions
+   above, then restart the installed service as documented there. Apply the same
+   idle boundary to affected remote adapters before their next start.
+   Do not treat a successful unset or an active service as proof of activation.
+
+5. After activation, verify the effective executable path, exact runtime
+   version and SHA-256 for each affected host/harness, plus the adapter package version.
+   Use the actual adapter launch/process information and the selected binary's
+   version output and file hash, not just the executable on your shell's PATH.
+   Package-managed vendor paths can move or contain different bytes after an
+   update; a saved path alone does not pin a runtime version.
+   Run one real model turn per affected host/harness. Verify the expected hook
+   fires and enforces its result, then resume an existing session and verify
+   its conversation continues. Record the results before calling the upgrade
+   successful. This checklist is not proof that an untested release works.
+
+**Recorded upgrade example (2026-09-05):** Gibson's Codex overlay was saved
+with reported runtime version `0.153.2` and SHA-256
+`f8786262ebc0fa1337448a2977332beadec66c8d0cda0ce973c7849766d7943c`.
+The prior overlay was absent. The saved override was not activated, and no
+production restart occurred. Its path points into the package-managed
+`@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`
+tree. For a 0.1.9 upgrade, review this override using the steps above: remove
+it only if obsolete, retain it if intentional and compatible, and verify
+the effective version and hash after activation. This record does not prove
+0.1.9 compatibility. A separate disposable gateway's partial test results
+do not establish production activation or complete gateway verification.
+
+If verification fails, stop the rollout. Restore each changed overlay to its
+recorded value with `tightbeam host-env-set --host <host> --harness <harness>
+'NAME=previous-value' --as-user <adminUserId>`. Restore the prior service
+environment and compatible runtime/adapter versions through the supported
+installation procedure. Use the same idle/restart boundary and repeat verification.
+Check the target's state-migration rollback restrictions before reverting a
+Tightbeam package; restoring an executable alone does not undo a database migration.
 
 ### Cutting a release
 
@@ -336,28 +431,74 @@ terminal.
 
 ### Connect your first client — do this BEFORE onboarding
 
-A fresh org has no users. The first user becomes the admin through either of
-these bootstrap paths:
+A fresh org supports two bootstrap sequences. Choose one.
 
-- For an agent-driven install on the box, create the user locally:
+For a human-first install:
 
-  ```sh
-  <base_dir>/bin/tightbeam add-user <userId>
-  ```
+1. Start the gateway.
+2. Point the client at `TIGHTBEAM_ADVERTISED_URL` and pair with the intended
+   user name.
+3. Verify that pairing created the admin user and that user's built-in `Main`.
+4. Onboard provider credentials as that admin.
+5. Learn the working identity.
+6. Send a real turn to `Main`.
+7. Add later users through authenticated `tightbeam add-user` requests.
 
-  This empty-org exception is local to the box. After the first user exists,
-  the same command uses ordinary admin authentication, for example
-  `tightbeam add-user <userId> --as-user <adminUserId>`; pass `--admin` when the
-  new user should also be an admin.
-- For a human with a client, point it at `TIGHTBEAM_ADVERTISED_URL` and pair
-  with a claimed name. The first client is auto-approved and its user becomes
-  the admin immediately, with no approval step because nobody exists to
-  approve it yet.
+For a headless install on the gateway host:
 
-Do one of these first. Onboarding is admin-only, so it fails with
-`forbidden: admin required` until the first admin exists.
+1. Start the gateway, then reserve the intended first user locally:
+
+   ```sh
+   <base_dir>/bin/tightbeam add-user <userId>
+   ```
+
+2. The gateway creates the forced-admin user and built-in `Main`. `tightbeam doctor`
+   reports the cold-start state as `reserved`.
+3. Complete the authorized headless onboarding or spawn flow.
+4. Pair a client with the same normalized user name.
+5. Verify that `tightbeam doctor` reports the state as `claimed`.
+6. Onboard credentials, learn the identity, and send a real turn to `Main`.
+7. Add later users through authenticated `tightbeam add-user` requests.
+
+The bare `add-user` command is a loopback-only gateway request. It never writes
+SQLite directly. A remote bare request is refused. After cold start, use an
+explicit authenticated identity, for example `tightbeam add-user <userId>
+--as-user <adminUserId>`. Pass `--admin` only when the later user must also be
+an admin.
+
+Do one sequence first. Onboarding is admin-only, so it fails with `forbidden:
+admin required` until the first admin exists.
 
 Every client after this one pairs as `pending` and must be approved by the admin.
+
+A replay-capable client keeps its claim replay secret until its first
+authenticated handshake succeeds. If the first pairing response is lost, it
+repeats the exact pair request with that secret. A legacy client, or a client
+that loses the secret, receives `bootstrap_closed`. Use the recovery below
+only when that fresh installation is safe to discard.
+
+### Recover an unusable fresh database
+
+Use this recovery only for an incomplete identity graph or a lost first-pair
+response before activation in a fresh installation that the operator intends
+to discard. The database contains organization identity, sessions, work, and
+audit history. Restore or investigate a non-fresh database instead of
+resetting it.
+
+1. Stop the gateway.
+2. Locate `state.db` and its `state.db-wal` and `state.db-shm` companions, if
+   they exist.
+3. Verify that no gateway process still has the database open.
+4. Move the complete database set to a timestamped backup directory. Do not
+   delete it.
+5. Keep the gateway configuration, authentication files, binaries, and
+   provider credentials in place.
+6. Restart the gateway and run `tightbeam doctor`. Verify that cold start is
+   `open`.
+7. Choose the human-first or headless sequence above.
+8. Verify exactly one admin user, one allowlisted first device, one complete
+   cold-start receipt, and one active, self-parented built-in `Main` for that
+   user.
 
 ### Then onboard a credential, per provider
 

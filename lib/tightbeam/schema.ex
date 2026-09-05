@@ -16,13 +16,18 @@ defmodule Tightbeam.Schema do
     Tightbeam.SubagentMarkers,
     Tightbeam.Escalation,
     Tightbeam.Wakes,
+    Tightbeam.NoticeBatcher,
     Tightbeam.Projection,
     Tightbeam.Org,
+    Tightbeam.ColdStart,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
     Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
+    Tightbeam.DeliverableContract,
+    Tightbeam.Productions.CompletionEscalation,
+    Tightbeam.Activations,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
     Tightbeam.RecurrenceSuppression,
@@ -31,7 +36,10 @@ defmodule Tightbeam.Schema do
     Tightbeam.WorkState,
     Tightbeam.Productions.BubbleSweeper,
     Tightbeam.HarnessProcess,
-    Tightbeam.AdminProjection
+    Tightbeam.AdminProjection,
+    Tightbeam.HarnessHealth,
+    Tightbeam.Toplines,
+    Tightbeam.Premises
   ]
 
   # The shape this build writes. Bump it when a production table changes in a
@@ -70,11 +78,72 @@ defmodule Tightbeam.Schema do
   # `CREATE TABLE IF NOT EXISTS`, so a v3 database must refuse by name rather
   # than failing on the first return with a raw column/CHECK error.
   # The operational-parent port adds a required `sessions.operationalParent`
-  # column. The v4 stamp remains its exact predecessor. Artifact digest
-  # integrity adds the substrate-authored `contentSha256Verified` bit; v5 is
-  # its exact predecessor, and the existing v4 upgrade composes through v5.
-  @shape "coordination-fabric-v1-phase1-v6"
-  @previous_shape "coordination-fabric-v1-phase1-v5"
+  # column. The v4 stamp is the one exact predecessor that upgrade accepts.
+  # The nullable transcript discriminator adds `messages.messageType`; v6 is
+  # its one exact predecessor, and historical rows remain null.
+  # Terminal operator decisions advance v7 to v8. Nullable effective parent
+  # then relaxes the stored parent constraint from that exact predecessor.
+  # Identity render stamps advance v9 to v10, and the effort-request exit CHECK
+  # advances v10 to v11. The session projection amendment then materializes
+  # mechanical status from its sole durable input and advances v11 to v12.
+  # Ruled-decision integrity then rebuilds `decision_requests` from that exact
+  # shape, so a ruled status cannot exist without its decision, ruler, and time.
+  # Cannot-proceed first advances v13 to v14 while preserving historical
+  # surrender rows and widening typed wake cancellation for release facts.
+  #
+  # Completion escalation adds the immutable assignment report-to declaration,
+  # completion-owned tables, and the `completion_transition` cancellation
+  # classification. SQLite cannot widen those existing shapes in place. The
+  # reviewed R17 boundary therefore refuses every predecessor and recreates at
+  # v15; the older named migration helpers remain explicit test seams only.
+  # The deliverable contract adds companion tables and advances the exact v15
+  # predecessor transactionally to v16.
+  #
+  # The strict false-premise park gate adds three NEW tables — `premise_claims`,
+  # `premise_checks`, `park_premises` — and widens nothing that already exists.
+  # It advances the exact v16 predecessor to v17. It is now a FROZEN seam:
+  # `upgrade_premise_gate_v1/1` still exists and stamps a FIXED v17 target
+  # (`@effort_generator_retirement_previous_shape`), but `check_shape` no longer
+  # dispatches to it — a v16 database is refused by name, exactly as v15 is. The
+  # seam test exercises it directly; boot walks only the immediate predecessor.
+  #
+  # The effort-generator-retirement rebuild adds the four nullable retirement
+  # fields and the all-or-none retirement CHECK on `effort_checkin_generations`,
+  # plus the `effort_checkin_wake_ownership` relation, advancing the exact v17
+  # predecessor transactionally to the fixed v18 completion predecessor. It is
+  # now a frozen seam: the function remains public, but boot no longer wires it.
+  #
+  # The terminal empty-epoch and bounded-recipient revision changes the
+  # completion-owned tables again. Its v18 predecessor advances to the fixed
+  # v19 principal-duty predecessor only when both completion-owned tables are
+  # empty. The function remains a public seam, but boot no longer wires it.
+  #
+  # The Stall 4.10 principal duty adds immutable work-item provenance,
+  # exactly-once duty receipts, and bounded horizon state. Its v19 predecessor
+  # is the current one-step boot arm; the migration creates those additive
+  # objects, backfills existing work-item provenance, and stamps v20 in the same
+  # transaction.
+  # Artifact digest evidence adds one bit in v21. Historical migration seams
+  # keep their fixed destinations; boot composes v19 through v20 to v21.
+  @shape "coordination-fabric-v1-phase1-v21"
+  @artifact_digest_previous_shape "coordination-fabric-v1-phase1-v20"
+  @principal_duty_previous_shape "coordination-fabric-v1-phase1-v19"
+  @completion_escalation_previous_shape "coordination-fabric-v1-phase1-v18"
+  @completion_escalation_label "incompatible_completion_escalation_v1"
+  @effort_generator_retirement_previous_shape "coordination-fabric-v1-phase1-v17"
+  @premise_gate_previous_shape "coordination-fabric-v1-phase1-v16"
+  @premise_gate_label "incompatible_premise_gate_v1"
+  @completion_previous_shape "coordination-fabric-v1-phase1-v14"
+  @cannot_proceed_previous_shape "coordination-fabric-v1-phase1-v13"
+  @ruled_decision_integrity_previous_shape "coordination-fabric-v1-phase1-v12"
+  @session_mechanical_status_previous_shape "coordination-fabric-v1-phase1-v11"
+  @effort_request_exit_previous_shape "coordination-fabric-v1-phase1-v10"
+  @identity_render_stamp_previous_shape "coordination-fabric-v1-phase1-v9"
+  @nullable_effective_parent_previous_shape "coordination-fabric-v1-phase1-v8"
+  @terminal_decision_previous_shape "coordination-fabric-v1-phase1-v7"
+  @message_type_previous_shape "coordination-fabric-v1-phase1-v6"
+  @cold_start_previous_shape "coordination-fabric-v1-phase1-v5"
+  @operational_parent_shape "coordination-fabric-v1-phase1-v5"
   @operational_parent_previous_shape "coordination-fabric-v1-phase1-v4"
 
   @supervision_liveness_objects [
@@ -164,6 +233,7 @@ defmodule Tightbeam.Schema do
         ),
         retirementPrincipal TEXT,
         retirementActionNeeded INTEGER CHECK (retirementActionNeeded IN (0,1)),
+        rootTurnSeq INTEGER REFERENCES turns(seq),
         CHECK (
           (controllerOrigin IS NULL AND wakeKind IS NULL AND controllerState IS NULL AND
            chargedGeneration IS NULL)
@@ -215,14 +285,14 @@ defmodule Tightbeam.Schema do
         requesterKind TEXT NOT NULL CHECK (requesterKind IN ('user','session','process')),
         requesterId TEXT NOT NULL,
         reasonKind TEXT NOT NULL CHECK (reasonKind IN (
-          'requester_withdrew','superseded','obligation_disposed',
+          'requester_withdrew','superseded','obligation_disposed','cannot_proceed_released',
           'routing_bracket_satisfied','target_retired','production_unmatched',
           'consumer_unavailable','target_unresolvable'
         )),
         causalSourceKind TEXT NOT NULL CHECK (causalSourceKind IN (
           'verb_call','wake','progress_attest','condition_fact','assignment_transition',
           'work_item_transition','decision_request','monitor_generation','routing_bracket',
-          'session_transition','scheduler_delivery'
+          'session_transition','scheduler_delivery','completion_transition'
         )),
         causalSourceId TEXT NOT NULL,
         outcomeKind TEXT NOT NULL CHECK (
@@ -231,7 +301,7 @@ defmodule Tightbeam.Schema do
         replacementWakeId TEXT REFERENCES wakes(wakeId) DEFERRABLE INITIALLY DEFERRED,
         dispositionKind TEXT CHECK (dispositionKind IN (
           'assignment_transition','work_item_transition',
-          'decision_request_transition','monitor_generation_transition'
+          'decision_request_transition','monitor_generation_transition','completion_transition'
         )),
         dispositionId TEXT,
         primaryWorkKind TEXT CHECK (primaryWorkKind IN ('assignment','work_item')),
@@ -264,6 +334,13 @@ defmodule Tightbeam.Schema do
            ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
              livenessTriggerId IS NOT NULL AND actionNeeded = 1)
             OR
+            (workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND
+             livenessTriggerId IS NULL AND actionNeeded = 0 AND
+             requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND
+             reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND
+             dispositionKind = 'decision_request_transition' AND
+             causalSourceId = dispositionId)
+            OR
             (workImpactKind != 'linked_work_open' AND livenessTriggerKind IS NULL AND
              livenessTriggerId IS NULL AND actionNeeded = 0)))
           OR
@@ -293,8 +370,21 @@ defmodule Tightbeam.Schema do
              outcomeKind IN ('replacement','disposition'))
             OR
             (requesterId = 'tightbeam:assignments' AND
-             reasonKind = 'obligation_disposed' AND causalSourceKind = 'assignment_transition' AND
-             outcomeKind = 'disposition')
+             ((reasonKind = 'obligation_disposed' AND
+               causalSourceKind = 'assignment_transition' AND outcomeKind = 'disposition')
+              OR
+              (reasonKind = 'cannot_proceed_released' AND
+               causalSourceKind = 'condition_fact' AND outcomeKind = 'no_replacement')))
+            OR
+            (requesterId = 'tightbeam:completion-escalation' AND
+             ((reasonKind = 'superseded' AND causalSourceKind = 'wake' AND
+               outcomeKind = 'replacement')
+              OR
+              (reasonKind = 'obligation_disposed' AND
+               causalSourceKind = 'completion_transition' AND outcomeKind = 'disposition')
+              OR
+              (reasonKind = 'target_unresolvable' AND
+               causalSourceKind = 'scheduler_delivery' AND outcomeKind = 'no_replacement')))
             OR
             (requesterId = 'tightbeam:effort-checkin' AND
              ((reasonKind = 'superseded' AND
@@ -481,6 +571,22 @@ defmodule Tightbeam.Schema do
     },
     %{
       type: "table",
+      name: "supervision_liveness_progress_receipts",
+      sql: """
+      CREATE TABLE IF NOT EXISTS supervision_liveness_progress_receipts (
+        receiptId INTEGER PRIMARY KEY AUTOINCREMENT,
+        assignmentId TEXT NOT NULL REFERENCES assignments(id),
+        sourceKind TEXT NOT NULL CHECK (sourceKind = 'progress'),
+        sourceId TEXT NOT NULL,
+        sourceAt INTEGER NOT NULL CHECK (sourceAt >= 0),
+        acceptedAt INTEGER NOT NULL CHECK (acceptedAt >= 0),
+        generation INTEGER NOT NULL CHECK (generation > 0),
+        UNIQUE (assignmentId, sourceId)
+      )
+      """
+    },
+    %{
+      type: "table",
       name: "supervision_liveness_checkpoint_bindings",
       sql: """
       CREATE TABLE IF NOT EXISTS supervision_liveness_checkpoint_bindings (
@@ -560,6 +666,16 @@ defmodule Tightbeam.Schema do
             )
         )
       )
+      OR (
+        NEW.controllerOrigin='scheduled'
+        AND (
+          NEW.rootTurnSeq IS NULL
+          OR NOT EXISTS (
+            SELECT 1 FROM turns t
+            WHERE t.seq=NEW.rootTurnSeq AND t.assignmentId=NEW.assignmentId
+          )
+        )
+      )
       BEGIN
         SELECT RAISE(ABORT, 'supervision sidecar requires coherent pending wake');
       END
@@ -591,6 +707,7 @@ defmodule Tightbeam.Schema do
           AND NEW.retirementCause IS OLD.retirementCause
           AND NEW.retirementPrincipal IS OLD.retirementPrincipal
           AND NEW.retirementActionNeeded IS OLD.retirementActionNeeded
+          AND NEW.rootTurnSeq IS OLD.rootTurnSeq
           AND NEW.controllerState='settled'
         )
       BEGIN
@@ -699,7 +816,7 @@ defmodule Tightbeam.Schema do
       sql: """
       CREATE TRIGGER IF NOT EXISTS supervision_fired_lineage_sidecar_identity_immutable
       BEFORE UPDATE OF wakeId, assignmentId, controllerOrigin, wakeKind, controllerState,
-                       chargedGeneration
+                       chargedGeneration, rootTurnSeq
       ON supervision_liveness_sidecar
       WHEN EXISTS (
         SELECT 1 FROM wakes w
@@ -749,6 +866,146 @@ defmodule Tightbeam.Schema do
         SELECT RAISE(ABORT, 'fired supervision lineage turn is required');
       END
       """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_immutable_update
+      BEFORE UPDATE OF wakeId, assignmentId, controllerOrigin, wakeKind, rootTurnSeq
+      ON supervision_liveness_sidecar
+      WHEN OLD.controllerOrigin IS NOT NULL
+        AND (
+          NEW.wakeId IS NOT OLD.wakeId OR NEW.assignmentId IS NOT OLD.assignmentId
+          OR NEW.controllerOrigin IS NOT OLD.controllerOrigin
+          OR NEW.wakeKind IS NOT OLD.wakeKind
+          OR NEW.rootTurnSeq IS NOT OLD.rootTurnSeq
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root link is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_immutable_delete
+      BEFORE DELETE ON supervision_liveness_sidecar
+      WHEN OLD.controllerOrigin IS NOT NULL
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root link is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_wake_identity_immutable",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_wake_identity_immutable
+      BEFORE UPDATE OF wakeId, sessionKey, assignmentId ON wakes
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
+          AND s.controllerOrigin IS NOT NULL
+      )
+        AND (
+          NEW.wakeId IS NOT OLD.wakeId OR NEW.sessionKey IS NOT OLD.sessionKey
+          OR NEW.assignmentId IS NOT OLD.assignmentId
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller wake identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_wake_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_wake_immutable_delete
+      BEFORE DELETE ON wakes
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.wakeId=OLD.wakeId AND s.assignmentId=OLD.assignmentId
+          AND s.controllerOrigin IS NOT NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller wake is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_turn_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_turn_immutable_update
+      BEFORE UPDATE OF seq, assignmentId ON turns
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.rootTurnSeq=OLD.seq AND s.assignmentId=OLD.assignmentId
+      )
+        AND (NEW.seq IS NOT OLD.seq OR NEW.assignmentId IS NOT OLD.assignmentId)
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root turn identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_root_turn_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_root_turn_immutable_delete
+      BEFORE DELETE ON turns
+      WHEN EXISTS (
+        SELECT 1 FROM supervision_liveness_sidecar s
+        WHERE s.rootTurnSeq=OLD.seq AND s.assignmentId=OLD.assignmentId
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller root turn is required');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_turn_identity_immutable_update",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_turn_identity_immutable_update
+      BEFORE UPDATE OF seq, sessionKey, wakeId, assignmentId ON turns
+      WHEN EXISTS (
+        SELECT 1
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId AND w.assignmentId=s.assignmentId
+        WHERE s.controllerOrigin IS NOT NULL
+          AND OLD.wakeId=w.wakeId AND OLD.assignmentId=w.assignmentId
+          AND OLD.sessionKey=w.sessionKey
+      )
+        AND (
+          NEW.seq IS NOT OLD.seq OR NEW.sessionKey IS NOT OLD.sessionKey
+          OR NEW.wakeId IS NOT OLD.wakeId OR NEW.assignmentId IS NOT OLD.assignmentId
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller turn identity is immutable');
+      END
+      """
+    },
+    %{
+      type: "trigger",
+      name: "supervision_controller_turn_immutable_delete",
+      sql: """
+      CREATE TRIGGER IF NOT EXISTS supervision_controller_turn_immutable_delete
+      BEFORE DELETE ON turns
+      WHEN EXISTS (
+        SELECT 1
+        FROM supervision_liveness_sidecar s
+        JOIN wakes w ON w.wakeId=s.wakeId AND w.assignmentId=s.assignmentId
+        WHERE s.controllerOrigin IS NOT NULL
+          AND OLD.wakeId=w.wakeId AND OLD.assignmentId=w.assignmentId
+          AND OLD.sessionKey=w.sessionKey
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'supervision controller turn is required');
+      END
+      """
     }
   ]
 
@@ -771,18 +1028,27 @@ defmodule Tightbeam.Schema do
   So the shape is STAMPED at creation and CHECKED here, per the house rule: a
   missing or unknown stamp is a refusal and a bug report, never an inference.
   Note the direction — the one existence question below is asked to REFUSE,
-  never to deduce a shape and accommodate it. Each accepted predecessor is
-  named above; both upgrades are exact and transactional. No shape is inferred
-  from stored DDL.
+  never to deduce a shape and accommodate it. The sole accepted predecessor is
+  named by the exact migration stamps below; each upgrade is transactional.
+  No shape is inferred from stored DDL. Completion escalation deliberately
+  accepts no predecessor at boot.
   """
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
-    :ok = check_shape(db)
+    shape_state = check_shape(db)
 
     Enum.each(@schema_modules, fn module ->
-      :ok = module.ensure_schema(db)
+      if shape_state == :fresh and module == Tightbeam.DeliverableContract do
+        :ok = Tightbeam.DeliverableContract.bootstrap_schema(db)
+      else
+        :ok = module.ensure_schema(db)
+      end
     end)
+
+    :ok = Tightbeam.Escalation.ensure_terminal_epoch(db)
+
+    :ok = Tightbeam.ColdStart.validate!(db)
 
     activated_at = System.system_time(:millisecond)
 
@@ -799,6 +1065,90 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_supervision_liveness_v1: additive activation failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_effort_request_exit_v1(DB.server()) :: :ok
+  def upgrade_effort_request_exit_v1(db) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@effort_request_exit_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_effort_request_exit_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           for name <- [
+                 "wakes_typed_cancellation_required",
+                 "wake_cancellations_pending_insert"
+               ] do
+             :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{name}")
+           end
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_effort_exit_v1"
+             )
+
+           table = Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
+           :ok = Txn.exec(txn, table.sql)
+
+           columns =
+             "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+               "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+               "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+               "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+           :ok =
+             Txn.exec(
+               txn,
+               "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_effort_exit_v1"
+             )
+
+           :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_effort_exit_v1")
+
+           for name <- [
+                 "wake_cancellations_pending_insert",
+                 "wakes_typed_cancellation_required"
+               ] do
+             object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+             :ok = Txn.exec(txn, object.sql)
+           end
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @effort_request_exit_previous_shape,
+             @session_mechanical_status_previous_shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_effort_request_exit_v1: stamp race")
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_effort_request_exit_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_effort_request_exit_v1: migration failed: #{Exception.message(error)}"
     end
   end
 
@@ -822,7 +1172,7 @@ defmodule Tightbeam.Schema do
              "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
              [
                @operational_parent_previous_shape,
-               @previous_shape,
+               @operational_parent_shape,
                System.system_time(:millisecond)
              ]
            )
@@ -847,11 +1197,927 @@ defmodule Tightbeam.Schema do
   end
 
   @doc false
+  @spec upgrade_message_type_v1(DB.server()) :: :ok
+  def upgrade_message_type_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@message_type_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_message_type_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Txn.exec(txn, "ALTER TABLE messages ADD COLUMN messageType TEXT")
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@message_type_previous_shape, @terminal_decision_previous_shape, migration_time]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError, message: "incompatible_message_type_v1: stamp race"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_message_type_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_terminal_operator_decision_v1(DB.server()) :: :ok
+  def upgrade_terminal_operator_decision_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@terminal_decision_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_terminal_operator_decision_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Escalation.migrate_terminal_operator_decision_v1_in_txn(txn)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [
+               @terminal_decision_previous_shape,
+               @nullable_effective_parent_previous_shape,
+               migration_time
+             ]
+           )
+
+           if Txn.changes(txn) != 1 do
+             raise ShapeError,
+               message: "incompatible_terminal_operator_decision_v1: stamp race"
+           end
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_terminal_operator_decision_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_cold_start_v1(DB.server(), keyword()) :: :ok
+  def upgrade_cold_start_v1(db, opts \\ []) when is_list(opts) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@cold_start_previous_shape]] ->
+               :ok
+
+             rows ->
+               incompatible_cold_start!("legacy_witness_missing", "predecessor #{inspect(rows)}")
+           end
+
+           ensure_no_migration_objects!(txn)
+
+           # Current Org row decoding is used by the cold-start classifier in
+           # this transaction. Add the nullable render-stamp columns before
+           # that read; the later v10 step observes them and only advances the
+           # shape stamp.
+           session_columns =
+             Txn.q(txn, "PRAGMA table_info(sessions)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           unless "identityRenderContract" in session_columns,
+             do: Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityRenderContract TEXT")
+
+           unless "identityGuidanceDigest" in session_columns,
+             do: Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityGuidanceDigest TEXT")
+
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               CREATE TABLE users_cold_start_v1 (
+                 userId       TEXT PRIMARY KEY,
+                 isAdmin      INTEGER NOT NULL DEFAULT 0,
+                 creationKind TEXT NOT NULL DEFAULT 'legacy' CHECK (creationKind IN (
+                   'cold_start','gateway_local_bootstrap','device_pair','admin_add','legacy'
+                 )),
+                 createdAt    INTEGER NOT NULL
+               )
+               """
+             )
+
+           Txn.q(
+             txn,
+             """
+             INSERT INTO users_cold_start_v1 (userId,isAdmin,creationKind,createdAt)
+             SELECT userId,isAdmin,'legacy',createdAt FROM users ORDER BY createdAt,userId
+             """
+           )
+
+           maybe_interrupt_cold_start_migration!(opts, :after_copy)
+           :ok = Txn.exec(txn, "DROP TABLE users")
+           maybe_interrupt_cold_start_migration!(opts, :after_drop)
+           :ok = Txn.exec(txn, "ALTER TABLE users_cold_start_v1 RENAME TO users")
+
+           :ok = Txn.exec(txn, Tightbeam.ColdStart.receipt_ddl())
+
+           :ok =
+             Txn.exec(
+               txn,
+               """
+               CREATE TRIGGER users_gateway_owned_insert
+               BEFORE INSERT ON users
+               WHEN NEW.creationKind = 'legacy'
+               BEGIN
+                 SELECT RAISE(ABORT, 'bootstrap_owned_by_gateway');
+               END
+               """
+             )
+
+           maybe_interrupt_cold_start_migration!(opts, :after_schema)
+
+           case Txn.q(txn, "SELECT COUNT(*) FROM users") do
+             [[0]] ->
+               :ok
+
+             [[_count]] ->
+               case legacy_witness(txn) do
+                 nil ->
+                   incompatible_cold_start!("legacy_witness_missing")
+
+                 %{user_id: user_id, device_id: device_id, root: root} ->
+                   Txn.q(
+                     txn,
+                     """
+                     INSERT INTO cold_start_receipts
+                       (id,userId,deviceId,rootSessionKey,cause,phase,principal,
+                        requestFingerprint,replaySecretHash,claimTokenHash,claimEventId,
+                        deviceEventId,createdAt,activatedAt)
+                     VALUES (1,?1,?2,?3,'v5_observed','complete','process:tightbeam',
+                             NULL,NULL,NULL,NULL,NULL,?4,?4)
+                     """,
+                     [user_id, device_id, root, migration_time]
+                   )
+               end
+           end
+
+           maybe_interrupt_cold_start_migration!(opts, :after_receipt)
+
+           Txn.q(
+             txn,
+             "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
+             [@cold_start_previous_shape, @message_type_previous_shape, migration_time]
+           )
+
+           if Txn.changes(txn) != 1, do: raise("cold-start stamp race")
+           maybe_interrupt_cold_start_migration!(opts, :after_stamp)
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] -> :ok
+             rows -> incompatible_cold_start!("orphan_identity_row", inspect(rows))
+           end
+
+           case Tightbeam.ColdStart.classify_legacy_in_txn(txn) do
+             %{state: state} when state in ["open", "claimed"] -> :ok
+             %{invariant: invariant} -> incompatible_cold_start!(invariant)
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, _error} ->
+        raise ShapeError,
+          message:
+            "incompatible_cold_start_v1: legacy_witness_missing; recovery: Recover an unusable fresh database"
+    end
+  end
+
+  defp legacy_witness(txn) do
+    Txn.q(
+      txn,
+      """
+      SELECT d.deviceId,d.userId,s.sessionKey
+      FROM devices d
+      JOIN users u ON u.userId=d.userId
+      JOIN sessions s ON s.ownerUserId=u.userId
+      WHERE d.status='allowlisted' AND d.token IS NOT NULL AND u.isAdmin=1
+        AND s.state='active' AND s.isBuiltIn=1 AND s.kind='main'
+        AND s.operationalParent=s.sessionKey
+      ORDER BY d.createdAt,d.deviceId,s.createdAt,s.sessionKey
+      """
+    )
+    |> Enum.find_value(fn [device_id, user_id, root] ->
+      if root == Tightbeam.Org.personal_session_key(user_id),
+        do: %{device_id: device_id, user_id: user_id, root: root}
+    end)
+  end
+
+  defp ensure_no_migration_objects!(txn) do
+    case Txn.q(
+           txn,
+           "SELECT name FROM sqlite_master WHERE name IN ('users_cold_start_v1','cold_start_receipts','users_gateway_owned_insert')"
+         ) do
+      [] ->
+        :ok
+
+      rows ->
+        incompatible_cold_start!("legacy_witness_missing", "migration objects #{inspect(rows)}")
+    end
+  end
+
+  defp maybe_interrupt_cold_start_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point, do: raise("forced cold-start migration interruption")
+    :ok
+  end
+
+  defp incompatible_cold_start!(invariant, detail \\ nil) do
+    _ = detail
+
+    raise ShapeError,
+      message:
+        "incompatible_cold_start_v1: #{invariant}; recovery: Recover an unusable fresh database"
+  end
+
+  @doc false
+  @spec upgrade_nullable_effective_parent_v1(DB.server(), keyword()) :: :ok
+  def upgrade_nullable_effective_parent_v1(db, opts \\ []) when is_list(opts) do
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@nullable_effective_parent_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_nullable_effective_parent_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = migrate_controller_root_link_in_txn(txn, opts)
+           maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_link)
+
+           :ok = Tightbeam.Org.migrate_nullable_effective_parent_in_txn(txn, opts)
+           maybe_interrupt_nullable_effective_parent_migration!(opts, :after_migration)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @nullable_effective_parent_previous_shape,
+             @identity_render_stamp_previous_shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError, message: "incompatible_nullable_effective_parent_v1: stamp race")
+
+           maybe_interrupt_nullable_effective_parent_migration!(opts, :after_stamp)
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_nullable_effective_parent_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_nullable_effective_parent_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  def upgrade_identity_render_stamp_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@identity_render_stamp_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_identity_render_stamp_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           columns =
+             Txn.q(txn, "PRAGMA table_info(sessions)")
+             |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+           unless "identityRenderContract" in columns,
+             do: Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityRenderContract TEXT")
+
+           unless "identityGuidanceDigest" in columns,
+             do: Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityGuidanceDigest TEXT")
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @identity_render_stamp_previous_shape,
+             @effort_request_exit_previous_shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_identity_render_stamp_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  @spec upgrade_session_mechanical_status_v1(DB.server()) :: :ok
+  def upgrade_session_mechanical_status_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@session_mechanical_status_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_session_mechanical_status_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE sessions ADD COLUMN mechanicalStatus TEXT NOT NULL " <>
+                 "DEFAULT 'idle' CHECK (mechanicalStatus IN ('idle','running'))"
+             )
+
+           Txn.q(
+             txn,
+             """
+             UPDATE sessions
+             SET mechanicalStatus = CASE WHEN EXISTS (
+                   SELECT 1 FROM turns
+                   WHERE turns.sessionKey = sessions.sessionKey
+                     AND turns.status IN ('queued','running')
+                 ) THEN 'running' ELSE 'idle' END,
+                 updatedAt = MAX(updatedAt + 1, ?1)
+             """,
+             [migration_time]
+           )
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @session_mechanical_status_previous_shape,
+             @ruled_decision_integrity_previous_shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_session_mechanical_status_v1: stamp race"
+               )
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        upgrade_ruled_decision_integrity_v1(db)
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_session_mechanical_status_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_ruled_decision_integrity_v1(DB.server()) :: :ok
+  def upgrade_ruled_decision_integrity_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@ruled_decision_integrity_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_ruled_decision_integrity_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.Escalation.migrate_ruled_decision_integrity_v1_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @ruled_decision_integrity_previous_shape,
+             @cannot_proceed_previous_shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError, message: "incompatible_ruled_decision_integrity_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        upgrade_cannot_proceed_v1(db)
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_ruled_decision_integrity_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_cannot_proceed_v1(DB.server()) :: :ok
+  def upgrade_cannot_proceed_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@cannot_proceed_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_cannot_proceed_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           if Txn.q(
+                txn,
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+              ) == [[1]] do
+             for name <- [
+                   "wakes_typed_cancellation_required",
+                   "wake_cancellations_pending_insert"
+                 ] do
+               :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{name}")
+             end
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_cannot_proceed_v1"
+               )
+
+             table = Enum.find(@supervision_liveness_objects, &(&1.name == "wake_cancellations"))
+             :ok = Txn.exec(txn, table.sql)
+
+             columns =
+               "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+                 "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+                 "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+                 "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_cannot_proceed_v1"
+               )
+
+             :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_cannot_proceed_v1")
+
+             for name <- [
+                   "wake_cancellations_pending_insert",
+                   "wakes_typed_cancellation_required"
+                 ] do
+               object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+               :ok = Txn.exec(txn, object.sql)
+             end
+           end
+
+           :ok = Tightbeam.Assignments.migrate_cannot_proceed_v1_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @cannot_proceed_previous_shape,
+             @completion_previous_shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_cannot_proceed_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_cannot_proceed_v1: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc """
+  Move a `coordination-fabric-v1-phase1-v16` database to v17 by activating the
+  strict false-premise park gate.
+
+  FROZEN SEAM. `check_shape` no longer dispatches to this function — v18 is the
+  current shape and v17 its only boot arm. This stamps a FIXED v17 target
+  (`@effort_generator_retirement_previous_shape`), never `@shape`, so a later
+  rung bump cannot silently turn its v16 stamp into a skip-migration. Reached
+  only by its exact-predecessor seam test.
+
+  Purely additive: three new tables and their indexes and immutability
+  triggers. No existing table is rebuilt, no CHECK widened, no NOT NULL
+  relaxed, and no row is read, rewritten, or reclassified — historical parks
+  stay `legacy-untyped` by having no `park_premises` rows, never by anything
+  this migration writes.
+
+  All-or-nothing on the owned set. A database carrying SOME of these objects is
+  a shape this build has no reading for, so it is refused by name rather than
+  repaired by inference.
+  """
+  @spec upgrade_premise_gate_v1(DB.server()) :: :ok
+  def upgrade_premise_gate_v1(db) do
+    migration_time = System.system_time(:millisecond)
+    objects = Tightbeam.Premises.owned_objects()
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@premise_gate_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "#{@premise_gate_label}: predecessor stamp #{inspect(rows)}"
+           end
+
+           present = Enum.filter(objects, &owned_object_present?(txn, &1, @premise_gate_label))
+
+           case length(present) do
+             0 ->
+               Enum.each(objects, fn object ->
+                 :ok = Txn.exec(txn, object.sql)
+                 validate_owned_object!(txn, object, @premise_gate_label)
+               end)
+
+             count when count == length(objects) ->
+               Enum.each(present, &validate_owned_object!(txn, &1, @premise_gate_label))
+
+             _count ->
+               missing =
+                 objects
+                 |> Kernel.--(present)
+                 |> Enum.map_join(", ", & &1.name)
+
+               raise ShapeError,
+                 message: "#{@premise_gate_label}: incomplete additive shape; missing #{missing}"
+           end
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @premise_gate_previous_shape,
+             @effort_generator_retirement_previous_shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "#{@premise_gate_label}: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "#{@premise_gate_label}: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
+  @spec upgrade_effort_generator_retirement_v1(DB.server()) :: :ok
+  def upgrade_effort_generator_retirement_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.foreign_key_rebuild(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@effort_generator_retirement_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_effort_generator_retirement_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           # Rebuild effort_checkin_generations to add the four nullable
+           # retirement fields and the all-or-none retirement CHECK. SQLite
+           # cannot add that table-level CHECK in place, so rename → recreate →
+           # copy → drop, preserving every existing column value.
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE effort_checkin_generations RENAME TO effort_checkin_generations_retirement_v1"
+             )
+
+           :ok =
+             Txn.exec(txn, """
+             CREATE TABLE effort_checkin_generations (
+               assignmentId TEXT NOT NULL REFERENCES assignments(id),
+               generation INTEGER NOT NULL,
+               state TEXT NOT NULL CHECK (state IN ('armed','probed','canceled')),
+               baseHorizonMs INTEGER NOT NULL,
+               multiplier INTEGER NOT NULL CHECK (multiplier IN (1,2,4)),
+               armedAt INTEGER NOT NULL,
+               terminalSeqWatermark INTEGER NOT NULL,
+               holderKey TEXT NOT NULL,
+               host TEXT NOT NULL,
+               root TEXT NOT NULL,
+               baseline TEXT NOT NULL,
+               wakeId TEXT NOT NULL,
+               evidence TEXT,
+               agentProdded INTEGER NOT NULL DEFAULT 0,
+               artifactWatermark INTEGER NOT NULL DEFAULT 0,
+               attestWatermark INTEGER NOT NULL DEFAULT 0,
+               workItemWatermark INTEGER NOT NULL DEFAULT 0,
+               retiredAt INTEGER,
+               retiredOutcome TEXT,
+               retiredCause TEXT,
+               retiredPrincipal TEXT,
+               PRIMARY KEY (assignmentId, generation),
+               CHECK (
+                 (retiredAt IS NULL AND retiredOutcome IS NULL AND retiredCause IS NULL
+                  AND retiredPrincipal IS NULL)
+                 OR
+                 (retiredAt IS NOT NULL AND retiredOutcome IS NOT NULL AND retiredCause IS NOT NULL
+                  AND retiredPrincipal IS NOT NULL
+                  AND state IN ('probed','canceled')
+                  AND retiredOutcome IN ('completed','surrendered','revoked')
+                  AND retiredCause = 'assignment-terminal:' || retiredOutcome || ':' || assignmentId)
+               )
+             )
+             """)
+
+           :ok =
+             Txn.exec(txn, """
+             CREATE INDEX IF NOT EXISTS effort_checkin_wake
+               ON effort_checkin_generations (wakeId, state)
+             """)
+
+           columns =
+             "assignmentId,generation,state,baseHorizonMs,multiplier,armedAt," <>
+               "terminalSeqWatermark,holderKey,host,root,baseline,wakeId,evidence," <>
+               "agentProdded,artifactWatermark,attestWatermark,workItemWatermark"
+
+           :ok =
+             Txn.exec(
+               txn,
+               "INSERT INTO effort_checkin_generations (#{columns}) SELECT #{columns} FROM effort_checkin_generations_retirement_v1"
+             )
+
+           :ok = Txn.exec(txn, "DROP TABLE effort_checkin_generations_retirement_v1")
+
+           # Add the ownership relation (EGR-1 store).
+           :ok =
+             Txn.exec(txn, """
+             CREATE TABLE effort_checkin_wake_ownership (
+               wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
+               assignmentId TEXT NOT NULL,
+               generation INTEGER NOT NULL,
+               role TEXT NOT NULL CHECK (role IN (
+                 'probe','holder_checkin','parent_escalation','decision_deadline','decision_notification'
+               )),
+               FOREIGN KEY (assignmentId, generation)
+                 REFERENCES effort_checkin_generations (assignmentId, generation)
+             )
+             """)
+
+           # Backfill ownership only for legacy structurally-owned wakes, by exact
+           # foreign-key equality (EGR-9): each generation's probe wake, and each
+           # effort decision request's deadline wake. Nothing is inferred from
+           # prompt text, origin, holder, or time.
+           :ok =
+             Txn.exec(txn, """
+             INSERT INTO effort_checkin_wake_ownership (wakeId, assignmentId, generation, role)
+             SELECT wakeId, assignmentId, generation, 'probe'
+             FROM effort_checkin_generations
+             """)
+
+           :ok = Tightbeam.Escalation.migrate_effort_deadline_ownership_v1_in_txn(txn)
+
+           # EGR-9 preflight. Before the new stamp commits, refuse if any
+           # ambiguous legacy prompt wake exists: a pending prompt wake from
+           # process:tightbeam attributed to an assignment that has effort
+           # history but carries no ownership row. The substrate cannot prove
+           # such a wake is not an effort wake, so it names the ids and rolls
+           # back — it does not inspect prompts, classify, cancel, or advance the
+           # stamp. An operator retries after predecessor behavior settles each
+           # named wake to fired or canceled.
+           case Txn.q(txn, """
+                SELECT w.wakeId FROM wakes w
+                WHERE w.state = 'pending'
+                  AND w.consumer = 'prompt'
+                  AND w.origin = 'process:tightbeam'
+                  AND w.assignmentId IS NOT NULL
+                  AND EXISTS (
+                    SELECT 1 FROM effort_checkin_generations g
+                    WHERE g.assignmentId = w.assignmentId
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM effort_checkin_wake_ownership o
+                    WHERE o.wakeId = w.wakeId
+                  )
+                ORDER BY w.wakeId
+                """) do
+             [] ->
+               :ok
+
+             rows ->
+               ids = rows |> List.flatten() |> Enum.join(", ")
+
+               raise ShapeError,
+                 message: "incompatible_effort_wake_provenance: #{ids}"
+           end
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @effort_generator_retirement_previous_shape,
+             @completion_escalation_previous_shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_effort_generator_retirement_v1: stamp race"
+               )
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_effort_generator_retirement_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_effort_generator_retirement_v1: migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc """
+  Move an empty `coordination-fabric-v1-phase1-v18` completion shape to v19.
+
+  Both completion-owned tables must be empty. The checks, rebuild, and stamp
+  advance share one transaction, so a failed rebuild restores the predecessor
+  tables and v18 stamp together. Populated tables are refused with their exact
+  row count; no historical row mapping is inferred.
+  """
+  @spec upgrade_completion_escalation_v1(DB.server()) :: :ok
+  def upgrade_completion_escalation_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@completion_escalation_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "#{@completion_escalation_label}: predecessor stamp #{inspect(rows)}"
+           end
+
+           Enum.each(["completion_escalations", "completion_escalation_wakes"], fn table ->
+             [[count]] = Txn.q(txn, "SELECT count(*) FROM #{table}")
+
+             if count != 0 do
+               raise ShapeError,
+                 message: "#{@completion_escalation_label}: #{table} has #{count} rows"
+             end
+           end)
+
+           :ok =
+             Tightbeam.Productions.CompletionEscalation.replace_empty_v18_tables_for_v19_in_txn(
+               txn
+             )
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @completion_escalation_previous_shape,
+             @principal_duty_previous_shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "#{@completion_escalation_label}: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "#{@completion_escalation_label}: upgrade failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc """
+  Add the Stall 4.10 principal-duty objects to the exact v19 predecessor.
+
+  The new tables and the provenance backfill share one transaction with the
+  v20 stamp, so an incomplete migration cannot admit duty checks against
+  missing source rows.
+  """
+  @spec upgrade_principal_duty_v1(DB.server()) :: :ok
+  def upgrade_principal_duty_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@principal_duty_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_principal_duty_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok = Tightbeam.WorkItems.principal_duty_schema_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @principal_duty_previous_shape,
+             @artifact_digest_previous_shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_principal_duty_v1: stamp race")
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message: "incompatible_principal_duty_v1: migration failed: #{Exception.message(error)}"
+    end
+  end
+
+  @doc false
   @spec upgrade_artifact_digest_integrity_v1(DB.server(), keyword()) :: :ok
   def upgrade_artifact_digest_integrity_v1(db, opts \\ []) when is_list(opts) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@previous_shape]] ->
+             [[@artifact_digest_previous_shape]] ->
                :ok
 
              rows ->
@@ -876,7 +2142,7 @@ defmodule Tightbeam.Schema do
            Txn.q(
              txn,
              "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1",
-             [@previous_shape, @shape, System.system_time(:millisecond)]
+             [@artifact_digest_previous_shape, @shape, System.system_time(:millisecond)]
            )
 
            if Txn.changes(txn) != 1 do
@@ -896,6 +2162,89 @@ defmodule Tightbeam.Schema do
           message:
             "incompatible_artifact_digest_integrity_v1: upgrade failed: #{Exception.message(error)}"
     end
+  end
+
+  defp maybe_interrupt_nullable_effective_parent_migration!(opts, point) do
+    if Keyword.get(opts, :fail_at) == point,
+      do: raise("forced nullable-effective-parent migration interruption")
+
+    :ok
+  end
+
+  defp migrate_controller_root_link_in_txn(txn, opts) do
+    predecessor_columns =
+      Txn.q(txn, "PRAGMA table_info(supervision_liveness_sidecar)")
+      |> Enum.map(fn [_cid, name | _rest] -> name end)
+
+    if "rootTurnSeq" in predecessor_columns do
+      raise ShapeError,
+        message: "incompatible_nullable_effective_parent_v1: predecessor already has rootTurnSeq"
+    end
+
+    copied_columns = [
+      "wakeId",
+      "assignmentId",
+      "controllerOrigin",
+      "wakeKind",
+      "controllerState",
+      "chargedGeneration",
+      "transferEvidenceId",
+      "retirementEpoch",
+      "retiringSessionKey",
+      "retirementOutcomeKind",
+      "retirementOutcomeId",
+      "retirementTargetSessionKey",
+      "retirementCause",
+      "retirementPrincipal",
+      "retirementActionNeeded"
+    ]
+
+    column_list = Enum.join(copied_columns, ", ")
+
+    :ok =
+      Txn.exec(
+        txn,
+        "CREATE TEMP TABLE nullable_effective_parent_sidecar_v1 AS SELECT #{column_list} FROM supervision_liveness_sidecar"
+      )
+
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_copy)
+
+    dependent_objects =
+      (@supervision_liveness_objects ++ @supervision_liveness_enforcement_objects)
+      |> Enum.filter(fn object ->
+        object.name != "supervision_liveness_sidecar" and
+          String.contains?(object.sql, "supervision_liveness_sidecar")
+      end)
+
+    Enum.each(dependent_objects, fn object ->
+      :ok = Txn.exec(txn, "DROP #{String.upcase(object.type)} IF EXISTS #{object.name}")
+    end)
+
+    :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_sidecar")
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_drop)
+
+    sidecar =
+      Enum.find(@supervision_liveness_objects, fn object ->
+        object.name == "supervision_liveness_sidecar"
+      end)
+
+    :ok = Txn.exec(txn, sidecar.sql)
+
+    Txn.q(
+      txn,
+      "INSERT INTO supervision_liveness_sidecar (#{column_list}) SELECT #{column_list} FROM nullable_effective_parent_sidecar_v1"
+    )
+
+    :ok = Txn.exec(txn, "DROP TABLE nullable_effective_parent_sidecar_v1")
+
+    Enum.each(dependent_objects, fn object ->
+      :ok = Txn.exec(txn, object.sql)
+      validate_owned_object!(txn, object)
+    end)
+
+    validate_owned_object!(txn, sidecar)
+    maybe_interrupt_nullable_effective_parent_migration!(opts, :after_root_restore)
+    :ok
   end
 
   @doc false
@@ -969,7 +2318,12 @@ defmodule Tightbeam.Schema do
     incompatible_supervision_liveness!("activation epoch must be a nonnegative integer")
   end
 
-  defp owned_object_present?(txn, %{type: type, name: name}) do
+  # The `label` names WHICH activation is refusing. Owned-object validation is
+  # shared, but a refusal that names the wrong shape sends its reader to the
+  # wrong subsystem, so every caller passes its own.
+  defp owned_object_present?(txn, object, label \\ "incompatible_supervision_liveness_v1")
+
+  defp owned_object_present?(txn, %{type: type, name: name}, label) do
     case Txn.q(
            txn,
            "SELECT 1 FROM sqlite_master WHERE type = ?1 AND name = ?2",
@@ -977,11 +2331,13 @@ defmodule Tightbeam.Schema do
          ) do
       [] -> false
       [[1]] -> true
-      _rows -> incompatible_supervision_liveness!("duplicate owned object #{name}")
+      _rows -> incompatible_owned_object!(label, "duplicate owned object #{name}")
     end
   end
 
-  defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}) do
+  defp validate_owned_object!(txn, object, label \\ "incompatible_supervision_liveness_v1")
+
+  defp validate_owned_object!(txn, %{type: type, name: name, sql: expected_sql}, label) do
     case Txn.q(
            txn,
            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
@@ -991,15 +2347,19 @@ defmodule Tightbeam.Schema do
         if normalize_schema_sql(actual_sql) == normalize_schema_sql(expected_sql) do
           :ok
         else
-          incompatible_supervision_liveness!("malformed owned object #{name}")
+          incompatible_owned_object!(label, "malformed owned object #{name}")
         end
 
       [] ->
-        incompatible_supervision_liveness!("missing owned object #{name}")
+        incompatible_owned_object!(label, "missing owned object #{name}")
 
       _rows ->
-        incompatible_supervision_liveness!("duplicate owned object #{name}")
+        incompatible_owned_object!(label, "duplicate owned object #{name}")
     end
+  end
+
+  defp incompatible_owned_object!(label, detail) do
+    raise ShapeError, message: "#{label}: #{detail}"
   end
 
   defp normalize_schema_sql(sql) do
@@ -1050,11 +2410,11 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
-      {:ok, [[@previous_shape]]} ->
+      {:ok, [[@principal_duty_previous_shape]]} ->
+        :ok = upgrade_principal_duty_v1(db)
         upgrade_artifact_digest_integrity_v1(db)
 
-      {:ok, [[@operational_parent_previous_shape]]} ->
-        :ok = upgrade_operational_parent_v1(db)
+      {:ok, [[@artifact_digest_previous_shape]]} ->
         upgrade_artifact_digest_integrity_v1(db)
 
       {:ok, []} ->
@@ -1072,8 +2432,8 @@ defmodule Tightbeam.Schema do
           this build: #{@shape}
 
         There is no migration from #{found}. The supported upgrade sources are
-        #{@previous_shape} and #{@operational_parent_previous_shape}. Move this
-        database aside and let it be recreated.
+        #{@principal_duty_previous_shape} and #{@artifact_digest_previous_shape}.
+        Move this database aside and let it be recreated.
         """
 
       # More than one shape stamped. Nothing writes a second row, so this is a
@@ -1101,12 +2461,15 @@ defmodule Tightbeam.Schema do
   # database" sharing one representation.
   #
   # Stamping first cannot lose that way. Interrupted after the stamp, the next
-  # boot reads its own shape and carries on creating what is missing, which is
-  # exactly what `CREATE TABLE IF NOT EXISTS` is for.
+  # boot reads its own shape. Ordinary additive schema creation can continue,
+  # while a contract whose accepted stamp requires an all-or-nothing object set
+  # refuses any missing object instead of silently recreating authoritative
+  # state.
   defp unstamped(db) do
     case DB.query(db, "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'") do
       {:ok, []} ->
-        stamp(db)
+        :ok = stamp(db)
+        :fresh
 
       {:ok, [_ | _]} ->
         raise ShapeError, """
