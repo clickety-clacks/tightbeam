@@ -1031,41 +1031,56 @@ defmodule Tightbeam.Assignments do
   end
 
   @doc """
-  Return the latest linked review round holder's qualifying verdict kind.
+  Return `["reviewed-clean"]` when the producing card's most recent REVIEW
+  CONCLUSION concludes clean on an independent card, else `[]`.
 
-  HOLDER-VERDICT-WINS (fabric §13 Phase 0, wi_1b0237fe wedge class): the round
-  is selected among the linked review cards THAT CARRY A HOLDER-FILED VERDICT,
-  never by assignment-lifecycle recency alone. A review card holding no verdict
-  by its own holder carries no judgment, so it may not displace the standing
-  judgment of an earlier round — and a card CLOSED without one never can carry
-  one (`attest` refuses a verdict on a closed assignment), which is exactly the
-  state that wedged with no lawful exit. Verdict rows beat lifecycle rows.
+  REVIEW-CONCLUSION POOL (owner-decision-request-relief-v1 R6): the judgment is
+  read from the pool of every HOLDER-FILED REVIEW-CONCLUSION verdict across EVERY
+  one of the producing card's `--reviews`-linked review cards. A review-conclusion
+  verdict is one whose kind is drawn from the closed set
+  {`reviewed-clean`, `changes-requested`} — the only two kinds that state what a
+  review round CONCLUDED about the reviewed work. A holder-filed verdict of any
+  other kind seen on review cards (`verified`, `merged`, `release-approved`,
+  `tests-passed`, `spirit-approved`, `spec-reviewed`, `spirit-reviewed`,
+  `no-landing`, `work-blocked`, `pass`, or any novel kind) is a statement about
+  the reviewer's OWN card, never a conclusion about the reviewed work; it is
+  ignored here — it neither qualifies a card nor retracts a qualification. The
+  set is closed because this fact's definition names it, never because storage
+  constrains `verdictKind` (which is open text).
 
-  The tiebreak is the RECENCY OF THE LATEST HOLDER-FILED VERDICT itself (verdict
-  row `ts` DESC, then verdict row `rowid` DESC) — never `r.openedAt`. Ordering by
-  when the round was OPENED, rather than when its verdict was FILED, is exactly
-  the lifecycle-recency mistake this function exists to refuse: `reopen-assignment`
-  lets an OLDER round receive a fresh verdict after a chronologically YOUNGER
-  round already closed, and a card that reopens to file the newest judgment must
-  win the selection even though it opened first (Sol xhigh review, finding 1).
+  This function used to make two mistakes it no longer makes. It selected only
+  ONE linked review card, whichever carried the most recent holder-filed verdict
+  row (CARD COLLAPSE), and on that one card it read the most recent holder-filed
+  verdict of ANY kind, so a later `verified` filed to satisfy
+  `completion-requires-verification` hid an earlier `reviewed-clean` (KIND
+  COLLAPSE). Both discarded a `reviewed-clean` that was on the record. The pool
+  above removes both: no card is dropped and no non-conclusion kind is read.
 
-  What this deliberately does NOT relax: once the selected round is the latest
-  VERDICT-CARRYING one, the pre-existing independence guard still applies to it
-  verbatim — a self-held latest round still disqualifies, so a holder cannot
-  launder its own verdict past an earlier independent one.
+  WINNER RECENCY: order the pool by the VERDICT ROW's own recency — `v.ts` DESC,
+  then `v.rowid` DESC, so two verdicts filed in the same millisecond still have
+  exactly one winner — and take the single most recent verdict. Never
+  `r.openedAt`: a reopened OLDER round can receive a fresh verdict after a
+  chronologically younger round closed, and the newest JUDGMENT must win the
+  selection even though its card opened first.
 
-  SINGLE SOURCE OF TRUTH FOR THE WINNING VERDICT (Sol xhigh review round 2):
-  reopening lets ONE card carry more than one verdict over its life — file
-  reviewed-clean, close, reopen, file changes-requested — so "which round"
-  and "which verdict on that round" cannot be two independently-computed
-  answers; a query that picks the round by its latest verdict and then
-  RE-DERIVES a kind by scanning that round's verdicts again is a second
-  computation that has to agree with the first by construction rather than by
-  identity. Each candidate round is joined to the exact `attests` ROW its
-  ordering was computed from (`latestVerdictRowid`), and `latestVerdictKind`
-  is read off that same row — not recomputed. A round with no holder verdict
-  fails the join (the correlated subquery returns NULL, which no rowid
-  equals) exactly where the old `EXISTS` clause excluded it.
+  INDEPENDENCE ON THE WINNER: the producing card qualifies if and only if that
+  single winning verdict's kind is `reviewed-clean` AND the review card the
+  winner sits on is held by a session other than the producing card's holder.
+  The independence test is applied to the WINNER — it is NOT a filter that
+  strips self-held cards from the pool before the winner is chosen. That
+  ordering is load-bearing: a self-held LATEST round still disqualifies, so a
+  holder cannot launder its own stale verdict past an earlier independent one
+  (this is the third collapse R6 deliberately preserves). A later
+  `changes-requested` — on this card or any sibling review card — likewise wins
+  the pool and denies the parent, so a round that found problems still bites.
+
+  SINGLE SOURCE OF TRUTH: the winning kind and the holder it is tested against
+  are read from the SAME `attests` row. `v` is the winning verdict row and `r`
+  is the card it was filed on (`r.id = v.assignmentId`); the kind is `v.verdictKind`
+  and the independence holder is `r.holderKey` off that one row, never a second
+  scan that must agree by construction. An empty pool — no linked card carries
+  any holder-filed review-conclusion verdict — yields nothing and the rail denies
+  exactly as before.
   """
   @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t()) :: [String.t()]
   def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key) do
@@ -1073,32 +1088,24 @@ defmodule Tightbeam.Assignments do
       DB.query(
         db,
         """
-        WITH latest_review AS (
+        WITH winning_verdict AS (
           SELECT
-            r.id,
-            r.holderKey,
-            lv.ts AS latestVerdictTs,
-            lv.rowid AS latestVerdictRowid,
-            lv.verdictKind AS latestVerdictKind
-          FROM assignments AS r
-          JOIN attests AS lv
-            ON lv.rowid = (
-              SELECT v.rowid
-              FROM attests AS v
-              WHERE v.assignmentId = r.id
-                AND v.kind = 'verdict'
-                AND v.bySession = r.holderKey
-              ORDER BY v.ts DESC, v.rowid DESC
-              LIMIT 1
-            )
+            r.holderKey AS reviewHolderKey,
+            v.verdictKind AS verdictKind
+          FROM attests AS v
+          JOIN assignments AS r
+            ON r.id = v.assignmentId
           WHERE r.reviewsAssignmentId = ?1
-          ORDER BY latestVerdictTs DESC, latestVerdictRowid DESC
+            AND v.kind = 'verdict'
+            AND v.bySession = r.holderKey
+            AND v.verdictKind IN ('reviewed-clean', 'changes-requested')
+          ORDER BY v.ts DESC, v.rowid DESC
           LIMIT 1
         )
-        SELECT latestVerdictKind
-        FROM latest_review AS r
-        WHERE r.holderKey != ?2
-          AND latestVerdictKind = 'reviewed-clean'
+        SELECT verdictKind
+        FROM winning_verdict
+        WHERE reviewHolderKey != ?2
+          AND verdictKind = 'reviewed-clean'
         """,
         [assignment_id, assignment_holder_key]
       )

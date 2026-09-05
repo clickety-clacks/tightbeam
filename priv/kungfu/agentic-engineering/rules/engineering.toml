@@ -7,7 +7,7 @@
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
-text = "code, policy, release, and live-mutation completion needs exactly one --reviews-linked card held by a different session whose latest holder-filed verdict is reviewed-clean; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide reviewer selection only"
+text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide reviewer selection only"
 external_producer = false
 edges = ["verb"]
 effect = "remedy"
