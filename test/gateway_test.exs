@@ -234,6 +234,9 @@ defmodule Tightbeam.GatewayTest do
          {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
          parent}
 
+    def handle_call({:prompt, _sid, "fail with " <> json, _opts}, _from, parent),
+      do: {:reply, {:error, JSON.decode!(json)}, parent}
+
     def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
       send(parent, {:prompt_started, self()})
 
@@ -7647,91 +7650,127 @@ defmodule Tightbeam.GatewayTest do
     assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
   end
 
-  test "a failed turn publishes its reason as a chat marker and a terminal state", ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :failed_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
+  # Captured from turns.error for Omarchy Ask PO turn 120945 on September 6,
+  # 2026 at 13:50:30 PT. The provider supplied no timezone for its retry date.
+  @quota_message "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 13th, 2026 6:39 AM."
+  for {label, reason, expected} <- [
+        {"nested quota message",
+         %{
+           "code" => -32603,
+           "message" => "Internal error",
+           "data" => %{"codexErrorInfo" => "usageLimitExceeded", "message" => @quota_message}
+         }, "Internal error " <> @quota_message},
+        {"details", %{"message" => "Internal error", "data" => %{"details" => "auth expired"}},
+         "Internal error auth expired"},
+        {"message and details",
+         %{
+           "message" => "Internal error",
+           "data" => %{"message" => "quota", "details" => "retry later"}
+         }, "Internal error quota retry later"},
+        {"string data", %{"message" => "Internal error", "data" => "retry later"},
+         "Internal error retry later"},
+        {"string reason", "provider unavailable", "provider unavailable"},
+        {"empty nested message",
+         %{
+           "message" => "Internal error",
+           "data" => %{"message" => "", "details" => "retry later"}
+         }, "Internal error retry later"},
+        {"false details", %{"message" => "Internal error", "data" => %{"details" => false}},
+         "Internal error"},
+        {"fallback", %{"code" => -32603}, inspect(%{"code" => -32603})}
+      ] do
+    @tag error_reason: reason, expected_error: expected
+    test "a failed turn publishes #{label} as a chat marker and a terminal state", ctx do
+      exact_registry =
+        start_supervised!(%{
+          id: :failed_conn_registry,
+          start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
+        })
 
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, adapter})
+      adapter = start_supervised!({AdapterStub, self()})
+      start_supervised!({CoordinatorStub, adapter})
 
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "failed",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
+      {:ok, _ref, nil} =
+        ConnRegistry.register(exact_registry, %{
+          pid: self(),
+          user_id: "flynn",
+          device_id: "failed",
+          is_admin: false,
+          subscriptions: MapSet.new(["chat"])
+        })
 
-    base = gateway_children_base!()
+      base = gateway_children_base!()
 
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
+      config = %{
+        base_dir: base,
+        cwd: "/tmp",
+        port: 0,
+        default_harness: :claude,
+        default_model: Model.new("claude-fable-5"),
+        max_live_sessions_per_user: 50,
+        wake_tick_ms: 1_000,
+        onboarding_lease_ms: 1_800_000,
+        db: ctx.db
+      }
 
-    children = Gateway.children(config)
+      children = Gateway.children(config)
 
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
+      {Tightbeam.LaneManager, lane_opts} =
+        Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
 
-    runner = Keyword.fetch!(lane_opts, :runner)
+      runner = Keyword.fetch!(lane_opts, :runner)
 
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "fail this turn",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "failed",
-               client_message_id: "c_fail"
-             )
+      assert :appended =
+               Gateway.deliver_prompt(
+                 "k1",
+                 "user:flynn",
+                 "fail with " <> JSON.encode!(ctx.error_reason),
+                 db: ctx.db,
+                 conn_registry: exact_registry,
+                 lane_manager: ctx.lane,
+                 device_id: "failed",
+                 client_message_id: "c_fail"
+               )
 
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
 
-    assert {:error, %{reason: _, terminal_publish: publish, record_in_txn: record}} =
-             runner.(Map.put(turn, :session_key, "k1"))
+      assert {:error, %{reason: _, terminal_publish: publish, record_in_txn: record}} =
+               runner.(Map.put(turn, :session_key, "k1"))
 
-    assert {:ok, true} =
-             DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom")
-               record.(txn)
-               true
+      assert {:ok, true} =
+               DB.transaction(ctx.db, fn txn ->
+                 assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom")
+                 record.(txn)
+                 true
+               end)
+
+      publish.("failed")
+
+      # EVERY failed turn speaks now. Adjudication used to route a failure into a
+      # brief instead of the marker, so deleting the brief (2026-08-05) would have
+      # left this class of failure with no channel at all — the "agent progress
+      # interrupted, no reason given" that Flynn hit on gibson twice.
+      frames = collect_pushes(9, [])
+
+      assert Enum.any?(frames, fn frame ->
+               frame["type"] == "message" and
+                 frame["content"] ==
+                   "[turn failed]\n\nThe agent could not answer the message above: " <>
+                     ctx.expected_error
              end)
 
-    publish.("failed")
+      assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
+               event.kind == "harness_turn_error" and event.subject == "k1"
+             end)
 
-    # EVERY failed turn speaks now. Adjudication used to route a failure into a
-    # brief instead of the marker, so deleting the brief (2026-08-05) would have
-    # left this class of failure with no channel at all — the "agent progress
-    # interrupted, no reason given" that Flynn hit on gibson twice.
-    frames = collect_pushes(9, [])
-
-    assert Enum.any?(frames, fn frame ->
-             frame["type"] == "message" and
-               String.starts_with?(frame["content"] || "", "[turn failed]\n")
-           end)
-
-    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "harness_turn_error" and event.subject == "k1"
-           end)
-
-    assert Enum.any?(
-             frames,
-             &match?(
-               %{"event" => "prompt_turn_state", "payload" => %{"state" => "failed"}},
-               &1
+      assert Enum.any?(
+               frames,
+               &match?(
+                 %{"event" => "prompt_turn_state", "payload" => %{"state" => "failed"}},
+                 &1
+               )
              )
-           )
+    end
   end
 
   # AC6 (spec 1ae8fa52 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name

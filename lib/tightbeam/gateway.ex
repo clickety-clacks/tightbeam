@@ -6172,7 +6172,13 @@ defmodule Tightbeam.Gateway do
     data = map_get_any(reason, ["data", :data]) || %{}
 
     details =
-      if is_map(data), do: map_get_any(data, ["details", :details]) || "", else: to_string(data)
+      if is_map(data) do
+        [map_get_any(data, ["message", :message]), map_get_any(data, ["details", :details])]
+        |> Enum.reject(&(&1 in [nil, ""]))
+        |> Enum.join(" ")
+      else
+        to_string(data)
+      end
 
     String.trim("#{message} #{details}")
   end
