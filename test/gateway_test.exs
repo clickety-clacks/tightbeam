@@ -69,6 +69,7 @@ defmodule Tightbeam.GatewayTest do
     Placement,
     Projection,
     Rails,
+    RuleRuntime,
     Roles,
     Rules,
     SessionLane,
@@ -1084,6 +1085,60 @@ defmodule Tightbeam.GatewayTest do
       Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
 
     assert Keyword.fetch!(supervision_opts, :recover) == false
+  end
+
+  test "children installs row recognition before recovery closes retired assignments", ctx do
+    base_dir = gateway_children_base!()
+    retired = create_session(ctx.db, "boot-retired", "flynn")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_retired', 'retired at boot', '#{retired.session_key}', 'flynn', 1)"
+      )
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE sessions SET state='retired' WHERE sessionKey='#{retired.session_key}'"
+      )
+
+    rules_dir = Path.join(base_dir, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    File.write!(Path.join(rules_dir, "boot-recovery.toml"), """
+    [[rule]]
+    name = "observe-boot-recovery"
+    verb = "retire"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "record recovered assignment closure"
+    deny_when = [{ fact = "assignment.state", op = "eq", value = "closed" }]
+
+    [rule.notice]
+    target_session = "k1"
+    prompt = "boot recovery closed {assignment_id}"
+    """)
+
+    :persistent_term.erase(RuleRuntime)
+
+    Gateway.children(
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:wake_tick_ms, 1_234)
+    )
+
+    assert {:ok, [["closed", "revoked"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state, outcome FROM assignments WHERE id='asg_boot_retired'"
+             )
+
+    assert [wake] =
+             ctx.db
+             |> Wakes.list_pending()
+             |> Enum.filter(&(&1.prompt == "boot recovery closed asg_boot_retired"))
+
+    assert wake.session_key == "k1"
   end
 
   test "repair-assignment requires outcome reconciliation and appends one deduped rerun", ctx do

@@ -153,10 +153,6 @@ defmodule Tightbeam.Gateway do
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
-    # Recover durable liveness before any runtime child can consume wakes or
-    # accept traffic. The Supervision child skips its duplicate recovery below.
-    :ok = Supervision.recover_liveness!(db, config.wake_tick_ms)
-
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
     cli_token =
@@ -199,6 +195,12 @@ defmodule Tightbeam.Gateway do
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
     reload_law!(config, Map.keys(handler_table))
+
+    # Recover durable liveness only after row-commit recognition is installed,
+    # and before any runtime child can consume wakes or accept traffic. The
+    # Supervision child skips its duplicate recovery below.
+    :ok = Supervision.recover_liveness!(db, config.wake_tick_ms)
+
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
