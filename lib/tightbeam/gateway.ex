@@ -194,7 +194,7 @@ defmodule Tightbeam.Gateway do
 
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
-    reload_law!(config, Map.keys(handler_table))
+    load_law!(config, Map.keys(handler_table))
 
     # Recover durable liveness only after row-commit recognition is installed,
     # and before any runtime child can consume wakes or accept traffic. The
@@ -3128,7 +3128,7 @@ defmodule Tightbeam.Gateway do
         })
 
       {:noop, revision} ->
-        reload_law!(config)
+        load_law!(config)
         %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
 
       {:conflict, paths} ->
@@ -3173,7 +3173,7 @@ defmodule Tightbeam.Gateway do
     case Org.release_archetypes(db, archetypes, prepare, fn {candidate, marker} ->
            case Identity.publish_live!(config.base_dir, candidate) do
              {:ok, revision} ->
-               reload_law!(config)
+               load_law!(config)
                {:published, marker, revision}
 
              {:error, error} ->
@@ -3227,7 +3227,7 @@ defmodule Tightbeam.Gateway do
         "pending" ->
           case Identity.publish_live!(config.base_dir, candidate) do
             {:ok, revision} ->
-              reload_law!(config)
+              load_law!(config)
 
               {:ok, :ok} =
                 DB.transaction(db, fn txn ->
@@ -3390,7 +3390,9 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp reload_law!(config, verbs \\ nil) do
+  @doc false
+  @spec load_law!(config(), Enumerable.t() | nil) :: [Rules.rule()]
+  def load_law!(config, verbs \\ nil) do
     verbs = verbs || config |> handlers() |> Map.keys()
     Archetypes.load!(config.base_dir)
     Rails.load!(config.base_dir)

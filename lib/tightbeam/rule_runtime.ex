@@ -40,7 +40,7 @@ defmodule Tightbeam.RuleRuntime do
   def row_commit_effects_in_txn(%DB.Txn{} = txn, transitions) do
     case callbacks() do
       %{row_commit_effects: evaluate} -> evaluate.(txn, transitions)
-      nil -> []
+      nil -> raise "row rule recognition is not loaded"
     end
   end
 

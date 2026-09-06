@@ -59,7 +59,7 @@ defmodule Tightbeam.Application do
   end
 
   defp start_tree(config) do
-    with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
+    with {:ok, supervisor} <- Supervisor.start_link(children(config), root_opts()) do
       Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
         {:ok, _pid} = Supervisor.start_child(supervisor, child)
       end)
@@ -149,10 +149,22 @@ defmodule Tightbeam.Application do
 
   @doc "The production child list (also started manually by the app test)."
   @spec children() :: [Supervisor.child_spec() | {module(), term()} | module()]
-  def children do
-    base_dir = Application.get_env(:tightbeam, :base_dir, default_base_dir())
+  def children, do: children(production_config())
+
+  @doc false
+  @spec children(Tightbeam.Gateway.config()) ::
+          [Supervisor.child_spec() | {module(), term()} | module()]
+  def children(config) do
+    base_dir = config.base_dir
     File.mkdir_p!(base_dir)
     db_path = Path.join(base_dir, "state.db")
+
+    # Install recognition before the supervisor starts any child. Boot is the
+    # first child after the database and performs every startup business-row
+    # recovery, so loading from inside Gateway composition is already too late.
+    # Keeping this outside the child list also covers future children inserted
+    # before Gateway: no startup child can run while row recognition is absent.
+    Tightbeam.Gateway.load_law!(config)
 
     [
       # DB owner first — the serialization seam everything writes through.
