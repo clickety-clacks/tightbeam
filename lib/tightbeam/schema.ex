@@ -41,6 +41,9 @@ defmodule Tightbeam.Schema do
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
   @shape "row-driven-waits-v1-019"
+  @pre_liveness_shape "row-driven-waits-pre-liveness-v1-019"
+  @pre_liveness_rules_shape "row-driven-rules-pre-liveness-v1-019"
+  @pre_liveness_identity_shape "identity-universal-root-render-pre-liveness-v1-019"
   @row_driven_waits_previous_shape "row-driven-rules-v1-019"
   @row_driven_rules_previous_shape "liveness-progress-receipts-v1-019"
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
@@ -935,7 +938,17 @@ defmodule Tightbeam.Schema do
 
     case DB.transaction(db, fn txn ->
            :ok = Tightbeam.Escalation.ensure_terminal_parity_in_txn(txn, activated_at)
-           ensure_supervision_liveness_v1_in_txn(txn, activated_at)
+           :ok = ensure_supervision_liveness_v1_in_txn(txn, activated_at)
+
+           # Activation and its stamp commit together. A restart before this
+           # transaction retains the explicit pre-liveness migration state.
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+             @shape,
+             activated_at,
+             @pre_liveness_shape
+           ])
+
+           :ok
          end) do
       {:ok, :ok} ->
         :ok
@@ -1192,6 +1205,15 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@pre_liveness_shape]]} ->
+        :ok
+
+      {:ok, [[@pre_liveness_rules_shape]]} ->
+        upgrade_row_driven_waits_v1(db, @pre_liveness_rules_shape)
+
+      {:ok, [[@pre_liveness_identity_shape]]} ->
+        upgrade_liveness_progress_receipts_v1(db, @pre_liveness_identity_shape)
+
       {:ok, [[@row_driven_waits_previous_shape]]} ->
         upgrade_row_driven_waits_v1(db)
 
@@ -1273,6 +1295,11 @@ defmodule Tightbeam.Schema do
          db,
          predecessor \\ @identity_render_stamp_previous_shape
        ) do
+    successor =
+      if predecessor == @notice_batching_pre_liveness_shape,
+        do: @pre_liveness_identity_shape,
+        else: @liveness_progress_receipts_previous_shape
+
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[^predecessor]] ->
@@ -1288,7 +1315,7 @@ defmodule Tightbeam.Schema do
            Txn.q(txn, "ALTER TABLE sessions ADD COLUMN identityGuidanceDigest TEXT")
 
            Txn.q(txn, "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3", [
-             @liveness_progress_receipts_previous_shape,
+             successor,
              System.system_time(:millisecond),
              predecessor
            ])
@@ -1298,20 +1325,27 @@ defmodule Tightbeam.Schema do
 
            :ok
          end) do
-      {:ok, :ok} -> upgrade_liveness_progress_receipts_v1(db)
+      {:ok, :ok} -> check_shape(db)
       {:error, error} -> raise error
     end
   end
 
-  defp upgrade_liveness_progress_receipts_v1(db) do
+  defp upgrade_liveness_progress_receipts_v1(
+         db,
+         predecessor \\ @liveness_progress_receipts_previous_shape
+       ) do
     migration_time = System.system_time(:millisecond)
+    activated = predecessor == @liveness_progress_receipts_previous_shape
+
+    successor =
+      if activated, do: @row_driven_waits_previous_shape, else: @pre_liveness_rules_shape
 
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
       case DB.transaction(db, fn txn ->
              case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-               [[@liveness_progress_receipts_previous_shape]] ->
+               [[^predecessor]] ->
                  :ok
 
                rows ->
@@ -1320,10 +1354,9 @@ defmodule Tightbeam.Schema do
                      "incompatible_liveness_progress_receipts_v1: predecessor stamp #{inspect(rows)}"
              end
 
-             if Txn.q(
-                  txn,
-                  "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervision_liveness_receipts'"
-                ) != [] do
+             # The predecessor stamp carries activation state; physical tables
+             # must never choose which constrained-table migration runs.
+             if activated do
                :ok =
                  Txn.exec(txn, "DROP INDEX IF EXISTS supervision_liveness_receipts_assignment")
 
@@ -1365,8 +1398,8 @@ defmodule Tightbeam.Schema do
              end
 
              Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
-               @liveness_progress_receipts_previous_shape,
-               @row_driven_waits_previous_shape,
+               predecessor,
+               successor,
                migration_time
              ])
 
@@ -1389,7 +1422,7 @@ defmodule Tightbeam.Schema do
              end
            end) do
         {:ok, :ok} ->
-          upgrade_row_driven_waits_v1(db)
+          check_shape(db)
 
         {:error, %ShapeError{} = error} ->
           raise error
@@ -1440,10 +1473,12 @@ defmodule Tightbeam.Schema do
     end
   end
 
-  defp upgrade_row_driven_waits_v1(db) do
+  defp upgrade_row_driven_waits_v1(db, predecessor \\ @row_driven_waits_previous_shape) do
+    successor = if predecessor == @pre_liveness_rules_shape, do: @pre_liveness_shape, else: @shape
+
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@row_driven_waits_previous_shape]] ->
+             [[^predecessor]] ->
                :ok
 
              rows ->
@@ -1455,8 +1490,8 @@ defmodule Tightbeam.Schema do
            migrate_condition_fact_owners_in_txn(txn)
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
-             @row_driven_waits_previous_shape,
-             @shape,
+             predecessor,
+             successor,
              System.system_time(:millisecond)
            ])
 
@@ -1472,7 +1507,7 @@ defmodule Tightbeam.Schema do
                  message: "incompatible_row_driven_waits_v1: foreign key check #{inspect(rows)}"
            end
          end) do
-      {:ok, :ok} -> :ok
+      {:ok, :ok} -> check_shape(db)
       {:error, error} -> raise error
     end
   end

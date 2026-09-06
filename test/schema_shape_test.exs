@@ -13,12 +13,16 @@ defmodule Tightbeam.SchemaShapeTest.FailingDb do
   def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
 
   @impl true
-  def init(opts), do: {:ok, Map.put(opts, :armed, true)}
+  def init(opts), do: {:ok, opts |> Map.put(:armed, true) |> Map.put_new(:skip, 0)}
 
   @impl true
   def handle_call(message, _from, state) do
     if state.armed and holds?(message, state.fragment) do
-      {:reply, {:error, "interrupted"}, %{state | armed: false}}
+      if state.skip > 0 do
+        {:reply, GenServer.call(state.db, message), %{state | skip: state.skip - 1}}
+      else
+        {:reply, {:error, "interrupted"}, %{state | armed: false}}
+      end
     else
       {:reply, GenServer.call(state.db, message), state}
     end
@@ -383,6 +387,67 @@ defmodule Tightbeam.SchemaShapeTest do
     assert "identityRenderContract" in table_columns(db, "sessions")
     assert "identityGuidanceDigest" in table_columns(db, "sessions")
     assert table?(db, "wake_cancellations")
+  end
+
+  for activated <- [false, true], boundary <- [1, 2, 3] do
+    test "activation=#{activated} survives restart after migration boundary #{boundary}" do
+      activated = unquote(activated)
+      boundary = unquote(boundary)
+      unique = System.unique_integer([:positive])
+      path = Path.join(System.tmp_dir!(), "activation-stamp-#{unique}.sqlite3")
+      first = :"activation_before_#{unique}"
+      second = :"activation_after_#{unique}"
+      on_exit(fn -> File.rm(path) end)
+
+      {:ok, first_pid} = DB.start_link(path: path, name: first)
+      assert :ok = Schema.ensure_all(first)
+      downgrade_row_driven_rules(first)
+      unless activated, do: drop_liveness_activation(first)
+      assert :ok = DB.execute(first, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
+      assert :ok = DB.execute(first, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
+
+      predecessor =
+        if activated,
+          do: @identity_render_stamp_previous_shape,
+          else: @notice_batching_pre_liveness_shape
+
+      assert {:ok, _} = DB.query(first, "UPDATE schema_stamp SET shape=?1", [predecessor])
+
+      {:ok, interposer} =
+        Tightbeam.SchemaShapeTest.FailingDb.start_link(
+          db: first,
+          fragment: "SELECT shape FROM schema_stamp",
+          skip: boundary
+        )
+
+      assert_raise CaseClauseError, fn -> Schema.ensure_all(interposer) end
+
+      expected =
+        Enum.at(
+          if(activated,
+            do: ["identity-universal-root-render-v1-019", "row-driven-rules-v1-019", @shape],
+            else: [
+              "identity-universal-root-render-pre-liveness-v1-019",
+              "row-driven-rules-pre-liveness-v1-019",
+              "row-driven-waits-pre-liveness-v1-019"
+            ]
+          ),
+          boundary - 1
+        )
+
+      assert {:ok, [[^expected]]} = DB.query(first, "SELECT shape FROM schema_stamp")
+      assert table?(first, "supervision_liveness_sidecar") == activated
+      :ok = GenServer.stop(interposer)
+      :ok = GenServer.stop(first_pid)
+
+      {:ok, second_pid} = DB.start_link(path: path, name: second)
+      assert :ok = Schema.ensure_all(second)
+      assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
+      assert table?(second, "supervision_liveness_sidecar")
+      assert {:ok, []} = DB.query(second, "PRAGMA foreign_key_check")
+      assert :ok = Schema.ensure_all(second)
+      :ok = GenServer.stop(second_pid)
+    end
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
