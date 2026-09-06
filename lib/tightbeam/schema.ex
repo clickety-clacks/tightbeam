@@ -1489,6 +1489,16 @@ defmodule Tightbeam.Schema do
            add_row_driven_wait_columns_in_txn(txn)
            migrate_condition_fact_owners_in_txn(txn)
 
+           if predecessor == @row_driven_waits_previous_shape do
+             trigger =
+               Enum.find(
+                 @supervision_liveness_enforcement_objects,
+                 &(&1.name == "supervision_liveness_sidecar_insert_coherent")
+               )
+
+             :ok = Txn.exec(txn, trigger.sql)
+           end
+
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              predecessor,
              successor,
@@ -2020,7 +2030,11 @@ defmodule Tightbeam.Schema do
       :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_notice_batching_v1")
     end
 
-    Enum.each(wake_bound_objects, fn object -> :ok = Txn.exec(txn, object.sql) end)
+    # The sidecar admission trigger belongs to the final wake shape. Recreate
+    # it only after the row-driven wait columns exist, not on legacy wakes.
+    wake_bound_objects
+    |> Enum.reject(&(&1.name == "supervision_liveness_sidecar_insert_coherent"))
+    |> Enum.each(fn object -> :ok = Txn.exec(txn, object.sql) end)
 
     case Txn.q(txn, "PRAGMA foreign_key_check") do
       [] ->

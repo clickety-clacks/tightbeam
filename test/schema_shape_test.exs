@@ -1135,14 +1135,38 @@ defmodule Tightbeam.SchemaShapeTest do
     {:ok, first_pid} = DB.start_link(path: path, name: first)
     assert {:ok, [[@terminal_decision_shape]]} = DB.query(first, "SELECT shape FROM schema_stamp")
     assert table?(first, "wake_cancellations")
-    assert :ok = Schema.ensure_all(first)
-    assert {:ok, [[@shape]]} = DB.query(first, "SELECT shape FROM schema_stamp")
+
+    {:ok, interposer} =
+      Tightbeam.SchemaShapeTest.FailingDb.start_link(
+        db: first,
+        fragment: "SELECT shape FROM schema_stamp",
+        skip: 1
+      )
+
+    assert_raise CaseClauseError, fn -> Schema.ensure_all(interposer) end
+
+    assert {:ok, [[@effort_request_exit_previous_shape]]} =
+             DB.query(first, "SELECT shape FROM schema_stamp")
+
+    refute "waitMode" in table_columns(first, "wakes")
+
+    assert {:ok, []} =
+             DB.query(
+               first,
+               "SELECT name FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+             )
+
+    :ok = GenServer.stop(interposer)
     :ok = GenServer.stop(first_pid)
 
     {:ok, second_pid} = DB.start_link(path: path, name: second)
     assert :ok = Schema.ensure_all(second)
     assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
     assert "identityGuidanceDigest" in table_columns(second, "sessions")
+    assert "waitMode" in table_columns(second, "wakes")
+
+    assert object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent") =~
+             "coherentpendingwake"
 
     assert object_sql(second, "trigger", "wakes_typed_cancellation_required") =~
              "pendingwakecancellationrequirestypedprovenance"
