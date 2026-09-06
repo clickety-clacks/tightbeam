@@ -23,25 +23,27 @@ defmodule Tightbeam.CliIntegrationTest do
 
   setup_all do
     cli_dir = Path.expand("../cli", __DIR__)
-    binary = Path.join(cli_dir, "target/release/tightbeam")
+    target_dir = Path.join(cli_dir, "target/cli-integration")
+    binary = Path.join(target_dir, "release/tightbeam")
 
-    if cargo = System.find_executable("cargo") do
-      {output, status} =
-        System.cmd(cargo, ["build", "--release"], cd: cli_dir, stderr_to_stdout: true)
+    # Other suites rebuild target/release. This suite owns its parser executable.
+    {output, status} =
+      System.cmd("cargo", ["build", "--release"],
+        cd: cli_dir,
+        env: [{"CARGO_TARGET_DIR", target_dir}],
+        stderr_to_stdout: true
+      )
 
-      if status != 0, do: raise("release CLI build failed:\n#{output}")
-    end
+    if status != 0, do: raise("CLI integration build failed:\n#{output}")
 
     unless File.exists?(binary) do
-      raise "CLI integration binary missing: #{binary}; run cargo build --release in cli/"
+      raise "CLI integration build did not produce #{binary}"
     end
 
-    :ok
+    {:ok, binary: binary}
   end
 
-  setup do
-    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
-
+  setup %{binary: binary} do
     db = :"cli_integration_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -1805,6 +1807,20 @@ defmodule Tightbeam.CliIntegrationTest do
     assert status != 0
     assert output =~ "usage: tightbeam decision-request --request <decisionRequestId>"
     refute_receive {:cli_call, _call}
+  end
+
+  test "real CLI rejects closed or retired Topline shapes before router dispatch", ctx do
+    for args <- [
+          ["topline-create", "--title", "Ship", "--key", "closed-key", "--bogus", "ignored"],
+          ["toplines", "--tree"],
+          ["topline", "tl_probe", "--under", "wi_probe"],
+          ["topline-placement-list", "--history"]
+        ] do
+      {output, status} = System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      assert status != 0
+      assert output =~ "does not accept"
+      refute_receive {:cli_call, _call}
+    end
   end
 
   test "A-27 checked fixture is captured from release CLI and real HTTP responses", ctx do
