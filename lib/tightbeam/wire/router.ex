@@ -76,6 +76,22 @@ defmodule Tightbeam.Wire.Router do
   @state_not_found_floor_us 3_000
   @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
   @state_read_specs %{
+    work_items: %{
+      route: "work_items.collection",
+      resource: "work items",
+      class: "work_item.created",
+      filters: %{
+        "state" => {:enum, ~w(open iceboxed closed failed)},
+        "ownerUserId" => :string,
+        "createdBySession" => :string,
+        "createdByUser" => :string,
+        "isBug" => {:enum, ~w(true false)},
+        "specRefName" => :string,
+        "holderKey" => :string
+      },
+      order: [{:created_at, :integer}, {:id, :string}],
+      detail: true
+    },
     config: %{
       route: "config.collection",
       resource: "config",
@@ -482,18 +498,7 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/api/work-items" do
-    conn = Plug.Conn.fetch_query_params(conn)
-
-    with {:ok, device} <- device_auth(conn) do
-      filters = %{
-        session_key: conn.query_params["sessionKey"],
-        owner_user_id: if(device.is_admin, do: nil, else: device.user_id)
-      }
-
-      json(conn, 200, WorkState.list_items(db(conn), filters))
-    else
-      {:error, status, code, message} -> error(conn, status, code, message)
-    end
+    state_collection(conn, Map.fetch!(@state_read_specs, :work_items))
   end
 
   get "/api/work-items/:work_item_id" do
@@ -564,7 +569,11 @@ defmodule Tightbeam.Wire.Router do
          {:ok, request} <- state_collection_request(query, spec),
          {:ok, boundary} <- state_cursor_boundary(request, principal, spec),
          seam <- state_seam!(spec),
-         visible <- apply(StateVisibility, seam.visibility, [principal.is_admin]),
+         visible <-
+           if(spec.resource == "work items",
+             do: principal,
+             else: apply(StateVisibility, seam.visibility, [principal.is_admin])
+           ),
          rows <- state_collection_rows(conn, spec, seam, request.filters, visible),
          {page_rows, page} <- state_page(rows, boundary, request, principal, spec),
          items <- state_serialize_rows(page_rows, spec) do
@@ -1107,6 +1116,23 @@ defmodule Tightbeam.Wire.Router do
 
   defp state_collection_rows(_conn, _spec, _seam, _filters, false), do: []
 
+  defp state_collection_rows(conn, %{resource: "work items"} = spec, _seam, filters, principal) do
+    filters
+    |> state_filter_combinations()
+    |> Enum.flat_map(fn selection ->
+      selection =
+        case selection["isBug"] do
+          "true" -> Map.put(selection, "isBug", 1)
+          "false" -> Map.put(selection, "isBug", 0)
+          _ -> selection
+        end
+
+      StateResources.query_work_item(db(conn), selection, %{rest_principal: principal})
+    end)
+    |> Enum.uniq_by(&state_row_tuple(&1, spec.order))
+    |> Enum.sort_by(&state_row_tuple(&1, spec.order))
+  end
+
   defp state_collection_rows(conn, spec, seam, filters, true) do
     filters
     |> state_filter_combinations()
@@ -1129,6 +1155,9 @@ defmodule Tightbeam.Wire.Router do
       end
     end)
   end
+
+  defp state_seam!(%{resource: "work items"}),
+    do: %{query: :query_work_item, serializer: :work_item}
 
   defp state_seam!(spec) do
     row = Registry.rows() |> Map.fetch!(spec.class)

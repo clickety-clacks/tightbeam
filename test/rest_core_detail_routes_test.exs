@@ -29,7 +29,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   @r7_fields %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closingAttestId workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "wakes" =>
@@ -65,7 +65,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   }
 
   @integer_fields %{
-    "work items" => ~w(createdInTurnSeq createdAt rowVersion),
+    "work items" => ~w(createdInTurnSeq createdAt priority rowVersion),
     "assignments" => ~w(openedAt closedAt rowVersion),
     "wakes" =>
       ~w(dueAt createdAt firedAt reresolveRung conditionAfterId canceledAt targetGate rowVersion),
@@ -293,6 +293,74 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       artifact: artifact,
       catalog: catalog
     }
+  end
+
+  test "work-item collection uses the same priority projection as detail", ctx do
+    response = get(ctx, "/api/work-items")
+    assert response.status == 200, response.resp_body
+    body = JSON.decode!(response.resp_body)
+    assert body["resource"] == "work items"
+    assert body["schemaVersion"] == 1
+    assert Map.keys(body) |> Enum.sort() == ~w(items page resource schemaVersion)
+
+    detail =
+      get(ctx, "/api/work-items/#{ctx.work_item.id}") |> Map.fetch!(:resp_body) |> JSON.decode!()
+
+    assert Enum.find(body["items"], &(&1["id"] == ctx.work_item.id)) == detail["item"]
+    assert is_integer(detail["item"]["priority"])
+
+    invalid = get(ctx, "/api/work-items?priority=4")
+    assert invalid.status == 400
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
+  end
+
+  test "no-sidecar work items retain configured and fallback priority across reads and notices",
+       ctx do
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM work_item_priorities WHERE workItemId=?1", [ctx.work_item.id])
+
+    for {configured, expected} <- [{nil, 4}, {"7", 7}, {"0", 0}] do
+      {:ok, _} = DB.query(ctx.db, "DELETE FROM org_settings WHERE key='default-priority'")
+
+      if configured do
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "INSERT INTO org_settings (key,value,updatedAt) VALUES ('default-priority',?1,1)",
+            [configured]
+          )
+      end
+
+      collection = get(ctx, "/api/work-items")
+      detail = get(ctx, "/api/work-items/#{ctx.work_item.id}")
+      assert collection.status == 200, collection.resp_body
+      assert detail.status == 200, detail.resp_body
+      item = JSON.decode!(detail.resp_body)["item"]
+      assert item["priority"] == expected
+
+      assert Enum.find(
+               JSON.decode!(collection.resp_body)["items"],
+               &(&1["id"] == ctx.work_item.id)
+             ) == item
+
+      call = %{
+        verb: "work-item-update",
+        principal: {:user, ctx.work_item.ownerUserId},
+        origin: "user:#{ctx.work_item.ownerUserId}",
+        params: %{work_item_id: ctx.work_item.id}
+      }
+
+      notice = Tightbeam.Firehose.Publisher.state_notice(ctx.db, call, %{id: ctx.work_item.id})
+      assert notice["payload"] == item
+
+      assert StateResources.encode_item("work items", notice["payload"], ctx.catalog) ==
+               StateResources.encode_item("work items", item, ctx.catalog)
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT count(*) FROM work_item_priorities WHERE workItemId=?1", [
+                 ctx.work_item.id
+               ])
+    end
   end
 
   test "the closed nine-route inventory returns exact shared item bytes", ctx do
