@@ -46,10 +46,10 @@ defmodule Tightbeam.Firehose.Publisher do
                        )
 
   @spec accepted(map(), term()) :: :ok
-  def accepted(call, result), do: Hub.accepted(nil, call, result)
+  def accepted(call, result), do: Hub.accepted(hub(call), nil, call, result)
 
   @spec accepted(GenServer.server(), map(), term()) :: :ok
-  def accepted(db, call, result), do: Hub.accepted(db, call, result)
+  def accepted(db, call, result), do: Hub.accepted(hub(call), db, call, result)
 
   @spec transactional_verb?(String.t()) :: boolean()
   def transactional_verb?(verb), do: MapSet.member?(@transactional_verbs, verb)
@@ -64,7 +64,7 @@ defmodule Tightbeam.Firehose.Publisher do
   @doc "Queue accepted notices on the transaction that committed their state."
   @spec accepted_in_txn(Txn.t(), map(), term()) :: :ok
   def accepted_in_txn(%Txn{} = txn, call, result) do
-    Txn.handoff(txn, Hub, {:accepted, nil, call, result})
+    Txn.handoff(txn, hub(call), {:accepted, nil, call, result})
   end
 
   @spec maybe_accepted_in_txn(Txn.t(), map(), term()) :: :ok
@@ -75,7 +75,7 @@ defmodule Tightbeam.Firehose.Publisher do
 
   @spec observed_accepted_in_txn(Txn.t(), map()) :: :ok
   def observed_accepted_in_txn(%Txn{} = txn, call) do
-    Txn.handoff(txn, Hub, {:publish, observation_notice("verb.accepted", call)})
+    Txn.handoff(txn, hub(call), {:publish, observation_notice("verb.accepted", call)})
   end
 
   @spec maybe_observed_accepted_in_txn(Txn.t(), map()) :: :ok
@@ -96,15 +96,16 @@ defmodule Tightbeam.Firehose.Publisher do
   def capture_before(_db, call), do: call
 
   @spec denied(map(), map()) :: :ok
-  def denied(call, error), do: Hub.denied(call, error)
+  def denied(call, error), do: Hub.denied(hub(call), call, error)
 
   @spec denied_in_txn(Txn.t(), map(), map()) :: :ok
   def denied_in_txn(%Txn{} = txn, call, error) do
-    Txn.handoff(txn, Hub, {:denied, call, error})
+    Txn.handoff(txn, hub(call), {:denied, call, error})
   end
 
   @spec observed_accepted(map()) :: :ok
-  def observed_accepted(call), do: Hub.publish(observation_notice("verb.accepted", call))
+  def observed_accepted(call),
+    do: Hub.publish(hub(call), observation_notice("verb.accepted", call))
 
   @spec accepted_notices(GenServer.server() | nil, map(), term()) :: [map()]
   def accepted_notices(db, call, result) do
@@ -465,6 +466,8 @@ defmodule Tightbeam.Firehose.Publisher do
   defp principal({kind, value}) when is_binary(value), do: "#{kind}:#{value}"
   defp principal(value) when is_binary(value), do: value
   defp principal(_value), do: nil
+
+  defp hub(call), do: Map.get(call, :firehose_hub, Hub)
 
   defp require_primary_refs!(class, primary_refs, refs) do
     missing = Enum.reject(primary_refs, &(is_binary(refs[&1]) or is_integer(refs[&1])))

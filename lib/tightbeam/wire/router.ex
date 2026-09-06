@@ -169,6 +169,7 @@ defmodule Tightbeam.Wire.Router do
         verb: verb,
         origin: origin,
         principal: principal,
+        firehose_hub: deps(conn)[:firehose_hub] || Tightbeam.Firehose.Hub,
         # Identity resolution can turn a session-authenticated call into a user
         # principal. Keep the authenticated transport beside that principal so a
         # handler can stamp the hop without trusting a caller param.

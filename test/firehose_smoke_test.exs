@@ -3,141 +3,151 @@ defmodule Tightbeam.FirehoseSmokeTest do
 
   alias Tightbeam.ClientE2E.WS
   alias Tightbeam.Firehose.Hub
-  alias Tightbeam.Wire.Router
-  alias Tightbeam.{DB, Devices, Gateway, Rules}
+  alias Tightbeam.FirehoseAcceptanceFixture, as: Fixture
 
-  setup do
-    db = :firehose_smoke_db
-    start_supervised!({DB, path: ":memory:", name: db})
-    start_supervised!({Hub, name: Hub})
-    :ok = Tightbeam.Schema.ensure_all(db)
+  @moduledoc """
+  Firehose acceptance map: A5 slow-consumer 4008/reconnect/rebuild is automated
+  here. A5 remains partial for gateway-kill recovery until Card 4 promotes the
+  existing restart smoke into ExUnit.
+  """
 
-    base_dir =
-      Path.join(
-        System.tmp_dir!(),
-        "tightbeam-firehose-smoke-#{System.unique_integer([:positive])}"
-      )
-
-    File.mkdir_p!(base_dir)
-    on_exit(fn -> File.rm_rf!(base_dir) end)
-
-    {:paired, device} =
-      Devices.pair(db, %{
-        device_id: "smoke-device",
-        claimed_name: "Flynn",
-        platform: nil,
-        model: nil
-      })
-
-    handlers = Gateway.handlers(%{db: db, base_dir: base_dir, wake_tick_ms: 1_000})
-    Rules.load!(Path.join(base_dir, "no-rules"), Map.keys(handlers))
-    on_exit(fn -> Rules.load!(Path.join(base_dir, "reset-rules"), []) end)
-
-    router_opts =
-      Router.init(
-        db: db,
-        base_dir: base_dir,
-        handlers: handlers,
-        cli_token: "tbc_firehose_smoke",
-        firehose_hub: Hub,
-        session_status: fn _ -> nil end
-      )
-
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
-      )
-
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
-    %{device: device, port: port}
-  end
-
-  test "external subscribe, query rebuild, live apply, and forced reconnect converge", ctx do
-    ws = connect(ctx)
-    snapshot = snapshot(ctx.port)
+  test "external subscribe, query rebuild, live apply, and forced reconnect converge" do
+    fixture = start_fixture!()
+    ws = Fixture.connect(fixture)
+    snapshot = Fixture.snapshot(fixture)
     assert snapshot == %{}
 
-    first = create_item(ctx.port, "First live item")
-    {notice, ws} = recv_change(ws)
+    first = Fixture.create_item(fixture, "First live item")
+    {notice, ws} = Fixture.recv_change(ws)
     assert notice["class"] == "work_item.created"
     model = Map.put(snapshot, notice["refs"]["workItemId"], notice["payload"])
     assert Map.keys(model) == [first]
-    assert Map.keys(model) |> Enum.sort() == snapshot(ctx.port) |> Map.keys() |> Enum.sort()
+
+    assert Map.keys(model) |> Enum.sort() ==
+             Fixture.snapshot(fixture) |> Map.keys() |> Enum.sort()
 
     :ok = WS.close(ws)
-    second = create_item(ctx.port, "Committed while disconnected")
+    second = Fixture.create_item(fixture, "Committed while disconnected")
 
-    ws = connect(ctx)
-    rebuilt = snapshot(ctx.port)
+    ws = Fixture.connect(fixture)
+    rebuilt = Fixture.snapshot(fixture)
     assert Enum.sort(Map.keys(rebuilt)) == Enum.sort([first, second])
 
-    third = create_item(ctx.port, "After reconnect")
-    {notice, ws} = recv_change(ws)
+    third = Fixture.create_item(fixture, "After reconnect")
+    {notice, ws} = Fixture.recv_change(ws)
     rebuilt = Map.put(rebuilt, notice["refs"]["workItemId"], notice["payload"])
     assert Enum.sort(Map.keys(rebuilt)) == Enum.sort([first, second, third])
-    assert rebuilt == snapshot(ctx.port)
+    assert rebuilt == Fixture.snapshot(fixture)
     :ok = WS.close(ws)
   end
 
-  defp connect(ctx) do
-    {:ok, ws} = WS.connect("127.0.0.1", ctx.port, "/ws/changes?protocolVersion=1")
-    :ok = WS.send_text(ws, JSON.encode!(%{"type" => "auth", "token" => ctx.device.token}))
-    {:ok, {:text, auth}, ws} = WS.recv(ws, 2_000)
-    assert %{"type" => "auth_result", "success" => true} = JSON.decode!(auth)
+  test "a real slow consumer observes 4008 then reconnects, rebuilds, and converges" do
+    owner = self()
+    barrier_ref = make_ref()
+    first_delivery = :atomics.new(1, signed: false)
 
-    :ok =
-      WS.send_text(
-        ws,
-        JSON.encode!(%{
-          "type" => "subscribe",
-          "protocolVersion" => 1,
-          "subscriptionId" => "work-items",
-          "filters" => %{"classes" => ["work_item."]}
-        })
-      )
+    delivery_barrier = fn notice ->
+      if :atomics.compare_exchange(first_delivery, 1, 0, 1) == :ok do
+        send(owner, {:firehose_delivery_held, barrier_ref, self(), notice})
 
-    {:ok, {:text, ready}, ws} = WS.recv(ws, 2_000)
-    assert %{"type" => "subscription_ready"} = JSON.decode!(ready)
-    ws
+        receive do
+          {:release_firehose_delivery, ^barrier_ref} -> :ok
+        end
+      end
+    end
+
+    fixture = start_fixture!(queue_limit: 2, delivery_barrier: delivery_barrier)
+    ws = Fixture.connect(fixture)
+    assert Fixture.snapshot(fixture) == %{}
+
+    first = Fixture.create_item(fixture, "Held delivery")
+
+    assert_receive {:firehose_delivery_held, ^barrier_ref, socket, first_notice}
+    assert first_notice["refs"]["workItemId"] == first
+
+    second = Fixture.create_item(fixture, "Queued delivery")
+    third = Fixture.create_item(fixture, "Overflow delivery")
+
+    publication_barrier(fixture)
+
+    assert Hub.connection_stats(fixture.hub, socket) == %{
+             in_flight: true,
+             overflowed: true,
+             queued: 0,
+             seq: 3
+           }
+
+    send(socket, {:release_firehose_delivery, barrier_ref})
+    assert {:ok, {:closed, 4008}, _ws} = Fixture.recv_close(ws, 2_000)
+
+    ws = Fixture.connect(fixture)
+    rebuilt = Fixture.snapshot(fixture)
+    assert Enum.sort(Map.keys(rebuilt)) == Enum.sort([first, second, third])
+
+    fourth = Fixture.create_item(fixture, "After slow-consumer reconnect")
+    {notice, ws} = Fixture.recv_change(ws)
+    rebuilt = Map.put(rebuilt, notice["refs"]["workItemId"], notice["payload"])
+    assert Enum.sort(Map.keys(rebuilt)) == Enum.sort([first, second, third, fourth])
+    assert rebuilt == Fixture.snapshot(fixture)
+    :ok = WS.close(ws)
   end
 
-  defp recv_change(ws) do
-    {:ok, {:text, bytes}, ws} = WS.recv(ws, 2_000)
-    notice = JSON.decode!(bytes)
-    assert notice["type"] == "change"
-    {notice, ws}
+  test "parallel fixtures own distinct state, ports, processes, and queues" do
+    left = start_fixture!()
+    right = start_fixture!()
+
+    assert left.base_dir != right.base_dir
+    assert left.db_path != right.db_path
+    assert File.exists?(left.db_path)
+    assert File.exists?(right.db_path)
+    assert left.port != right.port
+    assert left.db != right.db
+    assert left.gateway != right.gateway
+    assert left.hub != right.hub
+    assert left.supervisor != right.supervisor
+
+    left_task = Task.async(fn -> Fixture.create_item(left, "Left only") end)
+    right_task = Task.async(fn -> Fixture.create_item(right, "Right only") end)
+    left_id = Task.await(left_task)
+    right_id = Task.await(right_task)
+
+    assert Map.keys(Fixture.snapshot(left)) == [left_id]
+    assert Map.keys(Fixture.snapshot(right)) == [right_id]
+
+    assert :ok = Fixture.stop(left)
+    assert :ok = Fixture.stop(right)
   end
 
-  defp create_item(port, title) do
-    %{"result" => %{"id" => id}} =
-      dispatch(port, "work-item-create", %{"title" => title})
-
-    id
+  defp start_fixture!(opts \\ []) do
+    fixture = Fixture.start!(opts)
+    on_exit(fn -> assert :ok = Fixture.stop(fixture) end)
+    fixture
   end
 
-  defp snapshot(port) do
-    %{"result" => %{"workItems" => items}} = dispatch(port, "work-item-list", %{})
-    Map.new(items, &{&1["id"], Tightbeam.StateResources.work_item(&1)})
+  defp publication_barrier(fixture) do
+    marker = %{"fixtureBarrier" => inspect(make_ref())}
+    :ok = Hub.register(fixture.hub, self())
+
+    assert {:ok, :ok} =
+             Tightbeam.DB.transaction(fixture.db, fn txn ->
+               Tightbeam.DB.Txn.handoff(txn, fixture.hub, {:publish, marker})
+             end)
+
+    receive_barrier(fixture.hub, marker)
+    Hub.unregister(fixture.hub, self())
   end
 
-  defp dispatch(port, verb, params) do
-    body = JSON.encode!(%{"verb" => verb, "asUser" => "flynn", "params" => params})
-    url = ~c"http://127.0.0.1:#{port}/agent/dispatch"
+  defp receive_barrier(hub, marker) do
+    receive do
+      {:firehose_notice, ^marker} ->
+        Hub.delivered(hub, self())
+        :ok
 
-    {:ok, {{_version, 200, _reason}, _headers, response}} =
-      :httpc.request(
-        :post,
-        {url,
-         [
-           {~c"authorization", ~c"Bearer tbc_firehose_smoke"},
-           {~c"x-tightbeam-cli-version",
-            String.to_charlist(Tightbeam.CliCompatibility.required_version())},
-           {~c"content-type", ~c"application/json"}
-         ], ~c"application/json", body},
-        [{:timeout, 2_000}],
-        body_format: :binary
-      )
-
-    JSON.decode!(response)
+      {:firehose_notice, _notice} ->
+        Hub.delivered(hub, self())
+        receive_barrier(hub, marker)
+    after
+      1_000 -> flunk("Firehose publication barrier was not delivered")
+    end
   end
 end

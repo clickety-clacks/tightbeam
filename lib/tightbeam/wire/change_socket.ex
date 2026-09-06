@@ -37,6 +37,7 @@ defmodule Tightbeam.Wire.ChangeSocket do
 
   @impl true
   def handle_info({:firehose_notice, notice}, %{phase: :live} = state) do
+    await_delivery_release(state, notice)
     Hub.delivered(hub(state), self())
     push(notice, state)
   end
@@ -210,6 +211,14 @@ defmodule Tightbeam.Wire.ChangeSocket do
   defp db(state), do: Map.get(state.deps, :db, Tightbeam.DB)
   defp hub(state), do: Map.get(state.deps, :firehose_hub, Hub)
   defp heartbeat_ms(state), do: Map.get(state.deps, :firehose_heartbeat_ms, 15_000)
+
+  defp await_delivery_release(state, notice) do
+    case Map.get(state.deps, :firehose_delivery_barrier) do
+      barrier when is_function(barrier, 1) -> barrier.(notice)
+      nil -> :ok
+    end
+  end
+
   defp cancel_timer(nil), do: :ok
   defp cancel_timer(timer), do: Process.cancel_timer(timer, async: true, info: false)
 end
