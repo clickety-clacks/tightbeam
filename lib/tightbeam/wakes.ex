@@ -625,6 +625,7 @@ defmodule Tightbeam.Wakes do
 
   defp register_dependency_in_txn(txn, input, obligation) do
     with {:ok, declaration} <- normalize_dependency_declaration(input[:predicate]),
+         declaration <- capture_condition_cursor_in_txn(txn, declaration),
          {:ok, resolver} <-
            resolver_in_txn(txn, declaration.resolver_ref, obligation.owner_user_id),
          {:ok, verifier} <-
@@ -683,6 +684,35 @@ defmodule Tightbeam.Wakes do
       else
         wake
       end
+    end
+  end
+
+  defp capture_condition_cursor_in_txn(txn, declaration) do
+    condition_fact? =
+      Enum.any?(List.wrap(declaration.conditions), fn
+        condition when is_map(condition) ->
+          fact = Map.get(condition, "fact") || Map.get(condition, :fact)
+
+          match?(
+            %{kind: :condition_fact},
+            RuleRuntime.predicate_transition_contract(fact)
+          )
+
+        _ ->
+          false
+      end)
+
+    if condition_fact? and is_map(declaration.bindings) do
+      [[cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
+
+      bindings =
+        declaration.bindings
+        |> Map.drop(["conditionAfterId", :conditionAfterId, :condition_after_id])
+        |> Map.put("conditionAfterId", cursor)
+
+      %{declaration | bindings: bindings}
+    else
+      declaration
     end
   end
 
@@ -1016,38 +1046,50 @@ defmodule Tightbeam.Wakes do
 
   defp predicate_transition_relevant?(txn, wake, transition) do
     conditions = wake.predicate["conditions"] || wake.predicate[:conditions] || []
-    facts = MapSet.new(conditions, &(Map.get(&1, "fact") || Map.get(&1, :fact)))
     bindings = wake.predicate["bindings"] || wake.predicate[:bindings] || %{}
     domain = transition[:domain]
-    row_id = to_string(transition[:row_id])
 
-    cond do
-      domain == "assignment" and predicate_domain?(facts, "assignment.") ->
-        row_id == predicate_binding(bindings, "assignmentId")
+    Enum.any?(conditions, fn condition ->
+      fact = Map.get(condition, "fact") || Map.get(condition, :fact)
 
-      domain == "decision_request" and predicate_domain?(facts, "decision_request.") ->
-        row_id == predicate_binding(bindings, "decisionRequestId")
+      case RuleRuntime.predicate_transition_contract(fact) do
+        %{kind: :row, domains: domains, binding: binding} ->
+          domain in domains and
+            to_string(transition[:row_id]) == predicate_binding(bindings, binding)
 
-      domain == "work_item" and predicate_domain?(facts, "work_item.") ->
-        row_id == predicate_binding(bindings, "workItemId")
+        %{kind: :artifact, domains: domains, binding: binding} ->
+          domain in domains and
+            artifact_transition_relevant?(txn, transition, predicate_binding(bindings, binding))
 
-      domain == "artifact" and
-          (predicate_domain?(facts, "artifact.") or predicate_domain?(facts, "review.")) ->
-        artifact_transition_relevant?(txn, transition, predicate_binding(bindings, "artifact"))
+        %{kind: :condition_fact, domains: domains} ->
+          domain in domains and condition_fact_transition_relevant?(transition, bindings)
 
-      domain == "attest" and predicate_domain?(facts, "review.") ->
-        artifact_transition_relevant?(txn, transition, predicate_binding(bindings, "artifact"))
+        nil ->
+          false
 
-      true ->
-        false
-    end
+        contract ->
+          raise "unsupported predicate transition contract: #{inspect(contract)}"
+      end
+    end)
   end
-
-  defp predicate_domain?(facts, prefix),
-    do: Enum.any?(facts, &(is_binary(&1) and String.starts_with?(&1, prefix)))
 
   defp predicate_binding(bindings, key),
     do: Map.get(bindings, key) || Map.get(bindings, String.to_atom(key))
+
+  defp condition_fact_transition_relevant?(transition, bindings) do
+    transition_bindings = transition[:bindings] || %{}
+    fact_id = transition[:row_id]
+    expected_fact_id = predicate_binding(bindings, "conditionFactId")
+    expected_scope = predicate_binding(bindings, "conditionScope")
+    actual_kind = predicate_binding(transition_bindings, "conditionKind")
+    actual_scope = predicate_binding(transition_bindings, "conditionScope")
+    after_id = predicate_binding(bindings, "conditionAfterId")
+
+    is_integer(fact_id) and is_integer(after_id) and fact_id > after_id and
+      actual_kind == predicate_binding(bindings, "conditionKind") and
+      (is_nil(expected_scope) or actual_scope == expected_scope) and
+      (is_nil(expected_fact_id) or fact_id == expected_fact_id)
+  end
 
   defp artifact_transition_relevant?(_txn, _transition, selector) when not is_map(selector),
     do: false

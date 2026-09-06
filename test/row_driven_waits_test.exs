@@ -329,6 +329,72 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert reconsidered.recognition_transition["row_id"] == "R4-end"
   end
 
+  test "condition-fact dependency captures its cursor and stamps the exact future fact", ctx do
+    historical =
+      ConditionFacts.file(ctx.db, ctx.scheduler, %{
+        kind: "structured-ready",
+        scope: "production",
+        origin: "user:owner-a"
+      })
+
+    turn = running_turn(ctx.db, "holder")
+
+    wake =
+      register_wait(
+        ctx.db,
+        due_after(),
+        condition_fact_predicate("structured-ready", "production", 0)
+      )
+
+    assert wake.recognition_path == nil
+
+    assert Wakes.get(ctx.db, wake.wake_id).predicate["bindings"]["conditionAfterId"] ==
+             historical.fact_id
+
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "structured-ready",
+      scope: "staging",
+      origin: "user:owner-a"
+    })
+
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "structured-ready",
+      scope: "production",
+      origin: "user:owner-b"
+    })
+
+    assert Wakes.get(ctx.db, wake.wake_id).recognition_path == nil
+
+    matching =
+      ConditionFacts.file(ctx.db, ctx.scheduler, %{
+        kind: "structured-ready",
+        scope: "production",
+        origin: "user:owner-a"
+      })
+
+    matching_id = matching.fact_id
+    recognized = Wakes.get(ctx.db, wake.wake_id)
+    assert recognized.recognition_path == "success"
+
+    assert %{
+             "domain" => "condition_fact",
+             "row_id" => ^matching_id,
+             "field" => %{"name" => "id", "old" => nil, "new" => ^matching_id}
+           } = recognized.recognition_transition
+
+    assert recognized.recognition_evidence["label"] == "row-transition"
+
+    assert recognized.recognition_evidence["condition_match"] == %{
+             "id" => matching_id,
+             "scope" => "production"
+           }
+
+    assert turn_count(ctx.db, wake.wake_id) == 0
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, wake.wake_id) == 1
+  end
+
   test "after-turn captures the running turn and becomes eligible on every terminal outcome",
        ctx do
     before = wake_count(ctx.db)
@@ -1003,6 +1069,22 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       "bindings" => %{"decisionRequestId" => request_id},
       "resolverRef" => %{"kind" => "decision_request", "id" => request_id},
       "necessity" => "The named decision must reach the requested disposition.",
+      "verificationRef" => %{"kind" => "assignment", "id" => "V"}
+    }
+  end
+
+  defp condition_fact_predicate(kind, scope, asserted_cursor) do
+    %{
+      "conditions" => [
+        %{"fact" => "condition_fact.matches", "op" => "eq", "value" => true}
+      ],
+      "bindings" => %{
+        "conditionKind" => kind,
+        "conditionScope" => scope,
+        "conditionAfterId" => asserted_cursor
+      },
+      "resolverRef" => %{"kind" => "assignment", "id" => "R"},
+      "necessity" => "Only a new owner-scoped condition fact satisfies this dependency.",
       "verificationRef" => %{"kind" => "assignment", "id" => "V"}
     }
   end

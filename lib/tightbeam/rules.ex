@@ -165,17 +165,6 @@ defmodule Tightbeam.Rules do
     conditionKind conditionScope conditionAfterId conditionFactId
   )
   @artifact_facts ~w(artifact.present artifact.content_sha256 review.qualifying_verdict_kinds)
-  @row_fact_domains %{
-    "assignment.state" => ~w(assignment),
-    "assignment.outcome" => ~w(assignment),
-    "work_item.state" => ~w(work_item),
-    "decision_request.status" => ~w(decision_request),
-    "artifact.present" => ~w(artifact),
-    "artifact.content_sha256" => ~w(artifact),
-    "review.qualifying_verdict_kinds" => ~w(artifact attest),
-    "condition_fact.matches" => ~w(condition_fact)
-  }
-
   @type condition :: %{fact: String.t(), op: String.t(), value: term()}
   @type rule :: %{
           name: String.t(),
@@ -692,7 +681,7 @@ defmodule Tightbeam.Rules do
 
   defp row_domain_candidate?(rule, domain) do
     Enum.any?(rule.conditions, fn condition ->
-      domain in Map.get(@row_fact_domains, condition.fact, [])
+      domain in RuleRuntime.predicate_row_domains(condition.fact)
     end)
   end
 

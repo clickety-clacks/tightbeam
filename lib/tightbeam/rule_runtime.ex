@@ -11,6 +11,29 @@ defmodule Tightbeam.RuleRuntime do
 
   @persist_key __MODULE__
 
+  @predicate_transition_contracts %{
+    "work_item.state" => %{kind: :row, domains: ["work_item"], binding: "workItemId"},
+    "assignment.state" => %{kind: :row, domains: ["assignment"], binding: "assignmentId"},
+    "assignment.outcome" => %{kind: :row, domains: ["assignment"], binding: "assignmentId"},
+    "decision_request.status" => %{
+      kind: :row,
+      domains: ["decision_request"],
+      binding: "decisionRequestId"
+    },
+    "artifact.present" => %{kind: :artifact, domains: ["artifact"], binding: "artifact"},
+    "artifact.content_sha256" => %{
+      kind: :artifact,
+      domains: ["artifact"],
+      binding: "artifact"
+    },
+    "review.qualifying_verdict_kinds" => %{
+      kind: :artifact,
+      domains: ["artifact", "attest"],
+      binding: "artifact"
+    },
+    "condition_fact.matches" => %{kind: :condition_fact, domains: ["condition_fact"]}
+  }
+
   @type callbacks :: %{
           row_commit_effects: (DB.Txn.t(), [map()] | map() -> [tuple()]),
           resolve_notice: (DB.Txn.t(), map(), map() -> {:ok, map()} | {:error, term()}),
@@ -41,6 +64,19 @@ defmodule Tightbeam.RuleRuntime do
   @doc false
   @spec loaded?() :: boolean()
   def loaded?, do: not is_nil(callbacks())
+
+  @doc false
+  @spec predicate_transition_contract(String.t()) :: map() | nil
+  def predicate_transition_contract(fact), do: Map.get(@predicate_transition_contracts, fact)
+
+  @doc false
+  @spec predicate_row_domains(String.t()) :: [String.t()]
+  def predicate_row_domains(fact) do
+    case predicate_transition_contract(fact) do
+      %{domains: domains} -> domains
+      nil -> []
+    end
+  end
 
   @doc false
   @spec row_commit_effects_in_txn(DB.Txn.t(), [map()] | map()) :: [tuple()]
