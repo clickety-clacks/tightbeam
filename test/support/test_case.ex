@@ -40,6 +40,7 @@ defmodule Tightbeam.TestCase do
 
   @persistent_keys [
     Tightbeam.Rules,
+    Tightbeam.RuleRuntime,
     Tightbeam.Rails,
     Tightbeam.Archetypes,
     {Tightbeam.Application, :draining}

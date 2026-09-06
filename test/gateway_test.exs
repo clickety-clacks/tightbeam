@@ -1089,6 +1089,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "children installs row recognition before recovery closes retired assignments", ctx do
     base_dir = gateway_children_base!()
+    :initialized = Identity.init!(base_dir)
     retired = create_session(ctx.db, "boot-retired", "flynn")
 
     :ok =
