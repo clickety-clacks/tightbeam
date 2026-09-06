@@ -1536,14 +1536,6 @@ defmodule Tightbeam.Schema do
           """,
           """
           INSERT OR IGNORE INTO condition_fact_owner_candidates(factId,ownerUserId,source)
-          SELECT f.id, s.ownerUserId, 'agent-origin'
-          FROM condition_facts f
-          JOIN roles r ON f.origin='agent:' || r.name
-          JOIN sessions s ON s.sessionKey=r.boundSessionKey
-          JOIN users u ON u.userId=s.ownerUserId
-          """,
-          """
-          INSERT OR IGNORE INTO condition_fact_owner_candidates(factId,ownerUserId,source)
           SELECT f.id, d.ownerUserId, 'decision-request'
           FROM condition_facts f
           JOIN decision_requests d ON d.rulingFactId=f.id

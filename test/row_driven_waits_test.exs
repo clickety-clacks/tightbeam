@@ -12,17 +12,20 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
+    Artifacts,
     Assignments,
     ConditionFacts,
     ConnRegistry,
     DB,
+    Escalation,
     Gateway,
     Ledger,
     Model,
     Org,
     Roles,
     Rules,
-    Wakes
+    Wakes,
+    WorkItems
   }
 
   setup do
@@ -168,6 +171,13 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert recognized.recognition_path == "reconsideration"
     assert recognized.recognition_reason == "resolver-terminal"
     assert recognized.recognition_disposition == "surrendered"
+    assert recognized.recognition_transition["domain"] == "assignment"
+    assert recognized.recognition_transition["row_id"] == "R"
+
+    assert recognized.recognition_transition["fields"] == %{
+             "outcome" => %{"new" => "surrendered", "old" => nil},
+             "state" => %{"new" => "closed", "old" => "open"}
+           }
 
     challenged =
       attest(ctx.db, "V", "verifier", "verdict", "wait-challenged", wake.wake_id)
@@ -223,6 +233,102 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert turn_count(ctx.db, success.wake_id) == 1
   end
 
+  test "artifact and exact-revision review waits preserve producer and revision identity", ctx do
+    work_item(ctx.db, "wi-output")
+    assignment(ctx.db, "P", "resolver", "wi-output")
+    assignment(ctx.db, "Q", "resolver", "wi-output")
+    assignment(ctx.db, "P-review", "verifier", "wi-output", "P")
+    h1 = String.duplicate("1", 64)
+    h2 = String.duplicate("2", 64)
+
+    existing_artifact = record_artifact(ctx.db, "P", h1)
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             review_verdict(ctx.db, "P-review", existing_artifact, "reviewed-clean")
+
+    turn = running_turn(ctx.db, "holder")
+
+    existing =
+      register_wait(ctx.db, due_after(), artifact_predicate("P", h1, true))
+
+    assert existing.recognition_path == "success"
+    assert existing.recognition_transition.label == "registration-snapshot"
+    assert turn_count(ctx.db, existing.wake_id) == 0
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, existing.wake_id) == 1
+
+    assignment(ctx.db, "P2", "resolver", "wi-output")
+
+    producer_bound =
+      register_wait(ctx.db, due_after(), artifact_predicate("P2", h2, false))
+
+    assert producer_bound.recognition_path == nil
+    _wrong_artifact = record_artifact(ctx.db, "Q", h2)
+    assert Wakes.get(ctx.db, producer_bound.wake_id).recognition_path == nil
+
+    exact_artifact = record_artifact(ctx.db, "P2", h2)
+    exact = Wakes.get(ctx.db, producer_bound.wake_id)
+    assert exact.recognition_path == "success"
+    assert exact.recognition_transition["domain"] == "artifact"
+    assert exact.recognition_transition["row_id"] == exact_artifact.artifact_id
+
+    assignment(ctx.db, "P3", "resolver", "wi-output")
+    assignment(ctx.db, "P3-review", "verifier", "wi-output", "P3")
+
+    unknown_revision =
+      register_wait(ctx.db, due_after(), artifact_predicate("P3", nil, true))
+
+    candidate = record_artifact(ctx.db, "P3", h1)
+    assert Wakes.get(ctx.db, unknown_revision.wake_id).recognition_path == nil
+
+    assert %{attest: %{artifactId: nil, contentSha256: nil}} =
+             attest(ctx.db, "P3-review", "verifier", "verdict", "reviewed-clean")
+
+    assert Wakes.get(ctx.db, unknown_revision.wake_id).recognition_path == nil
+
+    bound_clean = review_verdict(ctx.db, "P3-review", candidate, "reviewed-clean")
+    no_hash = Wakes.get(ctx.db, unknown_revision.wake_id)
+    assert no_hash.recognition_path == "success"
+    assert no_hash.recognition_transition["domain"] == "attest"
+    assert no_hash.recognition_transition["row_id"] == bound_clean.attest.id
+
+    assert no_hash.recognition_evidence["artifact_revision"] == %{
+             "hash" => h1,
+             "id" => candidate.artifact_id,
+             "producer" => "P3"
+           }
+
+    assignment(ctx.db, "P4", "resolver", "wi-output")
+    assignment(ctx.db, "P4-review", "verifier", "wi-output", "P4")
+    assignment(ctx.db, "R4-end", "resolver")
+    stale = record_artifact(ctx.db, "P4", h1)
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             review_verdict(ctx.db, "P4-review", stale, "reviewed-clean")
+
+    current = record_artifact(ctx.db, "P4", h2)
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             review_verdict(ctx.db, "P4-review", current, "reviewed-clean")
+
+    assert %{attest: %{verdictKind: "changes-requested"}} =
+             review_verdict(ctx.db, "P4-review", current, "changes-requested")
+
+    blocked =
+      register_wait(ctx.db, due_after(), artifact_predicate("P4", h2, true, "R4-end"))
+
+    assert blocked.recognition_path == nil
+
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R4-end")
+    reconsidered = Wakes.get(ctx.db, blocked.wake_id)
+    assert reconsidered.recognition_path == "reconsideration"
+    assert reconsidered.recognition_disposition == "revoked"
+    assert reconsidered.recognition_transition["domain"] == "assignment"
+    assert reconsidered.recognition_transition["row_id"] == "R4-end"
+  end
+
   test "after-turn captures the running turn and becomes eligible on every terminal outcome",
        ctx do
     before = wake_count(ctx.db)
@@ -271,6 +377,92 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert turn_count(ctx.db, wake.wake_id) == 1
   end
 
+  test "terminal assignment, decision and work-item dispositions use the two firing paths", ctx do
+    assignment(ctx.db, "R-revoked", "resolver")
+    revoked_wait = register_wait(ctx.db, due_after(), predicate("R-revoked"))
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R-revoked")
+    revoked = Wakes.get(ctx.db, revoked_wait.wake_id)
+    assert revoked.recognition_path == "reconsideration"
+    assert revoked.recognition_disposition == "revoked"
+
+    withdrawn_request = operator_ask(ctx.db, "withdraw this request")
+
+    withdrawn_wait =
+      register_wait(
+        ctx.db,
+        due_after(),
+        decision_predicate(withdrawn_request.id, "ruled")
+      )
+
+    assert %{status: "withdrawn"} = operator_withdraw(ctx.db, withdrawn_request.id)
+    withdrawn = Wakes.get(ctx.db, withdrawn_wait.wake_id)
+    assert withdrawn.recognition_path == "reconsideration"
+    assert withdrawn.recognition_disposition == "withdrawn"
+    assert withdrawn.recognition_transition["domain"] == "decision_request"
+    assert withdrawn.recognition_transition["row_id"] == withdrawn_request.id
+
+    default_request = operator_ask(ctx.db, "withdraw successfully")
+
+    default_decision =
+      register_wait(ctx.db, due_after(), default_decision_predicate(default_request.id))
+
+    assert %{status: "withdrawn"} = operator_withdraw(ctx.db, default_request.id)
+    decision_success = Wakes.get(ctx.db, default_decision.wake_id)
+    assert decision_success.recognition_path == "success"
+    assert decision_success.recognition_disposition == "withdrawn"
+
+    superseded_request = operator_ask(ctx.db, "supersede this request")
+
+    superseded_wait =
+      register_wait(
+        ctx.db,
+        due_after(),
+        decision_predicate(superseded_request.id, "ruled")
+      )
+
+    assert %{id: replacement_id} =
+             operator_ask(ctx.db, "replacement request", superseded_request.id)
+
+    refute replacement_id == superseded_request.id
+    superseded = Wakes.get(ctx.db, superseded_wait.wake_id)
+    assert superseded.recognition_path == "reconsideration"
+    assert superseded.recognition_disposition == "superseded"
+
+    assignment(ctx.db, "R-work", "resolver")
+
+    for {work_item_id, verb, disposition} <- [
+          {"wi-iceboxed", "work-item-icebox", "iceboxed"},
+          {"wi-failed", "work-item-fail", "failed"}
+        ] do
+      work_item(ctx.db, work_item_id)
+
+      wait =
+        register_wait(ctx.db, due_after(), default_work_item_predicate(work_item_id, "R-work"))
+
+      assert %{ok: true, workItem: %{state: ^disposition}} =
+               dispose_work_item(ctx.db, verb, work_item_id)
+
+      recognized = Wakes.get(ctx.db, wait.wake_id)
+      assert recognized.recognition_path == "success"
+      assert recognized.recognition_disposition == disposition
+      assert recognized.recognition_transition["domain"] == "work_item"
+      assert recognized.recognition_transition["row_id"] == work_item_id
+    end
+
+    work_item(ctx.db, "wi-narrow")
+    assignment(ctx.db, "R-narrow", "resolver")
+
+    narrow =
+      register_wait(ctx.db, due_after(), work_item_predicate("wi-narrow", "closed", "R-narrow"))
+
+    assert %{ok: true, workItem: %{state: "iceboxed"}} =
+             dispose_work_item(ctx.db, "work-item-icebox", "wi-narrow")
+
+    assert Wakes.get(ctx.db, narrow.wake_id).recognition_path == nil
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R-narrow")
+    assert Wakes.get(ctx.db, narrow.wake_id).recognition_path == "reconsideration"
+  end
+
   test "gateway registration derives ownership and cancellation wins before eligible delivery",
        ctx do
     turn = running_turn(ctx.db, "holder")
@@ -306,6 +498,108 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, response.wake_id) == 0
+  end
+
+  test "latched recognition and serialized winners survive scheduler restarts without duplicates",
+       ctx do
+    work_item(ctx.db, "wi-latched")
+    assignment(ctx.db, "R-latched", "resolver")
+    turn = running_turn(ctx.db, "holder")
+
+    latched =
+      register_wait(
+        ctx.db,
+        due_after(),
+        default_work_item_predicate("wi-latched", "R-latched")
+      )
+
+    assert %{ok: true, workItem: %{state: "iceboxed"}} =
+             dispose_work_item(ctx.db, "work-item-icebox", "wi-latched")
+
+    recognized = Wakes.get(ctx.db, latched.wake_id)
+    assert recognized.recognition_path == "success"
+    assert recognized.recognition_disposition == "iceboxed"
+    assert turn_count(ctx.db, latched.wake_id) == 0
+
+    assert %{ok: true, workItem: %{state: "open"}} =
+             dispose_work_item(ctx.db, "work-item-reopen", "wi-latched")
+
+    assert :ok = stop_supervised(Wakes)
+
+    start_supervised!(
+      {Wakes,
+       name: ctx.scheduler,
+       db: ctx.db,
+       tick_ms: 60_000,
+       deliver: delivery_fun(ctx.db, ctx.registry, ctx.lane),
+       delivery_opts: [conn_registry: ctx.registry, lane_manager: ctx.lane]}
+    )
+
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed")
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, latched.wake_id) == 1
+
+    assert {:ok, [[prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [latched.wake_id])
+
+    assert prompt =~ "work_item:wi-latched"
+    assert prompt =~ ~s(state "open"→"iceboxed")
+    assert prompt =~ "disposition iceboxed"
+    assert current_work_item_state(ctx.db, "wi-latched") == "open"
+
+    assert :ok = stop_supervised(Wakes)
+
+    start_supervised!(
+      {Wakes,
+       name: ctx.scheduler,
+       db: ctx.db,
+       tick_ms: 60_000,
+       deliver: delivery_fun(ctx.db, ctx.registry, ctx.lane),
+       delivery_opts: [conn_registry: ctx.registry, lane_manager: ctx.lane]}
+    )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, latched.wake_id) == 1
+
+    assignment(ctx.db, "R-both", "resolver")
+    both = register_wait(ctx.db, due_after(), predicate("R-both", "closed"))
+
+    assert %{assignment: %{outcome: "completed"}} =
+             attest(ctx.db, "R-both", "resolver", "completion")
+
+    both_winner = Wakes.get(ctx.db, both.wake_id)
+    assert both_winner.recognition_path == "success"
+    assert both_winner.recognition_disposition == "completed"
+
+    assignment(ctx.db, "R-before-fallback", "resolver")
+
+    resolver_first =
+      register_wait(
+        ctx.db,
+        System.system_time(:millisecond) - 1,
+        predicate("R-before-fallback")
+      )
+
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R-before-fallback")
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, resolver_first.wake_id).recognition_path == "reconsideration"
+    assert turn_count(ctx.db, resolver_first.wake_id) == 1
+
+    assignment(ctx.db, "R-after-fallback", "resolver")
+
+    fallback_first =
+      register_wait(
+        ctx.db,
+        System.system_time(:millisecond) - 1,
+        predicate("R-after-fallback")
+      )
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert Wakes.get(ctx.db, fallback_first.wake_id).recognition_path == "fallback"
+    assert %{outcome: "revoked"} = revoke(ctx.db, "R-after-fallback")
+    assert Wakes.get(ctx.db, fallback_first.wake_id).recognition_path == "fallback"
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert turn_count(ctx.db, fallback_first.wake_id) == 1
   end
 
   test "verification verdicts are holder-and-wait-bound and challenge recognizes once", ctx do
@@ -577,12 +871,12 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     })
   end
 
-  defp assignment(db, id, holder, work_item_id \\ nil) do
+  defp assignment(db, id, holder, work_item_id \\ nil, reviews_assignment_id \\ nil) do
     {:ok, _} =
       DB.query(
         db,
-        "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,workItemId) VALUES(?1,?2,?3,'owner-a',1,?4)",
-        [id, id, holder, work_item_id]
+        "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,workItemId,reviewsAssignmentId) VALUES(?1,?2,?3,'owner-a',1,?4,?5)",
+        [id, id, holder, work_item_id, reviews_assignment_id]
       )
   end
 
@@ -654,6 +948,174 @@ defmodule Tightbeam.RowDrivenWaitsTest do
   defp turn_count(db, wake_id) do
     {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
     count
+  end
+
+  defp artifact_predicate(producer_id, expected_hash, reviewed?, resolver_id \\ nil) do
+    resolver_id = resolver_id || producer_id
+
+    artifact_binding =
+      %{"producedByAssignmentId" => producer_id}
+      |> then(fn binding ->
+        if is_binary(expected_hash),
+          do: Map.put(binding, "contentSha256", expected_hash),
+          else: binding
+      end)
+
+    conditions =
+      [%{"fact" => "artifact.present", "op" => "eq", "value" => true}]
+      |> then(fn conditions ->
+        if is_binary(expected_hash) do
+          conditions ++
+            [%{"fact" => "artifact.content_sha256", "op" => "eq", "value" => expected_hash}]
+        else
+          conditions
+        end
+      end)
+      |> then(fn conditions ->
+        if reviewed? do
+          conditions ++
+            [
+              %{
+                "fact" => "review.qualifying_verdict_kinds",
+                "op" => "in",
+                "value" => ["reviewed-clean"]
+              }
+            ]
+        else
+          conditions
+        end
+      end)
+
+    %{
+      "conditions" => conditions,
+      "bindings" => %{"artifact" => artifact_binding},
+      "resolverRef" => %{"kind" => "assignment", "id" => resolver_id},
+      "necessity" => "The producer and its exact reviewed revision are required.",
+      "verificationRef" => %{"kind" => "assignment", "id" => "V"}
+    }
+  end
+
+  defp decision_predicate(request_id, expected_status) do
+    %{
+      "conditions" => [
+        %{"fact" => "decision_request.status", "op" => "eq", "value" => expected_status}
+      ],
+      "bindings" => %{"decisionRequestId" => request_id},
+      "resolverRef" => %{"kind" => "decision_request", "id" => request_id},
+      "necessity" => "The named decision must reach the requested disposition.",
+      "verificationRef" => %{"kind" => "assignment", "id" => "V"}
+    }
+  end
+
+  defp default_decision_predicate(request_id) do
+    predicate = decision_predicate(request_id, "ruled")
+
+    put_in(predicate, ["conditions"], [
+      %{
+        "fact" => "decision_request.status",
+        "op" => "in",
+        "value" => ~w(ruled consumed withdrawn superseded)
+      }
+    ])
+  end
+
+  defp work_item_predicate(work_item_id, expected_state, resolver_id) do
+    %{
+      "conditions" => [
+        %{"fact" => "work_item.state", "op" => "eq", "value" => expected_state}
+      ],
+      "bindings" => %{"workItemId" => work_item_id},
+      "resolverRef" => %{"kind" => "assignment", "id" => resolver_id},
+      "necessity" => "The work item disposition decides the continuation.",
+      "verificationRef" => %{"kind" => "assignment", "id" => "V"}
+    }
+  end
+
+  defp default_work_item_predicate(work_item_id, resolver_id) do
+    predicate = work_item_predicate(work_item_id, "closed", resolver_id)
+
+    put_in(predicate, ["conditions"], [
+      %{
+        "fact" => "work_item.state",
+        "op" => "in",
+        "value" => ~w(closed failed iceboxed)
+      }
+    ])
+  end
+
+  defp record_artifact(db, producer_id, hash) do
+    Artifacts.record(db, %{
+      principal: {:session, "resolver"},
+      session_key: "resolver",
+      params: %{
+        kind: "report",
+        title: "candidate #{producer_id}",
+        origin_path: "/tmp/#{producer_id}",
+        work_item_id: "wi-output",
+        produced_by_assignment_id: producer_id,
+        content_sha256: hash
+      }
+    })
+  end
+
+  defp review_verdict(db, review_id, artifact, verdict_kind) do
+    Assignments.__handle__(db, "attest", %{
+      principal: {:session, "verifier"},
+      origin: "session:verifier",
+      params: %{
+        assignment_id: review_id,
+        kind: "verdict",
+        verdict_kind: verdict_kind,
+        artifact_id: artifact.artifact_id,
+        content_sha256: artifact.content_sha256,
+        note: "revision verdict"
+      }
+    })
+  end
+
+  defp revoke(db, assignment_id) do
+    Assignments.__handle__(db, "revoke-assignment", %{
+      verb: "revoke-assignment",
+      principal: {:user, "owner-a"},
+      origin: "user:owner-a",
+      params: %{assignment_id: assignment_id}
+    })
+  end
+
+  defp operator_ask(db, question, supersedes \\ nil) do
+    Escalation.operator_ask(db, %{
+      principal: {:session, "holder"},
+      session_key: "holder",
+      origin: "agent:holder-role",
+      params: %{
+        question: question,
+        options: [%{label: "continue"}, %{label: "stop"}],
+        supersedes: supersedes
+      }
+    })
+  end
+
+  defp operator_withdraw(db, request_id) do
+    Escalation.operator_withdraw(db, %{
+      principal: {:session, "holder"},
+      session_key: "holder",
+      origin: "agent:holder-role",
+      params: %{request: request_id, reason: "fixture withdrawal"}
+    })
+  end
+
+  defp dispose_work_item(db, verb, work_item_id) do
+    WorkItems.__handle__(db, verb, %{
+      verb: verb,
+      principal: {:user, "owner-a"},
+      origin: "user:owner-a",
+      params: %{work_item_id: work_item_id, reason: "fixture disposition"}
+    })
+  end
+
+  defp current_work_item_state(db, work_item_id) do
+    {:ok, [[state]]} = DB.query(db, "SELECT state FROM work_items WHERE id=?1", [work_item_id])
+    state
   end
 
   defp due_after, do: System.system_time(:millisecond) + 60_000

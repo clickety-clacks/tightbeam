@@ -329,6 +329,7 @@ defmodule Tightbeam.Rules do
                  matched: true,
                  facts: evidence_facts(conditions, cache),
                  condition_match: Map.get(cache, "$condition_match"),
+                 artifact_revision: candidate,
                  canonical: %{conditions: conditions, bindings: bindings}
                }}
 
@@ -338,6 +339,7 @@ defmodule Tightbeam.Rules do
                  matched: false,
                  facts: evidence_facts(conditions, cache),
                  condition_match: Map.get(cache, "$condition_match"),
+                 artifact_revision: candidate,
                  canonical: %{conditions: conditions, bindings: bindings}
                }}
 
@@ -352,6 +354,7 @@ defmodule Tightbeam.Rules do
            matched: false,
            facts: [],
            condition_match: nil,
+           artifact_revision: nil,
            canonical: %{conditions: conditions, bindings: bindings}
          }}
     rescue

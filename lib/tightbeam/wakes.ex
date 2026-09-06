@@ -926,9 +926,12 @@ defmodule Tightbeam.Wakes do
   end
 
   defp recognize_wait_transitions_in_txn(txn, transitions) do
+    transitions = Enum.filter(transitions, &(is_map(&1) and is_binary(&1[:owner_user_id])))
+
     transitions
-    |> Enum.filter(&(is_map(&1) and is_binary(&1[:owner_user_id])))
-    |> Enum.each(fn transition ->
+    |> Enum.map(& &1.owner_user_id)
+    |> Enum.uniq()
+    |> Enum.each(fn owner_user_id ->
       Txn.q(
         txn,
         """
@@ -937,7 +940,7 @@ defmodule Tightbeam.Wakes do
           AND ownerUserId=?1
         ORDER BY rowid
         """,
-        [transition.owner_user_id]
+        [owner_user_id]
       )
       |> Enum.each(fn [wake_id] ->
         case wait_in_txn(txn, wake_id) do
@@ -945,27 +948,150 @@ defmodule Tightbeam.Wakes do
             :ok
 
           wake ->
-            evaluation = evaluate_wait_predicate_in_txn(txn, wake)
-            resolver = resolver_for_wake_in_txn(txn, wake)
-            updated = recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, transition)
+            owner_transitions =
+              Enum.filter(transitions, &(&1.owner_user_id == wake.owner_user_id))
 
-            if is_nil(updated.recognition_path) and
-                 verification_terminal_transition?(wake, transition) do
-              recognize_wait_in_txn(
-                txn,
-                wake,
-                "reconsideration",
-                "verification-terminal",
-                evaluation,
-                resolver,
-                transition
-              )
+            predicate_transition =
+              Enum.find(owner_transitions, &predicate_transition_relevant?(txn, wake, &1))
+
+            resolver_transition =
+              Enum.find(owner_transitions, &resolver_transition_relevant?(wake, &1))
+
+            verification_transition =
+              Enum.find(owner_transitions, &verification_terminal_transition?(wake, &1))
+
+            if predicate_transition || resolver_transition || verification_transition do
+              evaluation = evaluate_wait_predicate_in_txn(txn, wake)
+              resolver = resolver_for_wake_in_txn(txn, wake)
+
+              cond do
+                evaluation.matched and predicate_transition ->
+                  recognize_wait_in_txn(
+                    txn,
+                    wake,
+                    "success",
+                    nil,
+                    evaluation,
+                    resolver,
+                    predicate_transition
+                  )
+
+                resolver.terminal and resolver_transition ->
+                  recognize_wait_in_txn(
+                    txn,
+                    wake,
+                    "reconsideration",
+                    "resolver-terminal",
+                    evaluation,
+                    resolver,
+                    resolver_transition
+                  )
+
+                verification_transition ->
+                  recognize_wait_in_txn(
+                    txn,
+                    wake,
+                    "reconsideration",
+                    "verification-terminal",
+                    evaluation,
+                    resolver,
+                    verification_transition
+                  )
+
+                true ->
+                  wake
+              end
             end
         end
       end)
     end)
 
     :ok
+  end
+
+  defp resolver_transition_relevant?(wake, transition) do
+    transition[:domain] == wake.resolver_kind and
+      to_string(transition[:row_id]) == wake.resolver_id
+  end
+
+  defp predicate_transition_relevant?(txn, wake, transition) do
+    conditions = wake.predicate["conditions"] || wake.predicate[:conditions] || []
+    facts = MapSet.new(conditions, &(Map.get(&1, "fact") || Map.get(&1, :fact)))
+    bindings = wake.predicate["bindings"] || wake.predicate[:bindings] || %{}
+    domain = transition[:domain]
+    row_id = to_string(transition[:row_id])
+
+    cond do
+      domain == "assignment" and predicate_domain?(facts, "assignment.") ->
+        row_id == predicate_binding(bindings, "assignmentId")
+
+      domain == "decision_request" and predicate_domain?(facts, "decision_request.") ->
+        row_id == predicate_binding(bindings, "decisionRequestId")
+
+      domain == "work_item" and predicate_domain?(facts, "work_item.") ->
+        row_id == predicate_binding(bindings, "workItemId")
+
+      domain == "artifact" and
+          (predicate_domain?(facts, "artifact.") or predicate_domain?(facts, "review.")) ->
+        artifact_transition_relevant?(txn, transition, predicate_binding(bindings, "artifact"))
+
+      domain == "attest" and predicate_domain?(facts, "review.") ->
+        artifact_transition_relevant?(txn, transition, predicate_binding(bindings, "artifact"))
+
+      true ->
+        false
+    end
+  end
+
+  defp predicate_domain?(facts, prefix),
+    do: Enum.any?(facts, &(is_binary(&1) and String.starts_with?(&1, prefix)))
+
+  defp predicate_binding(bindings, key),
+    do: Map.get(bindings, key) || Map.get(bindings, String.to_atom(key))
+
+  defp artifact_transition_relevant?(_txn, _transition, selector) when not is_map(selector),
+    do: false
+
+  defp artifact_transition_relevant?(txn, transition, selector) do
+    transition_binding = transition[:bindings] || %{}
+
+    artifact_binding =
+      Map.get(transition_binding, :artifact) || Map.get(transition_binding, "artifact") || %{}
+
+    artifact_id =
+      if transition[:domain] == "artifact",
+        do: to_string(transition[:row_id]),
+        else: Map.get(artifact_binding, :artifactId) || Map.get(artifact_binding, "artifactId")
+
+    case artifact_id &&
+           Txn.q(
+             txn,
+             "SELECT contentSha256,producedByAssignmentId FROM artifacts WHERE artifactId=?1",
+             [artifact_id]
+           ) do
+      [[hash, producer]] -> artifact_selector_matches?(selector, artifact_id, hash, producer)
+      _ -> false
+    end
+  end
+
+  defp artifact_selector_matches?(selector, artifact_id, hash, producer) do
+    expected_id = Map.get(selector, "artifactId") || Map.get(selector, :artifactId)
+
+    expected_producer =
+      Map.get(selector, "producedByAssignmentId") || Map.get(selector, :producedByAssignmentId)
+
+    expected_hash = Map.get(selector, "contentSha256") || Map.get(selector, :contentSha256)
+
+    cond do
+      is_binary(expected_id) ->
+        expected_id == artifact_id and expected_hash == hash
+
+      is_binary(expected_producer) ->
+        expected_producer == producer and (is_nil(expected_hash) or expected_hash == hash)
+
+      true ->
+        false
+    end
   end
 
   defp verification_terminal_transition?(wake, transition) do
@@ -1014,7 +1140,8 @@ defmodule Tightbeam.Wakes do
     evidence = %{
       label: if(is_nil(transition), do: "registration-snapshot", else: "row-transition"),
       facts: facts,
-      condition_match: evaluation[:condition_match]
+      condition_match: evaluation[:condition_match],
+      artifact_revision: evaluation[:artifact_revision]
     }
 
     Txn.q(

@@ -29,10 +29,20 @@ defmodule Tightbeam.SchemaShapeTest.FailingDb do
   end
 end
 
+defmodule Tightbeam.SchemaShapeTest.LaneStub do
+  use GenServer
+
+  def start_link(name), do: GenServer.start_link(__MODULE__, :ok, name: name)
+  @impl true
+  def init(:ok), do: {:ok, :ok}
+  @impl true
+  def handle_call({:ensure_lane, _session_key}, _from, state), do: {:reply, :ok, state}
+end
+
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, DB, Schema}
+  alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, Wakes}
 
   @shape "row-driven-waits-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
@@ -220,8 +230,23 @@ defmodule Tightbeam.SchemaShapeTest do
       host: "testhost"
     })
 
+    Tightbeam.Org.create(db, %{
+      session_key: "owner-b-session",
+      display_name: "owner-b-session",
+      owner_user_id: "owner-b",
+      origin: "user:owner-b",
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable"),
+      host: "testhost"
+    })
+
     assert %{name: "owner-a-role"} =
              Tightbeam.Roles.create!(db, "owner-a-role", "owner-a", "owner-a-session")
+
+    # A role's current binding cannot prove who owned a historical agent-origin fact.
+    assert :ok = Tightbeam.Roles.bind(db, "owner-a-role", "owner-b-session")
 
     assert :ok =
              DB.execute(db, """
@@ -233,8 +258,11 @@ defmodule Tightbeam.SchemaShapeTest do
              INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,conditionKind,conditionScope,conditionAfterId)
              VALUES
                ('w_pending','owner-a-session','agent:test','pending',100,'pending',1,'legacy','session-scope',2),
+               ('w_timed','owner-a-session','agent:test','timed',100,'pending',1,NULL,NULL,NULL),
                ('w_fired','owner-a-session','agent:test','fired',1,'fired',1,NULL,NULL,NULL),
                ('w_canceled','owner-a-session','agent:test','canceled',1,'canceled',1,NULL,NULL,NULL);
+             INSERT INTO wake_retry_attempts(wakeId,rootWakeId,attempt,outcome,observedAt)
+             VALUES('w_timed','w_timed',0,'pending',1);
              """)
 
     downgrade_row_driven_waits(db)
@@ -242,10 +270,16 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
-    assert {:ok, [[1, "owner-b"], [2, "owner-a"], [3, nil], [4, "owner-a"]]} =
+    assert {:ok, [[1, "owner-b"], [2, "owner-a"], [3, nil], [4, nil]]} =
              DB.query(db, "SELECT id,ownerUserId FROM condition_facts ORDER BY id")
 
-    assert {:ok, [["w_canceled", "canceled"], ["w_fired", "fired"], ["w_pending", "pending"]]} =
+    assert {:ok,
+            [
+              ["w_canceled", "canceled"],
+              ["w_fired", "fired"],
+              ["w_pending", "pending"],
+              ["w_timed", "pending"]
+            ]} =
              DB.query(db, "SELECT wakeId,state FROM wakes ORDER BY wakeId")
 
     assert {:ok, [[1]]} =
@@ -253,6 +287,66 @@ defmodule Tightbeam.SchemaShapeTest do
                db,
                "SELECT COUNT(*) FROM lifecycle_events WHERE kind='condition_fact_owner_unattributed' AND subject='3'"
              )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='condition_fact_owner_unattributed' AND subject='4'"
+             )
+
+    assert {:ok, [["w_timed", "w_timed", 0, "pending", 1]]} =
+             DB.query(
+               db,
+               "SELECT wakeId,rootWakeId,attempt,outcome,observedAt FROM wake_retry_attempts"
+             )
+
+    scheduler = :"legacy_migration_scheduler_#{System.unique_integer([:positive])}"
+    parent = self()
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.SchemaShapeTest.LaneStub, Tightbeam.LaneManager})
+
+    start_supervised!(
+      {Wakes,
+       name: scheduler,
+       db: db,
+       tick_ms: 60_000,
+       deliver: fn wake ->
+         send(parent, {:legacy_migration_delivery, wake.wake_id})
+         :ok
+       end}
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:legacy_migration_delivery, "w_timed"}
+    assert Wakes.get(db, "w_pending").state == "fired"
+    assert Wakes.get(db, "w_timed").state == "fired"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='w_pending'")
+
+    assert :ok = stop_supervised(Wakes)
+
+    start_supervised!(
+      {Wakes,
+       name: scheduler,
+       db: db,
+       tick_ms: 60_000,
+       deliver: fn wake ->
+         send(parent, {:legacy_migration_delivery, wake.wake_id})
+         :ok
+       end}
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    refute_receive {:legacy_migration_delivery, "w_timed"}
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='w_pending'")
+
+    assert {:ok,
+            [
+              ["w_canceled", "canceled"],
+              ["w_fired", "fired"],
+              ["w_pending", "fired"],
+              ["w_timed", "fired"]
+            ]} =
+             DB.query(db, "SELECT wakeId,state FROM wakes ORDER BY wakeId")
   end
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
