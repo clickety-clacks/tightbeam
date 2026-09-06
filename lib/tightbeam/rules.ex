@@ -54,6 +54,7 @@ defmodule Tightbeam.Rules do
     RailEpisodes,
     RailRemedy,
     RailScript,
+    RuleRuntime,
     Roles
   }
 
@@ -207,6 +208,13 @@ defmodule Tightbeam.Rules do
 
     validate_satisfiability!(rules, verbs)
     :persistent_term.put(@persist_key, rules)
+
+    RuleRuntime.install(%{
+      row_commit_effects: &row_commit_effects_in_txn/2,
+      resolve_notice: &resolve_notice_in_txn/3,
+      evaluate_predicate: &evaluate_predicate_in_txn/2
+    })
+
     rules
   end
 

@@ -25,7 +25,16 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway, NoticeBatcher, Rules}
+  alias Tightbeam.{
+    ConditionFacts,
+    DB,
+    Escalation,
+    EventLog,
+    Gateway,
+    NoticeBatcher,
+    RuleRuntime
+  }
+
   alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
@@ -426,7 +435,7 @@ defmodule Tightbeam.Wakes do
   @spec row_commit_in_txn(Txn.t(), [map()] | map()) :: :ok
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     txn
-    |> Rules.row_commit_effects_in_txn(transitions)
+    |> RuleRuntime.row_commit_effects_in_txn(transitions)
     |> Enum.each(fn
       {:notice, rule, call, evidence} ->
         try do
@@ -464,7 +473,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp deliver_rule_notice_in_txn(txn, rule, call, evidence) do
-    case Rules.resolve_notice_in_txn(txn, rule, call) do
+    case RuleRuntime.resolve_notice_in_txn(txn, rule, call) do
       {:ok, resolved} ->
         wake =
           schedule_in_txn(txn, %{
@@ -3042,7 +3051,7 @@ defmodule Tightbeam.Wakes do
     }
 
     match =
-      case Rules.evaluate_predicate_in_txn(txn, predicate) do
+      case RuleRuntime.evaluate_predicate_in_txn(txn, predicate) do
         {:ok, %{matched: true, condition_match: matched}} ->
           matched
 

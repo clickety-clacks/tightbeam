@@ -9,6 +9,7 @@ defmodule Tightbeam.ConditionFactsTest do
     EventLog,
     Gateway,
     Org,
+    Rules,
     Wakes
   }
 
@@ -45,6 +46,11 @@ defmodule Tightbeam.ConditionFactsTest do
     start_supervised!({DB, path: ":memory:", name: db})
 
     :ok = Tightbeam.Schema.ensure_all(db)
+
+    Rules.load!(
+      Path.join(System.tmp_dir!(), "condition-rules-#{System.unique_integer([:positive])}"),
+      []
+    )
 
     session =
       Org.create(db, %{
