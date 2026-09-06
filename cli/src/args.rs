@@ -63,6 +63,9 @@ pub enum Command {
         at: Option<String>,
         condition_kind: Option<String>,
         condition_scope: Option<String>,
+        predicate: Option<serde_json::Value>,
+        assignment_id: Option<String>,
+        after_turn: bool,
         idempotency_key: Option<String>,
         /// Sender-elected delivery class. The vocabulary is extensible, so the
         /// CLI validates only that a supplied name is non-empty.
@@ -269,6 +272,7 @@ pub enum Command {
         commit_refs: Option<Vec<serde_json::Value>>,
         artifact_id: Option<String>,
         content_sha256: Option<String>,
+        wait_id: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -456,6 +460,13 @@ COMMANDS:
           --when-fact <kind> [--when-scope <scope>]
           (--fallback-after 30s|5m|2h | --at <epochMs>)
           --prompt "<text>" [--key <idempotencyKey>]
+      Dependency wait:
+        tightbeam wake --session <holderSession> --assignment <assignmentId>
+          --predicate '<JSON object>'
+          (--fallback-after 30s|5m|2h | --at <epochMs>) --prompt "<continuation>"
+      Ready-now continuation:
+        tightbeam wake --session <holderSession> --assignment <assignmentId>
+          --after-turn --prompt "<continuation>"
       Send a prompt to the selected target. Immediate = a direct message; with --after or
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
@@ -464,6 +475,8 @@ COMMANDS:
       It never resumes or replays prior work. The fact stamp reports why the prompt arrived.
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
+      A dependency predicate names conditions, bindings, resolverRef, necessity,
+      and verificationRef. --after-turn captures the caller's running turn.
       --prompt is the caller's explicit instruction override.
       Tightbeam carries it without rewriting it.
       --class elects the receiver's delivery policy. Without --class the wake
@@ -611,7 +624,7 @@ COMMANDS:
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
       [--artifact <artifactId> --sha256 <hash>]
-         [--verdict <kind>] [--note "..."]
+         [--verdict <kind>] [--wait <wakeId>] [--note "..."]
       File against an assignment. Verdicts on review cards require the review
       holder; producer-card verdicts may be filed by any session or user.
   attests <assignmentId>
@@ -770,6 +783,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "abort",
     "admin",
     "all",
+    "after-turn",
     "api-key",
     "clear-spec-ref",
     "dry-run",
@@ -1139,11 +1153,25 @@ fn parse_with_optional_catalog(
             let at = nonempty(flags, "at").map(|value| js_number_json(number_coercion(&value)));
             let condition_kind = nonempty(flags, "when-fact");
             let condition_scope = nonempty(flags, "when-scope");
+            let predicate = nonempty(flags, "predicate")
+                .map(|encoded| {
+                    let value = serde_json::from_str::<serde_json::Value>(&encoded)
+                        .map_err(|_| "--predicate must be a JSON object".to_owned())?;
+                    if value.is_object() {
+                        Ok(value)
+                    } else {
+                        Err("--predicate must be a JSON object".to_owned())
+                    }
+                })
+                .transpose()?;
+            let assignment_id = nonempty(flags, "assignment");
+            let after_turn = flags.contains_key("after-turn");
+            let wait = predicate.is_some() || after_turn;
 
             if condition_scope.is_some() && condition_kind.is_none() {
                 return Err("--when-scope requires --when-fact".to_owned());
             }
-            if fallback_after_ms.is_some() && condition_kind.is_none() {
+            if fallback_after_ms.is_some() && condition_kind.is_none() && predicate.is_none() {
                 return Err("--fallback-after requires --when-fact".to_owned());
             }
             if after_ms.is_some() && fallback_after_ms.is_some() {
@@ -1160,7 +1188,33 @@ fn parse_with_optional_catalog(
             if fallback_after_ms.is_some() && at.is_some() {
                 return Err("--fallback-after and --at are mutually exclusive".to_owned());
             }
-            let idempotency_key = condition_kind.as_ref().and_then(|_| nonempty(flags, "key"));
+            if predicate.is_some() && after_turn {
+                return Err("--predicate and --after-turn are mutually exclusive".to_owned());
+            }
+            if wait && assignment_id.is_none() {
+                return Err("--predicate and --after-turn require --assignment".to_owned());
+            }
+            if !wait && assignment_id.is_some() {
+                return Err("--assignment requires --predicate or --after-turn".to_owned());
+            }
+            if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
+                return Err(
+                    "a predicate wake requires a fallback (--fallback-after / --at)".to_owned(),
+                );
+            }
+            if after_turn && (after_ms.is_some() || fallback_after_ms.is_some() || at.is_some()) {
+                return Err("--after-turn uses registration time and cannot be combined with --after, --fallback-after, or --at".to_owned());
+            }
+            if wait && condition_kind.is_some() {
+                return Err(
+                    "--predicate/--after-turn cannot be combined with --when-fact".to_owned(),
+                );
+            }
+            let idempotency_key = if condition_kind.is_some() || wait {
+                nonempty(flags, "key")
+            } else {
+                None
+            };
             if flags.get("class").is_some_and(String::is_empty) {
                 return Err("--class requires a class name".to_owned());
             }
@@ -1172,6 +1226,9 @@ fn parse_with_optional_catalog(
                 at,
                 condition_kind,
                 condition_scope,
+                predicate,
+                assignment_id,
+                after_turn,
                 idempotency_key,
                 class: nonempty(flags, "class"),
             })
@@ -1723,6 +1780,7 @@ fn parse_with_optional_catalog(
                 .transpose()?;
             let artifact_id = nonempty(flags, "artifact");
             let content_sha256 = nonempty(flags, "sha256");
+            let wait_id = nonempty(flags, "wait");
             if artifact_id.is_some() != content_sha256.is_some() {
                 return Err("--artifact and --sha256 must be supplied together".to_owned());
             }
@@ -1730,6 +1788,9 @@ fn parse_with_optional_catalog(
                 return Err(
                     "--artifact and --sha256 are only valid when --kind is verdict".to_owned(),
                 );
+            }
+            if kind != "verdict" && wait_id.is_some() {
+                return Err("--wait is only valid when --kind is verdict".to_owned());
             }
             Ok(Command::Attest {
                 identity: identity(flags)?,
@@ -1740,6 +1801,7 @@ fn parse_with_optional_catalog(
                 commit_refs,
                 artifact_id,
                 content_sha256,
+                wait_id,
             })
         }
         "attests" => {
@@ -3101,6 +3163,9 @@ mod tests {
                 at: None,
                 condition_kind: Some("build-finished".to_owned()),
                 condition_scope: Some("app".to_owned()),
+                predicate: None,
+                assignment_id: None,
+                after_turn: false,
                 idempotency_key: Some("wake-1".to_owned()),
                 class: None,
             })
@@ -3127,6 +3192,9 @@ mod tests {
                 at: Some("123".to_owned()),
                 condition_kind: Some("review-landed".to_owned()),
                 condition_scope: None,
+                predicate: None,
+                assignment_id: None,
+                after_turn: false,
                 idempotency_key: None,
                 class: None,
             })
@@ -3145,6 +3213,89 @@ mod tests {
                 scope: None,
                 idempotency_key: None,
             })
+        );
+    }
+
+    #[test]
+    fn parses_structured_dependency_and_after_turn_wakes() {
+        let predicate = r#"{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"bindings":{"assignmentId":"asg_r"},"resolverRef":{"kind":"assignment","id":"asg_r"},"necessity":"needs output","verificationRef":{"kind":"assignment","id":"asg_v"}}"#;
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--predicate",
+                predicate,
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "continue",
+                "--as",
+                "holder",
+            ])),
+            Ok(Command::Wake {
+                identity: Identity::Role("holder".to_owned()),
+                target: Target::Session("agent:holder".to_owned()),
+                prompt: "continue".to_owned(),
+                after_ms: Some("7200000".to_owned()),
+                at: None,
+                condition_kind: None,
+                condition_scope: None,
+                predicate: Some(serde_json::from_str(predicate).unwrap()),
+                assignment_id: Some("asg_a".to_owned()),
+                after_turn: false,
+                idempotency_key: None,
+                class: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--after-turn",
+                "--prompt",
+                "continue",
+                "--as",
+                "holder",
+            ])),
+            Ok(Command::Wake {
+                identity: Identity::Role("holder".to_owned()),
+                target: Target::Session("agent:holder".to_owned()),
+                prompt: "continue".to_owned(),
+                after_ms: None,
+                at: None,
+                condition_kind: None,
+                condition_scope: None,
+                predicate: None,
+                assignment_id: Some("asg_a".to_owned()),
+                after_turn: true,
+                idempotency_key: None,
+                class: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--predicate",
+                "[]",
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "continue",
+            ])),
+            Err("--predicate must be a JSON object".to_owned())
         );
     }
 
@@ -3745,6 +3896,9 @@ mod tests {
                     at: Some("123".to_owned()),
                     condition_kind: None,
                     condition_scope: None,
+                    predicate: None,
+                    assignment_id: None,
+                    after_turn: false,
                     idempotency_key: None,
                     class: None,
                 },

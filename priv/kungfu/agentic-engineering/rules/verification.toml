@@ -62,3 +62,12 @@ action = "wake"
 target_session = "{holder_key}"
 [rule.remedy.params]
 prompt = "Your completion of {assignment_id} is blocked: no artifact is recorded on its work item. Your session workspace is REMOVED when it closes, so a document you did not record is destroyed with it — the row survives and the bytes do not. Record what you produced (report, spec, evidence, logs) with `tightbeam artifact-record --kind <kind> --title <title> --path <path> --work-item <workItemId>`, then complete."
+
+[[policy]]
+name = "accountable-dependency-verifier"
+purpose = "wait-verification-admission"
+when = [
+  { fact = "verifier.open", op = "eq", value = true },
+  { fact = "verifier.holder_is_other", op = "eq", value = true },
+]
+verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }

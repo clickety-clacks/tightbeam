@@ -82,6 +82,7 @@ defmodule Tightbeam.Assignments do
     commitRefs TEXT NULL,
     artifactId TEXT NULL REFERENCES artifacts(artifactId),
     contentSha256 TEXT NULL,
+    waitId TEXT NULL REFERENCES wakes(wakeId),
     ts INTEGER NOT NULL,
     CHECK(
       (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
@@ -452,7 +453,7 @@ defmodule Tightbeam.Assignments do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
+        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
         [assignment_id]
       )
 
@@ -1371,15 +1372,38 @@ defmodule Tightbeam.Assignments do
 
           true ->
             with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
-                 :ok <- valid_note(call.params[:note]) do
+                 :ok <- valid_note(call.params[:note]),
+                 {by_user, by_session} = opener(call.principal),
+                 :ok <-
+                   Wakes.validate_verification_verdict_in_txn(txn, %{
+                     assignment_id: assignment_id,
+                     verdict_kind: call.params[:verdict_kind],
+                     wait_id: call.params[:wait_id],
+                     by_user: by_user,
+                     by_session: by_session
+                   }) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
                  do: raise(TransitionRace)
 
               attest = insert_attest(txn, call, assignment_id)
+
+              :ok =
+                Wakes.verification_verdict_in_txn(txn, %{
+                  assignment_id: assignment_id,
+                  verdict_kind: attest.verdictKind,
+                  wait_id: attest.waitId,
+                  by_user: attest.byUser,
+                  by_session: attest.bySession,
+                  attest_id: attest.id
+                })
+
               append_attest_marker(txn, attest)
               %{assignment: assignment, attest: attest}
+            else
+              {:error, error} -> error
+              %{code: _} = error -> error
             end
         end
     end
@@ -1511,7 +1535,8 @@ defmodule Tightbeam.Assignments do
       by_provider: by_provider,
       commit_refs: call.params[:commit_refs],
       artifact_id: call.params[:artifact_id],
-      content_sha256: call.params[:content_sha256]
+      content_sha256: call.params[:content_sha256],
+      wait_id: call.params[:wait_id]
     })
   end
 
@@ -1524,8 +1549,8 @@ defmodule Tightbeam.Assignments do
       """
       INSERT INTO attests
         (id, assignmentId, kind, verdictKind, note, bySession, byUser, producer,
-         producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, ts)
-      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+         producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
       WHERE EXISTS (SELECT 1 FROM assignments WHERE id = ?2 AND state = 'open')
       """,
       [
@@ -1543,6 +1568,7 @@ defmodule Tightbeam.Assignments do
         attrs[:commit_refs] && JSON.encode!(attrs.commit_refs),
         attrs[:artifact_id],
         attrs[:content_sha256],
+        attrs[:wait_id],
         ts
       ]
     )
@@ -1564,6 +1590,7 @@ defmodule Tightbeam.Assignments do
       attrs[:commit_refs] && JSON.encode!(attrs.commit_refs),
       attrs[:artifact_id],
       attrs[:content_sha256],
+      attrs[:wait_id],
       ts
     ])
   end
@@ -2198,6 +2225,7 @@ defmodule Tightbeam.Assignments do
          commit_refs,
          artifact_id,
          content_sha256,
+         wait_id,
          ts
        ]) do
     %{
@@ -2215,6 +2243,7 @@ defmodule Tightbeam.Assignments do
       commitRefs: commit_refs && JSON.decode!(commit_refs),
       artifactId: artifact_id,
       contentSha256: content_sha256,
+      waitId: wait_id,
       ts: ts
     }
   end

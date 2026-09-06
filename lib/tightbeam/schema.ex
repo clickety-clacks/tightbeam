@@ -40,7 +40,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "row-driven-rules-v1-019"
+  @shape "row-driven-waits-v1-019"
+  @row_driven_waits_previous_shape "row-driven-rules-v1-019"
   @row_driven_rules_previous_shape "liveness-progress-receipts-v1-019"
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
@@ -1191,6 +1192,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@row_driven_waits_previous_shape]]} ->
+        upgrade_row_driven_waits_v1(db)
+
       {:ok, [[@row_driven_rules_previous_shape]]} ->
         upgrade_row_driven_rules_v1(db)
 
@@ -1240,7 +1244,8 @@ defmodule Tightbeam.Schema do
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
-        #{@effort_request_exit_previous_shape} to #{@shape}. It can also migrate
+        #{@effort_request_exit_previous_shape} to #{@row_driven_waits_previous_shape},
+        then #{@shape}. It can also migrate
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
         then #{@shape}.
 
@@ -1361,7 +1366,7 @@ defmodule Tightbeam.Schema do
 
              Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
                @liveness_progress_receipts_previous_shape,
-               @shape,
+               @row_driven_waits_previous_shape,
                migration_time
              ])
 
@@ -1384,7 +1389,7 @@ defmodule Tightbeam.Schema do
              end
            end) do
         {:ok, :ok} ->
-          :ok
+          upgrade_row_driven_waits_v1(db)
 
         {:error, %ShapeError{} = error} ->
           raise error
@@ -1414,7 +1419,7 @@ defmodule Tightbeam.Schema do
 
            Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
              @row_driven_rules_previous_shape,
-             @shape,
+             @row_driven_waits_previous_shape,
              System.system_time(:millisecond)
            ])
 
@@ -1430,9 +1435,150 @@ defmodule Tightbeam.Schema do
                  message: "incompatible_row_driven_rules_v1: foreign key check #{inspect(rows)}"
            end
          end) do
+      {:ok, :ok} -> upgrade_row_driven_waits_v1(db)
+      {:error, error} -> raise error
+    end
+  end
+
+  defp upgrade_row_driven_waits_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@row_driven_waits_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_row_driven_waits_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           add_row_driven_wait_columns_in_txn(txn)
+           migrate_condition_fact_owners_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @row_driven_waits_previous_shape,
+             @shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_row_driven_waits_v1: stamp race")
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_row_driven_waits_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
+  end
+
+  defp add_row_driven_wait_columns_in_txn(txn) do
+    for sql <- [
+          "ALTER TABLE condition_facts ADD COLUMN ownerUserId TEXT NULL REFERENCES users(userId)",
+          "ALTER TABLE wakes ADD COLUMN ownerUserId TEXT NULL REFERENCES users(userId)",
+          "ALTER TABLE wakes ADD COLUMN obligationRef TEXT NULL REFERENCES assignments(id)",
+          "ALTER TABLE wakes ADD COLUMN waitMode TEXT NULL CHECK (waitMode IN ('dependency','after-turn'))",
+          "ALTER TABLE wakes ADD COLUMN predicate TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN resolverKind TEXT NULL CHECK (resolverKind IN ('assignment','decision_request'))",
+          "ALTER TABLE wakes ADD COLUMN resolverId TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN resolverHolder TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN resolverAddressee TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN necessity TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN verificationAssignmentId TEXT NULL REFERENCES assignments(id)",
+          "ALTER TABLE wakes ADD COLUMN verificationHolderKey TEXT NULL REFERENCES sessions(sessionKey)",
+          "ALTER TABLE wakes ADD COLUMN selectedPolicyName TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN verificationState TEXT NULL CHECK (verificationState IN ('provisional','confirmed','challenged'))",
+          "ALTER TABLE wakes ADD COLUMN verificationAttestId TEXT NULL REFERENCES attests(id)",
+          "ALTER TABLE wakes ADD COLUMN verificationNoticeWakeId TEXT NULL REFERENCES wakes(wakeId)",
+          "ALTER TABLE wakes ADD COLUMN originatingTurnSeq INTEGER NULL REFERENCES turns(seq)",
+          "ALTER TABLE wakes ADD COLUMN recognitionAt INTEGER NULL",
+          "ALTER TABLE wakes ADD COLUMN recognitionPath TEXT NULL CHECK (recognitionPath IN ('success','reconsideration','fallback','after-turn'))",
+          "ALTER TABLE wakes ADD COLUMN recognitionReason TEXT NULL CHECK (recognitionReason IN ('resolver-terminal','verification-challenged','verification-terminal'))",
+          "ALTER TABLE wakes ADD COLUMN recognitionEvidence TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN recognitionDisposition TEXT NULL",
+          "ALTER TABLE wakes ADD COLUMN recognitionTransition TEXT NULL",
+          "ALTER TABLE attests ADD COLUMN waitId TEXT NULL REFERENCES wakes(wakeId)",
+          "CREATE INDEX condition_facts_owner_match ON condition_facts(ownerUserId,kind,scope,id)",
+          "CREATE INDEX wakes_wait_recognition ON wakes(state,waitMode,ownerUserId,recognitionAt,dueAt)"
+        ] do
+      Txn.q(txn, sql)
+    end
+
+    :ok
+  end
+
+  defp migrate_condition_fact_owners_in_txn(txn) do
+    :ok =
+      Txn.exec(txn, """
+      CREATE TEMP TABLE condition_fact_owner_candidates (
+        factId INTEGER NOT NULL,
+        ownerUserId TEXT NOT NULL,
+        source TEXT NOT NULL,
+        UNIQUE(factId, ownerUserId, source)
+      );
+      """)
+
+    for sql <- [
+          """
+          INSERT OR IGNORE INTO condition_fact_owner_candidates(factId,ownerUserId,source)
+          SELECT f.id, u.userId, 'user-origin'
+          FROM condition_facts f JOIN users u ON f.origin='user:' || u.userId
+          """,
+          """
+          INSERT OR IGNORE INTO condition_fact_owner_candidates(factId,ownerUserId,source)
+          SELECT f.id, s.ownerUserId, 'session-origin'
+          FROM condition_facts f JOIN sessions s ON f.origin='session:' || s.sessionKey
+          """,
+          """
+          INSERT OR IGNORE INTO condition_fact_owner_candidates(factId,ownerUserId,source)
+          SELECT f.id, s.ownerUserId, 'agent-origin'
+          FROM condition_facts f
+          JOIN roles r ON f.origin='agent:' || r.name
+          JOIN sessions s ON s.sessionKey=r.boundSessionKey
+          JOIN users u ON u.userId=s.ownerUserId
+          """,
+          """
+          INSERT OR IGNORE INTO condition_fact_owner_candidates(factId,ownerUserId,source)
+          SELECT f.id, d.ownerUserId, 'decision-request'
+          FROM condition_facts f
+          JOIN decision_requests d ON d.rulingFactId=f.id
+          JOIN users u ON u.userId=d.ownerUserId
+          """
+        ],
+        do: Txn.q(txn, sql)
+
+    Txn.q(
+      txn,
+      """
+      UPDATE condition_facts
+      SET ownerUserId=(
+        SELECT MIN(c.ownerUserId) FROM condition_fact_owner_candidates c
+        WHERE c.factId=condition_facts.id
+      )
+      WHERE 1=(
+        SELECT COUNT(DISTINCT c.ownerUserId) FROM condition_fact_owner_candidates c
+        WHERE c.factId=condition_facts.id
+      )
+      """
+    )
+
+    Txn.q(txn, "SELECT id FROM condition_facts WHERE ownerUserId IS NULL ORDER BY id")
+    |> Enum.each(fn [fact_id] ->
+      Tightbeam.EventLog.lifecycle_in_txn(
+        txn,
+        "condition_fact_owner_unattributed",
+        to_string(fact_id),
+        "migration refused owner attribution: no unique recorded session/user or owning-row provenance"
+      )
+    end)
+
+    :ok = Txn.exec(txn, "DROP TABLE condition_fact_owner_candidates")
+    :ok
   end
 
   defp add_row_driven_rule_columns_in_txn(txn) do

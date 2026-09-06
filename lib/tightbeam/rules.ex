@@ -61,6 +61,7 @@ defmodule Tightbeam.Rules do
   import Bitwise
 
   @persist_key __MODULE__
+  @policy_key {__MODULE__, :policies}
   @rule_keys MapSet.new([
                "name",
                "verb",
@@ -75,6 +76,9 @@ defmodule Tightbeam.Rules do
                "recurrence_suppression"
              ])
   @condition_keys MapSet.new(["fact", "op", "value"])
+  @policy_keys MapSet.new(["name", "purpose", "when", "verification"])
+  @verification_keys MapSet.new(["trigger", "terminal", "fallback"])
+  @policy_purposes ~w(wait-prod-coverage wait-effort-relief wait-verification-admission)
   @recurrence_keys MapSet.new([
                      "scope",
                      "fingerprint",
@@ -151,7 +155,9 @@ defmodule Tightbeam.Rules do
     "artifact.present" => :bool,
     "artifact.content_sha256" => :string,
     "review.qualifying_verdict_kinds" => {:list, :string},
-    "condition_fact.matches" => :bool
+    "condition_fact.matches" => :bool,
+    "verifier.open" => :bool,
+    "verifier.holder_is_other" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
   @predicate_binding_keys ~w(
@@ -191,14 +197,19 @@ defmodule Tightbeam.Rules do
 
     identity_manifest_sha = identity_manifest_sha(base_dir)
 
-    rules =
+    entries =
       base_dir
       |> Path.join("identity/rules/*.toml")
       |> Path.wildcard()
       |> Enum.sort()
       |> Enum.flat_map(&load_file!(&1, verbs, base_dir, identity_manifest_sha))
 
-    case Enum.find(rules, fn rule -> Enum.count(rules, &(&1.name == rule.name)) > 1 end) do
+    rules = for {:rule, rule} <- entries, do: rule
+    policies = for {:policy, policy} <- entries, do: policy
+
+    named = rules ++ policies
+
+    case Enum.find(named, fn entry -> Enum.count(named, &(&1.name == entry.name)) > 1 end) do
       %{name: name, source: source} ->
         raise ArgumentError, "#{source}: rule #{inspect(name)}: duplicate name"
 
@@ -208,14 +219,39 @@ defmodule Tightbeam.Rules do
 
     validate_satisfiability!(rules, verbs)
     :persistent_term.put(@persist_key, rules)
+    :persistent_term.put(@policy_key, policies)
 
     RuleRuntime.install(%{
       row_commit_effects: &row_commit_effects_in_txn/2,
       resolve_notice: &resolve_notice_in_txn/3,
-      evaluate_predicate: &evaluate_predicate_in_txn/2
+      evaluate_predicate: &evaluate_predicate_in_txn/2,
+      select_policy: &select_policy_in_txn/3
     })
 
     rules
+  end
+
+  @doc "Select the bytewise-smallest matching predicate-only policy for one snapshot."
+  @spec select_policy_in_txn(DB.Txn.t(), String.t(), map()) :: {:ok, map()} | :none
+  def select_policy_in_txn(%DB.Txn{} = txn, purpose, context) do
+    @policy_key
+    |> :persistent_term.get([])
+    |> Enum.filter(&(&1.purpose == purpose))
+    |> Enum.sort_by(& &1.name)
+    |> Enum.find_value(:none, fn policy ->
+      call = %{origin: "process:tightbeam", params: %{}, policy_context: context}
+
+      case evaluate_conditions(policy.conditions, policy, txn, call, %{}) do
+        {:match, cache} ->
+          {:ok, %{name: policy.name, facts: evidence_facts(policy.conditions, cache)}}
+
+        {:no_match, _cache} ->
+          false
+
+        {:error, fact} ->
+          raise ArgumentError, "failed to compute #{fact} for policy #{policy.name}"
+      end
+    end)
   end
 
   @doc "Evaluate the active statutes for a raw dispatch call."
@@ -292,7 +328,8 @@ defmodule Tightbeam.Rules do
                %{
                  matched: true,
                  facts: evidence_facts(conditions, cache),
-                 condition_match: Map.get(cache, "$condition_match")
+                 condition_match: Map.get(cache, "$condition_match"),
+                 canonical: %{conditions: conditions, bindings: bindings}
                }}
 
             {:no_match, cache} ->
@@ -300,7 +337,8 @@ defmodule Tightbeam.Rules do
                %{
                  matched: false,
                  facts: evidence_facts(conditions, cache),
-                 condition_match: Map.get(cache, "$condition_match")
+                 condition_match: Map.get(cache, "$condition_match"),
+                 canonical: %{conditions: conditions, bindings: bindings}
                }}
 
             {:error, fact} ->
@@ -308,7 +346,14 @@ defmodule Tightbeam.Rules do
           end
         end)
 
-      {:ok, result || %{matched: false, facts: [], condition_match: nil}}
+      {:ok,
+       result ||
+         %{
+           matched: false,
+           facts: [],
+           condition_match: nil,
+           canonical: %{conditions: conditions, bindings: bindings}
+         }}
     rescue
       error in ArgumentError -> {:error, %{code: "invalid_predicate", message: error.message}}
     end
@@ -320,7 +365,7 @@ defmodule Tightbeam.Rules do
   @doc "Evaluate loaded row-commit notice rules into effects for Wakes to record."
   @spec row_commit_effects_in_txn(DB.Txn.t(), [map()] | map()) :: [tuple()]
   def row_commit_effects_in_txn(%DB.Txn{} = txn, transitions) do
-    (List.wrap(transitions) ++ DB.take_row_commits(txn))
+    List.wrap(transitions)
     |> Enum.flat_map(&evaluate_row_transition_in_txn(txn, &1))
   end
 
@@ -719,23 +764,117 @@ defmodule Tightbeam.Rules do
         {:error, error} -> raise ArgumentError, "#{path}: invalid TOML: #{inspect(error)}"
       end
 
-    unknown = unknown_keys(manifest, MapSet.new(["rule"]))
+    unknown = unknown_keys(manifest, MapSet.new(["rule", "policy"]))
 
     if unknown != [],
       do: raise(ArgumentError, "#{path}: unknown root keys: #{Enum.join(unknown, ", ")}")
 
-    case Map.get(manifest, "rule") do
-      rules when is_list(rules) and rules != [] ->
-        rules
-        |> Enum.with_index(1)
-        |> Enum.map(fn {rule, ordinal} ->
-          validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)
-        end)
+    rules =
+      case Map.fetch(manifest, "rule") do
+        {:ok, rules} when is_list(rules) and rules != [] ->
+          rules
+          |> Enum.with_index(1)
+          |> Enum.map(fn {rule, ordinal} ->
+            {:rule,
+             validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)}
+          end)
 
-      _ ->
-        raise ArgumentError, "#{path}: must contain one or more [[rule]] tables"
-    end
+        :error ->
+          []
+
+        _ ->
+          raise ArgumentError, "#{path}: [[rule]] must be a non-empty array of tables"
+      end
+
+    policies =
+      case Map.fetch(manifest, "policy") do
+        {:ok, policies} when is_list(policies) and policies != [] ->
+          policies
+          |> Enum.with_index(1)
+          |> Enum.map(fn {policy, ordinal} ->
+            {:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}
+          end)
+
+        :error ->
+          []
+
+        _ ->
+          raise ArgumentError, "#{path}: [[policy]] must be a non-empty array of tables"
+      end
+
+    if rules == [] and policies == [],
+      do: raise(ArgumentError, "#{path}: must contain one or more [[rule]] or [[policy]] tables")
+
+    rules ++ policies
   end
+
+  defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
+    raw_name = Map.get(policy, "name")
+
+    label =
+      if valid_name?(raw_name), do: "policy #{inspect(raw_name)}", else: "policy ##{ordinal}"
+
+    fail = fn message -> raise ArgumentError, "#{path}: #{label}: #{message}" end
+
+    unknown = unknown_keys(policy, @policy_keys)
+    if unknown != [], do: fail.("unknown keys: #{Enum.join(unknown, ", ")}")
+    unless valid_name?(raw_name), do: fail.("invalid or missing name: #{inspect(raw_name)}")
+
+    purpose = Map.get(policy, "purpose")
+    unless purpose in @policy_purposes, do: fail.("unsupported purpose: #{inspect(purpose)}")
+
+    conditions = validate_policy_conditions!(Map.get(policy, "when"), fail)
+    verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
+
+    %{
+      name: raw_name,
+      purpose: purpose,
+      conditions: conditions,
+      verification: verification,
+      source: path,
+      identity_manifest_sha: identity_manifest_sha
+    }
+  end
+
+  defp validate_policy!(path, ordinal, _policy, _identity_manifest_sha),
+    do: raise(ArgumentError, "#{path}: policy ##{ordinal}: policy must be a table")
+
+  defp validate_policy_conditions!(conditions, fail) do
+    unless is_list(conditions) and conditions != [] and Enum.all?(conditions, &is_map/1),
+      do: fail.("when must be a non-empty list of condition tables")
+
+    conditions
+    |> Enum.with_index(1)
+    |> Enum.map(fn {condition, index} -> validate_condition!(condition, index, fail) end)
+  end
+
+  defp validate_policy_verification!("wait-verification-admission", verification, fail)
+       when is_map(verification) do
+    unknown = unknown_keys(verification, @verification_keys)
+    if unknown != [], do: fail.("verification has unknown keys: #{Enum.join(unknown, ", ")}")
+
+    expected = %{
+      "trigger" => "registration",
+      "terminal" => "bound-verdict-or-obligation-terminal",
+      "fallback" => "wake-due-at"
+    }
+
+    unless verification == expected,
+      do:
+        fail.(
+          "verification must declare registration, bound-verdict-or-obligation-terminal, and wake-due-at"
+        )
+
+    expected
+  end
+
+  defp validate_policy_verification!("wait-verification-admission", _verification, fail),
+    do: fail.("verification admission requires a verification table")
+
+  defp validate_policy_verification!(_purpose, nil, _fail), do: nil
+
+  defp validate_policy_verification!(_purpose, _verification, fail),
+    do: fail.("verification is valid only for wait-verification-admission")
 
   defp validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)
        when is_map(rule) do
@@ -1935,12 +2074,20 @@ defmodule Tightbeam.Rules do
     scope = Map.get(bindings, "conditionScope")
     after_id = Map.get(bindings, "conditionAfterId")
     fact_id = Map.get(bindings, "conditionFactId")
+    owner_user_id = Map.get(call, :predicate_owner_user_id)
+
+    {owner_clause, params} =
+      if owner_user_id == "legacy-unscoped" do
+        {"ownerUserId IS NULL", [after_id, kind]}
+      else
+        {"ownerUserId=?3", [after_id, kind, owner_user_id]}
+      end
 
     {scope_clause, params} =
       if is_nil(scope) do
-        {"", [after_id, kind]}
+        {"", params}
       else
-        {" AND scope=?3", [after_id, kind, scope]}
+        {" AND scope=?#{length(params) + 1}", params ++ [scope]}
       end
 
     {id_clause, params} =
@@ -1953,7 +2100,7 @@ defmodule Tightbeam.Rules do
     rows =
       case DB.query(
              db,
-             "SELECT id, scope FROM condition_facts WHERE id>?1 AND kind=?2#{scope_clause}#{id_clause} ORDER BY id LIMIT 1",
+             "SELECT id, scope FROM condition_facts WHERE id>?1 AND kind=?2 AND #{owner_clause}#{scope_clause}#{id_clause} ORDER BY id LIMIT 1",
              params
            ) do
         {:ok, rows} -> rows
@@ -1966,6 +2113,15 @@ defmodule Tightbeam.Rules do
       [] ->
         {false, cache}
     end
+  end
+
+  defp compute_fact("verifier.open", _db, call, cache) do
+    {get_in(call, [:policy_context, :verifier_state]) == "open", cache}
+  end
+
+  defp compute_fact("verifier.holder_is_other", _db, call, cache) do
+    context = Map.get(call, :policy_context, %{})
+    {context[:verifier_holder_key] != context[:obligation_holder_key], cache}
   end
 
   # Explicit active membership is the sole Topline truth. Visibility is checked

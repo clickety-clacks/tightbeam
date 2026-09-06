@@ -302,6 +302,7 @@ defmodule Tightbeam.Gateway do
         {Tightbeam.Wakes,
          db: db,
          deliver: deliver,
+         delivery_opts: delivery_config,
          internal_consumers: %{
            "effort_probe" => &EffortCheckin.probe(db, config, &1),
            "effort_deadline" => &EffortCheckin.deadline(db, config, &1)
@@ -682,6 +683,13 @@ defmodule Tightbeam.Gateway do
               message: "a condition wake requires a fallback (--fallback-after / --at)"
             }
 
+          not valid_wait_request_shape?(p) ->
+            %{
+              code: "invalid",
+              message:
+                "--predicate and --after-turn are exclusive; each requires --assignment, and dependency waits require a fallback"
+            }
+
           not wake_principal_allowed?(db, call) ->
             %{code: "unknown_caller"}
 
@@ -717,6 +725,7 @@ defmodule Tightbeam.Gateway do
                    kind: p.kind,
                    scope: p[:scope],
                    origin: call.origin,
+                   owner_user_id: wait_owner_user_id_in_txn_for_db(db, Map.get(call, :principal)),
                    idempotency_key: p[:idempotency_key]
                  }) do
               {:error, error} -> error
@@ -4303,10 +4312,7 @@ defmodule Tightbeam.Gateway do
                 do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
 
             if prior do
-              case DB.Txn.q(txn, select_wake_in_txn_sql(), [prior.session_key]) do
-                [row] -> wake_from_in_txn_row(row)
-                [] -> nil
-              end
+              Wakes.get_in_txn(txn, prior.session_key)
             else
               wake = schedule_wake_in_txn(txn, call, session_key, due_at)
 
@@ -4325,13 +4331,15 @@ defmodule Tightbeam.Gateway do
 
         wake =
           case result do
+            {:ok, {:error, error}} -> error
             {:ok, wake} -> wake
             {:error, error} -> raise error
           end
 
-        if is_binary(wake[:wake_id]) do
-          if due_at <= System.system_time(:millisecond) and p[:nudge] != false,
-            do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
+        if is_map(wake) and is_binary(wake[:wake_id]) do
+          if (due_at <= System.system_time(:millisecond) or is_binary(wake[:wait_mode])) and
+               p[:nudge] != false,
+             do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
 
           wake_response(wake)
         else
@@ -4346,42 +4354,94 @@ defmodule Tightbeam.Gateway do
   defp schedule_wake_in_txn(txn, call, session_key, due_at) do
     p = call.params
 
-    if p[:condition_kind] == "subagent_stop" do
-      caller_session = creator_session_key(call[:principal])
+    cond do
+      is_map(p[:predicate]) or p[:after_turn] == true ->
+        Wakes.register_wait_in_txn(txn, %{
+          session_key: session_key,
+          target_role: Map.get(call, :target_role),
+          origin: call.origin,
+          prompt: p.prompt,
+          due_at: due_at,
+          assignment_id: p[:assignment_id],
+          predicate: p[:predicate],
+          after_turn: p[:after_turn] == true,
+          registrant_session_key: creator_session_key(call[:principal]),
+          owner_user_id: wait_owner_user_id_in_txn(txn, call[:principal])
+        })
 
-      case SubagentMarkers.resolve_subagent_in_txn(txn, caller_session, p[:condition_scope]) do
-        nil ->
-          %{
-            code: "subagent_not_found",
-            message: "no subagent for this session and tool call"
-          }
+      p[:condition_kind] == "subagent_stop" ->
+        caller_session = creator_session_key(call[:principal])
 
-        subagent_ref ->
-          if SubagentMarkers.stopped_in_txn?(txn, subagent_ref) do
+        case SubagentMarkers.resolve_subagent_in_txn(txn, caller_session, p[:condition_scope]) do
+          nil ->
             %{
-              code: "subagent_already_stopped",
-              subagent_ref: subagent_ref
+              code: "subagent_not_found",
+              message: "no subagent for this session and tool call"
             }
-          else
-            schedule_wake_row_in_txn(
-              txn,
-              call,
-              session_key,
-              due_at,
-              "subagent_stop",
-              subagent_ref
-            )
-          end
-      end
-    else
-      schedule_wake_row_in_txn(
-        txn,
-        call,
-        session_key,
-        due_at,
-        p[:condition_kind],
-        p[:condition_scope]
-      )
+
+          subagent_ref ->
+            if SubagentMarkers.stopped_in_txn?(txn, subagent_ref) do
+              %{
+                code: "subagent_already_stopped",
+                subagent_ref: subagent_ref
+              }
+            else
+              schedule_wake_row_in_txn(
+                txn,
+                call,
+                session_key,
+                due_at,
+                "subagent_stop",
+                subagent_ref
+              )
+            end
+        end
+
+      true ->
+        schedule_wake_row_in_txn(
+          txn,
+          call,
+          session_key,
+          due_at,
+          p[:condition_kind],
+          p[:condition_scope]
+        )
+    end
+  end
+
+  defp valid_wait_request_shape?(p) do
+    predicate_present? = Map.has_key?(p, :predicate)
+    predicate? = is_map(p[:predicate])
+    after_turn_present? = Map.has_key?(p, :after_turn)
+    after_turn? = p[:after_turn] == true
+    wait? = predicate? or after_turn?
+
+    cond do
+      predicate_present? and not predicate? -> false
+      after_turn_present? and not after_turn? -> false
+      predicate? and after_turn? -> false
+      wait? and not (is_binary(p[:assignment_id]) and p.assignment_id != "") -> false
+      wait? and is_binary(p[:condition_kind]) -> false
+      predicate? and is_nil(p[:after_ms]) and is_nil(p[:at]) -> false
+      after_turn? and (not is_nil(p[:after_ms]) or not is_nil(p[:at])) -> false
+      true -> true
+    end
+  end
+
+  defp wait_owner_user_id_in_txn(txn, {:session, session_key}) do
+    case DB.Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[owner_user_id]] -> owner_user_id
+      [] -> nil
+    end
+  end
+
+  defp wait_owner_user_id_in_txn(_txn, {:user, owner_user_id}), do: owner_user_id
+  defp wait_owner_user_id_in_txn(_txn, _principal), do: nil
+
+  defp wait_owner_user_id_in_txn_for_db(db, principal) do
+    case DB.transaction(db, &wait_owner_user_id_in_txn(&1, principal)) do
+      {:ok, owner_user_id} -> owner_user_id
+      {:error, error} -> raise error
     end
   end
 
@@ -4488,18 +4548,15 @@ defmodule Tightbeam.Gateway do
   defp creator_session_key({:session, key}), do: key
   defp creator_session_key(_principal), do: nil
 
-  defp select_wake_in_txn_sql do
-    "SELECT wakeId, dueAt, state, class, deliveryRule FROM wakes WHERE wakeId = ?1"
-  end
-
-  defp wake_from_in_txn_row([wake_id, due_at, state, class, delivery_rule]),
-    do: %{
-      wake_id: wake_id,
-      due_at: due_at,
-      state: state,
-      class: class,
-      delivery_rule: delivery_rule
+  defp wake_response(%{wait_mode: mode} = wake) when is_binary(mode) do
+    %{
+      wake_id: wake.wake_id,
+      due_at: wake.due_at,
+      state: wake.state,
+      recognition_path: wake.recognition_path,
+      eligible: wait_response_eligible?(wake)
     }
+  end
 
   defp wake_response(%{class: class} = wake) when is_binary(class) do
     %{
@@ -4514,6 +4571,9 @@ defmodule Tightbeam.Gateway do
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
   end
+
+  defp wait_response_eligible?(%{originating_turn_seq: nil}), do: true
+  defp wait_response_eligible?(_wake), do: false
 
   defp valid_reresolve?(p) do
     case {p[:reresolve], p[:reresolve_seed], p[:reresolve_rung]} do

@@ -63,10 +63,13 @@ defmodule Tightbeam.ConditionFacts do
     ts     INTEGER NOT NULL,
     kind   TEXT    NOT NULL,
     scope  TEXT,
-    origin TEXT    NOT NULL
+    origin TEXT    NOT NULL,
+    ownerUserId TEXT NULL REFERENCES users(userId)
   );
   CREATE INDEX IF NOT EXISTS condition_facts_match
     ON condition_facts (kind, scope, id);
+  CREATE INDEX IF NOT EXISTS condition_facts_owner_match
+    ON condition_facts (ownerUserId, kind, scope, id);
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
@@ -102,11 +105,12 @@ defmodule Tightbeam.ConditionFacts do
   defp file_admitted_in_txn(txn, kind, origin, input) do
     ts = System.system_time(:millisecond)
     scope = Map.get(input, :scope)
+    owner_user_id = Map.get(input, :owner_user_id) || owner_for_origin_in_txn(txn, origin)
 
     Txn.q(
       txn,
-      "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (?1, ?2, ?3, ?4)",
-      [ts, kind, scope, origin]
+      "INSERT INTO condition_facts (ts, kind, scope, origin, ownerUserId) VALUES (?1, ?2, ?3, ?4, ?5)",
+      [ts, kind, scope, origin, owner_user_id]
     )
 
     [[fact_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
@@ -117,8 +121,6 @@ defmodule Tightbeam.ConditionFacts do
       to_string(fact_id),
       "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
     )
-
-    owner_user_id = Map.get(input, :owner_user_id) || owner_for_origin_in_txn(txn, origin)
 
     fact = %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
 
@@ -198,12 +200,28 @@ defmodule Tightbeam.ConditionFacts do
     end
   end
 
-  defp owner_for_origin_in_txn(_txn, "user:" <> owner_user_id), do: owner_user_id
+  defp owner_for_origin_in_txn(txn, "user:" <> owner_user_id) do
+    case Txn.q(txn, "SELECT userId FROM users WHERE userId=?1", [owner_user_id]) do
+      [[^owner_user_id]] -> owner_user_id
+      _ -> nil
+    end
+  end
+
+  defp owner_for_origin_in_txn(txn, "session:" <> session_key) do
+    case Txn.q(
+           txn,
+           "SELECT s.ownerUserId FROM sessions s JOIN users u ON u.userId=s.ownerUserId WHERE s.sessionKey=?1",
+           [session_key]
+         ) do
+      [[owner_user_id]] -> owner_user_id
+      _ -> nil
+    end
+  end
 
   defp owner_for_origin_in_txn(txn, "agent:" <> role) do
     case Txn.q(
            txn,
-           "SELECT s.ownerUserId FROM roles r JOIN sessions s ON s.sessionKey=r.boundSessionKey WHERE r.name=?1",
+           "SELECT s.ownerUserId FROM roles r JOIN sessions s ON s.sessionKey=r.boundSessionKey JOIN users u ON u.userId=s.ownerUserId WHERE r.name=?1",
            [role]
          ) do
       [[owner_user_id]] -> owner_user_id

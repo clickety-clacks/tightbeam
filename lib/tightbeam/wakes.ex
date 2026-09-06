@@ -65,7 +65,29 @@ defmodule Tightbeam.Wakes do
           class_election: String.t() | nil,
           delivery_rule: String.t() | nil,
           digest: boolean(),
-          summon: boolean()
+          summon: boolean(),
+          owner_user_id: String.t() | nil,
+          obligation_ref: String.t() | nil,
+          wait_mode: String.t() | nil,
+          predicate: map() | nil,
+          resolver_kind: String.t() | nil,
+          resolver_id: String.t() | nil,
+          resolver_holder: String.t() | nil,
+          resolver_addressee: String.t() | nil,
+          necessity: String.t() | nil,
+          verification_assignment_id: String.t() | nil,
+          verification_holder_key: String.t() | nil,
+          selected_policy_name: String.t() | nil,
+          verification_state: String.t() | nil,
+          verification_attest_id: String.t() | nil,
+          verification_notice_wake_id: String.t() | nil,
+          originating_turn_seq: integer() | nil,
+          recognition_at: integer() | nil,
+          recognition_path: String.t() | nil,
+          recognition_reason: String.t() | nil,
+          recognition_evidence: map() | nil,
+          recognition_disposition: String.t() | nil,
+          recognition_transition: map() | nil
         }
 
   @typedoc "Delivery fun injected by the composition root: fires the prompt into the turn pipeline."
@@ -129,6 +151,28 @@ defmodule Tightbeam.Wakes do
     -- subtracts these, and both its windows must run the SAME query, so the
     -- carrier ships in Phase 1 even though Phase 3 stands up the first desk.
     summon INTEGER NOT NULL DEFAULT 0 CHECK (summon IN (0,1)),
+    ownerUserId TEXT NULL REFERENCES users(userId),
+    obligationRef TEXT NULL REFERENCES assignments(id),
+    waitMode TEXT NULL CHECK (waitMode IN ('dependency','after-turn')),
+    predicate TEXT NULL,
+    resolverKind TEXT NULL CHECK (resolverKind IN ('assignment','decision_request')),
+    resolverId TEXT NULL,
+    resolverHolder TEXT NULL,
+    resolverAddressee TEXT NULL,
+    necessity TEXT NULL,
+    verificationAssignmentId TEXT NULL REFERENCES assignments(id),
+    verificationHolderKey TEXT NULL REFERENCES sessions(sessionKey),
+    selectedPolicyName TEXT NULL,
+    verificationState TEXT NULL CHECK (verificationState IN ('provisional','confirmed','challenged')),
+    verificationAttestId TEXT NULL REFERENCES attests(id),
+    verificationNoticeWakeId TEXT NULL REFERENCES wakes(wakeId),
+    originatingTurnSeq INTEGER NULL REFERENCES turns(seq),
+    recognitionAt INTEGER NULL,
+    recognitionPath TEXT NULL CHECK (recognitionPath IN ('success','reconsideration','fallback','after-turn')),
+    recognitionReason TEXT NULL CHECK (recognitionReason IN ('resolver-terminal','verification-challenged','verification-terminal')),
+    recognitionEvidence TEXT NULL,
+    recognitionDisposition TEXT NULL,
+    recognitionTransition TEXT NULL,
     CHECK (consumer != 'prompt' OR prompt IS NOT NULL),
     CHECK ((class IS NULL) = (classElection IS NULL)),
     CHECK (digest = 0 OR class IS NOT NULL)
@@ -141,6 +185,8 @@ defmodule Tightbeam.Wakes do
   );
   INSERT OR IGNORE INTO scheduler_state (id, afterFact) VALUES (0, 0);
   CREATE INDEX IF NOT EXISTS wakes_condition ON wakes (state, conditionKind, conditionScope);
+  CREATE INDEX IF NOT EXISTS wakes_wait_recognition
+    ON wakes (state, waitMode, ownerUserId, recognitionAt, dueAt);
   CREATE TABLE IF NOT EXISTS wake_retry_attempts (
     wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
     rootWakeId TEXT NOT NULL REFERENCES wakes(wakeId),
@@ -317,6 +363,9 @@ defmodule Tightbeam.Wakes do
   def schedule_in_txn(%Txn{} = txn, input) do
     condition_kind = Map.get(input, :condition_kind)
 
+    owner_user_id =
+      Map.get(input, :owner_user_id) || authenticated_wake_owner_in_txn(txn, input.session_key)
+
     condition_after_id =
       if is_binary(condition_kind) do
         [[cursor]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
@@ -360,7 +409,29 @@ defmodule Tightbeam.Wakes do
       class_election: class_election,
       delivery_rule: delivery_rule,
       digest: Map.get(input, :digest, false),
-      summon: Map.get(input, :summon, false)
+      summon: Map.get(input, :summon, false),
+      owner_user_id: owner_user_id,
+      obligation_ref: Map.get(input, :obligation_ref),
+      wait_mode: Map.get(input, :wait_mode),
+      predicate: Map.get(input, :predicate),
+      resolver_kind: Map.get(input, :resolver_kind),
+      resolver_id: Map.get(input, :resolver_id),
+      resolver_holder: Map.get(input, :resolver_holder),
+      resolver_addressee: Map.get(input, :resolver_addressee),
+      necessity: Map.get(input, :necessity),
+      verification_assignment_id: Map.get(input, :verification_assignment_id),
+      verification_holder_key: Map.get(input, :verification_holder_key),
+      selected_policy_name: Map.get(input, :selected_policy_name),
+      verification_state: Map.get(input, :verification_state),
+      verification_attest_id: Map.get(input, :verification_attest_id),
+      verification_notice_wake_id: Map.get(input, :verification_notice_wake_id),
+      originating_turn_seq: Map.get(input, :originating_turn_seq),
+      recognition_at: Map.get(input, :recognition_at),
+      recognition_path: Map.get(input, :recognition_path),
+      recognition_reason: Map.get(input, :recognition_reason),
+      recognition_evidence: Map.get(input, :recognition_evidence),
+      recognition_disposition: Map.get(input, :recognition_disposition),
+      recognition_transition: Map.get(input, :recognition_transition)
     }
 
     Txn.q(
@@ -370,9 +441,16 @@ defmodule Tightbeam.Wakes do
           (wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt,
            reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope,
            conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId,
-           targetGate, class, classElection, deliveryRule, digest, summon)
+           targetGate, class, classElection, deliveryRule, digest, summon,
+           ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId,
+           resolverHolder, resolverAddressee, necessity, verificationAssignmentId,
+           verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId,
+           verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath,
+           recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, NULL, ?9, ?10, ?11,
-                ?12, ?13, ?14, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+                ?12, ?13, ?14, NULL, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37,
+                ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)
       """,
       [
         wake.wake_id,
@@ -398,7 +476,29 @@ defmodule Tightbeam.Wakes do
         wake.class_election,
         wake.delivery_rule,
         if(wake.digest, do: 1, else: 0),
-        if(wake.summon, do: 1, else: 0)
+        if(wake.summon, do: 1, else: 0),
+        wake.owner_user_id,
+        wake.obligation_ref,
+        wake.wait_mode,
+        encode_optional(wake.predicate),
+        wake.resolver_kind,
+        wake.resolver_id,
+        wake.resolver_holder,
+        wake.resolver_addressee,
+        wake.necessity,
+        wake.verification_assignment_id,
+        wake.verification_holder_key,
+        wake.selected_policy_name,
+        wake.verification_state,
+        wake.verification_attest_id,
+        wake.verification_notice_wake_id,
+        wake.originating_turn_seq,
+        wake.recognition_at,
+        wake.recognition_path,
+        wake.recognition_reason,
+        encode_optional(wake.recognition_evidence),
+        wake.recognition_disposition,
+        encode_optional(wake.recognition_transition)
       ]
     )
 
@@ -431,9 +531,671 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc "Register one obligation-scoped dependency or after-turn continuation atomically."
+  @spec register_wait_in_txn(Txn.t(), map()) :: wake() | {:error, map()}
+  def register_wait_in_txn(%Txn{} = txn, input) do
+    with :ok <- validate_wait_input(input),
+         {:ok, obligation} <- wait_obligation_in_txn(txn, input),
+         :ok <- wait_registrant_allowed(input, obligation),
+         :ok <- wait_target_allowed(input, obligation) do
+      if Map.get(input, :after_turn) do
+        register_after_turn_in_txn(txn, input, obligation)
+      else
+        register_dependency_in_txn(txn, input, obligation)
+      end
+    end
+  end
+
+  defp validate_wait_input(input) do
+    predicate? = is_map(input[:predicate])
+    after_turn? = input[:after_turn] == true
+
+    valid =
+      is_binary(input[:session_key]) and input.session_key != "" and
+        is_binary(input[:origin]) and input.origin != "" and
+        is_binary(input[:prompt]) and input.prompt != "" and
+        is_binary(input[:assignment_id]) and input.assignment_id != "" and
+        is_binary(input[:registrant_session_key]) and input.registrant_session_key != "" and
+        is_binary(input[:owner_user_id]) and input.owner_user_id != "" and
+        (is_nil(input[:target_role]) or
+           (is_binary(input.target_role) and input.target_role != "")) and
+        predicate? != after_turn? and (after_turn? or is_integer(input[:due_at]))
+
+    if valid,
+      do: :ok,
+      else: wait_error("invalid_wait", "invalid dependency or after-turn wake registration")
+  end
+
+  defp register_after_turn_in_txn(txn, input, obligation) do
+    case running_turn_seq_in_txn(txn, input.registrant_session_key) do
+      nil ->
+        wait_error("no_running_turn", "--after-turn requires the registrant's running turn")
+
+      turn_seq ->
+        now = now()
+
+        schedule_in_txn(txn, %{
+          session_key: input.session_key,
+          target_role: input[:target_role],
+          origin: input.origin,
+          prompt: input.prompt,
+          due_at: now,
+          creator_session_key: input.registrant_session_key,
+          assignment_id: obligation.id,
+          owner_user_id: obligation.owner_user_id,
+          obligation_ref: obligation.id,
+          wait_mode: "after-turn",
+          originating_turn_seq: turn_seq,
+          recognition_at: now,
+          recognition_path: "after-turn",
+          recognition_evidence: %{
+            label: "registration-snapshot",
+            observed: %{status: "running"},
+            eligible_after: "originating-turn-terminal"
+          },
+          recognition_transition: %{
+            label: "registration-snapshot",
+            domain: "turn",
+            row_id: turn_seq,
+            observed: %{status: "running"}
+          }
+        })
+    end
+  end
+
+  defp register_dependency_in_txn(txn, input, obligation) do
+    with {:ok, declaration} <- normalize_dependency_declaration(input[:predicate]),
+         {:ok, resolver} <-
+           resolver_in_txn(txn, declaration.resolver_ref, obligation.owner_user_id),
+         {:ok, verifier} <-
+           verification_assignment_in_txn(
+             txn,
+             declaration.verification_ref,
+             obligation.owner_user_id
+           ),
+         {:ok, selected} <- verification_policy_in_txn(txn, obligation, verifier),
+         {:ok, evaluation} <-
+           RuleRuntime.evaluate_predicate_in_txn(txn, %{
+             owner_user_id: obligation.owner_user_id,
+             conditions: declaration.conditions,
+             bindings: declaration.bindings
+           }) do
+      turn_seq = running_turn_seq_in_txn(txn, input.registrant_session_key)
+
+      wake =
+        schedule_in_txn(txn, %{
+          session_key: input.session_key,
+          target_role: input[:target_role],
+          origin: input.origin,
+          prompt: input.prompt,
+          due_at: input.due_at,
+          creator_session_key: input.registrant_session_key,
+          assignment_id: obligation.id,
+          owner_user_id: obligation.owner_user_id,
+          obligation_ref: obligation.id,
+          wait_mode: "dependency",
+          predicate: evaluation.canonical,
+          resolver_kind: resolver.kind,
+          resolver_id: resolver.id,
+          resolver_holder: resolver.holder,
+          resolver_addressee: resolver.addressee,
+          necessity: declaration.necessity,
+          verification_assignment_id: verifier.id,
+          verification_holder_key: verifier.holder_key,
+          selected_policy_name: selected.name,
+          verification_state: "provisional",
+          originating_turn_seq: turn_seq
+        })
+
+      wake = recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, nil)
+
+      if is_nil(wake.recognition_path) do
+        verifier_wake = schedule_verifier_notice_in_txn(txn, wake, verifier)
+
+        Txn.q(
+          txn,
+          "UPDATE wakes SET verificationNoticeWakeId=?2 WHERE wakeId=?1 AND verificationNoticeWakeId IS NULL",
+          [wake.wake_id, verifier_wake.wake_id]
+        )
+
+        %{wake | verification_notice_wake_id: verifier_wake.wake_id}
+      else
+        wake
+      end
+    end
+  end
+
+  defp wait_obligation_in_txn(txn, input) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.id,a.state,a.holderKey,s.ownerUserId
+           FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+           WHERE a.id=?1
+           """,
+           [input[:assignment_id]]
+         ) do
+      [[id, "open", holder_key, owner_user_id]] ->
+        if owner_user_id == input[:owner_user_id] do
+          {:ok, %{id: id, holder_key: holder_key, owner_user_id: owner_user_id}}
+        else
+          wait_error("unknown_assignment", "unknown or inaccessible open covered assignment")
+        end
+
+      _ ->
+        wait_error("unknown_assignment", "unknown or inaccessible open covered assignment")
+    end
+  end
+
+  defp wait_registrant_allowed(input, %{holder_key: holder_key}) do
+    if input[:registrant_session_key] == holder_key,
+      do: :ok,
+      else: wait_error("not_holder", "covered assignment is held by another session")
+  end
+
+  defp wait_target_allowed(input, %{holder_key: holder_key}) do
+    if input[:session_key] == holder_key,
+      do: :ok,
+      else: wait_error("invalid_target", "obligation continuation must target its holder")
+  end
+
+  defp normalize_dependency_declaration(predicate) when is_map(predicate) do
+    predicate = Map.new(predicate, fn {key, value} -> {to_string(key), value} end)
+    allowed = ~w(conditions bindings resolverRef necessity verificationRef)
+    unknown = Map.keys(predicate) -- allowed
+
+    cond do
+      unknown != [] ->
+        wait_error(
+          "invalid_predicate",
+          "predicate has unknown keys: #{Enum.join(Enum.sort(unknown), ", ")}"
+        )
+
+      not (is_binary(predicate["necessity"]) and String.trim(predicate["necessity"]) != "") ->
+        wait_error("invalid_predicate", "predicate necessity must be nonblank")
+
+      true ->
+        with {:ok, resolver_ref} <-
+               normalize_reference(
+                 predicate["resolverRef"],
+                 ~w(assignment decision_request),
+                 "resolverRef"
+               ),
+             {:ok, verification_ref} <-
+               normalize_reference(
+                 predicate["verificationRef"],
+                 ["assignment"],
+                 "verificationRef"
+               ) do
+          {:ok,
+           %{
+             conditions: predicate["conditions"],
+             bindings: predicate["bindings"] || %{},
+             resolver_ref: resolver_ref,
+             necessity: String.trim(predicate["necessity"]),
+             verification_ref: verification_ref
+           }}
+        end
+    end
+  end
+
+  defp normalize_dependency_declaration(_),
+    do: wait_error("invalid_predicate", "--predicate must be a JSON object")
+
+  defp normalize_reference(reference, allowed, label) when is_map(reference) do
+    reference = Map.new(reference, fn {key, value} -> {to_string(key), value} end)
+
+    case reference do
+      %{"kind" => kind, "id" => id}
+      when map_size(reference) == 2 and is_binary(id) and id != "" ->
+        if kind in allowed do
+          {:ok, %{kind: kind, id: id}}
+        else
+          wait_error(
+            "invalid_predicate",
+            "#{label} must contain exactly a supported kind and nonblank id"
+          )
+        end
+
+      _ ->
+        wait_error(
+          "invalid_predicate",
+          "#{label} must contain exactly a supported kind and nonblank id"
+        )
+    end
+  end
+
+  defp normalize_reference(_reference, _allowed, label),
+    do: wait_error("invalid_predicate", "#{label} must be an object")
+
+  defp resolver_in_txn(txn, %{kind: "assignment", id: id}, owner_user_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.state,a.outcome,a.holderKey,s.ownerUserId
+           FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+           WHERE a.id=?1
+           """,
+           [id]
+         ) do
+      [[state, outcome, holder_key, ^owner_user_id]] ->
+        {:ok,
+         %{
+           kind: "assignment",
+           id: id,
+           holder: "session:" <> holder_key,
+           addressee: holder_key,
+           terminal: state == "closed",
+           disposition: outcome
+         }}
+
+      _ ->
+        wait_error("invalid_resolver", "unknown or inaccessible assignment resolver")
+    end
+  end
+
+  defp resolver_in_txn(txn, %{kind: "decision_request", id: id}, owner_user_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT status,ownerUserId,expecterSessionKey,raiserSessionKey
+           FROM decision_requests WHERE id=?1
+           """,
+           [id]
+         ) do
+      [[status, ^owner_user_id, expecter_session, raiser_session]] ->
+        addressee =
+          expecter_session || raiser_session ||
+            "agent:main:clawline:#{owner_user_id}:main"
+
+        {:ok,
+         %{
+           kind: "decision_request",
+           id: id,
+           holder: "user:" <> owner_user_id,
+           addressee: addressee,
+           terminal: status in ~w(ruled consumed withdrawn superseded),
+           disposition: status
+         }}
+
+      _ ->
+        wait_error("invalid_resolver", "unknown or inaccessible decision request resolver")
+    end
+  end
+
+  defp verification_assignment_in_txn(txn, %{kind: "assignment", id: id}, owner_user_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.state,a.holderKey,s.ownerUserId
+           FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+           WHERE a.id=?1
+           """,
+           [id]
+         ) do
+      [["open", holder_key, ^owner_user_id]] ->
+        {:ok, %{id: id, state: "open", holder_key: holder_key}}
+
+      _ ->
+        wait_error("invalid_verifier", "verificationRef must name an accessible open assignment")
+    end
+  end
+
+  defp verification_policy_in_txn(txn, obligation, verifier) do
+    case RuleRuntime.select_policy_in_txn(txn, "wait-verification-admission", %{
+           verifier_state: verifier.state,
+           verifier_holder_key: verifier.holder_key,
+           obligation_holder_key: obligation.holder_key
+         }) do
+      {:ok, selected} -> {:ok, selected}
+      :none -> wait_error("verification_not_admitted", "no verification admission policy matched")
+    end
+  end
+
+  defp schedule_verifier_notice_in_txn(txn, wake, verifier) do
+    schedule_in_txn(txn, %{
+      session_key: verifier.holder_key,
+      origin: "process:tightbeam",
+      assignment_id: verifier.id,
+      obligation_ref: verifier.id,
+      owner_user_id: wake.owner_user_id,
+      prompt:
+        "Verify dependency wait #{wake.wake_id} for assignment #{wake.assignment_id}. " <>
+          "Predicate: #{JSON.encode!(wake.predicate)}. Necessity: #{wake.necessity}. " <>
+          "File wait-verified or wait-challenged on #{verifier.id} with --wait #{wake.wake_id}.",
+      due_at: now(),
+      sender_scheduled: true
+    })
+  end
+
+  defp running_turn_seq_in_txn(_txn, nil), do: nil
+
+  defp running_turn_seq_in_txn(txn, session_key) do
+    case Txn.q(
+           txn,
+           "SELECT seq FROM turns WHERE sessionKey=?1 AND status='running' LIMIT 1",
+           [session_key]
+         ) do
+      [[seq]] -> seq
+      [] -> nil
+    end
+  end
+
+  defp wait_error(code, message), do: {:error, %{code: code, message: message}}
+
+  defp recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, transition) do
+    cond do
+      evaluation.matched ->
+        recognize_wait_in_txn(txn, wake, "success", nil, evaluation, resolver, transition)
+
+      resolver.terminal ->
+        recognize_wait_in_txn(
+          txn,
+          wake,
+          "reconsideration",
+          "resolver-terminal",
+          evaluation,
+          resolver,
+          transition
+        )
+
+      true ->
+        wake
+    end
+  end
+
+  defp recognize_wait_transitions_in_txn(txn, transitions) do
+    transitions
+    |> Enum.filter(&(is_map(&1) and is_binary(&1[:owner_user_id])))
+    |> Enum.each(fn transition ->
+      Txn.q(
+        txn,
+        """
+        SELECT wakeId FROM wakes
+        WHERE state='pending' AND waitMode='dependency' AND recognitionAt IS NULL
+          AND ownerUserId=?1
+        ORDER BY rowid
+        """,
+        [transition.owner_user_id]
+      )
+      |> Enum.each(fn [wake_id] ->
+        case wait_in_txn(txn, wake_id) do
+          nil ->
+            :ok
+
+          wake ->
+            evaluation = evaluate_wait_predicate_in_txn(txn, wake)
+            resolver = resolver_for_wake_in_txn(txn, wake)
+            updated = recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, transition)
+
+            if is_nil(updated.recognition_path) and
+                 verification_terminal_transition?(wake, transition) do
+              recognize_wait_in_txn(
+                txn,
+                wake,
+                "reconsideration",
+                "verification-terminal",
+                evaluation,
+                resolver,
+                transition
+              )
+            end
+        end
+      end)
+    end)
+
+    :ok
+  end
+
+  defp verification_terminal_transition?(wake, transition) do
+    transition[:domain] == "assignment" and
+      to_string(transition[:row_id]) == wake.verification_assignment_id and
+      transition_new(transition, "state") == "closed" and wake.verification_state != "confirmed"
+  end
+
+  defp transition_new(%{field: %{name: name, new: value}}, name), do: value
+  defp transition_new(%{fields: fields}, name), do: get_in(fields, [String.to_atom(name), :new])
+  defp transition_new(_transition, _name), do: nil
+
+  defp evaluate_wait_predicate_in_txn(txn, wake) do
+    case RuleRuntime.evaluate_predicate_in_txn(txn, %{
+           owner_user_id: wake.owner_user_id,
+           conditions: wake.predicate["conditions"] || wake.predicate[:conditions],
+           bindings: wake.predicate["bindings"] || wake.predicate[:bindings]
+         }) do
+      {:ok, evaluation} ->
+        evaluation
+
+      {:error, error} ->
+        raise DB.Error, message: "stored wait predicate refused: #{error.message}"
+    end
+  end
+
+  defp resolver_for_wake_in_txn(txn, %{resolver_kind: kind, resolver_id: id} = wake) do
+    case resolver_in_txn(txn, %{kind: kind, id: id}, wake.owner_user_id) do
+      {:ok, resolver} -> resolver
+      {:error, error} -> raise DB.Error, message: "stored wait resolver refused: #{error.message}"
+    end
+  end
+
+  defp recognize_wait_in_txn(txn, wake, path, reason, evaluation, resolver, transition) do
+    recognized_at = now()
+    facts = wait_evidence_facts(evaluation.facts)
+    disposition = wait_recognition_disposition(path, evaluation.facts, resolver)
+
+    recognition_transition =
+      transition ||
+        %{
+          label: "registration-snapshot",
+          observed: facts
+        }
+
+    evidence = %{
+      label: if(is_nil(transition), do: "registration-snapshot", else: "row-transition"),
+      facts: facts,
+      condition_match: evaluation[:condition_match]
+    }
+
+    Txn.q(
+      txn,
+      """
+      UPDATE wakes
+      SET recognitionAt=?2,recognitionPath=?3,recognitionReason=?4,
+          recognitionEvidence=?5,recognitionDisposition=?6,recognitionTransition=?7
+      WHERE wakeId=?1 AND state='pending' AND recognitionAt IS NULL
+      """,
+      [
+        wake.wake_id,
+        recognized_at,
+        path,
+        reason,
+        JSON.encode!(evidence),
+        disposition,
+        JSON.encode!(recognition_transition)
+      ]
+    )
+
+    if Txn.changes(txn) == 1 do
+      EventLog.lifecycle_in_txn(
+        txn,
+        "wake_wait_recognized",
+        wake.wake_id,
+        "path=#{path} reason=#{reason || "nil"} disposition=#{disposition || "nil"}"
+      )
+
+      %{
+        wake
+        | recognition_at: recognized_at,
+          recognition_path: path,
+          recognition_reason: reason,
+          recognition_evidence: evidence,
+          recognition_disposition: disposition,
+          recognition_transition: recognition_transition
+      }
+    else
+      wait_in_txn(txn, wake.wake_id)
+    end
+  end
+
+  defp wait_evidence_facts(facts) do
+    Enum.map(facts, fn
+      {fact, value} -> %{fact: fact, value: value}
+      fact when is_map(fact) -> fact
+    end)
+  end
+
+  defp wait_recognition_disposition(_path, _facts, %{terminal: true, disposition: disposition}),
+    do: disposition
+
+  defp wait_recognition_disposition("success", facts, _resolver) do
+    Enum.find_value(facts, fn
+      {"assignment.outcome", value} when value in ~w(completed surrendered revoked) ->
+        value
+
+      {"work_item.state", value} when value in ~w(closed iceboxed failed) ->
+        value
+
+      {"decision_request.status", value}
+      when value in ~w(ruled consumed withdrawn superseded) ->
+        value
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp wait_recognition_disposition(_path, _facts, _resolver), do: nil
+
+  @doc false
+  @spec validate_verification_verdict_in_txn(Txn.t(), map()) :: :ok | {:error, map()}
+  def validate_verification_verdict_in_txn(%Txn{} = txn, attrs) do
+    verdict_kind = attrs[:verdict_kind]
+
+    cond do
+      verdict_kind in ~w(wait-verified wait-challenged) ->
+        verification_verdict_binding_in_txn(txn, attrs)
+
+      is_binary(attrs[:wait_id]) ->
+        wait_error(
+          "invalid_wait_verdict",
+          "--wait is valid only for wait-verified and wait-challenged"
+        )
+
+      true ->
+        :ok
+    end
+  end
+
+  @doc false
+  @spec verification_verdict_in_txn(Txn.t(), map()) :: :ok
+  def verification_verdict_in_txn(%Txn{} = txn, attrs) do
+    case attrs[:verdict_kind] do
+      kind when kind in ~w(wait-verified wait-challenged) ->
+        apply_verification_verdict_in_txn(txn, attrs)
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp verification_verdict_binding_in_txn(_txn, %{wait_id: nil}),
+    do: wait_error("wait_required", "wait-verified and wait-challenged require --wait")
+
+  defp verification_verdict_binding_in_txn(txn, attrs) do
+    case Txn.q(
+           txn,
+           """
+           SELECT w.verificationState,a.state,a.holderKey
+           FROM wakes w JOIN assignments a ON a.id=w.verificationAssignmentId
+           WHERE w.wakeId=?1 AND w.verificationAssignmentId=?2
+           """,
+           [attrs.wait_id, attrs.assignment_id]
+         ) do
+      [[state, "open", holder_key]] when holder_key == attrs.by_session ->
+        case {attrs.verdict_kind, state} do
+          {"wait-verified", "provisional"} ->
+            :ok
+
+          {"wait-challenged", state} when state in ~w(provisional confirmed) ->
+            :ok
+
+          _ ->
+            wait_error("invalid_wait_verdict", "wait verification transition is already terminal")
+        end
+
+      _ ->
+        wait_error(
+          "invalid_wait_verdict",
+          "wait verdict requires the named open verifier assignment and its recorded holder"
+        )
+    end
+  end
+
+  defp apply_verification_verdict_in_txn(txn, %{verdict_kind: "wait-verified"} = attrs) do
+    Txn.q(
+      txn,
+      """
+      UPDATE wakes SET verificationState='confirmed',verificationAttestId=?2
+      WHERE wakeId=?1 AND verificationState='provisional'
+      """,
+      [attrs.wait_id, attrs.attest_id]
+    )
+
+    if Txn.changes(txn) != 1,
+      do: raise(DB.Error, message: "wait verification confirmation race")
+
+    :ok
+  end
+
+  defp apply_verification_verdict_in_txn(txn, %{verdict_kind: "wait-challenged"} = attrs) do
+    Txn.q(
+      txn,
+      """
+      UPDATE wakes SET verificationState='challenged',verificationAttestId=?2
+      WHERE wakeId=?1 AND verificationState IN ('provisional','confirmed')
+      """,
+      [attrs.wait_id, attrs.attest_id]
+    )
+
+    if Txn.changes(txn) != 1,
+      do: raise(DB.Error, message: "wait verification challenge race")
+
+    wake = wait_in_txn(txn, attrs.wait_id)
+
+    if wake && is_nil(wake.recognition_path) do
+      resolver = resolver_for_wake_in_txn(txn, wake)
+      evaluation = evaluate_wait_predicate_in_txn(txn, wake)
+
+      recognize_wait_in_txn(
+        txn,
+        wake,
+        "reconsideration",
+        "verification-challenged",
+        evaluation,
+        resolver,
+        %{
+          domain: "attest",
+          row_id: attrs.attest_id,
+          field: %{name: "verdictKind", old: nil, new: "wait-challenged"}
+        }
+      )
+    end
+
+    :ok
+  end
+
+  defp wait_in_txn(txn, wake_id) do
+    case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
+      [row] -> to_wake(row)
+      [] -> nil
+    end
+  end
+
   @doc "Evaluate committed business-row transitions and record matching rule notices."
   @spec row_commit_in_txn(Txn.t(), [map()] | map()) :: :ok
   def row_commit_in_txn(%Txn{} = txn, transitions) do
+    transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
+
     txn
     |> RuleRuntime.row_commit_effects_in_txn(transitions)
     |> Enum.each(fn
@@ -453,6 +1215,8 @@ defmodule Tightbeam.Wakes do
       {:error, rule, message} ->
         EventLog.lifecycle_in_txn(txn, "rule_notice_failed", rule.name, message)
     end)
+
+    recognize_wait_transitions_in_txn(txn, transitions)
 
     :ok
   end
@@ -1865,6 +2629,10 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc false
+  @spec get_in_txn(Txn.t(), String.t()) :: wake() | nil
+  def get_in_txn(%Txn{} = txn, wake_id), do: wait_in_txn(txn, wake_id)
+
   @doc "All pending wakes, soonest first (inspect filters to owned sessions)."
   @spec list_pending(db()) :: [wake()]
   def list_pending(db \\ Tightbeam.DB) do
@@ -2584,6 +3352,7 @@ defmodule Tightbeam.Wakes do
       db: Keyword.get(opts, :db, Tightbeam.DB),
       tick_ms: Keyword.get(opts, :tick_ms, 1_000),
       batch: Keyword.get(opts, :batch, 100),
+      delivery_opts: Keyword.get(opts, :delivery_opts, []),
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
     }
 
@@ -2659,6 +3428,9 @@ defmodule Tightbeam.Wakes do
   # leaves its wake pending for the next tick; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
   defp deliver_due(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
+    recognize_due_dependency_waits(db)
+    deliver_eligible_waits(db, state.delivery_opts)
+
     # THE BATCHER RUNS FIRST, so a digest that just came due is delivered in
     # this same pass rather than waiting a tick. Held members are consumed here
     # and never reach the loop below as individual deliveries.
@@ -2668,7 +3440,7 @@ defmodule Tightbeam.Wakes do
       DB.query(
         db,
         select_wake_sql() <>
-          " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL" <>
+          " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL" <>
           " AND NOT (digest = 0 AND (deliveryRule IS ?2 OR deliveryRule IS ?3))" <>
           " ORDER BY dueAt ASC",
         [now(), @digest_rule, @legacy_digest_rule]
@@ -2717,33 +3489,185 @@ defmodule Tightbeam.Wakes do
     :ok
   end
 
+  defp recognize_due_dependency_waits(db) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT wakeId FROM wakes
+        WHERE state='pending' AND waitMode='dependency' AND recognitionAt IS NULL AND dueAt<=?1
+        ORDER BY dueAt,wakeId
+        """,
+        [now()]
+      )
+
+    Enum.each(rows, fn [wake_id] ->
+      case DB.transaction(db, fn txn -> recognize_due_dependency_in_txn(txn, wake_id) end) do
+        {:ok, _} -> :ok
+        {:error, error} -> raise error
+      end
+    end)
+  end
+
+  defp recognize_due_dependency_in_txn(txn, wake_id) do
+    case wait_in_txn(txn, wake_id) do
+      %{state: "pending", wait_mode: "dependency", recognition_at: nil} = wake ->
+        evaluation = evaluate_wait_predicate_in_txn(txn, wake)
+        resolver = resolver_for_wake_in_txn(txn, wake)
+        recognized = recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, nil)
+
+        if is_nil(recognized.recognition_path) and wake.due_at <= now() do
+          recognize_wait_in_txn(
+            txn,
+            wake,
+            "fallback",
+            nil,
+            %{matched: false, facts: [%{resolver_silent_through: wake.due_at}]},
+            %{resolver | disposition: nil, terminal: false},
+            %{label: "fallback-silence", due_at: wake.due_at}
+          )
+        else
+          recognized
+        end
+
+      _ ->
+        :noop
+    end
+  end
+
+  defp deliver_eligible_waits(db, delivery_opts) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT wakeId FROM wakes
+        WHERE state='pending' AND waitMode IS NOT NULL AND recognitionAt IS NOT NULL
+        ORDER BY recognitionAt,wakeId
+        """
+      )
+
+    Enum.each(rows, fn [wake_id] ->
+      case DB.transaction(db, fn txn -> deliver_wait_in_txn(txn, wake_id, delivery_opts) end) do
+        {:ok, {:delivery, delivery}} -> Gateway.complete_delivery(db, delivery)
+        {:ok, _} -> :ok
+        {:error, error} -> raise error
+      end
+    end)
+  end
+
+  defp deliver_wait_in_txn(txn, wake_id, delivery_opts) do
+    case wait_in_txn(txn, wake_id) do
+      %{state: "pending", recognition_path: path} = wake when is_binary(path) ->
+        if wait_eligible_in_txn?(txn, wake) do
+          fired_at = now()
+
+          Txn.q(
+            txn,
+            "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending'",
+            [wake.wake_id, fired_at]
+          )
+
+          if Txn.changes(txn) == 1 do
+            delivery =
+              Gateway.deliver_prompt_in_txn(
+                txn,
+                wake.session_key,
+                wake.origin,
+                wait_stamp(wake) <> "\n\n" <> wake.prompt,
+                [
+                  wake_id: wake.wake_id,
+                  sender: wake.origin,
+                  target_gate: wake,
+                  role_ref: wake.target_role
+                ] ++ delivery_opts
+              )
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "wake_wait_delivered",
+              wake.wake_id,
+              "path=#{wake.recognition_path} assignment=#{wake.assignment_id}"
+            )
+
+            {:delivery, delivery}
+          else
+            :noop
+          end
+        else
+          :ineligible
+        end
+
+      _ ->
+        :noop
+    end
+  end
+
+  defp wait_eligible_in_txn?(_txn, %{originating_turn_seq: nil}), do: true
+
+  defp wait_eligible_in_txn?(txn, wake) do
+    case Txn.q(txn, "SELECT status FROM turns WHERE seq=?1", [wake.originating_turn_seq]) do
+      [[status]] -> status in ~w(delivered canceled failed failed_unknown)
+      [] -> false
+    end
+  end
+
+  defp wait_stamp(wake) do
+    resolver =
+      if wake.resolver_kind,
+        do:
+          "resolver #{wake.resolver_kind}:#{wake.resolver_id} holder=#{wake.resolver_holder} " <>
+            "addressee=#{wake.resolver_addressee}",
+        else: "resolver none"
+
+    transition = wait_transition_stamp(wake.recognition_transition)
+    predicate = JSON.encode!(wake.predicate || %{})
+    evidence = JSON.encode!(wake.recognition_evidence || %{})
+
+    "[woke: wait #{wake.wake_id}; assignment #{wake.assignment_id}; " <>
+      "path #{wake.recognition_path}; #{resolver}; " <>
+      "disposition #{wake.recognition_disposition || "none"}; #{transition}; " <>
+      "predicate #{predicate}; evidence #{evidence}]"
+  end
+
+  defp wait_transition_stamp(%{"label" => "registration-snapshot"}),
+    do: "registration-snapshot"
+
+  defp wait_transition_stamp(%{"label" => "fallback-silence", "due_at" => due_at}),
+    do: "resolver-silent-through=#{due_at}"
+
+  defp wait_transition_stamp(%{"domain" => domain, "row_id" => row_id, "field" => field}) do
+    "#{domain}:#{row_id} #{field["name"]} #{inspect(field["old"])}→#{inspect(field["new"])}"
+  end
+
+  defp wait_transition_stamp(%{"domain" => domain, "row_id" => row_id, "fields" => fields}) do
+    changes =
+      Enum.map_join(fields, ",", fn {name, change} ->
+        "#{name} #{inspect(change["old"])}→#{inspect(change["new"])}"
+      end)
+
+    "#{domain}:#{row_id} #{changes}"
+  end
+
+  defp wait_transition_stamp(_transition), do: "transition unavailable"
+
   # THE PRODDER'S TRUE ACT TIME (spec production-machine-v1 §The prod
   # production). The prodder is three-phase on the ground: match records a
   # pending branch, drain SCHEDULES a wake, and this sweep FIRES it — so a
   # work-blocked fact asserted after the drain's recheck but before the fire
   # still has one effectful edge left to recognize at. Only supervision's own
-  # wakes are eligible: origin `process:tightbeam` AND an assignmentId AND the
-  # prompt consumer AND NOT a digest carrier — today that combination is
-  # scheduled nowhere else (the escalation decision notices carry no
-  # assignmentId), and it must stay that way or this discriminator learns to
-  # suppress someone else's mail. The `not wake.digest` guard is load-bearing
-  # since O4: the batcher's own carrier can now inherit an assignmentId too
-  # (its group's shared linked work, so the replacement-validation match is
-  # genuine rather than a special-cased bypass) — `digest = 1` is the same bit
-  # that already keeps a carrier out of its own materialization group, and it
-  # is what keeps THIS discriminator from mistaking a digest for a supervision
-  # prod. The holder is `reresolveSeed` for an escalation wake (its TARGET is
-  # the ancestor being told) and the target itself for a prod. Nothing here
-  # gates the turn queue: a suppressed wake is supervision's own prompt
-  # withdrawn by recognition, consumed as `canceled` with the reason named —
-  # never a turn, never an agent's wake.
+  # pending controllers are eligible. Assignment attribution is shared by
+  # ordinary process notices, so the sidecar is the durable discriminator: its
+  # schema requires the same wake/assignment, process origin, prompt consumer,
+  # pending state, and prod/escalation shape. The holder is `reresolveSeed` for
+  # an escalation wake (its TARGET is the ancestor being told) and the target
+  # itself for a prod. Nothing here gates the turn queue: a suppressed
+  # controller is withdrawn by recognition, consumed as `canceled` with the
+  # reason named — never a turn.
   defp suppressed_by_recognition?(db, wake) do
-    supervision_owned? =
-      wake.origin == "process:tightbeam" and is_binary(wake.assignment_id) and not wake.digest
-
     holder = wake.reresolve_seed || wake.session_key
 
-    if supervision_owned? and ConditionFacts.standing?(db, "work-blocked", holder) do
+    if pending_supervision_controller?(db, wake) and
+         ConditionFacts.standing?(db, "work-blocked", holder) do
       Logger.info(
         "supervision wake #{wake.wake_id} suppressed: work-blocked stands for #{holder}"
       )
@@ -2798,6 +3722,18 @@ defmodule Tightbeam.Wakes do
     else
       false
     end
+  end
+
+  defp pending_supervision_controller?(db, wake) do
+    DB.query(
+      db,
+      """
+      SELECT 1 FROM supervision_liveness_sidecar
+      WHERE wakeId=?1 AND assignmentId=?2 AND controllerOrigin='scheduled'
+        AND controllerState='pending'
+      """,
+      [wake.wake_id, wake.assignment_id]
+    ) == {:ok, [[1]]}
   end
 
   defp standing_block(txn, holder) do
@@ -3115,6 +4051,17 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  defp authenticated_wake_owner_in_txn(txn, session_key) do
+    case Txn.q(
+           txn,
+           "SELECT s.ownerUserId FROM sessions s JOIN users u ON u.userId=s.ownerUserId WHERE s.sessionKey=?1",
+           [session_key]
+         ) do
+      [[owner_user_id]] -> owner_user_id
+      [] -> nil
+    end
+  end
+
   # The 0.1.9 line has no firehose publisher. The ordinary wake row and its
   # lifecycle event remain the durable observation seams on this branch.
   @doc false
@@ -3155,7 +4102,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp select_wake_sql do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon FROM wakes"
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition FROM wakes"
   end
 
   defp to_wake([
@@ -3186,7 +4133,29 @@ defmodule Tightbeam.Wakes do
          class_election,
          delivery_rule,
          digest,
-         summon
+         summon,
+         owner_user_id,
+         obligation_ref,
+         wait_mode,
+         predicate,
+         resolver_kind,
+         resolver_id,
+         resolver_holder,
+         resolver_addressee,
+         necessity,
+         verification_assignment_id,
+         verification_holder_key,
+         selected_policy_name,
+         verification_state,
+         verification_attest_id,
+         verification_notice_wake_id,
+         originating_turn_seq,
+         recognition_at,
+         recognition_path,
+         recognition_reason,
+         recognition_evidence,
+         recognition_disposition,
+         recognition_transition
        ]) do
     %{
       wake_id: wake_id,
@@ -3216,9 +4185,37 @@ defmodule Tightbeam.Wakes do
       class_election: class_election,
       delivery_rule: delivery_rule,
       digest: digest == 1,
-      summon: summon == 1
+      summon: summon == 1,
+      owner_user_id: owner_user_id,
+      obligation_ref: obligation_ref,
+      wait_mode: wait_mode,
+      predicate: decode_optional(predicate),
+      resolver_kind: resolver_kind,
+      resolver_id: resolver_id,
+      resolver_holder: resolver_holder,
+      resolver_addressee: resolver_addressee,
+      necessity: necessity,
+      verification_assignment_id: verification_assignment_id,
+      verification_holder_key: verification_holder_key,
+      selected_policy_name: selected_policy_name,
+      verification_state: verification_state,
+      verification_attest_id: verification_attest_id,
+      verification_notice_wake_id: verification_notice_wake_id,
+      originating_turn_seq: originating_turn_seq,
+      recognition_at: recognition_at,
+      recognition_path: recognition_path,
+      recognition_reason: recognition_reason,
+      recognition_evidence: decode_optional(recognition_evidence),
+      recognition_disposition: recognition_disposition,
+      recognition_transition: decode_optional(recognition_transition)
     }
   end
+
+  defp encode_optional(nil), do: nil
+  defp encode_optional(value), do: JSON.encode!(value)
+
+  defp decode_optional(nil), do: nil
+  defp decode_optional(value), do: JSON.decode!(value)
 
   defp schedule_tick(tick_ms), do: Process.send_after(self(), :tick, tick_ms)
 

@@ -14,7 +14,8 @@ defmodule Tightbeam.RuleRuntime do
   @type callbacks :: %{
           row_commit_effects: (DB.Txn.t(), [map()] | map() -> [tuple()]),
           resolve_notice: (DB.Txn.t(), map(), map() -> {:ok, map()} | {:error, term()}),
-          evaluate_predicate: (DB.Txn.t(), map() -> {:ok, map()} | {:error, map()})
+          evaluate_predicate: (DB.Txn.t(), map() -> {:ok, map()} | {:error, map()}),
+          select_policy: (DB.Txn.t(), String.t(), map() -> {:ok, map()} | :none)
         }
 
   @doc false
@@ -22,14 +23,16 @@ defmodule Tightbeam.RuleRuntime do
   def install(%{
         row_commit_effects: row_commit_effects,
         resolve_notice: resolve_notice,
-        evaluate_predicate: evaluate_predicate
+        evaluate_predicate: evaluate_predicate,
+        select_policy: select_policy
       })
       when is_function(row_commit_effects, 2) and is_function(resolve_notice, 3) and
-             is_function(evaluate_predicate, 2) do
+             is_function(evaluate_predicate, 2) and is_function(select_policy, 3) do
     :persistent_term.put(@persist_key, %{
       row_commit_effects: row_commit_effects,
       resolve_notice: resolve_notice,
-      evaluate_predicate: evaluate_predicate
+      evaluate_predicate: evaluate_predicate,
+      select_policy: select_policy
     })
 
     :ok
@@ -59,6 +62,15 @@ defmodule Tightbeam.RuleRuntime do
     case callbacks() do
       %{evaluate_predicate: evaluate} -> evaluate.(txn, predicate)
       nil -> {:error, %{code: "rules_not_loaded", message: "rules are not loaded"}}
+    end
+  end
+
+  @doc false
+  @spec select_policy_in_txn(DB.Txn.t(), String.t(), map()) :: {:ok, map()} | :none
+  def select_policy_in_txn(%DB.Txn{} = txn, purpose, context) do
+    case callbacks() do
+      %{select_policy: select} -> select.(txn, purpose, context)
+      nil -> raise "row rule recognition is not loaded"
     end
   end
 

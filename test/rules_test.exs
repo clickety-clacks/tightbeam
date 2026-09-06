@@ -34,10 +34,13 @@ defmodule Tightbeam.RulesTest do
       Rules.load!(System.tmp_dir!() <> "/missing-rules-reset", [])
     end)
 
+    handlers = Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+    Rules.load!(Path.join(base_dir, "missing-rules"), Map.keys(handlers))
+
     %{
       db: db,
       base_dir: base_dir,
-      handlers: Gateway.handlers(%{db: db, wake_tick_ms: 1_000})
+      handlers: handlers
     }
   end
 

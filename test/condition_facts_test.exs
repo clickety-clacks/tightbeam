@@ -47,6 +47,12 @@ defmodule Tightbeam.ConditionFactsTest do
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+      )
+
     Rules.load!(
       Path.join(System.tmp_dir!(), "condition-rules-#{System.unique_integer([:positive])}"),
       []
@@ -81,7 +87,8 @@ defmodule Tightbeam.ConditionFactsTest do
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
         kind: "deploy-succeeded",
         scope: "prod",
-        origin: "process:ci"
+        origin: "process:ci",
+        owner_user_id: "flynn"
       })
 
     wake = condition_wake(ctx, "deploy-succeeded", "prod")
@@ -93,7 +100,8 @@ defmodule Tightbeam.ConditionFactsTest do
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
         kind: "deploy-succeeded",
         scope: "staging",
-        origin: "process:ci"
+        origin: "process:ci",
+        owner_user_id: "flynn"
       })
 
     assert mismatch.fact_id > preexisting.fact_id
@@ -104,7 +112,8 @@ defmodule Tightbeam.ConditionFactsTest do
       ConditionFacts.file(ctx.db, ctx.scheduler, %{
         kind: "deploy-succeeded",
         scope: "prod",
-        origin: "process:ci"
+        origin: "process:ci",
+        owner_user_id: "flynn"
       })
 
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
@@ -113,7 +122,8 @@ defmodule Tightbeam.ConditionFactsTest do
     ConditionFacts.file(ctx.db, ctx.scheduler, %{
       kind: "deploy-succeeded",
       scope: "prod",
-      origin: "process:ci"
+      origin: "process:ci",
+      owner_user_id: "flynn"
     })
 
     assert turn_count(ctx.db, wake.wake_id) == 1
@@ -169,14 +179,16 @@ defmodule Tightbeam.ConditionFactsTest do
           ConditionFacts.file_in_txn(txn, %{
             kind: "older-kind",
             scope: "prod",
-            origin: "process:ci"
+            origin: "process:ci",
+            owner_user_id: "flynn"
           })
 
         newer =
           ConditionFacts.file_in_txn(txn, %{
             kind: "newer-kind",
             scope: "prod",
-            origin: "process:ci"
+            origin: "process:ci",
+            owner_user_id: "flynn"
           })
 
         {older, newer}
@@ -422,12 +434,22 @@ defmodule Tightbeam.ConditionFactsTest do
 
     {:ok, fact_a} =
       DB.transaction(ctx.db, fn txn ->
-        ConditionFacts.file_in_txn(txn, %{kind: "seq-kind", scope: "a", origin: "process:ci"})
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "seq-kind",
+          scope: "a",
+          origin: "process:ci",
+          owner_user_id: "flynn"
+        })
       end)
 
     {:ok, fact_b} =
       DB.transaction(ctx.db, fn txn ->
-        ConditionFacts.file_in_txn(txn, %{kind: "seq-kind", scope: "b", origin: "process:ci"})
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "seq-kind",
+          scope: "b",
+          origin: "process:ci",
+          owner_user_id: "flynn"
+        })
       end)
 
     :ok = Wakes.fire_matching(ctx.scheduler, [fact_a.fact_id, fact_b.fact_id])
@@ -466,11 +488,38 @@ defmodule Tightbeam.ConditionFactsTest do
     ConditionFacts.file(ctx.db, ctx.scheduler, %{
       kind: "batch-scope",
       scope: "wanted",
-      origin: "process:ci"
+      origin: "process:ci",
+      owner_user_id: "flynn"
     })
 
     assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, matching)
     assert Enum.all?(nonmatches, &(Wakes.get(ctx.db, &1).state == "pending"))
+  end
+
+  test "an identical fact from another owner cannot satisfy a legacy condition wake", ctx do
+    assert :ok =
+             DB.execute(
+               ctx.db,
+               "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('other-owner', 0, 1)"
+             )
+
+    wake = condition_wake(ctx, "tenant-scoped", "same-scope")
+
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "tenant-scoped",
+      scope: "same-scope",
+      origin: "user:other-owner"
+    })
+
+    assert %{state: "pending"} = Wakes.get(ctx.db, wake.wake_id)
+
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "tenant-scoped",
+      scope: "same-scope",
+      origin: "user:flynn"
+    })
+
+    assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
   end
 
   test "recovery advances its fact watermark after a full batch of scope nonmatches", ctx do
@@ -485,7 +534,8 @@ defmodule Tightbeam.ConditionFactsTest do
         ConditionFacts.file_in_txn(txn, %{
           kind: "recovery-scope",
           scope: "wanted",
-          origin: "process:ci"
+          origin: "process:ci",
+          owner_user_id: "flynn"
         })
       end)
 

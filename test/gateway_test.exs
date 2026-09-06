@@ -601,6 +601,8 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
+    Rules.load!(catalog_base, Map.keys(Gateway.handlers(%{db: db})))
+
     %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, device: device}
   end
 

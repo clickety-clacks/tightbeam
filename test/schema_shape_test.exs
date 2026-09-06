@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "row-driven-rules-v1-019"
+  @shape "row-driven-waits-v1-019"
+  @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
   @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
@@ -194,6 +195,64 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
+  end
+
+  test "the row-driven-rules predecessor scopes legacy facts without rewriting wake history", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('owner-a',0,1),('owner-b',0,1)"
+             )
+
+    Tightbeam.Org.create(db, %{
+      session_key: "owner-a-session",
+      display_name: "owner-a-session",
+      owner_user_id: "owner-a",
+      origin: "user:owner-a",
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable"),
+      host: "testhost"
+    })
+
+    assert %{name: "owner-a-role"} =
+             Tightbeam.Roles.create!(db, "owner-a-role", "owner-a", "owner-a-session")
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO condition_facts(id,ts,kind,scope,origin,ownerUserId) VALUES
+               (1,1,'legacy','user-scope','user:owner-b',NULL),
+               (2,2,'legacy','session-scope','session:owner-a-session',NULL),
+               (3,3,'legacy','system-scope','process:tightbeam',NULL),
+               (4,4,'legacy','agent-scope','agent:owner-a-role',NULL);
+             INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,conditionKind,conditionScope,conditionAfterId)
+             VALUES
+               ('w_pending','owner-a-session','agent:test','pending',100,'pending',1,'legacy','session-scope',2),
+               ('w_fired','owner-a-session','agent:test','fired',1,'fired',1,NULL,NULL,NULL),
+               ('w_canceled','owner-a-session','agent:test','canceled',1,'canceled',1,NULL,NULL,NULL);
+             """)
+
+    downgrade_row_driven_waits(db)
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[1, "owner-b"], [2, "owner-a"], [3, nil], [4, "owner-a"]]} =
+             DB.query(db, "SELECT id,ownerUserId FROM condition_facts ORDER BY id")
+
+    assert {:ok, [["w_canceled", "canceled"], ["w_fired", "fired"], ["w_pending", "pending"]]} =
+             DB.query(db, "SELECT wakeId,state FROM wakes ORDER BY wakeId")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='condition_fact_owner_unattributed' AND subject='3'"
+             )
   end
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
@@ -1141,6 +1200,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_row_driven_rules(db) do
+    downgrade_row_driven_waits(db)
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
@@ -1157,6 +1217,45 @@ defmodule Tightbeam.SchemaShapeTest do
         CREATE INDEX artifacts_created_by_session ON artifacts (createdBySession);
         CREATE INDEX artifacts_recorded_message ON artifacts (recordedMessageId);
         #{@pre_row_driven_attests_ddl};
+        """)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp downgrade_row_driven_waits(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      :ok =
+        DB.execute(db, """
+        DROP INDEX wakes_wait_recognition;
+        DROP INDEX condition_facts_owner_match;
+        ALTER TABLE condition_facts DROP COLUMN ownerUserId;
+        ALTER TABLE wakes DROP COLUMN ownerUserId;
+        ALTER TABLE wakes DROP COLUMN obligationRef;
+        ALTER TABLE wakes DROP COLUMN waitMode;
+        ALTER TABLE wakes DROP COLUMN predicate;
+        ALTER TABLE wakes DROP COLUMN resolverKind;
+        ALTER TABLE wakes DROP COLUMN resolverId;
+        ALTER TABLE wakes DROP COLUMN resolverHolder;
+        ALTER TABLE wakes DROP COLUMN resolverAddressee;
+        ALTER TABLE wakes DROP COLUMN necessity;
+        ALTER TABLE wakes DROP COLUMN verificationAssignmentId;
+        ALTER TABLE wakes DROP COLUMN verificationHolderKey;
+        ALTER TABLE wakes DROP COLUMN selectedPolicyName;
+        ALTER TABLE wakes DROP COLUMN verificationState;
+        ALTER TABLE wakes DROP COLUMN verificationAttestId;
+        ALTER TABLE wakes DROP COLUMN verificationNoticeWakeId;
+        ALTER TABLE wakes DROP COLUMN originatingTurnSeq;
+        ALTER TABLE wakes DROP COLUMN recognitionAt;
+        ALTER TABLE wakes DROP COLUMN recognitionPath;
+        ALTER TABLE wakes DROP COLUMN recognitionReason;
+        ALTER TABLE wakes DROP COLUMN recognitionEvidence;
+        ALTER TABLE wakes DROP COLUMN recognitionDisposition;
+        ALTER TABLE wakes DROP COLUMN recognitionTransition;
+        ALTER TABLE attests DROP COLUMN waitId;
+        UPDATE schema_stamp SET shape='#{@row_driven_rules_shape}', stampedAt=1;
         """)
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
