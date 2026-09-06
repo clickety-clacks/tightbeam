@@ -734,6 +734,50 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert turn_count(ctx.db, fallback.wake_id) == 1
   end
 
+  test "Rules-only facts refuse dependency registration without wake or sidecar", ctx do
+    conditions = [
+      %{"fact" => "assignment.state", "op" => "eq", "value" => "open"},
+      %{"fact" => "assignment.artifact_kinds", "op" => "in", "value" => ["report"]}
+    ]
+
+    declaration =
+      predicate("R")
+      |> Map.put("conditions", conditions)
+      |> Map.put("bindings", %{"assignmentId" => "R"})
+
+    assert {:ok, {:ok, _}} =
+             DB.transaction(ctx.db, fn txn ->
+               Rules.evaluate_predicate_in_txn(txn, %{
+                 owner_user_id: "owner-a",
+                 conditions: conditions,
+                 bindings: declaration["bindings"]
+               })
+             end)
+
+    before = wake_count(ctx.db)
+    sidecars_before = DB.query(ctx.db, "SELECT COUNT(*) FROM supervision_liveness_sidecar")
+
+    assert {:ok, {:error, %{code: "invalid_predicate", message: message}}} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.register_wait_in_txn(txn, %{
+                 session_key: "holder",
+                 origin: "agent:holder",
+                 prompt: "do not persist",
+                 due_at: due_after(),
+                 assignment_id: "A",
+                 predicate: declaration,
+                 registrant_session_key: "holder",
+                 owner_user_id: "owner-a"
+               })
+             end)
+
+    assert message == ~s(unsupported ad hoc wait fact: "assignment.artifact_kinds")
+    assert wake_count(ctx.db) == before
+
+    assert DB.query(ctx.db, "SELECT COUNT(*) FROM supervision_liveness_sidecar") ==
+             sidecars_before
+  end
+
   test "cross-owner or incomplete registration refuses without any wake row", ctx do
     assignment(ctx.db, "B", "intruder")
     before = wake_count(ctx.db)

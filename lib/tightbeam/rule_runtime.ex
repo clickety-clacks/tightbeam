@@ -11,6 +11,8 @@ defmodule Tightbeam.RuleRuntime do
 
   @persist_key __MODULE__
 
+  # Admission and recognition share this complete ad hoc wait vocabulary. The
+  # broader loaded-rule fact registry does not confer a wait transition contract.
   @predicate_transition_contracts %{
     "work_item.state" => %{kind: :row, domains: ["work_item"], binding: "workItemId"},
     "assignment.state" => %{kind: :row, domains: ["assignment"], binding: "assignmentId"},
@@ -66,15 +68,27 @@ defmodule Tightbeam.RuleRuntime do
   def loaded?, do: not is_nil(callbacks())
 
   @doc false
-  @spec predicate_transition_contract(String.t()) :: map() | nil
-  def predicate_transition_contract(fact), do: Map.get(@predicate_transition_contracts, fact)
+  @spec predicate_transition_contract(String.t()) :: {:ok, map()} | {:error, map()}
+  def predicate_transition_contract(fact) do
+    case Map.fetch(@predicate_transition_contracts, fact) do
+      {:ok, contract} ->
+        {:ok, contract}
+
+      :error ->
+        {:error,
+         %{
+           code: "invalid_predicate",
+           message: "unsupported ad hoc wait fact: #{inspect(fact)}"
+         }}
+    end
+  end
 
   @doc false
   @spec predicate_row_domains(String.t()) :: [String.t()]
   def predicate_row_domains(fact) do
     case predicate_transition_contract(fact) do
-      %{domains: domains} -> domains
-      nil -> []
+      {:ok, %{domains: domains}} -> domains
+      {:error, _} -> []
     end
   end
 

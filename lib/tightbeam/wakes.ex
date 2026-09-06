@@ -625,6 +625,7 @@ defmodule Tightbeam.Wakes do
 
   defp register_dependency_in_txn(txn, input, obligation) do
     with {:ok, declaration} <- normalize_dependency_declaration(input[:predicate]),
+         {:ok, _contracts} <- dependency_contracts(declaration.conditions),
          declaration <- capture_condition_cursor_in_txn(txn, declaration),
          {:ok, resolver} <-
            resolver_in_txn(txn, declaration.resolver_ref, obligation.owner_user_id),
@@ -694,7 +695,7 @@ defmodule Tightbeam.Wakes do
           fact = Map.get(condition, "fact") || Map.get(condition, :fact)
 
           match?(
-            %{kind: :condition_fact},
+            {:ok, %{kind: :condition_fact}},
             RuleRuntime.predicate_transition_contract(fact)
           )
 
@@ -792,6 +793,36 @@ defmodule Tightbeam.Wakes do
 
   defp normalize_dependency_declaration(_),
     do: wait_error("invalid_predicate", "--predicate must be a JSON object")
+
+  defp dependency_contracts(conditions) when is_list(conditions) and conditions != [] do
+    Enum.reduce_while(conditions, {:ok, []}, fn
+      condition, {:ok, contracts} when is_map(condition) ->
+        fact = Map.get(condition, "fact") || Map.get(condition, :fact)
+
+        case RuleRuntime.predicate_transition_contract(fact) do
+          {:ok, contract} -> {:cont, {:ok, [contract | contracts]}}
+          {:error, _} = error -> {:halt, error}
+        end
+
+      _, _ ->
+        {:halt, wait_error("invalid_predicate", "predicate conditions must be objects")}
+    end)
+  end
+
+  defp dependency_contracts(_),
+    do: wait_error("invalid_predicate", "predicate conditions must be a nonempty list")
+
+  defp stored_dependency_contracts!(wake) do
+    conditions = wake.predicate["conditions"] || wake.predicate[:conditions]
+
+    case dependency_contracts(conditions) do
+      {:ok, contracts} ->
+        contracts
+
+      {:error, error} ->
+        raise DB.Error, message: "stored wait #{wake.wake_id} predicate refused: #{error.message}"
+    end
+  end
 
   defp normalize_reference(reference, allowed, label) when is_map(reference) do
     reference = Map.new(reference, fn {key, value} -> {to_string(key), value} end)
@@ -1045,14 +1076,12 @@ defmodule Tightbeam.Wakes do
   end
 
   defp predicate_transition_relevant?(txn, wake, transition) do
-    conditions = wake.predicate["conditions"] || wake.predicate[:conditions] || []
+    contracts = stored_dependency_contracts!(wake)
     bindings = wake.predicate["bindings"] || wake.predicate[:bindings] || %{}
     domain = transition[:domain]
 
-    Enum.any?(conditions, fn condition ->
-      fact = Map.get(condition, "fact") || Map.get(condition, :fact)
-
-      case RuleRuntime.predicate_transition_contract(fact) do
+    Enum.any?(contracts, fn contract ->
+      case contract do
         %{kind: :row, domains: domains, binding: binding} ->
           domain in domains and
             to_string(transition[:row_id]) == predicate_binding(bindings, binding)
@@ -1063,9 +1092,6 @@ defmodule Tightbeam.Wakes do
 
         %{kind: :condition_fact, domains: domains} ->
           domain in domains and condition_fact_transition_relevant?(transition, bindings)
-
-        nil ->
-          false
 
         contract ->
           raise "unsupported predicate transition contract: #{inspect(contract)}"
@@ -1147,6 +1173,10 @@ defmodule Tightbeam.Wakes do
   defp transition_new(_transition, _name), do: nil
 
   defp evaluate_wait_predicate_in_txn(txn, wake) do
+    # The deadline sweep must refuse corrupt stored vocabulary too, before it
+    # can stamp a later success as a registration snapshot.
+    stored_dependency_contracts!(wake)
+
     case RuleRuntime.evaluate_predicate_in_txn(txn, %{
            owner_user_id: wake.owner_user_id,
            conditions: wake.predicate["conditions"] || wake.predicate[:conditions],
