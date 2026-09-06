@@ -17,7 +17,7 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.{DB, HarnessHealth}
+  alias Tightbeam.{DB, HarnessHealth, Org}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -164,6 +164,7 @@ defmodule Tightbeam.Ledger do
       )
 
       [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+      Org.sync_mechanical_status_in_txn(txn, session_key)
       {:ok, seq}
     else
       {:error, :no_session}
@@ -493,6 +494,7 @@ defmodule Tightbeam.Ledger do
                 )
 
               Publisher.turn_in_txn(txn, "turn.started", seq)
+              Org.sync_mechanical_status_in_txn(txn, session_key)
 
               {:ok,
                %{
@@ -592,6 +594,7 @@ defmodule Tightbeam.Ledger do
           |> Enum.sort()
 
         Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
+        if seqs != [], do: Org.sync_mechanical_status_in_txn(txn, session_key)
         seqs
       end)
 
@@ -633,7 +636,12 @@ defmodule Tightbeam.Ledger do
 
     won = Txn.changes(txn) == 1
 
-    if won, do: Publisher.turn_in_txn(txn, "turn.ended", seq)
+    if won do
+      Publisher.turn_in_txn(txn, "turn.ended", seq)
+      [[session_key]] = Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq = ?1", [seq])
+      Org.sync_mechanical_status_in_txn(txn, session_key)
+    end
+
     won
   end
 
@@ -678,8 +686,8 @@ defmodule Tightbeam.Ledger do
 
     {:ok, {seqs, publications}} =
       DB.transaction(db, fn txn ->
-        rows = Txn.q(txn, "SELECT seq FROM turns WHERE status = 'running'")
-        seqs = Enum.map(rows, fn [seq] -> seq end)
+        rows = Txn.q(txn, "SELECT seq, sessionKey FROM turns WHERE status = 'running'")
+        seqs = Enum.map(rows, fn [seq, _session_key] -> seq end)
 
         Txn.q(
           txn,
@@ -703,6 +711,11 @@ defmodule Tightbeam.Ledger do
           end)
 
         Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
+
+        rows
+        |> Enum.map(fn [_seq, session_key] -> session_key end)
+        |> Enum.uniq()
+        |> Enum.each(&Org.sync_mechanical_status_in_txn(txn, &1))
 
         {seqs, publications}
       end)

@@ -41,7 +41,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "agent-decision-carrier-return-v1-019"
+  @shape "session-mechanical-status-v1-019"
+  @session_mechanical_status_previous_shape "agent-decision-carrier-return-v1-019"
   @decision_carrier_previous_shape "liveness-progress-receipts-v1-019"
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
@@ -1327,6 +1328,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@session_mechanical_status_previous_shape]]} ->
+        upgrade_session_mechanical_status_v1(db)
+
       {:ok, [[@decision_carrier_previous_shape]]} ->
         upgrade_decision_carrier_return_v1_019(db)
 
@@ -1558,6 +1562,72 @@ defmodule Tightbeam.Schema do
       :ok = DB.execute(db, "PRAGMA ignore_check_constraints = OFF")
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
+
+    upgrade_session_mechanical_status_v1(db)
+  end
+
+  @doc false
+  @spec upgrade_session_mechanical_status_v1(DB.server()) :: :ok
+  def upgrade_session_mechanical_status_v1(db) do
+    migration_time = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@session_mechanical_status_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message:
+                   "incompatible_session_mechanical_status_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           :ok =
+             Txn.exec(
+               txn,
+               "ALTER TABLE sessions ADD COLUMN mechanicalStatus TEXT NOT NULL " <>
+                 "DEFAULT 'idle' CHECK (mechanicalStatus IN ('idle','running'))"
+             )
+
+           Txn.q(
+             txn,
+             """
+             UPDATE sessions
+             SET mechanicalStatus = CASE WHEN EXISTS (
+                   SELECT 1 FROM turns
+                   WHERE turns.sessionKey = sessions.sessionKey
+                     AND turns.status IN ('queued','running')
+                 ) THEN 'running' ELSE 'idle' END,
+                 updatedAt = MAX(updatedAt + 1, ?1)
+             """,
+             [migration_time]
+           )
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @session_mechanical_status_previous_shape,
+             @shape,
+             migration_time
+           ])
+
+           if Txn.changes(txn) != 1,
+             do:
+               raise(ShapeError,
+                 message: "incompatible_session_mechanical_status_v1: stamp race"
+               )
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, %ShapeError{} = error} ->
+        raise error
+
+      {:error, error} ->
+        raise ShapeError,
+          message:
+            "incompatible_session_mechanical_status_v1: upgrade failed: #{Exception.message(error)}"
+    end
   end
 
   defp upgrade_decision_carrier_return_v1_019_in_txn(%Txn{} = txn, opts) do
@@ -1743,7 +1813,7 @@ defmodule Tightbeam.Schema do
 
     Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
       @decision_carrier_previous_shape,
-      @shape,
+      @session_mechanical_status_previous_shape,
       System.system_time(:millisecond)
     ])
 

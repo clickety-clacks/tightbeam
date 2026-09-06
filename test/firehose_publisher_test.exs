@@ -105,6 +105,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
              )
 
     assert %{
+             "class" => "session.updated",
+             "payload" => %{"mechanicalStatus" => "running", "sessionKey" => "post-target"}
+           } = receive_notice()
+
+    assert %{
              "class" => "message.created",
              "payload" => %{
                "content" => "[from user:flynn]\n\nexact A1 post reproduction"
@@ -112,10 +117,10 @@ defmodule Tightbeam.Firehose.PublisherTest do
            } = receive_notice()
 
     declared = Gateway.handler_effects(%{db: db})["post"]
-    observed = ["message.created"]
+    observed = ["message.created", "session.updated"]
     assert_effects_match!(declared, observed)
 
-    assert_raise ArgumentError, ~r/missing=\["message.created"\]/, fn ->
+    assert_raise ArgumentError, ~r/missing=\["message.created", "session.updated"\]/, fn ->
       assert_effects_match!([], observed)
     end
   end
@@ -219,6 +224,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert {:ok, %{canceled: false}} = Dispatch.dispatch(db, handlers, cancel_miss)
     assert observed_classes() == ["verb.accepted"]
 
+    {:ok, wake_turn} = Ledger.claim_next(db, "effect-target", "lane:effects")
+    _ = observed_classes()
+
+    :ok =
+      Ledger.finish(db, wake_turn.seq, "delivered", nil)
+
+    _ = observed_classes()
+
     _condition_wake =
       Wakes.schedule(db, %{
         session_key: "effect-target",
@@ -239,6 +252,14 @@ defmodule Tightbeam.Firehose.PublisherTest do
 
     assert {:ok, %{kind: "effect-ready"}} = Dispatch.dispatch(db, handlers, condition)
     assert_per_verb_effects!(config, "condition", observed_state_classes())
+
+    {:ok, condition_turn} = Ledger.claim_next(db, "effect-target", "lane:effects")
+    _ = observed_classes()
+
+    :ok =
+      Ledger.finish(db, condition_turn.seq, "delivered", nil)
+
+    _ = observed_classes()
 
     dispatch = %{
       verb: "dispatch",
@@ -577,6 +598,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
                prompt: "run"
              })
 
+    assert %{
+             "class" => "session.updated",
+             "payload" => %{"mechanicalStatus" => "running", "sessionKey" => "turn-target"}
+           } = receive_notice()
+
     assert {:ok, %{seq: ^seq}} =
              Ledger.claim_next(db, "turn-target", "lane:test")
 
@@ -590,6 +616,11 @@ defmodule Tightbeam.Firehose.PublisherTest do
     assert %{
              "class" => "turn.ended",
              "payload" => %{"status" => "delivered", "turnSeq" => ^seq}
+           } = receive_notice()
+
+    assert %{
+             "class" => "session.updated",
+             "payload" => %{"mechanicalStatus" => "idle", "sessionKey" => "turn-target"}
            } = receive_notice()
   end
 

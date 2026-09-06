@@ -1,6 +1,17 @@
 defmodule Tightbeam.SupervisionTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
+  alias Tightbeam.Firehose.{Hub, Registry}
+
+  defp receive_firehose_notices(acc \\ []) do
+    receive do
+      {:firehose_notice, notice} ->
+        Hub.delivered(Hub, self())
+        receive_firehose_notices([notice | acc])
+    after
+      100 -> Enum.reverse(acc)
+    end
+  end
 
   alias Tightbeam.{
     Assignments,
@@ -208,11 +219,34 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "prod claims once, counts delivery once, and freezes its outbox numbers", ctx do
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self())
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq = terminal!(ctx.db, "holder")
 
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
     assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 99, "holder", seq)
+
+    notices = receive_firehose_notices()
+
+    prod_notice = Enum.find(notices, &(&1["class"] == "prod.fired"))
+
+    assert %{
+             "class" => "prod.fired",
+             "op" => "observe",
+             "refs" => %{
+               "assignmentId" => "asg_1",
+               "sessionKey" => "holder",
+               "eventId" => event_id
+             },
+             "payload" => %{"kind" => "prod_fired"}
+           } = prod_notice
+
+    assert prod_notice["payload"]["seq"] == event_id
+
+    refute Map.has_key?(prod_notice, "resource")
+    assert :error = Registry.fetch("prod.fired")
+    assert "prod.fired" in Registry.observational_classes()
 
     assert %{attemptCount: 1, prodCount: 1, deniedStreak: 0} =
              Supervision.prod_state(ctx.db, "asg_1")

@@ -6585,7 +6585,13 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "Try again once the current turn finishes"
-    assert Org.get(ctx.db, "k1") == before
+    after_refusal = Org.get(ctx.db, "k1")
+
+    assert Map.drop(after_refusal, [:mechanical_status, :updated_at]) ==
+             Map.drop(before, [:mechanical_status, :updated_at])
+
+    assert after_refusal.mechanical_status == "running"
+    assert after_refusal.updated_at > before.updated_at
     refute File.exists?(home)
     send(runner, :finish_set_harness_turn)
   end

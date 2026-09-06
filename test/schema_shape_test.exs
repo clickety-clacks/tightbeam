@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "agent-decision-carrier-return-v1-019"
+  @shape "session-mechanical-status-v1-019"
   @decision_carrier_previous_shape "liveness-progress-receipts-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -220,6 +220,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
 
@@ -236,6 +237,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact pre-liveness notice stamp resumes without physical-shape inference", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
     drop_liveness_activation(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
@@ -1150,6 +1152,7 @@ defmodule Tightbeam.SchemaShapeTest do
       ALTER TABLE wake_cancellations RENAME TO wake_cancellations_current;
       #{predecessor_ddl};
       DROP TABLE wake_cancellations_current;
+      ALTER TABLE sessions DROP COLUMN mechanicalStatus;
       ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
       ALTER TABLE sessions DROP COLUMN identityRenderContract;
       UPDATE schema_stamp
@@ -1285,6 +1288,67 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @shape
   end
 
+  test "mechanical migration rolls back atomically and preserves carrier and effort contracts",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    seed_liveness_decision_requests(db)
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               "agent-decision-carrier-return-v1-019"
+             ])
+
+    snapshot = fn ->
+      for table <-
+            ~w(decision_requests decision_request_terminal_epoch decision_request_integrity_evidence wake_cancellations) do
+        {table, DB.query(db, "SELECT * FROM #{table} ORDER BY rowid")}
+      end
+    end
+
+    before_rows = snapshot.()
+
+    {:ok, before_contracts} =
+      DB.query(
+        db,
+        "SELECT type,name,sql FROM sqlite_master WHERE type IN ('trigger','index') ORDER BY type,name"
+      )
+
+    before_effort = object_sql(db, "table", "wake_cancellations")
+
+    assert :ok =
+             DB.execute(db, """
+             CREATE TRIGGER a6_test_interrupt BEFORE UPDATE OF shape ON schema_stamp
+             BEGIN SELECT RAISE(ABORT, 'a6 migration interruption'); END;
+             """)
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+    assert error.message =~ "incompatible_session_mechanical_status_v1"
+    assert error.message =~ "a6 migration interruption"
+
+    assert {:ok, [["agent-decision-carrier-return-v1-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    refute "mechanicalStatus" in table_columns(db, "sessions")
+    assert snapshot.() == before_rows
+
+    assert :ok = DB.execute(db, "DROP TRIGGER a6_test_interrupt")
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert snapshot.() == before_rows
+    assert object_sql(db, "table", "wake_cancellations") == before_effort
+
+    assert {:ok, ^before_contracts} =
+             DB.query(
+               db,
+               "SELECT type,name,sql FROM sqlite_master WHERE type IN ('trigger','index') ORDER BY type,name"
+             )
+
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+    assert :ok = Schema.ensure_all(db)
+    assert snapshot.() == before_rows
+  end
+
   defp seed_liveness_decision_requests(db) do
     :ok =
       DB.execute(db, """
@@ -1349,6 +1413,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_decision_requests_to_liveness_predecessor(db) do
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
@@ -1413,6 +1478,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_decision_requests_to_model_identity(db) do
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
+
     :ok =
       DB.execute(db, """
       DROP INDEX decision_requests_owner;
@@ -1448,6 +1515,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_wakes_to_terminal_decision(db) do
+    :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN mechanicalStatus")
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
