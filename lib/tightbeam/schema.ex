@@ -40,7 +40,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "liveness-progress-receipts-v1-019"
+  @shape "row-driven-rules-v1-019"
+  @row_driven_rules_previous_shape "liveness-progress-receipts-v1-019"
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
@@ -1190,6 +1191,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@row_driven_rules_previous_shape]]} ->
+        upgrade_row_driven_rules_v1(db)
+
       {:ok, [[@liveness_progress_receipts_previous_shape]]} ->
         upgrade_liveness_progress_receipts_v1(db)
 
@@ -1367,6 +1371,8 @@ defmodule Tightbeam.Schema do
                    message: "incompatible_liveness_progress_receipts_v1: stamp race"
                  )
 
+             add_row_driven_rule_columns_in_txn(txn)
+
              case Txn.q(txn, "PRAGMA foreign_key_check") do
                [] ->
                  :ok
@@ -1391,6 +1397,58 @@ defmodule Tightbeam.Schema do
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
+  end
+
+  defp upgrade_row_driven_rules_v1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@row_driven_rules_previous_shape]] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_row_driven_rules_v1: predecessor stamp #{inspect(rows)}"
+           end
+
+           add_row_driven_rule_columns_in_txn(txn)
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+             @row_driven_rules_previous_shape,
+             @shape,
+             System.system_time(:millisecond)
+           ])
+
+           if Txn.changes(txn) != 1,
+             do: raise(ShapeError, message: "incompatible_row_driven_rules_v1: stamp race")
+
+           case Txn.q(txn, "PRAGMA foreign_key_check") do
+             [] ->
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible_row_driven_rules_v1: foreign key check #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp add_row_driven_rule_columns_in_txn(txn) do
+    Txn.q(
+      txn,
+      "ALTER TABLE artifacts ADD COLUMN producedByAssignmentId TEXT NULL REFERENCES assignments(id)"
+    )
+
+    Txn.q(
+      txn,
+      "ALTER TABLE attests ADD COLUMN artifactId TEXT NULL REFERENCES artifacts(artifactId)"
+    )
+
+    Txn.q(txn, "ALTER TABLE attests ADD COLUMN contentSha256 TEXT NULL")
+    Txn.q(txn, "CREATE INDEX artifacts_producer ON artifacts(producedByAssignmentId)")
+    :ok
   end
 
   defp migrate_operator_decision_v1(db) do

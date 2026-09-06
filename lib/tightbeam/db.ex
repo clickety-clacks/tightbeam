@@ -41,7 +41,15 @@ defmodule Tightbeam.DB do
 
   @doc "Run one SQL statement with params; returns `{:ok, rows}` (rows are positional lists)."
   @spec query(server(), String.t(), [term()]) :: {:ok, [row()]} | {:error, Exception.t()}
-  def query(server \\ __MODULE__, sql, params \\ []) do
+  def query(server \\ __MODULE__, sql, params \\ [])
+
+  def query(%{__struct__: Tightbeam.DB.Txn} = txn, sql, params) do
+    {:ok, Tightbeam.DB.Txn.q(txn, sql, params)}
+  rescue
+    error -> {:error, error}
+  end
+
+  def query(server, sql, params) do
     GenServer.call(server, {:query, sql, params})
   end
 
@@ -64,9 +72,17 @@ defmodule Tightbeam.DB do
     GenServer.call(server, {:transaction, fun})
   end
 
-  @doc "Commit one transaction, then run a bounded publication callback before releasing the owner."
+  @doc """
+  Commit one transaction, then run a bounded publication callback before releasing the owner.
+
+  An arity-one callback receives the prepared result and retains the original publication
+  semantics. An arity-two callback receives the owner's transaction handle followed by the
+  prepared result; it runs in a second transaction after the first commit. This is the
+  row-commit recognition seam: the callback cannot recursively enter the DB owner.
+  """
   def transaction_then(server \\ __MODULE__, prepare, after_commit)
-      when is_function(prepare, 1) and is_function(after_commit, 1) do
+      when is_function(prepare, 1) and
+             (is_function(after_commit, 1) or is_function(after_commit, 2)) do
     GenServer.call(server, {:transaction_then, prepare, after_commit})
   end
 
@@ -96,6 +112,21 @@ defmodule Tightbeam.DB do
       {:ok, n} = Sqlite3.changes(conn)
       n
     end
+  end
+
+  @doc false
+  def record_row_commit(%Txn{conn: conn}, transition) when is_map(transition) do
+    key = row_commit_key(conn)
+    Process.put(key, [transition | Process.get(key, [])])
+    :ok
+  end
+
+  @doc false
+  def take_row_commits(%Txn{conn: conn}) do
+    key = row_commit_key(conn)
+    transitions = key |> Process.get([]) |> Enum.reverse()
+    Process.put(key, [])
+    transitions
   end
 
   ## Server
@@ -131,20 +162,26 @@ defmodule Tightbeam.DB do
   end
 
   def handle_call({:transaction, fun}, _from, %{conn: conn} = state) do
+    Process.put(row_commit_key(conn), [])
     :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
 
-    try do
-      result = fun.(%Txn{conn: conn})
-      :ok = Sqlite3.execute(conn, "COMMIT")
-      {:reply, {:ok, result}, state}
-    rescue
-      e ->
-        :ok = Sqlite3.execute(conn, "ROLLBACK")
-        {:reply, {:error, e}, state}
-    end
+    reply =
+      try do
+        result = fun.(%Txn{conn: conn})
+        :ok = Sqlite3.execute(conn, "COMMIT")
+        {:reply, {:ok, result}, state}
+      rescue
+        e ->
+          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          {:reply, {:error, e}, state}
+      end
+
+    Process.delete(row_commit_key(conn))
+    reply
   end
 
   def handle_call({:transaction_then, prepare, after_commit}, _from, %{conn: conn} = state) do
+    Process.put(row_commit_key(conn), [])
     :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
 
     prepared =
@@ -161,17 +198,38 @@ defmodule Tightbeam.DB do
     reply =
       case prepared do
         {:committed, result} ->
-          try do
-            {:ok, after_commit.(result)}
-          rescue
-            error -> {:error, error}
-          end
+          run_after_commit(conn, after_commit, result)
 
         {:rolled_back, error} ->
           {:error, error}
       end
 
+    Process.delete(row_commit_key(conn))
     {:reply, reply, state}
+  end
+
+  defp row_commit_key(conn), do: {__MODULE__, :row_commits, conn}
+
+  defp run_after_commit(_conn, after_commit, result) when is_function(after_commit, 1) do
+    try do
+      {:ok, after_commit.(result)}
+    rescue
+      error -> {:error, error}
+    end
+  end
+
+  defp run_after_commit(conn, after_commit, result) when is_function(after_commit, 2) do
+    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+    try do
+      published = after_commit.(%Txn{conn: conn}, result)
+      :ok = Sqlite3.execute(conn, "COMMIT")
+      {:ok, published}
+    rescue
+      error ->
+        :ok = Sqlite3.execute(conn, "ROLLBACK")
+        {:error, error}
+    end
   end
 
   @doc false

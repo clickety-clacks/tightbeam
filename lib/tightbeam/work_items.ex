@@ -16,7 +16,7 @@ defmodule Tightbeam.WorkItems do
   fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
   """
 
-  alias Tightbeam.{CausalEvents, DB, EffortCheckin, Org, Wakes}
+  alias Tightbeam.{CausalEvents, DB, EffortCheckin, Org, Rules, Wakes}
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
@@ -326,10 +326,26 @@ defmodule Tightbeam.WorkItems do
       reason = call.params[:reason]
 
       result =
-        transaction(db, fn txn -> dispose_in_txn(txn, call.principal, id, verb, reason) end)
+        transaction_with_row_commits(
+          db,
+          fn txn -> dispose_in_txn(txn, call.principal, id, verb, reason) end,
+          fn _txn, result ->
+            case result do
+              {:disposed, item, true, old_state} ->
+                [
+                  work_item_transition(item, call, "work-item-#{verb}", %{
+                    state: %{old: old_state, new: item.state}
+                  })
+                ]
+
+              _ ->
+                []
+            end
+          end
+        )
 
       case result do
-        {:disposed, item, changed?} ->
+        {:disposed, item, changed?, _old_state} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
           %{ok: true, workItem: public_work_item(item)}
 
@@ -354,7 +370,7 @@ defmodule Tightbeam.WorkItems do
           item.state == target ->
             # Same-state transition is a no-op success — changes nothing, and
             # emits no doorbell (fail keeps its prior reason untouched).
-            {:disposed, item, false}
+            {:disposed, item, false, item.state}
 
           not transition_allowed?(item.state, target) ->
             error(
@@ -404,7 +420,7 @@ defmodule Tightbeam.WorkItems do
               })
             end
 
-            {:disposed, disposed, true}
+            {:disposed, disposed, true, item.state}
         end
     end
   end
@@ -834,6 +850,33 @@ defmodule Tightbeam.WorkItems do
       _ -> :ok
     catch
       _, _ -> :ok
+    end
+  end
+
+  defp work_item_transition(item, call, verb, fields) do
+    %{
+      verb: verb,
+      domain: "work_item",
+      row_id: item.id,
+      owner_user_id: item.ownerUserId,
+      principal: principal_label(call.principal),
+      bindings: %{workItemId: item.id},
+      fields: fields
+    }
+  end
+
+  defp principal_label({:user, user}), do: "user:#{user}"
+  defp principal_label({:session, session}), do: "session:#{session}"
+  defp principal_label({:remedy, %{statute: statute}}), do: "remedy:#{statute}"
+  defp principal_label({:process, process}), do: "process:#{process}"
+
+  defp transaction_with_row_commits(db, fun, transitions) do
+    case DB.transaction_then(db, fun, fn txn, result ->
+           Rules.row_commit_in_txn(txn, transitions.(txn, result))
+           result
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
     end
   end
 

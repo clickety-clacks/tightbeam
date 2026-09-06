@@ -3,6 +3,7 @@ defmodule Tightbeam.RulesTest do
   alias Tightbeam.Model
 
   alias Tightbeam.{
+    Artifacts,
     Assignments,
     DB,
     Devices,
@@ -12,7 +13,8 @@ defmodule Tightbeam.RulesTest do
     Org,
     Roles,
     Rules,
-    Toplines
+    Toplines,
+    Wakes
   }
 
   setup do
@@ -1373,6 +1375,232 @@ defmodule Tightbeam.RulesTest do
     end
   end
 
+  test "row-commit and verb notices summon without bypassing a later deny", ctx do
+    holder = session(ctx.db, "notice-holder", "flynn", archetype: "coder")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "assignment-opened"
+    verb = "assign"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "record assignment opening"
+    deny_when = [{ fact = "assignment.state", op = "eq", value = "open" }]
+
+    [rule.notice]
+    target_session = "notice-holder"
+    prompt = "assignment {assignment_id} opened"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    opened = assignment(ctx, holder.session_key, {:user, "flynn"})
+
+    assert [wake] = Wakes.list_pending(ctx.db)
+    assert wake.session_key == holder.session_key
+    assert wake.prompt == "assignment #{opened.id} opened"
+    assert wake.origin == "remedy:assignment-opened"
+
+    assert %{detail: detail} =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.find(&(&1.kind == "rule_notice" and &1.subject == wake.wake_id))
+
+    assert detail =~ ~s("rule":"assignment-opened")
+    assert detail =~ ~s("edge":"row-commit")
+    assert detail =~ ~s("row_id":"#{opened.id}")
+    assert detail =~ ~s("principal":"user:flynn")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "observe-post"
+    verb = "post"
+    effect = "notice"
+    text = "observe the attempt"
+    deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+
+    [rule.notice]
+    target_session = "notice-holder"
+    prompt = "post observed"
+
+    [[rule]]
+    name = "deny-post"
+    verb = "post"
+    text = "deny after observation"
+    deny_when = [{ fact = "caller.origin_class", op = "eq", value = "user" }]
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    assert {:error, %{code: "rule_denied", rule: "deny-post"}} =
+             Dispatch.dispatch(
+               ctx.db,
+               %{"post" => fn _ -> flunk("handler ran") end},
+               p3_call("post", {:user, "flynn"}, %{})
+             )
+
+    assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.prompt == "post observed"))
+  end
+
+  test "row-commit rejects effects that cannot run after the governed write", ctx do
+    put_raw(ctx, """
+    [[rule]]
+    name = "late-denial"
+    verb = "assign"
+    edges = ["row-commit"]
+    text = "cannot deny a committed assignment"
+    deny_when = [{ fact = "assignment.state", op = "eq", value = "open" }]
+    """)
+
+    assert_raise ArgumentError, ~r/edge "row-commit" requires effect = "notice"/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end
+  end
+
+  test "ad hoc predicates validate ownership and make nil fail every operator", ctx do
+    own = session(ctx.db, "predicate-own", "flynn")
+    foreign = session(ctx.db, "predicate-foreign", "kay")
+    own_assignment = assignment(ctx, own.session_key, {:user, "flynn"})
+    foreign_assignment = assignment(ctx, foreign.session_key, {:user, "kay"})
+
+    assert {:ok, %{matched: true, facts: [{"assignment.state", "open"}]}} =
+             Rules.evaluate_predicate(ctx.db, %{
+               owner_user_id: "flynn",
+               conditions: [%{fact: "assignment.state", op: "eq", value: "open"}],
+               bindings: %{assignment_id: own_assignment.id}
+             })
+
+    for op <- ~w(ne not_in) do
+      value = if op == "ne", do: "completed", else: ["completed"]
+
+      assert {:ok, %{matched: false, facts: [{"assignment.outcome", nil}]}} =
+               Rules.evaluate_predicate(ctx.db, %{
+                 owner_user_id: "flynn",
+                 conditions: [%{fact: "assignment.outcome", op: op, value: value}],
+                 bindings: %{assignment_id: own_assignment.id}
+               })
+    end
+
+    assert {:error, %{code: "invalid_predicate", message: ownership_error}} =
+             Rules.evaluate_predicate(ctx.db, %{
+               owner_user_id: "flynn",
+               conditions: [%{fact: "assignment.state", op: "eq", value: "open"}],
+               bindings: %{assignment_id: foreign_assignment.id}
+             })
+
+    assert ownership_error == "unknown or inaccessible assignment binding"
+
+    for condition <- [
+          %{fact: "assignment.unknown", op: "eq", value: "open"},
+          %{fact: "assignment.state", op: "matches", value: "open"},
+          %{fact: "assignment.state", op: "eq", value: 1}
+        ] do
+      assert {:error, %{code: "invalid_predicate"}} =
+               Rules.evaluate_predicate(ctx.db, %{
+                 owner_user_id: "flynn",
+                 conditions: [condition],
+                 bindings: %{assignment_id: own_assignment.id}
+               })
+    end
+  end
+
+  test "artifact revisions bind their producer, review verdict, and predicate candidate", ctx do
+    producer_holder = session(ctx.db, "revision-producer", "flynn", archetype: "coder")
+    reviewer = session(ctx.db, "revision-reviewer", "flynn", archetype: "reviewer")
+    foreign_holder = session(ctx.db, "revision-foreign", "kay", archetype: "coder")
+    producer = assignment(ctx, producer_holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, producer.id, "wi_revision_binding")
+
+    review = assignment(ctx, reviewer.session_key, {:user, "flynn"}, reviews: producer.id)
+
+    foreign = assignment(ctx, foreign_holder.session_key, {:user, "kay"})
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE assignments SET workItemId=?2 WHERE id=?1", [
+        foreign.id,
+        "wi_revision_binding"
+      ])
+
+    hash = String.duplicate("a", 64)
+
+    assert %{code: "invalid_producer"} =
+             record_revision_artifact(
+               ctx,
+               foreign_holder.session_key,
+               foreign.id,
+               "wi_revision_binding",
+               hash
+             )
+
+    artifact =
+      record_revision_artifact(
+        ctx,
+        producer_holder.session_key,
+        producer.id,
+        "wi_revision_binding",
+        hash
+      )
+
+    assert artifact.produced_by_assignment_id == producer.id
+    assert artifact.content_sha256 == hash
+
+    legacy = verdict(ctx, reviewer.session_key, review.id, "reviewed-clean")
+    assert legacy.attest.artifactId == nil
+    assert legacy.attest.contentSha256 == nil
+
+    predicate = %{
+      owner_user_id: "flynn",
+      conditions: [
+        %{fact: "artifact.present", op: "eq", value: true},
+        %{fact: "artifact.content_sha256", op: "eq", value: hash},
+        %{
+          fact: "review.qualifying_verdict_kinds",
+          op: "in",
+          value: ["reviewed-clean"]
+        }
+      ],
+      bindings: %{artifact: %{artifact_id: artifact.artifact_id, content_sha256: hash}}
+    }
+
+    assert {:ok, %{matched: false}} = Rules.evaluate_predicate(ctx.db, predicate)
+
+    assert %{code: "invalid_revision_binding"} =
+             revision_verdict(ctx, reviewer.session_key, review.id, artifact.artifact_id, nil)
+
+    assert %{code: "invalid_revision_binding"} =
+             revision_verdict(
+               ctx,
+               reviewer.session_key,
+               review.id,
+               artifact.artifact_id,
+               String.duplicate("b", 64)
+             )
+
+    valid =
+      revision_verdict(
+        ctx,
+        reviewer.session_key,
+        review.id,
+        artifact.artifact_id,
+        hash,
+        "reviewed-clean"
+      )
+
+    assert valid.attest.artifactId == artifact.artifact_id
+    assert valid.attest.contentSha256 == hash
+    assert {:ok, %{matched: true}} = Rules.evaluate_predicate(ctx.db, predicate)
+
+    revision_verdict(
+      ctx,
+      reviewer.session_key,
+      review.id,
+      artifact.artifact_id,
+      hash,
+      "changes-requested"
+    )
+
+    assert {:ok, %{matched: false}} = Rules.evaluate_predicate(ctx.db, predicate)
+  end
+
   defp call(origin \\ "user:flynn") do
     %{verb: "post", origin: origin, session_key: nil, params: %{}}
   end
@@ -1434,6 +1662,42 @@ defmodule Tightbeam.RulesTest do
         note: note
       })
     )
+  end
+
+  defp revision_verdict(
+         ctx,
+         session_key,
+         assignment_id,
+         artifact_id,
+         hash,
+         verdict_kind \\ "reviewed-clean"
+       ) do
+    Assignments.__handle__(
+      ctx.db,
+      "attest",
+      p3_call("attest", {:session, session_key}, %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: verdict_kind,
+        artifact_id: artifact_id,
+        content_sha256: hash
+      })
+    )
+  end
+
+  defp record_revision_artifact(ctx, session_key, producer_id, work_item_id, hash) do
+    Artifacts.record(ctx.db, %{
+      principal: {:session, session_key},
+      session_key: session_key,
+      params: %{
+        kind: "report",
+        title: "candidate revision",
+        origin_path: "/tmp/candidate-revision",
+        work_item_id: work_item_id,
+        content_sha256: hash,
+        produced_by_assignment_id: producer_id
+      }
+    })
   end
 
   defp review_count(db, producer_id) do

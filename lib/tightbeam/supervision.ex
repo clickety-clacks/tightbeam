@@ -1681,6 +1681,9 @@ defmodule Tightbeam.Supervision do
   defp close_episode(db, {:episodes, statute, position}),
     do: RailEpisodes.recovered(db, statute, position)
 
+  defp close_episode(db, {:notice, rule, call, evidence}),
+    do: Rules.deliver_notice(db, rule, call, evidence)
+
   defp close_episode(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
 
@@ -2445,7 +2448,7 @@ defmodule Tightbeam.Supervision do
        when is_integer(interval) and interval > 0 do
     recovery_clock = now()
 
-    transaction!(state.db, fn txn ->
+    transaction_then!(state.db, fn txn ->
       retired_holders =
         Txn.q(
           txn,
@@ -4426,6 +4429,16 @@ defmodule Tightbeam.Supervision do
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp transaction_then!(db, fun) do
+    case DB.transaction_then(db, fun, fn txn, result ->
+           Rules.row_commit_in_txn(txn, [])
+           result
+         end) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end

@@ -7,7 +7,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Rules, Wakes}
   alias Tightbeam.DB.Txn
 
   defmodule IntegrityEvidenceConflict do
@@ -429,9 +429,38 @@ defmodule Tightbeam.Escalation do
         with %{owner_user_id: owner_user_id} <- Org.get(db, session_key),
              {:ok, ask} <- normalize_operator_ask(call) do
           {:ok, result} =
-            DB.transaction(db, fn txn ->
-              operator_ask_in_txn(txn, call, session_key, owner_user_id, ask, opts)
-            end)
+            DB.transaction_then(
+              db,
+              fn txn ->
+                superseded =
+                  if ask.supersedes, do: request_in_txn_optional(txn, ask.supersedes)
+
+                result = operator_ask_in_txn(txn, call, session_key, owner_user_id, ask, opts)
+
+                transitions =
+                  case superseded do
+                    %{status: "open"} = request ->
+                      [
+                        decision_transition(
+                          request,
+                          "open",
+                          "superseded",
+                          call.origin,
+                          "operator-ask"
+                        )
+                      ]
+
+                    _ ->
+                      []
+                  end
+
+                {result, transitions}
+              end,
+              fn txn, {result, transitions} ->
+                Rules.row_commit_in_txn(txn, transitions)
+                result
+              end
+            )
 
           result
         else
@@ -450,14 +479,32 @@ defmodule Tightbeam.Escalation do
     request_id = param(call, :request_id) || param(call, :request)
 
     with {:ok, answer} <- normalize_operator_answer(call) do
-      case DB.transaction(db, fn txn ->
-             operator_rule_in_txn(txn, call, request_id, answer, opts)
-           end) do
-        {:ok, {result, fact_id}} ->
-          if is_integer(fact_id) and Keyword.has_key?(opts, :scheduler) do
-            Wakes.fire_matching(Keyword.fetch!(opts, :scheduler), fact_id)
-          end
+      case DB.transaction_then(
+             db,
+             fn txn ->
+               before = request_in_txn_optional(txn, request_id)
+               {result, fact_id} = operator_rule_in_txn(txn, call, request_id, answer, opts)
+               after_request = request_in_txn_optional(txn, request_id)
 
+               transition =
+                 changed_decision_transition(before, after_request, call.origin, "operator-rule")
+
+               {result, fact_id, List.wrap(transition)}
+             end,
+             fn txn, {result, fact_id, transitions} ->
+               Rules.row_commit_in_txn(txn, transitions)
+
+               deliveries =
+                 if is_integer(fact_id),
+                   do: ConditionFacts.recognize_in_txn(txn, fact_id),
+                   else: []
+
+               {result, deliveries}
+             end
+           ) do
+        {:ok, {result, deliveries}} ->
+          ConditionFacts.complete_deliveries(db, deliveries)
+          nudge(opts, result[:ruling_fact_id] && [result.ruling_fact_id])
           result
 
         {:error, error} ->
@@ -476,9 +523,23 @@ defmodule Tightbeam.Escalation do
     with {:ok, reason} <-
            normalized_required(param(call, :reason), "withdrawal reason is required") do
       {:ok, result} =
-        DB.transaction(db, fn txn ->
-          operator_withdraw_in_txn(txn, call, request_id, reason, opts)
-        end)
+        DB.transaction_then(
+          db,
+          fn txn ->
+            before = request_in_txn_optional(txn, request_id)
+            result = operator_withdraw_in_txn(txn, call, request_id, reason, opts)
+            after_request = request_in_txn_optional(txn, request_id)
+
+            transition =
+              changed_decision_transition(before, after_request, call.origin, "operator-withdraw")
+
+            {result, List.wrap(transition)}
+          end,
+          fn txn, {result, transitions} ->
+            Rules.row_commit_in_txn(txn, transitions)
+            result
+          end
+        )
 
       result
     else
@@ -526,18 +587,32 @@ defmodule Tightbeam.Escalation do
   end
 
   @doc "Spend one ruled authorization. Batch rollback is deliberately not provided."
-  @spec consume(DB.server(), String.t()) :: boolean()
-  def consume(db, ruling_id) do
+  @spec consume(DB.server(), String.t(), String.t(), String.t()) :: boolean()
+  def consume(db, ruling_id, verb \\ "rule", principal \\ "process:tightbeam") do
     {:ok, consumed?} =
-      DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          "UPDATE decision_requests SET status = 'consumed', consumedAt = ?2 WHERE id = ?1 AND kind = 'statute' AND status = 'ruled'",
-          [ruling_id, now()]
-        )
+      DB.transaction_then(
+        db,
+        fn txn ->
+          request = request_in_txn_optional(txn, ruling_id)
 
-        Txn.changes(txn) == 1
-      end)
+          Txn.q(
+            txn,
+            "UPDATE decision_requests SET status = 'consumed', consumedAt = ?2 WHERE id = ?1 AND kind = 'statute' AND status = 'ruled'",
+            [ruling_id, now()]
+          )
+
+          consumed? = Txn.changes(txn) == 1
+
+          transition =
+            if consumed?, do: decision_transition(request, "ruled", "consumed", principal, verb)
+
+          {consumed?, List.wrap(transition)}
+        end,
+        fn txn, {consumed?, transitions} ->
+          Rules.row_commit_in_txn(txn, transitions)
+          consumed?
+        end
+      )
 
     consumed?
   end
@@ -697,52 +772,67 @@ defmodule Tightbeam.Escalation do
     at = now()
 
     {:ok, :ok} =
-      DB.transaction(db, fn txn ->
-        rows =
-          Txn.q(
-            txn,
-            "SELECT id FROM decision_requests WHERE raiserSessionKey = ?1 AND kind != 'operator' AND status = 'open'",
-            [session_key]
-          )
-
-        Enum.each(rows, fn [id] ->
-          Txn.q(
-            txn,
-            "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'raiser-retired', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
-            [id, at]
-          )
-
-          if Txn.changes(txn) == 1 do
-            EventLog.lifecycle_in_txn(
+      DB.transaction_then(
+        db,
+        fn txn ->
+          rows =
+            Txn.q(
               txn,
-              "decision_request_withdrawn",
-              id,
-              "by=process:tightbeam reason=raiser-retired"
+              "SELECT id, ownerUserId FROM decision_requests WHERE raiserSessionKey = ?1 AND kind != 'operator' AND status = 'open'",
+              [session_key]
             )
-          end
-        end)
 
-        waivers =
-          Txn.q(
-            txn,
-            "SELECT id FROM escalation_waivers WHERE raiserId = ?1 AND revokedAt IS NULL",
-            [raiser_id]
-          )
+          Enum.each(rows, fn [id, _owner_user_id] ->
+            Txn.q(
+              txn,
+              "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'raiser-retired', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
+              [id, at]
+            )
 
-        Enum.each(waivers, fn [id] ->
-          Txn.q(
-            txn,
-            "UPDATE escalation_waivers SET revokedBy = 'process:tightbeam', revokedAt = ?2 WHERE id = ?1 AND revokedAt IS NULL",
-            [id, at]
-          )
+            if Txn.changes(txn) == 1 do
+              EventLog.lifecycle_in_txn(
+                txn,
+                "decision_request_withdrawn",
+                id,
+                "by=process:tightbeam reason=raiser-retired"
+              )
+            end
+          end)
 
-          if Txn.changes(txn) == 1 do
-            EventLog.lifecycle_in_txn(txn, "waiver_revoked", id, "by=process:tightbeam")
-          end
-        end)
+          waivers =
+            Txn.q(
+              txn,
+              "SELECT id FROM escalation_waivers WHERE raiserId = ?1 AND revokedAt IS NULL",
+              [raiser_id]
+            )
 
-        :ok
-      end)
+          Enum.each(waivers, fn [id] ->
+            Txn.q(
+              txn,
+              "UPDATE escalation_waivers SET revokedBy = 'process:tightbeam', revokedAt = ?2 WHERE id = ?1 AND revokedAt IS NULL",
+              [id, at]
+            )
+
+            if Txn.changes(txn) == 1 do
+              EventLog.lifecycle_in_txn(txn, "waiver_revoked", id, "by=process:tightbeam")
+            end
+          end)
+
+          Enum.map(rows, fn [id, owner_user_id] ->
+            decision_transition(
+              %{id: id, owner_user_id: owner_user_id},
+              "open",
+              "withdrawn",
+              "process:tightbeam",
+              "retire"
+            )
+          end)
+        end,
+        fn txn, transitions ->
+          Rules.row_commit_in_txn(txn, transitions)
+          :ok
+        end
+      )
 
     :ok
   end
@@ -790,26 +880,40 @@ defmodule Tightbeam.Escalation do
 
   def withdraw_episodes(db, ids, statute_name) do
     {:ok, :ok} =
-      DB.transaction(db, fn txn ->
-        Enum.each(ids, fn id ->
-          Txn.q(
-            txn,
-            "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'sensor-recovered', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
-            [id, now()]
-          )
+      DB.transaction_then(
+        db,
+        fn txn ->
+          transitions =
+            Enum.flat_map(ids, fn id ->
+              request = request_in_txn_optional(txn, id)
 
-          if Txn.changes(txn) == 1 do
-            EventLog.lifecycle_in_txn(
-              txn,
-              "decision_request_withdrawn",
-              id,
-              "by=process:tightbeam reason=sensor-recovered statute=#{statute_name}"
-            )
-          end
-        end)
+              Txn.q(
+                txn,
+                "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = 'process:tightbeam', withdrawnReason = 'sensor-recovered', withdrawnAt = ?2 WHERE id = ?1 AND status = 'open'",
+                [id, now()]
+              )
 
-        :ok
-      end)
+              if Txn.changes(txn) == 1 do
+                EventLog.lifecycle_in_txn(
+                  txn,
+                  "decision_request_withdrawn",
+                  id,
+                  "by=process:tightbeam reason=sensor-recovered statute=#{statute_name}"
+                )
+
+                [decision_transition(request, "open", "withdrawn", "process:tightbeam", "attest")]
+              else
+                []
+              end
+            end)
+
+          transitions
+        end,
+        fn txn, transitions ->
+          Rules.row_commit_in_txn(txn, transitions)
+          :ok
+        end
+      )
 
     :ok
   end
@@ -1176,7 +1280,8 @@ defmodule Tightbeam.Escalation do
           ConditionFacts.file_in_txn(txn, %{
             kind: @terminal_condition_kind,
             scope: request.id,
-            origin: "process:tightbeam"
+            origin: "process:tightbeam",
+            owner_user_id: request.owner_user_id
           })
 
         terminal_test_step(opts, :after_fact)
@@ -1494,47 +1599,62 @@ defmodule Tightbeam.Escalation do
   defp rule_open(db, request, decision, rationale, origin, opts) do
     ruled_at = now()
 
-    {:ok, {result, filed_fact_id}} =
-      DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledAt = ?5 WHERE id = ?1 AND status = 'open'",
-          [request.id, decision, rationale, origin, ruled_at]
-        )
-
-        if Txn.changes(txn) == 1 do
-          %{fact_id: fact_id} =
-            ConditionFacts.file_in_txn(txn, %{
-              kind: "escalation-ruled",
-              scope: request.id,
-              origin: "process:tightbeam"
-            })
-
-          Txn.q(txn, "UPDATE decision_requests SET rulingFactId = ?2 WHERE id = ?1", [
-            request.id,
-            fact_id
-          ])
-
-          EventLog.lifecycle_in_txn(
+    {:ok, {result, deliveries}} =
+      DB.transaction_then(
+        db,
+        fn txn ->
+          Txn.q(
             txn,
-            "decision_request_ruled",
-            request.id,
-            "by=#{origin} decision=#{decision} factId=#{fact_id}"
+            "UPDATE decision_requests SET status = 'ruled', decision = ?2, rationale = ?3, ruledBy = ?4, ruledAt = ?5 WHERE id = ?1 AND status = 'open'",
+            [request.id, decision, rationale, origin, ruled_at]
           )
 
-          {request_in_txn(txn, request.id), fact_id}
-        else
-          current = request_in_txn(txn, request.id)
+          if Txn.changes(txn) == 1 do
+            %{fact_id: fact_id} =
+              ConditionFacts.file_in_txn(txn, %{
+                kind: "escalation-ruled",
+                scope: request.id,
+                origin: "process:tightbeam",
+                owner_user_id: request.owner_user_id
+              })
 
-          # A concurrent-ruler loser filed nothing: it must not nudge (F13 —
-          # one post-commit nudge per filed fact, owned by the filer).
-          if current.status == "ruled" and current.decision == decision,
-            do: {current, nil},
-            else: {error("not_open", "decision request is not open"), nil}
+            Txn.q(txn, "UPDATE decision_requests SET rulingFactId = ?2 WHERE id = ?1", [
+              request.id,
+              fact_id
+            ])
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "decision_request_ruled",
+              request.id,
+              "by=#{origin} decision=#{decision} factId=#{fact_id}"
+            )
+
+            ruled = request_in_txn(txn, request.id)
+
+            {ruled, fact_id, decision_transition(request, "open", "ruled", origin, "rule")}
+          else
+            current = request_in_txn(txn, request.id)
+
+            # A concurrent-ruler loser filed nothing: it must not nudge (F13 —
+            # one post-commit nudge per filed fact, owned by the filer).
+            if current.status == "ruled" and current.decision == decision,
+              do: {current, nil, nil},
+              else: {error("not_open", "decision request is not open"), nil, nil}
+          end
+        end,
+        fn txn, {result, fact_id, transition} ->
+          Rules.row_commit_in_txn(txn, List.wrap(transition))
+
+          deliveries =
+            if is_integer(fact_id), do: ConditionFacts.recognize_in_txn(txn, fact_id), else: []
+
+          {result, deliveries}
         end
-      end)
+      )
 
-    if filed_fact_id, do: nudge(opts, [filed_fact_id])
+    ConditionFacts.complete_deliveries(db, deliveries)
+    nudge(opts, result[:ruling_fact_id] && [result.ruling_fact_id])
     result
   end
 
@@ -1543,70 +1663,87 @@ defmodule Tightbeam.Escalation do
     granted_at = now()
     reason = param(call, :reason)
 
-    {:ok, {waiver, fact_ids}} =
-      DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          "INSERT INTO escalation_waivers (id, raiserId, statuteName, grantedBy, grantedAt, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-          [waiver_id, raiser_id, statute_name, call.origin, granted_at, reason]
-        )
+    {:ok, {waiver, deliveries, fact_ids}} =
+      DB.transaction_then(
+        db,
+        fn txn ->
+          Txn.q(
+            txn,
+            "INSERT INTO escalation_waivers (id, raiserId, statuteName, grantedBy, grantedAt, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            [waiver_id, raiser_id, statute_name, call.origin, granted_at, reason]
+          )
 
-        EventLog.lifecycle_in_txn(
-          txn,
-          "waiver_granted",
-          waiver_id,
-          "raiser=#{raiser_id} statute=#{statute_name} by=#{call.origin} path=#{path}"
-        )
+          EventLog.lifecycle_in_txn(
+            txn,
+            "waiver_granted",
+            waiver_id,
+            "raiser=#{raiser_id} statute=#{statute_name} by=#{call.origin} path=#{path}"
+          )
 
-        fact_ids =
-          if path == "request" do
-            open_ids =
-              Txn.q(
-                txn,
-                "SELECT id FROM decision_requests WHERE raiserId = ?1 AND statuteName = ?2 AND status = 'open' ORDER BY rowid",
-                [raiser_id, statute_name]
-              )
-
-            Enum.flat_map(open_ids, fn [id] ->
-              Txn.q(
-                txn,
-                "UPDATE decision_requests SET status = 'ruled', decision = 'waived', rationale = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
-                [id, reason, call.origin, granted_at]
-              )
-
-              if Txn.changes(txn) == 1 do
-                %{fact_id: fact_id} =
-                  ConditionFacts.file_in_txn(txn, %{
-                    kind: "escalation-ruled",
-                    scope: id,
-                    origin: "process:tightbeam"
-                  })
-
-                Txn.q(txn, "UPDATE decision_requests SET rulingFactId = ?2 WHERE id = ?1", [
-                  id,
-                  fact_id
-                ])
-
-                EventLog.lifecycle_in_txn(
+          recognized =
+            if path == "request" do
+              open_ids =
+                Txn.q(
                   txn,
-                  "decision_request_ruled",
-                  id,
-                  "by=#{call.origin} decision=waived factId=#{fact_id}"
+                  "SELECT id FROM decision_requests WHERE raiserId = ?1 AND statuteName = ?2 AND status = 'open' ORDER BY rowid",
+                  [raiser_id, statute_name]
                 )
 
-                [fact_id]
-              else
-                []
-              end
+              Enum.flat_map(open_ids, fn [id] ->
+                request = request_in_txn(txn, id)
+
+                Txn.q(
+                  txn,
+                  "UPDATE decision_requests SET status = 'ruled', decision = 'waived', rationale = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
+                  [id, reason, call.origin, granted_at]
+                )
+
+                if Txn.changes(txn) == 1 do
+                  %{fact_id: fact_id} =
+                    ConditionFacts.file_in_txn(txn, %{
+                      kind: "escalation-ruled",
+                      scope: id,
+                      origin: "process:tightbeam",
+                      owner_user_id: request.owner_user_id
+                    })
+
+                  Txn.q(txn, "UPDATE decision_requests SET rulingFactId = ?2 WHERE id = ?1", [
+                    id,
+                    fact_id
+                  ])
+
+                  EventLog.lifecycle_in_txn(
+                    txn,
+                    "decision_request_ruled",
+                    id,
+                    "by=#{call.origin} decision=waived factId=#{fact_id}"
+                  )
+
+                  [{fact_id, decision_transition(request, "open", "ruled", call.origin, "waive")}]
+                else
+                  []
+                end
+              end)
+            else
+              []
+            end
+
+          {waiver_in_txn(txn, waiver_id), recognized}
+        end,
+        fn txn, {waiver, recognized} ->
+          Rules.row_commit_in_txn(txn, Enum.map(recognized, &elem(&1, 1)))
+
+          deliveries =
+            Enum.flat_map(recognized, fn {fact_id, _transition} ->
+              ConditionFacts.recognize_in_txn(txn, fact_id)
             end)
-          else
-            []
-          end
 
-        {waiver_in_txn(txn, waiver_id), fact_ids}
-      end)
+          {waiver, deliveries, Enum.map(recognized, &elem(&1, 0))}
+        end
+      )
 
-    if fact_ids != [], do: nudge(opts, fact_ids)
+    ConditionFacts.complete_deliveries(db, deliveries)
+    nudge(opts, fact_ids)
     waiver
   end
 
@@ -1614,26 +1751,34 @@ defmodule Tightbeam.Escalation do
     withdrawn_at = now()
 
     {:ok, result} =
-      DB.transaction(db, fn txn ->
-        Txn.q(
-          txn,
-          "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = ?2, withdrawnReason = ?3, withdrawnAt = ?4 WHERE id = ?1 AND status = 'open'",
-          [request.id, by, reason, withdrawn_at]
-        )
-
-        if Txn.changes(txn) == 1 do
-          EventLog.lifecycle_in_txn(
+      DB.transaction_then(
+        db,
+        fn txn ->
+          Txn.q(
             txn,
-            "decision_request_withdrawn",
-            request.id,
-            "by=#{by} reason=#{reason}"
+            "UPDATE decision_requests SET status = 'withdrawn', withdrawnBy = ?2, withdrawnReason = ?3, withdrawnAt = ?4 WHERE id = ?1 AND status = 'open'",
+            [request.id, by, reason, withdrawn_at]
           )
 
-          request_in_txn(txn, request.id)
-        else
-          error("not_open", "decision request is not open")
+          if Txn.changes(txn) == 1 do
+            EventLog.lifecycle_in_txn(
+              txn,
+              "decision_request_withdrawn",
+              request.id,
+              "by=#{by} reason=#{reason}"
+            )
+
+            {request_in_txn(txn, request.id),
+             decision_transition(request, "open", "withdrawn", by, "withdraw")}
+          else
+            {error("not_open", "decision request is not open"), nil}
+          end
+        end,
+        fn txn, {result, transition} ->
+          Rules.row_commit_in_txn(txn, List.wrap(transition))
+          result
         end
-      end)
+      )
 
     result
   end
@@ -2567,15 +2712,38 @@ defmodule Tightbeam.Escalation do
     "Decision #{request.id}: #{request.question}\nOptions: #{JSON.encode!(request.options)}"
   end
 
-  defp nudge(opts, fact_ids) do
-    case Keyword.get(opts, :scheduler) do
-      nil ->
-        :ok
+  defp changed_decision_transition(
+         %{id: id, status: old_status} = before,
+         %{id: id, status: new_status},
+         principal,
+         verb
+       )
+       when old_status != new_status do
+    decision_transition(before, old_status, new_status, principal, verb)
+  end
 
-      scheduler ->
-        # One ordered call: the scheduler serves fact_ids strictly in filing
-        # order (a later fact's fan-out never overtakes an earlier fact's).
-        Wakes.fire_matching(scheduler, fact_ids)
+  defp changed_decision_transition(_before, _after, _principal, _verb), do: nil
+
+  defp decision_transition(request, old_status, new_status, principal, verb) do
+    %{
+      verb: verb,
+      domain: "decision_request",
+      row_id: request.id,
+      owner_user_id: request.owner_user_id,
+      principal: principal,
+      bindings: %{decision_request_id: request.id},
+      field: %{name: "status", old: old_status, new: new_status}
+    }
+  end
+
+  defp nudge(_opts, nil), do: :ok
+  defp nudge(_opts, []), do: :ok
+
+  defp nudge(opts, fact_ids) do
+    if Keyword.has_key?(opts, :scheduler) do
+      Wakes.fire_matching(Keyword.fetch!(opts, :scheduler), fact_ids)
+    else
+      :ok
     end
   end
 

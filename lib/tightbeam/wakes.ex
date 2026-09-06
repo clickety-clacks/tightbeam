@@ -25,7 +25,7 @@ defmodule Tightbeam.Wakes do
   use GenServer
   require Logger
 
-  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway, NoticeBatcher}
+  alias Tightbeam.{ConditionFacts, DB, Escalation, EventLog, Gateway, NoticeBatcher, Rules}
   alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
@@ -2454,6 +2454,34 @@ defmodule Tightbeam.Wakes do
     GenServer.call(server, {:fire_matching, fact_id})
   end
 
+  @doc false
+  @spec recognize_condition_fact_in_txn(Txn.t(), pos_integer()) :: [term()]
+  def recognize_condition_fact_in_txn(%Txn{} = txn, fact_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT w.wakeId
+      FROM condition_facts f
+      JOIN wakes w INDEXED BY wakes_condition ON w.conditionKind=f.kind
+      WHERE f.id=?1 AND w.state='pending' AND f.id>w.conditionAfterId
+      ORDER BY w.rowid
+      """,
+      [fact_id]
+    )
+    |> Enum.flat_map(fn [wake_id] ->
+      case Txn.q(txn, select_wake_sql() <> " WHERE wakeId=?1", [wake_id]) do
+        [row] ->
+          case fire_in_txn(txn, to_wake(row), fact_id) do
+            {:fired, delivery} -> [delivery]
+            :noop -> []
+          end
+
+        [] ->
+          []
+      end
+    end)
+  end
+
   @impl true
   def init(opts) do
     state = %{
@@ -2783,14 +2811,14 @@ defmodule Tightbeam.Wakes do
 
     rows
     |> Enum.sort_by(fn
-      [branch, _wake_id, fact_id, _scope, rid] when branch in ["C1", "C2"] ->
+      ["C", _wake_id, fact_id, _scope, rid] ->
         {0, fact_id, rid}
 
       [_branch, _wake_id, _fact_id, _scope, rid] ->
         {1, rid, rid}
     end)
-    |> Enum.each(fn [_branch, wake_id, _fact_id, _scope, _rid] ->
-      fire_candidate(db, wake_id)
+    |> Enum.each(fn [_branch, wake_id, fact_id, _scope, _rid] ->
+      fire_candidate(db, wake_id, fact_id)
     end)
 
     if mode == :tick do
@@ -2798,7 +2826,7 @@ defmodule Tightbeam.Wakes do
     end
 
     saturated? =
-      Enum.any?(~w(C1 C2 F), fn branch ->
+      Enum.any?(~w(C F), fn branch ->
         Enum.count(rows, &(hd(&1) == branch)) == batch
       end)
 
@@ -2809,84 +2837,64 @@ defmodule Tightbeam.Wakes do
     transaction!(db, fn txn ->
       [[after_fact]] = Txn.q(txn, "SELECT afterFact FROM scheduler_state WHERE id = 0")
       [[ceil]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
-      rows = Txn.q(txn, candidate_sql(:tick), [after_fact, ceil, batch, now()])
+
+      rows =
+        Txn.q(
+          txn,
+          """
+          SELECT * FROM (
+            SELECT 'C' AS branch, w.wakeId, f.id AS factId, f.scope, w.rowid AS rid
+            FROM condition_facts f
+            JOIN wakes w INDEXED BY wakes_condition ON w.conditionKind=f.kind
+            WHERE f.id>?1 AND f.id<=?2 AND w.state='pending' AND f.id>w.conditionAfterId
+            ORDER BY f.id, w.rowid LIMIT ?3
+          )
+          UNION ALL
+          SELECT * FROM (
+            SELECT 'F' AS branch, w.wakeId, NULL AS factId, NULL AS scope, w.rowid AS rid
+            FROM wakes w INDEXED BY wakes_due
+            WHERE w.state='pending' AND w.dueAt<=?4 AND w.conditionKind IS NOT NULL
+            ORDER BY w.rowid LIMIT ?3
+          )
+          """,
+          [after_fact, ceil, batch, now()]
+        )
+
       {rows, {after_fact, ceil}}
     end)
   end
 
   defp select_candidates(db, batch, {:eager, fact_id}) do
     transaction!(db, fn txn ->
-      {Txn.q(txn, candidate_sql(:eager), [fact_id, batch, now()]), nil}
+      rows =
+        Txn.q(
+          txn,
+          """
+          SELECT * FROM (
+            SELECT 'C' AS branch, w.wakeId, f.id AS factId, f.scope, w.rowid AS rid
+            FROM condition_facts f
+            JOIN wakes w INDEXED BY wakes_condition ON w.conditionKind=f.kind
+            WHERE f.id=?1 AND w.state='pending' AND f.id>w.conditionAfterId
+            ORDER BY w.rowid LIMIT ?2
+          )
+          UNION ALL
+          SELECT * FROM (
+            SELECT 'F' AS branch, w.wakeId, NULL AS factId, NULL AS scope, w.rowid AS rid
+            FROM wakes w INDEXED BY wakes_due
+            WHERE w.state='pending' AND w.dueAt<=?3 AND w.conditionKind IS NOT NULL
+            ORDER BY w.rowid LIMIT ?2
+          )
+          """,
+          [fact_id, batch, now()]
+        )
+
+      {rows, nil}
     end)
-  end
-
-  defp candidate_sql(:tick) do
-    """
-    SELECT * FROM (
-      SELECT 'C1' AS branch, w.wakeId AS wakeId, f.id AS matchedFactId,
-             f.scope AS matchedScope, w.rowid AS rid
-      FROM condition_facts f CROSS JOIN wakes w INDEXED BY wakes_condition
-      WHERE f.id > ?1 AND f.id <= ?2
-        AND w.state = 'pending' AND w.conditionKind = f.kind
-        AND w.conditionScope = f.scope AND f.id > w.conditionAfterId
-      ORDER BY f.id ASC, w.rowid ASC LIMIT ?3
-    )
-    UNION ALL
-    SELECT * FROM (
-      SELECT 'C2' AS branch, w.wakeId AS wakeId, f.id AS matchedFactId,
-             f.scope AS matchedScope, w.rowid AS rid
-      FROM condition_facts f CROSS JOIN wakes w INDEXED BY wakes_condition
-      WHERE f.id > ?1 AND f.id <= ?2
-        AND w.state = 'pending' AND w.conditionKind = f.kind
-        AND w.conditionScope IS NULL AND f.id > w.conditionAfterId
-      ORDER BY f.id ASC, w.rowid ASC LIMIT ?3
-    )
-    UNION ALL
-    SELECT * FROM (
-      SELECT 'F' AS branch, w.wakeId AS wakeId, NULL AS matchedFactId,
-             NULL AS matchedScope, w.rowid AS rid
-      FROM wakes w INDEXED BY wakes_due
-      WHERE w.state = 'pending' AND w.dueAt <= ?4 AND w.conditionKind IS NOT NULL
-      ORDER BY w.rowid ASC LIMIT ?3
-    )
-    """
-  end
-
-  defp candidate_sql(:eager) do
-    """
-    SELECT * FROM (
-      SELECT 'C1' AS branch, w.wakeId AS wakeId, f.id AS matchedFactId,
-             f.scope AS matchedScope, w.rowid AS rid
-      FROM condition_facts f CROSS JOIN wakes w INDEXED BY wakes_condition
-      WHERE f.id = ?1
-        AND w.state = 'pending' AND w.conditionKind = f.kind
-        AND w.conditionScope = f.scope AND f.id > w.conditionAfterId
-      ORDER BY f.id ASC, w.rowid ASC LIMIT ?2
-    )
-    UNION ALL
-    SELECT * FROM (
-      SELECT 'C2' AS branch, w.wakeId AS wakeId, f.id AS matchedFactId,
-             f.scope AS matchedScope, w.rowid AS rid
-      FROM condition_facts f CROSS JOIN wakes w INDEXED BY wakes_condition
-      WHERE f.id = ?1
-        AND w.state = 'pending' AND w.conditionKind = f.kind
-        AND w.conditionScope IS NULL AND f.id > w.conditionAfterId
-      ORDER BY f.id ASC, w.rowid ASC LIMIT ?2
-    )
-    UNION ALL
-    SELECT * FROM (
-      SELECT 'F' AS branch, w.wakeId AS wakeId, NULL AS matchedFactId,
-             NULL AS matchedScope, w.rowid AS rid
-      FROM wakes w INDEXED BY wakes_due
-      WHERE w.state = 'pending' AND w.dueAt <= ?3 AND w.conditionKind IS NOT NULL
-      ORDER BY w.rowid ASC LIMIT ?2
-    )
-    """
   end
 
   defp advance_watermark(db, rows, batch, {after_fact, ceil}) do
     boundaries =
-      Enum.map(~w(C1 C2), fn branch ->
+      Enum.map(~w(C), fn branch ->
         branch_rows = Enum.filter(rows, &(hd(&1) == branch))
 
         if length(branch_rows) < batch do
@@ -2907,11 +2915,11 @@ defmodule Tightbeam.Wakes do
     :ok
   end
 
-  defp fire_candidate(db, wake_id) do
+  defp fire_candidate(db, wake_id, fact_id) do
     result =
       DB.transaction(db, fn txn ->
         case Txn.q(txn, select_wake_sql() <> " WHERE wakeId = ?1", [wake_id]) do
-          [row] -> fire_in_txn(txn, to_wake(row))
+          [row] -> fire_in_txn(txn, to_wake(row), fact_id)
           [] -> :noop
         end
       end)
@@ -2923,21 +2931,38 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp fire_in_txn(txn, %{state: "pending", condition_kind: kind} = wake)
+  defp fire_in_txn(txn, %{state: "pending", condition_kind: kind} = wake, fact_id)
        when is_binary(kind) do
-    {match_sql, params} =
-      if is_nil(wake.condition_scope) do
-        {"SELECT id, scope FROM condition_facts WHERE id > ?1 AND kind = ?2 ORDER BY id ASC LIMIT 1",
-         [wake.condition_after_id, kind]}
-      else
-        {"SELECT id, scope FROM condition_facts INDEXED BY condition_facts_match WHERE id > ?1 AND kind = ?2 AND scope = ?3 ORDER BY id ASC LIMIT 1",
-         [wake.condition_after_id, kind, wake.condition_scope]}
-      end
+    # Owner provenance moves onto condition facts in G-B. Until that migration,
+    # unresolved legacy targets still need the common evaluator to preserve their
+    # existing fire-and-record behavior.
+    owner_user_id = wake_owner_in_txn(txn, wake) || "legacy-unscoped"
+
+    bindings = %{
+      condition_kind: kind,
+      condition_scope: wake.condition_scope,
+      condition_after_id: wake.condition_after_id
+    }
+
+    bindings =
+      if is_integer(fact_id), do: Map.put(bindings, :condition_fact_id, fact_id), else: bindings
+
+    predicate = %{
+      owner_user_id: owner_user_id,
+      conditions: [%{fact: "condition_fact.matches", op: "eq", value: true}],
+      bindings: bindings
+    }
 
     match =
-      case Txn.q(txn, match_sql, params) do
-        [[id, scope]] -> %{id: id, scope: scope}
-        [] -> nil
+      case Rules.evaluate_predicate_in_txn(txn, predicate) do
+        {:ok, %{matched: true, condition_match: matched}} ->
+          matched
+
+        {:ok, %{matched: false}} ->
+          nil
+
+        {:error, error} ->
+          raise DB.Error, message: "legacy wake predicate refused: #{error.message}"
       end
 
     cause =
@@ -2984,7 +3009,14 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  defp fire_in_txn(_txn, _wake), do: :noop
+  defp fire_in_txn(_txn, _wake, _fact_id), do: :noop
+
+  defp wake_owner_in_txn(txn, wake) do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [wake.session_key]) do
+      [[owner_user_id]] -> owner_user_id
+      [] -> nil
+    end
+  end
 
   # The 0.1.9 line has no firehose publisher. The ordinary wake row and its
   # lifecycle event remain the durable observation seams on this branch.

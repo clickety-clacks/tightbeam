@@ -34,7 +34,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "liveness-progress-receipts-v1-019"
+  @shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
   @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
@@ -112,6 +112,61 @@ defmodule Tightbeam.SchemaShapeTest do
   )
   """
 
+  # Exact pre-A-R4 tables. Migration fixtures begin from a current in-memory
+  # database, so they must remove the current nullable columns before assigning
+  # an older shape stamp. The stamp remains the production migration authority.
+  @pre_row_driven_artifacts_ddl """
+  CREATE TABLE artifacts (
+    artifactId TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('spec','report','doc','data','other')),
+    title TEXT NOT NULL,
+    description TEXT,
+    createdBySession TEXT NOT NULL REFERENCES sessions(sessionKey),
+    workItemId TEXT NOT NULL REFERENCES work_items(id),
+    parentSession TEXT REFERENCES sessions(sessionKey),
+    originPath TEXT NOT NULL,
+    contentSha256 TEXT,
+    recordedMessageId TEXT REFERENCES messages(id),
+    recordedTurnEvidence TEXT NOT NULL DEFAULT 'none'
+      CHECK (recordedTurnEvidence IN ('tool-call-observed','session-concurrent','none')),
+    state TEXT NOT NULL DEFAULT 'in-workspace'
+      CHECK (state IN ('in-workspace','archived','released')),
+    home TEXT,
+    createdAt INTEGER NOT NULL,
+    updatedAt INTEGER NOT NULL,
+    CHECK ((state = 'archived') = (home IS NOT NULL))
+  )
+  """
+
+  @pre_row_driven_attests_ddl """
+  CREATE TABLE attests (
+    id TEXT PRIMARY KEY,
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
+    verdictKind TEXT NULL,
+    note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
+    bySession TEXT NULL REFERENCES sessions(sessionKey),
+    byUser TEXT NULL REFERENCES users(userId),
+    producer TEXT NULL,
+    producerCommand TEXT NULL,
+    byHarness TEXT NULL,
+    byProvider TEXT NULL,
+    commitRefs TEXT NULL,
+    ts INTEGER NOT NULL,
+    CHECK(
+      (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
+       byUser IS NULL AND verdictKind IS NULL)
+      OR
+      (kind = 'verdict' AND verdictKind IS NOT NULL AND
+       ((bySession IS NOT NULL) != (byUser IS NOT NULL)))
+    ),
+    CHECK(producer IS NULL OR kind = 'verdict'),
+    CHECK(producerCommand IS NULL OR producer IS NOT NULL),
+    CHECK(byHarness IS NULL OR kind = 'verdict'),
+    CHECK(byProvider IS NULL OR kind = 'verdict')
+  )
+  """
+
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
@@ -143,6 +198,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    downgrade_row_driven_rules(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
 
@@ -159,6 +215,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact pre-liveness notice stamp resumes without physical-shape inference", %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    downgrade_row_driven_rules(db)
     drop_liveness_activation(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
@@ -318,6 +375,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "operator-decision migration classifies the complete predecessor census once", %{db: db} do
     :ok = Schema.ensure_all(db)
+    downgrade_row_driven_rules(db)
 
     :ok =
       DB.execute(db, """
@@ -485,6 +543,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
     {:ok, first_pid} = DB.start_link(path: path, name: first)
     assert :ok = Schema.ensure_all(first)
+    downgrade_row_driven_rules(first)
 
     :ok =
       DB.execute(first, """
@@ -876,6 +935,7 @@ defmodule Tightbeam.SchemaShapeTest do
   test "the exact notice-batching predecessor widens effort cancellation and preserves the stamp",
        %{db: db} do
     assert :ok = Schema.ensure_all(db)
+    downgrade_row_driven_rules(db)
 
     {:ok, [[current_ddl]]} =
       DB.query(
@@ -1044,6 +1104,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_decision_requests_to_model_identity(db) do
+    downgrade_row_driven_rules(db)
+
     :ok =
       DB.execute(db, """
       DROP INDEX decision_requests_owner;
@@ -1076,6 +1138,29 @@ defmodule Tightbeam.SchemaShapeTest do
       """)
 
     :ok
+  end
+
+  defp downgrade_row_driven_rules(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      :ok =
+        DB.execute(db, """
+        DROP TABLE attests;
+        DROP INDEX artifacts_producer;
+        DROP INDEX artifacts_work_item;
+        DROP INDEX artifacts_created_by_session;
+        DROP INDEX artifacts_recorded_message;
+        DROP TABLE artifacts;
+        #{@pre_row_driven_artifacts_ddl};
+        CREATE INDEX artifacts_work_item ON artifacts (workItemId);
+        CREATE INDEX artifacts_created_by_session ON artifacts (createdBySession);
+        CREATE INDEX artifacts_recorded_message ON artifacts (recordedMessageId);
+        #{@pre_row_driven_attests_ddl};
+        """)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
   end
 
   defp downgrade_wakes_to_terminal_decision(db) do

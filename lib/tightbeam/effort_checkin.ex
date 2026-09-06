@@ -25,6 +25,7 @@ defmodule Tightbeam.EffortCheckin do
     Escalation,
     Org,
     Placement,
+    Rules,
     Supervision,
     Wakes
   }
@@ -207,8 +208,8 @@ defmodule Tightbeam.EffortCheckin do
     end)
   end
 
-  @spec cancel_in_txn(Txn.t(), String.t(), map()) :: :ok
-  def cancel_in_txn(%Txn{} = txn, assignment_id, command) do
+  @spec cancel_in_txn(Txn.t(), String.t(), map(), map()) :: :ok
+  def cancel_in_txn(%Txn{} = txn, assignment_id, command, row_context \\ %{}) do
     case current_generation(txn, assignment_id) do
       nil ->
         :ok
@@ -227,7 +228,7 @@ defmodule Tightbeam.EffortCheckin do
         :ok
     end
 
-    dispose_requests_in_txn(txn, assignment_id, command)
+    dispose_requests_in_txn(txn, assignment_id, command, row_context)
     :ok
   end
 
@@ -403,17 +404,24 @@ defmodule Tightbeam.EffortCheckin do
             )
           end
 
-        case DB.transaction(db, fn txn ->
-               rule_in_txn(
-                 txn,
-                 config,
-                 request,
-                 action,
-                 actor,
-                 call.principal,
-                 fresh
-               )
-             end) do
+        case DB.transaction_then(
+               db,
+               fn txn ->
+                 rule_in_txn(
+                   txn,
+                   config,
+                   request,
+                   action,
+                   actor,
+                   call.principal,
+                   fresh
+                 )
+               end,
+               fn txn, result ->
+                 Rules.row_commit_in_txn(txn, [])
+                 result
+               end
+             ) do
           {:ok, result} -> result
           {:error, error} -> raise error
         end
@@ -700,6 +708,11 @@ defmodule Tightbeam.EffortCheckin do
         if Txn.changes(txn) == 1 do
           ruled = request_for_id(txn, current.id)
 
+          DB.record_row_commit(
+            txn,
+            decision_transition(current, "open", "ruled", actor, "effort-rule")
+          )
+
           cancel_pending_wake_in_txn!(
             txn,
             current.deadline_wake_id,
@@ -976,13 +989,12 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp supersede_requests_in_txn(txn, assignment_id, command) do
-    wake_ids =
+    requests =
       Txn.q(
         txn,
-        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        "SELECT id, ownerUserId, deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
         [assignment_id]
       )
-      |> List.flatten()
 
     Txn.q(
       txn,
@@ -990,18 +1002,31 @@ defmodule Tightbeam.EffortCheckin do
       [assignment_id]
     )
 
-    Enum.each(wake_ids, &cancel_pending_wake_in_txn!(txn, &1, command))
+    Enum.each(requests, fn [id, owner_user_id, wake_id] ->
+      cancel_pending_wake_in_txn!(txn, wake_id, command)
+
+      DB.record_row_commit(
+        txn,
+        decision_transition(
+          %{id: id, owner_user_id: owner_user_id},
+          "open",
+          "superseded",
+          @origin,
+          "effort-rule"
+        )
+      )
+    end)
+
     :ok
   end
 
-  defp dispose_requests_in_txn(txn, assignment_id, command) do
-    wake_ids =
+  defp dispose_requests_in_txn(txn, assignment_id, command, row_context) do
+    requests =
       Txn.q(
         txn,
-        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        "SELECT id, ownerUserId, deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
         [assignment_id]
       )
-      |> List.flatten()
 
     Txn.q(
       txn,
@@ -1009,7 +1034,20 @@ defmodule Tightbeam.EffortCheckin do
       [assignment_id]
     )
 
-    Enum.each(wake_ids, &cancel_pending_wake_in_txn!(txn, &1, command))
+    Enum.each(requests, fn [id, owner_user_id, wake_id] ->
+      cancel_pending_wake_in_txn!(txn, wake_id, command)
+
+      DB.record_row_commit(
+        txn,
+        decision_transition(
+          %{id: id, owner_user_id: owner_user_id},
+          "open",
+          "superseded",
+          Map.get(row_context, :principal, @origin),
+          Map.get(row_context, :verb, "attest")
+        )
+      )
+    end)
 
     :ok
   end
@@ -1761,6 +1799,18 @@ defmodule Tightbeam.EffortCheckin do
 
   defp expecter_ref(_session_key, user_id) when is_binary(user_id), do: "user:" <> user_id
   defp expecter_ref(_session_key, _user_id), do: nil
+
+  defp decision_transition(request, old_status, new_status, principal, verb) do
+    %{
+      verb: verb,
+      domain: "decision_request",
+      row_id: request.id,
+      owner_user_id: request.owner_user_id,
+      principal: principal,
+      bindings: %{decisionRequestId: request.id},
+      field: %{name: "status", old: old_status, new: new_status}
+    }
+  end
 
   defp error(code, message), do: %{code: code, message: message}
   defp now, do: System.system_time(:millisecond)

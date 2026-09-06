@@ -13,7 +13,7 @@ defmodule Tightbeam.ConditionFacts do
   substrate is forbidden to assert an agent's judgment.
   """
 
-  alias Tightbeam.{DB, EventLog, Idempotency, Wakes}
+  alias Tightbeam.{DB, EventLog, Gateway, Idempotency, Rules, Wakes}
   alias Tightbeam.DB.Txn
 
   @reserved_kinds ~w(
@@ -74,14 +74,18 @@ defmodule Tightbeam.ConditionFacts do
 
   @spec file(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file(db, scheduler, input) do
-    result = transaction!(db, &file_in_txn(&1, input))
+    case DB.transaction_then(db, &file_in_txn(&1, input), fn txn, result ->
+           Rules.row_commit_in_txn(txn, [])
+           recognize_after_commit(txn, result)
+         end) do
+      {:ok, {result, deliveries}} ->
+        complete_deliveries(db, deliveries)
+        notify_scheduler(scheduler, result)
+        result
 
-    case result do
-      %{fact_id: fact_id} -> Wakes.fire_matching(scheduler, fact_id)
-      _ -> :ok
+      {:error, error} ->
+        raise error
     end
-
-    result
   end
 
   @spec file_in_txn(Txn.t(), map()) :: map() | {:error, map()}
@@ -114,43 +118,134 @@ defmodule Tightbeam.ConditionFacts do
       "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
     )
 
-    %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    owner_user_id = Map.get(input, :owner_user_id) || owner_for_origin_in_txn(txn, origin)
+
+    fact = %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+
+    DB.record_row_commit(txn, condition_transition(fact, owner_user_id))
+    fact
   end
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file_idempotent(db, scheduler, input) do
-    {result, filed?} =
-      transaction!(db, fn txn ->
-        key = Map.get(input, :idempotency_key)
-        origin = Map.fetch!(input, :origin)
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             key = Map.get(input, :idempotency_key)
+             origin = Map.fetch!(input, :origin)
 
-        prior =
-          if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
+             prior =
+               if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
 
-        if prior do
-          {fact_in_txn(txn, prior.session_key), false}
-        else
-          case file_in_txn(txn, input) do
-            %{fact_id: fact_id} = fact ->
-              if is_binary(key) do
-                Idempotency.put_in_txn(txn, %{
-                  owner_user_id: origin,
-                  operation: "condition",
-                  idempotency_key: key,
-                  session_key: to_string(fact_id)
-                })
-              end
+             if prior do
+               {fact_in_txn(txn, prior.session_key), false}
+             else
+               case file_in_txn(txn, input) do
+                 %{fact_id: fact_id} = fact ->
+                   if is_binary(key) do
+                     Idempotency.put_in_txn(txn, %{
+                       owner_user_id: origin,
+                       operation: "condition",
+                       idempotency_key: key,
+                       session_key: to_string(fact_id)
+                     })
+                   end
 
-              {fact, true}
+                   {fact, true}
 
-            error ->
-              {error, false}
-          end
-        end
-      end)
+                 error ->
+                   {error, false}
+               end
+             end
+           end,
+           fn txn, {result, filed?} ->
+             Rules.row_commit_in_txn(txn, [])
 
-    if filed?, do: Wakes.fire_matching(scheduler, result.fact_id)
-    result
+             if filed? do
+               {result, deliveries} = recognize_after_commit(txn, result)
+               {result, deliveries, true}
+             else
+               {result, [], false}
+             end
+           end
+         ) do
+      {:ok, {result, deliveries, filed?}} ->
+        complete_deliveries(db, deliveries)
+        if filed?, do: notify_scheduler(scheduler, result)
+        result
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  defp recognize_after_commit(txn, %{fact_id: fact_id} = fact) do
+    {fact, Wakes.recognize_condition_fact_in_txn(txn, fact_id)}
+  end
+
+  defp recognize_after_commit(_txn, result), do: {result, []}
+
+  @doc false
+  @spec recognize_in_txn(Txn.t(), pos_integer()) :: [term()]
+  def recognize_in_txn(%Txn{} = txn, fact_id) do
+    case fact_in_txn(txn, fact_id) do
+      %{fact_id: ^fact_id} = fact ->
+        {_fact, deliveries} = recognize_after_commit(txn, fact)
+        deliveries
+
+      _ ->
+        []
+    end
+  end
+
+  defp owner_for_origin_in_txn(_txn, "user:" <> owner_user_id), do: owner_user_id
+
+  defp owner_for_origin_in_txn(txn, "agent:" <> role) do
+    case Txn.q(
+           txn,
+           "SELECT s.ownerUserId FROM roles r JOIN sessions s ON s.sessionKey=r.boundSessionKey WHERE r.name=?1",
+           [role]
+         ) do
+      [[owner_user_id]] -> owner_user_id
+      _ -> nil
+    end
+  end
+
+  defp owner_for_origin_in_txn(_txn, _origin), do: nil
+
+  @doc false
+  def complete_deliveries(db, deliveries) do
+    Enum.each(deliveries, fn delivery ->
+      try do
+        Gateway.complete_delivery(db, delivery)
+      catch
+        :exit, {:noproc, _call} -> :ok
+      end
+    end)
+
+    :ok
+  end
+
+  defp notify_scheduler(scheduler, %{fact_id: fact_id}),
+    do: Wakes.fire_matching(scheduler, fact_id)
+
+  defp notify_scheduler(_scheduler, _result), do: :ok
+
+  defp condition_transition(fact, owner_user_id) do
+    %{
+      verb: "condition",
+      domain: "condition_fact",
+      row_id: fact.fact_id,
+      owner_user_id: owner_user_id,
+      principal: fact.origin,
+      bindings: %{
+        conditionKind: fact.kind,
+        conditionScope: fact.scope,
+        conditionAfterId: fact.fact_id - 1,
+        conditionFactId: fact.fact_id
+      },
+      field: %{name: "id", old: nil, new: fact.fact_id}
+    }
   end
 
   @spec latest(DB.server(), String.t(), String.t() | nil) :: map() | nil
@@ -319,13 +414,6 @@ defmodule Tightbeam.ConditionFacts do
 
       true ->
         :ok
-    end
-  end
-
-  defp transaction!(db, fun) do
-    case DB.transaction(db, fun) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
     end
   end
 end

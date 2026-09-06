@@ -82,6 +82,7 @@ pub enum Command {
         description: Option<String>,
         work_item_id: Option<String>,
         content_sha256: Option<String>,
+        produced_by_assignment_id: Option<String>,
     },
     Artifacts {
         identity: Identity,
@@ -266,6 +267,8 @@ pub enum Command {
         verdict: Option<String>,
         note: Option<String>,
         commit_refs: Option<Vec<serde_json::Value>>,
+        artifact_id: Option<String>,
+        content_sha256: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -477,6 +480,7 @@ COMMANDS:
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
+                  [--produced-by-assignment <assignmentId>]
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
@@ -606,6 +610,7 @@ COMMANDS:
       tune also requires --model; rerun requires --outcome not-completed.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
+      [--artifact <artifactId> --sha256 <hash>]
          [--verdict <kind>] [--note "..."]
       File against an assignment. Verdicts on review cards require the review
       holder; producer-card verdicts may be filed by any session or user.
@@ -1189,7 +1194,7 @@ fn parse_with_optional_catalog(
         }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]".to_owned());
+                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--produced-by-assignment <assignmentId>]".to_owned());
             }
             Ok(Command::ArtifactRecord {
                 identity: identity(flags)?,
@@ -1200,6 +1205,7 @@ fn parse_with_optional_catalog(
                 description: nonempty(flags, "description"),
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
+                produced_by_assignment_id: nonempty(flags, "produced-by-assignment"),
             })
         }
         "tool-call-observed" => {
@@ -1715,6 +1721,16 @@ fn parse_with_optional_catalog(
                         .map_err(|_| "--commit-refs must be a JSON array".to_owned())
                 })
                 .transpose()?;
+            let artifact_id = nonempty(flags, "artifact");
+            let content_sha256 = nonempty(flags, "sha256");
+            if artifact_id.is_some() != content_sha256.is_some() {
+                return Err("--artifact and --sha256 must be supplied together".to_owned());
+            }
+            if kind != "verdict" && artifact_id.is_some() {
+                return Err(
+                    "--artifact and --sha256 are only valid when --kind is verdict".to_owned(),
+                );
+            }
             Ok(Command::Attest {
                 identity: identity(flags)?,
                 assignment_id,
@@ -1722,6 +1738,8 @@ fn parse_with_optional_catalog(
                 verdict,
                 note: nonempty(flags, "note"),
                 commit_refs,
+                artifact_id,
+                content_sha256,
             })
         }
         "attests" => {

@@ -17,7 +17,7 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.{DB, HarnessHealth}
+  alias Tightbeam.{DB, HarnessHealth, Rules}
   alias Tightbeam.DB.Txn
 
   require Logger
@@ -570,23 +570,56 @@ defmodule Tightbeam.Ledger do
   @spec fail_unclaimable(db(), String.t(), unclaimable()) :: [integer()]
   def fail_unclaimable(db \\ Tightbeam.DB, session_key, reason) do
     {:ok, seqs} =
-      DB.transaction(db, fn txn ->
-        txn
-        |> Txn.q(
-          """
-          UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
-          WHERE sessionKey = ?1 AND status = 'queued'
-            AND NOT EXISTS (
-              SELECT 1 FROM sessions AS s
-              WHERE s.sessionKey = ?1 AND s.state = 'active'
+      DB.transaction_then(
+        db,
+        fn txn ->
+          candidates =
+            Txn.q(
+              txn,
+              """
+              SELECT seq FROM turns
+              WHERE sessionKey=?1 AND status='queued'
+                AND NOT EXISTS (
+                  SELECT 1 FROM sessions AS s
+                  WHERE s.sessionKey=?1 AND s.state='active'
+                )
+              ORDER BY seq
+              """,
+              [session_key]
             )
-          RETURNING seq
-          """,
-          [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
-        )
-        |> Enum.map(&hd/1)
-        |> Enum.sort()
-      end)
+
+          transitions =
+            candidates
+            |> Enum.map(fn [seq] ->
+              turn_terminal_transition_in_txn(txn, seq, "queued", "failed")
+            end)
+            |> Enum.reject(&is_nil/1)
+
+          seqs =
+            txn
+            |> Txn.q(
+              """
+              UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
+              WHERE sessionKey = ?1 AND status = 'queued'
+                AND NOT EXISTS (
+                  SELECT 1 FROM sessions AS s
+                  WHERE s.sessionKey = ?1 AND s.state = 'active'
+                )
+              RETURNING seq
+              """,
+              [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
+            )
+            |> Enum.map(&hd/1)
+            |> Enum.sort()
+
+          Enum.each(transitions, &DB.record_row_commit(txn, &1))
+          seqs
+        end,
+        fn txn, seqs ->
+          Rules.row_commit_in_txn(txn, [])
+          seqs
+        end
+      )
 
     seqs
   end
@@ -605,9 +638,14 @@ defmodule Tightbeam.Ledger do
   def finish(db \\ Tightbeam.DB, seq, terminal, error \\ nil)
       when terminal in ~w(delivered canceled failed failed_unknown) do
     {:ok, won} =
-      DB.transaction(db, fn txn ->
-        finish_in_txn(txn, seq, terminal, error)
-      end)
+      DB.transaction_then(
+        db,
+        fn txn -> finish_in_txn(txn, seq, terminal, error) end,
+        fn txn, won ->
+          Rules.row_commit_in_txn(txn, [])
+          won
+        end
+      )
 
     if won, do: :ok, else: :already_terminal
   end
@@ -617,6 +655,7 @@ defmodule Tightbeam.Ledger do
   def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil)
       when terminal in ~w(delivered canceled failed failed_unknown) do
     now = System.system_time(:millisecond)
+    transition = turn_terminal_transition_in_txn(txn, seq, "running", terminal)
 
     Txn.q(
       txn,
@@ -624,7 +663,37 @@ defmodule Tightbeam.Ledger do
       [seq, terminal, now, error]
     )
 
-    Txn.changes(txn) == 1
+    won = Txn.changes(txn) == 1
+    if won and transition, do: DB.record_row_commit(txn, transition)
+    won
+  end
+
+  defp turn_terminal_transition_in_txn(txn, seq, old_status, terminal) do
+    case Txn.q(
+           txn,
+           """
+           SELECT t.wakeId, t.origin, t.assignmentId, a.workItemId, s.ownerUserId
+           FROM turns t
+           JOIN sessions s ON s.sessionKey=t.sessionKey
+           LEFT JOIN assignments a ON a.id=t.assignmentId
+           WHERE t.seq=?1 AND t.status=?2
+           """,
+           [seq, old_status]
+         ) do
+      [[wake_id, origin, assignment_id, work_item_id, owner_user_id]] ->
+        %{
+          verb: if(is_binary(wake_id), do: "wake", else: "post"),
+          domain: "turn",
+          row_id: seq,
+          owner_user_id: owner_user_id,
+          principal: origin,
+          bindings: %{assignmentId: assignment_id, workItemId: work_item_id},
+          field: %{name: "status", old: old_status, new: terminal}
+        }
+
+      [] ->
+        nil
+    end
   end
 
   @doc """
@@ -643,6 +712,11 @@ defmodule Tightbeam.Ledger do
         [session_key]
       )
 
+    transitions =
+      rows
+      |> Enum.map(fn [seq] -> turn_terminal_transition_in_txn(txn, seq, "queued", "canceled") end)
+      |> Enum.reject(&is_nil/1)
+
     Txn.q(
       txn,
       """
@@ -651,6 +725,8 @@ defmodule Tightbeam.Ledger do
       """,
       [session_key, System.system_time(:millisecond), reason]
     )
+
+    Enum.each(transitions, &DB.record_row_commit(txn, &1))
 
     Enum.map(rows, &hd/1)
   end
@@ -665,33 +741,46 @@ defmodule Tightbeam.Ledger do
     now = System.system_time(:millisecond)
 
     {:ok, {seqs, publications}} =
-      DB.transaction(db, fn txn ->
-        rows = Txn.q(txn, "SELECT seq FROM turns WHERE status = 'running'")
-        seqs = Enum.map(rows, fn [seq] -> seq end)
+      DB.transaction_then(
+        db,
+        fn txn ->
+          rows = Txn.q(txn, "SELECT seq FROM turns WHERE status = 'running'")
+          seqs = Enum.map(rows, fn [seq] -> seq end)
 
-        Txn.q(
-          txn,
-          """
-            UPDATE turns SET status = 'failed_unknown', endedAt = ?1,
-                             error = COALESCE(error, 'interrupted: outcome unknown')
-            WHERE status = 'running'
-          """,
-          [now]
-        )
+          transitions =
+            Enum.map(seqs, &turn_terminal_transition_in_txn(txn, &1, "running", "failed_unknown"))
 
-        publications =
-          Enum.map(seqs, fn seq ->
-            HarnessHealth.observe_terminal_in_txn(
-              txn,
-              seq,
-              "interrupted-outcome-unknown",
-              "boot recovery interrupted the running turn; outcome unknown",
-              "process:tightbeam"
-            )
+          Txn.q(
+            txn,
+            """
+              UPDATE turns SET status = 'failed_unknown', endedAt = ?1,
+                               error = COALESCE(error, 'interrupted: outcome unknown')
+              WHERE status = 'running'
+            """,
+            [now]
+          )
+
+          publications =
+            Enum.map(seqs, fn seq ->
+              HarnessHealth.observe_terminal_in_txn(
+                txn,
+                seq,
+                "interrupted-outcome-unknown",
+                "boot recovery interrupted the running turn; outcome unknown",
+                "process:tightbeam"
+              )
+            end)
+
+          {seqs, publications}
+          |> tap(fn _ ->
+            Enum.each(Enum.reject(transitions, &is_nil/1), &DB.record_row_commit(txn, &1))
           end)
-
-        {seqs, publications}
-      end)
+        end,
+        fn txn, result ->
+          Rules.row_commit_in_txn(txn, [])
+          result
+        end
+      )
 
     Enum.each(publications, fn publication ->
       if is_function(publication, 0), do: publication.()

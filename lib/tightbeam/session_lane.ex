@@ -18,7 +18,7 @@ defmodule Tightbeam.SessionLane do
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Ledger, Placement}
+  alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Ledger, Placement, Rules}
 
   defstruct [
     :session_key,
@@ -317,13 +317,20 @@ defmodule Tightbeam.SessionLane do
     {finish_result, recorded} =
       if in_txn do
         {:ok, {won, recorded}} =
-          DB.transaction(state.db, fn txn ->
-            if Ledger.finish_in_txn(txn, seq, terminal, error) do
-              {true, in_txn.(txn)}
-            else
-              {false, nil}
+          DB.transaction_then(
+            state.db,
+            fn txn ->
+              if Ledger.finish_in_txn(txn, seq, terminal, error) do
+                {true, in_txn.(txn)}
+              else
+                {false, nil}
+              end
+            end,
+            fn txn, result ->
+              Rules.row_commit_in_txn(txn, [])
+              result
             end
-          end)
+          )
 
         {if(won, do: :ok, else: :already_terminal), recorded}
       else

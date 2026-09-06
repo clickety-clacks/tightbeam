@@ -417,14 +417,22 @@ defmodule Tightbeam.Gateway do
     fn provider ->
       scope = "#{machine}:#{provider}"
 
-      case DB.transaction(db, fn txn ->
-             ConditionFacts.file_in_txn(txn, %{
-               kind: "credential-present",
-               scope: scope,
-               origin: "process:tightbeam"
-             })
-           end) do
-        {:ok, %{fact_id: fact_id}} ->
+      case DB.transaction_then(
+             db,
+             fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "credential-present",
+                 scope: scope,
+                 origin: "process:tightbeam"
+               })
+             end,
+             fn txn, fact ->
+               Rules.row_commit_in_txn(txn, [])
+               {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
+             end
+           ) do
+        {:ok, {%{fact_id: fact_id}, deliveries}} ->
+          Enum.each(deliveries, &complete_delivery(db, &1))
           Tightbeam.Productions.CatalogRederive.recognize(db, catalog, fact_id)
 
         other ->
@@ -6464,28 +6472,35 @@ defmodule Tightbeam.Gateway do
           %{owner_user_id: ^owner} = session ->
             if session.state == "active" do
               {:ok, result} =
-                DB.transaction(db, fn txn ->
-                  result =
-                    retire_cascade_in_txn(
-                      txn,
-                      session.session_key,
-                      owner,
-                      call.origin,
-                      Map.fetch!(config, :wake_tick_ms),
-                      "retired: session retired before execution"
-                    )
+                DB.transaction_then(
+                  db,
+                  fn txn ->
+                    result =
+                      retire_cascade_in_txn(
+                        txn,
+                        session.session_key,
+                        owner,
+                        call.origin,
+                        Map.fetch!(config, :wake_tick_ms),
+                        "retired: session retired before execution"
+                      )
 
-                  if result.retired != [] and p[:idempotency_key] do
-                    Idempotency.put_in_txn(txn, %{
-                      owner_user_id: owner,
-                      operation: "retire",
-                      idempotency_key: p.idempotency_key,
-                      session_key: session.session_key
-                    })
+                    if result.retired != [] and p[:idempotency_key] do
+                      Idempotency.put_in_txn(txn, %{
+                        owner_user_id: owner,
+                        operation: "retire",
+                        idempotency_key: p.idempotency_key,
+                        session_key: session.session_key
+                      })
+                    end
+
+                    result
+                  end,
+                  fn txn, result ->
+                    Rules.row_commit_in_txn(txn, [])
+                    result
                   end
-
-                  result
-                end)
+                )
 
               Enum.each(result.retired, fn retired ->
                 broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
@@ -6799,36 +6814,43 @@ defmodule Tightbeam.Gateway do
         %{session | host: host}
       )
 
-    case DB.transaction(db, fn txn ->
-           [[current_host]] =
-             Txn.q(txn, "SELECT host FROM sessions WHERE sessionKey=?1", [
-               session.session_key
-             ])
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             [[current_host]] =
+               Txn.q(txn, "SELECT host FROM sessions WHERE sessionKey=?1", [
+                 session.session_key
+               ])
 
-           cond do
-             current_host != session.host ->
-               :placement_changed
+             cond do
+               current_host != session.host ->
+                 :placement_changed
 
-             not EffortCheckin.prepared_rearms_current?(
-               txn,
-               session.session_key,
-               prepared
-             ) ->
-               :retry
-
-             true ->
-               Org.set_host_in_txn(txn, session.session_key, host)
-
-               EffortCheckin.apply_prepared_rearms_in_txn(
+               not EffortCheckin.prepared_rearms_current?(
                  txn,
-                 config,
                  session.session_key,
                  prepared
-               )
+               ) ->
+                 :retry
 
-               :ok
+               true ->
+                 Org.set_host_in_txn(txn, session.session_key, host)
+
+                 EffortCheckin.apply_prepared_rearms_in_txn(
+                   txn,
+                   config,
+                   session.session_key,
+                   prepared
+                 )
+
+                 :ok
+             end
+           end,
+           fn txn, result ->
+             Rules.row_commit_in_txn(txn, [])
+             result
            end
-         end) do
+         ) do
       {:ok, :ok} ->
         :ok
 

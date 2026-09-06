@@ -42,6 +42,19 @@ defmodule Tightbeam.RailRemedy do
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
 
+  @doc false
+  def resolve_notice(db, notice, bindings) when is_map(notice) and is_map(bindings) do
+    target = Map.take(notice, [:target_role, :target_session])
+    params = Map.take(notice, [:prompt])
+
+    with {:ok, resolved_target} <- resolve_map(target, bindings),
+         {:ok, resolved_params} <- resolve_map(params, bindings),
+         {:ok, resolved} <-
+           bind_target(db, "wake", %{target: resolved_target, params: resolved_params}) do
+      {:ok, resolved}
+    end
+  end
+
   @doc "Fire one remedy decision through the episode CAS and producer dispatch."
   @spec fire(DB.server(), Dispatch.handlers(), map(), String.t(), map()) :: outcome()
   def fire(db, handlers, rule, subject, call) do

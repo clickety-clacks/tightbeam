@@ -24,7 +24,8 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, TurnObservations}
+  alias Tightbeam.{DB, Rules, TurnObservations}
+  alias Tightbeam.DB.Txn
 
   @outside_workspace "artifact origin is outside its session workspace"
 
@@ -35,6 +36,7 @@ defmodule Tightbeam.Artifacts do
     description       TEXT,
     createdBySession  TEXT NOT NULL REFERENCES sessions(sessionKey),
     workItemId        TEXT NOT NULL REFERENCES work_items(id),
+    producedByAssignmentId TEXT NULL REFERENCES assignments(id),
     parentSession     TEXT REFERENCES sessions(sessionKey),
     originPath        TEXT NOT NULL,
     contentSha256     TEXT,
@@ -52,6 +54,7 @@ defmodule Tightbeam.Artifacts do
 
   @index_ddl [
     "CREATE INDEX IF NOT EXISTS artifacts_work_item ON artifacts (workItemId)",
+    "CREATE INDEX IF NOT EXISTS artifacts_producer ON artifacts (producedByAssignmentId)",
     "CREATE INDEX IF NOT EXISTS artifacts_created_by_session ON artifacts (createdBySession)",
     "CREATE INDEX IF NOT EXISTS artifacts_recorded_message ON artifacts (recordedMessageId)"
   ]
@@ -87,35 +90,77 @@ defmodule Tightbeam.Artifacts do
         parent_session = parent_session(db, session_key)
         {recorded_message_id, evidence} = turn_evidence(db, session_key)
         now = now()
+        producer_id = call.params[:produced_by_assignment_id]
 
-        {:ok, _} =
-          DB.query(
-            db,
-            """
-            INSERT INTO artifacts
-              (artifactId, kind, title, description, createdBySession, workItemId,
-               parentSession, originPath, contentSha256, recordedMessageId,
-               recordedTurnEvidence, state, home, createdAt, updatedAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                    'in-workspace', NULL, ?12, ?12)
-            """,
-            [
-              artifact_id,
-              call.params.kind,
-              call.params.title,
-              call.params[:description],
-              session_key,
-              work_item_id,
-              parent_session,
-              call.params.origin_path,
-              call.params[:content_sha256],
-              recorded_message_id,
-              evidence,
-              now
-            ]
-          )
+        case DB.transaction_then(
+               db,
+               fn txn ->
+                 case validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
+                   :ok ->
+                     Txn.q(
+                       txn,
+                       """
+                       INSERT INTO artifacts
+                         (artifactId, kind, title, description, createdBySession, workItemId,
+                          producedByAssignmentId, parentSession, originPath, contentSha256,
+                          recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                               'in-workspace', NULL, ?13, ?13)
+                       """,
+                       [
+                         artifact_id,
+                         call.params.kind,
+                         call.params.title,
+                         call.params[:description],
+                         session_key,
+                         work_item_id,
+                         producer_id,
+                         parent_session,
+                         call.params.origin_path,
+                         call.params[:content_sha256],
+                         recorded_message_id,
+                         evidence,
+                         now
+                       ]
+                     )
 
-        get(db, artifact_id)
+                     {:created, artifact_in_txn(txn, artifact_id)}
+
+                   error ->
+                     error
+                 end
+               end,
+               fn txn, result ->
+                 case result do
+                   {:created, artifact} ->
+                     [[owner]] =
+                       Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id=?1", [work_item_id])
+
+                     Rules.row_commit_in_txn(txn, %{
+                       verb: "artifact-record",
+                       domain: "artifact",
+                       row_id: artifact_id,
+                       owner_user_id: owner,
+                       principal: "session:#{session_key}",
+                       bindings: %{
+                         artifact: %{
+                           artifactId: artifact_id,
+                           contentSha256: artifact.content_sha256
+                         }
+                       },
+                       fields: %{present: %{old: false, new: true}}
+                     })
+
+                     artifact
+
+                   error ->
+                     error
+                 end
+               end
+             ) do
+          {:ok, result} -> result
+          {:error, error} -> raise error
+        end
 
       {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->
         %{code: "invalid", message: "artifact-record requires provenance edges"}
@@ -124,6 +169,36 @@ defmodule Tightbeam.Artifacts do
         %{code: "invalid", message: "artifact-record requires a session caller"}
     end
   end
+
+  defp validate_producer_in_txn(_txn, nil, _session_key, _work_item_id), do: :ok
+
+  defp validate_producer_in_txn(txn, producer_id, session_key, work_item_id)
+       when is_binary(producer_id) and producer_id != "" do
+    case Txn.q(
+           txn,
+           """
+           SELECT 1
+           FROM assignments a
+           JOIN sessions s ON s.sessionKey=a.holderKey
+           JOIN work_items wi ON wi.id=a.workItemId
+           WHERE a.id=?1 AND a.holderKey=?2 AND a.workItemId=?3
+             AND s.ownerUserId=wi.ownerUserId
+           """,
+           [producer_id, session_key, work_item_id]
+         ) do
+      [[1]] ->
+        :ok
+
+      [] ->
+        %{
+          code: "invalid_producer",
+          message: "artifact producer must be a held assignment on the artifact work item"
+        }
+    end
+  end
+
+  defp validate_producer_in_txn(_txn, _producer_id, _session_key, _work_item_id),
+    do: %{code: "invalid_producer", message: "producedByAssignmentId must be nonblank text"}
 
   # The best edge the substrate OBSERVED, with the observation method named.
   #
@@ -159,6 +234,12 @@ defmodule Tightbeam.Artifacts do
     case DB.query(db, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [artifact_id]) do
       {:ok, [row]} -> artifact(row)
       {:ok, []} -> nil
+    end
+  end
+
+  defp artifact_in_txn(txn, artifact_id) do
+    case Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId=?1", [artifact_id]) do
+      [row] -> artifact(row)
     end
   end
 
@@ -462,7 +543,7 @@ defmodule Tightbeam.Artifacts do
   defp columns do
     """
     artifactId, kind, title, description, createdBySession, workItemId,
-    parentSession, originPath, contentSha256, recordedMessageId,
+    producedByAssignmentId, parentSession, originPath, contentSha256, recordedMessageId,
     recordedTurnEvidence, state, home, createdAt, updatedAt
     """
   end
@@ -474,6 +555,7 @@ defmodule Tightbeam.Artifacts do
          description,
          created_by_session,
          work_item_id,
+         produced_by_assignment_id,
          parent_session,
          origin_path,
          content_sha256,
@@ -491,6 +573,7 @@ defmodule Tightbeam.Artifacts do
       description: description,
       created_by_session: created_by_session,
       work_item_id: work_item_id,
+      produced_by_assignment_id: produced_by_assignment_id,
       parent_session: parent_session,
       origin_path: origin_path,
       content_sha256: content_sha256,

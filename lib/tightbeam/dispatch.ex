@@ -14,7 +14,7 @@ defmodule Tightbeam.Dispatch do
   the CALLER's process (a socket, an HTTP request task, the scheduler), and
   anything long-running goes through the Ledger/lane pipeline, never inline.
 
-  Before a known handler runs, the deny-only `Tightbeam.Rules` tier evaluates
+  Before a known handler runs, the `Tightbeam.Rules` tier evaluates
   the raw call. A statute denial or fact error appends kind "denied" and
   returns immediately; that audit append is best-effort so an unavailable
   sink cannot fail open. All calls that pass statutes retain the existing
@@ -142,7 +142,7 @@ defmodule Tightbeam.Dispatch do
         {:error, ctx.error}
 
       :allow ->
-        consumed = Enum.map(to_consume, &{&1, Escalation.consume(db, &1)})
+        consumed = Enum.map(to_consume, &{&1, Escalation.consume(db, &1, verb, origin)})
 
         case Enum.find(consumed, fn {_id, won?} -> not won? end) do
           nil ->
@@ -173,6 +173,9 @@ defmodule Tightbeam.Dispatch do
   # is a lowercase string, never an atom.
   defp close(db, {:episodes, statute, position}),
     do: RailEpisodes.recovered(db, statute, position)
+
+  defp close(db, {:notice, rule, call, evidence}),
+    do: Rules.deliver_notice(db, rule, call, evidence)
 
   defp close(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)

@@ -539,7 +539,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
                1,
              {"lib/tightbeam/assignments.ex", "Gateway.deliver_prompt_in_txn/5",
               "open_dispatch_result/2"} => 1,
-             {"lib/tightbeam/wakes.ex", "Gateway.deliver_prompt_in_txn/5", "fire_in_txn/2"} => 1,
+             {"lib/tightbeam/wakes.ex", "Gateway.deliver_prompt_in_txn/5", "fire_in_txn/3"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt_in_txn/5", "deliver_prompt/4"} =>
                1,
              # `deliver_prompt_in_txn/5` declines undeliverable addresses BEFORE

@@ -1527,7 +1527,8 @@ defmodule Tightbeam.EscalationTest do
              )
   end
 
-  test "atomic ruling failures roll back every ordered step and recover from nudge loss", ctx do
+  test "atomic ruling failures roll back every ordered step and recognition survives nudge loss",
+       ctx do
     for step <- [
           :after_load,
           :after_schedule,
@@ -1575,7 +1576,7 @@ defmodule Tightbeam.EscalationTest do
              )
            )
 
-    assert {:ok, [["ruled", fact_id, wake_id, "pending"]]} =
+    assert {:ok, [["ruled", fact_id, wake_id, "fired"]]} =
              DB.query(
                ctx.db,
                "SELECT d.status,d.rulingFactId,w.wakeId,w.state FROM decision_requests d JOIN wakes w ON w.conditionKind='escalation-ruled' AND w.conditionScope=d.id WHERE d.id=?1",
@@ -2130,7 +2131,7 @@ defmodule Tightbeam.EscalationTest do
     end
   end
 
-  test "an evaluator cannot observe the schedule-before-fact transaction until commit", _ctx do
+  test "row recognition cannot observe the schedule-before-fact transaction until commit", _ctx do
     path =
       Path.join(
         System.tmp_dir!(),
@@ -2142,18 +2143,12 @@ defmodule Tightbeam.EscalationTest do
     writer = :"terminal_writer_#{System.unique_integer([:positive])}"
     observer = :"terminal_observer_#{System.unique_integer([:positive])}"
     reader = :"terminal_reader_#{System.unique_integer([:positive])}"
-    evaluator = :"terminal_observer_scheduler_#{System.unique_integer([:positive])}"
 
     start_supervised!({DB, path: path, name: writer}, id: writer)
     assert :ok = ensure_all_schemas(writer)
     raiser = session(writer, "transaction-raiser", "flynn")
     start_supervised!({DB, path: path, name: observer}, id: observer)
     start_supervised!({DB, path: path, name: reader}, id: reader)
-
-    start_supervised!(
-      {Wakes, db: observer, name: evaluator, tick_ms: 60_000, deliver: fn _ -> :ok end},
-      id: evaluator
-    )
 
     request =
       Escalation.operator_ask(writer, operator_call(raiser, %{question: "transaction barrier?"}))
@@ -2180,9 +2175,6 @@ defmodule Tightbeam.EscalationTest do
 
     assert_receive {:scheduled_uncommitted, writer_pid}
 
-    evaluator_task = Task.async(fn -> Wakes.fire_due(evaluator) end)
-    wait_until_waiting!(evaluator_task)
-
     assert {:ok, [[0, 0]]} =
              DB.query(
                reader,
@@ -2192,17 +2184,15 @@ defmodule Tightbeam.EscalationTest do
 
     send(writer_pid, :commit_terminal_ruling)
     ruled = Task.await(task)
-    assert :ok = Task.await(evaluator_task)
 
-    assert {:ok, [[cursor]]} =
+    assert {:ok, [[cursor, "fired", "condition"]]} =
              DB.query(
                observer,
-               "SELECT conditionAfterId FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
+               "SELECT conditionAfterId,state,firedBy FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
                [request.id]
              )
 
     assert cursor < ruled.ruling_fact_id
-    assert :ok = Wakes.fire_matching(evaluator, ruled.ruling_fact_id)
 
     rollback =
       Escalation.operator_ask(writer, operator_call(raiser, %{question: "transaction rollback?"}))

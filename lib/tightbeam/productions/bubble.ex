@@ -38,6 +38,7 @@ defmodule Tightbeam.Productions.Bubble do
     HarnessHealth,
     Org,
     Projection,
+    Rules,
     Supervision
   }
 
@@ -282,7 +283,7 @@ defmodule Tightbeam.Productions.Bubble do
               db,
               escalation,
               recipient,
-              Gateway.complete_delivery(db, delivery)
+              ConditionFacts.complete_deliveries(db, [delivery])
             )
 
           :exhausted ->
@@ -334,49 +335,64 @@ defmodule Tightbeam.Productions.Bubble do
 
     main_key = Org.personal_session_key(escalation.owner_user_id)
 
-    {:ok, published} =
-      DB.transaction(db, fn txn ->
-        {route_state, stream?} =
-          case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
-            [["active"]] -> {"owner_alerted", true}
-            _ -> {"record_only", false}
-          end
+    {:ok, {published, deliveries}} =
+      DB.transaction_then(
+        db,
+        fn txn ->
+          {route_state, stream?} =
+            case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
+              [["active"]] -> {"owner_alerted", true}
+              _ -> {"record_only", false}
+            end
 
-        DB.Txn.q(
-          txn,
-          """
-          UPDATE patrol_failure_escalations SET state=?2, updatedAt=?3
-          WHERE id=?1 AND state IN ('pending','admitted')
-          """,
-          [escalation.id, route_state, System.system_time(:millisecond)]
-        )
-
-        if DB.Txn.changes(txn) == 1 do
-          EventLog.lifecycle_in_txn(
+          DB.Txn.q(
             txn,
-            "patrol_failure_lineage_exhausted",
-            escalation.owner_user_id,
-            "escalationId=#{escalation.id} session=#{escalation.session_key} thresholdTurnSeq=#{escalation.threshold_turn_seq} principal=process:tightbeam"
+            """
+            UPDATE patrol_failure_escalations SET state=?2, updatedAt=?3
+            WHERE id=?1 AND state IN ('pending','admitted')
+            """,
+            [escalation.id, route_state, System.system_time(:millisecond)]
           )
 
-          ConditionFacts.file_in_txn(txn, %{
-            kind: "user-alerted",
-            scope: escalation.owner_user_id,
-            origin: "process:tightbeam"
-          })
+          if DB.Txn.changes(txn) == 1 do
+            EventLog.lifecycle_in_txn(
+              txn,
+              "patrol_failure_lineage_exhausted",
+              escalation.owner_user_id,
+              "escalationId=#{escalation.id} session=#{escalation.session_key} thresholdTurnSeq=#{escalation.threshold_turn_seq} principal=process:tightbeam"
+            )
 
-          if stream? do
-            {:appended, marker} =
-              Projection.append_substrate_in_txn(txn, main_key, message, :high)
+            fact =
+              ConditionFacts.file_in_txn(txn, %{
+                kind: "user-alerted",
+                scope: escalation.owner_user_id,
+                origin: "process:tightbeam",
+                owner_user_id: escalation.owner_user_id
+              })
 
-            {:ok, marker}
+            if stream? do
+              {:appended, marker} =
+                Projection.append_substrate_in_txn(txn, main_key, message, :high)
+
+              {{:ok, marker}, fact.fact_id}
+            else
+              {:no_stream, fact.fact_id}
+            end
           else
-            :no_stream
+            {:already_terminal, nil}
           end
-        else
-          :already_terminal
+        end,
+        fn txn, {published, fact_id} ->
+          Rules.row_commit_in_txn(txn, [])
+
+          deliveries =
+            if is_integer(fact_id), do: ConditionFacts.recognize_in_txn(txn, fact_id), else: []
+
+          {published, deliveries}
         end
-      end)
+      )
+
+    ConditionFacts.complete_deliveries(db, deliveries)
 
     case published do
       {:ok, marker} ->
@@ -424,35 +440,46 @@ defmodule Tightbeam.Productions.Bubble do
 
     main_key = Org.personal_session_key(turn.owner)
 
-    {:ok, published} =
-      DB.transaction(db, fn txn ->
-        EventLog.lifecycle_in_txn(
-          txn,
-          "lineage_exhausted",
-          turn.owner,
-          "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
-        )
+    {:ok, {published, deliveries}} =
+      DB.transaction_then(
+        db,
+        fn txn ->
+          EventLog.lifecycle_in_txn(
+            txn,
+            "lineage_exhausted",
+            turn.owner,
+            "cause_seq=#{turn.cause_seq} session=#{cause.session_key}"
+          )
 
-        ConditionFacts.file_in_txn(txn, %{
-          kind: "user-alerted",
-          scope: turn.owner,
-          origin: "process:tightbeam"
-        })
+          fact =
+            ConditionFacts.file_in_txn(txn, %{
+              kind: "user-alerted",
+              scope: turn.owner,
+              origin: "process:tightbeam",
+              owner_user_id: turn.owner
+            })
 
-        # The owner's main-session key is COMPOSED; when no row carries the
-        # stream, the fact and the record still commit — log it and be done;
-        # the alert becomes product surface when a main session exists.
-        case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
-          [["active"]] ->
-            {:appended, marker} =
-              Projection.append_substrate_in_txn(txn, main_key, message, :high)
+          # The owner's main-session key is COMPOSED; when no row carries the
+          # stream, the fact and the record still commit — log it and be done;
+          # the alert becomes product surface when a main session exists.
+          case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [main_key]) do
+            [["active"]] ->
+              {:appended, marker} =
+                Projection.append_substrate_in_txn(txn, main_key, message, :high)
 
-            {:ok, marker}
+              {{:ok, marker}, fact.fact_id}
 
-          _ ->
-            :no_stream
+            _ ->
+              {:no_stream, fact.fact_id}
+          end
+        end,
+        fn txn, {published, fact_id} ->
+          Rules.row_commit_in_txn(txn, [])
+          {published, ConditionFacts.recognize_in_txn(txn, fact_id)}
         end
-      end)
+      )
+
+    ConditionFacts.complete_deliveries(db, deliveries)
 
     case published do
       {:ok, marker} ->
@@ -687,14 +714,23 @@ defmodule Tightbeam.Productions.Bubble do
   end
 
   defp file_fact(db, kind, scope) do
-    case DB.transaction(db, fn txn ->
-           ConditionFacts.file_in_txn(txn, %{
-             kind: kind,
-             scope: scope,
-             origin: "process:tightbeam"
-           })
-         end) do
-      {:ok, %{fact_id: _}} ->
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             ConditionFacts.file_in_txn(txn, %{
+               kind: kind,
+               scope: scope,
+               origin: "process:tightbeam",
+               owner_user_id: scope
+             })
+           end,
+           fn txn, fact ->
+             Rules.row_commit_in_txn(txn, [])
+             {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
+           end
+         ) do
+      {:ok, {%{fact_id: _}, deliveries}} ->
+        ConditionFacts.complete_deliveries(db, deliveries)
         :ok
 
       other ->

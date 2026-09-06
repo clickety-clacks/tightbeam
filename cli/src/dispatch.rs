@@ -180,6 +180,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             description,
             work_item_id,
             content_sha256,
+            produced_by_assignment_id,
         } => {
             let mut params = vec![
                 string_field("kind", kind),
@@ -190,6 +191,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("description", description),
                 ("workItemId", work_item_id),
                 ("contentSha256", content_sha256),
+                ("producedByAssignmentId", produced_by_assignment_id),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -711,6 +713,8 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             verdict,
             note,
             commit_refs,
+            artifact_id,
+            content_sha256,
         } => {
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
@@ -727,6 +731,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     "\"commitRefs\":{}",
                     serde_json::to_string(value).expect("commit refs are JSON serializable")
                 ));
+            }
+            if let Some(value) = artifact_id {
+                params.push(string_field("artifactId", value));
+            }
+            if let Some(value) = content_sha256 {
+                params.push(string_field("contentSha256", value));
             }
             Ok(request(identity, "attest", vec![], params))
         }
