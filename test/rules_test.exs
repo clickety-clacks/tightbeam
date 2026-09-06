@@ -1472,6 +1472,60 @@ defmodule Tightbeam.RulesTest do
            end)
   end
 
+  test "row-commit caller facts and notices preserve a remedy principal", ctx do
+    target = session(ctx.db, "row-remedy-target", "flynn", archetype: "coder")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "remedy-opened-assignment"
+    verb = "assign"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "record remedy assignment opening"
+    deny_when = [
+      { fact = "assignment.state", op = "eq", value = "open" },
+      { fact = "caller.origin_class", op = "eq", value = "remedy" },
+      { fact = "caller.user", op = "eq", value = "flynn" }
+    ]
+
+    [rule.notice]
+    target_session = "row-remedy-target"
+    prompt = "remedy assignment opened"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    principal = {:remedy, %{statute: "assignment-remedy", action: "assign", owner: "flynn"}}
+
+    call =
+      p3_call("assign", {:user, "flynn"}, %{
+        subject: "remedy-created assignment",
+        idempotency_key: nil,
+        reviews_assignment_id: nil,
+        effect_kind: nil,
+        files: nil
+      })
+      |> Map.merge(%{
+        origin: "remedy:assignment-remedy",
+        principal: principal,
+        session_key: target.session_key
+      })
+
+    assert %{id: _assignment_id} = Assignments.__handle__(ctx.db, "assign", call)
+
+    assert [wake] =
+             ctx.db
+             |> Wakes.list_pending()
+             |> Enum.filter(&(&1.prompt == "remedy assignment opened"))
+
+    assert %{detail: detail} =
+             ctx.db
+             |> EventLog.lifecycle_events()
+             |> Enum.find(&(&1.kind == "rule_notice" and &1.subject == wake.wake_id))
+
+    assert detail =~ ~s("principal":"remedy:assignment-remedy")
+  end
+
   test "row-commit rejects effects that cannot run after the governed write", ctx do
     put_raw(ctx, """
     [[rule]]

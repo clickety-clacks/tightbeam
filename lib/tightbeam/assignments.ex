@@ -1921,6 +1921,9 @@ defmodule Tightbeam.Assignments do
   defp principal_id({:session, session}), do: "session:" <> session
   defp principal_id({:remedy, %{owner: owner}}), do: "user:" <> owner
 
+  defp row_commit_principal_id({:remedy, %{statute: statute}}), do: "remedy:" <> statute
+  defp row_commit_principal_id(principal), do: principal_id(principal)
+
   defp supervision_transition!(txn, expected, observation) do
     case Supervision.transition_in_txn(txn, observation) do
       ^expected -> expected
@@ -2020,7 +2023,7 @@ defmodule Tightbeam.Assignments do
       domain: "attest",
       row_id: attest.id,
       owner_user_id: owner,
-      principal: principal_id(call.principal),
+      principal: row_commit_principal_id(call.principal),
       bindings: %{
         assignmentId: assignment.id,
         workItemId: assignment.workItemId,
@@ -2064,7 +2067,7 @@ defmodule Tightbeam.Assignments do
       domain: "assignment",
       row_id: assignment.id,
       owner_user_id: assignment_owner_in_txn(txn, assignment.id),
-      principal: principal_id(call.principal),
+      principal: row_commit_principal_id(call.principal),
       bindings: %{assignmentId: assignment.id, workItemId: assignment.workItemId},
       fields: fields
     }
