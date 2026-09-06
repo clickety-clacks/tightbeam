@@ -8,6 +8,7 @@ defmodule Tightbeam.RulesTest do
     DB,
     Devices,
     Dispatch,
+    Escalation,
     EventLog,
     Gateway,
     Org,
@@ -1441,6 +1442,61 @@ defmodule Tightbeam.RulesTest do
     assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.prompt == "post observed"))
   end
 
+  test "refused operator ask does not publish a fabricated supersession", ctx do
+    raiser = session(ctx.db, "ask-raiser", "flynn")
+    closed_assignment = assignment(ctx, raiser.session_key, {:user, "flynn"})
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed', outcome='revoked', closedAt=1, closedByUser='flynn' WHERE id=?1",
+               [closed_assignment.id]
+             )
+
+    old =
+      Escalation.operator_ask(
+        ctx.db,
+        operator_ask_call(raiser.session_key, %{question: "original decision?"})
+      )
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "observe-supersession"
+    verb = "operator-ask"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "record decision supersession"
+    deny_when = [{ fact = "decision_request.status", op = "eq", value = "open" }]
+
+    [rule.notice]
+    target_session = "ask-raiser"
+    prompt = "decision superseded"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    before_wake_ids = MapSet.new(Wakes.list_pending(ctx.db), & &1.wake_id)
+
+    assert %{code: "not_open"} =
+             Escalation.operator_ask(
+               ctx.db,
+               operator_ask_call(raiser.session_key, %{
+                 question: "refused replacement?",
+                 supersedes: old.id,
+                 assignment: closed_assignment.id
+               })
+             )
+
+    assert Escalation.get(
+             ctx.db,
+             %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{}},
+             old.id
+           ).status == "open"
+
+    pending = Wakes.list_pending(ctx.db)
+    assert MapSet.new(pending, & &1.wake_id) == before_wake_ids
+    refute Enum.any?(pending, &(&1.prompt == "decision superseded"))
+  end
+
   test "row-commit caller facts use the acting session principal", ctx do
     actor = session(ctx.db, "row-actor", "flynn", archetype: "coder")
     target = session(ctx.db, "row-caller-target", "flynn", archetype: "coder")
@@ -1759,6 +1815,16 @@ defmodule Tightbeam.RulesTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000
+    }
+  end
+
+  defp operator_ask_call(session_key, params) do
+    %{
+      verb: "operator-ask",
+      origin: "agent:#{session_key}",
+      principal: {:session, session_key},
+      transport_session_key: session_key,
+      params: params
     }
   end
 

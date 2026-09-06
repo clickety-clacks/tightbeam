@@ -432,29 +432,23 @@ defmodule Tightbeam.Escalation do
             DB.transaction_then(
               db,
               fn txn ->
-                superseded =
+                before =
                   if ask.supersedes, do: request_in_txn_optional(txn, ask.supersedes)
 
                 result = operator_ask_in_txn(txn, call, session_key, owner_user_id, ask, opts)
 
-                transitions =
-                  case superseded do
-                    %{status: "open"} = request ->
-                      [
-                        decision_transition(
-                          request,
-                          "open",
-                          "superseded",
-                          call.origin,
-                          "operator-ask"
-                        )
-                      ]
+                after_request =
+                  if ask.supersedes, do: request_in_txn_optional(txn, ask.supersedes)
 
-                    _ ->
-                      []
-                  end
+                transition =
+                  changed_decision_transition(
+                    before,
+                    after_request,
+                    call.origin,
+                    "operator-ask"
+                  )
 
-                {result, transitions}
+                {result, List.wrap(transition)}
               end,
               fn txn, {result, transitions} ->
                 Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
