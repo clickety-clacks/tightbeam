@@ -2893,7 +2893,7 @@ defmodule Tightbeam.Wakes do
   end
 
   defp evaluate_conditions(%{db: db, batch: batch}, mode) do
-    {rows, watermark} = select_candidates(db, batch, mode)
+    {rows, watermark, condition_saturated?} = select_candidates(db, batch, mode)
 
     rows
     |> Enum.sort_by(fn
@@ -2911,10 +2911,7 @@ defmodule Tightbeam.Wakes do
       advance_watermark(db, rows, batch, watermark)
     end
 
-    saturated? =
-      Enum.any?(~w(C F), fn branch ->
-        Enum.count(rows, &(hd(&1) == branch)) == batch
-      end)
+    saturated? = condition_saturated? or Enum.count(rows, &(hd(&1) == "F")) == batch
 
     if saturated?, do: :saturated, else: :done
   end
@@ -2924,77 +2921,82 @@ defmodule Tightbeam.Wakes do
       [[after_fact]] = Txn.q(txn, "SELECT afterFact FROM scheduler_state WHERE id = 0")
       [[ceil]] = Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
 
-      rows =
+      fact_ids =
         Txn.q(
           txn,
-          """
-          SELECT * FROM (
+          "SELECT id FROM condition_facts WHERE id>?1 AND id<=?2 ORDER BY id LIMIT ?3",
+          [after_fact, ceil, batch]
+        )
+        |> Enum.map(&hd/1)
+
+      processed_fact = List.last(fact_ids) || ceil
+
+      condition_rows =
+        if fact_ids == [] do
+          []
+        else
+          Txn.q(
+            txn,
+            """
             SELECT 'C' AS branch, w.wakeId, f.id AS factId, f.scope, w.rowid AS rid
             FROM condition_facts f
             JOIN wakes w INDEXED BY wakes_condition ON w.conditionKind=f.kind
             WHERE f.id>?1 AND f.id<=?2 AND w.state='pending' AND f.id>w.conditionAfterId
-            ORDER BY f.id, w.rowid LIMIT ?3
+            ORDER BY f.id, w.rowid
+            """,
+            [after_fact, processed_fact]
           )
-          UNION ALL
-          SELECT * FROM (
-            SELECT 'F' AS branch, w.wakeId, NULL AS factId, NULL AS scope, w.rowid AS rid
-            FROM wakes w INDEXED BY wakes_due
-            WHERE w.state='pending' AND w.dueAt<=?4 AND w.conditionKind IS NOT NULL
-            ORDER BY w.rowid LIMIT ?3
-          )
+        end
+
+      fallback_rows =
+        Txn.q(
+          txn,
+          """
+          SELECT 'F' AS branch, w.wakeId, NULL AS factId, NULL AS scope, w.rowid AS rid
+          FROM wakes w INDEXED BY wakes_due
+          WHERE w.state='pending' AND w.dueAt<=?1 AND w.conditionKind IS NOT NULL
+          ORDER BY w.rowid LIMIT ?2
           """,
-          [after_fact, ceil, batch, now()]
+          [now(), batch]
         )
 
-      {rows, {after_fact, ceil}}
+      condition_saturated? = length(fact_ids) == batch and processed_fact < ceil
+      {condition_rows ++ fallback_rows, processed_fact, condition_saturated?}
     end)
   end
 
   defp select_candidates(db, batch, {:eager, fact_id}) do
     transaction!(db, fn txn ->
-      rows =
+      condition_rows =
         Txn.q(
           txn,
           """
-          SELECT * FROM (
-            SELECT 'C' AS branch, w.wakeId, f.id AS factId, f.scope, w.rowid AS rid
-            FROM condition_facts f
-            JOIN wakes w INDEXED BY wakes_condition ON w.conditionKind=f.kind
-            WHERE f.id=?1 AND w.state='pending' AND f.id>w.conditionAfterId
-            ORDER BY w.rowid LIMIT ?2
-          )
-          UNION ALL
-          SELECT * FROM (
-            SELECT 'F' AS branch, w.wakeId, NULL AS factId, NULL AS scope, w.rowid AS rid
-            FROM wakes w INDEXED BY wakes_due
-            WHERE w.state='pending' AND w.dueAt<=?3 AND w.conditionKind IS NOT NULL
-            ORDER BY w.rowid LIMIT ?2
-          )
+          SELECT 'C' AS branch, w.wakeId, f.id AS factId, f.scope, w.rowid AS rid
+          FROM condition_facts f
+          JOIN wakes w INDEXED BY wakes_condition ON w.conditionKind=f.kind
+          WHERE f.id=?1 AND w.state='pending' AND f.id>w.conditionAfterId
+          ORDER BY w.rowid
           """,
-          [fact_id, batch, now()]
+          [fact_id]
         )
 
-      {rows, nil}
+      fallback_rows =
+        Txn.q(
+          txn,
+          """
+          SELECT 'F' AS branch, w.wakeId, NULL AS factId, NULL AS scope, w.rowid AS rid
+          FROM wakes w INDEXED BY wakes_due
+          WHERE w.state='pending' AND w.dueAt<=?1 AND w.conditionKind IS NOT NULL
+          ORDER BY w.rowid LIMIT ?2
+          """,
+          [now(), batch]
+        )
+
+      {condition_rows ++ fallback_rows, nil, false}
     end)
   end
 
-  defp advance_watermark(db, rows, batch, {after_fact, ceil}) do
-    boundaries =
-      Enum.map(~w(C), fn branch ->
-        branch_rows = Enum.filter(rows, &(hd(&1) == branch))
-
-        if length(branch_rows) < batch do
-          ceil
-        else
-          branch_rows
-          |> Enum.map(&Enum.at(&1, 2))
-          |> Enum.max()
-          |> Kernel.-(1)
-        end
-      end)
-
-    after_fact_new = max(after_fact, Enum.min(boundaries))
-
+  defp advance_watermark(db, _rows, _batch, after_fact_new) do
     {:ok, _} =
       DB.query(db, "UPDATE scheduler_state SET afterFact = ?1 WHERE id = 0", [after_fact_new])
 

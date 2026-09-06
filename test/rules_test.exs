@@ -1441,6 +1441,37 @@ defmodule Tightbeam.RulesTest do
     assert Enum.any?(Wakes.list_pending(ctx.db), &(&1.prompt == "post observed"))
   end
 
+  test "row-commit caller facts use the acting session principal", ctx do
+    actor = session(ctx.db, "row-actor", "flynn", archetype: "coder")
+    target = session(ctx.db, "row-caller-target", "flynn", archetype: "coder")
+
+    put_raw(ctx, """
+    [[rule]]
+    name = "agent-opened-assignment"
+    verb = "assign"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "record agent assignment opening"
+    deny_when = [
+      { fact = "assignment.state", op = "eq", value = "open" },
+      { fact = "caller.origin_class", op = "eq", value = "agent" },
+      { fact = "caller.user", op = "eq", value = "flynn" }
+    ]
+
+    [rule.notice]
+    target_session = "row-caller-target"
+    prompt = "agent assignment opened"
+    """)
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    _opened = assignment(ctx, target.session_key, {:session, actor.session_key})
+
+    assert Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
+             wake.prompt == "agent assignment opened" and
+               wake.creator_session_key == actor.session_key
+           end)
+  end
+
   test "row-commit rejects effects that cannot run after the governed write", ctx do
     put_raw(ctx, """
     [[rule]]
@@ -1599,6 +1630,51 @@ defmodule Tightbeam.RulesTest do
     )
 
     assert {:ok, %{matched: false}} = Rules.evaluate_predicate(ctx.db, predicate)
+  end
+
+  test "artifact presence is one boolean for a fixed producer and hash selector", ctx do
+    producer_holder = session(ctx.db, "presence-producer", "flynn", archetype: "coder")
+    producer = assignment(ctx, producer_holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, producer.id, "wi_presence_selector")
+
+    old_hash = String.duplicate("0", 64)
+    wanted_hash = String.duplicate("1", 64)
+    missing_hash = String.duplicate("2", 64)
+
+    record_revision_artifact(
+      ctx,
+      producer_holder.session_key,
+      producer.id,
+      "wi_presence_selector",
+      old_hash
+    )
+
+    record_revision_artifact(
+      ctx,
+      producer_holder.session_key,
+      producer.id,
+      "wi_presence_selector",
+      wanted_hash
+    )
+
+    predicate = fn hash, present ->
+      %{
+        owner_user_id: "flynn",
+        conditions: [%{fact: "artifact.present", op: "eq", value: present}],
+        bindings: %{
+          artifact: %{produced_by_assignment_id: producer.id, content_sha256: hash}
+        }
+      }
+    end
+
+    assert {:ok, %{matched: false}} =
+             Rules.evaluate_predicate(ctx.db, predicate.(wanted_hash, false))
+
+    assert {:ok, %{matched: true}} =
+             Rules.evaluate_predicate(ctx.db, predicate.(wanted_hash, true))
+
+    assert {:ok, %{matched: true}} =
+             Rules.evaluate_predicate(ctx.db, predicate.(missing_hash, false))
   end
 
   defp call(origin \\ "user:flynn") do

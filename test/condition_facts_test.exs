@@ -449,6 +449,46 @@ defmodule Tightbeam.ConditionFactsTest do
     assert List.last(fired_order) == b_wake
   end
 
+  test "scope nonmatches cannot starve a later matching wake at the batch boundary", ctx do
+    nonmatches =
+      for scope <- ["older-a", "older-b"] do
+        condition_wake(ctx, "batch-scope", scope).wake_id
+      end
+
+    matching = condition_wake(ctx, "batch-scope", "wanted").wake_id
+
+    ConditionFacts.file(ctx.db, ctx.scheduler, %{
+      kind: "batch-scope",
+      scope: "wanted",
+      origin: "process:ci"
+    })
+
+    assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, matching)
+    assert Enum.all?(nonmatches, &(Wakes.get(ctx.db, &1).state == "pending"))
+  end
+
+  test "recovery advances its fact watermark after a full batch of scope nonmatches", ctx do
+    for scope <- ["older-a", "older-b"] do
+      condition_wake(ctx, "recovery-scope", scope)
+    end
+
+    matching = condition_wake(ctx, "recovery-scope", "wanted").wake_id
+
+    {:ok, fact} =
+      DB.transaction(ctx.db, fn txn ->
+        ConditionFacts.file_in_txn(txn, %{
+          kind: "recovery-scope",
+          scope: "wanted",
+          origin: "process:ci"
+        })
+      end)
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, matching)
+    assert {:ok, [[after_fact]]} = DB.query(ctx.db, "SELECT afterFact FROM scheduler_state")
+    assert after_fact >= fact.fact_id
+  end
+
   test "shared harness health keeps auth and rate-limit standing states distinct", ctx do
     scope = ConditionFacts.harness_scope("claude", "gibson")
     assert scope == JSON.encode!(["claude", "gibson"])

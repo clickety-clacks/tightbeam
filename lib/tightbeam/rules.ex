@@ -532,16 +532,24 @@ defmodule Tightbeam.Rules do
               [artifact_id, owner]
             )
 
-          %{"producedByAssignmentId" => producer} ->
+          %{"producedByAssignmentId" => producer} = artifact_binding ->
+            expected_hash = Map.get(artifact_binding, "contentSha256")
+            hash_clause = if is_binary(expected_hash), do: " AND art.contentSha256=?3", else: ""
+
+            params =
+              if is_binary(expected_hash),
+                do: [producer, owner, expected_hash],
+                else: [producer, owner]
+
             DB.Txn.q(
               txn,
               """
               SELECT art.artifactId, art.contentSha256, art.producedByAssignmentId
               FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId
-              WHERE art.producedByAssignmentId=?1 AND wi.ownerUserId=?2
+              WHERE art.producedByAssignmentId=?1 AND wi.ownerUserId=?2#{hash_clause}
               ORDER BY art.createdAt, art.artifactId
               """,
-              [producer, owner]
+              params
             )
 
           _ ->
@@ -584,11 +592,11 @@ defmodule Tightbeam.Rules do
     verb = field(transition, :verb)
     owner = field(transition, :owner_user_id)
     bindings = field(transition, :bindings) || %{}
-    origin = field(transition, :principal) || "process:tightbeam"
+    {origin, principal} = row_commit_principal(field(transition, :principal), owner)
 
     call =
       predicate_call(owner, normalize_bindings(bindings), nil, transition)
-      |> Map.merge(%{verb: verb, origin: origin, edge: :row_commit})
+      |> Map.merge(%{verb: verb, origin: origin, principal: principal, edge: :row_commit})
 
     domain = field(transition, :domain)
 
@@ -648,6 +656,28 @@ defmodule Tightbeam.Rules do
       caller_origin: call.origin
     }
   end
+
+  defp row_commit_principal("session:" <> session_key, _owner) do
+    origin =
+      case Tightbeam.Origin.parse(session_key) do
+        {:agent, _} -> session_key
+        _ -> "agent:#{session_key}"
+      end
+
+    {origin, {:session, session_key}}
+  end
+
+  defp row_commit_principal("user:" <> user_id, _owner),
+    do: {"user:#{user_id}", {:user, user_id}}
+
+  defp row_commit_principal("process:" <> process, _owner),
+    do: {"process:#{process}", {:process, process}}
+
+  defp row_commit_principal("remedy:" <> statute, owner),
+    do: {"remedy:#{statute}", {:remedy, %{statute: statute, owner: owner}}}
+
+  defp row_commit_principal(origin, owner) when is_binary(origin), do: {origin, {:user, owner}}
+  defp row_commit_principal(_origin, owner), do: {"process:tightbeam", {:user, owner}}
 
   defp normalize_bindings(bindings) do
     bindings = Map.new(bindings, fn {key, value} -> {predicate_binding_key(key), value} end)
@@ -2276,6 +2306,22 @@ defmodule Tightbeam.Rules do
   end
 
   defp caller_user(db, call, cache) do
+    case {Map.get(call, :edge), Map.get(call, :principal)} do
+      {:row_commit, {:session, session_key}} ->
+        value =
+          case Org.get(db, session_key) do
+            nil -> nil
+            session -> session.owner_user_id
+          end
+
+        {value, cache}
+
+      _ ->
+        caller_user_from_origin(db, call, cache)
+    end
+  end
+
+  defp caller_user_from_origin(db, call, cache) do
     case parse_origin(call.origin) do
       :malformed ->
         {nil, cache}
