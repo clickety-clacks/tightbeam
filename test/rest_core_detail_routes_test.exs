@@ -314,6 +314,55 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
     assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
   end
 
+  test "no-sidecar work items retain configured and fallback priority across reads and notices",
+       ctx do
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM work_item_priorities WHERE workItemId=?1", [ctx.work_item.id])
+
+    for {configured, expected} <- [{nil, 4}, {"7", 7}, {"0", 0}] do
+      {:ok, _} = DB.query(ctx.db, "DELETE FROM org_settings WHERE key='default-priority'")
+
+      if configured do
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "INSERT INTO org_settings (key,value,updatedAt) VALUES ('default-priority',?1,1)",
+            [configured]
+          )
+      end
+
+      collection = get(ctx, "/api/work-items")
+      detail = get(ctx, "/api/work-items/#{ctx.work_item.id}")
+      assert collection.status == 200, collection.resp_body
+      assert detail.status == 200, detail.resp_body
+      item = JSON.decode!(detail.resp_body)["item"]
+      assert item["priority"] == expected
+
+      assert Enum.find(
+               JSON.decode!(collection.resp_body)["items"],
+               &(&1["id"] == ctx.work_item.id)
+             ) == item
+
+      call = %{
+        verb: "work-item-update",
+        principal: {:user, ctx.work_item.ownerUserId},
+        origin: "user:#{ctx.work_item.ownerUserId}",
+        params: %{work_item_id: ctx.work_item.id}
+      }
+
+      notice = Tightbeam.Firehose.Publisher.state_notice(ctx.db, call, %{id: ctx.work_item.id})
+      assert notice["payload"] == item
+
+      assert StateResources.encode_item("work items", notice["payload"], ctx.catalog) ==
+               StateResources.encode_item("work items", item, ctx.catalog)
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT count(*) FROM work_item_priorities WHERE workItemId=?1", [
+                 ctx.work_item.id
+               ])
+    end
+  end
+
   test "the closed nine-route inventory returns exact shared item bytes", ctx do
     cases = core_detail_cases(ctx)
 

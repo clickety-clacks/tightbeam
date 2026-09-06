@@ -365,7 +365,10 @@ defmodule Tightbeam.StateResources do
         SELECT wi.id, wi.title, wi.specRefName, wi.specRefSha256, wi.isBug,
                wi.ownerUserId, wi.state, wi.failReason, wi.routingWakeId,
                wi.slateWakeId, wi.createdByUser, wi.createdBySession,
-               wi.createdInTurnSeq, wi.createdContextKnown, wi.createdAt, p.priority,
+               wi.createdInTurnSeq, wi.createdContextKnown, wi.createdAt,
+               CASE WHEN p.workItemId IS NULL THEN
+                 CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+               ELSE p.priority END,
                COALESCE(v.rowVersion, wi.createdAt)
         FROM work_items AS wi
         LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
