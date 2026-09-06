@@ -184,6 +184,9 @@ defmodule Tightbeam.Firehose.CoreDetailA6Test do
           ('wi_a6_core','A6 core detail','#{fixture.user_id}','open',
            '#{fixture.user_id}',1,#{now});
 
+        INSERT INTO work_item_priorities (workItemId, priority)
+        VALUES ('wi_a6_core', 4);
+
         INSERT INTO assignments
           (id,subject,holderKey,openedByUser,openedAt,state,workItemId)
         VALUES

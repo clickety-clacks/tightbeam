@@ -29,7 +29,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
 
   @r7_fields %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closingAttestId workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "wakes" =>
@@ -65,7 +65,7 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
   }
 
   @integer_fields %{
-    "work items" => ~w(createdInTurnSeq createdAt rowVersion),
+    "work items" => ~w(createdInTurnSeq createdAt priority rowVersion),
     "assignments" => ~w(openedAt closedAt rowVersion),
     "wakes" =>
       ~w(dueAt createdAt firedAt reresolveRung conditionAfterId canceledAt targetGate rowVersion),
@@ -293,6 +293,25 @@ defmodule Tightbeam.RestCoreDetailRoutesTest do
       artifact: artifact,
       catalog: catalog
     }
+  end
+
+  test "work-item collection uses the same priority projection as detail", ctx do
+    response = get(ctx, "/api/work-items")
+    assert response.status == 200, response.resp_body
+    body = JSON.decode!(response.resp_body)
+    assert body["resource"] == "work items"
+    assert body["schemaVersion"] == 1
+    assert Map.keys(body) |> Enum.sort() == ~w(items page resource schemaVersion)
+
+    detail =
+      get(ctx, "/api/work-items/#{ctx.work_item.id}") |> Map.fetch!(:resp_body) |> JSON.decode!()
+
+    assert Enum.find(body["items"], &(&1["id"] == ctx.work_item.id)) == detail["item"]
+    assert is_integer(detail["item"]["priority"])
+
+    invalid = get(ctx, "/api/work-items?priority=4")
+    assert invalid.status == 400
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
   end
 
   test "the closed nine-route inventory returns exact shared item bytes", ctx do

@@ -17,7 +17,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
 
   @field_order %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closingAttestId workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "attests" =>
@@ -474,7 +474,7 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
     refute StateResources.complete_item?("work-items", notice["payload"])
     assert Publisher.encode_wire_notice(notice) == JSON.encode!(notice)
 
-    additive = put_in(notice, ["payload", "priority"], 4)
+    additive = put_in(notice, ["payload", "unrequestedField"], 4)
     refute StateResources.item_shape_superset?("work-items", additive["payload"])
     assert_raise ArgumentError, fn -> Publisher.encode_wire_notice(additive) end
 
@@ -497,6 +497,28 @@ defmodule Tightbeam.StateResourcesOrderedEncoderTest do
       assert_raise ArgumentError, fn ->
         Publisher.encode_wire_notice(%{"class" => class, "op" => "upsert", "payload" => payload})
       end
+    end
+  end
+
+  test "work-item priority preserves boundary values and rejects invalid stored values" do
+    fields = Map.fetch!(@field_order, "work items")
+    row = item("work items", fields)
+
+    for priority <- [0, 4, 8] do
+      projected = row |> Map.put("priority", priority) |> StateResources.work_item()
+      bytes = StateResources.encode_item("work items", projected, @catalog)
+      assert bytes == expected_bytes("work items", fields, projected)
+      assert JSON.decode!(bytes)["priority"] == priority
+    end
+
+    for priority <- [nil, "4", 4.5, -1, 9] do
+      assert_raise ArgumentError, fn ->
+        StateResources.encode_item("work items", Map.put(row, "priority", priority), @catalog)
+      end
+    end
+
+    assert_raise ArgumentError, fn ->
+      StateResources.encode_item("work items", Map.delete(row, "priority"), @catalog)
     end
   end
 

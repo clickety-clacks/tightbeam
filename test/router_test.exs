@@ -605,23 +605,25 @@ defmodule Tightbeam.Wire.RouterTest do
 
     detail = get_device(ctx, ctx.device, "/api/work/#{assignment.id}")
     assert detail.status == 200
+    assert JSON.decode!(detail.resp_body)["assignment"]["id"] == assignment.id
     assert JSON.decode!(detail.resp_body)["holder"]["sessionKey"] == "holder"
 
     items = get_device(ctx, ctx.device, "/api/work-items")
     assert items.status == 200
 
     assert %{
-             "items" => [
-               %{"workItem" => %{"id" => item_id}, "assignments" => [%{"id" => assignment_id}]}
-             ],
-             "cursor" => %{"assignment" => _, "workItem" => _}
+             "items" => [%{"id" => item_id, "priority" => 4}],
+             "resource" => "work items",
+             "schemaVersion" => 1,
+             "page" => %{"hasMoreAfter" => false, "hasMoreBefore" => false}
            } = JSON.decode!(items.resp_body)
 
     assert item_id == item.id
-    assert assignment_id == assignment.id
+    refute Map.has_key?(JSON.decode!(items.resp_body), "cursor")
 
     item_detail = get_device(ctx, ctx.device, "/api/work-items/#{item.id}")
     assert item_detail.status == 200
+    assert JSON.decode!(items.resp_body)["items"] == [JSON.decode!(item_detail.resp_body)["item"]]
 
     invalid = get_device(ctx, ctx.device, "/api/work?status=blocked")
     assert invalid.status == 400

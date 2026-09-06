@@ -75,7 +75,7 @@ defmodule Tightbeam.StateResources do
 
   @item_field_order %{
     "work items" =>
-      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt rowVersion),
+      ~w(id title specRefName specRefSha256 isBug ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq createdContextKnown createdAt priority rowVersion),
     "assignments" =>
       ~w(id subject holderKey holderRole holderFallback openedByUser openedBySession openedAt state outcome closedAt closedByUser closedBySession closingAttestId workItemId reviewsAssignmentId holderHarness holderProvider files effectKind derivedStatus rowVersion),
     "attests" =>
@@ -122,7 +122,7 @@ defmodule Tightbeam.StateResources do
     "work items" => %{
       strings:
         ~w(id title specRefName specRefSha256 ownerUserId state failReason routingWakeId slateWakeId createdByUser createdBySession),
-      integers: ~w(createdInTurnSeq createdAt rowVersion),
+      integers: ~w(createdInTurnSeq createdAt priority rowVersion),
       booleans: ~w(isBug createdContextKnown),
       nullable:
         ~w(specRefName specRefSha256 ownerUserId failReason routingWakeId slateWakeId createdByUser createdBySession createdInTurnSeq)
@@ -351,38 +351,64 @@ defmodule Tightbeam.StateResources do
     {"kungfu", "status"} => ~w(available installed)
   }
 
-  def query_work_item(db, id, call) do
+  def query_work_item(db, selection, call) do
+    {id, filters} = if is_map(selection), do: {nil, selection}, else: {selection, %{}}
     {principal_kind, principal_id, is_admin} = detail_principal(call)
     principal = Map.get(call, :rest_principal)
     trace_core_detail(principal, {:au4_visibility, "work items"})
 
-    case observed_query(
-           db,
-           principal,
-           """
-           SELECT wi.id, wi.title, wi.specRefName, wi.specRefSha256, wi.isBug,
-                  wi.ownerUserId, wi.state, wi.failReason, wi.routingWakeId,
-                  wi.slateWakeId, wi.createdByUser, wi.createdBySession,
-                  wi.createdInTurnSeq, wi.createdContextKnown, wi.createdAt,
-                  COALESCE(v.rowVersion, wi.createdAt)
-           FROM work_items AS wi
-           LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
-           WHERE wi.id = ?1 AND (
-             ?2 = 1 OR
-             (?3 = 'user' AND wi.ownerUserId = ?4) OR
-             (?3 = 'session' AND (
-               wi.createdBySession = ?4 OR EXISTS (
-                 SELECT 1 FROM assignments AS held
-                 WHERE held.workItemId = wi.id AND held.holderKey = ?4
-               )
-             ))
-           )
-           """,
-           [id, bool_int(is_admin), principal_kind, principal_id]
-         ) do
-      [row] -> work_item_query_row(row)
-      [] -> nil
-    end
+    rows =
+      observed_query(
+        db,
+        principal,
+        """
+        SELECT wi.id, wi.title, wi.specRefName, wi.specRefSha256, wi.isBug,
+               wi.ownerUserId, wi.state, wi.failReason, wi.routingWakeId,
+               wi.slateWakeId, wi.createdByUser, wi.createdBySession,
+               wi.createdInTurnSeq, wi.createdContextKnown, wi.createdAt, p.priority,
+               COALESCE(v.rowVersion, wi.createdAt)
+        FROM work_items AS wi
+        LEFT JOIN work_item_versions AS v ON v.workItemId = wi.id
+        LEFT JOIN work_item_priorities AS p ON p.workItemId = wi.id
+        WHERE (?1 IS NULL OR wi.id = ?1) AND (
+          ?2 = 1 OR
+          (?3 = 'user' AND wi.ownerUserId = ?4) OR
+          (?3 = 'session' AND (
+            wi.createdBySession = ?4 OR EXISTS (
+              SELECT 1 FROM assignments AS held
+              WHERE held.workItemId = wi.id AND held.holderKey = ?4
+            )
+          ))
+        )
+        AND (?5 IS NULL OR wi.state = ?5)
+        AND (?6 IS NULL OR wi.ownerUserId = ?6)
+        AND (?7 IS NULL OR wi.createdBySession = ?7)
+        AND (?8 IS NULL OR wi.createdByUser = ?8)
+        AND (?9 IS NULL OR wi.isBug = ?9)
+        AND (?10 IS NULL OR wi.specRefName = ?10)
+        AND (?11 IS NULL OR EXISTS (
+          SELECT 1 FROM assignments AS selected_holder
+          WHERE selected_holder.workItemId = wi.id AND selected_holder.holderKey = ?11
+        ))
+        ORDER BY wi.createdAt, wi.id
+        """,
+        [
+          id,
+          bool_int(is_admin),
+          principal_kind,
+          principal_id,
+          filters["state"],
+          filters["ownerUserId"],
+          filters["createdBySession"],
+          filters["createdByUser"],
+          filters["isBug"],
+          filters["specRefName"],
+          filters["holderKey"]
+        ]
+      )
+      |> Enum.map(&work_item_query_row/1)
+
+    if is_map(selection), do: rows, else: List.first(rows)
   end
 
   def query_assignment(db, id, call) do
@@ -602,6 +628,7 @@ defmodule Tightbeam.StateResources do
          created_in_turn_seq,
          created_context_known,
          created_at,
+         priority,
          row_version
        ]) do
     %{
@@ -620,6 +647,7 @@ defmodule Tightbeam.StateResources do
       created_in_turn_seq: created_in_turn_seq,
       created_context_known: created_context_known == 1,
       created_at: created_at,
+      priority: priority,
       row_version: row_version
     }
   end
@@ -2073,6 +2101,12 @@ defmodule Tightbeam.StateResources do
     end
 
     validate_item_invariants!(resource, item)
+  end
+
+  defp validate_item_invariants!("work items", item) do
+    unless is_integer(item["priority"]) and item["priority"] in 0..8 do
+      raise ArgumentError, "work items priority must be an integer from 0 through 8"
+    end
   end
 
   defp validate_item_invariants!("condition facts", item) do

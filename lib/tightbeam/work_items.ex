@@ -644,8 +644,11 @@ defmodule Tightbeam.WorkItems do
             )
 
           case result do
-            {:updated, item, _changed?} ->
+            {:updated, item, true} ->
               Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+
+            {:updated, _item, false} ->
+              Publisher.maybe_observed_accepted_in_txn(txn, call)
 
             _ ->
               :ok
