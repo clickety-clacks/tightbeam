@@ -60,6 +60,19 @@ defmodule Tightbeam.FirehoseRestartSmokeTest do
     end)
   end
 
+  test "registered test child refuses startup when its deterministic executable is absent" do
+    output =
+      ExUnit.CaptureIO.capture_io(:stderr, fn ->
+        assert_raise RuntimeError, ~r/gateway did not boot: :child_exited/, fn ->
+          Fixture.start_subprocess!(fixture_cli: false)
+        end
+      end)
+
+    assert output =~ "no registered harness CLI is installed"
+    assert output =~ "process_present?: false"
+    assert output =~ "ready?: false"
+  end
+
   test "parallel subprocess fixtures isolate state and a failing journey leaks nothing" do
     test_process = self()
 

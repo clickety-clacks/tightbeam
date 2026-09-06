@@ -111,7 +111,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
       File.mkdir_p!(base_dir)
 
       gateway =
-        case LegGateway.boot(base_dir, port, repo_root: repo_root, boot_timeout_ms: 20_000) do
+        case boot_test_gateway(base_dir, port, repo_root, opts) do
           {:ok, gateway} ->
             gateway
 
@@ -206,7 +206,7 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
     end
 
     restarted =
-      case LegGateway.boot(fixture.base_dir, fixture.port, repo_root: fixture.repo_root) do
+      case boot_test_gateway(fixture.base_dir, fixture.port, fixture.repo_root, []) do
         {:ok, gateway} ->
           gateway
 
@@ -438,6 +438,84 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
       base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
 
     token
+  end
+
+  defp boot_test_gateway(base_dir, port, repo_root, opts) do
+    mix = System.find_executable("mix") || raise "mix executable missing"
+    erl = System.find_executable("erl") || raise "erl executable missing"
+    fixture_bin = Path.join(repo_root, "priv/harness_cli")
+
+    path =
+      if(Keyword.get(opts, :fixture_cli, true), do: [fixture_bin], else: []) ++
+        [Path.dirname(mix), Path.dirname(erl), "/usr/bin", "/bin"]
+
+    script = Path.join(base_dir, "fixture_boot.exs")
+
+    File.write!(script, """
+    unless Tightbeam.Harness.Fixture in Tightbeam.Harness.all(),
+      do: raise("deterministic Fixture harness is not registered in child")
+    if System.find_executable("claude") || System.find_executable("codex"),
+      do: raise("vendor CLI leaked into isolated fixture PATH")
+    Application.put_env(:tightbeam, :autostart, true)
+    Application.put_env(:tightbeam, :base_dir, System.fetch_env!("TIGHTBEAM_BASE_DIR"))
+    Application.put_env(:tightbeam, :port, String.to_integer(System.fetch_env!("TIGHTBEAM_PORT")))
+    {:ok, _} = Application.ensure_all_started(:tightbeam)
+    """)
+
+    log_path = Path.join(base_dir, "gateway.log")
+    quote_arg = fn arg -> "'" <> String.replace(arg, "'", "'\\''") <> "'" end
+
+    command =
+      "exec " <>
+        quote_arg.(mix) <>
+        " run --no-halt --no-start " <>
+        quote_arg.(script) <>
+        " >> " <> quote_arg.(log_path) <> " 2>&1"
+
+    handle =
+      Port.open({:spawn_executable, "/bin/sh"}, [
+        :binary,
+        :exit_status,
+        args: ["-c", command],
+        cd: repo_root,
+        env: [
+          {~c"MIX_ENV", ~c"test"},
+          {~c"PATH", to_charlist(Enum.join(path, ":"))},
+          {~c"ERL_FLAGS", ~c"+S 4:4 +SDcpu 2 +SDio 2"},
+          {~c"TIGHTBEAM_BASE_DIR", to_charlist(base_dir)},
+          {~c"TIGHTBEAM_PORT", to_charlist(Integer.to_string(port))}
+        ]
+      ])
+
+    {:os_pid, pid} = Port.info(handle, :os_pid)
+
+    gateway = %LegGateway{
+      base_dir: base_dir,
+      port: port,
+      os_pid: pid,
+      os_command: LegGateway.process_command(pid),
+      port_ref: handle,
+      log_path: log_path
+    }
+
+    await_test_gateway(gateway, System.monotonic_time(:millisecond) + 20_000)
+  end
+
+  defp await_test_gateway(gateway, deadline) do
+    cond do
+      LegGateway.ready?(gateway) ->
+        {:ok, %{gateway | os_command: LegGateway.process_command(gateway.os_pid)}}
+
+      is_nil(Port.info(gateway.port_ref)) ->
+        {:error, :child_exited, gateway}
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        {:error, :timeout, gateway}
+
+      true ->
+        Process.sleep(100)
+        await_test_gateway(gateway, deadline)
+    end
   end
 
   # Diagnostic-only successor: emit evidence before the outer test deadline,
