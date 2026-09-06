@@ -13,7 +13,7 @@ defmodule Tightbeam.ConditionFacts do
   substrate is forbidden to assert an agent's judgment.
   """
 
-  alias Tightbeam.{DB, EventLog, Gateway, Idempotency, Rules, Wakes}
+  alias Tightbeam.{DB, EventLog, Gateway, Idempotency, Wakes}
   alias Tightbeam.DB.Txn
 
   @reserved_kinds ~w(
@@ -75,7 +75,7 @@ defmodule Tightbeam.ConditionFacts do
   @spec file(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file(db, scheduler, input) do
     case DB.transaction_then(db, &file_in_txn(&1, input), fn txn, result ->
-           Rules.row_commit_in_txn(txn, [])
+           Tightbeam.Wakes.row_commit_in_txn(txn, [])
            recognize_after_commit(txn, result)
          end) do
       {:ok, {result, deliveries}} ->
@@ -159,7 +159,7 @@ defmodule Tightbeam.ConditionFacts do
              end
            end,
            fn txn, {result, filed?} ->
-             Rules.row_commit_in_txn(txn, [])
+             Tightbeam.Wakes.row_commit_in_txn(txn, [])
 
              if filed? do
                {result, deliveries} = recognize_after_commit(txn, result)

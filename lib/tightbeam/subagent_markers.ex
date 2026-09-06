@@ -4,7 +4,7 @@ defmodule Tightbeam.SubagentMarkers do
   and stops.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, Org, Rules, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @type marker :: %{
@@ -48,7 +48,7 @@ defmodule Tightbeam.SubagentMarkers do
         db,
         fn txn -> append_in_txn(txn, input) end,
         fn txn, result ->
-          Rules.row_commit_in_txn(txn, [])
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
 
           deliveries =
             if is_integer(result[:fact_id]),

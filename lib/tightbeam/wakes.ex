@@ -422,6 +422,92 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  @doc "Evaluate committed business-row transitions and record matching rule notices."
+  @spec row_commit_in_txn(Txn.t(), [map()] | map()) :: :ok
+  def row_commit_in_txn(%Txn{} = txn, transitions) do
+    txn
+    |> Rules.row_commit_effects_in_txn(transitions)
+    |> Enum.each(fn
+      {:notice, rule, call, evidence} ->
+        try do
+          deliver_rule_notice_in_txn(txn, rule, call, evidence)
+        rescue
+          error ->
+            EventLog.lifecycle_in_txn(
+              txn,
+              "rule_notice_failed",
+              rule.name,
+              Exception.message(error)
+            )
+        end
+
+      {:error, rule, message} ->
+        EventLog.lifecycle_in_txn(txn, "rule_notice_failed", rule.name, message)
+    end)
+
+    :ok
+  end
+
+  @doc "Execute an actor-owned rule notice without changing the governed decision."
+  @spec deliver_rule_notice(DB.server(), map(), map(), list()) :: :ok
+  def deliver_rule_notice(db, rule, call, evidence) do
+    case DB.transaction(db, &deliver_rule_notice_in_txn(&1, rule, call, evidence)) do
+      {:ok, :ok} ->
+        :ok
+
+      {:error, error} ->
+        _ = EventLog.lifecycle(db, "rule_notice_failed", rule.name, Exception.message(error))
+        :ok
+    end
+  rescue
+    _error -> :ok
+  end
+
+  defp deliver_rule_notice_in_txn(txn, rule, call, evidence) do
+    case Rules.resolve_notice_in_txn(txn, rule, call) do
+      {:ok, resolved} ->
+        wake =
+          schedule_in_txn(txn, %{
+            session_key: resolved.bound_session,
+            target_role: resolved.target[:target_role],
+            origin: "remedy:#{rule.name}",
+            prompt: resolved.params.prompt,
+            due_at: System.system_time(:millisecond),
+            creator_session_key: principal_session(call.principal),
+            summon: true
+          })
+
+        EventLog.lifecycle_in_txn(
+          txn,
+          "rule_notice",
+          wake.wake_id,
+          JSON.encode!(%{
+            rule: rule.name,
+            edge: rule_edge(call),
+            cause: Map.get(call, :transition),
+            principal: call.origin,
+            evidence: Enum.map(evidence, fn {fact, value} -> %{fact: fact, value: value} end)
+          })
+        )
+
+        :ok
+
+      {:error, reason} ->
+        raise "notice #{rule.name} has unresolved target: #{inspect(reason)}"
+    end
+  end
+
+  defp principal_session({:session, session_key}), do: session_key
+  defp principal_session(_principal), do: nil
+
+  defp rule_edge(call) do
+    case Map.get(call, :edge, :verb) do
+      :turn_end -> "turn-end"
+      :row_commit -> "row-commit"
+      _ -> "verb"
+    end
+  end
+
   @doc """
   Preserve a prompt wake after a rate-limit terminal by scheduling a new,
   traceable attempt. The failed turn remains terminal and every attempt keeps

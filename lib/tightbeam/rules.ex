@@ -54,8 +54,7 @@ defmodule Tightbeam.Rules do
     RailEpisodes,
     RailRemedy,
     RailScript,
-    Roles,
-    Wakes
+    Roles
   }
 
   import Bitwise
@@ -309,28 +308,17 @@ defmodule Tightbeam.Rules do
   def evaluate_predicate_in_txn(%DB.Txn{}, _predicate),
     do: {:error, %{code: "invalid_predicate", message: "predicate must be an object"}}
 
-  @doc "Evaluate loaded row-commit notice rules and record their durable wake effects."
-  @spec row_commit_in_txn(DB.Txn.t(), [map()] | map()) :: :ok
-  def row_commit_in_txn(%DB.Txn{} = txn, transitions) do
+  @doc "Evaluate loaded row-commit notice rules into effects for Wakes to record."
+  @spec row_commit_effects_in_txn(DB.Txn.t(), [map()] | map()) :: [tuple()]
+  def row_commit_effects_in_txn(%DB.Txn{} = txn, transitions) do
     (List.wrap(transitions) ++ DB.take_row_commits(txn))
-    |> Enum.each(&evaluate_row_transition_in_txn(txn, &1))
-
-    :ok
+    |> Enum.flat_map(&evaluate_row_transition_in_txn(txn, &1))
   end
 
-  @doc "Execute an actor-owned notice effect without changing the governed decision."
-  @spec deliver_notice(DB.server(), map(), map(), list()) :: :ok
-  def deliver_notice(db, rule, call, evidence) do
-    case DB.transaction(db, &deliver_notice_in_txn(&1, rule, call, evidence)) do
-      {:ok, :ok} ->
-        :ok
-
-      {:error, error} ->
-        _ = EventLog.lifecycle(db, "rule_notice_failed", rule.name, Exception.message(error))
-        :ok
-    end
-  rescue
-    _error -> :ok
+  @doc "Resolve a validated notice against the same transaction snapshot as its rule."
+  @spec resolve_notice_in_txn(DB.Txn.t(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def resolve_notice_in_txn(%DB.Txn{} = txn, rule, call) do
+    RailRemedy.resolve_notice(txn, rule.notice, notice_bindings(txn, call))
   end
 
   defp normalize_predicate_conditions(conditions) when is_list(conditions) do
@@ -609,27 +597,20 @@ defmodule Tightbeam.Rules do
       rule.verb == verb and "row-commit" in rule.edges and rule.effect == "notice" and
         row_domain_candidate?(rule, domain)
     end)
-    |> Enum.each(fn rule ->
+    |> Enum.flat_map(fn rule ->
       try do
         candidates =
           artifact_candidates_in_txn(txn, rule.conditions, call.predicate_bindings, owner)
 
-        Enum.reduce_while(candidates, :ok, fn candidate, :ok ->
+        Enum.reduce_while(candidates, [], fn candidate, [] ->
           candidate_call = Map.put(call, :artifact_candidate, candidate)
 
           case evaluate_conditions(rule.conditions, rule, txn, candidate_call, %{}) do
             {:match, cache} ->
-              deliver_notice_in_txn(
-                txn,
-                rule,
-                candidate_call,
-                evidence_facts(rule.conditions, cache)
-              )
-
-              {:halt, :ok}
+              {:halt, [{:notice, rule, candidate_call, evidence_facts(rule.conditions, cache)}]}
 
             {:no_match, _cache} ->
-              {:cont, :ok}
+              {:cont, []}
 
             {:error, fact} ->
               raise "row-commit rule #{rule.name} failed to compute #{fact}"
@@ -637,58 +618,17 @@ defmodule Tightbeam.Rules do
         end)
       rescue
         error ->
-          EventLog.lifecycle_in_txn(
-            txn,
-            "rule_notice_failed",
-            rule.name,
-            Exception.message(error)
-          )
+          [{:error, rule, Exception.message(error)}]
       end
     end)
   end
 
-  defp evaluate_row_transition_in_txn(_txn, _transition), do: :ok
+  defp evaluate_row_transition_in_txn(_txn, _transition), do: []
 
   defp row_domain_candidate?(rule, domain) do
     Enum.any?(rule.conditions, fn condition ->
       domain in Map.get(@row_fact_domains, condition.fact, [])
     end)
-  end
-
-  defp deliver_notice_in_txn(txn, rule, call, evidence) do
-    bindings = notice_bindings(txn, call)
-
-    case RailRemedy.resolve_notice(txn, rule.notice, bindings) do
-      {:ok, resolved} ->
-        wake =
-          Wakes.schedule_in_txn(txn, %{
-            session_key: resolved.bound_session,
-            target_role: resolved.target[:target_role],
-            origin: "remedy:#{rule.name}",
-            prompt: resolved.params.prompt,
-            due_at: System.system_time(:millisecond),
-            creator_session_key: principal_session(call.principal),
-            summon: true
-          })
-
-        EventLog.lifecycle_in_txn(
-          txn,
-          "rule_notice",
-          wake.wake_id,
-          JSON.encode!(%{
-            rule: rule.name,
-            edge: edge(call),
-            cause: Map.get(call, :transition),
-            principal: call.origin,
-            evidence: Enum.map(evidence, fn {fact, value} -> %{fact: fact, value: value} end)
-          })
-        )
-
-        :ok
-
-      {:error, reason} ->
-        raise "notice #{rule.name} has unresolved target: #{inspect(reason)}"
-    end
   end
 
   defp notice_bindings(db, call) do
@@ -708,9 +648,6 @@ defmodule Tightbeam.Rules do
       caller_origin: call.origin
     }
   end
-
-  defp principal_session({:session, session_key}), do: session_key
-  defp principal_session(_principal), do: nil
 
   defp normalize_bindings(bindings) do
     bindings = Map.new(bindings, fn {key, value} -> {predicate_binding_key(key), value} end)

@@ -32,7 +32,8 @@ defmodule Tightbeam.Dispatch do
     Placement,
     RailEpisodes,
     RailRemedy,
-    Rules
+    Rules,
+    Wakes
   }
 
   @typedoc """
@@ -175,7 +176,7 @@ defmodule Tightbeam.Dispatch do
     do: RailEpisodes.recovered(db, statute, position)
 
   defp close(db, {:notice, rule, call, evidence}),
-    do: Rules.deliver_notice(db, rule, call, evidence)
+    do: Wakes.deliver_rule_notice(db, rule, call, evidence)
 
   defp close(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)

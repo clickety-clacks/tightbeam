@@ -7,7 +7,7 @@ defmodule Tightbeam.Escalation do
   batch must fail closed if any CAS loses; earlier winners stay consumed.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Rules, Wakes}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Org, Roles, Wakes}
   alias Tightbeam.DB.Txn
 
   defmodule IntegrityEvidenceConflict do
@@ -457,7 +457,7 @@ defmodule Tightbeam.Escalation do
                 {result, transitions}
               end,
               fn txn, {result, transitions} ->
-                Rules.row_commit_in_txn(txn, transitions)
+                Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
                 result
               end
             )
@@ -492,7 +492,7 @@ defmodule Tightbeam.Escalation do
                {result, fact_id, List.wrap(transition)}
              end,
              fn txn, {result, fact_id, transitions} ->
-               Rules.row_commit_in_txn(txn, transitions)
+               Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
 
                deliveries =
                  if is_integer(fact_id),
@@ -536,7 +536,7 @@ defmodule Tightbeam.Escalation do
             {result, List.wrap(transition)}
           end,
           fn txn, {result, transitions} ->
-            Rules.row_commit_in_txn(txn, transitions)
+            Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
             result
           end
         )
@@ -609,7 +609,7 @@ defmodule Tightbeam.Escalation do
           {consumed?, List.wrap(transition)}
         end,
         fn txn, {consumed?, transitions} ->
-          Rules.row_commit_in_txn(txn, transitions)
+          Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
           consumed?
         end
       )
@@ -829,7 +829,7 @@ defmodule Tightbeam.Escalation do
           end)
         end,
         fn txn, transitions ->
-          Rules.row_commit_in_txn(txn, transitions)
+          Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
           :ok
         end
       )
@@ -910,7 +910,7 @@ defmodule Tightbeam.Escalation do
           transitions
         end,
         fn txn, transitions ->
-          Rules.row_commit_in_txn(txn, transitions)
+          Tightbeam.Wakes.row_commit_in_txn(txn, transitions)
           :ok
         end
       )
@@ -1644,7 +1644,7 @@ defmodule Tightbeam.Escalation do
           end
         end,
         fn txn, {result, fact_id, transition} ->
-          Rules.row_commit_in_txn(txn, List.wrap(transition))
+          Tightbeam.Wakes.row_commit_in_txn(txn, List.wrap(transition))
 
           deliveries =
             if is_integer(fact_id), do: ConditionFacts.recognize_in_txn(txn, fact_id), else: []
@@ -1731,7 +1731,7 @@ defmodule Tightbeam.Escalation do
           {waiver_in_txn(txn, waiver_id), recognized}
         end,
         fn txn, {waiver, recognized} ->
-          Rules.row_commit_in_txn(txn, Enum.map(recognized, &elem(&1, 1)))
+          Tightbeam.Wakes.row_commit_in_txn(txn, Enum.map(recognized, &elem(&1, 1)))
 
           deliveries =
             Enum.flat_map(recognized, fn {fact_id, _transition} ->
@@ -1775,7 +1775,7 @@ defmodule Tightbeam.Escalation do
           end
         end,
         fn txn, {result, transition} ->
-          Rules.row_commit_in_txn(txn, List.wrap(transition))
+          Tightbeam.Wakes.row_commit_in_txn(txn, List.wrap(transition))
           result
         end
       )

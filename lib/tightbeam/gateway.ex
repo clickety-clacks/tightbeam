@@ -427,7 +427,7 @@ defmodule Tightbeam.Gateway do
                })
              end,
              fn txn, fact ->
-               Rules.row_commit_in_txn(txn, [])
+               Tightbeam.Wakes.row_commit_in_txn(txn, [])
                {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
              end
            ) do
@@ -6497,7 +6497,7 @@ defmodule Tightbeam.Gateway do
                     result
                   end,
                   fn txn, result ->
-                    Rules.row_commit_in_txn(txn, [])
+                    Tightbeam.Wakes.row_commit_in_txn(txn, [])
                     result
                   end
                 )
@@ -6847,7 +6847,7 @@ defmodule Tightbeam.Gateway do
              end
            end,
            fn txn, result ->
-             Rules.row_commit_in_txn(txn, [])
+             Tightbeam.Wakes.row_commit_in_txn(txn, [])
              result
            end
          ) do

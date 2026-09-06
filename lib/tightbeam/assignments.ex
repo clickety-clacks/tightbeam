@@ -6,7 +6,7 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Rules, Supervision, Wakes}
+  alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
@@ -2089,7 +2089,7 @@ defmodule Tightbeam.Assignments do
 
   defp transaction_with_row_commits(db, fun, transitions) do
     case DB.transaction_then(db, fun, fn txn, result ->
-           Rules.row_commit_in_txn(txn, transitions.(txn, result))
+           Tightbeam.Wakes.row_commit_in_txn(txn, transitions.(txn, result))
            result
          end) do
       {:ok, result} -> result

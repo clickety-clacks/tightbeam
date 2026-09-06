@@ -25,7 +25,6 @@ defmodule Tightbeam.EffortCheckin do
     Escalation,
     Org,
     Placement,
-    Rules,
     Supervision,
     Wakes
   }
@@ -418,7 +417,7 @@ defmodule Tightbeam.EffortCheckin do
                  )
                end,
                fn txn, result ->
-                 Rules.row_commit_in_txn(txn, [])
+                 Tightbeam.Wakes.row_commit_in_txn(txn, [])
                  result
                end
              ) do

@@ -17,7 +17,7 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.{DB, HarnessHealth, Rules}
+  alias Tightbeam.{DB, HarnessHealth}
   alias Tightbeam.DB.Txn
 
   require Logger
@@ -616,7 +616,7 @@ defmodule Tightbeam.Ledger do
           seqs
         end,
         fn txn, seqs ->
-          Rules.row_commit_in_txn(txn, [])
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
           seqs
         end
       )
@@ -642,7 +642,7 @@ defmodule Tightbeam.Ledger do
         db,
         fn txn -> finish_in_txn(txn, seq, terminal, error) end,
         fn txn, won ->
-          Rules.row_commit_in_txn(txn, [])
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
           won
         end
       )
@@ -777,7 +777,7 @@ defmodule Tightbeam.Ledger do
           end)
         end,
         fn txn, result ->
-          Rules.row_commit_in_txn(txn, [])
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
           result
         end
       )

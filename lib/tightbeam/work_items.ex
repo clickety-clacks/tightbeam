@@ -16,7 +16,7 @@ defmodule Tightbeam.WorkItems do
   fail/reopen) are owner-or-admin verbs that write `state`/`failReason`.
   """
 
-  alias Tightbeam.{CausalEvents, DB, EffortCheckin, Org, Rules, Wakes}
+  alias Tightbeam.{CausalEvents, DB, EffortCheckin, Org, Wakes}
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
@@ -872,7 +872,7 @@ defmodule Tightbeam.WorkItems do
 
   defp transaction_with_row_commits(db, fun, transitions) do
     case DB.transaction_then(db, fun, fn txn, result ->
-           Rules.row_commit_in_txn(txn, transitions.(txn, result))
+           Tightbeam.Wakes.row_commit_in_txn(txn, transitions.(txn, result))
            result
          end) do
       {:ok, result} -> result

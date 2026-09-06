@@ -38,7 +38,6 @@ defmodule Tightbeam.Productions.Bubble do
     HarnessHealth,
     Org,
     Projection,
-    Rules,
     Supervision
   }
 
@@ -383,7 +382,7 @@ defmodule Tightbeam.Productions.Bubble do
           end
         end,
         fn txn, {published, fact_id} ->
-          Rules.row_commit_in_txn(txn, [])
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
 
           deliveries =
             if is_integer(fact_id), do: ConditionFacts.recognize_in_txn(txn, fact_id), else: []
@@ -474,7 +473,7 @@ defmodule Tightbeam.Productions.Bubble do
           end
         end,
         fn txn, {published, fact_id} ->
-          Rules.row_commit_in_txn(txn, [])
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
           {published, ConditionFacts.recognize_in_txn(txn, fact_id)}
         end
       )
@@ -725,7 +724,7 @@ defmodule Tightbeam.Productions.Bubble do
              })
            end,
            fn txn, fact ->
-             Rules.row_commit_in_txn(txn, [])
+             Tightbeam.Wakes.row_commit_in_txn(txn, [])
              {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
            end
          ) do

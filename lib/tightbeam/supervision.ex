@@ -1682,7 +1682,7 @@ defmodule Tightbeam.Supervision do
     do: RailEpisodes.recovered(db, statute, position)
 
   defp close_episode(db, {:notice, rule, call, evidence}),
-    do: Rules.deliver_notice(db, rule, call, evidence)
+    do: Wakes.deliver_rule_notice(db, rule, call, evidence)
 
   defp close_episode(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
@@ -4436,7 +4436,7 @@ defmodule Tightbeam.Supervision do
 
   defp transaction_then!(db, fun) do
     case DB.transaction_then(db, fun, fn txn, result ->
-           Rules.row_commit_in_txn(txn, [])
+           Tightbeam.Wakes.row_commit_in_txn(txn, [])
            result
          end) do
       {:ok, result} -> result

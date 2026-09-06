@@ -24,7 +24,7 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, Rules, TurnObservations}
+  alias Tightbeam.{DB, TurnObservations}
   alias Tightbeam.DB.Txn
 
   @outside_workspace "artifact origin is outside its session workspace"
@@ -136,7 +136,7 @@ defmodule Tightbeam.Artifacts do
                      [[owner]] =
                        Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id=?1", [work_item_id])
 
-                     Rules.row_commit_in_txn(txn, %{
+                     Tightbeam.Wakes.row_commit_in_txn(txn, %{
                        verb: "artifact-record",
                        domain: "artifact",
                        row_id: artifact_id,
