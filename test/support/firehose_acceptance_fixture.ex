@@ -111,12 +111,14 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
       File.mkdir_p!(base_dir)
 
       gateway =
-        case LegGateway.boot(base_dir, port, repo_root: repo_root) do
+        case LegGateway.boot(base_dir, port, repo_root: repo_root, boot_timeout_ms: 20_000) do
           {:ok, gateway} ->
             gateway
 
           {:error, reason, gateway} ->
             Agent.update(process_tracker, fn _ -> gateway end)
+
+            report_startup_failure(gateway, reason)
 
             raise "firehose subprocess gateway did not boot: #{inspect(reason)}; " <>
                     "log=#{gateway.log_path}"
@@ -436,6 +438,39 @@ defmodule Tightbeam.FirehoseAcceptanceFixture do
       base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
 
     token
+  end
+
+  # Diagnostic-only successor: emit evidence before the outer test deadline,
+  # while the captured handle is still owned and before rescue tears it down.
+  defp report_startup_failure(gateway, reason) do
+    current_command = LegGateway.process_command(gateway.os_pid)
+
+    lifecycle = %{
+      reason: reason,
+      os_pid: gateway.os_pid,
+      owned_identity_matches?: LegGateway.ours?(gateway),
+      process_present?: not is_nil(current_command),
+      port_handle_present?: not is_nil(Port.info(gateway.port_ref)),
+      ready?: LegGateway.ready?(gateway)
+    }
+
+    output =
+      case File.read(gateway.log_path) do
+        {:ok, bytes} ->
+          bytes
+          |> String.split("\n")
+          |> Enum.map(fn line ->
+            if Regex.match?(~r/token|secret|credential|authorization|password|api.?key/i, line),
+              do: "[redacted sensitive startup line]",
+              else: line
+          end)
+          |> Enum.join("\n")
+
+        {:error, error} ->
+          "startup log unavailable: #{inspect(error)}"
+      end
+
+    IO.puts(:stderr, "Card4 startup diagnostic: #{inspect(lifecycle)}\n#{output}")
   end
 
   defp gateway_processes(nil), do: []
