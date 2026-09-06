@@ -66,6 +66,11 @@ defmodule Tightbeam.TestCase do
     snapshot = snapshot()
     on_exit(fn -> restore(snapshot) end)
 
+    Tightbeam.Rules.load!(
+      Path.join(System.tmp_dir!(), "tightbeam-empty-rules-#{System.unique_integer([:positive])}"),
+      []
+    )
+
     # The ONE place the episode writer starts for tests. Not per-suite ceremony and
     # deliberately not lazy: call sites use the named process and a missing one is loud,
     # so a suite that evaluates a check-tier statute must find a real writer here rather

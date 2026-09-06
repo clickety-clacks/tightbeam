@@ -393,6 +393,7 @@ defmodule Tightbeam.Escalation do
               # a conflict or replay arms none.
               Wakes.schedule_in_txn(txn, %{
                 session_key: Org.personal_session_key(request.owner_user_id),
+                owner_user_id: request.owner_user_id,
                 origin: "process:tightbeam",
                 prompt: owner_notification(request),
                 due_at: now,

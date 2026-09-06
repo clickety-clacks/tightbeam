@@ -39,6 +39,10 @@ defmodule Tightbeam.RuleRuntime do
   end
 
   @doc false
+  @spec loaded?() :: boolean()
+  def loaded?, do: not is_nil(callbacks())
+
+  @doc false
   @spec row_commit_effects_in_txn(DB.Txn.t(), [map()] | map()) :: [tuple()]
   def row_commit_effects_in_txn(%DB.Txn{} = txn, transitions) do
     case callbacks() do

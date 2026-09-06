@@ -64,7 +64,7 @@ defmodule Tightbeam.ConditionFacts do
     kind   TEXT    NOT NULL,
     scope  TEXT,
     origin TEXT    NOT NULL,
-    ownerUserId TEXT NULL REFERENCES users(userId)
+    ownerUserId TEXT NULL
   );
   CREATE INDEX IF NOT EXISTS condition_facts_match
     ON condition_facts (kind, scope, id);

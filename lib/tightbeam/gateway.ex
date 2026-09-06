@@ -199,6 +199,7 @@ defmodule Tightbeam.Gateway do
     # Recover durable liveness only after row-commit recognition is installed,
     # and before any runtime child can consume wakes or accept traffic. The
     # Supervision child skips its duplicate recovery below.
+    :ok = Wakes.activate_wait_recognition(db)
     :ok = Supervision.recover_liveness!(db, config.wake_tick_ms)
 
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))

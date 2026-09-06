@@ -151,8 +151,8 @@ defmodule Tightbeam.Wakes do
     -- subtracts these, and both its windows must run the SAME query, so the
     -- carrier ships in Phase 1 even though Phase 3 stands up the first desk.
     summon INTEGER NOT NULL DEFAULT 0 CHECK (summon IN (0,1)),
-    ownerUserId TEXT NULL REFERENCES users(userId),
-    obligationRef TEXT NULL REFERENCES assignments(id),
+    ownerUserId TEXT NULL,
+    obligationRef TEXT NULL,
     waitMode TEXT NULL CHECK (waitMode IN ('dependency','after-turn')),
     predicate TEXT NULL,
     resolverKind TEXT NULL CHECK (resolverKind IN ('assignment','decision_request')),
@@ -160,13 +160,13 @@ defmodule Tightbeam.Wakes do
     resolverHolder TEXT NULL,
     resolverAddressee TEXT NULL,
     necessity TEXT NULL,
-    verificationAssignmentId TEXT NULL REFERENCES assignments(id),
-    verificationHolderKey TEXT NULL REFERENCES sessions(sessionKey),
+    verificationAssignmentId TEXT NULL,
+    verificationHolderKey TEXT NULL,
     selectedPolicyName TEXT NULL,
     verificationState TEXT NULL CHECK (verificationState IN ('provisional','confirmed','challenged')),
-    verificationAttestId TEXT NULL REFERENCES attests(id),
+    verificationAttestId TEXT NULL,
     verificationNoticeWakeId TEXT NULL REFERENCES wakes(wakeId),
-    originatingTurnSeq INTEGER NULL REFERENCES turns(seq),
+    originatingTurnSeq INTEGER NULL,
     recognitionAt INTEGER NULL,
     recognitionPath TEXT NULL CHECK (recognitionPath IN ('success','reconsideration','fallback','after-turn')),
     recognitionReason TEXT NULL CHECK (recognitionReason IN ('resolver-terminal','verification-challenged','verification-terminal')),
@@ -206,7 +206,27 @@ defmodule Tightbeam.Wakes do
   @retry_ceiling_ms 30 * 60_000
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    with :ok <- DB.execute(db, @ddl) do
+      if RuleRuntime.loaded?(), do: activate_wait_recognition(db), else: :ok
+    end
+  end
+
+  @doc false
+  @spec activate_wait_recognition(db()) :: :ok
+  def activate_wait_recognition(db) do
+    true = RuleRuntime.loaded?()
+    {:ok, :ok} = DB.transaction(db, &activate_wait_recognition_in_txn/1)
+    :ok
+  end
+
+  defp activate_wait_recognition_in_txn(%Txn{conn: conn}) do
+    Process.put({__MODULE__, :wait_recognition_ready, conn}, true)
+    :ok
+  end
+
+  defp wait_recognition_ready?(%Txn{conn: conn}),
+    do: Process.get({__MODULE__, :wait_recognition_ready, conn}, false)
 
   ## Delivery policy (coordination-fabric-v1 §5 `classifier` + `batcher`, §7 table)
   #
@@ -620,6 +640,7 @@ defmodule Tightbeam.Wakes do
              conditions: declaration.conditions,
              bindings: declaration.bindings
            }) do
+      :ok = activate_wait_recognition_in_txn(txn)
       turn_seq = running_turn_seq_in_txn(txn, input.registrant_session_key)
 
       wake =
@@ -1196,27 +1217,29 @@ defmodule Tightbeam.Wakes do
   def row_commit_in_txn(%Txn{} = txn, transitions) do
     transitions = List.wrap(transitions) ++ DB.take_row_commits(txn)
 
-    txn
-    |> RuleRuntime.row_commit_effects_in_txn(transitions)
-    |> Enum.each(fn
-      {:notice, rule, call, evidence} ->
-        try do
-          deliver_rule_notice_in_txn(txn, rule, call, evidence)
-        rescue
-          error ->
-            EventLog.lifecycle_in_txn(
-              txn,
-              "rule_notice_failed",
-              rule.name,
-              Exception.message(error)
-            )
-        end
+    if wait_recognition_ready?(txn) do
+      txn
+      |> RuleRuntime.row_commit_effects_in_txn(transitions)
+      |> Enum.each(fn
+        {:notice, rule, call, evidence} ->
+          try do
+            deliver_rule_notice_in_txn(txn, rule, call, evidence)
+          rescue
+            error ->
+              EventLog.lifecycle_in_txn(
+                txn,
+                "rule_notice_failed",
+                rule.name,
+                Exception.message(error)
+              )
+          end
 
-      {:error, rule, message} ->
-        EventLog.lifecycle_in_txn(txn, "rule_notice_failed", rule.name, message)
-    end)
+        {:error, rule, message} ->
+          EventLog.lifecycle_in_txn(txn, "rule_notice_failed", rule.name, message)
+      end)
 
-    recognize_wait_transitions_in_txn(txn, transitions)
+      recognize_wait_transitions_in_txn(txn, transitions)
+    end
 
     :ok
   end
