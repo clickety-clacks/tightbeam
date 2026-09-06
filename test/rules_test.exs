@@ -1547,12 +1547,19 @@ defmodule Tightbeam.RulesTest do
     own_assignment = assignment(ctx, own.session_key, {:user, "flynn"})
     foreign_assignment = assignment(ctx, foreign.session_key, {:user, "kay"})
 
+    valid_predicate = %{
+      owner_user_id: "flynn",
+      conditions: [%{fact: "assignment.state", op: "eq", value: "open"}],
+      bindings: %{assignment_id: own_assignment.id}
+    }
+
+    assert {:error, %{code: "invalid_predicate", message: dropped_message}} =
+             Rules.evaluate_predicate(ctx.db, Map.delete(valid_predicate, :conditions))
+
+    assert dropped_message =~ "predicate conditions must be a non-empty list"
+
     assert {:ok, %{matched: true, facts: [{"assignment.state", "open"}]}} =
-             Rules.evaluate_predicate(ctx.db, %{
-               owner_user_id: "flynn",
-               conditions: [%{fact: "assignment.state", op: "eq", value: "open"}],
-               bindings: %{assignment_id: own_assignment.id}
-             })
+             Rules.evaluate_predicate(ctx.db, valid_predicate)
 
     for op <- ~w(ne not_in) do
       value = if op == "ne", do: "completed", else: ["completed"]

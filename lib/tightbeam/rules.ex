@@ -276,6 +276,7 @@ defmodule Tightbeam.Rules do
 
       conditions = normalize_predicate_conditions(raw_conditions)
       fail = fn message -> raise ArgumentError, message end
+      validate_predicate_conditions!(conditions, fail)
       conditions = validate_conditions!(conditions, fail)
       bindings = validate_bindings_in_txn!(txn, conditions, raw_bindings, owner_user_id)
 
@@ -821,6 +822,12 @@ defmodule Tightbeam.Rules do
     conditions
     |> Enum.with_index(1)
     |> Enum.map(fn {condition, index} -> validate_condition!(condition, index, fail) end)
+  end
+
+  defp validate_predicate_conditions!(conditions, fail) do
+    unless is_list(conditions) and conditions != [] do
+      fail.("predicate conditions must be a non-empty list of condition objects")
+    end
   end
 
   defp validate_recurrence_suppression!(nil, _fail), do: nil
