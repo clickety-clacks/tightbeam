@@ -150,7 +150,7 @@ defmodule Tightbeam.ToplinesTest do
 
     ended = Toplines.unlink_work(ctx.db, unlink_call)
     assert ended == Toplines.unlink_work(ctx.db, unlink_call)
-    assert ended.endedConcernReferenceIds == []
+    assert ended.untaggedConcernIds == []
     assert ended.openedPlacement == nil
     assert ended.membership.unlinkReason == "work split"
     assert ended.membership.unlinkedActor == %{kind: "user", ref: "flynn"}
@@ -257,7 +257,7 @@ defmodule Tightbeam.ToplinesTest do
              )
   end
 
-  test "AC59 concurrent active Concern-reference links commit once and append one event", ctx do
+  test "AC59 concurrent Concern tags commit once and append one event", ctx do
     work_item!(ctx.db, "wi_reference_race", "flynn")
 
     topline =
@@ -266,20 +266,19 @@ defmodule Tightbeam.ToplinesTest do
         call({:user, "flynn"}, %{title: "Reference race", idempotency_key: "race-create"}, 20)
       ).topline
 
-    membership =
-      Toplines.link_work(
-        ctx.db,
-        call(
-          {:user, "flynn"},
-          %{
-            topline_id: topline.id,
-            work_item_id: "wi_reference_race",
-            reason: "member",
-            idempotency_key: "race-member"
-          },
-          21
-        )
-      ).membership
+    Toplines.link_work(
+      ctx.db,
+      call(
+        {:user, "flynn"},
+        %{
+          topline_id: topline.id,
+          work_item_id: "wi_reference_race",
+          reason: "member",
+          idempotency_key: "race-member"
+        },
+        21
+      )
+    )
 
     concern =
       Toplines.create_concern(
@@ -297,7 +296,7 @@ defmodule Tightbeam.ToplinesTest do
           {:user, "flynn"},
           %{
             concern_id: concern.id,
-            membership_id: membership.id,
+            work_item_id: "wi_reference_race",
             reason: "same reference",
             idempotency_key: key
           },
@@ -307,19 +306,19 @@ defmodule Tightbeam.ToplinesTest do
 
     results = race(calls, &Toplines.link_concern_work(ctx.db, &1))
 
-    assert 1 == Enum.count(results, &match?(%{concernReference: %{}}, &1))
-    assert 1 == Enum.count(results, &match?(%{code: "concern_reference_exists"}, &1))
+    assert 1 == Enum.count(results, &match?(%{concernTag: %{}}, &1))
+    assert 1 == Enum.count(results, &match?(%{code: "concern_tag_exists"}, &1))
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM topline_concern_refs WHERE unlinkedAt IS NULL"
+               "SELECT COUNT(*) FROM topline_concern_refs"
              )
 
     assert {:ok, [[1]]} =
              DB.query(
                ctx.db,
-               "SELECT COUNT(*) FROM topline_events WHERE toplineId=?1 AND kind='concern_work_linked'",
+               "SELECT COUNT(*) FROM topline_events WHERE toplineId=?1 AND kind='concern_work_tagged'",
                [topline.id]
              )
   end
@@ -427,8 +426,9 @@ defmodule Tightbeam.ToplinesTest do
     assert Enum.at(history, 1).detail == %{fromTitle: "Café", toTitle: "Ship"}
   end
 
-  test "concerns and references preserve current state and derived unlink history", ctx do
+  test "Concern definitions are immutable tags and membership unlink cleans current tags", ctx do
     work_item!(ctx.db, "wi_concern", "flynn")
+    session!(ctx.db, "s_flynn", "flynn")
 
     topline =
       Toplines.create(
@@ -451,76 +451,120 @@ defmodule Tightbeam.ToplinesTest do
         )
       ).membership
 
-    concern =
-      Toplines.create_concern(
-        ctx.db,
-        call(
-          {:user, "flynn"},
-          %{topline_id: topline.id, title: " Risk ", idempotency_key: "concern"},
-          22
-        )
-      ).concern
+    concerns =
+      for {title, key} <- [{" Risk ", "risk"}, {"Privacy", "privacy"}] do
+        Toplines.create_concern(
+          ctx.db,
+          call(
+            {:session, "s_flynn"},
+            %{topline_id: topline.id, title: title, idempotency_key: key},
+            22
+          )
+        ).concern
+      end
 
-    reference =
-      Toplines.link_concern_work(
-        ctx.db,
+    for {concern, key} <- Enum.zip(concerns, ["tag-risk", "tag-privacy"]) do
+      request =
         call(
           {:user, "flynn"},
           %{
             concern_id: concern.id,
-            membership_id: membership.id,
+            work_item_id: "wi_concern",
             reason: "addresses",
-            idempotency_key: "reference"
+            idempotency_key: key
           },
           23
         )
-      ).concernReference
 
-    assert reference.toplineId == topline.id
-    assert reference.unlinkedAt == nil
+      response = Toplines.link_concern_work(ctx.db, request)
+      assert response == Toplines.link_concern_work(ctx.db, %{request | now: 99})
+      assert response.concernTag.workItemId == "wi_concern"
+    end
 
-    resolved =
-      Toplines.resolve_concern(
-        ctx.db,
-        call(
-          {:user, "flynn"},
-          %{concern_id: concern.id, reason: "handled", idempotency_key: "resolve"},
-          24
-        )
-      ).concern
+    assert %{topline: %{concerns: projected, history: history}} =
+             Toplines.get(
+               ctx.db,
+               read_call({:user, "flynn"}, %{topline_id: topline.id, history: true})
+             )
 
-    assert resolved.state == "resolved"
-    assert resolved.activeConcernReferenceIds == [reference.id]
+    assert Map.new(projected, &{&1.title, &1.workItemIds}) == %{
+             "Privacy" => ["wi_concern"],
+             "Risk" => ["wi_concern"]
+           }
 
-    reopened =
-      Toplines.reopen_concern(
-        ctx.db,
-        call(
-          {:user, "flynn"},
-          %{concern_id: concern.id, reason: "returned", idempotency_key: "reopen"},
-          25
-        )
-      ).concern
+    assert Enum.take(Enum.map(history, & &1.kind), -2) ==
+             ["concern_work_tagged", "concern_work_tagged"]
 
-    assert reopened.state == "open"
-    assert reopened.resolveReason == nil
+    work_item!(ctx.db, "wi_unlinked", "flynn")
 
-    renamed =
-      Toplines.update_concern(
-        ctx.db,
-        call(
-          {:user, "flynn"},
-          %{
-            concern_id: concern.id,
-            title: "New risk",
-            reason: "clearer",
-            idempotency_key: "rename"
-          },
-          26
-        )
-      ).concern
+    assert %{code: "topline_mismatch"} =
+             Toplines.link_concern_work(
+               ctx.db,
+               call(
+                 {:user, "flynn"},
+                 %{
+                   concern_id: hd(concerns).id,
+                   work_item_id: "wi_unlinked",
+                   reason: "not a member",
+                   idempotency_key: "mismatch"
+                 },
+                 24
+               )
+             )
 
-    assert renamed.title == "New risk"
+    assert %{code: "not_found"} =
+             Toplines.create_concern(
+               ctx.db,
+               call(
+                 {:user, "kay"},
+                 %{topline_id: topline.id, title: "Invisible", idempotency_key: "foreign"},
+                 24
+               )
+             )
+
+    Toplines.close(
+      ctx.db,
+      call(
+        {:user, "flynn"},
+        %{topline_id: topline.id, reason: "pause", idempotency_key: "close"},
+        25
+      )
+    )
+
+    untag_request =
+      call(
+        {:user, "flynn"},
+        %{
+          concern_id: hd(concerns).id,
+          work_item_id: "wi_concern",
+          reason: "narrow focus",
+          idempotency_key: "untag"
+        },
+        26
+      )
+
+    assert %{concernId: concern_id, workItemId: "wi_concern"} =
+             Toplines.unlink_concern_work(ctx.db, untag_request)
+
+    assert concern_id == hd(concerns).id
+
+    assert Toplines.unlink_concern_work(ctx.db, untag_request) ==
+             %{concernId: concern_id, workItemId: "wi_concern"}
+
+    assert %{code: "topline_closed"} =
+             Toplines.link_concern_work(
+               ctx.db,
+               call(
+                 {:user, "flynn"},
+                 %{
+                   concern_id: hd(concerns).id,
+                   work_item_id: "wi_concern",
+                   reason: "reapply",
+                   idempotency_key: "closed-tag"
+                 },
+                 26
+               )
+             )
 
     ended =
       Toplines.unlink_work(
@@ -532,24 +576,17 @@ defmodule Tightbeam.ToplinesTest do
         )
       )
 
-    assert ended.endedConcernReferenceIds == [reference.id]
+    assert ended.untaggedConcernIds == [List.last(concerns).id]
+    assert ended.openedPlacement == nil
 
-    assert %{topline: %{concerns: [%{activeConcernReferenceIds: []}], history: history}} =
+    assert %{topline: %{concerns: cleaned, history: cleaned_history}} =
              Toplines.get(
                ctx.db,
                read_call({:user, "flynn"}, %{topline_id: topline.id, history: true})
              )
 
-    assert Enum.take(Enum.map(history, & &1.kind), -2) == [
-             "work_unlinked",
-             "concern_work_unlinked"
-           ]
-
-    assert List.last(history).detail == %{
-             cause: "membership_unlinked",
-             membershipId: membership.id,
-             unlinkReason: "split"
-           }
+    assert Enum.all?(cleaned, &(&1.workItemIds == []))
+    assert List.last(cleaned_history).kind == "work_unlinked"
   end
 
   test "public query applies visibility and state before the closed projection", ctx do
@@ -789,6 +826,69 @@ defmodule Tightbeam.ToplinesTest do
                  resolution_causal_event_seq: nil
                })
              end)
+  end
+
+  test "leave-unlinked resolves the caller's pending placement idempotently and lists resolved placements",
+       ctx do
+    work_item!(ctx.db, "wi_leave", "flynn")
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        """
+        INSERT INTO wakes
+          (wakeId, sessionKey, origin, prompt, consumer, dueAt, state, createdAt)
+        VALUES ('w_leave', 'agent:main:clawline:flynn:main', 'process:tightbeam',
+                'Choose placement', 'prompt', 40, 'pending', 40)
+        """
+      )
+
+    {:ok, _} =
+      DB.transaction(ctx.db, fn txn ->
+        Toplines.open_placement_in_txn(txn, %{
+          id: "tlp_leave",
+          work_item_id: "wi_leave",
+          owner_user_id: "flynn",
+          cause: "created",
+          cause_ref: "wi_leave",
+          source_causal_event_seq: nil,
+          actor_kind: "user",
+          actor_ref: "flynn",
+          at: 40,
+          prompt_wake_id: "w_leave"
+        })
+      end)
+
+    request = %{work_item_id: "wi_leave", reason: "not now", idempotency_key: "leave-1"}
+
+    assert %{placement: %{id: "tlp_leave", state: "left_unlinked", resolutionReason: "not now"}} =
+             Toplines.leave_unlinked(ctx.db, call({:user, "flynn"}, request, 41))
+
+    assert %{placement: %{id: "tlp_leave", state: "left_unlinked"}} =
+             Toplines.leave_unlinked(ctx.db, call({:user, "flynn"}, request, 42))
+
+    assert %{code: "placement_not_pending"} =
+             Toplines.leave_unlinked(
+               ctx.db,
+               call({:user, "flynn"}, %{request | idempotency_key: "leave-2"}, 43)
+             )
+
+    assert %{placements: []} = Toplines.list_placements(ctx.db, read_call({:user, "flynn"}))
+
+    assert %{placements: [%{id: "tlp_leave", state: "left_unlinked"}]} =
+             Toplines.list_placements(
+               ctx.db,
+               read_call({:user, "flynn"}, %{state: "resolved"})
+             )
+
+    assert %{placements: []} =
+             Toplines.list_placements(ctx.db, read_call({:user, "kay"}, %{state: "all"}))
+
+    assert %{code: "process_denied"} =
+             Toplines.leave_unlinked(
+               ctx.db,
+               call({:process, "tightbeam"}, %{work_item_id: "wi_leave"}, 44)
+             )
   end
 
   test "invalid, invisible, cross-owner, duplicate, and process operations refuse without writes",
