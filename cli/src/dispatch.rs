@@ -386,6 +386,49 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("action", action),
             ],
         )),
+        Command::Ask {
+            identity,
+            target,
+            question,
+            assignment_id,
+        } => {
+            let target = match target {
+                Target::Session(value) => string_field("sessionKey", value),
+                Target::Role(value) => string_field("role", value),
+                Target::User(value) => string_field("userId", value),
+            };
+            let mut params = vec![string_field("question", question)];
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignmentId", value));
+            }
+            Ok(request(identity, "ask", vec![target], params))
+        }
+        Command::Answer {
+            identity,
+            request_id,
+            answer,
+        } => Ok(request(
+            identity,
+            "answer",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("answer", answer),
+            ],
+        )),
+        Command::Return {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "return",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::OperatorAsk {
             identity,
             question,
@@ -1576,6 +1619,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
+        | Command::Ask { identity, .. }
+        | Command::Answer { identity, .. }
+        | Command::Return { identity, .. }
         | Command::OperatorAsk { identity, .. }
         | Command::OperatorRule { identity, .. }
         | Command::OperatorWithdraw { identity, .. }
@@ -1785,6 +1831,48 @@ mod tests {
                 Some(env!("CARGO_PKG_VERSION"))
             );
         }
+    }
+
+    #[test]
+    fn builds_agent_decision_bodies() {
+        assert_eq!(
+            body(&[
+                "ask",
+                "--session",
+                "agent:r",
+                "--question",
+                "Why?",
+                "--about",
+                "asg_1",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"ask","sessionKey":"agent:r","params":{"question":"Why?","assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "answer",
+                "--request",
+                "dr_1",
+                "--answer",
+                "Yes",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"answer","params":{"request":"dr_1","answer":"Yes"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "return",
+                "--request",
+                "dr_1",
+                "--reason",
+                "Need proof",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"return","params":{"request":"dr_1","reason":"Need proof"}}"#
+        );
     }
 
     #[test]

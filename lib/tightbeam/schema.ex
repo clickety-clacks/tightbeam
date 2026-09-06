@@ -17,16 +17,17 @@ defmodule Tightbeam.Schema do
     Tightbeam.Escalation,
     Tightbeam.Wakes,
     Tightbeam.NoticeBatcher,
-    Tightbeam.AdminProjection,
     Tightbeam.Projection,
     Tightbeam.Org,
     Tightbeam.CriticalLeases,
     Tightbeam.Roles,
+    Tightbeam.ReadMarkers,
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
     Tightbeam.CommandExecutions,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
+    Tightbeam.AdminProjection,
     Tightbeam.RecurrenceSuppression,
     Tightbeam.RailRemedy,
     Tightbeam.Supervision,
@@ -40,7 +41,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "liveness-progress-receipts-v1-019"
+  @shape "agent-decision-carrier-return-v1-019"
+  @decision_carrier_previous_shape "liveness-progress-receipts-v1-019"
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
@@ -181,6 +183,141 @@ defmodule Tightbeam.Schema do
   CREATE UNIQUE INDEX decision_requests_operator_open
     ON decision_requests (ownerUserId, raiserId, actionKey)
     WHERE kind = 'operator' AND status = 'open';
+  """
+
+  # Exact target for the stamped 0.1.9 predecessor. Agent questions get
+  # their own columns and statuses; the statute, effort, and operator arms keep
+  # their existing constraints and terminal-integrity fields unchanged.
+  @decision_carrier_requests_ddl """
+  CREATE TABLE decision_requests_agent_v1 (
+    id                TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort','operator','agent')),
+    raiserId          TEXT NOT NULL,
+    raiserSessionKey  TEXT,
+    ownerUserId       TEXT NOT NULL,
+    assignmentId      TEXT,
+    expecterSessionKey TEXT,
+    expecterUserId    TEXT,
+    lineageRung       INTEGER,
+    effortGeneration  INTEGER,
+    deadlineWakeId    TEXT,
+    raisedAt          INTEGER NOT NULL,
+    deadlineAt        INTEGER,
+    statuteName       TEXT,
+    actionKey         TEXT,
+    question          TEXT NOT NULL,
+    options           TEXT,
+    context           TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded','answered','returned')),
+    decision          TEXT,
+    rationale         TEXT,
+    ruledBy           TEXT,
+    ruledViaPrincipal TEXT,
+    ruledViaSessionKey TEXT,
+    ruledViaSessionState TEXT CHECK (ruledViaSessionState IS NULL OR ruledViaSessionState IN ('known','none')),
+    ruledAt           INTEGER,
+    rulingFactId      INTEGER,
+    consumedAt        INTEGER,
+    parkWakeId        TEXT,
+    withdrawnBy       TEXT,
+    withdrawnReason   TEXT,
+    withdrawnAt       INTEGER,
+    askedOfRole       TEXT,
+    answer            TEXT,
+    answeredBy        TEXT,
+    answeredAt        INTEGER,
+    returnedBy        TEXT,
+    returnReason      TEXT,
+    returnedAt        INTEGER,
+    CHECK (
+      (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
+       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+       AND deadlineAt IS NOT NULL
+       AND ruledViaSessionKey IS NULL
+       AND (decision IS NULL OR decision IN ('allow','deny','waived')))
+      OR
+      (kind = 'effort' AND raiserId = 'process:tightbeam'
+       AND raiserSessionKey IS NULL
+       AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
+       AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
+       AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
+       AND deadlineAt IS NOT NULL
+       AND ruledViaSessionKey IS NULL
+       AND (decision IS NULL OR decision IN ('continue','dismiss')))
+      OR
+      (kind = 'operator'
+       AND raiserSessionKey IS NOT NULL
+       AND statuteName IS NULL AND actionKey IS NOT NULL
+       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL
+       AND deadlineWakeId IS NULL
+       AND options IS NOT NULL
+       AND parkWakeId IS NULL AND consumedAt IS NULL
+       AND status <> 'consumed'
+       AND (
+         (status = 'ruled'
+          AND decision IS NOT NULL
+          AND ruledBy = 'user:' || ownerUserId
+          AND ruledAt IS NOT NULL AND rulingFactId IS NOT NULL)
+         OR
+         (status <> 'ruled'
+          AND decision IS NULL AND rationale IS NULL
+          AND ruledBy IS NULL AND ruledAt IS NULL AND rulingFactId IS NULL
+          AND ruledViaSessionKey IS NULL)
+       ))
+      OR
+      (kind = 'agent'
+       AND raiserSessionKey IS NOT NULL AND raiserId = 'session:' || raiserSessionKey
+       AND expecterSessionKey IS NOT NULL AND expecterUserId IS NOT NULL
+       AND statuteName IS NULL AND actionKey IS NULL AND options IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+       AND deadlineAt IS NULL
+       AND decision IS NULL AND rationale IS NULL
+       AND ruledBy IS NULL AND ruledViaPrincipal IS NULL
+       AND ruledViaSessionKey IS NULL AND ruledViaSessionState IS NULL
+       AND ruledAt IS NULL AND rulingFactId IS NULL
+       AND consumedAt IS NULL AND parkWakeId IS NULL
+       AND status IN ('open','answered','withdrawn','returned')
+       AND (status = 'answered') = (answer IS NOT NULL)
+       AND (answer IS NULL) = (answeredBy IS NULL)
+       AND (answer IS NULL) = (answeredAt IS NULL)
+       AND (status = 'returned') = (returnReason IS NOT NULL)
+       AND (returnReason IS NULL OR length(trim(returnReason)) > 0)
+       AND (returnReason IS NULL) = (returnedBy IS NULL)
+       AND (returnReason IS NULL) = (returnedAt IS NULL))
+    ),
+    CHECK (kind = 'agent' OR
+      (askedOfRole IS NULL AND answer IS NULL AND answeredBy IS NULL AND answeredAt IS NULL
+       AND returnedBy IS NULL AND returnReason IS NULL AND returnedAt IS NULL
+       AND status NOT IN ('answered','returned')))
+  );
+  """
+
+  @decision_carrier_predecessor_columns """
+  id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
+  expecterSessionKey,expecterUserId,lineageRung,effortGeneration,deadlineWakeId,
+  raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status,
+  decision,rationale,ruledBy,ruledViaPrincipal,ruledViaSessionKey,
+  ruledViaSessionState,ruledAt,rulingFactId,consumedAt,parkWakeId,withdrawnBy,
+  withdrawnReason,withdrawnAt
+  """
+
+  @decision_carrier_indexes_ddl """
+  CREATE INDEX decision_requests_owner
+    ON decision_requests (ownerUserId, status);
+  CREATE INDEX decision_requests_key
+    ON decision_requests (raiserId, statuteName, actionKey);
+  CREATE UNIQUE INDEX decision_requests_one_open
+    ON decision_requests (raiserId, statuteName, actionKey)
+    WHERE kind = 'statute' AND status = 'open';
+  CREATE UNIQUE INDEX decision_requests_effort_generation
+    ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
+  CREATE UNIQUE INDEX decision_requests_operator_open
+    ON decision_requests (ownerUserId, raiserId, actionKey)
+    WHERE kind = 'operator' AND status = 'open';
+  CREATE INDEX decision_requests_asked
+    ON decision_requests (expecterSessionKey, status) WHERE kind = 'agent';
   """
 
   @operator_messages_ddl """
@@ -1190,6 +1327,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@decision_carrier_previous_shape]]} ->
+        upgrade_decision_carrier_return_v1_019(db)
+
       {:ok, [[@liveness_progress_receipts_previous_shape]]} ->
         upgrade_liveness_progress_receipts_v1(db)
 
@@ -1238,7 +1378,7 @@ defmodule Tightbeam.Schema do
         It can migrate #{@terminal_decision_shape} through
         #{@effort_request_exit_previous_shape} to #{@shape}. It can also migrate
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
-        then #{@shape}.
+        then #{@decision_carrier_previous_shape} and #{@shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -1357,7 +1497,7 @@ defmodule Tightbeam.Schema do
 
              Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
                @liveness_progress_receipts_previous_shape,
-               @shape,
+               @decision_carrier_previous_shape,
                migration_time
              ])
 
@@ -1391,6 +1531,237 @@ defmodule Tightbeam.Schema do
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
+
+    upgrade_decision_carrier_return_v1_019(db)
+  end
+
+  @doc false
+  @spec upgrade_decision_carrier_return_v1_019(DB.server(), keyword()) :: :ok
+  def upgrade_decision_carrier_return_v1_019(db, opts \\ []) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+    :ok = DB.execute(db, "PRAGMA ignore_check_constraints = ON")
+
+    try do
+      case DB.transaction(db, &upgrade_decision_carrier_return_v1_019_in_txn(&1, opts)) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "incompatible_decision_carrier_return_v1_019: upgrade failed: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA ignore_check_constraints = OFF")
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp upgrade_decision_carrier_return_v1_019_in_txn(%Txn{} = txn, opts) do
+    case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+      [[@decision_carrier_previous_shape]] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "incompatible_decision_carrier_return_v1_019: predecessor stamp #{inspect(rows)}"
+    end
+
+    [[request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests")
+
+    census =
+      Txn.q(
+        txn,
+        "SELECT kind,status,COUNT(*) FROM decision_requests GROUP BY kind,status ORDER BY kind,status"
+      )
+
+    epoch =
+      Txn.q(
+        txn,
+        "SELECT id,schemaVersion,legacyRulingFactMaxId,activatedAt,cause,principal FROM decision_request_terminal_epoch ORDER BY id"
+      )
+
+    evidence =
+      Txn.q(
+        txn,
+        "SELECT requestId,shapeDigest,schemaVersion,causeCode,failingFields,firstSurface,firstObservedAt,observerPrincipal FROM decision_request_integrity_evidence ORDER BY requestId,shapeDigest"
+      )
+
+    trigger_sql =
+      Txn.q(
+        txn,
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN ('decision_requests_terminal_insert_guard','decision_requests_terminal_update_guard') ORDER BY name"
+      )
+
+    if length(trigger_sql) != 2 do
+      raise ShapeError,
+        message: "incompatible_decision_carrier_return_v1_019: terminal triggers missing"
+    end
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP TRIGGER decision_requests_terminal_insert_guard;
+        DROP TRIGGER decision_requests_terminal_update_guard;
+        DROP INDEX decision_requests_owner;
+        DROP INDEX decision_requests_key;
+        DROP INDEX decision_requests_one_open;
+        DROP INDEX decision_requests_effort_generation;
+        DROP INDEX decision_requests_operator_open;
+        ALTER TABLE decision_requests RENAME TO decision_requests_liveness_progress_v1;
+        #{@decision_carrier_requests_ddl}
+        """
+      )
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO decision_requests_agent_v1 (#{@decision_carrier_predecessor_columns})
+      SELECT #{@decision_carrier_predecessor_columns}
+      FROM decision_requests_liveness_progress_v1
+      ORDER BY id
+      """
+    )
+
+    if Txn.changes(txn) != request_count do
+      raise ShapeError,
+        message:
+          "incompatible_decision_carrier_return_v1_019: copied #{Txn.changes(txn)} of #{request_count} decision requests"
+    end
+
+    preservation_failures =
+      Txn.q(
+        txn,
+        """
+        SELECT #{@decision_carrier_predecessor_columns}
+        FROM decision_requests_liveness_progress_v1
+        EXCEPT
+        SELECT #{@decision_carrier_predecessor_columns}
+        FROM decision_requests_agent_v1
+        UNION ALL
+        SELECT #{@decision_carrier_predecessor_columns}
+        FROM decision_requests_agent_v1
+        EXCEPT
+        SELECT #{@decision_carrier_predecessor_columns}
+        FROM decision_requests_liveness_progress_v1
+        """
+      )
+
+    if preservation_failures != [] do
+      raise ShapeError,
+        message: "incompatible_decision_carrier_return_v1_019: row preservation failed"
+    end
+
+    decision_carrier_test_step(opts, :after_copy)
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP TABLE decision_requests_liveness_progress_v1;
+        ALTER TABLE decision_requests_agent_v1 RENAME TO decision_requests;
+        #{@decision_carrier_indexes_ddl}
+        """
+      )
+
+    :ok =
+      Tightbeam.Escalation.ensure_terminal_parity_in_txn(
+        txn,
+        System.system_time(:millisecond)
+      )
+
+    [[^request_count]] = Txn.q(txn, "SELECT COUNT(*) FROM decision_requests")
+
+    if Txn.q(
+         txn,
+         "SELECT kind,status,COUNT(*) FROM decision_requests GROUP BY kind,status ORDER BY kind,status"
+       ) != census do
+      raise ShapeError,
+        message: "incompatible_decision_carrier_return_v1_019: kind/status census changed"
+    end
+
+    if Txn.q(
+         txn,
+         "SELECT id,schemaVersion,legacyRulingFactMaxId,activatedAt,cause,principal FROM decision_request_terminal_epoch ORDER BY id"
+       ) != epoch do
+      raise ShapeError,
+        message: "incompatible_decision_carrier_return_v1_019: terminal epoch changed"
+    end
+
+    if Txn.q(
+         txn,
+         "SELECT requestId,shapeDigest,schemaVersion,causeCode,failingFields,firstSurface,firstObservedAt,observerPrincipal FROM decision_request_integrity_evidence ORDER BY requestId,shapeDigest"
+       ) != evidence do
+      raise ShapeError,
+        message: "incompatible_decision_carrier_return_v1_019: integrity evidence changed"
+    end
+
+    recreated_trigger_sql =
+      Txn.q(
+        txn,
+        "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND name IN ('decision_requests_terminal_insert_guard','decision_requests_terminal_update_guard') ORDER BY name"
+      )
+
+    normalize_triggers = fn rows ->
+      Enum.map(rows, fn [name, sql] -> [name, normalize_schema_sql(sql)] end)
+    end
+
+    if normalize_triggers.(recreated_trigger_sql) != normalize_triggers.(trigger_sql) do
+      raise ShapeError,
+        message: "incompatible_decision_carrier_return_v1_019: terminal triggers changed"
+    end
+
+    expected_indexes =
+      ~w(decision_requests_asked decision_requests_effort_generation decision_requests_key decision_requests_one_open decision_requests_operator_open decision_requests_owner)
+
+    actual_indexes =
+      txn
+      |> Txn.q(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='decision_requests' AND sql IS NOT NULL ORDER BY name"
+      )
+      |> List.flatten()
+
+    if actual_indexes != expected_indexes do
+      raise ShapeError,
+        message: "incompatible_decision_carrier_return_v1_019: indexes #{inspect(actual_indexes)}"
+    end
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "incompatible_decision_carrier_return_v1_019: foreign key check #{inspect(rows)}"
+    end
+
+    Txn.q(txn, "UPDATE schema_stamp SET shape=?2, stampedAt=?3 WHERE shape=?1", [
+      @decision_carrier_previous_shape,
+      @shape,
+      System.system_time(:millisecond)
+    ])
+
+    if Txn.changes(txn) != 1 do
+      raise ShapeError,
+        message: "incompatible_decision_carrier_return_v1_019: stamp race"
+    end
+
+    decision_carrier_test_step(opts, :after_stamp)
+    :ok
+  end
+
+  defp decision_carrier_test_step(opts, step) do
+    if Keyword.get(opts, :fail_after_step) == step do
+      raise "forced decision carrier migration interruption at #{step}"
+    end
+
+    :ok
   end
 
   defp migrate_operator_decision_v1(db) do
@@ -1573,6 +1944,12 @@ defmodule Tightbeam.Schema do
         ALTER TABLE messages_new RENAME TO messages;
         #{@operator_messages_indexes_ddl}
         """
+      )
+
+    :ok =
+      Tightbeam.Escalation.ensure_terminal_parity_in_txn(
+        txn,
+        System.system_time(:millisecond)
       )
 
     case Txn.q(txn, "PRAGMA foreign_key_check") do

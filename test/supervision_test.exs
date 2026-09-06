@@ -74,7 +74,10 @@ defmodule Tightbeam.SupervisionTest do
       do: {:reply, GenServer.call(state.db, request), state}
 
     defp current_request_query?(sql) do
-      String.contains?(sql, "FROM decision_requests WHERE raiserId") and
+      String.contains?(
+        sql,
+        "FROM decision_requests WHERE kind = 'statute' AND raiserId"
+      ) and
         String.contains?(sql, "ORDER BY rowid DESC LIMIT 1")
     end
 

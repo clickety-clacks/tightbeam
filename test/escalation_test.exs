@@ -429,13 +429,13 @@ defmodule Tightbeam.EscalationTest do
     assert {:ok, "open"} = Escalation.list_status(nil)
     assert {:ok, "all"} = Escalation.list_status("all")
 
-    for status <- ~w(open ruled consumed withdrawn superseded) do
+    for status <- ~w(open ruled consumed withdrawn superseded returned) do
       assert {:ok, ^status} = Escalation.list_status(status)
     end
 
     assert %{code: "invalid", message: message} = Escalation.list_status("bogus")
     assert message =~ "bogus"
-    assert message =~ "open, ruled, consumed, withdrawn, superseded, all"
+    assert message =~ "open, ruled, consumed, withdrawn, superseded, returned, all"
   end
 
   test "non-session raisers use the origin domain and option labels resolve to effects", ctx do
@@ -2426,6 +2426,420 @@ defmodule Tightbeam.EscalationTest do
              )
   end
 
+  test "agent ask files one non-blocking carrier and classed target wake atomically", ctx do
+    asked = session(ctx.db, "asked", "other")
+    other = session(ctx.db, "other", "other")
+    insert_assignment!(ctx.db, "a-agent-owned", ctx.raiser.session_key, "open")
+    insert_assignment!(ctx.db, "a-agent-foreign", other.session_key, "open")
+
+    before_facts = table_count(ctx.db, "condition_facts")
+
+    request =
+      Escalation.ask(
+        ctx.db,
+        agent_call(
+          ctx.raiser,
+          %{question: "  Which rollback boundary?  ", assignment_id: "a-agent-owned"},
+          %{
+            verb: "ask",
+            session_key: asked.session_key,
+            target_role: "reviewer",
+            role_fallback: false
+          }
+        )
+      )
+
+    assert %{
+             kind: "agent",
+             status: "open",
+             raiser_id: "session:" <> raiser_key,
+             raiser_session_key: raiser_key,
+             owner_user_id: "flynn",
+             assignment_id: "a-agent-owned",
+             expecter_session_key: asked_key,
+             expecter_user_id: "other",
+             asked_of_role: "reviewer",
+             question: "Which rollback boundary?",
+             deadline_at: nil,
+             decision: nil,
+             ruling_fact_id: nil,
+             park_wake_id: nil,
+             answer: nil,
+             return_reason: nil
+           } = request
+
+    assert raiser_key == ctx.raiser.session_key
+    assert asked_key == asked.session_key
+    assert Escalation.raw_by_id(ctx.db, request.id) == request
+    assert table_count(ctx.db, "condition_facts") == before_facts
+
+    assert [wake] = notification_wakes(ctx)
+    assert wake.session_key == asked.session_key
+    assert wake.origin == "session:" <> ctx.raiser.session_key
+    assert wake.target_gate == 0
+    assert wake.class == "input-needed"
+    assert wake.class_election == "sender"
+    assert wake.prompt =~ request.id
+    assert wake.prompt =~ request.question
+    assert wake.prompt =~ request.assignment_id
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "decision_request_asked" and event.subject == request.id
+           end) == 1
+
+    assert %{code: "invalid"} =
+             Escalation.ask(
+               ctx.db,
+               agent_call(ctx.raiser, %{question: "self"}, %{
+                 verb: "ask",
+                 session_key: ctx.raiser.session_key
+               })
+             )
+
+    assert %{code: "not_session"} =
+             Escalation.ask(ctx.db, %{
+               verb: "ask",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: asked.session_key,
+               params: %{question: "user ask"}
+             })
+
+    assert %{code: "not_found"} =
+             Escalation.ask(
+               ctx.db,
+               agent_call(ctx.raiser, %{question: "foreign", assignment_id: "a-agent-foreign"}, %{
+                 verb: "ask",
+                 session_key: asked.session_key
+               })
+             )
+  end
+
+  test "complete agent id grants session answer standing with private refusals and idempotency",
+       ctx do
+    asked = session(ctx.db, "answer-target", "other")
+    stranger = session(ctx.db, "answer-stranger", "third")
+
+    request =
+      Escalation.ask(
+        ctx.db,
+        agent_call(ctx.raiser, %{question: "Ship behind a flag?"}, %{
+          verb: "ask",
+          session_key: asked.session_key
+        })
+      )
+
+    {:decision_pending, statute_id} =
+      open(ctx, call(ctx.raiser, %{assignment_id: "answer-wrong-kind"}), statute())
+
+    not_found = %{code: "not_found", message: "decision request not found"}
+
+    assert ^not_found =
+             Escalation.answer(
+               ctx.db,
+               agent_call(stranger, %{request: "dr_missing", answer: "guess"}, %{verb: "answer"})
+             )
+
+    assert ^not_found =
+             Escalation.answer(
+               ctx.db,
+               agent_call(stranger, %{request: statute_id, answer: "wrong kind"}, %{
+                 verb: "answer"
+               })
+             )
+
+    assert ^not_found =
+             Escalation.answer(ctx.db, %{
+               verb: "answer",
+               origin: "process:ci",
+               principal: {:process, "ci"},
+               params: %{request: request.id, answer: "process answer"}
+             })
+
+    assert ^not_found =
+             Escalation.answer(ctx.db, %{
+               verb: "answer",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{request: request.id, answer: "asker owner is not the expecter"}
+             })
+
+    assert %{code: "not_owner", message: fake_rule} =
+             Escalation.rule(
+               ctx.db,
+               agent_call(stranger, %{request: "dr_missing", decision: "allow"}, %{verb: "rule"})
+             )
+
+    assert %{code: "not_owner", message: agent_rule} =
+             Escalation.rule(
+               ctx.db,
+               agent_call(stranger, %{request: request.id, decision: "allow"}, %{verb: "rule"})
+             )
+
+    assert %{code: "not_owner", message: statute_rule} =
+             Escalation.rule(
+               ctx.db,
+               agent_call(stranger, %{request: statute_id, decision: "allow"}, %{verb: "rule"})
+             )
+
+    assert fake_rule == agent_rule
+    assert agent_rule == statute_rule
+
+    assert %{code: "invalid", message: ruled_message} =
+             Escalation.rule(
+               ctx.db,
+               agent_call(stranger, %{request: request.id, decision: "allow"}, %{verb: "rule"}),
+               authorized: true
+             )
+
+    assert ruled_message =~ "answered, not ruled"
+
+    assert %{code: "invalid", message: waived_message} =
+             Escalation.waive(
+               ctx.db,
+               agent_call(stranger, %{request: request.id}, %{verb: "waive"}),
+               authorized: true
+             )
+
+    assert waived_message =~ "answered, not waived"
+
+    answered =
+      Escalation.answer(
+        ctx.db,
+        agent_call(stranger, %{request: request.id, answer: "  behind a flag  "}, %{
+          verb: "answer"
+        })
+      )
+
+    assert answered.status == "answered"
+    assert answered.answer == "behind a flag"
+    assert answered.answered_by == "session:" <> stranger.session_key
+    assert is_integer(answered.answered_at)
+    assert answered.decision == nil
+    assert answered.ruling_fact_id == nil
+    assert answered.consumed_at == nil
+
+    assert ^answered =
+             Escalation.answer(
+               ctx.db,
+               agent_call(stranger, %{request: request.id, answer: "behind a flag"}, %{
+                 verb: "answer"
+               })
+             )
+
+    assert %{code: "not_open"} =
+             Escalation.answer(
+               ctx.db,
+               agent_call(stranger, %{request: request.id, answer: "changed"}, %{verb: "answer"})
+             )
+
+    assert %{code: "not_open"} =
+             Escalation.answer(
+               ctx.db,
+               agent_call(asked, %{request: request.id, answer: "behind a flag"}, %{
+                 verb: "answer"
+               })
+             )
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "decision_request_answered" and event.subject == request.id
+           end) == 1
+
+    response_wakes =
+      notification_wakes(ctx)
+      |> Enum.filter(&(&1.session_key == ctx.raiser.session_key))
+
+    assert [wake] = response_wakes
+    assert wake.target_gate == 0
+    assert wake.class == nil
+    assert wake.prompt =~ "behind a flag"
+
+    user_request =
+      Escalation.ask(
+        ctx.db,
+        agent_call(ctx.raiser, %{question: "Human response?"}, %{
+          verb: "ask",
+          session_key: asked.session_key
+        })
+      )
+
+    assert %{status: "answered", answered_by: "user:other"} =
+             Escalation.answer(ctx.db, %{
+               verb: "answer",
+               origin: "user:other",
+               principal: {:user, "other"},
+               params: %{request: user_request.id, answer: "human answer"}
+             })
+  end
+
+  test "return preserves the immutable question and exact replay emits one terminal wake", ctx do
+    asked = session(ctx.db, "return-target", "other")
+    responder = session(ctx.db, "return-responder", "third")
+
+    request =
+      Escalation.ask(
+        ctx.db,
+        agent_call(ctx.raiser, %{question: "Which schema boundary?"}, %{
+          verb: "ask",
+          session_key: asked.session_key
+        })
+      )
+
+    assert %{code: "invalid"} =
+             Escalation.return_request(
+               ctx.db,
+               agent_call(responder, %{request: request.id, reason: "  "}, %{verb: "return"})
+             )
+
+    returned =
+      Escalation.return_request(
+        ctx.db,
+        agent_call(
+          responder,
+          %{request: request.id, reason: "  name the predecessor and rollback boundary  "},
+          %{verb: "return"}
+        )
+      )
+
+    assert returned.status == "returned"
+    assert returned.question == request.question
+    assert returned.context == request.context
+    assert returned.assignment_id == request.assignment_id
+    assert returned.raiser_session_key == request.raiser_session_key
+    assert returned.expecter_session_key == request.expecter_session_key
+    assert returned.return_reason == "name the predecessor and rollback boundary"
+    assert returned.returned_by == "session:" <> responder.session_key
+    assert is_integer(returned.returned_at)
+    assert returned.answer == nil
+
+    assert ^returned =
+             Escalation.return_request(
+               ctx.db,
+               agent_call(
+                 responder,
+                 %{request: request.id, reason: "name the predecessor and rollback boundary"},
+                 %{verb: "return"}
+               )
+             )
+
+    assert %{code: "not_open"} =
+             Escalation.return_request(
+               ctx.db,
+               agent_call(responder, %{request: request.id, reason: "different"}, %{
+                 verb: "return"
+               })
+             )
+
+    assert [listed] =
+             Escalation.list(
+               ctx.db,
+               agent_call(ctx.raiser, %{}, %{verb: "decision-requests"}),
+               "returned"
+             )
+
+    assert listed.id == returned.id
+    assert listed.return_reason == returned.return_reason
+    assert listed.returned_by == returned.returned_by
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.kind == "decision_request_returned" and event.subject == request.id
+           end) == 1
+
+    response_wakes =
+      notification_wakes(ctx)
+      |> Enum.filter(&(&1.session_key == ctx.raiser.session_key))
+
+    assert [wake] = response_wakes
+    assert wake.target_gate == 0
+    assert wake.class == nil
+    assert wake.prompt =~ returned.return_reason
+  end
+
+  test "answer and return CAS admit one winner and agent fields are kind-fenced", ctx do
+    asked = session(ctx.db, "race-target", "other")
+    responder = session(ctx.db, "race-responder", "third")
+
+    request =
+      Escalation.ask(
+        ctx.db,
+        agent_call(ctx.raiser, %{question: "Race?"}, %{
+          verb: "ask",
+          session_key: asked.session_key
+        })
+      )
+
+    answer_task =
+      Task.async(fn ->
+        Escalation.answer(
+          ctx.db,
+          agent_call(responder, %{request: request.id, answer: "yes"}, %{verb: "answer"})
+        )
+      end)
+
+    return_task =
+      Task.async(fn ->
+        Escalation.return_request(
+          ctx.db,
+          agent_call(responder, %{request: request.id, reason: "unclear"}, %{verb: "return"})
+        )
+      end)
+
+    outcomes = Task.await_many([answer_task, return_task])
+    assert Enum.count(outcomes, &(Map.get(&1, :status) in ["answered", "returned"])) == 1
+    assert Enum.count(outcomes, &(Map.get(&1, :code) == "not_open")) == 1
+
+    terminal = Escalation.raw_by_id(ctx.db, request.id)
+    assert terminal.status in ["answered", "returned"]
+    assert table_count(ctx.db, "condition_facts") == 0
+
+    assert Enum.count(EventLog.lifecycle_events(ctx.db), fn event ->
+             event.subject == request.id and
+               event.kind in ["decision_request_answered", "decision_request_returned"]
+           end) == 1
+
+    assert length(notification_wakes(ctx)) == 2
+
+    invalid_rows = [
+      """
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,expecterSessionKey,
+         expecterUserId,raisedAt,deadlineAt,question,context,status)
+      VALUES
+        ('dr_agent_deadline','agent','session:asker','asker','owner','asked',
+         'asked-owner',1,2,'q','{}','open')
+      """,
+      """
+      INSERT INTO decision_requests
+        (id,kind,raiserId,ownerUserId,raisedAt,deadlineAt,statuteName,actionKey,
+         question,context,status,answer)
+      VALUES
+        ('dr_statute_answer','statute','session:asker','owner',1,2,'law','action',
+         'q','{}','open','not allowed')
+      """,
+      """
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,expecterSessionKey,
+         expecterUserId,raisedAt,question,context,status,answer)
+      VALUES
+        ('dr_agent_incomplete_answer','agent','session:asker','asker','owner','asked',
+         'asked-owner',1,'q','{}','answered','yes')
+      """,
+      """
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,expecterSessionKey,
+         expecterUserId,raisedAt,question,context,status,returnedBy,returnReason,returnedAt)
+      VALUES
+        ('dr_agent_blank_return','agent','session:asker','asker','owner','asked',
+         'asked-owner',1,'q','{}','returned','session:asked','   ',2)
+      """
+    ]
+
+    Enum.each(invalid_rows, fn sql ->
+      assert {:error, %DB.Error{message: message}} = DB.query(ctx.db, sql)
+      assert message =~ "CHECK constraint failed"
+    end)
+  end
+
   test "escalation-ruled remains substrate-reserved", ctx do
     assert {:error, %{code: "reserved_kind"}} =
              ConditionFacts.file(ctx.db, ctx.scheduler, %{
@@ -2524,6 +2938,24 @@ defmodule Tightbeam.EscalationTest do
       session_key: nil,
       params: params
     }
+  end
+
+  defp agent_call(session, params, overrides \\ %{}) do
+    Map.merge(
+      %{
+        verb: "ask",
+        origin: "session:" <> session.session_key,
+        principal: {:session, session.session_key},
+        session_key: nil,
+        params: params
+      },
+      overrides
+    )
+  end
+
+  defp table_count(db, table) do
+    {:ok, [[count]]} = DB.query(db, "SELECT COUNT(*) FROM #{table}")
+    count
   end
 
   defp statute, do: %{name: "review", text: "owner denied review"}

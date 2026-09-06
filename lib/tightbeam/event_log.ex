@@ -127,6 +127,49 @@ defmodule Tightbeam.EventLog do
     :ok
   end
 
+  @doc "Append an event and queue its nonblocking handoff on the same transaction."
+  @spec append_event_with_handoff(
+          db(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t() | nil,
+          term(),
+          term(),
+          (Txn.t() -> term())
+        ) :: :ok
+  def append_event_with_handoff(
+        db,
+        kind,
+        verb,
+        origin,
+        session_key,
+        payload,
+        principal,
+        handoff
+      )
+      when kind in ~w(verb denied) and is_function(handoff, 1) do
+    {:ok, _event_id} =
+      DB.transaction(db, fn txn ->
+        event_id =
+          append_event_in_txn(
+            txn,
+            kind,
+            verb,
+            origin,
+            session_key,
+            payload,
+            principal,
+            now()
+          )
+
+        handoff.(txn)
+        event_id
+      end)
+
+    :ok
+  end
+
   @doc "Append an event inside its caller's transaction and return its durable id."
   @spec append_event_in_txn(
           Txn.t(),
@@ -253,16 +296,9 @@ defmodule Tightbeam.EventLog do
   @spec lifecycle(db(), String.t(), String.t(), String.t() | nil) :: :ok
   def lifecycle(db \\ Tightbeam.DB, kind, subject, detail \\ nil) do
     {:ok, _} =
-      DB.query(
-        db,
-        "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1, ?2, ?3, ?4)",
-        [
-          now(),
-          kind,
-          subject,
-          detail
-        ]
-      )
+      DB.transaction(db, fn txn ->
+        lifecycle_in_txn(txn, kind, subject, detail)
+      end)
 
     :ok
   end
@@ -276,6 +312,7 @@ defmodule Tightbeam.EventLog do
       [now(), kind, subject, detail]
     )
 
+    publish_lifecycle_in_txn(txn, kind, subject, detail)
     :ok
   end
 
@@ -524,7 +561,7 @@ defmodule Tightbeam.EventLog do
   """
   @spec boot(db()) :: pos_integer()
   def boot(db \\ Tightbeam.DB) do
-    {:ok, epoch} =
+    {:ok, {epoch, _prior_epoch}} =
       DB.transaction(db, fn txn ->
         prior =
           Tightbeam.DB.Txn.q(txn, """
@@ -532,26 +569,44 @@ defmodule Tightbeam.EventLog do
             WHERE cleanShutdownAt IS NULL ORDER BY epoch DESC LIMIT 1
           """)
 
-        case prior do
-          [[e]] ->
-            Tightbeam.DB.Txn.q(
-              txn,
-              "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1,?2,?3,?4)",
-              [
-                now(),
-                "dirty_exit",
-                "epoch:#{e}",
-                "prior epoch had no clean shutdown"
-              ]
-            )
+        prior_epoch =
+          case prior do
+            [[e]] ->
+              Tightbeam.DB.Txn.q(
+                txn,
+                "INSERT INTO lifecycle_events (ts, kind, subject, detail) VALUES (?1,?2,?3,?4)",
+                [
+                  now(),
+                  "dirty_exit",
+                  "epoch:#{e}",
+                  "prior epoch had no clean shutdown"
+                ]
+              )
 
-          [] ->
-            :ok
-        end
+              Tightbeam.Firehose.Publisher.lifecycle_in_txn(
+                txn,
+                "lifecycle.dirty_exit",
+                %{epoch: e, detail: "prior epoch had no clean shutdown"},
+                %{"epoch" => e}
+              )
+
+              e
+
+            [] ->
+              nil
+          end
 
         Tightbeam.DB.Txn.q(txn, "INSERT INTO boot_epochs (bootedAt) VALUES (?1)", [now()])
         [[epoch]] = Tightbeam.DB.Txn.q(txn, "SELECT last_insert_rowid()")
-        epoch
+
+        Tightbeam.Firehose.Publisher.lifecycle_in_txn(
+          txn,
+          "lifecycle.boot",
+          %{epoch: epoch},
+          %{"epoch" => epoch}
+        )
+
+        {epoch, prior_epoch}
       end)
 
     epoch
@@ -565,10 +620,31 @@ defmodule Tightbeam.EventLog do
   @spec clean_shutdown(db(), pos_integer()) :: :ok
   def clean_shutdown(db \\ Tightbeam.DB, epoch) do
     {:ok, _} =
-      DB.query(db, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
+      DB.transaction(db, fn txn ->
+        Txn.q(txn, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
+
+        Tightbeam.Firehose.Publisher.lifecycle_in_txn(
+          txn,
+          "lifecycle.clean_shutdown",
+          %{epoch: epoch},
+          %{"epoch" => epoch}
+        )
+      end)
 
     :ok
   end
+
+  defp publish_lifecycle_in_txn(txn, kind, subject, detail)
+       when kind in ~w(boot clean_shutdown dirty_exit takeover) do
+    Tightbeam.Firehose.Publisher.lifecycle_in_txn(
+      txn,
+      "lifecycle.#{kind}",
+      %{subject: subject, detail: detail},
+      %{"subject" => subject}
+    )
+  end
+
+  defp publish_lifecycle_in_txn(_txn, _kind, _subject, _detail), do: :ok
 
   defp now, do: System.system_time(:millisecond)
 

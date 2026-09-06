@@ -20,6 +20,8 @@ defmodule Tightbeam.DB do
   use GenServer
   alias Exqlite.Sqlite3
 
+  require Logger
+
   @typedoc "The DB owner process (name or pid) — pass a test-local name to isolate."
   @type server :: GenServer.server()
 
@@ -78,8 +80,8 @@ defmodule Tightbeam.DB do
     process — never hold one outside the callback. Errors RAISE (rolling the
     transaction back) rather than returning tuples.
     """
-    @type t :: %__MODULE__{conn: reference()}
-    defstruct [:conn]
+    @type t :: %__MODULE__{conn: reference(), outbox: reference()}
+    defstruct [:conn, :outbox]
 
     @doc "Run one SQL statement inside the transaction; returns rows (positional lists)."
     @spec q(t(), String.t(), [term()]) :: [Tightbeam.DB.row()]
@@ -95,6 +97,21 @@ defmodule Tightbeam.DB do
     def changes(%__MODULE__{conn: conn}) do
       {:ok, n} = Sqlite3.changes(conn)
       n
+    end
+
+    @doc "Queue one nonblocking GenServer handoff for immediately after this transaction commits."
+    @spec handoff(t(), GenServer.server(), term()) :: :ok
+    def handoff(%__MODULE__{outbox: outbox}, server, message) do
+      key = {__MODULE__, outbox}
+
+      case Process.get(key) do
+        handoffs when is_list(handoffs) ->
+          Process.put(key, [{server, message} | handoffs])
+          :ok
+
+        nil ->
+          raise ArgumentError, "transaction handoff used outside its transaction"
+      end
     end
   end
 
@@ -131,16 +148,31 @@ defmodule Tightbeam.DB do
   end
 
   def handle_call({:transaction, fun}, _from, %{conn: conn} = state) do
+    outbox = make_ref()
+    outbox_key = {Txn, outbox}
+    Process.put(outbox_key, [])
     :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
 
-    try do
-      result = fun.(%Txn{conn: conn})
-      :ok = Sqlite3.execute(conn, "COMMIT")
-      {:reply, {:ok, result}, state}
-    rescue
-      e ->
-        :ok = Sqlite3.execute(conn, "ROLLBACK")
-        {:reply, {:error, e}, state}
+    outcome =
+      try do
+        result = fun.(%Txn{conn: conn, outbox: outbox})
+        :ok = Sqlite3.execute(conn, "COMMIT")
+        {:committed, result, Process.get(outbox_key, []) |> Enum.reverse()}
+      rescue
+        e ->
+          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          {:rolled_back, e}
+      after
+        Process.delete(outbox_key)
+      end
+
+    case outcome do
+      {:committed, result, handoffs} ->
+        Enum.each(handoffs, &deliver_handoff/1)
+        {:reply, {:ok, result}, state}
+
+      {:rolled_back, error} ->
+        {:reply, {:error, error}, state}
     end
   end
 
@@ -172,6 +204,17 @@ defmodule Tightbeam.DB do
       end
 
     {:reply, reply, state}
+  end
+
+  defp deliver_handoff({server, message}) do
+    GenServer.cast(server, message)
+  catch
+    kind, reason ->
+      Logger.error(
+        "post-commit handoff to #{inspect(server)} failed: #{Exception.format(kind, reason)}"
+      )
+
+      :ok
   end
 
   @doc false

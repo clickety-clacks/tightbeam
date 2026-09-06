@@ -61,11 +61,18 @@ defmodule Tightbeam.ExternalAgentSkillsTest do
 
     refute Regex.match?(~r/\btightbeam ask(?:\s|`)/, cli)
 
-    {unsupported, status} =
+    # Agent questions are now supported, but do not replace operator decisions
+    # in this external-agent workflow. Help must work; an incomplete ask must
+    # still refuse before dispatch.
+    {help, status} =
       System.cmd(release_cli(), ["ask", "--help"], stderr_to_stdout: true)
 
+    assert status == 0
+    assert help =~ "ask (--session"
+
+    {invalid, status} = System.cmd(release_cli(), ["ask"], stderr_to_stdout: true)
     assert status != 0
-    assert unsupported =~ "no such command: ask"
+    assert invalid =~ "usage: tightbeam ask"
     assert cli =~ "`decision_pending`"
   end
 

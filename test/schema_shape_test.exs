@@ -34,7 +34,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, DB, Schema}
 
-  @shape "liveness-progress-receipts-v1-019"
+  @shape "agent-decision-carrier-return-v1-019"
+  @decision_carrier_previous_shape "liveness-progress-receipts-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
   @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
@@ -91,6 +92,82 @@ defmodule Tightbeam.SchemaShapeTest do
        AND (decision IS NULL OR decision IN ('continue','dismiss')))
     )
   )
+  """
+
+  # Captured from 0.1.9 at 7ccf653185fa9b9e26610dec8909eae49b594862.
+  # This is the sole stamped predecessor accepted by the carrier rebuild.
+  @liveness_decision_requests_ddl """
+  CREATE TABLE decision_requests (
+    id                TEXT PRIMARY KEY,
+    kind              TEXT NOT NULL DEFAULT 'statute' CHECK (kind IN ('statute','effort','operator')),
+    raiserId          TEXT NOT NULL,
+    raiserSessionKey  TEXT,
+    ownerUserId       TEXT NOT NULL,
+    assignmentId      TEXT,
+    expecterSessionKey TEXT,
+    expecterUserId    TEXT,
+    lineageRung       INTEGER,
+    effortGeneration  INTEGER,
+    deadlineWakeId    TEXT,
+    raisedAt          INTEGER NOT NULL,
+    deadlineAt        INTEGER NOT NULL,
+    statuteName       TEXT,
+    actionKey         TEXT,
+    question          TEXT NOT NULL,
+    options           TEXT,
+    context           TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK (status IN ('open','ruled','consumed','withdrawn','superseded')),
+    decision          TEXT,
+    rationale         TEXT,
+    ruledBy           TEXT,
+    ruledViaPrincipal TEXT,
+    ruledViaSessionKey TEXT,
+    ruledViaSessionState TEXT CHECK (ruledViaSessionState IS NULL OR ruledViaSessionState IN ('known','none')),
+    ruledAt           INTEGER,
+    rulingFactId      INTEGER,
+    consumedAt        INTEGER,
+    parkWakeId        TEXT,
+    withdrawnBy       TEXT,
+    withdrawnReason   TEXT,
+    withdrawnAt       INTEGER,
+    CHECK (
+      (kind = 'statute' AND statuteName IS NOT NULL AND actionKey IS NOT NULL
+       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL AND deadlineWakeId IS NULL
+       AND ruledViaSessionKey IS NULL
+       AND (decision IS NULL OR decision IN ('allow','deny','waived')))
+      OR
+      (kind = 'effort' AND raiserId = 'process:tightbeam'
+       AND raiserSessionKey IS NULL
+       AND statuteName IS NULL AND actionKey IS NULL AND assignmentId IS NOT NULL
+       AND ((expecterSessionKey IS NOT NULL) != (expecterUserId IS NOT NULL))
+       AND lineageRung IS NOT NULL AND effortGeneration IS NOT NULL AND deadlineWakeId IS NOT NULL
+       AND ruledViaSessionKey IS NULL
+       AND (decision IS NULL OR decision IN ('continue','dismiss')))
+      OR
+      (kind = 'operator'
+       AND raiserSessionKey IS NOT NULL
+       AND statuteName IS NULL AND actionKey IS NOT NULL
+       AND expecterSessionKey IS NULL AND expecterUserId IS NULL
+       AND lineageRung IS NULL AND effortGeneration IS NULL
+       AND deadlineWakeId IS NULL
+       AND options IS NOT NULL
+       AND parkWakeId IS NULL AND consumedAt IS NULL
+       AND status <> 'consumed'
+       AND (
+         (status = 'ruled'
+          AND decision IS NOT NULL
+          AND ruledBy = 'user:' || ownerUserId
+          AND ruledAt IS NOT NULL AND rulingFactId IS NOT NULL)
+         OR
+         (status <> 'ruled'
+          AND decision IS NULL AND rationale IS NULL
+          AND ruledBy IS NULL AND ruledAt IS NULL AND rulingFactId IS NULL
+          AND ruledViaSessionKey IS NULL)
+       ))
+    )
+  );
+
   """
 
   @model_identity_messages_ddl """
@@ -290,7 +367,7 @@ defmodule Tightbeam.SchemaShapeTest do
              object_sql(fresh, "table", "decision_requests")
 
     for name <-
-          ~w(decision_requests_owner decision_requests_key decision_requests_one_open decision_requests_effort_generation decision_requests_operator_open) do
+          ~w(decision_requests_owner decision_requests_key decision_requests_one_open decision_requests_effort_generation decision_requests_operator_open decision_requests_asked) do
       assert object_sql(db, "index", name) == object_sql(fresh, "index", name)
     end
 
@@ -318,6 +395,8 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "operator-decision migration classifies the complete predecessor census once", %{db: db} do
     :ok = Schema.ensure_all(db)
+
+    downgrade_decision_requests_to_liveness_predecessor(db)
 
     :ok =
       DB.execute(db, """
@@ -486,6 +565,8 @@ defmodule Tightbeam.SchemaShapeTest do
     {:ok, first_pid} = DB.start_link(path: path, name: first)
     assert :ok = Schema.ensure_all(first)
 
+    downgrade_decision_requests_to_liveness_predecessor(first)
+
     :ok =
       DB.execute(first, """
       DROP TRIGGER decision_requests_terminal_insert_guard;
@@ -565,6 +646,174 @@ defmodule Tightbeam.SchemaShapeTest do
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
     refute "messageType" in table_columns(db, "messages")
     assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+  end
+
+  test "the exact liveness predecessor preserves requests, terminal evidence, triggers, and indexes",
+       %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+    seed_liveness_decision_requests(db)
+    downgrade_decision_requests_to_liveness_predecessor(db)
+
+    columns = liveness_request_columns()
+
+    assert {:ok, before_rows} =
+             DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
+
+    assert {:ok, before_census} =
+             DB.query(
+               db,
+               "SELECT kind,status,COUNT(*) FROM decision_requests GROUP BY kind,status ORDER BY kind,status"
+             )
+
+    assert {:ok, before_epoch} =
+             DB.query(
+               db,
+               "SELECT id,schemaVersion,legacyRulingFactMaxId,activatedAt,cause,principal FROM decision_request_terminal_epoch ORDER BY id"
+             )
+
+    assert {:ok, before_evidence} =
+             DB.query(
+               db,
+               "SELECT requestId,shapeDigest,schemaVersion,causeCode,failingFields,firstSurface,firstObservedAt,observerPrincipal FROM decision_request_integrity_evidence ORDER BY requestId,shapeDigest"
+             )
+
+    before_triggers =
+      for name <-
+            ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
+          do: object_sql(db, "trigger", name)
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, ^before_rows} =
+             DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
+
+    assert {:ok, ^before_census} =
+             DB.query(
+               db,
+               "SELECT kind,status,COUNT(*) FROM decision_requests GROUP BY kind,status ORDER BY kind,status"
+             )
+
+    assert {:ok, ^before_epoch} =
+             DB.query(
+               db,
+               "SELECT id,schemaVersion,legacyRulingFactMaxId,activatedAt,cause,principal FROM decision_request_terminal_epoch ORDER BY id"
+             )
+
+    assert {:ok, ^before_evidence} =
+             DB.query(
+               db,
+               "SELECT requestId,shapeDigest,schemaVersion,causeCode,failingFields,firstSurface,firstObservedAt,observerPrincipal FROM decision_request_integrity_evidence ORDER BY requestId,shapeDigest"
+             )
+
+    expected_agent_nulls = List.duplicate([nil, nil, nil, nil, nil, nil, nil], 7)
+
+    assert {:ok, ^expected_agent_nulls} =
+             DB.query(
+               db,
+               "SELECT askedOfRole,answer,answeredBy,answeredAt,returnedBy,returnReason,returnedAt FROM decision_requests ORDER BY id"
+             )
+
+    after_triggers =
+      for name <-
+            ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
+          do: object_sql(db, "trigger", name)
+
+    assert after_triggers == before_triggers
+
+    for name <-
+          ~w(decision_requests_owner decision_requests_key decision_requests_one_open decision_requests_effort_generation decision_requests_operator_open decision_requests_asked) do
+      assert {:ok, [[1]]} = index_count(db, name)
+    end
+
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+    refute table?(db, "decision_requests_liveness_progress_v1")
+    refute table?(db, "decision_requests_agent_v1")
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, ^before_rows} =
+             DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
+  end
+
+  test "an interrupted carrier rebuild rolls back bytes and retries from the predecessor", %{
+    db: db
+  } do
+    assert :ok = Schema.ensure_all(db)
+    seed_liveness_decision_requests(db)
+    downgrade_decision_requests_to_liveness_predecessor(db)
+
+    columns = liveness_request_columns()
+
+    assert {:ok, before_rows} =
+             DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
+
+    before_triggers =
+      for name <-
+            ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
+          do: object_sql(db, "trigger", name)
+
+    error =
+      assert_raise Schema.ShapeError, fn ->
+        Schema.upgrade_decision_carrier_return_v1_019(db, fail_after_step: :after_copy)
+      end
+
+    assert error.message =~ "forced decision carrier migration interruption"
+
+    assert {:ok, [[@decision_carrier_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, ^before_rows} =
+             DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
+
+    after_rollback_triggers =
+      for name <-
+            ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard),
+          do: object_sql(db, "trigger", name)
+
+    assert after_rollback_triggers == before_triggers
+
+    refute table?(db, "decision_requests_liveness_progress_v1")
+    refute table?(db, "decision_requests_agent_v1")
+    assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, ^before_rows} =
+             DB.query(db, "SELECT #{columns} FROM decision_requests ORDER BY id")
+  end
+
+  test "the carrier rebuild survives database-owner restart and the next boot is idempotent",
+       %{db: _setup_db} do
+    unique = System.unique_integer([:positive])
+    path = Path.join(System.tmp_dir!(), "decision-carrier-restart-#{unique}.sqlite3")
+    first = :"decision_carrier_before_#{unique}"
+    second = :"decision_carrier_after_#{unique}"
+
+    on_exit(fn -> File.rm(path) end)
+
+    {:ok, first_pid} = DB.start_link(path: path, name: first)
+    assert :ok = Schema.ensure_all(first)
+    seed_liveness_decision_requests(first)
+    downgrade_decision_requests_to_liveness_predecessor(first)
+    :ok = GenServer.stop(first_pid)
+
+    {:ok, second_pid} = DB.start_link(path: path, name: second)
+    assert :ok = Schema.ensure_all(second)
+    assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[7]]} = DB.query(second, "SELECT COUNT(*) FROM decision_requests")
+    assert :ok = Schema.ensure_all(second)
+
+    assert {:ok, [[7, @shape]]} =
+             DB.query(
+               second,
+               "SELECT (SELECT COUNT(*) FROM decision_requests),(SELECT shape FROM schema_stamp)"
+             )
+
+    :ok = GenServer.stop(second_pid)
   end
 
   test "the harness health foundation is additive and exact", %{db: db} do
@@ -1034,6 +1283,126 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert error.message =~ "model-identity-message-envelope-v1"
     assert error.message =~ @shape
+  end
+
+  defp seed_liveness_decision_requests(db) do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
+         statuteName,actionKey,question,context,status)
+      VALUES
+        ('dr_preserve_statute_open','statute','session:asker','asker','mike',1,101,
+         'law','open-action','open?','{}','open');
+
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
+         statuteName,actionKey,question,context,status,decision,ruledBy,ruledAt)
+      VALUES
+        ('dr_preserve_statute_ruled','statute','session:asker','asker','mike',2,102,
+         'law','ruled-action','ruled?','{}','ruled','allow','user:mike',12),
+        ('dr_preserve_statute_consumed','statute','session:asker','asker','mike',3,103,
+         'law','consumed-action','consumed?','{}','consumed','allow','user:mike',13);
+
+      UPDATE decision_requests SET consumedAt=23
+      WHERE id='dr_preserve_statute_consumed';
+
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
+         statuteName,actionKey,question,context,status,withdrawnBy,withdrawnReason,withdrawnAt)
+      VALUES
+        ('dr_preserve_statute_withdrawn','statute','session:asker','asker','mike',4,104,
+         'law','withdrawn-action','withdrawn?','{}','withdrawn','session:asker','done',24);
+
+      INSERT INTO decision_requests
+        (id,kind,raiserId,ownerUserId,assignmentId,expecterSessionKey,lineageRung,
+         effortGeneration,deadlineWakeId,raisedAt,deadlineAt,question,context,status)
+      VALUES
+        ('dr_preserve_effort','effort','process:tightbeam','mike','asg_fixture',
+         'expecter',2,3,'w_fixture',5,105,'continue?','{}','superseded');
+
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
+         actionKey,question,options,context,status)
+      VALUES
+        ('dr_preserve_operator_open','operator','session:asker','asker','mike',6,106,
+         'operator-open','ship?','[{"label":"accept"}]','{}','open');
+
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
+         actionKey,question,options,context,status,decision,ruledBy,
+         ruledViaPrincipal,ruledViaSessionState,ruledAt,rulingFactId)
+      VALUES
+        ('dr_preserve_operator_ruled','operator','session:asker','asker','mike',7,107,
+         'operator-ruled','ship?','[{"label":"accept"}]','{}','ruled','accept',
+         'user:mike','user:mike','none',17,77);
+
+      INSERT INTO decision_request_integrity_evidence
+        (requestId,shapeDigest,schemaVersion,causeCode,failingFields,firstSurface,
+         firstObservedAt,observerPrincipal)
+      VALUES
+        ('dr_evidence_fixture','digest','terminal-operator-decision-parity-v1',
+         'decision_request_integrity_invalid','["decision"]','list',18,'process:test');
+      """)
+
+    :ok
+  end
+
+  defp downgrade_decision_requests_to_liveness_predecessor(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      :ok =
+        DB.execute(db, """
+        DROP TRIGGER decision_requests_terminal_insert_guard;
+        DROP TRIGGER decision_requests_terminal_update_guard;
+        DROP INDEX decision_requests_owner;
+        DROP INDEX decision_requests_key;
+        DROP INDEX decision_requests_one_open;
+        DROP INDEX decision_requests_effort_generation;
+        DROP INDEX decision_requests_operator_open;
+        DROP INDEX decision_requests_asked;
+        ALTER TABLE decision_requests RENAME TO decision_requests_agent_final;
+        #{@liveness_decision_requests_ddl};
+        INSERT INTO decision_requests (#{liveness_request_columns()})
+        SELECT #{liveness_request_columns()} FROM decision_requests_agent_final ORDER BY id;
+        DROP TABLE decision_requests_agent_final;
+        CREATE INDEX decision_requests_owner
+          ON decision_requests (ownerUserId, status);
+        CREATE INDEX decision_requests_key
+          ON decision_requests (raiserId, statuteName, actionKey);
+        CREATE UNIQUE INDEX decision_requests_one_open
+          ON decision_requests (raiserId, statuteName, actionKey)
+          WHERE kind = 'statute' AND status = 'open';
+        CREATE UNIQUE INDEX decision_requests_effort_generation
+          ON decision_requests (assignmentId, effortGeneration) WHERE kind = 'effort';
+        CREATE UNIQUE INDEX decision_requests_operator_open
+          ON decision_requests (ownerUserId, raiserId, actionKey)
+          WHERE kind = 'operator' AND status = 'open';
+        UPDATE schema_stamp
+        SET shape='#{@decision_carrier_previous_shape}', stampedAt=1;
+        """)
+
+      {:ok, :ok} =
+        DB.transaction(db, fn txn ->
+          Tightbeam.Escalation.ensure_terminal_parity_in_txn(txn, 1)
+        end)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+
+    :ok
+  end
+
+  defp liveness_request_columns do
+    """
+    id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
+    expecterSessionKey,expecterUserId,lineageRung,effortGeneration,deadlineWakeId,
+    raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status,
+    decision,rationale,ruledBy,ruledViaPrincipal,ruledViaSessionKey,
+    ruledViaSessionState,ruledAt,rulingFactId,consumedAt,parkWakeId,withdrawnBy,
+    withdrawnReason,withdrawnAt
+    """
   end
 
   defp table?(db, name) do

@@ -496,6 +496,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     # in-transaction prompt arm each one owes.
     request_sites = [
       {"lib/tightbeam/escalation.ex", "escalate/4"},
+      {"lib/tightbeam/escalation.ex", "file_agent_request/2"},
       {"lib/tightbeam/escalation.ex", "insert_operator_request_in_txn/7"},
       {"lib/tightbeam/effort_checkin.ex", "open_request_in_txn/4"},
       {"lib/tightbeam/effort_checkin.ex", "deadline_in_txn/3"}
@@ -513,7 +514,7 @@ defmodule Tightbeam.EscalationDeliveryTest do
     assert sink_sites() == %{
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
               "children_after_preflight/1"} => 2,
-             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handlers/1"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handler_specs/1"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
               "execute_assignment_repair/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "notify_session/4"} => 1,

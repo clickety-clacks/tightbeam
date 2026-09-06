@@ -15,6 +15,7 @@ defmodule Tightbeam.ConditionFacts do
 
   alias Tightbeam.{DB, EventLog, Idempotency, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @reserved_kinds ~w(
     quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present
@@ -119,6 +120,14 @@ defmodule Tightbeam.ConditionFacts do
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file_idempotent(db, scheduler, input) do
+    {result, _filed?} = file_idempotent_with_effect(db, scheduler, input)
+    result
+  end
+
+  @doc false
+  @spec file_idempotent_with_effect(DB.server(), GenServer.server(), map()) ::
+          {map() | {:error, map()}, boolean()}
+  def file_idempotent_with_effect(db, scheduler, input, firehose_call \\ nil) do
     {result, filed?} =
       transaction!(db, fn txn ->
         key = Map.get(input, :idempotency_key)
@@ -127,30 +136,45 @@ defmodule Tightbeam.ConditionFacts do
         prior =
           if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
 
-        if prior do
-          {fact_in_txn(txn, prior.session_key), false}
-        else
-          case file_in_txn(txn, input) do
-            %{fact_id: fact_id} = fact ->
-              if is_binary(key) do
-                Idempotency.put_in_txn(txn, %{
-                  owner_user_id: origin,
-                  operation: "condition",
-                  idempotency_key: key,
-                  session_key: to_string(fact_id)
-                })
-              end
+        outcome =
+          if prior do
+            {fact_in_txn(txn, prior.session_key), false}
+          else
+            case file_in_txn(txn, input) do
+              %{fact_id: fact_id} = fact ->
+                if is_binary(key) do
+                  Idempotency.put_in_txn(txn, %{
+                    owner_user_id: origin,
+                    operation: "condition",
+                    idempotency_key: key,
+                    session_key: to_string(fact_id)
+                  })
+                end
 
-              {fact, true}
+                {fact, true}
 
-            error ->
-              {error, false}
+              error ->
+                {error, false}
+            end
           end
+
+        case {outcome, firehose_call} do
+          {{{:error, %{code: _}}, _filed?}, _call} ->
+            :ok
+
+          {{fact, changed?}, %{firehose_in_txn: true} = call} ->
+            call = Map.put(call, :firehose_changed, changed?)
+            Publisher.maybe_accepted_in_txn(txn, call, fact)
+
+          _ ->
+            :ok
         end
+
+        outcome
       end)
 
     if filed?, do: Wakes.fire_matching(scheduler, result.fact_id)
-    result
+    {result, filed?}
   end
 
   @spec latest(DB.server(), String.t(), String.t() | nil) :: map() | nil
