@@ -435,7 +435,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
 
-    # Two requests spanning two statuses: one left open, one ruled.
+    # Three requests spanning three statuses: one left open, one ruled, one returned.
     open_ask =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
@@ -461,6 +461,28 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert ruled.status == 200
 
+    returned_target = create_session(ctx.db, "dr-filter-return-target", owner)
+
+    returned_request =
+      Tightbeam.Escalation.ask(ctx.db, %{
+        verb: "ask",
+        origin: "session:" <> raiser.session_key,
+        principal: {:session, raiser.session_key},
+        session_key: returned_target.session_key,
+        params: %{question: "q-returned?"}
+      })
+
+    returned =
+      Tightbeam.Escalation.return_request(ctx.db, %{
+        verb: "return",
+        origin: "session:" <> returned_target.session_key,
+        principal: {:session, returned_target.session_key},
+        session_key: nil,
+        params: %{request: returned_request.id, reason: "needs more context"}
+      })
+
+    assert returned.status == "returned"
+
     list_ids = fn params ->
       resp =
         dispatch_cli(ctx, "tbc_test", %{verb: "decision-requests", asUser: owner, params: params})
@@ -469,22 +491,30 @@ defmodule Tightbeam.Wire.RouterTest do
       JSON.decode!(resp.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
     end
 
-    # status=all returns rows in BOTH statuses over the wire — the regression: before the
+    # status=all returns rows in all three statuses over the wire — the regression: before the
     # fix this filtered on literal 'all' and returned [].
     all_ids = list_ids.(%{status: "all"})
     assert open_id in all_ids
     assert ruled_id in all_ids
+    assert returned_request.id in all_ids
 
-    # Absent status defaults to "open" through the router: the open row shows, the ruled
-    # one is filtered out.
+    # Absent status defaults to "open" through the router: the open row shows, while the
+    # ruled and returned rows are filtered out.
     default_ids = list_ids.(%{})
     assert open_id in default_ids
     refute ruled_id in default_ids
+    refute returned_request.id in default_ids
 
     # An explicit legal status filters over the wire to exactly that status.
     open_only = list_ids.(%{status: "open"})
     assert open_id in open_only
     refute ruled_id in open_only
+    refute returned_request.id in open_only
+
+    returned_only = list_ids.(%{status: "returned"})
+    assert returned_request.id in returned_only
+    refute open_id in returned_only
+    refute ruled_id in returned_only
 
     # An illegal status reaches the client as a NAMED refusal (HTTP 400), not a silent
     # empty 200 — the refusal names the legal set.
@@ -498,7 +528,9 @@ defmodule Tightbeam.Wire.RouterTest do
     assert bogus.status == 400
     error = JSON.decode!(bogus.resp_body)["error"]
     assert error["code"] == "invalid"
-    assert error["message"] =~ "open, ruled, consumed, withdrawn, superseded, all"
+
+    assert error["message"] =~
+             "open, ruled, consumed, withdrawn, superseded, returned, all"
   end
 
   test "identity status crosses the closed CLI verb router", ctx do

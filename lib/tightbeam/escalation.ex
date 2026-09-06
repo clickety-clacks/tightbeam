@@ -239,6 +239,10 @@ defmodule Tightbeam.Escalation do
   returnedBy, returnReason, returnedAt
   """
 
+  @agent_request_fields ~w(
+    asked_of_role answer answered_by answered_at returned_by return_reason returned_at
+  )a
+
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
@@ -2327,17 +2331,19 @@ defmodule Tightbeam.Escalation do
     operator_projection(request, :list)
   end
 
-  defp list_projection(request),
-    do:
-      Map.drop(request, [
-        :context,
-        :action_key,
-        :owner_user_id,
-        :ruling_fact_id,
-        :consumed_at,
-        :park_wake_id,
-        :withdrawn_by
-      ])
+  defp list_projection(request) do
+    request
+    |> without_agent_fields()
+    |> Map.drop([
+      :context,
+      :action_key,
+      :owner_user_id,
+      :ruling_fact_id,
+      :consumed_at,
+      :park_wake_id,
+      :withdrawn_by
+    ])
+  end
 
   defp terminal_project_rows_in_txn(txn, rows, surface, observer_principal) do
     parsed = Enum.map(rows, &request_from_row/1)
@@ -2351,8 +2357,15 @@ defmodule Tightbeam.Escalation do
     case invalid do
       [] ->
         Enum.map(parsed, fn
-          %{kind: "operator"} = request -> operator_projection(request, surface)
-          request -> if(surface == :list, do: list_projection(request), else: request)
+          %{kind: "operator"} = request ->
+            operator_projection(request, surface)
+
+          request ->
+            if surface == :list do
+              list_projection(request)
+            else
+              without_agent_fields(request)
+            end
         end)
 
       invalid ->
@@ -2417,10 +2430,15 @@ defmodule Tightbeam.Escalation do
           :assignment_id
         ])
       else
-        Map.drop(request, [:ruled_via_principal, :ruled_via_session_state])
+        request
+        |> without_agent_fields()
+        |> Map.drop([:ruled_via_principal, :ruled_via_session_state])
       end
     end
   end
+
+  defp without_agent_fields(%{kind: "agent"} = request), do: request
+  defp without_agent_fields(request), do: Map.drop(request, @agent_request_fields)
 
   defp terminal_projection(request), do: operator_projection(request, :detail)
 
