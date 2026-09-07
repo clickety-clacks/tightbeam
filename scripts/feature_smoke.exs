@@ -152,9 +152,7 @@ defmodule FeatureSmoke do
         )
       end)
 
-      actual_home
-      |> MapSet.difference(before_home)
-      |> MapSet.difference(expected_home)
+      Tightbeam.FeatureSmokeHome.new_strays(before_home, actual_home, expected_home, harness)
       |> Enum.each(fn relative ->
         assert(
           state,
@@ -574,6 +572,9 @@ defmodule FeatureSmoke do
 
     asg_id = asg["id"] || asg["assignmentId"]
 
+    check = seed_verifiable_work!(state, coder_key, u)
+    file_author_test_receipt!(state, coder_tok, asg_id, check)
+
     # 1. Coder attests completion with NO review on record → BLOCKED by the rule.
     # (The wire exposes only code+message; a remedy and a plain deny both carry
     # code=rule_denied — the remedy's `reason=remedy_fired` is stripped. Proof that
@@ -635,6 +636,22 @@ defmodule FeatureSmoke do
       state,
       "flagship reviewer-loop enforced end-to-end on same harness with different sessions: blocked → reviewer assigned → verdict → completes"
     )
+  end
+
+  # The current code-review rule requires an author-filed receipt before the
+  # completion remedy may commission review. Prove the denial, then file the
+  # output of the real smoke fixture using the holder's credential.
+  defp file_author_test_receipt!(state, token, assignment_id, check) do
+    denied = post_as(state, token, "attest", %{"assignmentId" => assignment_id, "kind" => "completion"})
+    assert(state,
+      (get_in(denied, ["error", "message"]) || "") =~ "code-review-requires-passing-tests",
+      "review must refuse a missing author test receipt: #{inspect(denied)}")
+    ok_as!(state, token, "attest", %{
+      "assignmentId" => assignment_id,
+      "kind" => "verdict",
+      "verdictKind" => "tests-passed",
+      "note" => check.note
+    })
   end
 
   # --- T2a: the gate chain, enforced -------------------------------------------------
@@ -729,6 +746,7 @@ defmodule FeatureSmoke do
     wi_id = wi["workItemId"] || wi["id"]
     holder = open_grounded_assignment!(state, u, wi_id, "gate chain #{u}", "g")
     asg_id = holder.assignment_id
+    file_author_test_receipt!(state, holder.token, asg_id, holder.check)
 
     complete = fn ->
       post_as(state, holder.token, "attest", %{"assignmentId" => asg_id, "kind" => "completion"})
@@ -1117,6 +1135,31 @@ defmodule FeatureSmoke do
     ok!(state, "role-bind", %{"name" => "coder-#{tag}-#{u}", "sessionKey" => key})
     check = seed_verifiable_work!(state, key, u)
 
+    # Current engineering law asks for a posture ruling before assigning to a
+    # coder. This fixture is one local script with a deterministic output.
+    posture = ok!(state, "spawn", %{
+      "archetype" => "default",
+      "displayName" => "smoke-posture-#{u}",
+      "idempotencyKey" => "posture-#{u}"
+    })
+    posture_key = get_in(posture, ["stream", "sessionKey"]) || posture["sessionKey"]
+    post(state, "role-create", %{"name" => "posture-#{u}"})
+    ok!(state, "role-bind", %{"name" => "posture-#{u}", "sessionKey" => posture_key})
+    posture_card = ok!(state, "assign", %{
+      "sessionKey" => posture_key,
+      "subject" => "Choose posture for the disposable smoke fixture",
+      "effectKind" => "coordination",
+      "workItemId" => wi_id,
+      "idempotencyKey" => "posture-card-#{u}"
+    })
+    ok_as!(state, session_token(state, posture_key), "attest", %{
+      "assignmentId" => posture_card["id"] || posture_card["assignmentId"],
+      "kind" => "verdict",
+      "verdictKind" => "posture-light",
+      "note" => "One disposable local shell fixture with deterministic output; no product or external-state change. Light posture is sufficient."
+    })
+    retire(state, posture)
+
     assignment =
       ok!(state, "assign", %{
         "sessionKey" => key,
@@ -1174,6 +1217,10 @@ defmodule FeatureSmoke do
     """)
 
     File.chmod!(path, 0o755)
+    smoke_git!(workdir, ["init", "-q"])
+    smoke_git!(workdir, ["add", name])
+    smoke_git!(workdir, ["commit", "-q", "-m", "Add verifiable smoke fixture"])
+    commit = smoke_git!(workdir, ["rev-parse", "HEAD"])
 
     # Run it the way the note says it was run — same cwd, same command form. Executing an
     # absolute path from the smoke's own directory and then writing "sh <name> in this
@@ -1194,7 +1241,7 @@ defmodule FeatureSmoke do
       path: path,
       output: output,
       note:
-        "Ran `sh #{name}` in this assignment's workdir (#{workdir}); it exited 0 and printed " <>
+        "Repository #{workdir}, commit #{commit}; ran `sh #{name}`; it exited 0 and printed " <>
           "exactly #{inspect(output)}"
     }
   end
@@ -1899,7 +1946,7 @@ defmodule FeatureSmoke do
   end
 
   # --- effort-without-effect: durable parent check-in and reassignment ----------
-  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=250 (or another
+  # Run the smoke gateway with TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS=2500 (or another
   # short value). The child is never prompted by this probe; its unavailable/idle
   # workdir is adjudicated only by the opening user.
   defp check_effort_without_effect(state) do
@@ -2049,8 +2096,10 @@ defmodule FeatureSmoke do
   # expectation is DERIVED — from this run's salt, from `work-item-get`'s DIRECT
   # assignments, and from the `attests` verb — so no number here can rot when an
   # earlier group changes what it does.
+  # The telemetry verbs moved to execution-map; durable Toplines now has its own surface.
+  # Keep all membership, attribution, filtering and forest assertions on that read seam.
   defp check_toplines_board(state) do
-    roster = ok!(state, "toplines", %{})
+    roster = ok!(state, "execution-map", %{})
 
     assert(
       state,
@@ -2108,7 +2157,7 @@ defmodule FeatureSmoke do
     # The explicit assignment surface must map every DIRECT id back to THIS item
     # — the two surfaces reading the SAME membership function, on live rows.
     Enum.each(direct, fn asg ->
-      selected = ok!(state, "topline", %{"assignments" => [asg["id"]]})
+      selected = ok!(state, "execution-map-select", %{"assignments" => [asg["id"]]})
 
       assert(
         state,
@@ -2224,7 +2273,7 @@ defmodule FeatureSmoke do
       expected = mine |> Enum.filter(&(&1["state"] == wanted)) |> Enum.map(& &1["id"])
 
       got =
-        ok!(state, "toplines", %{"state" => wanted})["items"]
+        ok!(state, "execution-map", %{"state" => wanted})["items"]
         |> Enum.map(& &1["id"])
         |> Enum.filter(&(&1 in ids))
 
@@ -2239,7 +2288,7 @@ defmodule FeatureSmoke do
   # The forest carries the same nodes as the roster: nesting changes shape, never
   # membership.
   defp assert_toplines_forest(state, mine) do
-    forest = ok!(state, "toplines", %{"tree" => true})
+    forest = ok!(state, "execution-map", %{"tree" => true})
     nested = forest["roots"] |> List.wrap() |> Enum.flat_map(&flatten_node/1) |> this_run()
 
     assert(
@@ -2376,26 +2425,7 @@ defmodule FeatureSmoke do
     if is_binary(key), do: post(state, "retire", %{"sessionKey" => key})
   end
 
-  defp leaf_entries(root), do: leaf_entries(root, root, [])
-
-  defp leaf_entries(path, root, entries) do
-    path
-    |> File.ls!()
-    |> Enum.reduce(entries, fn name, acc ->
-      child = Path.join(path, name)
-
-      case File.lstat!(child).type do
-        :directory ->
-          case File.ls!(child) do
-            [] -> [Path.relative_to(child, root) <> "/" | acc]
-            _ -> leaf_entries(child, root, acc)
-          end
-
-        _ ->
-          [Path.relative_to(child, root) | acc]
-      end
-    end)
-  end
+  defp leaf_entries(root), do: Tightbeam.FeatureSmokeHome.leaf_entries(root)
 
   defp await_materialized_skills!(state, cwd, skills) do
     deadline = System.monotonic_time(:millisecond) + 30_000

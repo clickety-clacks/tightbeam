@@ -57,7 +57,11 @@ defmodule Tightbeam.Harness.Codex do
   # the adapter, `initialize`, `session/new`, then confirm each candidate with
   # `session/set_config_option {configId: "model"}`. Update this table and
   # `@adapter_version` together.
-  @adapter_selectable_models ~w(gpt-5.6-sol)
+  # Codex 0.153.2's API-key model/list marks Astra hidden, although the API
+  # serves it. The adapter patch below opts in only that hidden model. Recorded
+  # model/list metadata and the validation limits live in docs/astra-api-hotfix.md.
+  @adapter_selectable_models ~w(gpt-5.6-sol gpt-6-astra)
+  @api_key_efforts %{"gpt-6-astra" => ~w(low medium high xhigh max ultra)}
 
   # The gate probe's own model, as fields — it crosses the adapter seam like any
   # other selection.
@@ -65,6 +69,10 @@ defmodule Tightbeam.Harness.Codex do
 
   @adapter_bundle "index.js"
   @adapter_replacements [
+    {
+      "      const response = await this.codexClient.listModels({ cursor, limit: null });\n      models.push(...response.data);",
+      "      const response = await this.codexClient.listModels({ cursor, limit: null, includeHidden: true });\n      models.push(...response.data.filter((model) => !model.hidden || model.id === \"gpt-6-astra\"));"
+    },
     {
       "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd\n",
       "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd,\n      developerInstructions: request._meta?.developerInstructions\n"
@@ -245,6 +253,23 @@ defmodule Tightbeam.Harness.Codex do
       canonical_model_prefixes: ["gpt-"]
     }
   end
+
+  # Recorded native runtime paths from Codex 0.153.2. These are engine-owned,
+  # not entries produced by Tightbeam home projection.
+  @native_home_patterns [
+    # The engine populates this downloaded plugin cache asynchronously on first use.
+    ~r"\A\.tmp/plugins/.+\z",
+    ~r"\Asessions/\d{4}/\d{2}/\d{2}/rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl\z",
+    ~r"\Ashell_snapshots/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.\d+\.sh\z",
+    # Exact Unix aliases and lock from rust-v0.153.2/codex-rs/arg0/src/lib.rs.
+    # The directory can be observed while its aliases are being created/removed.
+    ~r"\Atmp/arg0/codex-arg0[A-Za-z0-9]+/(?:\.lock|apply_patch|applypatch|codex-linux-sandbox|codex-execve-wrapper)?\z",
+    ~r"\Athread-writer-locks/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.lock\z"
+  ]
+
+  @impl true
+  def native_home_entry?(relative),
+    do: Enum.any?(@native_home_patterns, &Regex.match?(&1, relative))
 
   @impl true
   def owned_home_entries,
@@ -610,6 +635,11 @@ defmodule Tightbeam.Harness.Codex do
     }
 
     Support.conformance_vectors(__MODULE__, %{
+      native_home_paths: [
+        "thread-writer-locks/01a079d2-1306-7031-938e-66bec2ea11a6.lock",
+        "unexpected.txt"
+      ],
+      native_home_expected: [true, false],
       wire_name: wire_name(),
       provider: credential_provider(),
       home_scope: wire_name(),
@@ -853,10 +883,10 @@ defmodule Tightbeam.Harness.Codex do
   # route's: `{"data": [{"id": …, "object": "model", …}]}`. No display name, no
   # `supported_reasoning_levels`, no context window. So this is a SECOND
   # derivation, not a second decoder feeding one, and the catalog it produces is
-  # honestly thinner: bare ids, no effort tiers, no token ceiling. A session on
-  # such a catalog reports `canChangeReasoning: false`, which is correct —
-  # nothing here knows what efforts the model offers, and inventing tiers would
-  # advertise a control that does not work.
+  # thinner: bare ids and no token ceiling. Astra alone carries the effort
+  # values recorded from the pinned engine's model/list metadata; this preserves
+  # existing medium/high selections after API-key onboarding. Other entries
+  # remain untiered rather than inferring controls from their names.
   #
   # OBSERVED LIVE 2026-07-28 (the #89 api-key exercise): 125 entries in exactly
   # this shape, bare ids under "data".
@@ -872,7 +902,7 @@ defmodule Tightbeam.Harness.Codex do
                 context: nil,
                 display_name: id,
                 name: id,
-                efforts: [],
+                efforts: Map.get(@api_key_efforts, id, []),
                 max_input_tokens: nil,
                 capabilities: %{},
                 provider: :openai

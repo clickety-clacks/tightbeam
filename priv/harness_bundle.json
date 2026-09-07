@@ -168,6 +168,12 @@
         "round_trip"
       ],
       "oracle": "decoded fields round-trip the manifest field list exactly"
+    },
+    "native_home_entry?": {
+      "required_cases": [
+        "native_and_stray"
+      ],
+      "oracle": "known native runtime paths classify as native and arbitrary new files remain strays"
     }
   },
   "wire_projection_fields": [

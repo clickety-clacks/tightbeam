@@ -88,6 +88,9 @@ defmodule Tightbeam.Harness.Fixture do
   end
 
   @impl true
+  def native_home_entry?(_relative), do: false
+
+  @impl true
   def owned_home_entries,
     do: Support.owned_home_entries("fixture.json", "fixture.rails")
 
@@ -208,6 +211,8 @@ defmodule Tightbeam.Harness.Fixture do
     }
 
     Support.conformance_vectors(__MODULE__, %{
+      native_home_paths: ["unexpected.txt"],
+      native_home_expected: [false],
       wire_name: wire_name(),
       provider: credential_provider(),
       home_scope: wire_name(),

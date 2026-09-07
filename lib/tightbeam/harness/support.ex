@@ -210,6 +210,11 @@ defmodule Tightbeam.Harness.Support do
       "ensure_adapter" => ensure_adapter_vectors(module, profile),
       "session_config" => session_config_vectors(module, profile),
       "owned_home_entries" => owned_home_entries_vectors(profile),
+      "native_home_entry?" => [
+        vector("native_and_stray", profile.native_home_expected, %{
+          paths: profile.native_home_paths
+        })
+      ],
       "reconcile_home" => reconcile_home_vectors(module, profile),
       "materialize_skills" => materialize_skills_vectors(module, profile),
       "credential_ready?/harvest_credential" => credential_vectors(module, profile),
@@ -233,6 +238,9 @@ defmodule Tightbeam.Harness.Support do
 
   def observe_vector(module, "session_config", %{input: input}),
     do: module.session_config(%{}, input.guidance).meta
+
+  def observe_vector(module, "native_home_entry?", %{input: input}),
+    do: Enum.map(input.paths, &module.native_home_entry?/1)
 
   def observe_vector(module, "owned_home_entries", %{input: input}) do
     write_set = observe_reconcile_home(module, input.profile).write_set

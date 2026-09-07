@@ -351,6 +351,39 @@ defmodule Tightbeam.CredentialKindsTest do
       assert Enum.map(entries, & &1.family) == ["gpt-5.6-sol"]
     end
 
+    test "API-key Astra retains the pinned engine's effort controls without granting absent models",
+         ctx do
+      stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-fixture"}))
+      body = ~s({"data":[{"id":"gpt-6-astra"},{"id":"gpt-5.1-codex"}]})
+
+      state = %{
+        base_dir: ctx.base,
+        credential_kind: :api_key,
+        options: %{sh: fn _ -> {body <> "\n200", 0} end}
+      }
+
+      assert {:ok, [entry]} = Codex.fetch_catalog(state)
+      assert entry.family == "gpt-6-astra"
+
+      fixture =
+        Path.join(__DIR__, "fixtures/model_catalog/codex_0_153_2_api_models.json")
+        |> File.read!()
+        |> JSON.decode!()
+
+      astra = Enum.find(fixture["data"], &(&1["id"] == "gpt-6-astra"))
+
+      assert entry.efforts ==
+               Enum.map(astra["supportedReasoningEfforts"], & &1["reasoningEffort"])
+
+      assert Tightbeam.ModelCatalog.offers_effort?(entry, "high")
+      refute Tightbeam.ModelCatalog.offers_effort?(entry, "invented")
+
+      missing =
+        put_in(state.options.sh, fn _ -> {~s({"data":[{"id":"gpt-5.6-sol"}]}) <> "\n200", 0} end)
+
+      assert {:ok, [%{family: "gpt-5.6-sol", efforts: []}]} = Codex.fetch_catalog(missing)
+    end
+
     test "the injectable seam lifts the api-key selectable pin", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-unpinned"}))
       sh = fn _command -> {platform_fixture_body() <> "\n200", 0} end

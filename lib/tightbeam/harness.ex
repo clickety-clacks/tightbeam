@@ -64,6 +64,7 @@ defmodule Tightbeam.Harness do
   @callback session_config(map(), binary()) :: map()
   @doc "The harness-owned leaf entries of a projected home."
   @callback owned_home_entries() :: [String.t()]
+  @callback native_home_entry?(String.t()) :: boolean()
   @callback reconcile_home(target(), String.t(), desired_home()) :: map()
   @callback materialize_skills(target(), String.t(), map()) :: map()
   @callback credential_ready?(target(), String.t()) :: boolean()
