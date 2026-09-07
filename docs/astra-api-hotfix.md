@@ -39,12 +39,26 @@ versions, and does not change production configuration.
 | PR-produced patched ACP copy, isolated API-key mode with a dummy key | Astra selection and high effort accepted; no generation attempted |
 | PR-produced patched ACP copy, restored subscription authentication | Astra/high selection and actual response succeeded; usage metadata identifies `gpt-6-astra` |
 | PR-produced patched ACP copy, subscription, adapter restart and `session/load` | Fresh response recalled the previous marker after replayed history was excluded from the observer |
+| Fresh hotfix gateway, real API key, Astra/high | Actual response, startup-hook PASS, and remembered phrase after full gateway restart all passed |
 
-The API-key credential was replaced by the operator's subscription before a full
-patched API-key turn was obtained. The isolated dummy-key check exercises real
-engine/adapter configuration behavior; it does **not** establish authentication,
-entitlement, or generation success. The earlier direct API response and the
-subscription ACP response do not substitute for that missing end-to-end test.
+A subsequent fresh-org gateway run with a real API key closed the earlier
+API-key turn gap. The test used the hotfix source at `1941e7d4`, an isolated
+adapter installation, and the same native Codex 0.153.2 engine. The live catalog
+advertised Astra and all recorded efforts. Astra/high returned
+`ASTRA_API_READY amber harbor 8624`, then, after an idle full gateway restart,
+returned `ASTRA_API_RESUMED amber harbor 8624` without the phrase in the second
+prompt or a transcript lookup. Both turns were delivered with no error and
+recorded `gpt-6-astra` as their model. The startup wiring gate logged PASS before
+and after the restart. The disposable canary was retired.
+
+Broader validation remains incomplete. In this fresh instance, the Codex-only
+`feature_smoke` passed credential preflight, then failed its local-deployment
+HOME census on a normal `sessions/.../rollout-....jsonl` file produced by the
+engine. That file was not removed to force a passing result. Separately,
+0.1.9 automatic provisioning failed to apply its Claude 0.73.0 adapter patch;
+the Codex adapter was provisioned with the PR's exact patch function to proceed
+with the Codex checks. Neither issue was repaired as part of this hotfix, and
+neither is claimed to be a passing cross-harness matrix.
 
 `test/fixtures/model_catalog/codex_0_153_2_api_models.json` is a three-model subset
 of actual native `model/list(includeHidden: true)` output captured in isolated
@@ -57,14 +71,12 @@ unrelated hidden model, and does not synthesize Astra when absent.
 
 - Enforce the Codex 0.153.2 native engine prerequisite for any release rollout;
   older bundled engines were not validated and may lack Astra metadata.
-- Complete an actual Astra/high turn through the patched ACP adapter using a real
-  API key, then verify startup-hook gate PASS and remembered context after restart.
 - Run the required fresh-org `feature_smoke` matrix for both Claude and Codex.
 - Confirm baseline and after-change CI gates on supported Linux and macOS.
 - Obtain maintenance-owner review and routing before integration; 0.1.8 is frozen.
 
-The observed host's Claude authentication was expired, so the two-harness live
-matrix has not been claimed. No production service restart or migration is part
+The two-harness live matrix has not been claimed; the fresh-instance blockers
+are recorded above. No production service restart or migration is part
 of this PR. Once accepted and packaged, activate only at an idle maintenance
 boundary, retain the previous build/override for rollback, and repeat the live
 checks with the installed bytes.
