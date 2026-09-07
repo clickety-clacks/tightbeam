@@ -1922,8 +1922,8 @@ defmodule Tightbeam.SupervisionTest do
 
     expected_prod =
       "[from process:tightbeam]\n\n" <>
-        "Your turn ended with no filing and no continuation scheduled for assignment asg_1 — \"ship it\". " <>
-        "File completion, schedule your continuation, or file surrender. This is prod 1 of 3; " <>
+        "Your turn ended with no qualifying receipt or admitted continuation covering assignment asg_1 — \"ship it\". " <>
+        "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or surrender. This is prod 1 of 3; " <>
         "a reply without a row escalates to your spawner."
 
     assert {:ok, [[^expected_prod]]} =
@@ -2021,7 +2021,7 @@ defmodule Tightbeam.SupervisionTest do
     expected_escalation =
       "[from process:tightbeam]\n\n" <>
         "Assignment asg_escalation — \"investigate\" — held by escalating-holder is stalled: " <>
-        "0 prods produced no filing and no continuation. This is escalation 1 for this assignment. " <>
+        "0 prods produced no qualifying receipt and no admitted continuation covering it. This is escalation 1 for this assignment. " <>
         "Why, and what happens next, is your judgment — the substrate only reports the rows."
 
     assert {:ok, [[^expected_escalation]]} =

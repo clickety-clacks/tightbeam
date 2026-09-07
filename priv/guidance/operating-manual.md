@@ -42,6 +42,10 @@ retry after a delay, or resume a long task — schedule a wake to your own role 
 
     tightbeam wake --role <your-role> --prompt "check if the build finished, then continue" --after 10m
 
+Use these ordinary notifications for timed rechecks of external systems with no observable
+rows. They do not cover an assignment or pause its effort horizon. For unfinished assigned
+work, use the obligation-scoped continuation pattern below.
+
 The prompt you send yourself instructs the future you. Cancel a scheduled wake with
 `tightbeam cancel-wake <wakeId>`, using the id the wake command returned.
 
@@ -157,9 +161,12 @@ your workdir. Your home is substrate-owned identity: the substrate may regenerat
 time, and anything loose in it is forfeit. Keep work out of your home and out of system temp
 directories.
 
+Use the existing authorized non-Gibson test machine for required verification. Escalate only
+an actual missing authority or exception; do not request a new route when an authorized one exists.
+
 ## Keep open work live without generic reports
-While you hold an open assignment, leave a valid durable liveness receipt or schedule a
-continuation wake to yourself before the turn ends. Create a reporting attest or reporting
+While you hold an open assignment, leave a qualifying durable receipt or register an
+obligation-scoped continuation before the turn ends. Create a reporting attest or reporting
 wake only for one of these exceptions:
 
 - a new material result or evidence, such as an artifact, verification result, frozen revision, or
@@ -169,10 +176,27 @@ wake only for one of these exceptions:
 - one new, unexpired bounded checkpoint that names the next action or condition and its
   deadline or scheduled continuation.
 
-A continuation wake is a liveness receipt, not a status report. Schedule concrete continuation
-work or a named dependency recheck, and state when it resumes. Do not file "still working,"
-"unchanged," "waiting," or "no update." Do not repeat a result, blocker, refusal, decision
-request, or checkpoint that adds no new evidence or owner-relevant state.
+Before ending a turn with unfinished actionable work, register its next action:
+
+    tightbeam wake --session <holder-session> --assignment <id> --after-turn --prompt "<concrete next action>"
+
+The continuation becomes eligible after the captured current turn ends.
+
+For a row dependency, open or link the assignment or decision request that owes the action.
+Register the predicate, resolver, covered assignment, continuation and fallback:
+
+    tightbeam wake --session <holder-session> --assignment <id> --predicate '<JSON object>' --fallback-after <duration> --prompt "<action to reconsider with the result>"
+
+Include conditions, bindings, resolverRef, declared necessity and the existing verification
+assignment in verificationRef in the predicate object. Register as the holder or an authorized
+supervising ancestor. Preserve the actual registrant as creator. Dependency coverage is provisional until
+the named verifier checks necessity; a challenge ends coverage and summons reconsideration.
+An admitted continuation covers only its named obligation, including while queued or running.
+Only a qualifying unresolved dependency wait pauses the effort horizon; scheduling alone does
+not show advancement. Read the actual disposition before acting. Delivery grants no permission.
+
+Do not file "still working," "unchanged," "waiting," or "no update." Do not repeat a result,
+blocker, refusal, decision request, or checkpoint without new evidence or owner-relevant state.
 
 When you need more time, say so in a receipt that carries evidence: what moved on the
 deliverable since the last one, with the row, commit or artifact that shows it. A receipt
@@ -181,11 +205,11 @@ judgment for the work; how any particular monitor behaves is not a rule of this
 substrate.
 
 If no reporting exception applies, record the one valid bounded checkpoint when available or
-schedule a concrete continuation wake. Do not manufacture a generic progress attest.
+use the obligation-scoped continuation pattern above. Do not manufacture a generic progress attest.
 Completion and surrender remain truthful terminal receipts.
 
-A turn with neither a receipt nor a scheduled continuation is a stall. The substrate checks in
-on the holder and escalates unanswered check-ins to the session that spawned it. Workdir writes,
+A turn with neither a qualifying receipt nor an admitted continuation covering its obligation
+is a stall. The substrate checks in on the holder and escalates unanswered check-ins to the session that spawned it. Workdir writes,
 recorded artifacts, assignment attests, and work-item updates remain the mechanical effect
 channels that keep the liveness bracket moving.
 

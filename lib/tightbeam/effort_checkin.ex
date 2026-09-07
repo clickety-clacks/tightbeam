@@ -1457,8 +1457,9 @@ defmodule Tightbeam.EffortCheckin do
           "A checkpoint must name the next action or condition and its deadline. " <>
           "Use `artifact-record` for anything produced outside this workdir " <>
           "(another machine, a service, a conversation). Do not file generic or duplicate status. " <>
-          "If no reporting exception applies, schedule a concrete continuation wake that names " <>
-          "the next action or dependency condition and when to resume.",
+          "For unfinished work, follow the manual’s obligation-scoped continuation pattern. " <>
+          "An ordinary notification does not cover this assignment or pause effort. " <>
+          "Only a qualifying unresolved dependency wait pauses the effort horizon.",
       due_at: now(),
       assignment_id: generation.assignment_id
     })

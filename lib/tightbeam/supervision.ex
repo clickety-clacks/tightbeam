@@ -4446,14 +4446,14 @@ defmodule Tightbeam.Supervision do
   end
 
   defp prod_prompt(id, subject, k, n) do
-    "Your turn ended with no filing and no continuation scheduled for assignment #{id} — \"#{subject}\". " <>
-      "File completion, schedule your continuation, or file surrender. This is prod #{k} of #{n}; " <>
+    "Your turn ended with no qualifying receipt or admitted continuation covering assignment #{id} — \"#{subject}\". " <>
+      "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or surrender. This is prod #{k} of #{n}; " <>
       "a reply without a row escalates to your spawner."
   end
 
   defp escalation_prompt(id, subject, holder, n, rung) do
-    "Assignment #{id} — \"#{subject}\" — held by #{holder} is stalled: #{n} prods produced no filing " <>
-      "and no continuation. This is escalation #{rung} for this assignment. Why, and what happens next, " <>
+    "Assignment #{id} — \"#{subject}\" — held by #{holder} is stalled: #{n} prods produced no qualifying receipt " <>
+      "and no admitted continuation covering it. This is escalation #{rung} for this assignment. Why, and what happens next, " <>
       "is your judgment — the substrate only reports the rows."
   end
 
