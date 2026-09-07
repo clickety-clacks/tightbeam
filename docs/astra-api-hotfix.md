@@ -51,14 +51,22 @@ prompt or a transcript lookup. Both turns were delivered with no error and
 recorded `gpt-6-astra` as their model. The startup wiring gate logged PASS before
 and after the restart. The disposable canary was retired.
 
-Broader validation remains incomplete. In this fresh instance, the Codex-only
-`feature_smoke` passed credential preflight, then failed its local-deployment
-HOME census on a normal `sessions/.../rollout-....jsonl` file produced by the
-engine. That file was not removed to force a passing result. Separately,
-0.1.9 automatic provisioning failed to apply its Claude 0.73.0 adapter patch;
-the Codex adapter was provisioned with the PR's exact patch function to proceed
-with the Codex checks. Neither issue was repaired as part of this hotfix, and
-neither is claimed to be a passing cross-harness matrix.
+The full fresh-org `feature_smoke` matrix now passes: 13 checks on Claude
+and 13 on API-key Codex/Astra, including real artifact-carrying turns and
+cross-harness review gates. No failed assertion or rule was disabled. Completing
+that gate required repairing the pinned Claude 0.73.0 patch anchors while
+preserving upstream completion bookkeeping, and activating its disk-only forks
+with `resumeSession` before returning configuration metadata. The fork regression
+executes the patched method extracted from recorded upstream source and checks
+ordering, metadata preservation, and propagation of a resume failure.
+
+The smoke census now delegates native runtime filenames to the harness registry,
+with conformance vectors and negative controls for arbitrary files. Its filesystem
+walk tolerates entries that disappear between listing and stat, but still refuses
+permission and other IO errors. Existing required-entry and durable-state checks
+remain. The review fixtures now file actual committed fixture-check receipts and
+the required posture ruling; telemetry assertions use the renamed execution-map
+verbs. The smoke gateway uses its required 2500ms effort-check-in horizon.
 
 `test/fixtures/model_catalog/codex_0_153_2_api_models.json` is a three-model subset
 of actual native `model/list(includeHidden: true)` output captured in isolated
@@ -71,12 +79,11 @@ unrelated hidden model, and does not synthesize Astra when absent.
 
 - Enforce the Codex 0.153.2 native engine prerequisite for any release rollout;
   older bundled engines were not validated and may lack Astra metadata.
-- Run the required fresh-org `feature_smoke` matrix for both Claude and Codex.
+- Repeat the required fresh-org matrix for any changed engine, adapter, or source revision.
 - Confirm baseline and after-change CI gates on supported Linux and macOS.
 - Obtain maintenance-owner review and routing before integration; 0.1.8 is frozen.
 
-The two-harness live matrix has not been claimed; the fresh-instance blockers
-are recorded above. No production service restart or migration is part
+The two-harness live matrix passed on the final candidate. No production service restart or migration is part
 of this PR. Once accepted and packaged, activate only at an idle maintenance
 boundary, retain the previous build/override for rollback, and repeat the live
 checks with the installed bytes.
@@ -106,6 +113,56 @@ release. A standalone ACP prompt does not prove those gateway checks.
 
 Base `7311707d`: format check and authoritative Elixir gate passed with
 9 doctests, 1,810 tests, 0 failures, 11 existing skips. After this change:
-9 doctests, 1812 tests, 0 failures, 11 skipped. Focused adapter/catalog checks: 27 tests, 0 failures.
+9 doctests, 1818 tests, 0 failures, 11 skipped. Overlay installer safety: 6 tests, 0 failures. The original focused adapter/catalog gate passed 27 tests; the later conformance, census and adapter gate passed 20 tests.
 Shipped privacy and public rule-fact compatibility checks also passed.
 These local Linux results do not replace the release gates listed above.
+
+## Exact-build production overlay
+
+A full maintenance package upgrade is separate from applying this workaround.
+The tested production build is 0.1.8 at source `84dd13e3` with the
+`cursor-harness-v1` database stamp. The 0.1.9 branch has a different schema
+contract; do not replace that production package with this branch's full
+release as an incidental part of enabling Astra.
+
+For that exact installed build, the prepared overlay changes only
+`Elixir.Tightbeam.Harness.Codex.beam` and the existing ACP 1.1.4 `dist/index.js`.
+It retains the production provisioning callback, Cursor support, database,
+identity and other adapters. The original source was first rebuilt using the
+installed release libraries, relative source paths and Logger's compile-time
+application metadata. Its executable BEAM MD5 matched the installed module
+before the three Codex changes from this PR were applied. The final payloads
+are tied to their original and patched SHA-256 hashes in a manifest.
+
+`packaging/astra-overlay.py` consumes such a reviewed bundle. It refuses unknown
+or mixed installed bytes, corrupted payloads, a listening local gateway, and
+mismatched rollback backups. It preserves file modes, backs up both originals,
+and restores them if a write raises. An interrupted process can still leave
+mixed state; that state is refused loudly rather than guessed at. The installer
+does not onboard credentials, restart services, or migrate the database.
+
+The bundle is specific to the captured build, not a portable release. Rebuild
+and revalidate for different installed bytes. Example operator sequence:
+
+```sh
+python3 /path/to/bundle/astra-overlay.py check --bundle /path/to/bundle \
+  --package-root /absolute/npm/tightbeam --base-dir /absolute/tightbeam-state \
+  --backup-dir /absolute/private/overlay-backup
+```
+
+At an idle maintenance boundary, stop the gateway and wait until its process
+has exited and its listener is down. Run the same command with `apply` in place
+of `check`, then start the gateway. Verify the pinned native Codex 0.153.2 path,
+Astra catalog, real Astra/high turn, startup-hook PASS, and restart/resume before
+changing authentication or agents in bulk. The original CODEX_PATH persists.
+
+For rollback, stop and fully drain the gateway again, run `rollback` with the
+same paths and private backup directory, then start it. Restore the prior
+authentication separately if it was changed. This restores original module and
+adapter bytes; it does not undo later conversation turns or credential changes.
+The overlay changes no schema, so it requires no reverse migration.
+
+Keep the bundle manifest, original bytes, source patch, and validation evidence
+with the deployment record. Review and remove the overlay when an official
+release replaces it. Maintenance-owner approval remains the merge/release step;
+production activation is a separate operator decision.

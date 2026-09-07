@@ -254,6 +254,19 @@ defmodule Tightbeam.Harness.Codex do
     }
   end
 
+  # Recorded native runtime paths from Codex 0.153.2. These are engine-owned,
+  # not entries produced by Tightbeam home projection.
+  @native_home_patterns [
+    ~r"\Asessions/\d{4}/\d{2}/\d{2}/rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl\z",
+    ~r"\Ashell_snapshots/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.\d+\.sh\z",
+    ~r"\Atmp/arg0/codex-arg0[A-Za-z0-9]+/\.lock\z",
+    ~r"\Athread-writer-locks/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.lock\z"
+  ]
+
+  @impl true
+  def native_home_entry?(relative),
+    do: Enum.any?(@native_home_patterns, &Regex.match?(&1, relative))
+
   @impl true
   def owned_home_entries,
     do: Support.owned_home_entries("auth.json", "hooks.json")
@@ -618,6 +631,11 @@ defmodule Tightbeam.Harness.Codex do
     }
 
     Support.conformance_vectors(__MODULE__, %{
+      native_home_paths: [
+        "thread-writer-locks/01a079d2-1306-7031-938e-66bec2ea11a6.lock",
+        "unexpected.txt"
+      ],
+      native_home_expected: [true, false],
       wire_name: wire_name(),
       provider: credential_provider(),
       home_scope: wire_name(),
