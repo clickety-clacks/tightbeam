@@ -1362,6 +1362,72 @@ defmodule Tightbeam.CredentialsTest do
       assert Credentials.kind(:cursor, server) == :api_key
     end
 
+    test "seeds canonical preferences before the planned restart restores a writable runtime copy",
+         ctx do
+      home = Path.join([ctx.base, "homes", "eezo", "cursor"])
+      File.mkdir_p!(home)
+      File.chmod!(home, 0o2770)
+      owner = self()
+
+      {:ok, server} =
+        Credentials.start_link(
+          name: nil,
+          base_dir: ctx.base,
+          machine: "eezo",
+          stop: fn :cursor ->
+            send(owner, :stopped)
+            :ok
+          end,
+          start: fn :cursor, :api_key ->
+            canonical = Path.join([ctx.base, "auth", "cursor", "cli-config.json"])
+            projected = Path.join(home, "cli-config.json")
+
+            assert File.read!(canonical) == Tightbeam.Harness.Cursor.initial_cli_config()
+            assert File.read!(projected) == File.read!(canonical)
+            assert Bitwise.band(File.stat!(projected).mode, 0o777) == 0o640
+
+            # The fresh process owns this runtime replacement. The canonical
+            # non-secret baseline stays private and is never harvested back.
+            File.rm!(projected)
+            File.write!(projected, ~s({"version":1,"runtime":true}))
+            File.chmod!(projected, 0o660)
+            send(owner, :started)
+            :ok
+          end,
+          on_credential_present: fn :cursor -> :ok end,
+          resume: fn :cursor -> :ok end
+        )
+
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:cursor, server)
+      File.write!(Path.join(staging, "api-key"), "cur-secret-key\n")
+      assert :ok = Credentials.finish_onboard(:cursor, :api_key, lease_id, server)
+      assert_receive :stopped
+      assert_receive :started
+
+      canonical = Path.join([ctx.base, "auth", "cursor", "cli-config.json"])
+      projected = Path.join(home, "cli-config.json")
+      assert File.read!(canonical) == ~s({"version":1})
+      assert Bitwise.band(File.stat!(canonical).mode, 0o777) == 0o600
+      assert File.read!(projected) == ~s({"version":1,"runtime":true})
+      assert Bitwise.band(File.stat!(projected).mode, 0o777) == 0o660
+      refute File.read!(canonical) =~ "cur-secret-key"
+      refute File.read!(projected) =~ "cur-secret-key"
+    end
+
+    test "re-onboarding preserves existing canonical Cursor preferences", ctx do
+      dir = Path.join([ctx.base, "auth", "cursor"])
+      File.mkdir_p!(dir)
+      canonical = Path.join(dir, "cli-config.json")
+      File.write!(canonical, ~s({"version":1,"editor":{"vimMode":true}}))
+
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:cursor, server)
+      File.write!(Path.join(staging, "api-key"), "cur-secret-key\n")
+      assert :ok = Credentials.finish_onboard(:cursor, :api_key, lease_id, server)
+
+      assert File.read!(canonical) == ~s({"version":1,"editor":{"vimMode":true}})
+    end
+
     test "refuses a blank cursor key and banks nothing", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
 

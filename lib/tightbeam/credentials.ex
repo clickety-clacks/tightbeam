@@ -773,6 +773,7 @@ defmodule Tightbeam.Credentials do
         bank_dir_mode(:cursor)
       )
 
+      seed_cursor_preferences!(state)
       reconcile_provider_homes(state, :cursor)
       :ok
     end
@@ -783,6 +784,29 @@ defmodule Tightbeam.Credentials do
       atomic_write!(credential_store_path(state, :fixture_provider), credential.bytes)
       reconcile_provider_homes(state, :fixture_provider)
       :ok
+    end
+  end
+
+  # Cursor's pinned config schema supplies every default from a version-only
+  # document. Seed that non-secret canonical document before home reconciliation
+  # and the planned stop/start below. Reconciliation projects a read-only copy;
+  # the fresh Cursor process can then replace it inside the group-writable home
+  # with its own writable runtime copy. An existing canonical preference file is
+  # operator state and remains untouched.
+  defp seed_cursor_preferences!(state) do
+    path = Path.join(Path.dirname(credential_store_path(state, :cursor)), "cli-config.json")
+
+    case :file.open(path, [:write, :exclusive, :binary]) do
+      {:ok, io} ->
+        :ok = :file.write(io, Tightbeam.Harness.Cursor.initial_cli_config())
+        :ok = :file.close(io)
+        File.chmod!(path, 0o600)
+
+      {:error, :eexist} ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: reason, action: "seed Cursor preferences", path: path
     end
   end
 

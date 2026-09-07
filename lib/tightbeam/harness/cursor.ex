@@ -27,6 +27,7 @@ defmodule Tightbeam.Harness.Cursor do
   @credential_file "cli-config.json"
   @api_key_file "api-key"
   @rails_file ".cursor/hooks.json"
+  @initial_cli_config JSON.encode!(%{"version" => 1})
 
   # The catalog must not advertise what the adapter will refuse. `cursor-agent
   # --list-models` publishes ~200 refs; ACP `session/new` exposes a closed enum
@@ -71,6 +72,22 @@ defmodule Tightbeam.Harness.Cursor do
 
   @doc false
   def adapter_version, do: @adapter_version
+
+  @doc false
+  def adapter_path do
+    Path.join([
+      execution_home(nil),
+      ".local",
+      "share",
+      "cursor-agent",
+      "versions",
+      @adapter_version,
+      "cursor-agent"
+    ])
+  end
+
+  @doc false
+  def initial_cli_config, do: @initial_cli_config
 
   @impl true
   def wire_projection do
@@ -847,15 +864,7 @@ defmodule Tightbeam.Harness.Cursor do
   defp resolve_launcher(%{find_executable: find}), do: find.(cli_binary())
 
   defp resolve_launcher(_target) do
-    Path.join([
-      execution_home(nil),
-      ".local",
-      "share",
-      "cursor-agent",
-      "versions",
-      @adapter_version,
-      "cursor-agent"
-    ])
+    adapter_path()
   end
 
   defp remote_realpath(target, path),

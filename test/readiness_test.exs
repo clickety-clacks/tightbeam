@@ -206,6 +206,32 @@ defmodule Tightbeam.ReadinessTest do
            ]
   end
 
+  test "a missing Cursor operand names its dedicated pin and onboarding remedy", ctx do
+    module = Tightbeam.Harness.Cursor
+    previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
+    Application.put_env(:tightbeam, :enabled_dormant_harnesses, [:cursor])
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :enabled_dormant_harnesses),
+        else: Application.put_env(:tightbeam, :enabled_dormant_harnesses, previous)
+    end)
+
+    catalog = catalog!(%{module.wire_name() => live("m", [])})
+
+    line =
+      ctx.config
+      |> Readiness.summary(catalog)
+      |> Readiness.render(ctx.config)
+      |> Enum.find(&(&1 =~ "Dedicated pinned Cursor operand missing"))
+
+    assert line =~ module.adapter_path()
+    assert line =~ module.adapter_version()
+    assert line =~ "tightbeam onboard cursor --api-key"
+    refute line =~ "npm install"
+    refute line =~ Path.join([ctx.base, "adapters", "node_modules", ".bin"])
+  end
+
   test "a missing credential names the separate login, auth root, and onboard command", ctx do
     [module | _] = Harness.all()
     install_adapter!(ctx.base, module)
@@ -234,23 +260,21 @@ defmodule Tightbeam.ReadinessTest do
 
   test "a missing Cursor credential renders the legal API-key command", ctx do
     module = Tightbeam.Harness.Cursor
-    install_adapter!(ctx.base, module)
 
-    previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
-    Application.put_env(:tightbeam, :enabled_dormant_harnesses, [:cursor])
-
-    on_exit(fn ->
-      if is_nil(previous),
-        do: Application.delete_env(:tightbeam, :enabled_dormant_harnesses),
-        else: Application.put_env(:tightbeam, :enabled_dormant_harnesses, previous)
-    end)
-
-    catalog =
-      catalog!(%{module.wire_name() => {[], {:unavailable, {:needs_onboarding, :missing}}}})
+    row = %{
+      host: "testhost",
+      base_dir: ctx.base,
+      harness: module.wire_name(),
+      provider: module.credential_provider(),
+      adapter: :present,
+      binary: :runnable,
+      credential: {:absent, :missing},
+      model: :unknown,
+      runnable?: false
+    }
 
     line =
-      ctx.config
-      |> Readiness.summary(catalog)
+      %{runnable?: false, harnesses: [row]}
       |> Readiness.render(ctx.config)
       |> Enum.find(&(&1 =~ "Tightbeam has no credential for cursor"))
 
@@ -666,8 +690,8 @@ defmodule Tightbeam.ReadinessTest do
     for module <- Harness.all() do
       # The harness behaviour exposes no adapter_bin, so the coupling is pinned
       # against the path Support ACTUALLY builds, as published in the harness's
-      # own conformance vectors. Cursor launches its dedicated pinned bundle;
-      # readiness still tracks the operator-side shim that onboarding stages.
+      # own conformance vectors. Cursor launches and reports its dedicated
+      # pinned bundle rather than the generic npm adapter path.
       expected = "/adapters/node_modules/.bin/" <> Path.basename(module.install_package())
 
       published =

@@ -334,6 +334,8 @@ fn admin_instructions_for(
              sudo chmod -R g+rwX {base}/work\n\
              sudo chmod 2770 {base}/work\n\
              sudo mkdir -p {base}/homes/{machine}/cursor/.tightbeam/harness-processes {base}/homes/{machine}/cursor/acp-sessions\n\
+             sudo chgrp tightbeam-workspace {base}/homes {base}/homes/{machine}\n\
+             sudo chmod 0710 {base}/homes {base}/homes/{machine}\n\
              sudo chown -R $USER:tightbeam-workspace {base}/homes/{machine}/cursor\n\
              sudo chmod 2770 {base}/homes/{machine}/cursor {base}/homes/{machine}/cursor/.tightbeam {base}/homes/{machine}/cursor/.tightbeam/harness-processes {base}/homes/{machine}/cursor/acp-sessions\n\
              sudo chgrp tightbeam-workspace {base}/auth\n\
@@ -381,6 +383,8 @@ fn admin_instructions_for(
              sudo chmod -R g+rwX {base}/work\n\
              sudo chmod 2770 {base}/work\n\
              sudo mkdir -p {base}/homes/{machine}/cursor/.tightbeam/harness-processes {base}/homes/{machine}/cursor/acp-sessions\n\
+             sudo chgrp tightbeam-workspace {base}/homes {base}/homes/{machine}\n\
+             sudo chmod 0710 {base}/homes {base}/homes/{machine}\n\
              sudo chown -R $USER:tightbeam-workspace {base}/homes/{machine}/cursor\n\
              sudo chmod 2770 {base}/homes/{machine}/cursor {base}/homes/{machine}/cursor/.tightbeam {base}/homes/{machine}/cursor/.tightbeam/harness-processes {base}/homes/{machine}/cursor/acp-sessions\n\
              sudo chgrp tightbeam-workspace {base}/auth\n\
@@ -800,6 +804,13 @@ mod tests {
             assert!(instructions.contains("/build/tightbeam"));
             assert!(instructions.contains("/homes/test-machine/cursor"));
             assert!(instructions.contains("/homes/test-machine/cursor/acp-sessions"));
+            assert!(instructions.contains(
+                "chgrp tightbeam-workspace /srv/tightbeam/homes /srv/tightbeam/homes/test-machine"
+            ));
+            assert!(
+                instructions
+                    .contains("chmod 0710 /srv/tightbeam/homes /srv/tightbeam/homes/test-machine")
+            );
             assert!(instructions.contains("chmod 2770 /srv/tightbeam/homes/test-machine/cursor "));
             assert!(instructions.contains("chown -R root:tightbeam-workspace"));
             assert!(instructions.contains(HELPER_PATH_DIR));
