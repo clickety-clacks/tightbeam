@@ -55,6 +55,8 @@ defmodule Tightbeam.EffortCheckin do
     artifactWatermark INTEGER NOT NULL DEFAULT 0,
     attestWatermark INTEGER NOT NULL DEFAULT 0,
     workItemWatermark INTEGER NOT NULL DEFAULT 0,
+    reliefStartedAt INTEGER,
+    reliefExcludedMs INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (assignmentId, generation)
   );
   CREATE INDEX IF NOT EXISTS effort_checkin_wake

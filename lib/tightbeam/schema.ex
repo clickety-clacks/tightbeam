@@ -40,8 +40,10 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "row-driven-waits-v1-019"
-  @pre_liveness_shape "row-driven-waits-pre-liveness-v1-019"
+  @shape "row-driven-coverage-v1-019"
+  @row_driven_coverage_previous_shape "row-driven-waits-v1-019"
+  @coverage_pre_liveness_previous_shape "row-driven-waits-pre-liveness-v1-019"
+  @pre_liveness_shape "row-driven-coverage-pre-liveness-v1-019"
   @pre_liveness_rules_shape "row-driven-rules-pre-liveness-v1-019"
   @pre_liveness_identity_shape "identity-universal-root-render-pre-liveness-v1-019"
   @row_driven_waits_previous_shape "row-driven-rules-v1-019"
@@ -295,7 +297,7 @@ defmodule Tightbeam.Schema do
       CREATE TABLE IF NOT EXISTS supervision_liveness_sidecar (
         wakeId TEXT PRIMARY KEY REFERENCES wakes(wakeId),
         assignmentId TEXT NOT NULL REFERENCES assignments(id),
-        controllerOrigin TEXT CHECK (controllerOrigin IN ('scheduled','retirement_elevation')),
+        controllerOrigin TEXT CHECK (controllerOrigin IN ('scheduled','retirement_elevation','holder_continuation')),
         wakeKind TEXT CHECK (wakeKind IN ('prod','escalation')),
         controllerState TEXT CHECK (controllerState IN ('pending','settled')),
         chargedGeneration INTEGER CHECK (chargedGeneration > 0),
@@ -321,6 +323,9 @@ defmodule Tightbeam.Schema do
           OR
           (controllerOrigin = 'retirement_elevation' AND wakeKind = 'escalation' AND
            controllerState = 'settled' AND chargedGeneration IS NULL)
+          OR
+          (controllerOrigin = 'holder_continuation' AND wakeKind IS NULL AND
+           controllerState IN ('pending','settled') AND chargedGeneration IS NULL)
         ),
         CHECK (
           (transferEvidenceId IS NULL AND retirementEpoch IS NULL AND
@@ -507,7 +512,7 @@ defmodule Tightbeam.Schema do
       type: "index",
       name: "supervision_liveness_pending_controller",
       sql:
-        "CREATE UNIQUE INDEX IF NOT EXISTS supervision_liveness_pending_controller ON supervision_liveness_sidecar(assignmentId) WHERE controllerState = 'pending'"
+        "CREATE UNIQUE INDEX IF NOT EXISTS supervision_liveness_pending_controller ON supervision_liveness_sidecar(assignmentId) WHERE controllerState = 'pending' AND controllerOrigin = 'scheduled'"
     },
     %{
       type: "index",
@@ -693,10 +698,11 @@ defmodule Tightbeam.Schema do
       WHEN NOT EXISTS (
         SELECT 1 FROM wakes w
         WHERE w.wakeId=NEW.wakeId AND w.assignmentId=NEW.assignmentId
-          AND w.consumer='prompt' AND w.origin='process:tightbeam'
+          AND w.consumer='prompt'
+          AND (w.origin='process:tightbeam' OR NEW.controllerOrigin='holder_continuation')
       )
       OR (
-        NEW.controllerOrigin IS NOT NULL
+        NEW.controllerOrigin IN ('scheduled','retirement_elevation')
         AND NOT EXISTS (
           SELECT 1 FROM wakes w
           WHERE w.wakeId=NEW.wakeId AND w.assignmentId=NEW.assignmentId
@@ -709,6 +715,22 @@ defmodule Tightbeam.Schema do
               (NEW.wakeKind='escalation' AND w.reresolve='lineage'
                AND w.reresolveSeed IS NOT NULL AND w.reresolveRung > 0)
             )
+        )
+      )
+      OR (
+        NEW.controllerOrigin='holder_continuation'
+        AND NOT EXISTS (
+          SELECT 1 FROM wakes w
+          JOIN assignments a ON a.id=w.assignmentId
+          JOIN sessions s ON s.sessionKey=a.holderKey
+          WHERE w.wakeId=NEW.wakeId AND w.state='pending' AND a.state='open'
+            AND w.obligationRef=a.id AND w.sessionKey=a.holderKey
+            AND w.creatorSessionKey=a.holderKey AND w.ownerUserId=s.ownerUserId
+            AND w.waitMode IN ('dependency','after-turn') AND w.prompt IS NOT NULL
+            AND (w.originatingTurnSeq IS NULL OR EXISTS (
+              SELECT 1 FROM turns t WHERE t.seq=w.originatingTurnSeq
+                AND t.sessionKey=w.creatorSessionKey AND t.status='running'
+            ))
         )
       )
       BEGIN
@@ -1205,6 +1227,12 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@row_driven_coverage_previous_shape]]} ->
+        upgrade_row_driven_coverage_v1(db, @row_driven_coverage_previous_shape)
+
+      {:ok, [[@coverage_pre_liveness_previous_shape]]} ->
+        upgrade_row_driven_coverage_v1(db, @coverage_pre_liveness_previous_shape)
+
       {:ok, [[@pre_liveness_shape]]} ->
         :ok
 
@@ -1474,7 +1502,10 @@ defmodule Tightbeam.Schema do
   end
 
   defp upgrade_row_driven_waits_v1(db, predecessor \\ @row_driven_waits_previous_shape) do
-    successor = if predecessor == @pre_liveness_rules_shape, do: @pre_liveness_shape, else: @shape
+    successor =
+      if predecessor == @pre_liveness_rules_shape,
+        do: @coverage_pre_liveness_previous_shape,
+        else: @row_driven_coverage_previous_shape
 
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
@@ -1519,6 +1550,99 @@ defmodule Tightbeam.Schema do
          end) do
       {:ok, :ok} -> check_shape(db)
       {:error, error} -> raise error
+    end
+  end
+
+  defp upgrade_row_driven_coverage_v1(db, predecessor) do
+    activated = predecessor == @row_driven_coverage_previous_shape
+    successor = if activated, do: @shape, else: @pre_liveness_shape
+    # The exact predecessor stamp selects this rebuild; no stored-DDL inference.
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      case DB.transaction(db, fn txn ->
+             [[^predecessor]] =
+               Txn.q(txn, "SELECT shape FROM schema_stamp")
+
+             Txn.q(
+               txn,
+               "ALTER TABLE effort_checkin_generations ADD COLUMN reliefStartedAt INTEGER"
+             )
+
+             Txn.q(
+               txn,
+               "ALTER TABLE effort_checkin_generations ADD COLUMN reliefExcludedMs INTEGER NOT NULL DEFAULT 0"
+             )
+
+             :ok =
+               Txn.exec(
+                 txn,
+                 "ALTER TABLE supervision_watermarks RENAME TO supervision_watermarks_gc_previous"
+               )
+
+             :ok = Txn.exec(txn, Tightbeam.Supervision.watermarks_ddl())
+
+             Txn.q(txn, """
+             INSERT INTO supervision_watermarks
+               (sessionKey,assignmentId,lastEvaluatedTerminal,pendingBranch,pendingAssignment,pendingK,pendingN)
+             SELECT sessionKey,COALESCE(pendingAssignment,''),lastEvaluatedTerminal,pendingBranch,pendingAssignment,pendingK,pendingN
+             FROM supervision_watermarks_gc_previous
+             """)
+
+             :ok = Txn.exec(txn, "DROP TABLE supervision_watermarks_gc_previous")
+
+             if activated do
+               object =
+                 Enum.find(
+                   @supervision_liveness_objects,
+                   &(&1.name == "supervision_liveness_sidecar")
+                 )
+
+               Enum.each(@supervision_liveness_enforcement_objects, fn trigger ->
+                 :ok = Txn.exec(txn, "DROP TRIGGER IF EXISTS #{trigger.name}")
+               end)
+
+               :ok =
+                 Txn.exec(
+                   txn,
+                   "ALTER TABLE supervision_liveness_sidecar RENAME TO supervision_liveness_sidecar_gc_previous"
+                 )
+
+               :ok = Txn.exec(txn, object.sql)
+
+               Txn.q(
+                 txn,
+                 "INSERT INTO supervision_liveness_sidecar SELECT * FROM supervision_liveness_sidecar_gc_previous"
+               )
+
+               :ok = Txn.exec(txn, "DROP TABLE supervision_liveness_sidecar_gc_previous")
+
+               for name <-
+                     ~w(supervision_liveness_assignment supervision_liveness_pending_controller supervision_liveness_retirement_dedupe supervision_liveness_retirement_immutable_update supervision_liveness_retirement_immutable_delete) do
+                 index = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+                 :ok = Txn.exec(txn, index.sql)
+               end
+
+               Enum.each(@supervision_liveness_enforcement_objects, fn trigger ->
+                 :ok = Txn.exec(txn, trigger.sql)
+               end)
+             end
+
+             Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+               successor,
+               System.system_time(:millisecond),
+               predecessor
+             ])
+
+             if Txn.changes(txn) != 1, do: raise(ShapeError, message: "coverage stamp race")
+             [] = Txn.q(txn, "PRAGMA foreign_key_check")
+             :ok
+           end) do
+        {:ok, :ok} -> :ok
+        {:error, error} -> raise error
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
   end
 

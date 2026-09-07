@@ -594,32 +594,35 @@ defmodule Tightbeam.Wakes do
       turn_seq ->
         now = now()
 
-        schedule_in_txn(txn, %{
-          session_key: input.session_key,
-          target_role: input[:target_role],
-          origin: input.origin,
-          prompt: input.prompt,
-          due_at: now,
-          creator_session_key: input.registrant_session_key,
-          assignment_id: obligation.id,
-          owner_user_id: obligation.owner_user_id,
-          obligation_ref: obligation.id,
-          wait_mode: "after-turn",
-          originating_turn_seq: turn_seq,
-          recognition_at: now,
-          recognition_path: "after-turn",
-          recognition_evidence: %{
-            label: "registration-snapshot",
-            observed: %{status: "running"},
-            eligible_after: "originating-turn-terminal"
-          },
-          recognition_transition: %{
-            label: "registration-snapshot",
-            domain: "turn",
-            row_id: turn_seq,
-            observed: %{status: "running"}
-          }
-        })
+        wake =
+          schedule_in_txn(txn, %{
+            session_key: input.session_key,
+            target_role: input[:target_role],
+            origin: input.origin,
+            prompt: input.prompt,
+            due_at: now,
+            creator_session_key: input.registrant_session_key,
+            assignment_id: obligation.id,
+            owner_user_id: obligation.owner_user_id,
+            obligation_ref: obligation.id,
+            wait_mode: "after-turn",
+            originating_turn_seq: turn_seq,
+            recognition_at: now,
+            recognition_path: "after-turn",
+            recognition_evidence: %{
+              label: "registration-snapshot",
+              observed: %{status: "running"},
+              eligible_after: "originating-turn-terminal"
+            },
+            recognition_transition: %{
+              label: "registration-snapshot",
+              domain: "turn",
+              row_id: turn_seq,
+              observed: %{status: "running"}
+            }
+          })
+
+        admit_continuation_in_txn(txn, wake)
     end
   end
 
@@ -671,6 +674,7 @@ defmodule Tightbeam.Wakes do
         })
 
       wake = recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, nil)
+      admit_continuation_in_txn(txn, wake)
 
       if is_nil(wake.recognition_path) do
         verifier_wake = schedule_verifier_notice_in_txn(txn, wake, verifier)
@@ -686,6 +690,136 @@ defmodule Tightbeam.Wakes do
         wake
       end
     end
+  end
+
+  defp admit_continuation_in_txn(txn, wake) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO supervision_liveness_sidecar
+        (wakeId,assignmentId,controllerOrigin,controllerState)
+      VALUES (?1,?2,'holder_continuation','pending')
+      """,
+      [wake.wake_id, wake.assignment_id]
+    )
+
+    wake
+  end
+
+  @doc false
+  def covering_continuation_in_txn?(%Txn{} = txn, assignment_id) do
+    qualifying_wait_in_txn?(txn, assignment_id, "wait-prod-coverage")
+  end
+
+  @doc false
+  def effort_relief_in_txn?(%Txn{} = txn, assignment_id) do
+    qualifying_wait_in_txn?(txn, assignment_id, "wait-effort-relief")
+  end
+
+  # Candidate selection does not confer qualification. Both purposes use the
+  # same checked snapshot, then the common Rules policy evaluator.
+  defp qualifying_wait_in_txn?(txn, assignment_id, purpose) do
+    Txn.q(
+      txn,
+      """
+      SELECT w.wakeId FROM wakes w
+      JOIN supervision_liveness_sidecar s ON s.wakeId=w.wakeId
+        AND s.assignmentId=w.assignmentId AND s.controllerOrigin='holder_continuation'
+      WHERE w.assignmentId=?1 AND w.obligationRef=?1
+        AND ((w.state='pending' AND s.controllerState='pending') OR
+             (w.state='fired' AND s.controllerState='settled'))
+      """,
+      [assignment_id]
+    )
+    |> Enum.any?(fn [wake_id] ->
+      wake = wait_in_txn(txn, wake_id)
+      facts = continuation_facts_in_txn(txn, wake, assignment_id)
+
+      mechanical =
+        if purpose == "wait-prod-coverage" do
+          facts["wait.obligation_matches"] and facts["wait.admitted"] and
+            facts["wait.after_turn_eligible"] and facts["wait.coverage_valid"] and
+            facts["wait.continuation_state"] in ~w(pending queued running)
+        else
+          facts["wait.obligation_matches"] and facts["wait.admitted"] and
+            facts["wait.continuation_state"] == "pending" and
+            not facts["wait.recognized"] and facts["resolver.open"] and
+            facts["wait.declaration_complete"] and facts["wait.verification_accountable"] and
+            facts["wait.coverage_valid"]
+        end
+
+      mechanical and
+        match?({:ok, _}, RuleRuntime.select_policy_in_txn(txn, purpose, %{wait_facts: facts}))
+    end)
+  end
+
+  defp continuation_facts_in_txn(txn, wake, assignment_id) do
+    obligation =
+      Txn.q(
+        txn,
+        """
+        SELECT a.holderKey FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+        WHERE a.id=?1 AND a.state='open' AND s.ownerUserId=?2
+        """,
+        [assignment_id, wake.owner_user_id]
+      )
+
+    matches = obligation == [[wake.session_key]] and wake.obligation_ref == assignment_id
+
+    continuation_state =
+      case Txn.q(
+             txn,
+             "SELECT status FROM turns WHERE wakeId=?1 AND assignmentId=?2 AND sessionKey=?3",
+             [wake.wake_id, assignment_id, wake.session_key]
+           ) do
+        [[status]] when status in ~w(queued running) -> status
+        [] when wake.state == "pending" -> "pending"
+        _ -> "terminal"
+      end
+
+    dependency = wake.wait_mode == "dependency"
+    resolver = if dependency, do: resolver_for_wake_in_txn(txn, wake)
+
+    accountable =
+      dependency and wake.verification_state in ~w(provisional confirmed) and
+        Txn.q(
+          txn,
+          """
+          SELECT 1 FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+          WHERE a.id=?1 AND a.holderKey=?2 AND s.ownerUserId=?3
+            AND (a.state='open' OR ?4='confirmed')
+          """,
+          [
+            wake.verification_assignment_id,
+            wake.verification_holder_key,
+            wake.owner_user_id,
+            wake.verification_state
+          ]
+        ) == [[1]]
+
+    complete =
+      dependency and is_map(wake.predicate) and
+        is_binary(wake.necessity) and wake.necessity != "" and
+        is_binary(wake.prompt) and wake.prompt != "" and
+        is_binary(wake.selected_policy_name)
+
+    if complete, do: stored_dependency_contracts!(wake)
+
+    %{
+      "wait.obligation_matches" => matches,
+      "wait.admitted" => wake.wait_mode in ~w(dependency after-turn),
+      "wait.after_turn_eligible" => wait_eligible_in_txn?(txn, wake),
+      "wait.coverage_valid" => not dependency or accountable,
+      "wait.continuation_state" => continuation_state,
+      "wait.recognized" => not is_nil(wake.recognition_at),
+      "wait.declaration_complete" => complete,
+      "wait.verification_accountable" => accountable,
+      "wait.verification_state" => wake.verification_state,
+      "resolver.open" => dependency and not resolver.terminal,
+      "resolver.owed_by_other" =>
+        dependency and
+          resolver.holder != "session:" <> wake.session_key
+    }
   end
 
   defp capture_condition_cursor_in_txn(txn, declaration) do
@@ -2815,7 +2949,7 @@ defmodule Tightbeam.Wakes do
         """
         UPDATE supervision_liveness_sidecar
         SET controllerState='settled'
-        WHERE wakeId=?1 AND controllerOrigin='scheduled' AND controllerState='pending'
+        WHERE wakeId=?1 AND controllerOrigin IN ('scheduled','holder_continuation') AND controllerState='pending'
         """,
         [wake.wake_id]
       )
@@ -3790,6 +3924,12 @@ defmodule Tightbeam.Wakes do
           )
 
           if Txn.changes(txn) == 1 do
+            Txn.q(
+              txn,
+              "UPDATE supervision_liveness_sidecar SET controllerState='settled' WHERE wakeId=?1 AND controllerOrigin='holder_continuation' AND controllerState='pending'",
+              [wake.wake_id]
+            )
+
             delivery =
               Gateway.deliver_prompt_in_txn(
                 txn,

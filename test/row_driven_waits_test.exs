@@ -17,6 +17,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     ConditionFacts,
     ConnRegistry,
     DB,
+    EffortCheckin,
     Escalation,
     Gateway,
     Ledger,
@@ -24,6 +25,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     Org,
     Roles,
     Rules,
+    Supervision,
     Wakes,
     WorkItems
   }
@@ -904,6 +906,136 @@ defmodule Tightbeam.RowDrivenWaitsTest do
              end)
 
     assert wake_count(ctx.db) == before
+  end
+
+  test "C1-C4: coverage follows only the admitted obligation through pending, queued and running",
+       ctx do
+    qualification_policy(ctx)
+    assignment(ctx.db, "B", "holder")
+    turn = running_turn(ctx.db, "holder")
+    wake = register_wait(ctx.db, due_after(), predicate("R"))
+    refute covered?(ctx.db, "A")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert covered?(ctx.db, "A")
+    refute covered?(ctx.db, "B")
+    assert {:match, %{id: "B"}} = Supervision.prod_production_matches?(ctx.db, "holder", turn.seq)
+
+    assert {:ok, [["holder_continuation", nil, nil, "pending"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT controllerOrigin,wakeKind,chargedGeneration,controllerState FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [wake.wake_id]
+             )
+
+    assert %{assignment: %{outcome: "completed"}} = attest(ctx.db, "R", "resolver", "completion")
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    assert covered?(ctx.db, "A")
+    assert {:ok, continuation} = Ledger.claim_next(ctx.db, "holder", "fixture")
+    assert covered?(ctx.db, "A")
+    refute covered?(ctx.db, "B")
+    assert :ok = Ledger.finish(ctx.db, continuation.seq, "delivered")
+    refute covered?(ctx.db, "A")
+
+    assert {:match, %{id: "A"}} =
+             Supervision.prod_production_matches?(ctx.db, "holder", continuation.seq)
+
+    # The executive specimen named its assignments only in prose: no typed join.
+    Wakes.schedule(ctx.db, %{
+      session_key: "holder",
+      origin: "agent:holder",
+      prompt: "Continue A and B",
+      due_at: due_after()
+    })
+
+    refute covered?(ctx.db, "A")
+    refute covered?(ctx.db, "B")
+  end
+
+  test "C2-C3: one covered card cannot suppress another card's actual prod or watermark", ctx do
+    qualification_policy(ctx)
+    assignment(ctx.db, "B", "holder")
+    assignment(ctx.db, "C", "holder")
+
+    for id <- ~w(A B C) do
+      assert {:ok, :armed} =
+               DB.transaction(ctx.db, fn txn ->
+                 Supervision.transition_in_txn(txn, %{
+                   kind: "assignment_open",
+                   assignment_id: id,
+                   opened_at: 0,
+                   principal: "user:owner-a",
+                   supervision_interval_ms: 1
+                 })
+               end)
+    end
+
+    turn = running_turn(ctx.db, "holder")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    register_wait(ctx.db, due_after(), predicate("R"))
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 60_000})
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, handlers, 3, "holder", turn.seq)
+    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "B")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, handlers, 3, "holder", turn.seq)
+    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "C")
+    assert {:ok, []} = DB.query(ctx.db, "SELECT 1 FROM assignment_prods WHERE assignmentId='A'")
+
+    assert {:ok, [["B"], ["C"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId FROM supervision_watermarks WHERE lastEvaluatedTerminal=?1 ORDER BY assignmentId",
+               [turn.seq]
+             )
+  end
+
+  test "C8: failed and unknown continuation outcomes end coverage without answering work", ctx do
+    qualification_policy(ctx)
+
+    for status <- ~w(failed failed_unknown) do
+      wake = register_wait(ctx.db, due_after(), predicate("R", "open"))
+      assert :ok = Wakes.fire_due(ctx.scheduler)
+      assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "fixture")
+      assert covered?(ctx.db, "A")
+      before = {attest_count(ctx.db, "A"), supervision_counts(ctx.db, "A")}
+      assert :ok = Ledger.finish(ctx.db, turn.seq, status, "model capacity")
+      refute covered?(ctx.db, "A")
+      assert {attest_count(ctx.db, "A"), supervision_counts(ctx.db, "A")} == before
+
+      assert {:ok, [["open", nil]]} =
+               DB.query(ctx.db, "SELECT state,outcome FROM assignments WHERE id='A'")
+
+      assert turn.wake_id == wake.wake_id
+    end
+  end
+
+  defp qualification_policy(ctx, other \\ true) do
+    File.write!(Path.join(ctx.base, "identity/rules/qualification.toml"), """
+    [[policy]]
+    name = "fixture-coverage"
+    purpose = "wait-prod-coverage"
+    when = [{fact="wait.coverage_valid",op="eq",value=true}]
+    [[policy]]
+    name = "fixture-relief"
+    purpose = "wait-effort-relief"
+    when = [{fact="resolver.owed_by_other",op="eq",value=#{other}}]
+    """)
+
+    Rules.load!(ctx.base, ~w(wake attest))
+  end
+
+  defp covered?(db, id) do
+    assert {:ok, covered} = DB.transaction(db, &Wakes.covering_continuation_in_txn?(&1, id))
+    covered
+  end
+
+  defp effort_snapshot(db) do
+    {:ok, rows} =
+      DB.query(db, """
+      SELECT generation,state,baseHorizonMs,multiplier,armedAt,terminalSeqWatermark,
+        wakeId,agentProdded,artifactWatermark,attestWatermark,workItemWatermark
+      FROM effort_checkin_generations WHERE assignmentId='A'
+      """)
+
+    rows
   end
 
   defp register_wait(db, due_at, predicate) do

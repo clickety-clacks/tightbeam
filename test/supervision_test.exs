@@ -147,7 +147,7 @@ defmodule Tightbeam.SupervisionTest do
     names = Enum.map(columns, &Enum.at(&1, 1))
 
     assert names ==
-             ~w(sessionKey lastEvaluatedTerminal pendingBranch pendingAssignment pendingK pendingN)
+             ~w(sessionKey assignmentId lastEvaluatedTerminal pendingBranch pendingAssignment pendingK pendingN)
 
     refute "pendingTarget" in names
   end

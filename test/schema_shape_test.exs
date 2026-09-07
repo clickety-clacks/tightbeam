@@ -48,7 +48,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, Wakes}
 
-  @shape "row-driven-waits-v1-019"
+  @shape "row-driven-coverage-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -425,7 +425,11 @@ defmodule Tightbeam.SchemaShapeTest do
       expected =
         Enum.at(
           if(activated,
-            do: ["identity-universal-root-render-v1-019", "row-driven-rules-v1-019", @shape],
+            do: [
+              "identity-universal-root-render-v1-019",
+              "row-driven-rules-v1-019",
+              "row-driven-waits-v1-019"
+            ],
             else: [
               "identity-universal-root-render-pre-liveness-v1-019",
               "row-driven-rules-pre-liveness-v1-019",
@@ -1410,8 +1414,23 @@ defmodule Tightbeam.SchemaShapeTest do
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
 
     try do
+      # Captured verbatim from the reviewed G-B source, schema.ex:292 and :688.
+      prior_sidecar = File.read!(Path.join(__DIR__, "fixtures/row_wakes/sidecar-40bd6fc1.sql"))
+
       :ok =
         DB.execute(db, """
+        CREATE TEMP TABLE gc_sidecar_rows AS SELECT * FROM supervision_liveness_sidecar;
+        DROP TABLE supervision_liveness_sidecar;
+        #{prior_sidecar}
+        DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
+        INSERT INTO supervision_liveness_sidecar SELECT * FROM gc_sidecar_rows;
+        DROP TABLE gc_sidecar_rows;
+        """)
+
+      :ok =
+        DB.execute(db, """
+        ALTER TABLE effort_checkin_generations DROP COLUMN reliefStartedAt;
+        ALTER TABLE effort_checkin_generations DROP COLUMN reliefExcludedMs;
         DROP INDEX wakes_wait_recognition;
         DROP INDEX condition_facts_owner_match;
         ALTER TABLE condition_facts DROP COLUMN ownerUserId;

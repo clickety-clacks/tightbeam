@@ -156,6 +156,17 @@ defmodule Tightbeam.Rules do
     "artifact.content_sha256" => :string,
     "review.qualifying_verdict_kinds" => {:list, :string},
     "condition_fact.matches" => :bool,
+    "wait.obligation_matches" => :bool,
+    "wait.admitted" => :bool,
+    "wait.after_turn_eligible" => :bool,
+    "wait.coverage_valid" => :bool,
+    "wait.continuation_state" => :string,
+    "wait.recognized" => :bool,
+    "wait.declaration_complete" => :bool,
+    "wait.verification_accountable" => :bool,
+    "wait.verification_state" => :string,
+    "resolver.open" => :bool,
+    "resolver.owed_by_other" => :bool,
     "verifier.open" => :bool,
     "verifier.holder_is_other" => :bool
   }
@@ -2109,6 +2120,16 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("verifier.open", _db, call, cache) do
     {get_in(call, [:policy_context, :verifier_state]) == "open", cache}
+  end
+
+  defp compute_fact(fact, _db, call, cache)
+       when fact in ~w(wait.obligation_matches wait.admitted wait.after_turn_eligible
+                      wait.coverage_valid wait.continuation_state wait.recognized
+                      wait.declaration_complete wait.verification_accountable
+                      wait.verification_state resolver.open resolver.owed_by_other) do
+    # Only the bound, checked wake snapshot supplies these facts. Missing context
+    # remains nil (including for ne), never an invented negative observation.
+    {get_in(call, [:policy_context, :wait_facts, fact]), cache}
   end
 
   defp compute_fact("verifier.holder_is_other", _db, call, cache) do
