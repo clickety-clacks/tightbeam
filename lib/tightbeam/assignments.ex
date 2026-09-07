@@ -127,6 +127,30 @@ defmodule Tightbeam.Assignments do
   );
   """
 
+  # Reopening clears the close fields on `assignments`, so the prior close must
+  # move to an append-only row in the same transaction. The assignment CHECK
+  # keeps open and closed rows distinct; this table keeps both facts durable.
+  @reopenings_ddl """
+  CREATE TABLE IF NOT EXISTS assignment_reopenings (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    assignmentId         TEXT    NOT NULL REFERENCES assignments(id),
+    ts                   INTEGER NOT NULL,
+    reopenedByUser       TEXT    NULL REFERENCES users(userId),
+    reopenedBySession    TEXT    NULL REFERENCES sessions(sessionKey),
+    reason               TEXT    NOT NULL
+      CHECK(length(trim(reason)) BETWEEN 1 AND 2000),
+    priorOutcome         TEXT    NOT NULL
+      CHECK(priorOutcome IN ('completed', 'surrendered', 'revoked')),
+    priorClosedAt        INTEGER NOT NULL,
+    priorClosedByUser    TEXT    NULL,
+    priorClosedBySession TEXT    NULL,
+    priorClosingAttestId TEXT    NULL REFERENCES attests(id),
+    CHECK((reopenedByUser IS NOT NULL) != (reopenedBySession IS NOT NULL))
+  );
+  CREATE INDEX IF NOT EXISTS assignment_reopenings_assignment
+    ON assignment_reopenings (assignmentId, id);
+  """
+
   @doc "Create the assignment/attest schema."
   @spec ensure_schema(DB.server()) :: :ok
   def ensure_schema(db \\ Tightbeam.DB) do
@@ -138,6 +162,7 @@ defmodule Tightbeam.Assignments do
     :ok = DB.execute(db, @assignment_effects_ddl)
     :ok = DB.execute(db, @assignment_priorities_ddl)
     :ok = DB.execute(db, @interruptions_ddl)
+    :ok = DB.execute(db, @reopenings_ddl)
     Tightbeam.EffortCheckin.ensure_schema(db)
   end
 
@@ -441,6 +466,26 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &attest/1)
   end
 
+  @doc "List an assignment's reopening history in deterministic order."
+  @spec list_reopenings(DB.server(), String.t()) :: [map()]
+  def list_reopenings(db, assignment_id) do
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT id, assignmentId, ts, reopenedByUser, reopenedBySession, reason,
+          priorOutcome, priorClosedAt, priorClosedByUser, priorClosedBySession,
+          priorClosingAttestId
+        FROM assignment_reopenings
+        WHERE assignmentId = ?1
+        ORDER BY ts ASC, id ASC
+        """,
+        [assignment_id]
+      )
+
+    Enum.map(rows, &reopening/1)
+  end
+
   @doc false
   def __for_work_item__(db, work_item_id) do
     {:ok, rows} =
@@ -479,8 +524,7 @@ defmodule Tightbeam.Assignments do
           """
         )
         |> Enum.reduce([], fn [id, work_item_id, reviews_assignment_id], conflicts ->
-          reviewed_item_id =
-            resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
+          reviewed_item_id = resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
 
           if not is_nil(work_item_id) and work_item_id != reviewed_item_id do
             [{id, work_item_id, reviews_assignment_id, reviewed_item_id} | conflicts]
@@ -508,6 +552,7 @@ defmodule Tightbeam.Assignments do
   def __handle__(db, "attests", call), do: attests_result(db, call)
   def __handle__(db, "assignment-get", call), do: assignment_get_result(db, call)
   def __handle__(db, "revoke-assignment", call), do: revoke_result(db, call)
+  def __handle__(db, "reopen-assignment", call), do: reopen_result(db, call)
   def __handle__(db, "assignments", call), do: assignments_result(db, call)
 
   defp assign_result(db, call) do
@@ -949,6 +994,39 @@ defmodule Tightbeam.Assignments do
     TransitionRace -> assignment_closed()
   end
 
+  # Reopening is an agent-reachable repair for a closed assignment. It records
+  # the prior close, restores the existing custody row, and re-arms the same
+  # monitoring and work-item seams used when the assignment first opened.
+  defp reopen_result(db, call) do
+    with :ok <- principal_allowed(call.principal, "reopen-assignment"),
+         :ok <- valid_reopen_reason(call.params[:reason]) do
+      assignment_id = call.params[:assignment_id]
+      from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
+      effort_config = effort_config(db, call)
+
+      prepared_effort_arm =
+        may_prepare_reopen_effort?(db, call.principal, assignment_id) &&
+          EffortCheckin.prepare_reopen_arm(db, effort_config, assignment_id)
+
+      call =
+        call
+        |> Map.put(:effort_config, effort_config)
+        |> Map.put(:prepared_effort_arm, prepared_effort_arm)
+
+      result = transaction(db, fn txn -> reopen_in_txn(txn, call) end)
+
+      if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
+        {:ok, prior_state} = from
+        best_effort(fn -> notify(call, :on_assignment_change, assignment_id, prior_state) end)
+      end
+
+      result
+    end
+  rescue
+    TransitionRace ->
+      error("transition_race", "assignment changed state during the reopen; read it and retry")
+  end
+
   defp assignments_result(db, call) do
     with :ok <- principal_allowed(call.principal, "assignments"),
          :ok <- valid_state(call.params[:state]) do
@@ -964,7 +1042,7 @@ defmodule Tightbeam.Assignments do
 
     with :ok <- principal_allowed(call.principal, "assignment-get") do
       case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
-        {:ok, [row]} -> assignment(row)
+        {:ok, [row]} -> Map.put(assignment(row), :reopenings, list_reopenings(db, assignment_id))
         {:ok, []} -> error("not_found", "unknown assignment: #{assignment_id}")
       end
     end
@@ -1022,8 +1100,7 @@ defmodule Tightbeam.Assignments do
         end
 
         if reviews_assignment_id do
-          reviewed_item_id =
-            resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
+          reviewed_item_id = resolve_work_item_id_in_txn(txn, reviews_assignment_id, MapSet.new())
 
           if not is_nil(work_item_id) and work_item_id != reviewed_item_id do
             throw(:review_item_conflict)
@@ -1329,8 +1406,7 @@ defmodule Tightbeam.Assignments do
             revoked_assignment = fetch_assignment!(txn, assignment_id)
             Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
 
-            liveness_trigger =
-              disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
+            liveness_trigger = disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
 
             supervision_transition!(txn, :terminal_disposition, %{
               kind: "terminal_disposition",
@@ -1353,6 +1429,167 @@ defmodule Tightbeam.Assignments do
             append_assignment_marker(txn, revoked_assignment, :revoked)
             revoked_assignment
         end
+    end
+  end
+
+  defp reopen_in_txn(txn, call) do
+    assignment_id = call.params[:assignment_id]
+
+    case fetch_assignment(txn, assignment_id) do
+      nil ->
+        error("unknown_assignment", "unknown assignment: #{assignment_id}")
+
+      assignment ->
+        cond do
+          not reopen_allowed?(txn, call.principal, assignment) ->
+            error("not_authorized", "assignment reopen requires its opener, holder, or an admin")
+
+          assignment.state == "open" ->
+            error("assignment_open", "assignment #{assignment_id} is already open")
+
+          true ->
+            with :ok <- lawful_closed_shape(assignment),
+                 :ok <- reopen_holder_active(txn, assignment),
+                 :ok <- reopen_work_item_open(txn, assignment) do
+              apply_reopen(txn, call, assignment)
+            end
+        end
+    end
+  end
+
+  defp apply_reopen(txn, call, assignment) do
+    assignment_id = assignment.id
+    reopened_at = now()
+    {reopened_user, reopened_session} = opener(call.principal)
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_reopenings
+        (assignmentId, ts, reopenedByUser, reopenedBySession, reason, priorOutcome,
+         priorClosedAt, priorClosedByUser, priorClosedBySession, priorClosingAttestId)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+      """,
+      [
+        assignment_id,
+        reopened_at,
+        reopened_user,
+        reopened_session,
+        call.params[:reason],
+        assignment.outcome,
+        assignment.closedAt,
+        assignment.closedByUser,
+        assignment.closedBySession,
+        assignment.closingAttestId
+      ]
+    )
+
+    Txn.q(
+      txn,
+      """
+      UPDATE assignments SET state = 'open', outcome = NULL, closedAt = NULL,
+        closedByUser = NULL, closedBySession = NULL, closingAttestId = NULL
+      WHERE id = ?1 AND state = 'closed'
+      """,
+      [assignment_id]
+    )
+
+    if Txn.changes(txn) != 1, do: raise(TransitionRace)
+    reopened = fetch_assignment!(txn, assignment_id)
+
+    EffortCheckin.arm_reopened_in_txn(
+      txn,
+      call.effort_config,
+      reopened,
+      call.prepared_effort_arm
+    )
+
+    supervision_transition!(txn, :armed, %{
+      kind: "assignment_open",
+      assignment_id: assignment_id,
+      opened_at: reopened_at,
+      supervision_interval_ms: call.supervision_interval_ms,
+      principal: principal_id(call.principal)
+    })
+
+    liveness_trigger = liveness_trigger!(txn, {:assignment, assignment_id})
+
+    if reopened.workItemId do
+      Tightbeam.WorkItems.cancel_brackets_in_txn(txn, reopened.workItemId, %{
+        causal_source: %{kind: "assignment_transition", id: assignment_id},
+        outcome: %{
+          kind: "disposition",
+          disposition_kind: "assignment_transition",
+          disposition_id: assignment_id,
+          liveness_trigger: liveness_trigger
+        }
+      })
+    end
+
+    append_assignment_marker(
+      txn,
+      reopened,
+      :reopened,
+      principal_id(call.principal),
+      call.params[:reason]
+    )
+
+    reopened
+  end
+
+  defp lawful_closed_shape(%{
+         outcome: outcome,
+         closedAt: closed_at,
+         closedByUser: closed_by_user,
+         closedBySession: closed_by_session
+       })
+       when outcome in ["completed", "surrendered", "revoked"] and is_integer(closed_at) and
+              ((is_binary(closed_by_user) and is_nil(closed_by_session)) or
+                 (is_nil(closed_by_user) and is_binary(closed_by_session))),
+       do: :ok
+
+  defp lawful_closed_shape(assignment) do
+    found =
+      "state=#{inspect(assignment.state)} outcome=#{inspect(assignment.outcome)} " <>
+        "closedAt=#{inspect(assignment.closedAt)} closedByUser=#{inspect(assignment.closedByUser)} " <>
+        "closedBySession=#{inspect(assignment.closedBySession)}"
+
+    Logger.error(
+      "reopen refused: assignment #{assignment.id} is not a lawful closed row: #{found}"
+    )
+
+    error(
+      "unexpected_assignment_shape",
+      "assignment #{assignment.id} is not a lawful closed row (#{found}); this is a bug report, not a repair"
+    )
+  end
+
+  defp reopen_holder_active(txn, assignment) do
+    case Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey = ?1", [assignment.holderKey]) do
+      [["active"]] ->
+        :ok
+
+      _ ->
+        error(
+          "session_retired",
+          "assignment #{assignment.id} is held by #{assignment.holderKey}, which is not active; " <>
+            "reopening it would create an assignment no agent can work"
+        )
+    end
+  end
+
+  defp reopen_work_item_open(_txn, %{workItemId: nil}), do: :ok
+
+  defp reopen_work_item_open(txn, assignment) do
+    case Tightbeam.WorkItems.state_in_txn(txn, assignment.workItemId) do
+      "open" ->
+        :ok
+
+      state ->
+        error(
+          "work_item_not_open",
+          "work item #{assignment.workItemId} is #{state || "missing"}; reopen the item before its assignment"
+        )
     end
   end
 
@@ -1393,6 +1630,14 @@ defmodule Tightbeam.Assignments do
     append_substrate(txn, assignment.holderKey, "[assignment revoked: #{assignment.id}]")
   end
 
+  defp append_assignment_marker(txn, assignment, :reopened, actor, reason) do
+    append_substrate(
+      txn,
+      assignment.holderKey,
+      "[assignment reopened: #{assignment.id} by #{actor} — #{reason}]"
+    )
+  end
+
   defp append_substrate(txn, session_key, text) do
     best_effort(fn -> Projection.append_substrate_in_txn(txn, session_key, text) end)
   end
@@ -1404,6 +1649,21 @@ defmodule Tightbeam.Assignments do
 
   defp revoke_allowed?(_txn, {:session, session}, assignment),
     do: assignment.openedBySession == session
+
+  defp reopen_allowed?(txn, {:session, session} = principal, assignment),
+    do: revoke_allowed?(txn, principal, assignment) or session == assignment.holderKey
+
+  defp reopen_allowed?(txn, principal, assignment),
+    do: revoke_allowed?(txn, principal, assignment)
+
+  defp may_prepare_reopen_effort?(db, principal, assignment_id) do
+    transaction(db, fn txn ->
+      case fetch_assignment(txn, assignment_id) do
+        %{state: "closed"} = assignment -> reopen_allowed?(txn, principal, assignment)
+        _ -> false
+      end
+    end)
+  end
 
   defp insert_attest(txn, call, assignment_id) do
     {by_user, by_session} = opener(call.principal)
@@ -1605,6 +1865,18 @@ defmodule Tightbeam.Assignments do
   end
 
   defp valid_note(_), do: error("invalid_note", "note must be text")
+
+  defp valid_reopen_reason(reason) when is_binary(reason) do
+    if length(String.to_charlist(reason)) in 1..2000 and String.trim(reason) != "",
+      do: :ok,
+      else:
+        error("invalid_reason", "reason must be 1..2000 non-blank characters naming the repair")
+  end
+
+  defp valid_reopen_reason(nil),
+    do: error("missing_reason", "reopen requires a reason naming why this card must reopen")
+
+  defp valid_reopen_reason(_), do: error("invalid_reason", "reason must be text")
 
   defp valid_commit_refs(_db, _kind, nil), do: :ok
 
@@ -2014,6 +2286,34 @@ defmodule Tightbeam.Assignments do
       byProvider: by_provider,
       commitRefs: commit_refs && JSON.decode!(commit_refs),
       ts: ts
+    }
+  end
+
+  defp reopening([
+         id,
+         assignment_id,
+         ts,
+         reopened_by_user,
+         reopened_by_session,
+         reason,
+         prior_outcome,
+         prior_closed_at,
+         prior_closed_by_user,
+         prior_closed_by_session,
+         prior_closing_attest_id
+       ]) do
+    %{
+      id: id,
+      assignmentId: assignment_id,
+      ts: ts,
+      reopenedByUser: reopened_by_user,
+      reopenedBySession: reopened_by_session,
+      reason: reason,
+      priorOutcome: prior_outcome,
+      priorClosedAt: prior_closed_at,
+      priorClosedByUser: prior_closed_by_user,
+      priorClosedBySession: prior_closed_by_session,
+      priorClosingAttestId: prior_closing_attest_id
     }
   end
 end

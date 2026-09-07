@@ -285,6 +285,29 @@ defmodule Tightbeam.EffortCheckinTest do
                "SELECT priority FROM assignment_priorities WHERE assignmentId=?1",
                [assignment.id]
              )
+
+    reopened =
+      assignment(ctx, "reopen-assignment", {:session, "parent"}, nil, %{
+        assignment_id: assignment.id,
+        reason: "the card carries work again"
+      })
+
+    assert reopened.state == "open"
+
+    assert [[2, "armed", 57_600_000, 57_600_000, reopened_root]] =
+             rows(
+               ctx.db,
+               """
+               SELECT g.generation,g.state,g.baseHorizonMs,w.dueAt-g.armedAt,g.root
+               FROM effort_checkin_generations AS g
+               JOIN wakes AS w ON w.wakeId=g.wakeId
+               WHERE g.assignmentId=?1
+               ORDER BY g.generation DESC LIMIT 1
+               """,
+               [assignment.id]
+             )
+
+    assert reopened_root == ctx.root
   end
 
   test "a standing work-blocked fact suppresses the check and an ineligible icebox cancels it",
@@ -673,8 +696,7 @@ defmodule Tightbeam.EffortCheckinTest do
                effort_call(user_request.id, "dismiss", {:user, "h1"})
              )
 
-    mid =
-      session(ctx.db, "mid", "h1", Placement.local_host_name(), %{spawned_by: "parent"})
+    mid = session(ctx.db, "mid", "h1", Placement.local_host_name(), %{spawned_by: "parent"})
 
     chained = dispatch(ctx, {:session, mid.session_key}, "holder", "chain")
     chained_request = escalate(ctx, chained.id)
@@ -708,8 +730,7 @@ defmodule Tightbeam.EffortCheckinTest do
     skipped = dispatch(ctx, {:session, mid.session_key}, "holder", "held chain")
     skipped_request = escalate(ctx, skipped.id)
 
-    :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='parent'")
+    :ok = DB.execute(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='parent'")
 
     EffortCheckin.deadline(
       ctx.db,
@@ -719,8 +740,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert request(ctx.db, skipped_request.id).expecter_user_id == "h1"
 
-    :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='parent'")
+    :ok = DB.execute(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='parent'")
 
     pinned = dispatch(ctx, {:session, "parent"}, "holder", "pinned")
     pinned_request = escalate(ctx, pinned.id)
@@ -957,8 +977,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert nil == fire_probe(ctx, scoped.id)
 
-    assert [_prod] =
-             Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == scoped.id))
+    assert [_prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == scoped.id))
 
     matching = dispatch_for_item(ctx, {:session, "parent"}, "holder", "matching", item.id)
     artifact!(ctx.db, "holder", item.id, "this-card.md")
@@ -972,8 +991,7 @@ defmodule Tightbeam.EffortCheckinTest do
 
     assert nil == fire_probe(ctx, unthreaded.id)
 
-    assert [_prod] =
-             Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == unthreaded.id))
+    assert [_prod] = Enum.filter(prods(ctx.db, "holder"), &(&1.assignment_id == unthreaded.id))
   end
 
   test "acceptance 1 on the PRODUCTION path: the dispatch's own doorbell is not the holder's work",
@@ -1564,8 +1582,7 @@ defmodule Tightbeam.EffortCheckinTest do
       }
     }
 
-    assert {:ok, false} =
-             DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
+    assert {:ok, false} = DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
 
     assert Wakes.get(ctx.db, deadline.wake_id).state == "pending"
     assert request(ctx.db, request.id).status == "open"
@@ -1605,8 +1622,7 @@ defmodule Tightbeam.EffortCheckinTest do
       }
     }
 
-    assert {:ok, false} =
-             DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
+    assert {:ok, false} = DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
 
     assert Wakes.get(ctx.db, unrelated.wake_id).state == "pending"
     assert Wakes.get(ctx.db, deadline.wake_id).state == "pending"
