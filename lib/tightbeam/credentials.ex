@@ -787,12 +787,13 @@ defmodule Tightbeam.Credentials do
     end
   end
 
-  # Cursor's pinned config schema supplies every default from a version-only
-  # document. Seed that non-secret canonical document before home reconciliation
-  # and the planned stop/start below. Reconciliation projects a read-only copy;
-  # the fresh Cursor process can then replace it inside the group-writable home
-  # with its own writable runtime copy. An existing canonical preference file is
-  # operator state and remains untouched.
+  # Cursor's pinned loader merges defaults into this version-only seed, validates
+  # the completed document, and replaces the file atomically. Seed the non-secret
+  # canonical document before home reconciliation and the planned stop/start
+  # below. Reconciliation projects a read-only copy; the fresh Cursor process can
+  # then replace it inside the group-writable home with its own writable runtime
+  # copy. An existing canonical preference file is operator state and remains
+  # untouched.
   defp seed_cursor_preferences!(state) do
     path = Path.join(Path.dirname(credential_store_path(state, :cursor)), "cli-config.json")
 
