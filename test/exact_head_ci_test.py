@@ -34,6 +34,14 @@ class ExactHeadCI(unittest.TestCase):
             self.assertIn('run: test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"', job)
             self.assertLess(job.index('Verify exact checkout'), job.index('uses: erlef/setup-beam'))
 
+    def test_public_rule_gate_has_full_checkout_history(self):
+        job = self.jobs['test']
+        checkout = re.search(
+            r'uses: actions/checkout@v4\n(.*?)(?=\n      -)', job, re.S).group(1)
+        self.assertRegex(checkout, r'(?m)^          fetch-depth: 0$')
+        self.assertLess(job.index('uses: actions/checkout'),
+                        job.index('run: python3 scripts/verify_public_rule_facts.py'))
+
     def test_sha_validation_executes_and_rejects_invalid_values(self):
         for name in ('test', 'release'):
             guard = re.search(r'run: \|\n          (\[\[.*?\]\] \|\| exit 1)', self.jobs[name]).group(1)
