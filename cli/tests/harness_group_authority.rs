@@ -149,7 +149,15 @@ fn await_identity(path: &std::path::Path) -> Identity {
     while Instant::now() < deadline {
         if let Ok(text) = fs::read_to_string(path) {
             let fields: Vec<&str> = text.trim_end().split('\t').collect();
-            if let [pid, pgid, boot, _launch] = fields[..] {
+            if let [
+                pid,
+                pgid,
+                _start_seconds,
+                _start_microseconds,
+                boot,
+                _launch,
+            ] = fields[..]
+            {
                 if let (Ok(pid), Ok(pgid)) = (pid.parse(), pgid.parse()) {
                     return Identity {
                         path: path.to_string_lossy().into_owned(),

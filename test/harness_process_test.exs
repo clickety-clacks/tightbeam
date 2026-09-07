@@ -230,7 +230,7 @@ defmodule Tightbeam.HarnessProcessTest do
     # OS pid ceiling (macOS ~99998, linux default 4194304), so the kill is
     # ESRCH by construction and can never reach a real process. Never forge a
     # low number here.
-    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
+    File.write!(row.identity_path, "999999123\t999999123\t0\t0\tboot-marker\t#{launch_id}\n")
 
     {:ok, _} =
       DB.query(
@@ -268,7 +268,7 @@ defmodule Tightbeam.HarnessProcessTest do
     launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
     [row] = HarnessProcess.list(ctx.db)
     # See the forged-pgid note above: 999999123 is unallocatable by construction.
-    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
+    File.write!(row.identity_path, "999999123\t999999123\t0\t0\tboot-marker\t#{launch_id}\n")
 
     assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id, :infinity)
   end
@@ -1010,10 +1010,10 @@ defmodule Tightbeam.HarnessProcessTest do
     assert [%{identity_path: identity_path, launch_id: launch_id}] =
              HarnessProcess.list(ctx.db)
 
-    # The identity file exactly as the launcher writes it — pid, pgid, boot
-    # identity, launch id — but with a boot identity no running kernel has.
+    # The identity file exactly as the launcher writes it — pid, pgid, leader
+    # start time, boot identity, launch id — but with a boot identity no running kernel has.
     File.mkdir_p!(Path.dirname(identity_path))
-    File.write!(identity_path, "999999	999999	boot-that-ended	#{launch_id}
+    File.write!(identity_path, "999999	999999	0	0	boot-that-ended	#{launch_id}
 ")
 
     assert :ok = HarnessProcess.reconcile(ctx.db)

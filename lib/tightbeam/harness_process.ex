@@ -593,10 +593,12 @@ defmodule Tightbeam.HarnessProcess do
   defp read_identity(row, timeout_ms) do
     case read_identity_file(row, timeout_ms) do
       {:ok, output} ->
-        with [pid, process_group_id, boot_identity, launch_id] <-
-               output |> String.trim() |> String.split("\t", parts: 4),
+        with [pid, process_group_id, start_seconds, start_microseconds, boot_identity, launch_id] <-
+               output |> String.trim() |> String.split("\t", parts: 6),
              {pid, ""} when pid > 0 <- Integer.parse(pid),
              {process_group_id, ""} when process_group_id > 0 <- Integer.parse(process_group_id),
+             {_start_seconds, ""} <- Integer.parse(start_seconds),
+             {_start_microseconds, ""} <- Integer.parse(start_microseconds),
              true <- pid == process_group_id,
              true <- launch_id == row.launch_id do
           {:ok, pid, process_group_id, boot_identity, launch_id}

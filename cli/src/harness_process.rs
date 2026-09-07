@@ -70,10 +70,16 @@ pub fn session_exec(args: &[String]) -> Result<i32, String> {
 
     let boot_identity = boot_identity()?;
     let launch_id = &args[1];
+    let leader_start_time = read_process_start_time(pid)
+        .map_err(|error| format!("harness session leader start time could not be read: {error}"))?;
 
-    writeln!(identity, "{pid}\t{pgid}\t{boot_identity}\t{launch_id}")
-        .and_then(|_| identity.sync_all())
-        .map_err(|error| format!("harness identity could not be written: {error}"))?;
+    writeln!(
+        identity,
+        "{pid}\t{pgid}\t{}\t{}\t{boot_identity}\t{launch_id}",
+        leader_start_time.seconds, leader_start_time.microseconds
+    )
+    .and_then(|_| identity.sync_all())
+    .map_err(|error| format!("harness identity could not be written: {error}"))?;
 
     let error = Command::new(&args[separator + 1])
         .args(&args[separator + 2..])
@@ -129,15 +135,18 @@ pub fn group(args: &[String]) -> Result<i32, String> {
         .filter(|pgid| *pgid > 0)
         .ok_or_else(|| "process group id must be a positive integer".to_string())?;
 
-    let target = HarnessTarget {
-        pgid,
-        identity_path: args[1].clone(),
-        boot_identity: args[2].clone(),
-        launch_id: args[3].clone(),
-    };
-    target.revalidate_before_signal()?;
+    let target = HarnessTarget::load(pgid, &args[1], &args[2], &args[3])?;
+    if target.revalidate_authority()? == HarnessAuthority::Gone {
+        return Ok(0);
+    }
 
     kill_harness_tree(&target, freeze_harness_tree(&target)?)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HarnessAuthority {
+    Live,
+    Gone,
 }
 
 /// The authorized harness instance every signal in a sweep must still be killing.
@@ -146,40 +155,89 @@ struct HarnessTarget {
     identity_path: String,
     boot_identity: String,
     launch_id: String,
+    leader_start_time: ProcessStartTime,
 }
 
 impl HarnessTarget {
+    fn load(
+        pgid: libc::pid_t,
+        identity_path: &str,
+        boot_identity: &str,
+        launch_id: &str,
+    ) -> Result<Self, String> {
+        let leader_start_time =
+            authorize_group_signal(Path::new(identity_path), pgid, boot_identity, launch_id)?;
+        let target = Self {
+            pgid,
+            identity_path: identity_path.to_owned(),
+            boot_identity: boot_identity.to_owned(),
+            launch_id: launch_id.to_owned(),
+            leader_start_time,
+        };
+        Ok(target)
+    }
+
     /// Re-read boot identity, the identity file, and the live session leader before a signal.
     ///
     /// A pgid can be reused once the leader is gone; signalling the number alone is not enough
     /// to know the process group still belongs to this launch.
-    fn revalidate_before_signal(&self) -> Result<(), String> {
-        authorize_group_signal(
+    fn revalidate_authority(&self) -> Result<HarnessAuthority, String> {
+        let recorded_start_time = authorize_group_signal(
             Path::new(&self.identity_path),
             self.pgid,
             &self.boot_identity,
             &self.launch_id,
         )?;
-        verify_session_leader_alive(self.pgid)
+        if recorded_start_time != self.leader_start_time {
+            return Err("harness identity leader instance changed during cleanup".into());
+        }
+        verify_session_leader_instance(self.pgid, self.leader_start_time)
+    }
+
+    fn require_live_before_signal(&self) -> Result<(), String> {
+        match self.revalidate_authority()? {
+            HarnessAuthority::Live => Ok(()),
+            HarnessAuthority::Gone => Err(format!(
+                "harness session leader {} disappeared during cleanup",
+                self.pgid
+            )),
+        }
     }
 }
 
-/// The recorded session leader must still lead `pgid` whenever it is still live.
-///
-/// Once the leader has exited, `getpgid` cannot answer for it; the identity file and the
-/// freeze snapshot are what still bind the sweep. A live pid that is no longer the leader
-/// of `pgid` is reuse and must refuse before any signal is sent.
-fn verify_session_leader_alive(pgid: libc::pid_t) -> Result<(), String> {
-    let actual_pgid = unsafe { libc::getpgid(pgid) };
-    if actual_pgid == -1 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
+/// The recorded session leader must still be the same process and lead `pgid`.
+fn verify_session_leader_instance(
+    pgid: libc::pid_t,
+    expected_start_time: ProcessStartTime,
+) -> Result<HarnessAuthority, String> {
+    match read_process_start_time(pgid) {
+        Ok(current) if current == expected_start_time => {}
+        Ok(_) => {
+            return Err(format!(
+                "process group {pgid} no longer matches its session leader (pid/pgid reuse)"
+            ));
         }
-        return Err(format!(
-            "harness session leader {pgid} process group could not be read: {error}"
-        ));
+        Err(error) if process_read_target_gone(&error) => {
+            return leader_disappeared_authority(pgid);
+        }
+        Err(error) => {
+            return Err(format!(
+                "harness session leader {pgid} start time could not be read: {error}"
+            ));
+        }
     }
+
+    let actual_pgid = match read_process_group(pgid) {
+        Ok(actual_pgid) => actual_pgid,
+        Err(error) => {
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return leader_disappeared_authority(pgid);
+            }
+            return Err(format!(
+                "harness session leader {pgid} process group could not be read: {error}"
+            ));
+        }
+    };
     if actual_pgid != pgid {
         return Err(format!(
             "process group {pgid} no longer matches its session leader \
@@ -187,7 +245,19 @@ fn verify_session_leader_alive(pgid: libc::pid_t) -> Result<(), String> {
         ));
     }
 
-    Ok(())
+    Ok(HarnessAuthority::Live)
+}
+
+fn leader_disappeared_authority(pgid: libc::pid_t) -> Result<HarnessAuthority, String> {
+    let snapshot = Snapshot::capture()
+        .map_err(|reason| format!("harness session leader {pgid} disappeared; {reason}"))?;
+    if snapshot.group_tree(pgid).is_empty() {
+        Ok(HarnessAuthority::Gone)
+    } else {
+        Err(format!(
+            "harness session leader {pgid} disappeared while process group still has members; group left unsignalled"
+        ))
+    }
 }
 
 /// Kernel start time — the stable instance token that survives only for THIS process.
@@ -318,33 +388,40 @@ fn parse_proc_starttime(stat: &[u8]) -> Option<u64> {
 }
 
 /// The captured instance must still be the same process before a pid signal is sent.
-fn verify_process_instance(instance: &ProcessInstance) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessAuthority {
+    Live,
+    Gone,
+}
+
+fn verify_process_instance(instance: &ProcessInstance) -> Result<ProcessAuthority, String> {
     match read_process_start_time(instance.pid) {
         Ok(current) if current == instance.start_time => {
-            let actual_pgid = unsafe { libc::getpgid(instance.pid) };
-            if actual_pgid == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    return Ok(());
+            let actual_pgid = match read_process_group(instance.pid) {
+                Ok(actual_pgid) => actual_pgid,
+                Err(error) => {
+                    if error.raw_os_error() == Some(libc::ESRCH) {
+                        return Ok(ProcessAuthority::Gone);
+                    }
+                    return Err(format!(
+                        "process {} process group could not be read: {error}",
+                        instance.pid
+                    ));
                 }
-                return Err(format!(
-                    "process {} process group could not be read: {error}",
-                    instance.pid
-                ));
-            }
+            };
             if actual_pgid != instance.pgid {
                 return Err(format!(
                     "process {} moved from group {} to {actual_pgid} (group reuse)",
                     instance.pid, instance.pgid
                 ));
             }
-            Ok(())
+            Ok(ProcessAuthority::Live)
         }
         Ok(_) => Err(format!(
             "process {} no longer matches its captured instance (pid reuse)",
             instance.pid
         )),
-        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        Err(error) if process_read_target_gone(&error) => Ok(ProcessAuthority::Gone),
         Err(error) => Err(format!(
             "process {} start time could not be read: {error}",
             instance.pid
@@ -374,17 +451,18 @@ fn authorize_escapee_group(
     for instance in members {
         match read_process_start_time(instance.pid) {
             Ok(current) if current == instance.start_time => {
-                let actual_pgid = unsafe { libc::getpgid(instance.pid) };
-                if actual_pgid == -1 {
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::ESRCH) {
-                        continue;
+                let actual_pgid = match read_process_group(instance.pid) {
+                    Ok(actual_pgid) => actual_pgid,
+                    Err(error) => {
+                        if error.raw_os_error() == Some(libc::ESRCH) {
+                            continue;
+                        }
+                        return Err(format!(
+                            "process {} process group could not be read: {error}",
+                            instance.pid
+                        ));
                     }
-                    return Err(format!(
-                        "process {} process group could not be read: {error}",
-                        instance.pid
-                    ));
-                }
+                };
                 if actual_pgid != pgid {
                     return Err(format!(
                         "process group {pgid} no longer matches captured member {} \
@@ -400,7 +478,7 @@ fn authorize_escapee_group(
                     instance.pid
                 ));
             }
-            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+            Err(error) if process_read_target_gone(&error) => {}
             Err(error) => {
                 return Err(format!(
                     "process {} start time could not be read: {error}",
@@ -459,7 +537,7 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
     };
     sweep.groups.remove(&my_group);
 
-    target.revalidate_before_signal()?;
+    target.require_live_before_signal()?;
 
     if pgid == my_group {
         // Never killpg the recorded group: we are in it. The first snapshot round below
@@ -471,7 +549,7 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
     let mut rounds = 0;
     let mut found_more = true;
     while rounds < FREEZE_ROUNDS {
-        target.revalidate_before_signal()?;
+        target.require_live_before_signal()?;
 
         let snapshot = match Snapshot::capture() {
             Ok(snapshot) => snapshot,
@@ -498,7 +576,7 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
             };
             let start_time = match read_process_start_time(pid) {
                 Ok(start_time) => start_time,
-                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+                Err(error) if process_read_target_gone(&error) => continue,
                 Err(error) => {
                     return Err(format!(
                         "process {pid} start time could not be read before freeze: {error}"
@@ -546,8 +624,10 @@ fn signal_process_group(
     signal: libc::c_int,
     target: &HarnessTarget,
 ) -> Result<(), String> {
-    target.revalidate_before_signal()?;
-    if unsafe { libc::killpg(pgid, signal) } == 0 {
+    if target.revalidate_authority()? == HarnessAuthority::Gone {
+        return Ok(());
+    }
+    if send_group_signal(pgid, signal) == 0 {
         return Ok(());
     }
     let error = std::io::Error::last_os_error();
@@ -564,19 +644,74 @@ fn signal_process(
     signal: libc::c_int,
     target: &HarnessTarget,
 ) -> Result<(), String> {
-    target.revalidate_before_signal()?;
-    verify_process_instance(&instance)?;
-    if unsafe { libc::kill(instance.pid, signal) } == 0 {
+    if target.revalidate_authority()? == HarnessAuthority::Gone {
         return Ok(());
     }
-    let error = std::io::Error::last_os_error();
+    match signal_process_instance(&instance, signal)? {
+        ProcessSignalResult::Delivered | ProcessSignalResult::Gone => Ok(()),
+        ProcessSignalResult::Failed(error) => Err(format!(
+            "process {} could not be signalled: {error}",
+            instance.pid
+        )),
+    }
+}
+
+enum ProcessSignalResult {
+    Delivered,
+    Gone,
+    Failed(io::Error),
+}
+
+/// Verify and signal in one seam so a Gone observation cannot authorize a later numeric kill.
+fn signal_process_instance(
+    instance: &ProcessInstance,
+    signal: libc::c_int,
+) -> Result<ProcessSignalResult, String> {
+    if verify_process_instance(instance)? == ProcessAuthority::Gone {
+        return Ok(ProcessSignalResult::Gone);
+    }
+    if send_process_signal(instance.pid, signal) == 0 {
+        return Ok(ProcessSignalResult::Delivered);
+    }
+    let error = io::Error::last_os_error();
     if process_signal_target_gone(&error) {
-        return Ok(());
+        Ok(ProcessSignalResult::Gone)
+    } else {
+        Ok(ProcessSignalResult::Failed(error))
     }
-    Err(format!(
-        "process {} could not be signalled: {error}",
-        instance.pid
-    ))
+}
+
+fn send_group_signal(pgid: libc::pid_t, signal: libc::c_int) -> libc::c_int {
+    #[cfg(test)]
+    GROUP_SIGNAL_CALLS.with(|calls| calls.set(calls.get() + 1));
+    unsafe { libc::killpg(pgid, signal) }
+}
+
+fn send_process_signal(pid: libc::pid_t, signal: libc::c_int) -> libc::c_int {
+    #[cfg(test)]
+    PROCESS_SIGNAL_CALLS.with(|calls| calls.set(calls.get() + 1));
+    unsafe { libc::kill(pid, signal) }
+}
+
+fn read_process_group(pid: libc::pid_t) -> io::Result<libc::pid_t> {
+    #[cfg(test)]
+    if let Some(errno) = PROCESS_GROUP_ERRNO.with(|value| value.take()) {
+        return Err(io::Error::from_raw_os_error(errno));
+    }
+
+    let pgid = unsafe { libc::getpgid(pid) };
+    if pgid == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(pgid)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static GROUP_SIGNAL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROCESS_SIGNAL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROCESS_GROUP_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 /// A group with no live members to signal — linux says ESRCH, darwin often EPERM.
@@ -589,6 +724,11 @@ fn group_signal_target_gone(error: &std::io::Error) -> bool {
 /// killpg, kill(pid) has no leader-exited proof path on this floor.
 fn process_signal_target_gone(error: &std::io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// `/proc/<pid>` disappearance is ENOENT on Linux; the process APIs use ESRCH.
+fn process_read_target_gone(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ESRCH) || error.kind() == io::ErrorKind::NotFound
 }
 
 /// SIGKILL everything the freeze proved was ours, then the recorded group last.
@@ -621,18 +761,15 @@ fn kill_harness_tree(target: &HarnessTarget, sweep: Sweep) -> Result<i32, String
         }
     }
 
-    for instance in &sweep.frozen {
+    // Keep the recorded leader alive as the group's authority until the recorded-group
+    // signal. Every stopped member still in that group is reached by the same killpg.
+    for instance in sweep.frozen.iter().filter(|instance| instance.pgid != pgid) {
         if let Some(reason) = sigkill_stray(Stray::Process(*instance), target, &sweep.frozen) {
             cleanup_failures.push(reason);
         }
     }
 
-    target.revalidate_before_signal()?;
-    let recorded = if unsafe { libc::killpg(pgid, libc::SIGKILL) } == 0 {
-        Ok(0)
-    } else {
-        classify_group_kill(pgid, std::io::Error::last_os_error())
-    };
+    let recorded = signal_process_group(pgid, libc::SIGKILL, target).map(|_| 0);
 
     if cleanup_failures.is_empty() {
         recorded
@@ -665,23 +802,26 @@ fn sigkill_stray(
     target: &HarnessTarget,
     frozen: &BTreeSet<ProcessInstance>,
 ) -> Option<String> {
-    if let Err(error) = target.revalidate_before_signal() {
-        return Some(error);
+    match target.revalidate_authority() {
+        Ok(HarnessAuthority::Live) => {}
+        Ok(HarnessAuthority::Gone) => return None,
+        Err(error) => return Some(error),
     }
 
     match stray {
         Stray::Group(pgid) => match authorize_escapee_group(pgid, frozen) {
             Ok(EscapeeGroupAuthority::Gone) => None,
             Ok(EscapeeGroupAuthority::Live) => report_sigkill_result(
-                unsafe { libc::killpg(pgid, libc::SIGKILL) },
+                send_group_signal(pgid, libc::SIGKILL),
                 format!("process group {pgid}"),
                 group_signal_target_gone,
             ),
             Err(reason) => Some(reason),
         },
-        Stray::Process(instance) => match verify_process_instance(&instance) {
-            Ok(()) => report_sigkill_result(
-                unsafe { libc::kill(instance.pid, libc::SIGKILL) },
+        Stray::Process(instance) => match signal_process_instance(&instance, libc::SIGKILL) {
+            Ok(ProcessSignalResult::Delivered) | Ok(ProcessSignalResult::Gone) => None,
+            Ok(ProcessSignalResult::Failed(error)) => report_sigkill_error(
+                error,
                 format!("process {}", instance.pid),
                 process_signal_target_gone,
             ),
@@ -699,8 +839,14 @@ fn report_sigkill_result(
         return None;
     }
 
-    let error = std::io::Error::last_os_error();
+    report_sigkill_error(std::io::Error::last_os_error(), target_label, gone)
+}
 
+fn report_sigkill_error(
+    error: std::io::Error,
+    target_label: String,
+    gone: fn(&std::io::Error) -> bool,
+) -> Option<String> {
     if gone(&error) {
         None
     } else {
@@ -724,6 +870,7 @@ fn report_sigkill_result(
 /// somebody else's group, which is exactly what it means on linux and why this is
 /// darwin-only. `child_process.rs` already carries the same guard for the same reason; this
 /// is the one place that knew the fact in only one language.
+#[cfg(test)]
 fn classify_group_kill(pgid: libc::pid_t, error: std::io::Error) -> Result<i32, String> {
     if group_signal_target_gone(&error) {
         Ok(0)
@@ -810,8 +957,19 @@ mod signal_target_gone_tests {
 #[cfg(test)]
 mod instance_authority_tests {
     use super::{
-        ProcessInstance, parse_proc_starttime, read_process_start_time, verify_process_instance,
+        GROUP_SIGNAL_CALLS, HarnessTarget, PROCESS_GROUP_ERRNO, PROCESS_SIGNAL_CALLS,
+        ProcessInstance, ProcessSignalResult, ProcessStartTime, boot_identity,
+        parse_proc_starttime, read_process_start_time, signal_process_group,
+        signal_process_instance, verify_process_instance,
     };
+    use std::fs;
+
+    fn stale(time: ProcessStartTime) -> ProcessStartTime {
+        ProcessStartTime {
+            seconds: time.seconds.saturating_add(1),
+            microseconds: time.microseconds,
+        }
+    }
 
     #[test]
     fn linux_starttime_is_read_from_proc_stat() {
@@ -844,6 +1002,112 @@ mod instance_authority_tests {
             "must not pass via pid-reuse branch: {error}"
         );
     }
+
+    #[test]
+    fn signal_time_pid_reuse_never_reaches_numeric_kill() {
+        PROCESS_SIGNAL_CALLS.with(|calls| calls.set(0));
+        let pid = unsafe { libc::getpid() };
+        let pgid = unsafe { libc::getpgid(pid) };
+        let current = read_process_start_time(pid).expect("live pid start time readable");
+        let reused = ProcessInstance {
+            pid,
+            pgid,
+            start_time: stale(current),
+        };
+
+        let error = signal_process_instance(&reused, 0)
+            .err()
+            .expect("a pid now occupied by another instance must be refused");
+
+        assert!(error.contains("pid reuse"), "{error}");
+        PROCESS_SIGNAL_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
+    fn signal_time_esrch_never_reaches_numeric_kill() {
+        PROCESS_SIGNAL_CALLS.with(|calls| calls.set(0));
+        let pid = unsafe { libc::getpid() };
+        let gone = ProcessInstance {
+            pid,
+            pgid: unsafe { libc::getpgid(pid) },
+            start_time: read_process_start_time(pid).expect("live pid start time readable"),
+        };
+        PROCESS_GROUP_ERRNO.with(|errno| errno.set(Some(libc::ESRCH)));
+
+        assert!(matches!(
+            signal_process_instance(&gone, 0),
+            Ok(ProcessSignalResult::Gone)
+        ));
+        PROCESS_SIGNAL_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
+    fn signal_time_pgid_reuse_never_reaches_numeric_killpg() {
+        GROUP_SIGNAL_CALLS.with(|calls| calls.set(0));
+        let pgid = unsafe { libc::getpgrp() };
+        let current = read_process_start_time(pgid).expect("live group leader start time readable");
+        let captured = stale(current);
+        let boot = boot_identity().expect("boot identity readable");
+        let launch = "signal-time-pgid-reuse";
+        let path = std::env::temp_dir().join(format!(
+            "tightbeam-pgid-reuse-{}-{}",
+            std::process::id(),
+            current.seconds
+        ));
+        fs::write(
+            &path,
+            format!(
+                "{pgid}\t{pgid}\t{}\t{}\t{boot}\t{launch}\n",
+                captured.seconds, captured.microseconds
+            ),
+        )
+        .unwrap();
+        let target = HarnessTarget {
+            pgid,
+            identity_path: path.to_string_lossy().into_owned(),
+            boot_identity: boot,
+            launch_id: launch.into(),
+            leader_start_time: captured,
+        };
+
+        let error = signal_process_group(pgid, 0, &target)
+            .err()
+            .expect("a pgid now led by another instance must be refused");
+
+        assert!(error.contains("pid/pgid reuse"), "{error}");
+        GROUP_SIGNAL_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn disappeared_leader_with_an_empty_group_never_reaches_numeric_killpg() {
+        GROUP_SIGNAL_CALLS.with(|calls| calls.set(0));
+        let pgid = 999_999_123;
+        let captured = ProcessStartTime {
+            seconds: 1,
+            microseconds: 0,
+        };
+        let boot = boot_identity().expect("boot identity readable");
+        let launch = "disappeared-leader";
+        let path = std::env::temp_dir().join(format!(
+            "tightbeam-disappeared-leader-{}",
+            std::process::id()
+        ));
+        fs::write(&path, format!("{pgid}\t{pgid}\t1\t0\t{boot}\t{launch}\n")).unwrap();
+        let target = HarnessTarget {
+            pgid,
+            identity_path: path.to_string_lossy().into_owned(),
+            boot_identity: boot,
+            launch_id: launch.into(),
+            leader_start_time: captured,
+        };
+
+        signal_process_group(pgid, 0, &target)
+            .expect("an observed-empty group needs no signal delivery");
+
+        GROUP_SIGNAL_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        fs::remove_file(path).unwrap();
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -870,7 +1134,7 @@ fn authorize_group_signal(
     pgid: libc::pid_t,
     expected_boot_identity: &str,
     launch_id: &str,
-) -> Result<(), String> {
+) -> Result<ProcessStartTime, String> {
     if boot_identity()? != expected_boot_identity {
         return Err("harness boot identity does not match the current boot".into());
     }
@@ -884,11 +1148,26 @@ fn authorize_group_signal(
     identity
         .read_to_string(&mut recorded)
         .map_err(|error| format!("harness identity could not be read: {error}"))?;
-    if recorded.trim_end() != format!("{pgid}\t{pgid}\t{expected_boot_identity}\t{launch_id}") {
+    let fields = recorded.trim_end().split('\t').collect::<Vec<_>>();
+    if fields.len() != 6
+        || fields[0] != pgid.to_string()
+        || fields[1] != pgid.to_string()
+        || fields[4] != expected_boot_identity
+        || fields[5] != launch_id
+    {
         return Err("harness identity does not match the requested process group".into());
     }
 
-    Ok(())
+    let seconds = fields[2]
+        .parse::<libc::time_t>()
+        .map_err(|_| "harness identity carries an invalid leader start time".to_string())?;
+    let microseconds = fields[3]
+        .parse::<i32>()
+        .map_err(|_| "harness identity carries an invalid leader start time".to_string())?;
+    Ok(ProcessStartTime {
+        seconds,
+        microseconds,
+    })
 }
 
 #[cfg(test)]
