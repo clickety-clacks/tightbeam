@@ -1422,10 +1422,9 @@ defmodule Tightbeam.Wire.Router do
   end
 
   # SUBSTRATE-INTERNAL params, PER VERB: fields a client may not set on that verb
-  # because the substrate is their only legitimate author. `wake.assignmentId` is
-  # the wake's attribution CARRIER — a client-supplied one would forge
-  # wake -> turn -> trace attribution, which Law 0 forbids (cross-review F6), so
-  # it is stripped before the handler sees it.
+  # because the substrate is their only legitimate author. Ordinary notifications
+  # cannot supply wake attribution. Typed obligation waits name an assignment for
+  # the existing atomic admission checks; that reference is not authority.
   #
   # An operator ruling's transport provenance follows the same rule: the router
   # derives it from bearer authentication above, so `ruledViaSessionKey` cannot
@@ -1438,7 +1437,7 @@ defmodule Tightbeam.Wire.Router do
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
   @substrate_only_params %{
-    "wake" => ~w(assignment_id request_ref)a,
+    "wake" => ~w(request_ref)a,
     "operator-rule" => ~w(ruled_via_session_key)a,
     "work-item-create" => ~w(created_in_turn_seq created_context_known)a,
     # The artifact's turn edge and the class of evidence behind it are the
@@ -1484,7 +1483,16 @@ defmodule Tightbeam.Wire.Router do
       {Map.get(aliases, atom, atom), value}
     end)
     |> Map.drop(Map.get(@substrate_only_params, verb, []))
+    |> strip_notification_assignment(verb)
   end
+
+  defp strip_notification_assignment(params, "wake") do
+    if params[:after_turn] == true or is_map(params[:predicate]),
+      do: params,
+      else: Map.delete(params, :assignment_id)
+  end
+
+  defp strip_notification_assignment(params, _verb), do: params
 
   defp json(conn, status, body) do
     data = JSON.encode!(wire_value(body))

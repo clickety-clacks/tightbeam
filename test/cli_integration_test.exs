@@ -162,6 +162,184 @@ defmodule Tightbeam.CliIntegrationTest do
     }
   end
 
+  test "manual obligation continuation examples register rows and deliver intact prompts", ctx do
+    {help, 0} = System.cmd(ctx.binary, ["wake", "--help"])
+    assert help =~ "--after-turn"
+    assert help =~ "--predicate"
+    assert help =~ "--fallback-after"
+    File.mkdir_p!(Path.join(ctx.base_dir, "identity/rules"))
+
+    File.cp!(
+      Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__),
+      Path.join(ctx.base_dir, "identity/rules/verification.toml")
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    registry = start_supervised!({Tightbeam.ConnRegistry, name: :d3_cli_registry})
+    # Stop at the durable notification boundary; do not start an agent/provider lane.
+    lane =
+      spawn_link(fn ->
+        receive_loop = fn receive_loop ->
+          receive do
+            {:"$gen_call", from, {:ensure_lane, _key}} ->
+              GenServer.reply(from, :ok)
+              receive_loop.(receive_loop)
+          end
+        end
+
+        receive_loop.(receive_loop)
+      end)
+
+    on_exit(fn -> Process.exit(lane, :kill) end)
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       name: Tightbeam.WakeScheduler,
+       tick_ms: 60_000,
+       deliver: fn _wake -> true end,
+       delivery_opts: [conn_registry: registry, lane_manager: lane]}
+    )
+
+    ids =
+      for {key, subject} <- [{"cli-holder", "A"}, {"cli-worker", "R"}, {"cli-worker", "V"}] do
+        {output, 0} =
+          System.cmd(ctx.binary, ["assign", "--session", key, "--subject", subject],
+            cd: ctx.workdir,
+            stderr_to_stdout: true
+          )
+
+        JSON.decode!(output)["id"]
+      end
+
+    [assignment, resolver, verifier] = ids
+
+    {:ok, _} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "cli-holder",
+        message_id: "manual-turn",
+        origin: "agent:fixture",
+        prompt: "current turn"
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, "cli-holder", "fixture")
+
+    after_prompt = "D3 manual: continue the named assignment"
+
+    after_result =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-holder",
+          "--assignment",
+          assignment,
+          "--after-turn",
+          "--prompt",
+          after_prompt
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call, %{verb: "wake", params: wire_params}}
+    assert wire_params.assignment_id == assignment
+    {after_output, 0} = after_result
+    after_id = JSON.decode!(after_output)["wakeId"]
+    after_wake = Wakes.get(ctx.db, after_id)
+    assert after_wake.assignment_id == assignment
+    assert after_wake.obligation_ref == assignment
+    assert after_wake.creator_session_key == "cli-holder"
+    assert after_wake.originating_turn_seq == turn.seq
+    assert after_wake.wait_mode == "after-turn"
+    assert after_wake.prompt == after_prompt
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [after_id])
+
+    predicate = %{
+      "conditions" => [%{"fact" => "assignment.state", "op" => "eq", "value" => "closed"}],
+      "bindings" => %{"assignmentId" => resolver},
+      "resolverRef" => %{"kind" => "assignment", "id" => resolver},
+      "necessity" => "The resolver owns the required output.",
+      "verificationRef" => %{"kind" => "assignment", "id" => verifier}
+    }
+
+    dependency_prompt = "D3 manual: read the resolver disposition before acting"
+
+    {dependency_output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-holder",
+          "--assignment",
+          assignment,
+          "--predicate",
+          JSON.encode!(predicate),
+          "--fallback-after",
+          "1h",
+          "--prompt",
+          dependency_prompt
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    dependency_id = JSON.decode!(dependency_output)["wakeId"]
+    dependency = Wakes.get(ctx.db, dependency_id)
+    assert dependency.obligation_ref == assignment
+    assert dependency.creator_session_key == "cli-holder"
+    assert dependency.originating_turn_seq == turn.seq
+    assert dependency.verification_assignment_id == verifier
+    assert dependency.verification_state == "provisional"
+    assert dependency.selected_policy_name == "accountable-dependency-verifier"
+    assert dependency.resolver_id == resolver
+    assert dependency.due_at > System.system_time(:millisecond)
+    assert dependency.prompt == dependency_prompt
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_liveness_sidecar WHERE assignmentId=?1 AND controllerOrigin='holder_continuation'",
+               [assignment]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [dependency_id])
+
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    Wakes.fire_due(Tightbeam.WakeScheduler)
+
+    assert {:ok, [[after_delivered]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [after_id])
+
+    assert String.ends_with?(after_delivered, after_prompt)
+
+    {_, 0} =
+      System.cmd(ctx.binary, ["revoke-assignment", resolver],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    Wakes.fire_due(Tightbeam.WakeScheduler)
+
+    assert {:ok, [[dependency_delivered]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [dependency_id])
+
+    assert String.ends_with?(dependency_delivered, dependency_prompt)
+
+    Wakes.fire_due(Tightbeam.WakeScheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [after_id])
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [dependency_id])
+  end
+
   test "real CLI states its built version when it connects", ctx do
     {version, 0} = System.cmd(ctx.binary, ["version"])
     version = String.trim(version)

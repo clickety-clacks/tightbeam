@@ -1261,13 +1261,33 @@ defmodule Tightbeam.Wire.RouterTest do
     assert_receive {:call, %{verb: "wake", params: wake_params}}
 
     refute Map.has_key?(wake_params, :assignment_id),
-           "a client-supplied wake assignmentId must never reach the handler"
+           "an ordinary notification assignmentId must never reach the handler"
 
     refute Map.has_key?(wake_params, :request_ref),
            "a client-supplied wake requestRef must never reach the handler"
 
     assert wake_params[:prompt] == "an ordinary conversational wake"
     assert response.status == 200
+  end
+
+  test "typed wait assignment reaches admission but request provenance remains internal" do
+    for wait <- [%{"afterTurn" => true}, %{"predicate" => %{"conditions" => []}}] do
+      params =
+        Router.atomize_params_for_test(
+          "wake",
+          Map.merge(wait, %{"assignmentId" => "asg_named", "requestRef" => "dr_forged"})
+        )
+
+      assert params.assignment_id == "asg_named"
+      refute Map.has_key?(params, :request_ref)
+    end
+
+    for malformed <- [%{"afterTurn" => false}, %{"afterTurn" => "true"}, %{"predicate" => nil}] do
+      params =
+        Router.atomize_params_for_test("wake", Map.put(malformed, "assignmentId", "asg_named"))
+
+      refute Map.has_key?(params, :assignment_id)
+    end
   end
 
   test "operator ruling provenance is substrate-only" do

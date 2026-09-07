@@ -42,6 +42,9 @@ retry after a delay, or resume a long task — schedule a wake to your own role 
 
     tightbeam wake --role <your-role> --prompt "check if the build finished, then continue" --after 10m
 
+Keep using legacy kind/scope wake syntax when it fits. It remains compatible through the
+common evaluator; no deadline forces callers to convert.
+
 Use these ordinary notifications for timed rechecks of external systems with no observable
 rows. They do not cover an assignment or pause its effort horizon. For unfinished assigned
 work, use the obligation-scoped continuation pattern below.
