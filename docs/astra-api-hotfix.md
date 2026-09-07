@@ -170,7 +170,8 @@ checked. Production instructions must set CODEX_PATH to that dedicated location
 before the maintenance restart; do not assume a global npm path stays pinned.
 The native plugin cache populated during fresh-home testing is engine-owned;
 the census permits only that cache subtree, while unrelated temporary files
-remain rejected.
+remain rejected. Native argument-wrapper aliases and locks are enumerated from
+[the pinned engine source](https://github.com/openai/codex/blob/rust-v0.153.2/codex-rs/arg0/src/lib.rs), including directories observed during creation or cleanup.
 
 The narrow production-source backport's full suite ran 1,699 tests and 9
 doctests with three failures and 11 skips. All three failures reproduced on the

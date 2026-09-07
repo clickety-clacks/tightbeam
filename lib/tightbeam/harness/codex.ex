@@ -261,7 +261,9 @@ defmodule Tightbeam.Harness.Codex do
     ~r"\A\.tmp/plugins/.+\z",
     ~r"\Asessions/\d{4}/\d{2}/\d{2}/rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl\z",
     ~r"\Ashell_snapshots/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.\d+\.sh\z",
-    ~r"\Atmp/arg0/codex-arg0[A-Za-z0-9]+/\.lock\z",
+    # Exact Unix aliases and lock from rust-v0.153.2/codex-rs/arg0/src/lib.rs.
+    # The directory can be observed while its aliases are being created/removed.
+    ~r"\Atmp/arg0/codex-arg0[A-Za-z0-9]+/(?:\.lock|apply_patch|applypatch|codex-linux-sandbox|codex-execve-wrapper)?\z",
     ~r"\Athread-writer-locks/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.lock\z"
   ]
 

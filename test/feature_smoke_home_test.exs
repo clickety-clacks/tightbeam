@@ -50,6 +50,19 @@ defmodule Tightbeam.FeatureSmokeHomeTest do
     refute Tightbeam.Harness.Codex.native_home_entry?(".tmp/unexpected.txt")
     assert Tightbeam.Harness.Codex.native_home_entry?("tmp/arg0/codex-arg0kNZker/.lock")
     refute Tightbeam.Harness.Codex.native_home_entry?("tmp/arg0/unexpected/.lock")
+
+    for name <- [
+          "",
+          ".lock",
+          "apply_patch",
+          "applypatch",
+          "codex-linux-sandbox",
+          "codex-execve-wrapper"
+        ] do
+      assert Tightbeam.Harness.Codex.native_home_entry?("tmp/arg0/codex-arg0zzkRu4/" <> name)
+    end
+
+    refute Tightbeam.Harness.Codex.native_home_entry?("tmp/arg0/codex-arg0zzkRu4/unexpected.txt")
     refute Tightbeam.Harness.Claude.native_home_entry?(codex_lock)
     assert Tightbeam.Harness.Claude.native_home_entry?(claude_key)
     assert Tightbeam.Harness.Claude.native_home_entry?("sessions/2192740.json")
