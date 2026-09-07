@@ -1,0 +1,43 @@
+// Source-audited 2026-09-04 from @agentclientprotocol/codex-acp 1.9.0 native ACP updates.
+// Right-sizing: assert only consumed fields and relied-on invariants; additive unconsumed fields must not fail.
+{
+  "adapter": "@agentclientprotocol/codex-acp",
+  "version": "1.9.0",
+  "semantic": {
+    "spawn_operation_terminal": "the parent tool call may settle while the native child session remains independently live",
+    "child_termination_terminal": "subagent_state_update carries the child session terminal state"
+  },
+  "live_started": {
+    "sessionUpdate": "subagent_spawned",
+    "subagentSessionId": "thread-child-1",
+    "name": "Reviewer",
+    "task": "Review the implementation",
+    "capabilities": {}
+  },
+  "spawn_operation_terminal": {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call-codex-1",
+    "status": "completed"
+  },
+  "live_interacted": {
+    "sessionUpdate": "agent_message_chunk",
+    "content": {"type": "text", "text": "reviewing"}
+  },
+  "live_interrupted": {
+    "sessionUpdate": "subagent_state_update",
+    "subagentSessionId": "thread-child-1",
+    "state": "cancelled"
+  },
+  "native_termination": {
+    "sessionUpdate": "subagent_state_update",
+    "subagentSessionId": "thread-child-1",
+    "state": "completed"
+  },
+  "load_replay_started": {
+    "sessionUpdate": "subagent_spawned",
+    "subagentSessionId": "thread-child-replayed",
+    "name": "Replayed",
+    "task": "Delegated task for Replayed",
+    "capabilities": {}
+  }
+}
