@@ -12,6 +12,20 @@ defmodule Tightbeam.RuleRuntime do
   @persist_key __MODULE__
 
   @doc false
+  def install_admission(callback) when is_function(callback, 2) do
+    :persistent_term.put({__MODULE__, :admission}, callback)
+    :ok
+  end
+
+  @doc false
+  def recheck_admission_in_txn(txn, call) do
+    case :persistent_term.get({__MODULE__, :admission}, nil) do
+      callback when is_function(callback, 2) -> callback.(txn, call)
+      nil -> raise "admission rule runtime is not installed"
+    end
+  end
+
+  @doc false
   def install_wait_relief(callback) when is_function(callback, 4) do
     :persistent_term.put({__MODULE__, :wait_relief}, callback)
     :ok

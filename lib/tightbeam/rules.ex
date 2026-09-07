@@ -167,6 +167,9 @@ defmodule Tightbeam.Rules do
     "wait.verification_state" => :string,
     "resolver.open" => :bool,
     "resolver.owed_by_other" => :bool,
+    "wake.has_obligation" => :bool,
+    "wake.registrant_is_holder" => :bool,
+    "wake.registrant_is_ancestor" => :bool,
     "verifier.open" => :bool,
     "verifier.holder_is_other" => :bool
   }
@@ -220,6 +223,8 @@ defmodule Tightbeam.Rules do
     validate_satisfiability!(rules, verbs)
     :persistent_term.put(@persist_key, rules)
     :persistent_term.put(@policy_key, policies)
+
+    RuleRuntime.install_admission(&evaluate/2)
 
     RuleRuntime.install(%{
       row_commit_effects: &row_commit_effects_in_txn/2,
@@ -2116,6 +2121,46 @@ defmodule Tightbeam.Rules do
       [] ->
         {false, cache}
     end
+  end
+
+  defp compute_fact("wake.has_obligation", _db, call, cache) do
+    {is_binary(call.params[:assignment_id]), cache}
+  end
+
+  defp compute_fact(fact, db, call, cache)
+       when fact in ~w(wake.registrant_is_holder wake.registrant_is_ancestor) do
+    registrant =
+      case call[:principal] do
+        {:session, key} -> key
+        _ -> nil
+      end
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        WITH RECURSIVE lineage(sessionKey,spawnedBy,holderKey,ownerUserId) AS (
+          SELECT s.sessionKey,s.spawnedBy,s.sessionKey,s.ownerUserId
+          FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+          JOIN sessions caller ON caller.sessionKey=?2 AND caller.ownerUserId=s.ownerUserId
+          WHERE a.id=?1 AND a.state='open'
+          UNION
+          SELECT s.sessionKey,s.spawnedBy,l.holderKey,l.ownerUserId
+          FROM sessions s JOIN lineage l ON s.sessionKey=l.spawnedBy AND s.ownerUserId=l.ownerUserId
+        )
+        SELECT sessionKey=holderKey FROM lineage WHERE sessionKey=?2
+        """,
+        [call.params[:assignment_id], registrant]
+      )
+
+    value =
+      case {fact, rows} do
+        {"wake.registrant_is_holder", [[1]]} -> true
+        {"wake.registrant_is_ancestor", [[0]]} -> true
+        _ -> false
+      end
+
+    {value, cache}
   end
 
   defp compute_fact("verifier.open", _db, call, cache) do

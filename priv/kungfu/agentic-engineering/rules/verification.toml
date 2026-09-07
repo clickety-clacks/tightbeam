@@ -97,3 +97,15 @@ when = [
   { fact = "wait.verification_accountable", op = "eq", value = true },
   { fact = "wait.verification_state", op = "in", value = ["provisional", "confirmed"] },
 ]
+
+[[rule]]
+name = "wake-obligation-registration-authority"
+verb = "wake"
+edges = ["verb"]
+effect = "deny"
+text = "Register this obligation wake as its holder or through an authorized ancestor."
+deny_when = [
+  { fact = "wake.has_obligation", op = "eq", value = true },
+  { fact = "wake.registrant_is_holder", op = "eq", value = false },
+  { fact = "wake.registrant_is_ancestor", op = "eq", value = false },
+]

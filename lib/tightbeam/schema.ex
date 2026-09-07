@@ -40,10 +40,12 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
-  @shape "row-driven-coverage-v1-019"
+  @shape "row-driven-admission-v1-019"
+  @admission_previous_shape "row-driven-coverage-v1-019"
+  @admission_pre_liveness_previous_shape "row-driven-coverage-pre-liveness-v1-019"
   @row_driven_coverage_previous_shape "row-driven-waits-v1-019"
   @coverage_pre_liveness_previous_shape "row-driven-waits-pre-liveness-v1-019"
-  @pre_liveness_shape "row-driven-coverage-pre-liveness-v1-019"
+  @pre_liveness_shape "row-driven-admission-pre-liveness-v1-019"
   @pre_liveness_rules_shape "row-driven-rules-pre-liveness-v1-019"
   @pre_liveness_identity_shape "identity-universal-root-render-pre-liveness-v1-019"
   @row_driven_waits_previous_shape "row-driven-rules-v1-019"
@@ -725,7 +727,18 @@ defmodule Tightbeam.Schema do
           JOIN sessions s ON s.sessionKey=a.holderKey
           WHERE w.wakeId=NEW.wakeId AND w.state='pending' AND a.state='open'
             AND w.obligationRef=a.id AND w.sessionKey=a.holderKey
-            AND w.creatorSessionKey=a.holderKey AND w.ownerUserId=s.ownerUserId
+            AND w.ownerUserId=s.ownerUserId
+            AND EXISTS (
+              WITH RECURSIVE lineage(sessionKey,spawnedBy) AS (
+                SELECT sessionKey,spawnedBy FROM sessions
+                  WHERE sessionKey=a.holderKey AND ownerUserId=w.ownerUserId
+                UNION
+                SELECT ancestor.sessionKey,ancestor.spawnedBy
+                  FROM sessions ancestor JOIN lineage child ON ancestor.sessionKey=child.spawnedBy
+                  WHERE ancestor.ownerUserId=w.ownerUserId
+              )
+              SELECT 1 FROM lineage WHERE sessionKey=w.creatorSessionKey
+            )
             AND w.waitMode IN ('dependency','after-turn') AND w.prompt IS NOT NULL
             AND (w.originatingTurnSeq IS NULL OR EXISTS (
               SELECT 1 FROM turns t WHERE t.seq=w.originatingTurnSeq
@@ -1227,6 +1240,12 @@ defmodule Tightbeam.Schema do
       {:ok, [[@shape]]} ->
         :ok
 
+      {:ok, [[@admission_previous_shape]]} ->
+        upgrade_wait_admission_v1(db, @admission_previous_shape)
+
+      {:ok, [[@admission_pre_liveness_previous_shape]]} ->
+        upgrade_wait_admission_v1(db, @admission_pre_liveness_previous_shape)
+
       {:ok, [[@row_driven_coverage_previous_shape]]} ->
         upgrade_row_driven_coverage_v1(db, @row_driven_coverage_previous_shape)
 
@@ -1316,6 +1335,38 @@ defmodule Tightbeam.Schema do
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
+    end
+  end
+
+  defp upgrade_wait_admission_v1(db, predecessor) do
+    activated = predecessor == @admission_previous_shape
+    successor = if activated, do: @shape, else: @pre_liveness_shape
+
+    case DB.transaction(db, fn txn ->
+           [[^predecessor]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+
+           if activated do
+             trigger =
+               Enum.find(
+                 @supervision_liveness_enforcement_objects,
+                 &(&1.name == "supervision_liveness_sidecar_insert_coherent")
+               )
+
+             :ok = Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+             :ok = Txn.exec(txn, trigger.sql)
+           end
+
+           Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+             successor,
+             System.system_time(:millisecond),
+             predecessor
+           ])
+
+           if Txn.changes(txn) != 1, do: raise(ShapeError, message: "admission stamp race")
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
     end
   end
 

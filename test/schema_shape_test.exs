@@ -48,7 +48,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, Wakes}
 
-  @shape "row-driven-coverage-v1-019"
+  @shape "row-driven-admission-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -1340,6 +1340,55 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert error.message =~ "model-identity-message-envelope-v1"
     assert error.message =~ @shape
+  end
+
+  for activated <- [false, true] do
+    test "coverage admission predecessor survives restart, activated=#{activated}" do
+      activated = unquote(activated)
+      unique = System.unique_integer([:positive])
+      path = Path.join(System.tmp_dir!(), "admission-upgrade-#{unique}.sqlite3")
+      first = :"admission_before_#{unique}"
+      second = :"admission_after_#{unique}"
+      on_exit(fn -> File.rm(path) end)
+      {:ok, first_pid} = DB.start_link(path: path, name: first)
+      assert :ok = Schema.ensure_all(first)
+
+      # Exact trigger SQL from accepted G-C 32911d0c; only heredoc indentation removed.
+      prior = File.read!(Path.join(__DIR__, "fixtures/row_wakes/admission-trigger-32911d0c.sql"))
+
+      assert Base.encode16(:crypto.hash(:sha256, prior), case: :lower) ==
+               "1b87873ea6360d8954d27f1b6c7a79815a9e617d80b4e4ed62d4f6dfef68c6a0"
+
+      assert :ok = DB.execute(first, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+      assert :ok = DB.execute(first, prior)
+
+      assert object_sql(first, "trigger", "supervision_liveness_sidecar_insert_coherent") =~
+               "w.creatorsessionkey=a.holderkey"
+
+      unless activated, do: drop_liveness_activation(first)
+
+      predecessor =
+        if activated,
+          do: "row-driven-coverage-v1-019",
+          else: "row-driven-coverage-pre-liveness-v1-019"
+
+      assert {:ok, _} = DB.query(first, "UPDATE schema_stamp SET shape=?1", [predecessor])
+      :ok = GenServer.stop(first_pid)
+
+      {:ok, second_pid} = DB.start_link(path: path, name: second)
+      assert :ok = Schema.ensure_all(second)
+      assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
+      trigger = object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent")
+      assert trigger =~ "withrecursivelineage"
+      refute trigger =~ "w.creatorsessionkey=a.holderkey"
+      assert trigger =~ "t.sessionkey=w.creatorsessionkey"
+      assert :ok = Schema.ensure_all(second)
+
+      assert object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent") ==
+               trigger
+
+      :ok = GenServer.stop(second_pid)
+    end
   end
 
   defp table?(db, name) do

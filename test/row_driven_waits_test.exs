@@ -987,6 +987,85 @@ defmodule Tightbeam.RowDrivenWaitsTest do
              )
   end
 
+  test "ancestor admission preserves the true creator and rechecks revoked lineage", ctx do
+    session(ctx.db, "supervisor", "owner-a")
+
+    shipped =
+      File.read!(
+        Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
+      )
+
+    File.write!(Path.join(ctx.base, "identity/rules/verification.toml"), shipped)
+    Rules.load!(ctx.base, ~w(wake attest))
+    turn = running_turn(ctx.db, "supervisor")
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET spawnedBy='supervisor' WHERE sessionKey='holder'"
+             )
+
+    input = %{
+      session_key: "holder",
+      origin: "agent:supervisor",
+      prompt: "Resume assigned work.",
+      due_at: due_after(),
+      assignment_id: "A",
+      predicate: predicate("R"),
+      registrant_session_key: "supervisor",
+      owner_user_id: "owner-a"
+    }
+
+    assert {:ok, wake} = DB.transaction(ctx.db, &Wakes.register_wait_in_txn(&1, input))
+    assert wake.creator_session_key == "supervisor"
+    assert wake.session_key == "holder"
+    assert wake.obligation_ref == "A"
+    assert wake.originating_turn_seq == turn.seq
+    refute covered?(ctx.db, "A")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    assert covered?(ctx.db, "A")
+
+    # A rule installed after an earlier allowed decision must still be checked
+    # inside registration. Evaluation must not execute notice/remedy effects.
+    File.write!(Path.join(ctx.base, "identity/rules/pause.toml"), """
+    [[rule]]
+    name = "pause-ancestor-admission"
+    verb = "wake"
+    text = "Admission paused."
+    effect = "deny"
+    deny_when = [{ fact = "wake.registrant_is_ancestor", op = "eq", value = true }]
+    """)
+
+    Rules.load!(ctx.base, ~w(wake attest))
+    assert {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    assert {:ok, {:error, %{code: "rule_denied"}}} =
+             DB.transaction(ctx.db, &Wakes.register_wait_in_txn(&1, input))
+
+    assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=NULL WHERE sessionKey='holder'")
+
+    assert {:ok, {:error, %{code: "not_holder"}}} =
+             DB.transaction(ctx.db, &Wakes.register_wait_in_txn(&1, input))
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET spawnedBy='supervisor' WHERE sessionKey='holder'"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE sessions SET ownerUserId='owner-b' WHERE sessionKey='supervisor'"
+             )
+
+    assert {:ok, {:error, %{code: "not_holder"}}} =
+             DB.transaction(ctx.db, &Wakes.register_wait_in_txn(&1, input))
+  end
+
   test "missing relief runtime rolls back admission and schema initialization reinstalls it",
        ctx do
     qualification_policy(ctx)
