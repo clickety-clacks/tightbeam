@@ -14,6 +14,7 @@ mod lease;
 mod onboard_emit;
 mod preflight;
 mod probe;
+mod process_tree;
 mod users;
 
 fn main() {

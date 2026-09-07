@@ -1147,6 +1147,69 @@ defmodule Tightbeam.HarnessProcessTest do
     :ok
   end
 
+  test "harness-group refuses a boot identity mismatch at signal time", ctx do
+    helper = grouped_helper(ctx, "boot-mismatch.sh", "while :; do sleep 60; done")
+    {port, row} = launch(ctx, {:claude, "shared", "boot-mismatch"}, [helper])
+
+    assert eventually(fn -> match?({^port, _}, {port, %{state: "running"}}) end)
+
+    {output, exit} =
+      System.cmd(
+        @helper,
+        [
+          "harness-group",
+          Integer.to_string(row.process_group_id),
+          row.identity_path,
+          "boot-that-ended",
+          row.launch_id
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert exit != 0
+    assert output =~ "boot identity"
+
+    Port.close(port)
+  end
+
+  test "harness-group run from inside the recorded group does not hang the caller", ctx do
+    launch_id = "same-group-#{System.unique_integer([:positive, :monotonic])}"
+
+    identity_path =
+      Path.join([ctx.test_dir, "helper", "harness-processes", launch_id <> ".identity"])
+
+    File.mkdir_p!(Path.dirname(identity_path))
+
+    helper = Path.join(ctx.test_dir, "same-group-inner.sh")
+
+    File.write!(
+      helper,
+      """
+      #!/bin/sh
+      exec "#{@helper}" harness-exec "#{identity_path}" "#{launch_id}" -- /bin/sh -c '
+        while :; do
+          if [ -f "#{identity_path}" ]; then
+            pgid=$(awk -F"\\t" "{print \\$2}" "#{identity_path}")
+            exec "#{@helper}" harness-group "$pgid" "#{identity_path}" "$("#{@helper}" boot-identity)" "#{launch_id}"
+          fi
+          sleep 0.05
+        done
+      '
+      """
+    )
+
+    File.chmod!(helper, 0o755)
+
+    task =
+      Task.async(fn ->
+        System.cmd("/bin/sh", [helper], stderr_to_stdout: true)
+      end)
+
+    assert {:ok, {_output, _exit}} =
+             Task.yield(task, 20_000) ||
+               flunk("same-group harness-group timed out — caller frozen")
+  end
+
   defp eventually(fun, attempts \\ 200)
 
   defp eventually(fun, attempts) do
