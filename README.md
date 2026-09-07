@@ -385,18 +385,36 @@ distinct ports already give distinct names and there is nothing extra to set.
 `TIGHTBEAM_NODE` names it yourself if you want to; the only way to collide is to
 give two instances the same port, or to pin them to the same name by hand.
 
-That name is also how `tightbeam-gateway stop`, `remote` and `pid` FIND a running
-gateway — so **run them the same way you started it**. Same port (or same
-`TIGHTBEAM_NODE`), same machine name. When they disagree you do not get a clear
-message; you get a connection failure like
+The lifecycle verbs `tightbeam-gateway stop`, `remote` and `pid` FIND a running
+gateway through its descriptor at `<base_dir>/gateway.json` — resolved from
+`TIGHTBEAM_BASE_DIR` ONLY, never from an ambient port or inherited node. `stop`
+SIGTERMs the owned OS pid the descriptor records — no Erlang node or cookie is
+consulted; `remote` and `pid` read the same descriptor. So **point them at the
+same `TIGHTBEAM_BASE_DIR` you started the instance with**. With no
+`TIGHTBEAM_BASE_DIR` set, `stop` REFUSES rather than guess a target — set
+`TIGHTBEAM_BASE_DIR=<dir>` for the instance you mean, or use
+`systemctl stop tightbeam` for the managed gateway.
 
-```
---rpc-eval : RPC failed with reason :noconnection
-```
+What `stop`'s identity check does and does not guarantee: the descriptor records
+the owned pid together with that process's command line **and its start time**,
+and `stop` re-derives all three and signals only on a full match. A pid the OS
+has recycled is therefore refused, including the case that pid-plus-command
+cannot see — a *later* process running the same command line, such as a second
+gateway started the same way, which the recorded start time tells apart. `ps`
+reports that start time to the second, so this separates any successor that
+started in a different second than the recorded process; a successor within the
+*same* second would additionally require the OS to have wrapped the entire pid
+space inside that second. A descriptor written before this field existed, or by
+a boot where `ps` was unavailable, is refused rather than signalled on the
+weaker evidence. What
+remains is the microseconds between that check and the signal: POSIX offers no
+atomic check-and-signal for a process that is not your child, so `stop` re-checks
+the identity **after** signalling and fails loudly if the pid changed hands, and
+does not claim to have prevented it.
 
-about a gateway that is running perfectly well. It means the name they looked for
-is not the name it started under. Same discipline as the CLI, for the same
-reason.
+The `restart` verb was removed: for an isolated instance run `stop` then `start`;
+for the managed gateway use `systemctl restart tightbeam`. (A SIGTERM-then-boot
+restart would replace a service-managed gateway with an unsupervised process.)
 
 With at least one usable harness through preflight, the first boot creates the
 base dir and serves, but **cannot run a turn yet**: it has no credentials, so it

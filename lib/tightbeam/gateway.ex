@@ -168,7 +168,33 @@ defmodule Tightbeam.Gateway do
         _ -> "tbc_" <> (:crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false))
       end
 
-    File.write!(gateway_path, JSON.encode!(%{port: config.port, cliToken: cli_token}))
+    # R5: round-trip the OWNED pid so the lifecycle `stop` verb can SIGTERM this
+    # exact process by identity — no Erlang node, no cookie, no handshake. The
+    # identity is the TRIPLE pid + command + START TIME, all captured now (the VM
+    # is up by the time this runs) and all re-checked before any signal. The pid
+    # alone is a reusable name, and pid + command is still not an identity: a
+    # LATER process can carry the same command line (a second gateway started the
+    # same way), and only the start time tells this process apart from such a
+    # successor.
+    # R1/R4: also record `node` — the instance's ACTUAL booted RELEASE_NODE — so
+    # the debug verbs `rpc`/`remote` resolve the node FROM the descriptor (custom
+    # `TIGHTBEAM_NODE` instances included), never from an ambient/inherited node.
+    # `cliToken` is preserved (read above); `port`/`node`/`ownedPid`/
+    # `ownedCommand`/`ownedStart` are overwritten every boot.
+    owned_pid = System.pid()
+
+    File.write!(
+      gateway_path,
+      JSON.encode!(%{
+        port: config.port,
+        cliToken: cli_token,
+        node: System.get_env("RELEASE_NODE"),
+        ownedPid: owned_pid,
+        ownedCommand: ps_field(owned_pid, "command"),
+        ownedStart: ps_field(owned_pid, "lstart")
+      })
+    )
+
     File.chmod!(gateway_path, 0o600)
     provision_host_endpoints(db, config, cli_token)
     cli_bin = install_cli_bin(config.base_dir)
@@ -513,6 +539,42 @@ defmodule Tightbeam.Gateway do
   # handler-scoped functions that were only ever handed `config` resolve it the
   # same way rather than reaching for the global name directly.
   defp gateway_db(config), do: Map.get(config, :db, Tightbeam.DB)
+
+  # One `ps` field of our own OS pid, for the descriptor's identity triple
+  # (`ownedPid` + `ownedCommand` + `ownedStart`). The `stop` verb re-derives these
+  # exact fields with the same command (`LC_ALL=C ps -ww -o <field>= -p <pid>`)
+  # and signals ONLY on a full match, so neither a pid the OS has recycled onto an
+  # unrelated process nor a LATER process that happens to share our command line
+  # is mis-signalled — a successor cannot also share our start time.
+  #
+  # LC_ALL=C is load-bearing, not tidiness: `lstart` is locale-formatted on macOS
+  # (measured on eezo — LC_TIME=de_DE.UTF-8 renders "Fr.  4 Sep. 23:20:39 2026"
+  # for the same instant the C locale renders "Fri Sep  4 23:20:39 2026"). The
+  # writer here and the `stop` shim both force C so they compare one spelling; an
+  # operator shell in another locale must not be able to refuse a valid stop.
+  #
+  # nil (ps failed) writes JSON null, which the stop path treats as a refusal —
+  # never a fall-through to a node-based stop.
+  defp ps_field(pid, field) do
+    case System.cmd("ps", ["-ww", "-o", field <> "=", "-p", pid],
+           env: [{"LC_ALL", "C"}],
+           stderr_to_stdout: true
+         ) do
+      {out, 0} ->
+        case String.trim(out) do
+          "" -> nil
+          value -> value
+        end
+
+      _ ->
+        nil
+    end
+  rescue
+    # `ps` off PATH (System.cmd raises :enoent) must not crash the boot. A nil
+    # field makes the `stop` verb refuse rather than mis-signal — the safe
+    # degradation, never a fall-through to a node-based stop.
+    _ -> nil
+  end
 
   defp provision_host_endpoints(db, config, cli_token) do
     config.base_dir
