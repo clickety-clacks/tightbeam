@@ -1,96 +1,50 @@
 defmodule Tightbeam.ModelCatalogRotationE2ETest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Credentials, DB, Model, ModelCatalog, Placement}
+  alias Tightbeam.{Model, ModelCatalog, Placement}
 
-  @host "rotation-e2e"
-  @fixtures Path.join(__DIR__, "fixtures/model_catalog")
+  @host "manifest-e2e"
 
   setup do
-    previous_host = Application.get_env(:tightbeam, :local_host_name)
-    Application.put_env(:tightbeam, :local_host_name, @host)
-
     base_dir =
-      Path.join(
-        System.tmp_dir!(),
-        "model-catalog-rotation-e2e-#{System.unique_integer([:positive])}"
-      )
+      Path.join(System.tmp_dir!(), "model-manifest-e2e-#{System.unique_integer([:positive])}")
 
-    on_exit(fn ->
-      File.rm_rf!(base_dir)
-
-      case previous_host do
-        nil -> Application.delete_env(:tightbeam, :local_host_name)
-        host -> Application.put_env(:tightbeam, :local_host_name, host)
-      end
-    end)
-
-    start_supervised!({DB, path: ":memory:", name: DB})
-    :ok = Placement.ensure_schema(DB)
-
-    {:ok, _host} =
-      Placement.register_host(DB, @host, %{ssh: nil, base_dir: base_dir, cli_bin: nil})
-
-    %{base_dir: base_dir}
+    db = String.to_atom("model_manifest_e2e_db_#{System.unique_integer([:positive])}")
+    start_supervised!({Tightbeam.DB, path: ":memory:", name: db})
+    :ok = Placement.ensure_schema(db)
+    on_exit(fn -> File.rm_rf!(base_dir) end)
+    %{base_dir: base_dir, db: db}
   end
 
-  test "E2E: a public catalog route repairs one severed local subscription credential", ctx do
-    stale = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
-    rotated = ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
-
-    store = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
-    metadata = Path.join([ctx.base_dir, "auth", "claude", ".tightbeam", "credential.json"])
-    home = Path.join([ctx.base_dir, "homes", @host, "claude", ".credentials.json"])
-
-    File.mkdir_p!(Path.dirname(metadata))
-    File.write!(store, stale)
-
-    File.write!(
-      metadata,
-      JSON.encode!(%{
-        provider: "anthropic",
-        kind: "subscription",
-        onboarded: true,
-        terminal: false,
-        expires_at: System.system_time(:second) + 3_600
-      })
-    )
-
-    File.mkdir_p!(Path.dirname(home))
-    File.write!(home, rotated)
-
-    start_supervised!({Credentials, base_dir: ctx.base_dir, machine: @host})
-
+  test "E2E: the public route uses the manifest and never calls the retired offered-set fetch",
+       ctx do
     owner = self()
-    model_list = fixture_body("claude_models.jsonc")
-    model_detail = fixture_body("claude_model_detail.jsonc")
-
-    fetch = fn
-      "/v1/models?limit=100", headers ->
-        token = bearer(headers)
-        send(owner, {:catalog_token, token})
-
-        case token do
-          "fixture-token-ROTATED" ->
-            {:ok, model_list}
-
-          "fixture-token-STALE" ->
-            {:error,
-             {:http_status, 401,
-              ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})}}
-        end
-
-      "/v1/models/claude-haiku-4-5-20251001", _headers ->
-        {:ok, model_detail}
-    end
 
     start_supervised!(
       {ModelCatalog,
        name: ModelCatalog,
        base_dir: ctx.base_dir,
-       db: DB,
-       claude_fetch: fetch,
-       claude_selectable_models: :all}
+       db: ctx.db,
+       hosts: fn -> %{@host => %{base_dir: ctx.base_dir, ssh: nil}} end,
+       credential_status: fn _provider -> :onboarded end,
+       credential_kind: fn _provider -> :subscription end,
+       model_manifest: fn ->
+         %{
+           document:
+             :tightbeam
+             |> Application.app_dir("priv/model-manifest.json")
+             |> File.read!()
+             |> JSON.decode!(),
+           source: :bundled,
+           health: :fresh
+         }
+       end,
+       claude_code_version: "2.1.257",
+       claude_fetch: fn _path, _headers ->
+         send(owner, :retired_offered_set_fetch)
+         {:error, :must_not_fetch}
+       end,
+       sh: fn _command -> {"unavailable", 1} end}
     )
 
     await(fn ->
@@ -104,11 +58,7 @@ defmodule Tightbeam.ModelCatalogRotationE2ETest do
       )
     end)
 
-    assert_receive {:catalog_token, "fixture-token-STALE"}
-    assert_receive {:catalog_token, "fixture-token-ROTATED"}
-    refute_receive {:catalog_token, _}
-
-    assert File.read!(store) == rotated
+    refute_receive :retired_offered_set_fetch
 
     assert {:ok, %{harness: "claude", provider: "anthropic", health: :fresh}} =
              ModelCatalog.route(
@@ -116,20 +66,6 @@ defmodule Tightbeam.ModelCatalogRotationE2ETest do
                "claude",
                Model.new("claude-sonnet-5", effort: "medium")
              )
-  end
-
-  defp bearer(headers) do
-    {~c"authorization", raw} = List.keyfind(headers, ~c"authorization", 0)
-    raw |> to_string() |> String.replace_prefix("Bearer ", "")
-  end
-
-  defp fixture_body(name) do
-    @fixtures
-    |> Path.join(name)
-    |> File.read!()
-    |> String.split("\n")
-    |> Enum.drop_while(&String.starts_with?(&1, "//"))
-    |> Enum.join("\n")
   end
 
   defp await(fun, attempts \\ 200)

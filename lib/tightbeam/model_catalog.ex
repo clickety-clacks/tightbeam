@@ -22,7 +22,7 @@ defmodule Tightbeam.ModelCatalog do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Model, Placement, Unroutable}
+  alias Tightbeam.{Harness, Model, ModelManifest, Placement, Unroutable}
 
   @default_ttl_ms :timer.minutes(15)
 
@@ -34,13 +34,16 @@ defmodule Tightbeam.ModelCatalog do
   Capabilities live here rather than folded into an identity.
   """
   @type entry :: %{
-          family: String.t(),
-          context: String.t() | nil,
-          display_name: String.t(),
-          efforts: [String.t()],
-          max_input_tokens: non_neg_integer() | nil,
-          capabilities: map(),
-          provider: atom()
+          required(:family) => String.t(),
+          required(:context) => String.t() | nil,
+          required(:display_name) => String.t(),
+          required(:efforts) => [String.t()],
+          required(:max_input_tokens) => non_neg_integer() | nil,
+          required(:capabilities) => map(),
+          required(:provider) => atom(),
+          optional(:aliases) => [String.t()],
+          optional(:status) => String.t(),
+          optional(:profile) => String.t()
         }
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -65,6 +68,25 @@ defmodule Tightbeam.ModelCatalog do
     case safe_call(server, {:get, {host, harness}}) do
       {:ok, answer} -> answer
       :unavailable -> {[], {:unavailable, :catalog_not_started}}
+    end
+  end
+
+  @doc "Return hosted-manifest health independently from catalog or credential health."
+  @spec manifest_health(String.t(), String.t(), GenServer.server()) :: ModelManifest.health()
+  def manifest_health(host, harness, server \\ __MODULE__) do
+    case safe_call(server, {:metadata, {host, harness}}) do
+      {:ok, %{manifest_health: health}} -> health
+      {:ok, _metadata} -> {:unavailable, :not_derived}
+      :unavailable -> {:unavailable, :catalog_not_started}
+    end
+  end
+
+  @doc "Return derivation metadata for one host and harness without provider I/O."
+  @spec metadata(String.t(), String.t(), GenServer.server()) :: map()
+  def metadata(host, harness, server \\ __MODULE__) do
+    case safe_call(server, {:metadata, {host, harness}}) do
+      {:ok, metadata} -> metadata
+      :unavailable -> %{}
     end
   end
 
@@ -152,10 +174,11 @@ defmodule Tightbeam.ModelCatalog do
           {:ok, routed()} | {:error, Unroutable.t()}
   def route(host, harness, %Model{} = selection, server)
       when is_binary(host) and is_binary(harness) do
-    {entries, health} = get(host, harness, server)
+    {entries, health, metadata} = routing_snapshot({host, harness}, server)
     entry = Enum.find(entries, &names_same_model?(&1, selection))
+    version_block = version_block_for(selection, metadata)
 
-    refuse = fn cause, offered ->
+    refuse = fn cause, offered, block ->
       {:error,
        %Unroutable{
          cause: cause,
@@ -163,16 +186,31 @@ defmodule Tightbeam.ModelCatalog do
          harness: harness,
          selection: selection,
          health: [{harness, health}],
-         offered: offered
+         offered: offered,
+         version_block: block
        }}
     end
 
     cond do
       entries == [] or match?({:unavailable, _reason}, health) ->
-        refuse.(:no_catalog, [])
+        refuse.(:no_catalog, [], nil)
+
+      is_nil(entry) and not is_nil(version_block) ->
+        refuse.(:family_absent, offers(harness, entries), version_block)
+
+      is_nil(entry) and unknown_model_passthrough?(harness, selection, entries) ->
+        module = Harness.parse!(harness)
+
+        {:ok,
+         %{
+           harness: harness,
+           provider: Atom.to_string(module.credential_provider()),
+           entry: passthrough_entry(selection, module.credential_provider(), entries),
+           health: health
+         }}
 
       is_nil(entry) ->
-        refuse.(:family_absent, offers(harness, entries))
+        refuse.(:family_absent, offers(harness, entries), nil)
 
       offers_effort?(entry, selection.effort) ->
         {:ok,
@@ -184,11 +222,35 @@ defmodule Tightbeam.ModelCatalog do
          }}
 
       is_nil(selection.effort) ->
-        refuse.(:needs_effort, offers(harness, [entry]))
+        refuse.(:needs_effort, offers(harness, [entry]), nil)
 
       true ->
-        refuse.(:effort_not_offered, offers(harness, [entry]))
+        refuse.(:effort_not_offered, offers(harness, [entry]), nil)
     end
+  end
+
+  defp version_block_for(selection, metadata) do
+    metadata
+    |> Map.get(:version_blocks, [])
+    |> Enum.find(fn block ->
+      slug = Map.get(block, :slug)
+
+      is_binary(slug) and
+        (selection.family == slug or selection.family in Map.get(block, :aliases, []))
+    end)
+  end
+
+  defp unknown_model_passthrough?(harness, selection, entries) do
+    module = Harness.parse!(harness)
+
+    prefixes =
+      entries
+      |> Enum.map(&(&1.family |> String.split("-", parts: 2) |> hd() |> Kernel.<>("-")))
+      |> Enum.uniq()
+
+    function_exported?(module, :unknown_model_passthrough?, 0) and
+      module.unknown_model_passthrough?() and
+      Enum.any?(prefixes, &String.starts_with?(selection.family, &1))
   end
 
   # Which refusal the fleet gives when nothing routed. A cause that names the
@@ -199,30 +261,36 @@ defmodule Tightbeam.ModelCatalog do
     refusals = for {_harness, {:error, unroutable}} <- answers, do: unroutable
     health = Enum.flat_map(refusals, & &1.health)
     named = Enum.filter(refusals, &(&1.cause in [:needs_effort, :effort_not_offered]))
+    version_gated = Enum.find(refusals, &is_map(&1.version_block))
 
-    {cause, offered} =
+    {cause, offered, version_block, harness} =
       cond do
         # Named refusals cannot disagree about WHICH effort cause they are:
         # `route/3` decides that from the selection, which is the same on every
         # harness. So folding them is a union of what they offer, not a vote.
         named != [] ->
           {if(is_nil(selection.effort), do: :needs_effort, else: :effort_not_offered),
-           Enum.flat_map(named, & &1.offered)}
+           Enum.flat_map(named, & &1.offered), nil, nil}
+
+        version_gated ->
+          {:family_absent, version_gated.offered, version_gated.version_block,
+           version_gated.harness}
 
         Enum.all?(refusals, &(&1.cause == :no_catalog)) ->
-          {:no_catalog, []}
+          {:no_catalog, [], nil, nil}
 
         true ->
-          {:family_absent, Enum.flat_map(refusals, & &1.offered)}
+          {:family_absent, Enum.flat_map(refusals, & &1.offered), nil, nil}
       end
 
     %Unroutable{
       cause: cause,
       host: host,
-      harness: nil,
+      harness: harness,
       selection: selection,
       health: health,
-      offered: offered
+      offered: offered,
+      version_block: version_block
     }
   end
 
@@ -275,7 +343,9 @@ defmodule Tightbeam.ModelCatalog do
   @doc "Whether a catalog entry names the same vendor model as a selection."
   @spec names_same_model?(entry(), Model.t()) :: boolean()
   def names_same_model?(entry, %Model{} = model),
-    do: entry.family == model.family and entry.context == model.context
+    do:
+      (entry.family == model.family or model.family in Map.get(entry, :aliases, [])) and
+        entry.context == model.context
 
   @doc """
   Whether an entry offers a reasoning level. The ENTRY is the authority on what
@@ -336,6 +406,34 @@ defmodule Tightbeam.ModelCatalog do
     {:reply, answer, state}
   end
 
+  def handle_call({:routing_snapshot, key}, _from, state) do
+    state = refresh_due(state)
+
+    answer =
+      case state.entries[key] do
+        nil ->
+          {[], {:unavailable, {:host_not_configured, elem(key, 0)}}, %{}}
+
+        cache ->
+          {cache.entries, health(cache, now_ms(state), state.ttl_ms),
+           Map.get(cache, :metadata, %{})}
+      end
+
+    {:reply, answer, state}
+  end
+
+  def handle_call({:metadata, key}, _from, state) do
+    state = refresh_due(state)
+
+    metadata =
+      state.entries
+      |> Map.get(key, %{})
+      |> Map.get(:metadata, %{})
+      |> Map.put_new_lazy(:manifest_health, fn -> manifest_health_from_options(state.options) end)
+
+    {:reply, metadata, state}
+  end
+
   # The RHS of the credential-present recognition (O4/I5): re-derive the catalog
   # for every harness that spends `provider` on `host`, NOW, reading current
   # world-state. Provider-scoped by the same rule the runtime uses — a harness
@@ -355,20 +453,11 @@ defmodule Tightbeam.ModelCatalog do
   def handle_info(:refresh_due, state), do: {:noreply, refresh_due(state)}
 
   def handle_info({:catalog_refresh, key, {:ok, entries}}, state) do
-    now = now_ms(state)
-    recheck? = match?(%{recheck: true}, state.entries[key])
+    accept_refresh(state, key, entries, %{})
+  end
 
-    cache = %{
-      entries: entries,
-      derived_at: now,
-      attempted_at: now,
-      reason: nil,
-      refreshing: false,
-      recheck: false
-    }
-
-    state = put_in(state, [:entries, key], cache)
-    {:noreply, maybe_recheck(state, key, recheck?)}
+  def handle_info({:catalog_refresh, key, {:ok, entries, metadata}}, state) do
+    accept_refresh(state, key, entries, metadata)
   end
 
   def handle_info({:catalog_refresh, {host, harness} = key, {:error, reason}}, state) do
@@ -390,6 +479,24 @@ defmodule Tightbeam.ModelCatalog do
         state = put_in(state, [:entries, key], cache)
         {:noreply, maybe_recheck(state, key, recheck?)}
     end
+  end
+
+  defp accept_refresh(state, key, entries, metadata) do
+    now = now_ms(state)
+    recheck? = match?(%{recheck: true}, state.entries[key])
+
+    cache = %{
+      entries: entries,
+      derived_at: now,
+      attempted_at: now,
+      reason: nil,
+      refreshing: false,
+      recheck: false,
+      metadata: metadata
+    }
+
+    state = put_in(state, [:entries, key], cache)
+    {:noreply, maybe_recheck(state, key, recheck?)}
   end
 
   # Hosts are re-read every pass rather than captured at init: `assimilate`
@@ -481,7 +588,14 @@ defmodule Tightbeam.ModelCatalog do
   end
 
   defp new_cache do
-    %{entries: [], derived_at: nil, attempted_at: nil, reason: :not_derived, refreshing: false}
+    %{
+      entries: [],
+      derived_at: nil,
+      attempted_at: nil,
+      reason: :not_derived,
+      refreshing: false,
+      metadata: %{}
+    }
   end
 
   # What the probe sees is the OWNING host: its base_dir (where its credential
@@ -512,6 +626,9 @@ defmodule Tightbeam.ModelCatalog do
       else
         {:needs_onboarding, reason} ->
           {:error, {:needs_onboarding, reason}}
+
+        {:credential_rejected, reason} ->
+          {:error, {:credential_rejected, reason}}
 
         # Onboarded, but the store records no kind. Refused rather than
         # defaulted: the two kinds read different routes, so a catalog derived
@@ -651,5 +768,71 @@ defmodule Tightbeam.ModelCatalog do
     end
   end
 
+  defp routing_snapshot(key, server) do
+    case safe_call(server, {:routing_snapshot, key}) do
+      {:ok, snapshot} -> snapshot
+      :unavailable -> {[], {:unavailable, :catalog_not_started}, %{}}
+    end
+  end
+
   defp harness_names, do: Enum.map(Harness.all(), & &1.wire_name())
+
+  defp passthrough_entry(selection, provider, entries) do
+    nearest = nearest_family_entry(selection, entries)
+
+    %{
+      family: selection.family,
+      context: selection.context,
+      display_name: selection.family,
+      name: selection.family,
+      efforts: if(nearest, do: nearest.efforts, else: []),
+      max_input_tokens: if(nearest, do: nearest.max_input_tokens, else: nil),
+      capabilities: if(nearest, do: nearest.capabilities, else: %{}),
+      provider: provider,
+      aliases: [],
+      status: "unknown",
+      profile: if(nearest, do: Map.get(nearest, :profile), else: nil)
+    }
+  end
+
+  # Unknown ids remain opaque. Metadata may still follow the closest manifest
+  # family when at least the provider and family tokens agree; sharing only the
+  # provider prefix is not a family match.
+  defp nearest_family_entry(selection, entries) do
+    selection_parts = String.split(selection.family, "-")
+
+    entries
+    |> Enum.map(fn entry ->
+      shared = shared_prefix_length(selection_parts, String.split(entry.family, "-"))
+      context_match = if entry.context == selection.context, do: 1, else: 0
+      {shared, context_match, entry}
+    end)
+    |> Enum.filter(fn {shared, _context_match, _entry} -> shared >= 2 end)
+    |> Enum.max_by(fn {shared, context_match, _entry} -> {shared, context_match} end, fn ->
+      nil
+    end)
+    |> case do
+      nil -> nil
+      {_shared, _context_match, entry} -> entry
+    end
+  end
+
+  defp shared_prefix_length(left, right) do
+    left
+    |> Enum.zip(right)
+    |> Enum.take_while(fn {left_part, right_part} -> left_part == right_part end)
+    |> length()
+  end
+
+  defp manifest_health_from_options(options) do
+    case Map.get(options, :model_manifest) do
+      fun when is_function(fun, 0) -> snapshot_health(fun.())
+      %{} = snapshot -> snapshot_health(snapshot)
+      nil -> {:unavailable, :not_derived}
+      server -> server |> ModelManifest.get() |> Map.fetch!(:health)
+    end
+  end
+
+  defp snapshot_health(%{health: health}), do: health
+  defp snapshot_health(_snapshot), do: {:unavailable, :malformed_snapshot}
 end
