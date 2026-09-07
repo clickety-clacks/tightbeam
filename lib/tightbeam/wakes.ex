@@ -675,7 +675,7 @@ defmodule Tightbeam.Wakes do
 
       wake = recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, nil)
       admit_continuation_in_txn(txn, wake)
-      Tightbeam.EffortCheckin.reconcile_wait_relief_in_txn(txn, obligation.id, wake.created_at)
+      reconcile_wait_relief_in_txn(txn, obligation.id, wake.created_at)
 
       if is_nil(wake.recognition_path) do
         verifier_wake = schedule_verifier_notice_in_txn(txn, wake, verifier)
@@ -710,6 +710,21 @@ defmodule Tightbeam.Wakes do
   @doc false
   def covering_continuation_in_txn?(%Txn{} = txn, assignment_id) do
     qualifying_wait_in_txn?(txn, assignment_id, "wait-prod-coverage")
+  end
+
+  defp reconcile_wait_relief_in_txn(txn, assignment_id, at) do
+    case Txn.q(
+           txn,
+           "SELECT 1 FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed' LIMIT 1",
+           [assignment_id]
+         ) do
+      [] ->
+        :ok
+
+      [[1]] ->
+        qualifies = effort_relief_in_txn?(txn, assignment_id)
+        RuleRuntime.apply_wait_relief_in_txn(txn, assignment_id, at, qualifies)
+    end
   end
 
   @doc false
@@ -1371,7 +1386,7 @@ defmodule Tightbeam.Wakes do
     )
 
     if Txn.changes(txn) == 1 do
-      Tightbeam.EffortCheckin.reconcile_wait_relief_in_txn(txn, wake.assignment_id, recognized_at)
+      reconcile_wait_relief_in_txn(txn, wake.assignment_id, recognized_at)
 
       EventLog.lifecycle_in_txn(
         txn,
@@ -1450,7 +1465,7 @@ defmodule Tightbeam.Wakes do
       kind when kind in ~w(wait-verified wait-challenged) ->
         apply_verification_verdict_in_txn(txn, attrs)
         wake = wait_in_txn(txn, attrs.wait_id)
-        Tightbeam.EffortCheckin.reconcile_wait_relief_in_txn(txn, wake.assignment_id, now())
+        reconcile_wait_relief_in_txn(txn, wake.assignment_id, now())
 
       _ ->
         :ok
@@ -2960,7 +2975,7 @@ defmodule Tightbeam.Wakes do
       )
 
       if is_binary(wake.assignment_id) do
-        Tightbeam.EffortCheckin.reconcile_wait_relief_in_txn(txn, wake.assignment_id, canceled_at)
+        reconcile_wait_relief_in_txn(txn, wake.assignment_id, canceled_at)
       end
 
       if is_binary(wake.condition_kind) do

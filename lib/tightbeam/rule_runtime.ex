@@ -11,6 +11,21 @@ defmodule Tightbeam.RuleRuntime do
 
   @persist_key __MODULE__
 
+  @doc false
+  def install_wait_relief(callback) when is_function(callback, 4) do
+    :persistent_term.put({__MODULE__, :wait_relief}, callback)
+    :ok
+  end
+
+  @doc false
+  def apply_wait_relief_in_txn(txn, assignment_id, at, qualifies)
+      when is_boolean(qualifies) do
+    case :persistent_term.get({__MODULE__, :wait_relief}, nil) do
+      callback when is_function(callback, 4) -> callback.(txn, assignment_id, at, qualifies)
+      nil -> raise "wait relief accounting runtime is not installed"
+    end
+  end
+
   # Admission and recognition share this complete ad hoc wait vocabulary. The
   # broader loaded-rule fact registry does not confer a wait transition contract.
   @predicate_transition_contracts %{

@@ -987,6 +987,62 @@ defmodule Tightbeam.RowDrivenWaitsTest do
              )
   end
 
+  test "missing relief runtime rolls back admission and schema initialization reinstalls it",
+       ctx do
+    qualification_policy(ctx)
+
+    assert {:ok, _} =
+             DB.transaction(ctx.db, fn txn ->
+               EffortCheckin.arm_in_txn(txn, %{base_dir: ctx.base}, %{
+                 id: "A",
+                 holderKey: "holder"
+               })
+             end)
+
+    before = effort_snapshot(ctx.db)
+    {:ok, wake_count} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+    {:ok, sidecar_count} = DB.query(ctx.db, "SELECT COUNT(*) FROM supervision_liveness_sidecar")
+    key = {Tightbeam.RuleRuntime, :wait_relief}
+    installed = :persistent_term.get(key)
+
+    try do
+      :persistent_term.erase(key)
+
+      assert {:error, %RuntimeError{message: "wait relief accounting runtime is not installed"}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Wakes.register_wait_in_txn(txn, %{
+                   session_key: "holder",
+                   origin: "agent:holder",
+                   prompt: "Continue after resolution.",
+                   due_at: due_after(),
+                   assignment_id: "A",
+                   predicate: predicate("R"),
+                   registrant_session_key: "holder",
+                   owner_user_id: "owner-a"
+                 })
+               end)
+
+      assert {:ok, ^wake_count} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+      assert {:ok, ^sidecar_count} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM supervision_liveness_sidecar")
+
+      assert effort_snapshot(ctx.db) == before
+      assert :ok = Tightbeam.Schema.ensure_all(ctx.db)
+      wake = register_wait(ctx.db, due_after(), predicate("R"))
+
+      assert {:ok, [[started]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT reliefStartedAt FROM effort_checkin_generations WHERE assignmentId='A'"
+               )
+
+      assert started == wake.created_at
+    after
+      :persistent_term.put(key, installed)
+    end
+  end
+
   test "C5-C7,V1-V2: overlapping provisional waits pause one generation and challenge resumes its remainder",
        ctx do
     qualification_policy(ctx)
@@ -1021,6 +1077,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert :ok = DB.execute(ctx.db, "VACUUM INTO '#{path}'")
     restarted = :"relief_restart_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: path, name: restarted}, id: restarted)
+    :persistent_term.erase({Tightbeam.RuleRuntime, :wait_relief})
     assert :ok = Tightbeam.Schema.ensure_all(restarted)
 
     assert {:ok, :ok} =

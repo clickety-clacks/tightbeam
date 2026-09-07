@@ -64,7 +64,11 @@ defmodule Tightbeam.EffortCheckin do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @ddl) do
+      Tightbeam.RuleRuntime.install_wait_relief(&apply_wait_relief_in_txn/4)
+    end
+  end
 
   @doc false
   def reconcile_wait_relief_in_txn(%Txn{} = txn, assignment_id, at) do
@@ -82,37 +86,56 @@ defmodule Tightbeam.EffortCheckin do
 
     if rows != [] do
       qualifies = Wakes.effort_relief_in_txn?(txn, assignment_id)
-
-      Enum.each(rows, fn [generation, wake_id, started] ->
-        cond do
-          qualifies and is_nil(started) ->
-            Txn.q(
-              txn,
-              "UPDATE effort_checkin_generations SET reliefStartedAt=?3 WHERE assignmentId=?1 AND generation=?2",
-              [assignment_id, generation, at]
-            )
-
-          not qualifies and is_integer(started) ->
-            elapsed = max(at - started, 0)
-
-            Txn.q(
-              txn,
-              "UPDATE effort_checkin_generations SET reliefStartedAt=NULL,reliefExcludedMs=reliefExcludedMs+?3 WHERE assignmentId=?1 AND generation=?2",
-              [assignment_id, generation, elapsed]
-            )
-
-            Txn.q(txn, "UPDATE wakes SET dueAt=dueAt+?2 WHERE wakeId=?1 AND state='pending'", [
-              wake_id,
-              elapsed
-            ])
-
-          true ->
-            :ok
-        end
-      end)
+      apply_wait_relief_rows_in_txn(txn, assignment_id, at, qualifies, rows)
     end
 
     :ok
+  end
+
+  @doc false
+  def apply_wait_relief_in_txn(%Txn{} = txn, assignment_id, at, qualifies)
+      when is_boolean(qualifies) do
+    rows =
+      Txn.q(
+        txn,
+        "SELECT generation,wakeId,reliefStartedAt FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+        [assignment_id]
+      )
+
+    apply_wait_relief_rows_in_txn(txn, assignment_id, at, qualifies, rows)
+    :ok
+  end
+
+  # Leaf accounting callback: the caller supplies a checked snapshot in this
+  # same transaction. This path never calls Wakes or re-enters qualification.
+  defp apply_wait_relief_rows_in_txn(txn, assignment_id, at, qualifies, rows) do
+    Enum.each(rows, fn [generation, wake_id, started] ->
+      cond do
+        qualifies and is_nil(started) ->
+          Txn.q(
+            txn,
+            "UPDATE effort_checkin_generations SET reliefStartedAt=?3 WHERE assignmentId=?1 AND generation=?2",
+            [assignment_id, generation, at]
+          )
+
+        not qualifies and is_integer(started) ->
+          elapsed = max(at - started, 0)
+
+          Txn.q(
+            txn,
+            "UPDATE effort_checkin_generations SET reliefStartedAt=NULL,reliefExcludedMs=reliefExcludedMs+?3 WHERE assignmentId=?1 AND generation=?2",
+            [assignment_id, generation, elapsed]
+          )
+
+          Txn.q(txn, "UPDATE wakes SET dueAt=dueAt+?2 WHERE wakeId=?1 AND state='pending'", [
+            wake_id,
+            elapsed
+          ])
+
+        true ->
+          :ok
+      end
+    end)
   end
 
   @spec valid_workdir_root(term()) :: :ok | {:error, map()}
