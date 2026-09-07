@@ -6,6 +6,7 @@ defmodule Tightbeam.MixProject do
       app: :tightbeam,
       version: cli_version(),
       elixir: "~> 1.19",
+      compilers: [:topline_unicode] ++ Mix.compilers(),
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -65,5 +66,76 @@ defmodule Tightbeam.MixProject do
       {:toml, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
+  end
+end
+
+defmodule Mix.Tasks.Compile.ToplineUnicode do
+  @moduledoc false
+  use Mix.Task.Compiler
+
+  @impl Mix.Task.Compiler
+  def run(_args) do
+    root = File.cwd!()
+    manifest = Path.join(root, "native/topline_unicode/Cargo.toml")
+    target = Path.join(root, "priv/#{target_name()}")
+
+    if current?(root, target) do
+      {:noop, []}
+    else
+      build(root, manifest, target)
+    end
+  end
+
+  defp build(root, manifest, target) do
+    cargo = System.find_executable("cargo") || Mix.raise("cargo is required to build Toplines")
+
+    {output, status} =
+      System.cmd(
+        cargo,
+        ["build", "--locked", "--release", "--manifest-path", manifest],
+        cd: root,
+        stderr_to_stdout: true
+      )
+
+    if status != 0, do: Mix.raise("Toplines Unicode extension build failed:\n#{output}")
+
+    source = Path.join(root, "native/topline_unicode/target/release/#{source_name()}")
+    File.mkdir_p!(Path.dirname(target))
+    File.cp!(source, target)
+    {:ok, []}
+  end
+
+  defp current?(root, target) do
+    with {:ok, target_stat} <- File.stat(target, time: :posix) do
+      sources =
+        [
+          Path.join(root, "native/topline_unicode/Cargo.toml"),
+          Path.join(root, "native/topline_unicode/Cargo.lock")
+          | Path.wildcard(Path.join(root, "native/topline_unicode/src/**/*.rs"))
+        ]
+
+      Enum.all?(sources, fn source ->
+        {:ok, source_stat} = File.stat(source, time: :posix)
+        source_stat.mtime <= target_stat.mtime
+      end)
+    else
+      _ -> false
+    end
+  end
+
+  defp source_name do
+    case :os.type() do
+      {:unix, :darwin} -> "libtopline_unicode.dylib"
+      {:unix, _} -> "libtopline_unicode.so"
+      other -> Mix.raise("Toplines Unicode extension does not support #{inspect(other)}")
+    end
+  end
+
+  defp target_name do
+    case :os.type() do
+      {:unix, :darwin} -> "topline_unicode.dylib"
+      {:unix, _} -> "topline_unicode.so"
+      other -> Mix.raise("Toplines Unicode extension does not support #{inspect(other)}")
+    end
   end
 end

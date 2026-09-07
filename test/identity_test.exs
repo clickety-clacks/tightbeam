@@ -172,7 +172,8 @@ defmodule Tightbeam.IdentityTest do
     assert {:noop, ^revision} = learn!(ctx.base, "agentic-engineering", "operator")
   end
 
-  test "shipped engineering bundle imports the test receipt rule and role guidance", ctx do
+  test "shipped engineering bundle imports the test receipt rule and split review guidance",
+       ctx do
     shipped = Path.expand("priv/kungfu/agentic-engineering")
     Application.put_env(:tightbeam, :identity_source_dir, shipped)
     base = Path.join(ctx.root, "shipped-runtime")
@@ -182,9 +183,21 @@ defmodule Tightbeam.IdentityTest do
     engineering_rule = File.read!(Path.join(base, "identity/rules/engineering.toml"))
     assert engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
     assert engineering_rule =~ ~s(on_rule_denied = "surface")
+    assert engineering_rule =~ ~s(target_role = "reviewer-code")
+    refute engineering_rule =~ ~s(target_role = "reviewer")
 
-    reviewer = Identity.snapshot!(base, "reviewer", :codex)
-    assert reviewer.guidance =~ "producer holder filed the `tests-passed`"
+    for {role, present_axis, absent_axis} <- [
+          {"reviewer-code", "## Analysis axes: code", "## Analysis axes: spec"},
+          {"reviewer-spec", "## Analysis axes: spec", "## Analysis axes: code"}
+        ] do
+      review = Identity.snapshot!(base, role, :codex)
+      assert review.guidance =~ "# Review"
+      assert review.guidance =~ present_axis
+      refute review.guidance =~ absent_axis
+      refute Regex.match?(~r/^#include/m, review.guidance)
+
+      assert Map.keys(review.skills) == ~w(human-communication worktree-session)
+    end
 
     coder = Identity.snapshot!(base, "coder", :codex)
     assert coder.guidance =~ "Before the ready-for-review progress attest"

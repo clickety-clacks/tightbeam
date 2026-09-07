@@ -76,42 +76,66 @@ wake without a card you opened is an expectation you chose not to record. Thread
 assignment to the work item it serves. What you hire, you clean up: when a hire's last
 assignment closes and no more work is planned for it, retire it — dependents first.
 
-## Before you build what tightbeam already is
+## Carry finished work to a line
+If you opened an assignment, you own carrying its finished work forward. When its holder files
+`completion`, or a review holder files `reviewed-clean`, act in that same turn on your open
+owner assignment for the same work item, one of two ways and never neither.
+
+Carry it: open an integration assignment against a staffed role and name the line in its
+subject. No row holds a release line and no verb binds one; the assignment you open, with the
+line named in its subject, is the whole record. The default is both active lines, `0.1.9` and
+`main` (the 0.2.0 line) — open one integration assignment per line unless the card says otherwise.
+
+Or record why you cannot: file a `progress` attest that states the exact reason the work is not
+carried now and names the principal who must clear it. A card that pins a single line or
+quarantines is a card saying otherwise; recording that reason and its principal is the discharge,
+not a stall. This duty does not transfer to the user, and asking the user to authorize the
+carry is not a third discharge: the default above is the standing authorization, and an
+already-targeted line needs no fresh permission.
+
+"Targetless", "done awaiting target" and "candidate remains unintegrated" are stall states, not
+completed work.
+
+## Before you create what tightbeam already is
 When work — yours or the user's ask — starts to look like one of these, tightbeam (or
 an installed kungfu) already does it: guardrails/checks on agent behavior (rails);
 ticketing or task tracking (work items + assignments); cron jobs, reminders, pollers
 (wakes and condition wakes); running agents on other machines over ssh (assimilation);
 per-agent prompt/config profiles (archetypes); accumulated playbooks and process docs
 (kungfu bundles); dashboards or logs of agent activity (the event stream). The rule:
-NAME the native feature to whoever commissioned the work before building a parallel
-one — once, plainly — then build only if they still want their own. At the start of any
+NAME the native capability to whoever commissioned the work before creating a parallel
+one — once, plainly — then create it only if they still want their own. At the start of any
 conversation with a USER, read each installed kungfu's `kungfu/<name>/capabilities.md`
 — they carry the watch-for signals you cannot recognize unread; they are small by
 design. Work wakes from agents need none of this.
 
 ## Track work: work-items, assignments, facts
 Work is tracked as durable records, not in chat.
-- A work-item is the durable thread for one feature or bug:
+- A work-item is the durable thread for one intended outcome or repair:
 
-    tightbeam work-item-create --title "voice dictation crash on resume"
+    tightbeam work-item-create --title "restore access to the shared account"
 
 - An assignment is an obligation on that work, held by a session:
 
-    tightbeam assign --subject "fix the resume crash" --role implementer --work-item <workItemId>
+    tightbeam assign --subject "restore the shared account" --role implementer --work-item <workItemId>
 
 - Record what happens against your assignment with attest:
 
-    tightbeam attest <assignmentId> --kind progress   --note "root-caused to a nil token"
-    tightbeam attest <assignmentId> --kind completion --note "fixed; tests green"
-    tightbeam attest <assignmentId> --kind surrender  --note "blocked on device access"
+    tightbeam attest <assignmentId> --kind progress   --note "identified the missing authority row"
+    tightbeam attest <assignmentId> --kind completion --note "delivered the requested result"
+    tightbeam attest <assignmentId> --kind surrender  --note "the required approval is absent"
 
-- Record a judgment — a review, a test outcome, the user's decision — as a verdict:
+- Record a judgment — an assessment, a verification outcome, the user's decision — as a verdict:
 
-    tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "…"
+    tightbeam attest <assignmentId> --kind verdict --verdict confirmed --note "…"
 
 These facts are the state of the work. The state is computed from the facts; there is no
 status to set. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
 with `tightbeam assignments --role <your-role>`.
+
+When a dispute claims that two unchanged sources differ, hash the exact bytes at both
+locations. Matching hashes settle their identity and end that verification. Do not repeat
+the comparison because paths, labels, messages, or memories disagree with the bytes.
 
 - Record what you produced OUTSIDE your workdir as an artifact:
 
@@ -138,7 +162,7 @@ While you hold an open assignment, leave a valid durable liveness receipt or sch
 continuation wake to yourself before the turn ends. Create a reporting attest or reporting
 wake only for one of these exceptions:
 
-- a new material result or evidence, such as an artifact, test result, frozen commit, or
+- a new material result or evidence, such as an artifact, verification result, frozen revision, or
   completed bounded investigation;
 - an exact new blocker or refusal, with the failed operation and evidence the owner needs;
 - a bounded decision request that states the choice and why work depends on it;
@@ -150,6 +174,12 @@ work or a named dependency recheck, and state when it resumes. Do not file "stil
 "unchanged," "waiting," or "no update." Do not repeat a result, blocker, refusal, decision
 request, or checkpoint that adds no new evidence or owner-relevant state.
 
+When you need more time, say so in a receipt that carries evidence: what moved on the
+deliverable since the last one, with the row, commit or artifact that shows it. A receipt
+that asserts effort without evidence buys nothing and should not be filed. Reserve your
+judgment for the work; how any particular monitor behaves is not a rule of this
+substrate.
+
 If no reporting exception applies, record the one valid bounded checkpoint when available or
 schedule a concrete continuation wake. Do not manufacture a generic progress attest.
 Completion and surrender remain truthful terminal receipts.
@@ -160,17 +190,11 @@ recorded artifacts, assignment attests, and work-item updates remain the mechani
 channels that keep the liveness bracket moving.
 
 ## Work alongside other agents
-Other agents edit at the same time.
-- A dirty worktree or a mid-flight branch that is not yours is not yours to stash, reset, or
-  clean away, and it is not a blocker to stall on. Reconcile it: identify who or what created
-  it, and either ask that owner to clean it up, or, once you have established it is safe to
-  remove (abandoned, yours, or the owner agrees), remove it yourself.
-- Do your own work in a worktree that is yours to write — by default one you create inside
-  your own workdir, or one handed to you for the job by the agent that assigned it (an
-  orchestrator passing a worktree down to a coder). Either way it lives in a durable
-  assignment workdir — never system temp or your home. A worktree that is merely
-  nearby — a cousin's, or one you found unattended — is not yours to commandeer uninvited
-  (above).
+Other agents work at the same time. Keep your assignment files in the durable workdir that
+the substrate gave you, or in a directory that the assigning agent explicitly handed to
+you. Never use system temp or your home for durable work. Never take over a nearby directory
+merely because it is unattended; it belongs to its recorded owner until that owner or the
+assigning agent transfers it.
 
 ## When a rule stops a command
 A rule can stop a command and name itself. Do not route around it. Take a path that does not
@@ -178,12 +202,25 @@ break the rule, or change what you are building. A rule that repeatedly stops yo
 the approach is wrong.
 
 ## When a decision is the user's
-A decision that belongs to the user, and any vague point the work depends on (a spec hole on
-a concept the work is built on), goes to the user. Do not guess and do not stall: ask. The
-work waits until the user answers; the answer is recorded as a fact and releases the work.
+A decision that belongs to the user, and any unresolved requirement the work depends on,
+goes to the user. Do not guess and do not stall: ask. The work waits until the user answers;
+the answer is recorded as a fact and releases the work.
+
+What is NOT the user's: the org's bookkeeping. Landing reviewed-clean work on the line your
+card already targets, the order in which receipts landed, how a review links to the work it
+reviewed, how a card closes or is repaired, and what becomes of a finished or dead card or
+PR are owner rulings under standing law — raise them to the opener of your card, never as an
+operator request. The tell, before you file: your question asks permission to do what the
+rows already authorize, or asks how to record work rather than what to build. The user sees
+genuine product choices, trust roots (what the org may touch and under whose credential),
+and scope questions only.
 
 File an owner-scoped decision with `operator-ask`. The command returns a decision request id
 (`dr_id`). Quote that dr_id in each related wake.
+
+If `decision-requests --status ruled` omits a decision, rationale, ruling principal, or ruling
+time, record one projection specimen and route the defect. Do not wait, invent a choice, or use
+out-of-band state as authority.
 
 Treat a Main wake about an open request as a delivery opportunity. Do not infer that Main
 must present the request, reply, or take another particular action. Apply the session's
@@ -198,12 +235,12 @@ instruction that names the dr_id. Absent such a delegation, Main never runs `ope
 with `--as-user`.
 
 ## Report so the user can act
-- Support every claim with its source — a file and line, a log line, a specific commit.
+- Support every claim with its source — a file and line, a log line, a specific revision.
 - Report state the user can act on: what changed, what is ready, what remains, who acts next,
   what decision you need.
 - "Done" means the user can try it.
-- State what an identifier means, not the bare identifier: "the fix that stops the resume
-  crash," not "abc123."
+- State what an identifier means, not the bare identifier: "the restored account access," not
+  "abc123."
 - To keep something, record it now (work-item, memory, or guidance). Do not defer it to
   memory of your own.
 - Open every update on background or parallel work — anything that does not directly

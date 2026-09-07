@@ -35,7 +35,7 @@ defmodule Tightbeam.SchemaShapeTest do
   alias Tightbeam.{Assignments, DB, Schema}
 
   @shape "cursor-provider-v1-020"
-  @identity_render_shape "identity-universal-root-render-v1-019"
+  @cursor_provider_previous_shape "liveness-progress-receipts-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
   @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
@@ -155,7 +155,7 @@ defmodule Tightbeam.SchemaShapeTest do
              """)
   end
 
-  test "identity-render shape advances through the cursor-provider migration", %{db: db} do
+  test "liveness-receipt shape advances through the cursor-provider migration", %{db: db} do
     assert :ok = Schema.ensure_all(db)
 
     assert :ok =
@@ -178,7 +178,7 @@ defmodule Tightbeam.SchemaShapeTest do
              """)
 
     assert {:ok, _} =
-             DB.query(db, "UPDATE schema_stamp SET shape = ?1", [@identity_render_shape])
+             DB.query(db, "UPDATE schema_stamp SET shape = ?1", [@cursor_provider_previous_shape])
 
     assert :ok = Schema.ensure_all(db)
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
@@ -647,6 +647,12 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert table_columns(db, "harness_health_assignments") ==
              ~w(incidentId assignmentId sessionKey)
+
+    assert table_columns(db, "turn_repair_attempts") ==
+             ~w(id repairKey sourceSeq attemptSeq assignmentId principal createdAt)
+
+    assert table_columns(db, "assignment_repair_attempts") ==
+             ~w(id assignmentId repairKey requestFingerprint action principal state resultJson createdAt completedAt)
 
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     assert :ok = Schema.ensure_all(db)

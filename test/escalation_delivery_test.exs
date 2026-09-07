@@ -514,12 +514,16 @@ defmodule Tightbeam.EscalationDeliveryTest do
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
               "children_after_preflight/1"} => 2,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "handlers/1"} => 1,
+             {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4",
+              "execute_assignment_repair/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.deliver_prompt/4", "notify_session/4"} => 1,
              # The fault bubble's notice enqueue (production-machine-v1): a
              # substrate-authored turn to the failing session's nearest active
              # ancestor, deduped by deterministic wakeId.
              {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt/4",
               "enqueue_notice/4"} => 1,
+             {"lib/tightbeam/productions/bubble.ex", "Gateway.deliver_prompt_in_txn/5",
+              "route_patrol_escalation/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt/4",
               "notify_stranded_ancestor/2"} => 1,
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
@@ -527,6 +531,11 @@ defmodule Tightbeam.EscalationDeliveryTest do
              {"lib/tightbeam/supervision.ex", "Gateway.deliver_prompt_in_txn/5",
               "recover_retired_target_in_txn/6"} => 1,
              {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4", "remove_override_result/3"} =>
+               1,
+             # Identity apply asks a started session to re-read the Tightbeam
+             # skill files it has just rewritten. An ordinary prompt, submitted
+             # and never waited on, so it is a turn sink like any other.
+             {"lib/tightbeam/gateway.ex", "Gateway.notify_session/4", "identity_apply_nudge/4"} =>
                1,
              {"lib/tightbeam/assignments.ex", "Gateway.deliver_prompt_in_txn/5",
               "open_dispatch_result/2"} => 1,
@@ -538,7 +547,9 @@ defmodule Tightbeam.EscalationDeliveryTest do
              # private. Still exactly one turn sink; it simply has a name now.
              {"lib/tightbeam/gateway.ex", "Ledger.enqueue_in_txn/2",
               "append_and_enqueue_in_txn/7"} => 1,
-             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1
+             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1,
+             {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "append_repair_attempt/5"} =>
+               1
            }
 
     # `Ledger.enqueue/2` has zero production call sites: the wrapper exists for

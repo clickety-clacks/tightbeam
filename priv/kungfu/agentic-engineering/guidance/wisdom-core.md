@@ -3,7 +3,7 @@
 The numbered map of the project's design wisdom, sections every archetype carries. Each
 rule's WORKING TEXT lives in exactly one home; cite "wisdom N" and open the home for the
 directive. Rules 1-10 and 15-22 are the meta sections (enforcement, substrate-vs-inference,
-guidance authoring) — carried by orchestrator, reviewer, and spec-writer, homed in the
+guidance authoring) — carried by orchestrator, reviewer-code, reviewer-spec, and spec-writer, homed in the
 `tightbeam-law-minting` and `tightbeam-guidance-authoring` skills.
 
 ## Work and accountability — homes: operating manual; accountability-constitution-v1

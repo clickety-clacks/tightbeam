@@ -9,11 +9,14 @@
 - Passing is not working. Compiling, green tests, and a clean review are not proof it works.
   Run it against real inputs before you call it done.
 - Capture test fixtures from real responses. A hand-written ideal fixture passes review and
-  ships broken.
+  ships broken. Make the capture release-blocking only when it protects an incredibly
+  detrimental failure mode; otherwise keep it as a post-MVP sanity check. Never fabricate
+  the fixture.
 - Read code and its provenance before you change it. Do not modify or delete code you do not
   understand.
-- Build exactly the spec. Unrequested additions are defects. If the spec has a hole on a
-  load-bearing concept, ask the user.
+- Build exactly the ask. Anything beyond it is a defect: an extra feature, an unasked
+  behavior change, an incidental fix. If the ask has a hole on a load-bearing concept,
+  ask the user.
 - Produce the evidence the next step needs, one step at a time. A rejected final step means
   an earlier proof was skipped.
 - Find what changed before fixing a regression.

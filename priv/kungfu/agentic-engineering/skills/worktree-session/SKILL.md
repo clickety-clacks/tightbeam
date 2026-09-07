@@ -8,6 +8,8 @@ description: Your own clone is the isolation boundary when many agents edit one 
 Other agents edit the same repository at the same time. Your own clone is the isolation
 boundary.
 
+Codex exposes the engineering review commands `/review-branch` and `/review-commit`.
+
 1. **Clone your own copy, into your own workdir.** `git clone <remote>
    <workdir>/<branch-name>`, then work on a branch named for the work. Do NOT
    `git worktree add` against a repo you did not create, and do not adopt a repo you

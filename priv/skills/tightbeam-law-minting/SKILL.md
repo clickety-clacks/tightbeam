@@ -1,6 +1,6 @@
 ---
 name: tightbeam-law-minting
-description: The rules for designing tightbeam law and mechanisms — statutes, rails, substrate specs. Use before minting or reviewing any of them.
+description: The rules for designing tightbeam law and mechanisms — statutes, rails, substrate contracts. Use before minting or reviewing any of them.
 ---
 
 Working projection of wisdom.md rules 1-10 and 25 (doctrine is

@@ -8,7 +8,7 @@ obligation as a row — `tightbeam assign --subject "..."
 (--session K | --role R) [--work-item <id>]` — and wake the worker
 with a brief of AT MOST ONE SENTENCE plus the references:
 
-    tightbeam wake --role coder:x --prompt \
+    tightbeam wake --session "agent:role:name" --prompt \
       "You hold asg_123 (wi_456): fix the picker titles — read the \
       assignment, its attests, and the work-item from the substrate."
 
@@ -34,6 +34,10 @@ concrete continuation work or a dependency recheck and when it resumes.
 Do not file "still working," "unchanged," "waiting," or "no update."
 Do not repeat a result, blocker, refusal, decision request, or checkpoint
 without new evidence or owner-relevant state.
+
+When a holder needs more time, the receipt that earns it carries evidence of what
+moved: the row, commit or artifact, not an assertion of effort. A receipt with no
+evidence in it is not a receipt.
 
 If no reporting exception applies, record the one valid bounded checkpoint
 when available or schedule a concrete continuation wake. Never manufacture

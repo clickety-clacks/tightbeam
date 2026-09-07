@@ -38,6 +38,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
     holder = session(db, "fix-holder", "coder", "claude", "anthropic")
     recon = session(db, "recon-holder", "recon", "codex", "openai")
+    orchestrator = session(db, "slice-orchestrator", "orchestrator", "codex", "openai")
     Roles.create!(db, "recon", "flynn", recon.session_key)
 
     base_dir =
@@ -66,6 +67,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       db: db,
       handlers: handlers,
       holder: holder,
+      orchestrator: orchestrator,
       recon: recon,
       rules: rules
     }
@@ -77,6 +79,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
              "refix-requires-diagnosis",
              "code-review-requires-passing-tests",
              "spec-dispatch-requires-spirit",
+             "implementation-requires-posture",
+             "implementation-dispatch-requires-posture",
              "completion-requires-verification",
              "completion-requires-results-artifact"
            ]
@@ -232,10 +236,48 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   end
 
   defp work_item(ctx, is_bug) do
-    WorkItems.__handle__(ctx.db, "work-item-create", %{
-      principal: {:user, "flynn"},
-      params: %{title: "Bug #{System.unique_integer([:positive])}", is_bug: is_bug}
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, "flynn"},
+        params: %{title: "Bug #{System.unique_integer([:positive])}", is_bug: is_bug}
+      })
+
+    rule_posture!(ctx, item)
+    item
+  end
+
+  # The posture gate (implementation-requires-posture) refuses a coder card on a
+  # work item nobody has ruled heavy or light. These tests are about the
+  # re-fix edge, so the org's orchestrator rules posture up front, as it would
+  # in life.
+  defp rule_posture!(ctx, item) do
+    slice = assign(ctx, ctx.orchestrator.session_key, item.id, "orchestrate #{item.id}")
+
+    Assignments.__handle__(ctx.db, "attest", %{
+      verb: "attest",
+      origin: "agent:#{ctx.orchestrator.session_key}",
+      principal: {:session, ctx.orchestrator.session_key},
+      session_key: nil,
+      params: %{
+        assignment_id: slice.id,
+        kind: "verdict",
+        verdict_kind: "posture-light",
+        note: "test slice"
+      }
     })
+
+    # The ruling is the verdict row, which outlives its card. Revoke the card so
+    # the disposal proofs see zero open assignments, and so it never reads as a
+    # completed prior fix (revoked, not completed).
+    Assignments.__handle__(ctx.db, "revoke-assignment", %{
+      verb: "revoke-assignment",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{assignment_id: slice.id}
+    })
+
+    :ok
   end
 
   defp completed_fix(ctx, work_item_id) do

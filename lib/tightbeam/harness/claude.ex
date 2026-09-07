@@ -7,7 +7,7 @@ defmodule Tightbeam.Harness.Claude do
 
   require Logger
 
-  @adapter_version "0.66.0"
+  @adapter_version "0.73.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
   @warm_timeout_ms 30_000
@@ -100,7 +100,9 @@ defmodule Tightbeam.Harness.Claude do
   # default-pin vocabulary, not the grant; the operator's own picker offered
   # Opus 5 all along). Same lesson, second occurrence: re-probe from a second
   # vantage before trusting any row here, in either direction.
-  # UPGRADED 2026-08-08 on gibson to claude-agent-acp 0.66.0 / SDK 0.3.220.
+  # UPGRADED 2026-09-01 on gibson to claude-agent-acp 0.73.0 / SDK 0.3.257 /
+  # bundled Claude Code 2.1.257. This version offers and accepts claude-fable-5-1
+  # plus its 1M-context variant.
   # Its public picker still exposes aliases, but their meaning changed: opus[1m]
   # now identifies Opus 5. Tightbeam therefore tries a requested canonical id
   # first and treats this table only as fallback candidates. The selected
@@ -109,7 +111,7 @@ defmodule Tightbeam.Harness.Claude do
 
   @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
                                 claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5
-                                claude-opus-5)
+                                claude-opus-5 claude-fable-5-1 claude-fable-5-1[1m])
 
   @doc """
   Model values this adapter version accepts at `session/set_config_option`.
@@ -274,8 +276,8 @@ defmodule Tightbeam.Harness.Claude do
         "haiku" => "claude-haiku-4-5-20251001",
         "opus" => "claude-opus-4-8",
         "opus[1m]" => "claude-opus-4-8[1m]",
-        "fable" => "claude-fable-5",
-        "fable[1m]" => "claude-fable-5[1m]"
+        "fable" => "claude-fable-5-1",
+        "fable[1m]" => "claude-fable-5-1[1m]"
       },
       canonical_model_prefixes: ["claude-"]
     }

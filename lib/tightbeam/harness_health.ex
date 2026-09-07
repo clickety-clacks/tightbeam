@@ -14,10 +14,13 @@ defmodule Tightbeam.HarnessHealth do
   recycling remain outside this module.
   """
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, Id}
+  alias Tightbeam.{ConditionFacts, DB, EventLog, Harness, HarnessProcess, Id, Org}
   alias Tightbeam.DB.Txn
 
-  @failure_classes ~w(auth-dead rate-limit-dead)
+  @failure_classes ~w(
+    auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
+    interrupted-outcome-unknown
+  )
   @failure_evidence ~w(authoritative-provider terminal-failure)
   @evidence_window_ms 120_000
 
@@ -37,7 +40,10 @@ defmodule Tightbeam.HarnessHealth do
     correlationId TEXT NOT NULL UNIQUE,
     harness       TEXT NOT NULL CHECK(length(trim(harness)) > 0),
     host          TEXT NOT NULL CHECK(length(trim(host)) > 0),
-    failureClass  TEXT NOT NULL CHECK(failureClass IN ('auth-dead','rate-limit-dead')),
+    failureClass  TEXT NOT NULL CHECK(failureClass IN (
+                    'auth-dead','rate-limit-dead','adapter_unavailable','model_unavailable',
+                    'task_crash','interrupted-outcome-unknown'
+                  )),
     evidenceKind  TEXT NOT NULL CHECK(evidenceKind IN (
                     'authoritative-provider','terminal-failure','normal-turn-success'
                   )),
@@ -62,7 +68,10 @@ defmodule Tightbeam.HarnessHealth do
     id                      TEXT PRIMARY KEY,
     harness                 TEXT NOT NULL CHECK(length(trim(harness)) > 0),
     host                    TEXT NOT NULL CHECK(length(trim(host)) > 0),
-    failureClass            TEXT NOT NULL CHECK(failureClass IN ('auth-dead','rate-limit-dead')),
+    failureClass            TEXT NOT NULL CHECK(failureClass IN (
+                              'auth-dead','rate-limit-dead','adapter_unavailable',
+                              'model_unavailable','task_crash','interrupted-outcome-unknown'
+                            )),
     state                   TEXT NOT NULL CHECK(state IN ('open','resolved')),
     openedAt                INTEGER NOT NULL CHECK(openedAt >= 0),
     openObservationId       TEXT NOT NULL REFERENCES harness_health_observations(id)
@@ -225,10 +234,56 @@ defmodule Tightbeam.HarnessHealth do
   def classify_turn_failure(%{"data" => %{"errorKind" => "rate_limit"}}),
     do: "rate-limit-dead"
 
+  def classify_turn_failure(:task_crash), do: "task_crash"
+  def classify_turn_failure({:task_crash, _}), do: "task_crash"
+  def classify_turn_failure(:interrupted_outcome_unknown), do: "interrupted-outcome-unknown"
+
+  def classify_turn_failure({:interrupted_outcome_unknown, _}),
+    do: "interrupted-outcome-unknown"
+
+  def classify_turn_failure(%{code: code})
+      when code in ["adapter_unavailable", "model_unavailable"],
+      do: code
+
+  def classify_turn_failure(%{"code" => code})
+      when code in ["adapter_unavailable", "model_unavailable"],
+      do: code
+
   def classify_turn_failure(reason) do
     evidence = reason |> evidence_text() |> String.downcase()
 
     cond do
+      contains_any?(evidence, [
+        "interrupted: outcome unknown",
+        "interrupted-outcome-unknown",
+        "outcome unknown"
+      ]) ->
+        "interrupted-outcome-unknown"
+
+      contains_any?(evidence, ["task_crash", "turn task crash", "turn-task-crash"]) ->
+        "task_crash"
+
+      contains_any?(evidence, [
+        "model_unavailable",
+        "model unavailable",
+        "model is not available",
+        "unknown model",
+        "unsupported model"
+      ]) ->
+        "model_unavailable"
+
+      contains_any?(evidence, [
+        "adapter_unavailable",
+        "adapter unavailable",
+        "adapter for ",
+        "coordinator_unavailable",
+        "adapter boot",
+        "adapter died",
+        "adapter is degraded",
+        "noproc"
+      ]) ->
+        "adapter_unavailable"
+
       contains_any?(evidence, [
         "rate limit",
         "rate_limit",
@@ -306,6 +361,51 @@ defmodule Tightbeam.HarnessHealth do
     end
   end
 
+  @doc "Record a terminal class whose owner is the lane or boot reconciler."
+  @spec observe_terminal_in_txn(Txn.t(), integer(), String.t(), String.t(), String.t()) ::
+          nil | (-> :ok)
+  def observe_terminal_in_txn(%Txn{} = txn, seq, failure_class, cause, principal)
+      when failure_class in @failure_classes do
+    columns = Txn.q(txn, "PRAGMA table_info(sessions)") |> Enum.map(&Enum.at(&1, 1))
+
+    rows =
+      if "host" in columns and "harness" in columns do
+        Txn.q(
+          txn,
+          """
+          SELECT t.sessionKey,t.assignmentId,s.harness,s.host
+          FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
+          WHERE t.seq=?1
+          """,
+          [seq]
+        )
+      else
+        []
+      end
+
+    case rows do
+      [[session_key, assignment_id, harness, host]] ->
+        result =
+          observe_in_txn(txn, %{
+            correlation_id: "harness-turn:#{seq}:#{failure_class}",
+            harness: harness,
+            host: host,
+            failure_class: failure_class,
+            evidence_kind: "terminal-failure",
+            session_key: session_key,
+            assignment_id: assignment_id,
+            observed_at: System.system_time(:millisecond),
+            cause: cause,
+            principal: principal
+          })
+
+        post_commit(result)
+
+      [] ->
+        nil
+    end
+  end
+
   @doc "Resolve every open class for this shared harness inside a delivered-turn transaction."
   @spec resolve_normal_turn_in_txn(Txn.t(), map(), map()) :: :ok
   def resolve_normal_turn_in_txn(%Txn{} = txn, session, turn) do
@@ -338,9 +438,9 @@ defmodule Tightbeam.HarnessHealth do
     :ok
   end
 
-  @doc "Record provider-authoritative invalidation and open unless human delivery must refuse."
+  @doc "Open an auth incident immediately from a provider-authoritative invalidation."
   @spec observe_provider_invalidation(DB.server(), String.t(), String.t(), term(), keyword()) ::
-          {:pending | :opened | :attached | :duplicate, map()}
+          {:opened | :attached | :duplicate, map()}
   def observe_provider_invalidation(db \\ DB, harness, host, event, opts \\ []) do
     observe(db, %{
       correlation_id: "provider-auth:" <> Id.uuid4(),
@@ -384,21 +484,28 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   @doc "Resolve one class-specific open incident on normal-turn success."
-  @spec resolve(DB.server(), map()) :: {:resolved | :duplicate, map()} | :already_healthy
+  @spec resolve(DB.server(), map()) ::
+          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
   def resolve(db \\ DB, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
     transaction!(db, &resolve_in_txn(&1, input))
   end
 
   @doc "The class-specific resolution mutation inside a caller-owned transaction."
-  @spec resolve_in_txn(Txn.t(), map()) :: {:resolved | :duplicate, map()} | :already_healthy
+  @spec resolve_in_txn(Txn.t(), map()) ::
+          {:resolved | :duplicate, map()} | :already_healthy | :repair_required
   def resolve_in_txn(%Txn{} = txn, input) do
     input = input |> Map.put(:evidence_kind, "normal-turn-success") |> normalize_common!()
     validate_session_membership!(txn, input)
 
-    case observation_by_correlation(txn, input.correlation_id) do
-      nil -> resolve_open(txn, input)
-      prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
+    if input.failure_class == "rate-limit-dead" and
+         HarnessProcess.parked_in_txn?(txn, adapter_key(input.harness, input.host)) do
+      :repair_required
+    else
+      case observation_by_correlation(txn, input.correlation_id) do
+        nil -> resolve_open(txn, input)
+        prior -> duplicate_or_refuse!(txn, prior, input, "normal-turn-success")
+      end
     end
   end
 
@@ -408,14 +515,14 @@ defmodule Tightbeam.HarnessHealth do
     {:ok, rows} =
       DB.query(db, incident_sql() <> " WHERE state='open' ORDER BY openedAt,id")
 
-    Enum.map(rows, &incident/1)
+    Enum.map(rows, &(incident(&1) |> with_repair_guidance()))
   end
 
   @doc "Read one incident with the evidence that names its affected work."
   @spec get(DB.server(), String.t()) :: map() | nil
   def get(db \\ DB, incident_id) do
     with {:ok, [row]} <- DB.query(db, incident_sql() <> " WHERE id=?1", [incident_id]) do
-      incident = incident(row)
+      incident = row |> incident() |> with_repair_guidance()
 
       {:ok, observations} =
         DB.query(
@@ -476,7 +583,7 @@ defmodule Tightbeam.HarnessHealth do
   end
 
   defp open_new_incident(txn, opening_observation_id, input) do
-    case auth_blocker_recipient(txn, input) do
+    case incident_recipient(txn, input) do
       :no_recipient ->
         refuse_incident_promotion(txn, opening_observation_id, input)
 
@@ -515,6 +622,10 @@ defmodule Tightbeam.HarnessHealth do
       ]
     )
 
+    if input.failure_class == "rate-limit-dead" do
+      HarnessProcess.begin_park_in_txn(txn, adapter_key(input.harness, input.host))
+    end
+
     snapshot_affected_work(txn, incident_id, input)
 
     observations_to_attach(txn, input)
@@ -527,7 +638,7 @@ defmodule Tightbeam.HarnessHealth do
       lifecycle_detail(input, opening_observation_id)
     )
 
-    notice_publication = auth_blocker_in_txn(txn, incident_id, input, recipient)
+    notice_publication = incident_notice_in_txn(txn, incident_id, input, recipient)
 
     {:opened,
      %{
@@ -597,6 +708,10 @@ defmodule Tightbeam.HarnessHealth do
 
         if Txn.changes(txn) != 1, do: raise("harness health incident resolution race")
 
+        if input.failure_class == "rate-limit-dead" do
+          HarnessProcess.complete_park_in_txn(txn, adapter_key(input.harness, input.host))
+        end
+
         EventLog.lifecycle_in_txn(
           txn,
           "harness_health_incident_resolved",
@@ -630,6 +745,8 @@ defmodule Tightbeam.HarnessHealth do
 
     count
   end
+
+  defp adapter_key(harness, host), do: {Harness.parse!(harness).id(), "shared", host}
 
   defp observations_to_attach(txn, input) do
     authoritative =
@@ -915,15 +1032,21 @@ defmodule Tightbeam.HarnessHealth do
     })
   end
 
-  defp auth_blocker_in_txn(
+  defp incident_recipient(txn, %{failure_class: "auth-dead"} = input),
+    do: auth_blocker_recipient(txn, input)
+
+  defp incident_recipient(_txn, _input), do: {:ok, :automatic}
+
+  defp incident_notice_in_txn(
          _txn,
          _incident_id,
          %{failure_class: "rate-limit-dead"},
-         nil
+         _recipient
        ),
        do: nil
 
-  defp auth_blocker_in_txn(txn, incident_id, input, recipient) when is_binary(recipient) do
+  defp incident_notice_in_txn(txn, incident_id, %{failure_class: "auth-dead"} = input, recipient)
+       when is_binary(recipient) do
     [[assignment_count]] =
       Txn.q(
         txn,
@@ -949,7 +1072,52 @@ defmodule Tightbeam.HarnessHealth do
     )
   end
 
-  defp auth_blocker_recipient(_txn, %{failure_class: "rate-limit-dead"}), do: {:ok, nil}
+  defp incident_notice_in_txn(txn, incident_id, input, :automatic) do
+    audience =
+      case Txn.q(
+             txn,
+             """
+             SELECT DISTINCT s.ownerUserId
+             FROM harness_health_members m
+             JOIN sessions s ON s.sessionKey=m.sessionKey
+             WHERE m.incidentId=?1
+             ORDER BY s.ownerUserId
+             LIMIT 1
+             """,
+             [incident_id]
+           ) do
+        [[owner_user_id]] -> {:session, Org.personal_session_key(owner_user_id)}
+        [] -> :record_only
+      end
+
+    [[assignment_count]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM harness_health_assignments WHERE incidentId=?1",
+        [incident_id]
+      )
+
+    guidance = repair_guidance(input.failure_class)
+
+    message =
+      "[shared harness incident: #{input.failure_class}]\n\n" <>
+        "The #{input.harness} harness on #{input.host} opened incident #{incident_id}, " <>
+        "covering #{assignment_count} affected open assignment(s). " <>
+        guidance.message <> " Prodding for this harness is suppressed until repair succeeds."
+
+    EventLog.notice_in_txn(
+      txn,
+      if(input.failure_class == "auth-dead",
+        do: "harness_health_auth_blocker",
+        else: "harness_health_repair_required"
+      ),
+      incident_id,
+      lifecycle_detail(input, input.correlation_id),
+      audience: audience,
+      message: message,
+      attention: :high
+    )
+  end
 
   defp auth_blocker_recipient(txn, input) do
     affected_main =
@@ -981,14 +1149,61 @@ defmodule Tightbeam.HarnessHealth do
                LIMIT 1
                """
              ) do
-          [[session_key]] ->
-            {:ok, session_key}
-
-          [] ->
-            :no_recipient
+          [[session_key]] -> {:ok, session_key}
+          [] -> :no_recipient
         end
     end
   end
+
+  defp with_repair_guidance(incident),
+    do: Map.put(incident, :repair, repair_guidance(incident.failureClass))
+
+  defp repair_guidance("model_unavailable"),
+    do: %{
+      action: "tune",
+      requires: ["model"],
+      message:
+        "An opener or admin must tune the holder to an explicitly named available catalog model."
+    }
+
+  defp repair_guidance("adapter_unavailable"),
+    do: %{
+      action: "restart",
+      requires: [],
+      message: "An opener or admin must restart the holder's shared harness adapter."
+    }
+
+  defp repair_guidance("task_crash"),
+    do: %{
+      action: "restart",
+      requires: [],
+      message:
+        "An opener or admin must restart the shared adapter before retrying the failed turn."
+    }
+
+  defp repair_guidance("interrupted-outcome-unknown"),
+    do: %{
+      action: "rerun",
+      requires: ["outcome=not-completed"],
+      message:
+        "An opener or admin must reconcile the external outcome, then explicitly rerun the terminal turn only when it did not complete."
+    }
+
+  defp repair_guidance("rate-limit-dead"),
+    do: %{
+      action: "resume",
+      requires: [],
+      message:
+        "The harness remains parked until an opener or admin explicitly resumes it after the limit clears."
+    }
+
+  defp repair_guidance("auth-dead"),
+    do: %{
+      action: "resume",
+      requires: [],
+      message:
+        "A human must restore this credential. Then an opener or admin explicitly resumes the holder."
+    }
 
   defp post_commit(result, registry \\ Tightbeam.ConnRegistry)
 

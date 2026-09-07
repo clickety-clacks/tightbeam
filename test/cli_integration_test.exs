@@ -30,13 +30,29 @@ defmodule Tightbeam.CliIntegrationTest do
 
   alias Tightbeam.Wire.Router
 
-  setup do
-    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
+  setup_all do
+    cli_dir = Path.expand("../cli", __DIR__)
+    target_dir = Path.join(cli_dir, "target/cli-integration")
+    binary = Path.join(target_dir, "release/tightbeam")
+
+    # Other suites rebuild target/release. This suite owns its parser executable.
+    {output, status} =
+      System.cmd("cargo", ["build", "--release"],
+        cd: cli_dir,
+        env: [{"CARGO_TARGET_DIR", target_dir}],
+        stderr_to_stdout: true
+      )
+
+    if status != 0, do: raise("CLI integration build failed:\n#{output}")
 
     unless File.exists?(binary) do
-      raise "CLI integration binary missing: #{binary}; run cargo build --release in cli/"
+      raise "CLI integration build did not produce #{binary}"
     end
 
+    {:ok, binary: binary}
+  end
+
+  setup %{binary: binary} do
     db = :"cli_integration_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -644,6 +660,62 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     item_id = JSON.decode!(created)["id"]
+
+    # The posture gate refuses a coder card on an unpostured work item, so the
+    # org's orchestrator rules the slice first, through the same real CLI.
+    orchestrator =
+      Org.create(ctx.db, %{
+        session_key: "cli-orchestrator",
+        display_name: "CLI Orchestrator",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "orchestrator",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("test")
+      })
+
+    Roles.create!(ctx.db, "cli-orchestrator", "flynn", orchestrator.session_key)
+
+    {slice, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "orchestrate the slice",
+          "--session",
+          "cli-orchestrator",
+          "--work-item",
+          item_id,
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    slice_id = JSON.decode!(slice)["id"]
+
+    {_postured, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          slice_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "posture-light",
+          "--note",
+          "e2e: the input is the spec",
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
 
     {assigned, 0} =
       System.cmd(
@@ -1364,6 +1436,245 @@ defmodule Tightbeam.CliIntegrationTest do
     assert pairing =~ "supplied together"
   end
 
+  test "real CLI composes priority and metadata in one work-item update", ctx do
+    sha = String.duplicate("a", 64)
+    sha2 = String.duplicate("b", 64)
+
+    {created, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-create",
+          "--title",
+          "Before",
+          "--spec-ref",
+          "governing.md",
+          "--spec-sha256",
+          sha,
+          "--priority",
+          "4"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    work_item_id = JSON.decode!(created)["id"]
+    assert_receive {:cli_call, %{verb: "work-item-create"}}
+
+    {priority_only, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--priority", "5"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "title" => "Before",
+             "priority" => 5,
+             "specRefName" => "governing.md",
+             "specRefSha256" => ^sha
+           } = JSON.decode!(priority_only)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{work_item_id: ^work_item_id, priority: 5}
+                    }}
+
+    {metadata_only, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--title", "After"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"title" => "After", "priority" => 5, "specRefSha256" => ^sha} =
+             JSON.decode!(metadata_only)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{work_item_id: ^work_item_id, title: "After"}
+                    }}
+
+    {combined, 0} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--spec-sha256", sha2, "--priority", "6"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "title" => "After",
+             "priority" => 6,
+             "specRefName" => "governing.md",
+             "specRefSha256" => ^sha2
+           } = JSON.decode!(combined)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        spec_ref_sha256: ^sha2,
+                        priority: 6
+                      }
+                    }}
+
+    {noop, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(noop) == JSON.decode!(combined)
+
+    assert_receive {:cli_call,
+                    %{verb: "work-item-update", params: %{work_item_id: ^work_item_id}}}
+
+    {cleared, 0} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--clear-spec-ref"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"priority" => 6, "specRefName" => nil, "specRefSha256" => nil} =
+             JSON.decode!(cleared)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        spec_ref_name: nil,
+                        spec_ref_sha256: nil
+                      }
+                    }}
+
+    {incomplete, 1} =
+      System.cmd(ctx.binary, ["work-item-update", work_item_id, "--spec-ref", "next.md"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert incomplete =~ "invalid_spec_ref"
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{work_item_id: ^work_item_id, spec_ref_name: "next.md"}
+                    }}
+
+    {set, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-update",
+          work_item_id,
+          "--spec-ref",
+          "next.md",
+          "--spec-sha256",
+          sha
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{"specRefName" => "next.md", "specRefSha256" => ^sha} = JSON.decode!(set)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        spec_ref_name: "next.md",
+                        spec_ref_sha256: ^sha
+                      }
+                    }}
+
+    {replayed, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-update",
+          work_item_id,
+          "--spec-ref",
+          "next.md",
+          "--spec-sha256",
+          sha
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert JSON.decode!(replayed) == JSON.decode!(set)
+    assert_receive {:cli_call, %{verb: "work-item-update"}}
+
+    {conflict, 1} =
+      System.cmd(
+        ctx.binary,
+        ["work-item-update", work_item_id, "--clear-spec-ref", "--spec-ref", "next.md"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert conflict =~ "conflicts"
+    refute_receive {:cli_call, %{verb: "work-item-update"}}, 50
+
+    {got, 0} =
+      System.cmd(ctx.binary, ["work-item-get", work_item_id],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "workItem" => %{
+               "priority" => 6,
+               "specRefName" => "next.md",
+               "specRefSha256" => ^sha
+             }
+           } = JSON.decode!(got)
+
+    assert_receive {:cli_call, %{verb: "work-item-get"}}
+
+    {combined, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "work-item-update",
+          work_item_id,
+          "--title",
+          "Together",
+          "--spec-ref",
+          "combined.md",
+          "--spec-sha256",
+          sha2,
+          "--priority",
+          "7"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert %{
+             "title" => "Together",
+             "specRefName" => "combined.md",
+             "specRefSha256" => ^sha2,
+             "priority" => 7
+           } = JSON.decode!(combined)
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "work-item-update",
+                      params: %{
+                        work_item_id: ^work_item_id,
+                        title: "Together",
+                        spec_ref_name: "combined.md",
+                        spec_ref_sha256: ^sha2,
+                        priority: 7
+                      }
+                    }}
+  end
+
   defp open_effort_request(ctx, action) do
     key = "effort-#{action}-#{System.unique_integer([:positive])}"
 
@@ -1431,5 +1742,19 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     request_id
+  end
+
+  test "real CLI rejects closed or retired Topline shapes before router dispatch", ctx do
+    for args <- [
+          ["topline-create", "--title", "Ship", "--key", "closed-key", "--bogus", "ignored"],
+          ["toplines", "--tree"],
+          ["topline", "tl_probe", "--under", "wi_probe"],
+          ["topline-placement-list", "--history"]
+        ] do
+      {output, status} = System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      assert status != 0
+      assert output =~ "does not accept"
+      refute_receive {:cli_call, _call}
+    end
   end
 end

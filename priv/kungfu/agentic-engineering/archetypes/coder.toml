@@ -5,13 +5,13 @@ skills = ["worktree-session", "committing-and-pushing", "human-communication"]
 text = """
 #include "golden-rule.md"
 
+#include "scope-and-architecture.md"
+
 #include "wisdom-core.md"
 
 #include "engineering-tenets.md"
 
 #include "preferred-models.md"
-
-#include "model-policy.md"
 
 #include "coder.md"
 """

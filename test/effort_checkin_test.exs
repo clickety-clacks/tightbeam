@@ -1483,12 +1483,18 @@ defmodule Tightbeam.EffortCheckinTest do
              )
   end
 
-  test "an exact effort transition cancels its deadline after liveness disappears", ctx do
-    for action <- ["continue", "dismiss"] do
-      assignment = dispatch(ctx, {:session, "parent"}, "holder", "stale #{action}")
+  test "an exact effort transition cancels its deadline with absent or terminal liveness", ctx do
+    for liveness <- [:absent, :terminal], action <- ["continue", "dismiss"] do
+      assignment =
+        dispatch(ctx, {:session, "parent"}, "holder", "#{liveness} #{action}")
+
       request = escalate(ctx, assignment.id)
       deadline = Wakes.get(ctx.db, request.deadline_wake_id)
-      drop_supervision_liveness(ctx.db, assignment.id)
+
+      case liveness do
+        :absent -> drop_supervision_liveness(ctx.db, assignment.id)
+        :terminal -> terminate_supervision_liveness(ctx.db, assignment.id)
+      end
 
       assert %{code: "not_authorized", message: "current expecter required"} =
                EffortCheckin.rule(
@@ -1684,6 +1690,23 @@ defmodule Tightbeam.EffortCheckinTest do
     assert rows(db, "SELECT COUNT(*) FROM supervision_entitlements WHERE assignmentId=?1", [
              assignment_id
            ]) == [[0]]
+
+    :ok
+  end
+
+  defp terminate_supervision_liveness(db, assignment_id) do
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "UPDATE supervision_entitlements SET state='terminus',dueAt=NULL,supervisionIntervalMs=NULL,claimClock=NULL,lastAttemptGeneration=NULL,terminusAt=9000,cause='terminus',principal='process:tightbeam' WHERE assignmentId=?1",
+               [assignment_id]
+             )
+
+    assert rows(
+             db,
+             "SELECT state,dueAt,supervisionIntervalMs,terminusAt FROM supervision_entitlements WHERE assignmentId=?1",
+             [assignment_id]
+           ) == [["terminus", nil, nil, 9000]]
 
     :ok
   end

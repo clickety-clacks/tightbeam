@@ -9,7 +9,7 @@ One work-item is the durable thread for the whole feature:
 `tightbeam work-item-create --title "<feature>"`. When a spec already exists at a
 canonical path, bind it to the work-item by content, not by memory:
 `--spec-ref <name> --spec-sha256 <hex>` records the exact spec version the work
-serves, so every coder and reviewer reads the same one. Every assignment below threads
+serves, so every coder, reviewer-code, and reviewer-spec session reads the same one. Every assignment below threads
 to the work-item (`--work-item <id>`). `tightbeam dispatch --to <holder> --subject "…"
 --brief "…" --work-item <id>` opens a plain card and wakes its holder in one atomic step;
 a card that includes an advisory file suggestion (`--files`) or links a review
@@ -19,6 +19,13 @@ a card that includes an advisory file suggestion (`--files`) or links a review
 Keep only a handful of goals truly in-flight at once (see the kernel); this loop is
 per-feature, but your attention across features is the scarce resource.
 
+0. **Posture.** Before anything is staffed, rule the slice heavy or light (the
+   orchestrator kernel defines both) and file it as a verdict on your slice card on
+   this work item: `--verdict posture-heavy` or `--verdict posture-light`, grounds in
+   the note. The substrate refuses a coder card on an unpostured work item. HEAVY runs
+   steps 1 through 10. LIGHT skips steps 1 through 3: the work item's input is the
+   spec, one coder is assigned it as the goal (step 4), and its review (step 5) runs
+   at the light bar. Every other step applies to both.
 1. **Spec.** Spawn a spec-writer and assign it the spec:
    `tightbeam assign --subject "spec: <feature>" --role spec-writer --work-item <id>`.
    The spec states invariants first, a testable acceptance contract, open questions,
@@ -30,11 +37,13 @@ per-feature, but your attention across features is the scarce resource.
    `preferred-models.md`. Try each candidate once; on an unavailable candidate, step
    right once. Send ambiguous qualification to your parent, and when the row is
    exhausted have the parent record `work-blocked` or surface the missing credential.
-   Spawn the selected reviewer as a fresh session. Link the review to the work it
+   Spawn the selected reviewer-spec session fresh. Link the review to the work it
    reviews so the substrate can witness the independence:
-   `tightbeam assign --subject "review of spec <id>" --role reviewer:<slug> --work-item <id> --reviews <specAssignmentId>`.
-   The reviewer works per `reviewing-specs`. On `changes-requested`, wake the
-   spec-writer to revise; repeat until `reviewed-clean`. The spec-writer then pins (or
+   `tightbeam assign --subject "review of spec <id>" --role reviewer-spec:<slug> --work-item <id> --reviews <specAssignmentId>`.
+   The reviewer-spec session follows its projected guidance. Its card ends after its
+   verdict. On `changes-requested`, wake the spec-writer to revise. Open a fresh
+   reviewer-spec card for the next review round; never reuse the prior card. Repeat
+   until `reviewed-clean`. The spec-writer then pins (or
    re-pins) the reviewed spec's hash on the work item (spec-handoff skill), so builders
    build from the cleared text.
 3. **Decompose.** Break the spec into focused, independently verifiable coding goals —
@@ -62,17 +71,32 @@ per-feature, but your attention across features is the scarce resource.
    unavailable candidate advances the selection one place to the right; never retry
    the same candidate. Send ambiguous qualification to your parent. If the row is
    exhausted, the parent records `work-blocked` or surfaces the credential need. Spawn
-   the selected reviewer as a fresh session with the capability the effect requires.
-   Same model, provider, or harness remains eligible. Link the single review card to
-   the reviewed work:
-   `tightbeam assign --subject "review of <goal>" --role reviewer:<slug> --work-item <id> --reviews <coderAssignmentId>`.
+   the selected reviewer-code session fresh with the capability the effect requires.
+   Same model, provider, or harness remains eligible. Open one linked review card for
+   the current review round:
+   `tightbeam assign --subject "review of <goal>" --role reviewer-code:<slug> --work-item <id> --reviews <coderAssignmentId>`.
+   A review card ends after its holder files the verdict; do not reuse it for a later
+   review round.
    The `--reviews` link and the verdict by that card's different-session holder are
    what let the substrate compute independence. Harness and provider differences stay
    observable selection evidence; they do not gate completion. A verdict filed
    without the link is a claim the rows cannot confirm. On `changes-requested`, wake
-   the producer to iterate and have the same reviewer re-file on the same review card
-   until `reviewed-clean`; do not multiply review cards for review rounds.
-6. **Spirit review (substantial changes).** A goal is substantial when it produces
+   the producer to iterate. When it returns, judge whether the revision warrants a
+   fresh review (orchestrator kernel, "Verifying without redoing"): real code changes
+   usually do and a cold reviewer-code session is fine or better; a moved base, a rebuild onto green
+   main, or a missing hash in a report are not new code and get no new review.
+   Commission the review you want rather than letting a completion attest manufacture
+   one. Under light posture the
+   reviewer-code bar is "nothing egregiously wrong." A producer that believes a blocking
+   finding is not needed for the ask contests it to you, and you rule on that one
+   finding (orchestrator kernel, "Verifying without redoing"); you do not audit
+   reviews that nobody contested.
+   The product owner's spirit review (step 6) asks a different question, whether the
+   built thing is the product; the reviewer-code session asks whether it is the ask. Nobody gates
+   the same question twice, and spirit is judged once per work item (step 6), never
+   once per slice.
+6. **Spirit review (substantial work items).** Spirit review happens once per work
+   item, never once per goal or slice. A work item is substantial when it produces
    product behavior with no product-owner-gated spec authority behind it —
    behavior an agent or user experiences, an authority moved between homes, or a
    change to what a fresh install boots as, that no owner-gated spec states. A
@@ -85,25 +109,34 @@ per-feature, but your attention across features is the scarce resource.
    Cross-model spec review is quality control, not spirit — a spec cleared only by
    cross-model review makes nothing routine.
 
-   A substantial goal does not integrate until the product owner has answered its
-   spirit summary. Wake the owner with what changed in product terms, which Spirit
-   clauses it serves, and what it forecloses:
-   `tightbeam wake --session <productOwner> --prompt "spirit review of <goalAssignmentId>: <summary>"`.
-   The answer is an attest on the goal's assignment in the owner-verdict shape:
-   `tightbeam attest <goalAssignmentId> --kind verdict --verdict spirit-accepted --note "<basis>"`,
-   or `--verdict changes-requested` with what the spirit refuses. An unanswered
+   If the work item already carries the product owner's spirit verdict for its current
+   intent, every implementation slice inherits it; do not ask again as the work is
+   decomposed. Otherwise, the work item does not integrate until the product owner has
+   answered one spirit summary. Wake the owner with what changed in product terms,
+   which Spirit clauses it serves, and what it forecloses. Keep revisions on that same
+   spirit-review assignment. The answer is an attest on that assignment, and its
+   verdict name is exact because the dispatch rail reads it:
+   `tightbeam attest <spiritAssignmentId> --kind verdict --verdict spirit-approved --note "<basis>"`,
+   or `--verdict changes-requested` with what the spirit refuses. `spirit-accepted`
+   releases nothing: `spec-dispatch-requires-spirit` denies every slice dispatch on a
+   spec-backed work item until a `spirit-approved` verdict lands on it. An unanswered
    gate queues the merge indefinitely — that wait is the accepted cost; chase it
    up the existing wake rungs, never around the gate. An answer from before
-   integration is stale where integration changed the product-visible semantics,
-   exactly as a code review is. When you cannot tell which side a goal falls on,
+   integration is stale where integration changed the product-visible semantics; revise
+   the same work-item spirit review instead of opening one per slice. When you cannot
+   tell which side a work item falls on,
    that question goes to the product owner too — the ask costs one wake; a wrong
    guess merges a change the spirit never accepted.
-7. **Integrate.** The coder reconciles the change with main
-   (committing-and-pushing skill); the review that clears the work covers the
-   post-reconciliation result — a review from before integration is stale where
-   integration changed semantics.
-8. **Verification papertrail.** Before a goal completes, the coder verifies the work
-   the way the repository's prose defines verification (its AGENTS.md or equivalent),
+7. **Integrate.** Pin the authorized target tip before reconciliation and hold that
+   exact tip until the reviewed candidate lands. Unrelated target movement is a hold
+   violation to report, not a request to rebuild or reconcile again. The coder follows
+   the committing-and-pushing skill; the review that clears the work covers the
+   post-reconciliation result.
+8. **Verification papertrail.** The coder writes the change first, runs its focused
+   tests next, and then broadens verification only in proportion to its risk. Never
+   require a full-suite baseline before implementation. Before a goal completes, the
+   coder verifies the work the way the repository's prose defines verification (its
+   AGENTS.md or equivalent),
    records the results (output, logs, evidence) as a report artifact on the work item
    with `tightbeam artifact-record`, and files
    `tightbeam attest <assignmentId> --kind verdict --verdict verified` with a note

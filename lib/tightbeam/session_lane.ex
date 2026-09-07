@@ -18,7 +18,7 @@ defmodule Tightbeam.SessionLane do
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, EventLog, Ledger, Placement}
+  alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Ledger, Placement}
 
   defstruct [
     :session_key,
@@ -176,7 +176,7 @@ defmodule Tightbeam.SessionLane do
       )
       when not is_nil(reason) do
     EventLog.lifecycle(state.db, "turn_task_crash", state.session_key, inspect(reason))
-    finalize(state, seq, crash_outcome(reason))
+    finalize(state, seq, crash_outcome(reason, seq))
     {:noreply, maybe_start(%{state | task_ref: nil})}
   end
 
@@ -188,10 +188,26 @@ defmodule Tightbeam.SessionLane do
 
   ## Internals
 
-  defp crash_outcome({%Placement.Refusal{} = refusal, _stacktrace}),
+  defp crash_outcome({%Placement.Refusal{} = refusal, _stacktrace}, _seq),
     do: {:error, refusal.message}
 
-  defp crash_outcome(_reason), do: {:error, :task_crash}
+  defp crash_outcome(reason, seq) do
+    record = fn txn ->
+      Tightbeam.HarnessHealth.observe_terminal_in_txn(
+        txn,
+        seq,
+        "task_crash",
+        "turn task crashed: #{inspect(reason, limit: 20)}",
+        "process:tightbeam"
+      )
+    end
+
+    committed = fn publication ->
+      if is_function(publication, 0), do: publication.()
+    end
+
+    {:error, %{reason: :task_crash, record_in_txn: record, after_commit: committed}}
+  end
 
   defp maybe_start(%{task_ref: ref} = state) when not is_nil(ref), do: state
 
@@ -207,6 +223,26 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp claim_and_start(state) do
+    if harness_parked?(state) do
+      state
+    else
+      claim_next(state)
+    end
+  end
+
+  defp harness_parked?(state) do
+    case DB.query(state.db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [
+           state.session_key
+         ]) do
+      {:ok, [[harness, host]]} ->
+        HarnessProcess.parked?(state.db, {Harness.parse!(harness).id(), "shared", host})
+
+      {:ok, []} ->
+        false
+    end
+  end
+
+  defp claim_next(state) do
     case Ledger.claim_next(state.db, state.session_key, "lane:#{inspect(self())}") do
       {:ok, turn} ->
         runner = state.runner
@@ -247,32 +283,40 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp finalize(state, seq, outcome) do
-    {terminal, error, publish, in_txn} =
+    {terminal, error, publish, in_txn, after_commit} =
       case outcome do
         {:ok, %{terminal_publish: fun, record_in_txn: action}}
         when is_function(fun, 1) and is_function(action, 1) ->
-          {"delivered", nil, fun, action}
+          after_commit = fn recorded ->
+            if is_function(recorded, 0), do: recorded.()
+          end
+
+          {"delivered", nil, fun, action, after_commit}
 
         {:ok, %{terminal_publish: fun}} when is_function(fun, 1) ->
-          {"delivered", nil, fun, nil}
+          {"delivered", nil, fun, nil, nil}
 
         {:ok, _} ->
-          {"delivered", nil, nil, nil}
+          {"delivered", nil, nil, nil, nil}
 
         {:error, %{reason: reason, terminal_publish: fun, record_in_txn: action}}
         when is_function(fun, 1) and is_function(action, 1) ->
-          {"failed", error_text(reason), fun, action}
+          {"failed", error_text(reason), fun, action, nil}
+
+        {:error, %{reason: reason, record_in_txn: action, after_commit: committed}}
+        when is_function(action, 1) and is_function(committed, 1) ->
+          {"failed", error_text(reason), nil, action, committed}
 
         {:error, %{reason: reason, terminal_publish: fun}} when is_function(fun, 1) ->
-          {"failed", error_text(reason), fun, nil}
+          {"failed", error_text(reason), fun, nil, nil}
 
         {:error, reason} ->
-          {"failed", error_text(reason), nil, nil}
+          {"failed", error_text(reason), nil, nil, nil}
       end
 
-    {finish_result, post_commit} =
+    {finish_result, recorded} =
       if in_txn do
-        {:ok, {won, post_commit}} =
+        {:ok, {won, recorded}} =
           DB.transaction(state.db, fn txn ->
             if Ledger.finish_in_txn(txn, seq, terminal, error) do
               {true, in_txn.(txn)}
@@ -281,14 +325,14 @@ defmodule Tightbeam.SessionLane do
             end
           end)
 
-        {if(won, do: :ok, else: :already_terminal), post_commit}
+        {if(won, do: :ok, else: :already_terminal), recorded}
       else
         {Ledger.finish(state.db, seq, terminal, error), nil}
       end
 
     case finish_result do
       :ok ->
-        if is_function(post_commit, 0), do: post_commit.()
+        if is_function(after_commit, 1), do: after_commit.(recorded)
 
         if publish do
           publish.(terminal)

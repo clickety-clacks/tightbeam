@@ -133,6 +133,59 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "served neutral identity excludes engineering vocabulary", ctx do
+    assert :initialized = Identity.init!(ctx.base_dir)
+
+    forbidden = [
+      {"worktree", ~r/\bworktrees?\b/i},
+      {"branch", ~r/\bbranch(es)?\b/i},
+      {"spec", ~r/\bspecs?\b/i},
+      {"feature", ~r/\bfeatures?\b/i},
+      {"bug", ~r/\bbugs?\b/i},
+      {"product-owner", ~r/\bproduct[- ]owners?\b/i},
+      {"orchestrator", ~r/\borchestrators?\b/i},
+      {"coder", ~r/\bcoders?\b/i}
+    ]
+
+    for {concept, pattern} <- forbidden do
+      assert Regex.match?(pattern, concept),
+             "forbidden pattern does not match its singular concept #{concept}"
+    end
+
+    assert Regex.match?(
+             forbidden
+             |> Enum.find_value(fn
+               {"branch", pattern} -> pattern
+               _ -> nil
+             end),
+             "branches"
+           )
+
+    baseline_skill_names = Tightbeam.Homes.baseline_skill_names()
+    assert length(baseline_skill_names) == 9
+
+    baseline_skill_bodies =
+      Enum.map(baseline_skill_names, fn skill ->
+        Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
+        |> File.read!()
+      end)
+
+    for harness <- [:claude, :codex] do
+      snapshot = Identity.snapshot!(ctx.base_dir, "default", harness)
+
+      served =
+        Enum.join(
+          [snapshot.guidance | Map.values(snapshot.skills) ++ baseline_skill_bodies],
+          "\n"
+        )
+
+      for {concept, pattern} <- forbidden do
+        refute Regex.match?(pattern, served),
+               "neutral default/#{harness} guidance contains engineering concept #{concept}"
+      end
+    end
+  end
+
   test "the operating manual names the shell as the path to every substrate verb" do
     manual = Archetypes.builtin_fragments()["operating-manual.md"]
     assert manual =~ "shell tool"
@@ -141,6 +194,41 @@ defmodule Tightbeam.ArchetypesTest do
     refute manual =~ "--role reviewer"
     refute manual =~ "--role coder"
     refute manual =~ "worktree-session"
+  end
+
+  @tag timeout: 180_000
+  test "the finished-work carry law is single-homed and served to owner projections", ctx do
+    heading = "## Carry finished work to a line"
+    manual = Archetypes.builtin_fragments()["operating-manual.md"]
+
+    assert manual =~ heading
+    assert manual =~ "No row holds a release line and no verb binds one"
+    assert manual =~ "The default is both active lines"
+    assert manual =~ "names the principal who must clear it"
+    assert manual =~ "This duty does not transfer to the user"
+    assert manual =~ ~s("done awaiting target" and "candidate remains unintegrated")
+
+    for role <- ~w(product-owner orchestrator) do
+      role_guidance =
+        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/guidance/#{role}.md")
+        |> File.read!()
+
+      assert role_guidance =~ "the operating manual's finished-work carry"
+      refute role_guidance =~ heading
+      refute role_guidance =~ "The default is both active lines"
+    end
+
+    Identity.init!(ctx.base_dir)
+    assert {:ok, _revision} = learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+    revision = Identity.live_revision!(ctx.base_dir)
+
+    for role <- ~w(product-owner orchestrator), harness <- [:codex, :claude] do
+      served = Identity.snapshot_at!(ctx.base_dir, revision, role, harness).guidance
+
+      assert length(String.split(served, heading)) == 2
+      assert served =~ "the operating manual's finished-work carry"
+      refute Regex.match?(~r/^#include/m, served)
+    end
   end
 
   test "the shipped bundle loads role guidance and elected shared skills", ctx do
@@ -152,7 +240,7 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(coder default orchestrator product-owner recon reviewer spec-writer)
+             ~w(coder default orchestrator product-owner recon reviewer-code reviewer-spec spec-writer)
 
     assert loaded["product-owner"].skills == [
              "worktree-session",
@@ -161,8 +249,31 @@ defmodule Tightbeam.ArchetypesTest do
              "human-communication"
            ]
 
-    for role <- ~w(coder orchestrator product-owner reviewer) do
+    for role <- ~w(coder orchestrator product-owner reviewer-code reviewer-spec) do
       assert "worktree-session" in loaded[role].skills
+    end
+
+    refute Map.has_key?(loaded, "reviewer")
+
+    for role <- ~w(reviewer-code reviewer-spec) do
+      refute Enum.any?(loaded[role].skills, &String.starts_with?(&1, "review"))
+      refute "spec-conformance" in loaded[role].skills
+    end
+
+    refute File.exists?(
+             Application.app_dir(
+               :tightbeam,
+               "priv/kungfu/agentic-engineering/archetypes/reviewer.toml"
+             )
+           )
+
+    for skill <- ~w(reviewing-code reviewing-specs) do
+      refute File.dir?(
+               Application.app_dir(
+                 :tightbeam,
+                 "priv/kungfu/agentic-engineering/skills/#{skill}"
+               )
+             )
     end
 
     coder =
@@ -240,6 +351,28 @@ defmodule Tightbeam.ArchetypesTest do
 
       assert served =~ "# Tightbeam · #{archetype.name}\n\n#{@golden_rule}"
       refute served =~ ~s(#include ")
+    end
+  end
+
+  # V9 re-homes the verdict-note law in shared guidance for both review roles.
+  # The spec-conformance skill assertions drop because neither role elects it.
+  # The artifact requirement survives as the command, not the retired sentence.
+  test "both reviewing archetypes serve the bounded verdict-note law", ctx do
+    Identity.init!(ctx.base_dir)
+
+    assert {:ok, _revision} =
+             learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
+
+    revision = Identity.live_revision!(ctx.base_dir)
+
+    for role <- ~w(reviewer-code reviewer-spec) do
+      guidance = Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).guidance
+
+      assert guidance =~ "The verdict note has a 2,000-character cap"
+      assert guidance =~ "report artifact's id and SHA-256"
+      assert guidance =~ ~r/Do not copy the clause table into the\s+note/
+      assert guidance =~ "tightbeam artifact-record --kind report"
+      assert guidance =~ "--work-item <workItemId>"
     end
   end
 

@@ -1,5 +1,9 @@
 # Preferred models — substrate
 
+The org owns this table; retune it through an identity edit, not by deference to
+whoever wrote it. It is the only model-selection guidance: there is no separate
+policy table.
+
 Two parts: CAPSULES (the org's working set — the minds we actually use, characterized
 once each) and the SUBSTRATE'S OWN ACTIVITIES. Kungfu-owned activities live in each
 bundle's `kungfu/<name>/preferred-models.md`. The working set is deliberately small:
@@ -43,11 +47,13 @@ do it.
 
 Decide at spawn AND again whenever a mind fails you mid-work. Try each candidate once:
 a refused spawn or a harness out of tokens advances you one place to the right, never
-back to the same candidate. If qualification is ambiguous, stop and ask your parent to
-adjudicate it; do not guess. When no mind on the list is available, follow
-`model-policy.md`'s three moves: switch is off the table by definition, so have your
-parent assert `work-blocked` over the affected session and report up, or surface the
-credential need to the user. Never a silent stall, never a retry loop against a wall.
+back to the same candidate. If qualification is ambiguous, use the recorded model
+policy; do not guess. When no mind on the list is available, the list has produced a
+named capability block: record the attempted rungs and evidence on the affected
+assignment, keep separable work moving, and schedule a re-check. Do not report up
+merely because the list ended; Main is never a model fallback. A responsible owner
+surfaces a real credential need to the user only through the normal exception path.
+Never a silent stall, never a retry loop against a wall.
 
 ## Substrate activities
 

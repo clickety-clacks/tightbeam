@@ -477,6 +477,37 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![],
             vec![string_field("assignmentId", assignment_id)],
         )),
+        Command::RepairAssignment {
+            identity,
+            assignment_id,
+            action,
+            model,
+            effort,
+            context,
+            outcome,
+            turn_seq,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("assignmentId", assignment_id),
+                string_field("action", action),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+            for (name, value) in [
+                ("model", model),
+                ("effort", effort),
+                ("context", context),
+                ("outcome", outcome),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            if let Some(value) = turn_seq {
+                params.push(format!("\"turnSeq\":{value}"));
+            }
+            Ok(request(identity, "repair-assignment", vec![], params))
+        }
         Command::WorkItemCreate {
             identity,
             title,
@@ -503,16 +534,32 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::WorkItemUpdate {
             identity,
             work_item_id,
+            title,
+            spec_ref_name,
+            spec_ref_sha256,
+            clear_spec_ref,
             priority,
-        } => Ok(request(
-            identity,
-            "work-item-update",
-            vec![],
-            vec![
-                string_field("workItemId", work_item_id),
-                format!("\"priority\":{priority}"),
-            ],
-        )),
+        } => {
+            let mut params = vec![string_field("workItemId", work_item_id)];
+            if let Some(value) = title {
+                params.push(string_field("title", value));
+            }
+            if *clear_spec_ref {
+                params.push("\"specRefName\":null".to_owned());
+                params.push("\"specRefSha256\":null".to_owned());
+            } else {
+                if let Some(value) = spec_ref_name {
+                    params.push(string_field("specRefName", value));
+                }
+                if let Some(value) = spec_ref_sha256 {
+                    params.push(string_field("specRefSha256", value));
+                }
+            }
+            if let Some(value) = priority {
+                params.push(format!("\"priority\":{value}"));
+            }
+            Ok(request(identity, "work-item-update", vec![], params))
+        }
         Command::WorkItemGet {
             identity,
             work_item_id,
@@ -579,7 +626,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if *tree {
                 params.push("\"tree\":true".to_owned());
             }
-            Ok(request(identity, "toplines", vec![], params))
+            Ok(request(identity, "execution-map", vec![], params))
         }
         // Every selector travels as an ordinary body PARAM: both verbs are declared
         // non-target at the router, and --session is a COHORT FILTER over creator
@@ -598,7 +645,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         } => {
             let mut params = filter_params(filters);
             params.push(string_field("under", work_item_id));
-            Ok(request(identity, "topline", vec![], params))
+            Ok(request(identity, "execution-map-select", vec![], params))
         }
         Command::Topline {
             identity,
@@ -611,13 +658,44 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
 
             Ok(request(
                 identity,
-                "topline",
+                "execution-map-select",
                 vec![],
                 vec![format!(
                     "\"assignments\":{}",
                     serde_json::Value::Array(list)
                 )],
             ))
+        }
+        Command::ToplineMutation {
+            identity,
+            verb,
+            params,
+        } => Ok(request(
+            identity,
+            verb,
+            vec![],
+            params
+                .iter()
+                .map(|(name, value)| string_field(name, value))
+                .collect(),
+        )),
+        Command::DurableToplines { identity, state } => {
+            let params = state
+                .as_ref()
+                .map(|value| vec![string_field("state", value)])
+                .unwrap_or_default();
+            Ok(request(identity, "toplines", vec![], params))
+        }
+        Command::DurableTopline {
+            identity,
+            topline_id,
+            history,
+        } => {
+            let mut params = vec![string_field("toplineId", topline_id)];
+            if *history {
+                params.push("\"history\":true".to_owned());
+            }
+            Ok(request(identity, "topline", vec![], params))
         }
         Command::WorkItemIcebox {
             identity,
@@ -1535,6 +1613,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::DecisionRequests { identity, .. }
         | Command::DecisionRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
+        | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
@@ -1543,6 +1622,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Transcript { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
+        | Command::ToplineMutation { identity, .. }
+        | Command::DurableToplines { identity, .. }
+        | Command::DurableTopline { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
@@ -2214,6 +2296,7 @@ mod tests {
     #[test]
     fn builds_byte_exact_work_item_bodies() {
         let sha = "a".repeat(64);
+        let class_a_sha = "d4e8260c8a82faf07ab2659e1f317bef961441af6ba43a4b9d1ef62fa01d4b86";
         assert_eq!(
             body(&[
                 "work-item-create",
@@ -2233,6 +2316,69 @@ mod tests {
         assert_eq!(
             body(&["work-item-get", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&["work-item-update", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "Retitled",
+                "--spec-sha256",
+                &sha,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Retitled","specRefSha256":"{sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "Together",
+                "--spec-ref",
+                "governing.md",
+                "--spec-sha256",
+                &sha,
+                "--priority",
+                "7",
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Together","specRefName":"governing.md","specRefSha256":"{sha}","priority":7}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_6d418db1-26b4-4ad0-9886-86e757e93342",
+                "--spec-ref",
+                "patrol-failure-classification-and-escalation-v1.md",
+                "--spec-sha256",
+                class_a_sha,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_6d418db1-26b4-4ad0-9886-86e757e93342","specRefName":"patrol-failure-classification-and-escalation-v1.md","specRefSha256":"{class_a_sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null}}"#
         );
         assert_eq!(
             body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),
@@ -2274,6 +2420,18 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","priority":2}}"#
         );
         assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--priority",
+                "1",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null,"priority":1}}"#
+        );
+        assert_eq!(
             body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-icebox","params":{"workItemId":"wi_1"}}"#
         );
@@ -2296,6 +2454,166 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"work-item-fail","params":{"workItemId":"wi_1","reason":"cannot repro"}}"#
         );
+    }
+
+    #[test]
+    fn builds_byte_exact_durable_topline_bodies() {
+        for (argv, expected) in [
+            (
+                &["toplines", "--state", "open", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"toplines","params":{"state":"open"}}"#,
+            ),
+            (
+                &["topline", "tl_1", "--history", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"topline","params":{"toplineId":"tl_1","history":true}}"#,
+            ),
+            (
+                &[
+                    "topline-work-leave-unlinked",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-work-leave-unlinked","params":{"workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-placement-list",
+                    "--state",
+                    "resolved",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-placement-list","params":{"state":"resolved"}}"#,
+            ),
+            (
+                &[
+                    "topline-create",
+                    "--title",
+                    "Ship",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-create","params":{"title":"Ship","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-update",
+                    "tl_1",
+                    "--title",
+                    "Ship",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-update","params":{"toplineId":"tl_1","title":"Ship","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-close",
+                    "tl_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-close","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-reopen",
+                    "tl_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-reopen","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-link-work",
+                    "tl_1",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-link-work","params":{"toplineId":"tl_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-unlink-work",
+                    "tlm_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-unlink-work","params":{"membershipId":"tlm_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-concern-create",
+                    "tl_1",
+                    "--title",
+                    "Risk",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-concern-create","params":{"toplineId":"tl_1","title":"Risk","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-concern-link-work",
+                    "tlc_1",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-concern-link-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-concern-unlink-work",
+                    "tlc_1",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-concern-unlink-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+        ] {
+            assert_eq!(body(argv), expected);
+        }
     }
 
     #[test]
