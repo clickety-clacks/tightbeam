@@ -36,6 +36,93 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     refute source =~ "{:adapter_for, key}, 30_000"
   end
 
+  test "gateway turn checkout reuses an ordinary live adapter while initialize is pending", ctx do
+    path = Path.join(ctx.test_dir, "slow-untracked.js")
+    marker = Path.join(ctx.test_dir, "slow-untracked.initializing")
+
+    File.write!(path, """
+    const fs = require("node:fs");
+    const rl = require("node:readline").createInterface({ input: process.stdin });
+    rl.on("line", (line) => {
+      const m = JSON.parse(line);
+      if (m.method === "initialize") {
+        fs.writeFileSync(#{JSON.encode!(marker)}, "pending");
+      }
+    });
+    """)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :ordinary_pending_untracked_coordinator}
+      )
+
+    key = {:claude, "shared", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert eventually(fn -> File.exists?(marker) end)
+    refute AdapterCoordinator.ready?(coordinator, key)
+    assert {:ok, ^adapter, 1} = AdapterCoordinator.adapter_for_turn(coordinator, key)
+    assert DynamicSupervisor.count_children(ctx.sup).active == 1
+  end
+
+  test "gateway turn checkout reuses a tracked ordinary adapter during initialize", ctx do
+    path = Path.join(ctx.test_dir, "slow-tracked.js")
+    marker = Path.join(ctx.test_dir, "slow-tracked.initializing")
+
+    File.write!(path, """
+    const fs = require("node:fs");
+    const rl = require("node:readline").createInterface({ input: process.stdin });
+    rl.on("line", (line) => {
+      const m = JSON.parse(line);
+      if (m.method === "initialize") {
+        fs.writeFileSync(#{JSON.encode!(marker)}, "pending");
+      }
+    });
+    """)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :claude,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir,
+             stderr_path: Path.join(ctx.test_dir, "slow-tracked.stderr"),
+             process_identity_dir: ctx.test_dir,
+             process_helper: @process_helper
+           ]
+         end,
+         db: ctx.db,
+         name: :ordinary_pending_tracked_coordinator}
+      )
+
+    key = {:claude, "shared", "testhost"}
+    assert {:ok, adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    assert eventually(fn -> File.exists?(marker) end)
+    refute AdapterCoordinator.ready?(coordinator, key)
+
+    assert [%{state: "running", resolved_at: nil}] =
+             AdapterCoordinator.harness_processes(coordinator)
+
+    assert {:ok, ^adapter, 1} = AdapterCoordinator.adapter_for_turn(coordinator, key)
+    assert DynamicSupervisor.count_children(ctx.sup).active == 1
+  end
+
   test "typed launch refusal is coalesced and never starts an adapter child", ctx do
     parent = self()
     refusal = %{code: "DIV-CURSOR-API-KEY-ONLY", message: "Cursor requires a banked API key"}

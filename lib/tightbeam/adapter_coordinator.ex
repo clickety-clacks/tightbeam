@@ -249,7 +249,7 @@ defmodule Tightbeam.AdapterCoordinator do
     entry = Map.get(state.adapters, key, fresh_entry())
 
     cond do
-      ready_entry?(entry) ->
+      reusable_entry?(entry) ->
         {:reply, checkout(entry), state}
 
       readiness_pending?(entry) ->
@@ -356,7 +356,7 @@ defmodule Tightbeam.AdapterCoordinator do
             {:reply, error, state}
         end
 
-      ready_entry?(entry) ->
+      reusable_entry?(entry) ->
         {:reply, checkout(entry), state}
 
       readiness_pending?(entry) ->
@@ -1021,6 +1021,9 @@ defmodule Tightbeam.AdapterCoordinator do
 
   defp ready_entry?(entry),
     do: entry.ready == true and is_pid(entry.pid) and Process.alive?(entry.pid)
+
+  defp reusable_entry?(entry),
+    do: ready_entry?(entry) or (not entry.rendezvous and live_entry?(entry))
 
   defp readiness_pending?(entry),
     do:
