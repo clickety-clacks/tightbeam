@@ -9873,6 +9873,12 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp make_model_unknown(db, session_key) do
+    {:ok, [[sidecar_trigger]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+      )
+
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
 
     try do
@@ -9880,11 +9886,13 @@ defmodule Tightbeam.GatewayTest do
         DB.execute(
           db,
           """
+          DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
           CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
           DROP TABLE sessions;
           ALTER TABLE sessions_with_unknown RENAME TO sessions;
           CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
           UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
+          #{sidecar_trigger};
           """
         )
     after

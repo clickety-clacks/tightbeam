@@ -2660,9 +2660,11 @@ defmodule Tightbeam.ConformanceSupport do
 
               cond do
                 fixture["name"] == "busy-or-queued-no-sweep" ->
-                  assert result == :busy
-                  assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
-                  refute lifecycle_kind?(db, "rail_sweep")
+                  # C-R1: this fixture's unscoped queued turn does not cover
+                  # the open obligation. Normal sweep evaluation re-obligates it.
+                  assert result == {:prodded, 1}
+                  assert %{prodCount: 1} = Supervision.prod_state(db, assignment_id)
+                  assert sweep_decision?(db, session_key, rule, "re-obligate")
 
                 self_wake?(db, call) ->
                   assert result == :continuation
