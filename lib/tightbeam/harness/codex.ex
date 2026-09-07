@@ -57,7 +57,11 @@ defmodule Tightbeam.Harness.Codex do
   # the adapter, `initialize`, `session/new`, then confirm each candidate with
   # `session/set_config_option {configId: "model"}`. Update this table and
   # `@adapter_version` together.
-  @adapter_selectable_models ~w(gpt-5.6-sol)
+  # Codex 0.153.2's API-key model/list marks Astra hidden, although the API
+  # serves it. The adapter patch below opts in only that hidden model. Recorded
+  # model/list metadata and the validation limits live in docs/astra-api-hotfix.md.
+  @adapter_selectable_models ~w(gpt-5.6-sol gpt-6-astra)
+  @api_key_efforts %{"gpt-6-astra" => ~w(low medium high xhigh max ultra)}
 
   # The gate probe's own model, as fields — it crosses the adapter seam like any
   # other selection.
@@ -65,6 +69,10 @@ defmodule Tightbeam.Harness.Codex do
 
   @adapter_bundle "index.js"
   @adapter_replacements [
+    {
+      "      const response = await this.codexClient.listModels({ cursor, limit: null });\n      models.push(...response.data);",
+      "      const response = await this.codexClient.listModels({ cursor, limit: null, includeHidden: true });\n      models.push(...response.data.filter((model) => !model.hidden || model.id === \"gpt-6-astra\"));"
+    },
     {
       "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd\n",
       "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd,\n      developerInstructions: request._meta?.developerInstructions\n"
@@ -853,10 +861,10 @@ defmodule Tightbeam.Harness.Codex do
   # route's: `{"data": [{"id": …, "object": "model", …}]}`. No display name, no
   # `supported_reasoning_levels`, no context window. So this is a SECOND
   # derivation, not a second decoder feeding one, and the catalog it produces is
-  # honestly thinner: bare ids, no effort tiers, no token ceiling. A session on
-  # such a catalog reports `canChangeReasoning: false`, which is correct —
-  # nothing here knows what efforts the model offers, and inventing tiers would
-  # advertise a control that does not work.
+  # thinner: bare ids and no token ceiling. Astra alone carries the effort
+  # values recorded from the pinned engine's model/list metadata; this preserves
+  # existing medium/high selections after API-key onboarding. Other entries
+  # remain untiered rather than inferring controls from their names.
   #
   # OBSERVED LIVE 2026-07-28 (the #89 api-key exercise): 125 entries in exactly
   # this shape, bare ids under "data".
@@ -872,7 +880,7 @@ defmodule Tightbeam.Harness.Codex do
                 context: nil,
                 display_name: id,
                 name: id,
-                efforts: [],
+                efforts: Map.get(@api_key_efforts, id, []),
                 max_input_tokens: nil,
                 capabilities: %{},
                 provider: :openai

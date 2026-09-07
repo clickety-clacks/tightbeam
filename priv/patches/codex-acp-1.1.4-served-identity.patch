@@ -16,3 +16,12 @@ Upstreamable changes:
 The executable, idempotent form lives in Tightbeam.Harness.Codex because
 codex-acp is installed per host at runtime rather than committed in this
 repository.
+
+Astra API-key discovery hotfix:
+
+4. In CodexAcpClient.fetchAvailableModels, request model/list with
+   includeHidden: true, then retain only !model.hidden or id === "gpt-6-astra".
+   Preserve pagination and the engine's exact metadata. Codex 0.153.2 marks
+   Astra hidden in API-key mode; do not expose other hidden entries or synthesize
+   missing models. See docs/astra-api-hotfix.md for recorded evidence and the
+   remaining release gates.
