@@ -42,6 +42,12 @@ defmodule Tightbeam.FeatureSmokeHomeTest do
       "sessions/2159598.b1226807dd39786332307f7b370d0d000a05d4106ec7f1724ba71d59e1e9b225.key"
 
     assert Tightbeam.Harness.Codex.native_home_entry?(codex_lock)
+
+    assert Tightbeam.Harness.Codex.native_home_entry?(
+             ".tmp/plugins/plugins/zoom/skills/virtual-agent/ios/examples/js-bridge-patterns.md"
+           )
+
+    refute Tightbeam.Harness.Codex.native_home_entry?(".tmp/unexpected.txt")
     assert Tightbeam.Harness.Codex.native_home_entry?("tmp/arg0/codex-arg0kNZker/.lock")
     refute Tightbeam.Harness.Codex.native_home_entry?("tmp/arg0/unexpected/.lock")
     refute Tightbeam.Harness.Claude.native_home_entry?(codex_lock)

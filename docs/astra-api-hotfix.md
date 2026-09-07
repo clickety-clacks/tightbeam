@@ -162,6 +162,24 @@ authentication separately if it was changed. This restores original module and
 adapter bytes; it does not undo later conversation turns or credential changes.
 The overlay changes no schema, so it requires no reverse migration.
 
+A final engine audit found that the host's global npm executable had advanced to
+0.153.4 during the work. That path was not treated as a 0.153.2 pin. Validation
+was repeated using a dedicated versioned 0.153.2 installation, with its native
+executable version and hash recorded and the running app-server executable
+checked. Production instructions must set CODEX_PATH to that dedicated location
+before the maintenance restart; do not assume a global npm path stays pinned.
+The native plugin cache populated during fresh-home testing is engine-owned;
+the census permits only that cache subtree, while unrelated temporary files
+remain rejected.
+
+The narrow production-source backport's full suite ran 1,699 tests and 9
+doctests with three failures and 11 skips. All three failures reproduced on the
+unchanged production source: two depend on a Darwin-only Cursor listener probe
+and one requires a different pinned Cursor acceptance fixture than the host
+has installed. The backport's 27 focused Codex/catalog tests passed. These
+baseline limitations are not hidden or fixed by this Codex-only overlay;
+upstream maintenance CI and its full live matrix are separate passing gates.
+
 Keep the bundle manifest, original bytes, source patch, and validation evidence
 with the deployment record. Review and remove the overlay when an official
 release replaces it. Maintenance-owner approval remains the merge/release step;

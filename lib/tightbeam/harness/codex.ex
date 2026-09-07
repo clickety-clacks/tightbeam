@@ -257,6 +257,8 @@ defmodule Tightbeam.Harness.Codex do
   # Recorded native runtime paths from Codex 0.153.2. These are engine-owned,
   # not entries produced by Tightbeam home projection.
   @native_home_patterns [
+    # The engine populates this downloaded plugin cache asynchronously on first use.
+    ~r"\A\.tmp/plugins/.+\z",
     ~r"\Asessions/\d{4}/\d{2}/\d{2}/rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl\z",
     ~r"\Ashell_snapshots/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.\d+\.sh\z",
     ~r"\Atmp/arg0/codex-arg0[A-Za-z0-9]+/\.lock\z",
