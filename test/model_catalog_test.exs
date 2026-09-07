@@ -8,7 +8,6 @@ defmodule Tightbeam.ModelCatalogTest do
 
   @fixtures Path.join(__DIR__, "fixtures/model_catalog")
   @host "testhost"
-  @claude_secret "sk-ant-oat01-NEVER-ON-A-COMMAND-LINE"
   @codex_secret "ey-codex-access-NEVER-ON-A-COMMAND-LINE"
 
   setup do
@@ -24,17 +23,7 @@ defmodule Tightbeam.ModelCatalogTest do
       ~s({"claudeAiOauth":{"accessToken":"fixture-token"}})
     )
 
-    claude_json = fixture_body("claude_models.jsonc")
-    claude_detail_json = fixture_body("claude_model_detail.jsonc")
     codex_json = fixture_body("codex_models.jsonc")
-
-    claude_fetch = fn
-      "/v1/models?limit=100", _headers ->
-        {:ok, claude_json}
-
-      "/v1/models/claude-haiku-4-5-20251001", _headers ->
-        {:ok, claude_detail_json}
-    end
 
     # Codex has no local-file path any more: on every host the catalog is one
     # HTTPS call the host itself makes, so the seam is the runner, not a reader.
@@ -48,13 +37,13 @@ defmodule Tightbeam.ModelCatalogTest do
     %{
       base_dir: base_dir,
       db: db,
-      claude_fetch: claude_fetch,
       codex_json: codex_json,
       codex_sh: codex_sh
     }
   end
 
-  test "derives consumed Claude and Codex fields from provider captures", ctx do
+  test "derives consumed Claude fields from the manifest and Codex fields from its capture",
+       ctx do
     catalog = start_catalog(ctx)
     await_fresh(catalog, "claude")
     await_fresh(catalog, "codex")
@@ -63,7 +52,7 @@ defmodule Tightbeam.ModelCatalogTest do
     {codex, :fresh} = ModelCatalog.get(@host, "codex", catalog)
 
     opus = Enum.find(claude, &(&1.family == "claude-opus-5"))
-    assert opus.display_name == "Claude Opus 5"
+    assert opus.display_name == "Opus 5"
     assert opus.max_input_tokens == 1_000_000
     assert opus.context == nil
     assert MapSet.new(opus.efforts) == MapSet.new(["low", "medium", "high", "xhigh", "max"])
@@ -84,43 +73,29 @@ defmodule Tightbeam.ModelCatalogTest do
            ]) ==
              "medium"
 
-    refute Enum.any?(claude ++ codex, &(&1.context != nil))
+    assert Enum.any?(claude, &(&1.context == "1m"))
+    refute Enum.any?(codex, &(&1.context != nil))
   end
 
-  # THE DEFECT, at the catalog. Anthropic spells a context-window variant
-  # `claude-fable-5[1m]`; Tightbeam used to spell a reasoning level the same
-  # way. The catalog read the vendor's bracket as ours — it stripped `[1m]`,
-  # discarded that it existed, and re-attached our five effort levels — so the
-  # 1M-context model silently ceased to exist and no operator could ask for it.
-  test "a vendor context variant is its own model, with our efforts attached to it", ctx do
-    fetch = fn "/v1/models?limit=100", _headers ->
-      {:ok,
-       JSON.encode!(%{
-         "data" => [
-           context_variant_model("claude-fable-5"),
-           context_variant_model("claude-fable-5[1m]")
-         ]
-       })}
-    end
-
-    catalog = start_catalog(ctx, claude_fetch: fetch)
+  test "a manifest context variant is its own model with the profile efforts", ctx do
+    catalog = start_catalog(ctx)
     await_fresh(catalog, "claude")
     {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
 
-    assert Enum.map(claude, &{&1.family, &1.context}) == [
-             {"claude-fable-5", nil},
-             {"claude-fable-5", "1m"}
-           ]
+    fable = Enum.filter(claude, &(&1.family == "claude-fable-5-1"))
+
+    assert Enum.map(fable, &{&1.family, &1.context}) ==
+             [{"claude-fable-5-1", nil}, {"claude-fable-5-1", "1m"}]
 
     # The context variant carries OUR efforts, and `1m` is not one of them.
-    wide = Enum.find(claude, &(&1.context == "1m"))
-    assert MapSet.new(wide.efforts) == MapSet.new(["low", "high"])
+    wide = Enum.find(fable, &(&1.context == "1m"))
+    assert MapSet.new(wide.efforts) == MapSet.new(["low", "medium", "high", "xhigh", "max"])
 
     assert {:ok, %{entry: %{context: "1m"}}} =
              ModelCatalog.route(
                @host,
                "claude",
-               Model.new("claude-fable-5", context: "1m", effort: "high"),
+               Model.new("claude-fable-5-1", context: "1m", effort: "high"),
                catalog
              )
 
@@ -129,7 +104,7 @@ defmodule Tightbeam.ModelCatalogTest do
              ModelCatalog.route(
                @host,
                "claude",
-               Model.new("claude-fable-5", effort: "high"),
+               Model.new("claude-fable-5-1", effort: "high"),
                catalog
              )
 
@@ -139,127 +114,9 @@ defmodule Tightbeam.ModelCatalogTest do
              ModelCatalog.route(
                @host,
                "claude",
-               Model.new("claude-fable-5", effort: "1m"),
+               Model.new("claude-fable-5-1", effort: "1m"),
                catalog
              )
-  end
-
-  defp context_variant_model(id) do
-    %{
-      "type" => "model",
-      "id" => id,
-      "display_name" => "Claude Fable 5",
-      "max_input_tokens" => 1_000_000,
-      "capabilities" => %{
-        "effort" => %{
-          "supported" => true,
-          "low" => %{"supported" => true},
-          "high" => %{"supported" => true}
-        }
-      }
-    }
-  end
-
-  test "fills a summary row from the captured Claude detail body", ctx do
-    summary =
-      "claude_models.jsonc"
-      |> fixture_json()
-      |> Map.fetch!("data")
-      |> Enum.find(&(&1["id"] == "claude-haiku-4-5-20251001"))
-      |> Map.delete("capabilities")
-
-    list_body = JSON.encode!(%{"data" => [summary]})
-    detail_body = fixture_body("claude_model_detail.jsonc")
-
-    claude_fetch = fn
-      "/v1/models?limit=100", _headers -> {:ok, list_body}
-      "/v1/models/claude-haiku-4-5-20251001", _headers -> {:ok, detail_body}
-    end
-
-    catalog = start_catalog(ctx, claude_fetch: claude_fetch)
-    await_fresh(catalog, "claude")
-
-    assert {[%{family: "claude-haiku-4-5-20251001", context: nil} = entry], :fresh} =
-             ModelCatalog.get(@host, "claude", catalog)
-
-    assert entry.display_name == "Claude Haiku 4.5"
-    assert entry.max_input_tokens == 200_000
-    assert get_in(entry.capabilities, ["thinking", "supported"])
-  end
-
-  test "claude preserves every provider capability without imposing a tier allowlist", ctx do
-    claude_json =
-      JSON.encode!(%{
-        data: [
-          %{
-            id: "claude-sort-test",
-            display_name: "Claude Sort Test",
-            max_input_tokens: 1_000_000,
-            capabilities: %{
-              effort: %{
-                xhigh: %{supported: true},
-                max: %{supported: true},
-                low: %{supported: true},
-                ultra: %{supported: true},
-                high: %{supported: true},
-                medium: %{supported: true}
-              }
-            }
-          }
-        ]
-      })
-
-    claude_fetch = fn "/v1/models?limit=100", _headers -> {:ok, claude_json} end
-
-    catalog = start_catalog(ctx, claude_fetch: claude_fetch)
-    await_fresh(catalog, "claude")
-
-    {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
-
-    assert Enum.map(claude, & &1.family) == ["claude-sort-test"]
-
-    assert Enum.sort(hd(claude).efforts) == [
-             "high",
-             "low",
-             "max",
-             "medium",
-             "ultra",
-             "xhigh"
-           ]
-  end
-
-  # Regression: the live endpoint and captured fixture carry an aggregate `supported`
-  # boolean beside the per-level maps. The parser once rejected the whole catalog as
-  # :malformed_catalog on that provider field.
-  test "claude effort parser accepts the live aggregate supported boolean", ctx do
-    claude_json =
-      JSON.encode!(%{
-        data: [
-          %{
-            id: "claude-live-shape",
-            display_name: "Claude Live Shape",
-            max_input_tokens: 1_000_000,
-            capabilities: %{
-              effort: %{
-                supported: true,
-                low: %{supported: true},
-                medium: %{supported: true},
-                high: %{supported: false}
-              }
-            }
-          }
-        ]
-      })
-
-    claude_fetch = fn "/v1/models?limit=100", _headers -> {:ok, claude_json} end
-
-    catalog = start_catalog(ctx, claude_fetch: claude_fetch)
-    await_fresh(catalog, "claude")
-
-    {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
-
-    assert Enum.map(claude, & &1.family) == ["claude-live-shape"]
-    assert Enum.sort(hd(claude).efforts) == ["low", "medium"]
   end
 
   test "codex preserves provider-reported effort order without tier presentation logic", ctx do
@@ -300,59 +157,18 @@ defmodule Tightbeam.ModelCatalogTest do
            ]
   end
 
-  test "mixed valid and unexpectedly shaped rows degrade atomically", ctx do
-    claude_valid = %{
-      id: "claude-valid",
-      display_name: "Claude Valid",
-      max_input_tokens: 200_000,
-      capabilities: %{effort: %{}}
-    }
-
+  test "mixed valid and unexpectedly shaped Codex rows degrade atomically", ctx do
     codex_valid = %{
       slug: "gpt-valid",
       display_name: "GPT Valid",
       supported_reasoning_levels: []
     }
 
-    claude_fetch = fn malformed ->
-      fn "/v1/models?limit=100", _headers ->
-        {:ok, JSON.encode!(%{data: [claude_valid, malformed]})}
-      end
-    end
-
     codex_sh = fn malformed ->
       fn _command -> catalog_reply(JSON.encode!(%{models: [codex_valid, malformed]})) end
     end
 
     for {label, harness, overrides} <- [
-          {:claude_missing_id, "claude",
-           [
-             claude_fetch:
-               claude_fetch.(%{
-                 display_name: "Missing ID",
-                 max_input_tokens: 200_000,
-                 capabilities: %{effort: %{}}
-               })
-           ]},
-          {:claude_missing_max_input_tokens, "claude",
-           [
-             claude_fetch:
-               claude_fetch.(%{
-                 id: "claude-missing-max-input-tokens",
-                 display_name: "Missing Max Input Tokens",
-                 capabilities: %{effort: %{}}
-               })
-           ]},
-          {:claude_null_max_input_tokens, "claude",
-           [
-             claude_fetch:
-               claude_fetch.(%{
-                 id: "claude-null-max-input-tokens",
-                 display_name: "Null Max Input Tokens",
-                 max_input_tokens: nil,
-                 capabilities: %{effort: %{}}
-               })
-           ]},
           {:codex_missing_slug, "codex",
            [
              sh:
@@ -400,17 +216,17 @@ defmodule Tightbeam.ModelCatalogTest do
         start: {Agent, :start_link, [fn -> false end]}
       })
 
-    fetch = fn path, headers ->
+    manifest = fn ->
       if Agent.get(failures, & &1),
         do: {:error, :fetch_failed},
-        else: ctx.claude_fetch.(path, headers)
+        else: manifest_snapshot()
     end
 
     catalog =
       start_catalog(ctx,
         ttl_ms: 10,
         now: fn -> Agent.get(clock, & &1) end,
-        claude_fetch: fetch
+        model_manifest: manifest
       )
 
     await_fresh(catalog, "claude")
@@ -448,13 +264,18 @@ defmodule Tightbeam.ModelCatalogTest do
        base_dir: Path.join(ctx.base_dir, "missing"),
        db: ctx.db,
        sh: ctx.codex_sh,
+       model_manifest: fn -> {:error, :manifest_unavailable} end,
+       claude_code_version: "2.1.257",
        credential_status: fn _provider -> :onboarded end}
     )
 
     await(fn ->
       match?(
         {:error,
-         %Unroutable{cause: :no_catalog, health: [{"claude", {:unavailable, :missing_token}}]}},
+         %Unroutable{
+           cause: :no_catalog,
+           health: [{"claude", {:unavailable, :manifest_unavailable}}]
+         }},
         ModelCatalog.route(@host, "claude", Model.new("anything"), missing)
       )
     end)
@@ -476,7 +297,7 @@ defmodule Tightbeam.ModelCatalogTest do
        base_dir: ctx.base_dir,
        db: ctx.db,
        sh: fn _command -> raise "no probe may run: the credential gate must refuse first" end,
-       claude_fetch: fn _path, _headers ->
+       model_manifest: fn ->
          raise "no probe may run: the credential gate must refuse first"
        end}
     )
@@ -522,223 +343,6 @@ defmodule Tightbeam.ModelCatalogTest do
     assert log =~ "refresh degraded: #{inspect(reason)}"
   end
 
-  test "failed fetch, malformed JSON, and a refused grant degrade without crashing readers",
-       ctx do
-    for {label, opts, harness, reason} <- [
-          {:failed, [claude_fetch: fn _, _ -> {:error, :network_down} end], "claude",
-           :network_down},
-          {:malformed, [claude_fetch: fn _, _ -> {:ok, "{"} end], "claude", :malformed_json},
-          # The vendor's own sentence, verbatim — this is the 401 body the live
-          # endpoint returns for a grant that needs signing in again.
-          {:refused_grant,
-           [
-             sh: fn _command ->
-               catalog_reply(~s({"detail":"Could not parse your authentication token."}), 401)
-             end
-           ], "codex",
-           {:rotation_retry_failed,
-            %{
-              initial_401:
-                {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})},
-              initial_guidance: "sign in again to repair the original 401",
-              retry_failure:
-                {:http_status, 401, ~s({"detail":"Could not parse your authentication token."})}
-            }}}
-        ] do
-      name = unique_name(label)
-      catalog = start_catalog(ctx, Keyword.put(opts, :name, name))
-
-      await(fn -> ModelCatalog.get(@host, harness, catalog) == {[], {:unavailable, reason}} end)
-
-      assert {:error, %Unroutable{cause: :no_catalog}} =
-               ModelCatalog.route(@host, harness, Model.new("absent"), catalog)
-    end
-
-    Archetypes.load!(ctx.base_dir)
-    # org_options is the globals-facing form: it reads the default-named DB.
-    start_supervised!({Tightbeam.DB, path: ":memory:", name: Tightbeam.DB}, id: :global_db)
-    :ok = Placement.ensure_schema(Tightbeam.DB)
-    assert is_map(Gateway.org_options())
-  end
-
-  # Issue #9: Claude Code rotates `.credentials.json` inside the harness home
-  # (write-temp-then-rename), which severs the symlink to the store copy. The
-  # store copy freezes on the pre-rotation token and the provider revokes it,
-  # so every refresh 401s "revoked" against a token that is fine everywhere
-  # else. The store credential here is deliberately stale/wrong; the home
-  # copy under `homes/<host>/claude` is the rotated one the vendor actually
-  # wrote, and only it authenticates -- proving the recovered catalog came
-  # from a real harvest-and-retry, not a lucky second read of the same file.
-  test "a subscription 401 harvests the rotated home credential and retries", ctx do
-    stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
-    File.write!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]), stale_store)
-
-    rotated_home = ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
-    home = Path.join([ctx.base_dir, "homes", @host, "claude"])
-    File.mkdir_p!(home)
-    File.write!(Path.join(home, ".credentials.json"), rotated_home)
-
-    claude_json = fixture_body("claude_models.jsonc")
-
-    claude_fetch = fn
-      "/v1/models?limit=100", headers ->
-        if bearer(headers) == "fixture-token-ROTATED" do
-          {:ok, claude_json}
-        else
-          {:error,
-           {:http_status, 401,
-            ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})}}
-        end
-
-      "/v1/models/claude-haiku-4-5-20251001", _headers ->
-        ctx.claude_fetch.("/v1/models/claude-haiku-4-5-20251001", [])
-    end
-
-    log =
-      capture_log(fn ->
-        catalog = start_catalog(ctx, claude_fetch: claude_fetch)
-        await_fresh(catalog, "claude")
-
-        assert {[_ | _], :fresh} = ModelCatalog.get(@host, "claude", catalog)
-      end)
-
-    refute log =~ "revoked"
-
-    assert File.read!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])) ==
-             rotated_home
-  end
-
-  test "a failed rotation retry reports the original 401 and distinct retry failure", ctx do
-    stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
-    File.write!(Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"]), stale_store)
-
-    home = Path.join([ctx.base_dir, "homes", @host, "claude"])
-    File.mkdir_p!(home)
-
-    File.write!(
-      Path.join(home, ".credentials.json"),
-      ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
-    )
-
-    revoked =
-      ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})
-
-    fetches = :counters.new(1, [])
-
-    claude_fetch = fn "/v1/models?limit=100", _headers ->
-      :counters.add(fetches, 1, 1)
-
-      case :counters.get(fetches, 1) do
-        1 -> {:error, {:http_status, 401, revoked}}
-        2 -> {:error, {:network, :etimedout}}
-        count -> flunk("catalog fetched #{count} times")
-      end
-    end
-
-    catalog = start_catalog(ctx, claude_fetch: claude_fetch)
-
-    combined_failure =
-      {:rotation_retry_failed,
-       %{
-         initial_401: {:http_status, 401, revoked},
-         initial_guidance: "sign in again to repair the original 401",
-         retry_failure: {:network, :etimedout}
-       }}
-
-    await(fn ->
-      ModelCatalog.get(@host, "claude", catalog) ==
-        {[], {:unavailable, combined_failure}}
-    end)
-
-    assert :counters.get(fetches, 1) == 2
-
-    assert {:error, %Unroutable{} = unroutable} =
-             ModelCatalog.route(@host, "claude", Model.new("anything"), catalog)
-
-    message = Unroutable.message(unroutable)
-    assert message =~ "initial_401"
-    assert message =~ "sign in again to repair the original 401"
-    assert message =~ "retry_failure"
-    assert message =~ "etimedout"
-  end
-
-  test "an api-key 401 is never treated as a rotation and never harvested", ctx do
-    store = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
-    File.write!(store, "sk-ant-api03-STALE")
-
-    home = Path.join([ctx.base_dir, "homes", @host, "claude"])
-    File.mkdir_p!(home)
-    File.write!(Path.join(home, ".credentials.json"), "sk-ant-api03-ROTATED")
-
-    claude_fetch = fn "/v1/models?limit=100", _headers ->
-      {:error, {:http_status, 401, ~s({"detail":"API key is invalid."})}}
-    end
-
-    catalog =
-      start_catalog(ctx,
-        claude_fetch: claude_fetch,
-        credential_kind: fn _provider -> :api_key end
-      )
-
-    await(fn ->
-      ModelCatalog.get(@host, "claude", catalog) ==
-        {[], {:unavailable, {:http_status, 401, ~s({"detail":"API key is invalid."})}}}
-    end)
-
-    assert File.read!(store) == "sk-ant-api03-STALE"
-  end
-
-  # The harvest reads the LOCAL filesystem, so the `ssh: nil` guard scopes it to
-  # a local probe: a remote host's credential lives on that host, and a 401 from
-  # its probe must fall through untouched rather than sweep this box's homes.
-  # Same rotation, same 401 body -- but the owning host is remote, so the store
-  # is left exactly as stale as it was.
-  test "a subscription 401 on a remote host is never harvested against the local store", ctx do
-    remote_base = Path.join(ctx.base_dir, "remote-root")
-    store = Path.join([remote_base, "auth", "claude", ".credentials.json"])
-    File.mkdir_p!(Path.dirname(store))
-    stale_store = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
-    File.write!(store, stale_store)
-
-    home = Path.join([remote_base, "homes", "sat", "claude"])
-    File.mkdir_p!(home)
-
-    File.write!(
-      Path.join(home, ".credentials.json"),
-      ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
-    )
-
-    {:ok, _entry} =
-      Placement.register_host(ctx.db, "sat", %{
-        ssh: "sat.example",
-        base_dir: remote_base,
-        cli_bin: nil
-      })
-
-    revoked =
-      ~s({"type":"error","error":{"type":"authentication_error","message":"OAuth access token has been revoked."}})
-
-    sh = fn command ->
-      if claude_probe?(command),
-        do: catalog_reply(revoked, 401),
-        else: catalog_reply(JSON.encode!(%{models: []}))
-    end
-
-    catalog = start_catalog(ctx, sh: sh)
-
-    await(fn ->
-      ModelCatalog.get("sat", "claude", catalog) ==
-        {[], {:unavailable, {:http_status, 401, revoked}}}
-    end)
-
-    assert File.read!(store) == stale_store
-  end
-
-  defp bearer(headers) do
-    {~c"authorization", raw} = List.keyfind(headers, ~c"authorization", 0)
-    to_string(raw) |> String.replace_prefix("Bearer ", "")
-  end
-
   test "missing Credentials server fails catalog refresh closed", ctx do
     parent = self()
     name = unique_name(:missing_credentials)
@@ -750,9 +354,9 @@ defmodule Tightbeam.ModelCatalogTest do
        name: name,
        base_dir: ctx.base_dir,
        db: ctx.db,
-       claude_fetch: fn path, headers ->
+       model_manifest: fn ->
          send(parent, :provider_io)
-         ctx.claude_fetch.(path, headers)
+         manifest_snapshot()
        end,
        sh: fn command ->
          send(parent, :provider_io)
@@ -778,48 +382,6 @@ defmodule Tightbeam.ModelCatalogTest do
     refute_receive :provider_io
   end
 
-  test "a hung refresh never blocks a reader or concurrent org-options list", ctx do
-    parent = self()
-
-    hung_fetch = fn _path, _headers ->
-      send(parent, {:fetch_started, self()})
-
-      receive do
-        :release -> {:error, :released}
-      end
-    end
-
-    catalog = start_catalog(ctx, name: ModelCatalog, claude_fetch: hung_fetch)
-    assert_receive {:fetch_started, fetch_pid}
-    Archetypes.load!(ctx.base_dir)
-    # org_options is the globals-facing form: it reads the default-named DB.
-    start_supervised!({Tightbeam.DB, path: ":memory:", name: Tightbeam.DB}, id: :global_db)
-    :ok = Placement.ensure_schema(Tightbeam.DB)
-
-    {reader_us, {[], {:unavailable, :not_derived}}} =
-      :timer.tc(fn -> ModelCatalog.get(@host, "claude", catalog) end)
-
-    {list_us, options} = :timer.tc(&Gateway.org_options/0)
-
-    # The defect is a reader QUEUED BEHIND the hung refresh, and that has a floor,
-    # not a slope: it waits out `GenServer.call`'s 5s and then comes back in the
-    # shape the match above already refuses. So the number only has to separate
-    # "served while the fetch hangs" from that floor. Three ordered quantities,
-    # measured on a 4-core linux box 2026-07-29: served costs 44-122us idle and
-    # 12ms (read) / 74ms (list) with the four cores 3x oversubscribed; the bound
-    # below is 1s; the blocked floor is 5s. The old 100_000 sat inside the loaded
-    # range, so a busy runner failed it with nothing wrong — and a wall-clock
-    # budget that a healthy machine can miss reports load as a defect.
-    assert reader_us < 1_000_000
-    assert list_us < 1_000_000
-    assert options.models[@host]["claude"] == []
-    send(fetch_pid, :release)
-  end
-
-  # THE ONE OWNER of "can this be routed, and if not why". Every cause gets a
-  # POSITIVE assertion: a distinction over five cases that only refutes four of
-  # them cannot catch the fifth clause going wrong, and the defect this replaced
-  # was exactly a clause naming the wrong cause while every refute stayed green.
   describe "route" do
     test "routes a complete selection, and carries the provider and the entry", ctx do
       catalog = start_catalog(ctx)
@@ -911,7 +473,6 @@ defmodule Tightbeam.ModelCatalogTest do
     test "a catalog that could not be derived blames the CATALOG and names the repair", ctx do
       catalog =
         start_catalog(ctx,
-          claude_fetch: fn _path, _headers -> {:error, :network_down} end,
           credential_status: fn _provider -> {:needs_onboarding, :no_credential} end
         )
 
@@ -969,9 +530,7 @@ defmodule Tightbeam.ModelCatalogTest do
     test "a selection two harnesses could each take is ambiguous, and names them", ctx do
       catalog =
         start_catalog(ctx,
-          claude_fetch: fn "/v1/models?limit=100", _headers ->
-            {:ok, JSON.encode!(%{"data" => [context_variant_model("shared-model")]})}
-          end,
+          model_manifest: shared_manifest(["low", "high"]),
           sh: fn _command ->
             catalog_reply(
               JSON.encode!(%{
@@ -1045,9 +604,7 @@ defmodule Tightbeam.ModelCatalogTest do
     test "a tierless selection routes to the harness that offers the model untiered", ctx do
       catalog =
         start_catalog(ctx,
-          claude_fetch: fn "/v1/models?limit=100", _headers ->
-            {:ok, JSON.encode!(%{"data" => [context_variant_model("shared-model")]})}
-          end,
+          model_manifest: shared_manifest(["low", "high"]),
           sh: fn _command ->
             catalog_reply(
               JSON.encode!(%{
@@ -1076,7 +633,7 @@ defmodule Tightbeam.ModelCatalogTest do
       assert {:error, %Unroutable{cause: :effort_not_offered} = unroutable} =
                ModelCatalog.route(@host, Model.new("shared-model", effort: "medium"), catalog)
 
-      assert Unroutable.message(unroutable) =~ "claude (high|low)"
+      assert Unroutable.message(unroutable) =~ "claude (low|high)"
     end
 
     test "a fleet with no fresh catalog at all blames the catalogs, not the model", ctx do
@@ -1146,7 +703,7 @@ defmodule Tightbeam.ModelCatalogTest do
                ModelCatalog.route(@host, harness, flipped, catalog)
     end
 
-    assert {:error, %Unroutable{cause: :family_absent}} =
+    assert {:ok, %{entry: %{family: "claude-opus-5", context: "1m"}}} =
              ModelCatalog.route(
                @host,
                "claude",
@@ -1177,13 +734,7 @@ defmodule Tightbeam.ModelCatalogTest do
       # read these files locally and interpolated them, the secret would appear
       # in the command line the test captures.
       satellite_base = Path.join(ctx.base_dir, "satellite-root")
-      File.mkdir_p!(Path.join([satellite_base, "auth", "claude"]))
       File.mkdir_p!(Path.join([satellite_base, "auth", "codex"]))
-
-      File.write!(
-        Path.join([satellite_base, "auth", "claude", ".credentials.json"]),
-        ~s({"claudeAiOauth":{"accessToken":"#{@claude_secret}"}})
-      )
 
       File.write!(
         Path.join([satellite_base, "auth", "codex", "auth.json"]),
@@ -1198,91 +749,6 @@ defmodule Tightbeam.ModelCatalogTest do
         })
 
       %{satellite_base: satellite_base}
-    end
-
-    test "each host's catalog is its own, and neither token reaches a command line", ctx do
-      parent = self()
-
-      satellite_claude =
-        JSON.encode!(%{
-          data: [
-            %{
-              id: "satellite-only",
-              display_name: "Satellite Only",
-              max_input_tokens: 1_000,
-              capabilities: %{effort: %{}}
-            }
-          ]
-        })
-
-      sh = fn command ->
-        send(parent, {:probe, command})
-
-        case claude_probe?(command) do
-          true -> catalog_reply(satellite_claude)
-          false -> catalog_reply(ctx.codex_json)
-        end
-      end
-
-      catalog = start_catalog(ctx, sh: sh)
-      await_fresh(catalog, "claude", "satellite")
-      await_fresh(catalog, "claude")
-
-      # The satellite's account, not the gateway's — and the gateway's entry is
-      # untouched by the satellite's answer.
-      assert {[%{family: "satellite-only"}], :fresh} =
-               ModelCatalog.get("satellite", "claude", catalog)
-
-      {local, :fresh} = ModelCatalog.get(@host, "claude", catalog)
-      refute Enum.any?(local, &(&1.family == "satellite-only"))
-
-      # The eurisko method: the credential is read by the shell ON the owning
-      # host, so no byte of it is in the argv, and each script says so literally.
-      # The shell variable is `credential`, not `token`: this file holds whichever
-      # KIND the host was onboarded on.
-      claude = probe_command!(:claude)
-      claude_line = Enum.join(claude, " ")
-      refute claude_line =~ @claude_secret
-
-      # A subscription credential is Claude Code's OAuth record, so the far host PARSES it
-      # rather than cat-ing it -- but the property this test exists for is unchanged and
-      # asserted above: the secret is captured into a shell variable on the owning host and
-      # never appears in any argv. `python3` is handed the PATH, not the token.
-      # The far host's own tightbeam binary reads the credential -- it is already installed
-      # there and already exec'd for `harness-group`. What this replaced was a `python3`
-      # one-liner parsing the vendor's JSON, which added a runtime dependency to every
-      # satellite and was a THIRD copy of an extraction that already existed twice.
-      #
-      # The property this test exists for is stronger now, not weaker: the secret never
-      # enters a shell variable at all. Only the PATH is on the command line, asserted here
-      # and by the `refute` above.
-      credential_file = Path.join([ctx.satellite_base, "auth", "claude", ".credentials.json"])
-      assert claude_line =~ "catalog-probe anthropic subscription"
-      assert claude_line =~ credential_file
-      refute claude_line =~ "python3"
-      refute claude_line =~ "credential=$("
-
-      # No authorization header on the command line at all: the binary builds it from the
-      # file it just read. The old form referenced a shell variable, which was safe; this
-      # form has nothing to reference.
-      refute claude_line =~ "authorization:"
-      refute claude_line =~ "Bearer"
-      assert ["ssh" | claude_rest] = claude
-      assert "sat.example" in claude_rest
-
-      codex = probe_command!(:codex, "sat.example")
-      codex_line = Enum.join(codex, " ")
-      refute codex_line =~ @codex_secret
-      assert codex_line =~ "token=$(node -e "
-      assert codex_line =~ Path.join([ctx.satellite_base, "auth", "codex", "auth.json"])
-      assert codex_line =~ ~s(-H "authorization: Bearer $token")
-
-      # The gateway's own codex probe is the same script without the ssh: one
-      # shape for both localities, each reading its own host's grant.
-      local_codex = probe_command!(:codex, :local)
-      assert ["sh", "-c", script] = local_codex
-      assert script =~ Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
-      refute script =~ ctx.satellite_base
     end
 
     test "the codex client_version comes from the binary on the owning host", ctx do
@@ -1408,18 +874,30 @@ defmodule Tightbeam.ModelCatalogTest do
           else: catalog_reply(ctx.codex_json)
       end
 
-      catalog = start_catalog(ctx, sh: sh)
-      unreachable = {[], {:unavailable, {:probe_failed, 255, ""}}}
+      catalog =
+        start_catalog(ctx,
+          sh: sh,
+          claude_code_version: fn state ->
+            if state.host_config.ssh,
+              do: {:error, {:claude_code_version_probe_failed, 255, ""}},
+              else: "2.1.257"
+          end
+        )
+
+      claude_unreachable =
+        {[], {:unavailable, {:claude_code_version_probe_failed, 255, ""}}}
+
+      codex_unreachable = {[], {:unavailable, {:probe_failed, 255, ""}}}
 
       # Wait for the VERDICT, not for the shape of one. `:not_derived` is itself an
       # `{:unavailable, _}`, so the old wait was satisfied before the first probe
       # had run and waited for nothing at all — leaving the assertions below racing
       # the probe the wait was there to cover.
-      await(fn -> ModelCatalog.get("satellite", "claude", catalog) == unreachable end)
-      await(fn -> ModelCatalog.get("satellite", "codex", catalog) == unreachable end)
+      await(fn -> ModelCatalog.get("satellite", "claude", catalog) == claude_unreachable end)
+      await(fn -> ModelCatalog.get("satellite", "codex", catalog) == codex_unreachable end)
 
-      assert ModelCatalog.get("satellite", "claude", catalog) == unreachable
-      assert ModelCatalog.get("satellite", "codex", catalog) == unreachable
+      assert ModelCatalog.get("satellite", "claude", catalog) == claude_unreachable
+      assert ModelCatalog.get("satellite", "codex", catalog) == codex_unreachable
 
       # The gateway's own entries are established here and stay fresh.
       await_fresh(catalog, "claude")
@@ -1436,7 +914,7 @@ defmodule Tightbeam.ModelCatalogTest do
   # call came first, and the one that actually wanted it then waited out its
   # second for a message that no longer existed ("no codex probe command was
   # constructed"). Stable on an idle box, ordinary on a loaded one.
-  defp probe_command!(harness, dest \\ nil, skipped \\ []) do
+  defp probe_command!(harness, dest, skipped \\ []) do
     receive do
       {:probe, command} = record ->
         matches_harness? = claude_probe?(command) == (harness == :claude)
@@ -1471,21 +949,60 @@ defmodule Tightbeam.ModelCatalogTest do
         name: name,
         base_dir: ctx.base_dir,
         db: ctx.db,
-        claude_fetch: ctx.claude_fetch,
         sh: ctx.codex_sh,
         credential_status: fn _provider -> :onboarded end,
         credential_kind: fn _provider -> :subscription end,
-        # These tests exercise catalog DERIVATION (field mapping, effort parsing,
-        # health, sorting) with synthetic and fixture model ids. The claude
-        # selectable-model pin is a separate subject with its own tests below, so
-        # it is disabled here — otherwise every derivation test would silently
-        # become a test of that table.
-        claude_selectable_models: :all
+        model_manifest: manifest_snapshot(),
+        claude_code_version: "2.1.257"
       ]
       |> Keyword.merge(overrides)
 
     start_supervised!(%{id: name, start: {ModelCatalog, :start_link, [opts]}})
     name
+  end
+
+  defp manifest_snapshot do
+    %{
+      document:
+        :tightbeam
+        |> Application.app_dir("priv/model-manifest.json")
+        |> File.read!()
+        |> JSON.decode!(),
+      source: :bundled,
+      health: :fresh
+    }
+  end
+
+  defp shared_manifest(efforts) do
+    %{
+      document: %{
+        "version" => 1,
+        "providers" => %{
+          "claude" => %{
+            "defaults" => %{"chat" => "shared-model"},
+            "profiles" => %{
+              "shared" => %{
+                "efforts" => efforts,
+                "defaultContext" => "default",
+                "contextWindowTokens" => %{"default" => 200_000},
+                "adapter" => %{"claudeCode" => %{"contextSuffix" => %{}}}
+              }
+            },
+            "models" => [
+              %{
+                "slug" => "shared-model",
+                "name" => "Shared",
+                "aliases" => [],
+                "status" => "current",
+                "profile" => "shared"
+              }
+            ]
+          }
+        }
+      },
+      source: :bundled,
+      health: :fresh
+    }
   end
 
   defp await_fresh(catalog, harness, host \\ @host) do
@@ -1503,85 +1020,7 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
-  # Task #41. The catalog must not advertise a model the adapter will refuse, and no
-  # substitution may be smuggled in at the only place a mapping could live.
-  describe "claude selectable-model pin" do
-    test "keeps Fable 5.1 default and 1m vendor identities", ctx do
-      fetch = fn "/v1/models?limit=100", _headers ->
-        {:ok,
-         JSON.encode!(%{
-           "data" => [
-             context_variant_model("claude-fable-5-1"),
-             context_variant_model("claude-fable-5-1[1m]"),
-             context_variant_model("claude-sonnet-4-6")
-           ]
-         })}
-      end
-
-      catalog =
-        start_catalog(ctx,
-          claude_fetch: fetch,
-          claude_selectable_models: Tightbeam.Harness.Claude.adapter_selectable_models()
-        )
-
-      await_fresh(catalog, "claude")
-      {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
-
-      assert Enum.map(claude, &{&1.family, &1.context}) == [
-               {"claude-fable-5-1", nil},
-               {"claude-fable-5-1", "1m"}
-             ]
-
-      assert {:ok, %{entry: %{family: "claude-fable-5-1", context: "1m"}}} =
-               ModelCatalog.route(
-                 @host,
-                 "claude",
-                 Model.new("claude-fable-5-1", context: "1m", effort: "high"),
-                 catalog
-               )
-    end
-
-    test "withholds models the adapter refuses and keeps the ones it accepts", ctx do
-      catalog =
-        start_catalog(ctx,
-          claude_selectable_models: Tightbeam.Harness.Claude.adapter_selectable_models()
-        )
-
-      await_fresh(catalog, "claude")
-      {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
-      families = claude |> Enum.map(& &1.family) |> Enum.uniq()
-
-      # Only selectable models survive, and the fixture's refused ones are gone.
-      assert "claude-haiku-4-5-20251001" in families
-      # Re-measured 2026-08-06 on gibson (production grant): a pin-probed home
-      # offered and accepted claude-opus-5 and it answered a live prompt — the
-      # earlier REJECTED row was the default-pin vocabulary, not the grant.
-      assert "claude-opus-5" in families
-      # Re-measured 2026-08-05 on gibson (CLI 2.1.221, production grant):
-      # fable answers a real prompt; the July REJECTED row was one
-      # environment's snapshot. Fable is now offered.
-      assert "claude-fable-5" in families
-      refute "claude-sonnet-4-6" in families
-
-      assert Enum.all?(families, &(&1 in Tightbeam.Harness.Claude.adapter_selectable_models())),
-             "catalog offered a model the adapter refuses: #{inspect(families)}"
-
-      # The filter matches the vendor IDENTITY. Efforts are a property of the
-      # kept entry, not part of what is matched, so they survive INTACT — which
-      # means the values the fixture declares, not merely "a list". `is_list/1`
-      # stayed green against every list being emptied, which is exactly the
-      # damage a filter keyed on the wrong thing would do.
-      sonnet_5 = Enum.find(claude, &(&1.family == "claude-sonnet-5"))
-
-      assert MapSet.new(sonnet_5.efforts) ==
-               MapSet.new(["low", "medium", "high", "xhigh", "max"])
-
-      # …and an untiered model keeps its empty list, so "intact" is not read as
-      # "non-empty" and the two cases stay distinguishable.
-      haiku = Enum.find(claude, &(&1.family == "claude-haiku-4-5-20251001"))
-      assert haiku.efforts == []
-    end
-
+  describe "claude structured model identity" do
     # Where a substitution WOULD live: `Model.parse_ref/1` is the only transform
     # between a vendor identifier and what reaches session/set_config_option. If
     # someone maps a refused model onto an accepted one, it happens here, and
@@ -1672,8 +1111,8 @@ defmodule Tightbeam.ModelCatalogTest do
     # The PUSH: the wired edge itself. A credential commit files the
     # `credential-present` fact, whose recognition re-derives NOW — proven by the
     # derivation probe running with no `get/3` (no read) ever forcing it. The
-    # probe (a claude `/v1/models` fetch) runs ONLY past the credential gate, so
-    # its arrival is the signal that a re-derivation started from the recognition.
+    # manifest read runs ONLY past the credential gate, so its arrival is the
+    # signal that a re-derivation started from the recognition.
     test "the credential-present recognition re-derives with no read, and is provider-scoped",
          ctx do
       test_pid = self()
@@ -1690,14 +1129,10 @@ defmodule Tightbeam.ModelCatalogTest do
           start: {Agent, :start_link, [fn -> 0 end]}
         })
 
-      probing_fetch = fn
-        "/v1/models?limit=100" = path, headers ->
-          generation = Agent.get_and_update(claude_generation, fn n -> {n + 1, n + 1} end)
-          send(test_pid, {:catalog_generation, :claude, generation})
-          ctx.claude_fetch.(path, headers)
-
-        path, headers ->
-          ctx.claude_fetch.(path, headers)
+      probing_manifest = fn ->
+        generation = Agent.get_and_update(claude_generation, fn n -> {n + 1, n + 1} end)
+        send(test_pid, {:catalog_generation, :claude, generation})
+        manifest_snapshot()
       end
 
       probing_codex = fn command ->
@@ -1711,7 +1146,7 @@ defmodule Tightbeam.ModelCatalogTest do
           ttl_ms: :timer.minutes(15),
           now: fn -> 0 end,
           credential_status: fn _provider -> :onboarded end,
-          claude_fetch: probing_fetch,
+          model_manifest: probing_manifest,
           sh: probing_codex
         )
 
@@ -1759,23 +1194,23 @@ defmodule Tightbeam.ModelCatalogTest do
       count =
         start_supervised!(%{id: unique_name(:count), start: {Agent, :start_link, [fn -> 0 end]}})
 
-      gated_fetch = fn path, headers ->
+      gated_manifest = fn ->
         n = Agent.get_and_update(count, fn c -> {c + 1, c + 1} end)
-        send(test_pid, {:fetch_started, n})
+        send(test_pid, {:manifest_read_started, n})
         # Hold ONLY the first derive open, so a credential-present can land while
         # it is in flight; later derives pass straight through.
         if n == 1, do: await(fn -> Agent.get(gate, & &1) end, 400)
-        ctx.claude_fetch.(path, headers)
+        manifest_snapshot()
       end
 
       catalog =
         start_catalog(ctx,
           credential_status: fn _provider -> :onboarded end,
-          claude_fetch: gated_fetch
+          model_manifest: gated_manifest
         )
 
       # Derive #1 (boot) is in flight and blocked.
-      assert_receive {:fetch_started, 1}, 2_000
+      assert_receive {:manifest_read_started, 1}, 2_000
 
       # A credential-present lands while #1 is in flight -> recheck is set.
       ModelCatalog.credential_present(@host, :anthropic, catalog)
@@ -1783,7 +1218,7 @@ defmodule Tightbeam.ModelCatalogTest do
       # Release #1; it completes {:ok}. The recheck must force derive #2 — the
       # success path honoring it, symmetric with the error path.
       Agent.update(gate, fn _ -> true end)
-      assert_receive {:fetch_started, 2}, 2_000
+      assert_receive {:manifest_read_started, 2}, 2_000
     end
 
     # The eezo production repro (orchestrator, 2026-08-06): a CLEAN one-shot
@@ -1906,14 +1341,10 @@ defmodule Tightbeam.ModelCatalogTest do
           start: {Agent, :start_link, [fn -> 0 end]}
         })
 
-      probing_fetch = fn
-        "/v1/models?limit=100" = path, headers ->
-          generation = Agent.get_and_update(claude_generation, fn n -> {n + 1, n + 1} end)
-          send(test_pid, {:catalog_generation, :claude, generation})
-          ctx.claude_fetch.(path, headers)
-
-        path, headers ->
-          ctx.claude_fetch.(path, headers)
+      probing_manifest = fn ->
+        generation = Agent.get_and_update(claude_generation, fn n -> {n + 1, n + 1} end)
+        send(test_pid, {:catalog_generation, :claude, generation})
+        manifest_snapshot()
       end
 
       catalog =
@@ -1921,7 +1352,7 @@ defmodule Tightbeam.ModelCatalogTest do
           ttl_ms: :timer.minutes(15),
           now: fn -> 0 end,
           credential_status: fn _provider -> :onboarded end,
-          claude_fetch: probing_fetch
+          model_manifest: probing_manifest
         )
 
       await_fresh(catalog, "claude")
@@ -1961,8 +1392,6 @@ defmodule Tightbeam.ModelCatalogTest do
 
   defp await(_fun, 0), do: flunk("condition did not become true")
   defp unique_name(label), do: String.to_atom("#{label}_#{System.unique_integer([:positive])}")
-
-  defp fixture_json(name), do: name |> fixture_body() |> JSON.decode!()
 
   defp fixture_body(name) do
     @fixtures

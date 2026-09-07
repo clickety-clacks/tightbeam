@@ -581,7 +581,7 @@ defmodule Tightbeam.GatewayTest do
       db: db,
       credential_status: fn _provider -> :onboarded end,
       credential_kind: fn _provider -> :subscription end,
-      claude_selectable_models: :all,
+      claude_code_version: "2.1.257",
       claude_fetch: fn _, _ -> {:ok, claude_models} end,
       sh: fn command ->
         case catalog_probe_harness(command) do
@@ -1838,9 +1838,9 @@ defmodule Tightbeam.GatewayTest do
              ModelCatalog.route("testhost", "claude", Model.new("tiered-here"))
   end
 
-  # Task #41. A model the adapter cannot select must be refused by NAME and the
-  # operator told what IS available — before, this died deep in the adapter as
-  # "Invalid value for config option model", on every session/new and session/load.
+  # A model outside this harness family must be refused by name and the operator
+  # told what the manifest offers. Unknown Claude-family slugs are deliberately
+  # passed through and therefore are not the subject of this test.
   test "an unavailable model is refused by name and names what is offered", ctx do
     base_dir = role_test_base("model-not-offered")
     Archetypes.load!(base_dir)
@@ -1850,17 +1850,17 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_model", model: "claude-opus-5"}
+               params: %{setting: "set_model", model: "gpt-no-such-model"}
              })
 
-    assert message =~ ~s("claude-opus-5" is not offered by claude on host testhost)
+    assert message =~ ~s("gpt-no-such-model" is not offered by claude on host testhost)
 
     # The hint is the point: naming only the rejection makes the operator guess.
     assert message =~ "offered:"
-    assert message =~ "claude-sonnet-4-6"
+    assert message =~ "claude-sonnet-5"
 
     # ...and it must not recommend the very thing it just refused.
-    refute message =~ "offered: claude-opus-5"
+    refute message =~ "offered: gpt-no-such-model"
   end
 
   test "a catalog missing for want of a GATEWAY credential says so, with the repair", ctx do
@@ -2723,7 +2723,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert key == created.session_key
     assert Org.get(ctx.db, key).handle == "builder"
-    assert Org.get(ctx.db, key).model == Model.new("claude-fable-5")
+    assert Org.get(ctx.db, key).model == Model.new("claude-fable-5", effort: "medium")
 
     Roles.create!(ctx.db, "taken", "flynn", nil)
     {:ok, [[before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
