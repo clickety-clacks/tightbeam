@@ -675,6 +675,7 @@ defmodule Tightbeam.Wakes do
 
       wake = recognize_from_snapshot_in_txn(txn, wake, evaluation, resolver, nil)
       admit_continuation_in_txn(txn, wake)
+      Tightbeam.EffortCheckin.reconcile_wait_relief_in_txn(txn, obligation.id, wake.created_at)
 
       if is_nil(wake.recognition_path) do
         verifier_wake = schedule_verifier_notice_in_txn(txn, wake, verifier)
@@ -1370,6 +1371,8 @@ defmodule Tightbeam.Wakes do
     )
 
     if Txn.changes(txn) == 1 do
+      Tightbeam.EffortCheckin.reconcile_wait_relief_in_txn(txn, wake.assignment_id, recognized_at)
+
       EventLog.lifecycle_in_txn(
         txn,
         "wake_wait_recognized",
@@ -1446,6 +1449,8 @@ defmodule Tightbeam.Wakes do
     case attrs[:verdict_kind] do
       kind when kind in ~w(wait-verified wait-challenged) ->
         apply_verification_verdict_in_txn(txn, attrs)
+        wake = wait_in_txn(txn, attrs.wait_id)
+        Tightbeam.EffortCheckin.reconcile_wait_relief_in_txn(txn, wake.assignment_id, now())
 
       _ ->
         :ok
@@ -2953,6 +2958,10 @@ defmodule Tightbeam.Wakes do
         """,
         [wake.wake_id]
       )
+
+      if is_binary(wake.assignment_id) do
+        Tightbeam.EffortCheckin.reconcile_wait_relief_in_txn(txn, wake.assignment_id, canceled_at)
+      end
 
       if is_binary(wake.condition_kind) do
         EventLog.lifecycle_in_txn(

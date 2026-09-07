@@ -66,6 +66,55 @@ defmodule Tightbeam.EffortCheckin do
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
 
+  @doc false
+  def reconcile_wait_relief_in_txn(%Txn{} = txn, assignment_id, at) do
+    # One open interval per generation measures the union, even across restart.
+    # Wait transitions never replace the generation or its evidence cursors.
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT generation,wakeId,reliefStartedAt FROM effort_checkin_generations
+        WHERE assignmentId=?1 AND state='armed'
+        """,
+        [assignment_id]
+      )
+
+    if rows != [] do
+      qualifies = Wakes.effort_relief_in_txn?(txn, assignment_id)
+
+      Enum.each(rows, fn [generation, wake_id, started] ->
+        cond do
+          qualifies and is_nil(started) ->
+            Txn.q(
+              txn,
+              "UPDATE effort_checkin_generations SET reliefStartedAt=?3 WHERE assignmentId=?1 AND generation=?2",
+              [assignment_id, generation, at]
+            )
+
+          not qualifies and is_integer(started) ->
+            elapsed = max(at - started, 0)
+
+            Txn.q(
+              txn,
+              "UPDATE effort_checkin_generations SET reliefStartedAt=NULL,reliefExcludedMs=reliefExcludedMs+?3 WHERE assignmentId=?1 AND generation=?2",
+              [assignment_id, generation, elapsed]
+            )
+
+            Txn.q(txn, "UPDATE wakes SET dueAt=dueAt+?2 WHERE wakeId=?1 AND state='pending'", [
+              wake_id,
+              elapsed
+            ])
+
+          true ->
+            :ok
+        end
+      end)
+    end
+
+    :ok
+  end
+
   @spec valid_workdir_root(term()) :: :ok | {:error, map()}
   def valid_workdir_root(nil), do: :ok
   def valid_workdir_root(""), do: :ok
@@ -467,6 +516,23 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp probe_in_txn(txn, config, wake, inspection) do
+    reconcile_wait_relief_in_txn(txn, wake.assignment_id, now())
+
+    case Txn.q(
+           txn,
+           """
+           SELECT 1 FROM effort_checkin_generations g JOIN wakes w ON w.wakeId=g.wakeId
+           WHERE g.wakeId=?1 AND g.state='armed' AND
+             (g.reliefStartedAt IS NOT NULL OR (g.reliefExcludedMs>0 AND w.dueAt>?2))
+           """,
+           [wake.wake_id, now()]
+         ) do
+      [[1]] -> nil
+      [] -> probe_ready_in_txn(txn, config, wake, inspection)
+    end
+  end
+
+  defp probe_ready_in_txn(txn, config, wake, inspection) do
     case generation_for_wake_in_txn(txn, wake.wake_id) do
       %{state: "armed"} = generation ->
         eligible? =
@@ -929,6 +995,7 @@ defmodule Tightbeam.EffortCheckin do
       ]
     )
 
+    reconcile_wait_relief_in_txn(txn, assignment_id, armed_at)
     generation_for_assignment_in_txn(txn, assignment_id, generation)
   end
 
@@ -952,7 +1019,7 @@ defmodule Tightbeam.EffortCheckin do
       """
       UPDATE wakes
       SET dueAt=(
-        SELECT g.armedAt + (?2 * g.multiplier)
+        SELECT g.armedAt + (?2 * g.multiplier) + g.reliefExcludedMs
         FROM effort_checkin_generations AS g
         WHERE g.wakeId=wakes.wakeId AND g.state='armed'
       )

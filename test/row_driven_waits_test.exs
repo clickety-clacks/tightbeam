@@ -987,6 +987,241 @@ defmodule Tightbeam.RowDrivenWaitsTest do
              )
   end
 
+  test "C5-C7,V1-V2: overlapping provisional waits pause one generation and challenge resumes its remainder",
+       ctx do
+    qualification_policy(ctx)
+
+    assert {:ok, generation} =
+             DB.transaction(ctx.db, fn txn ->
+               EffortCheckin.arm_in_txn(txn, %{base_dir: ctx.base}, %{
+                 id: "A",
+                 holderKey: "holder"
+               })
+             end)
+
+    before = effort_snapshot(ctx.db)
+    first = register_wait(ctx.db, due_after(), predicate("R"))
+    second = register_wait(ctx.db, due_after(), predicate("R"))
+
+    assert {:ok, [[started, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+             )
+
+    assert started == first.created_at
+    assert effort_snapshot(ctx.db) == before
+
+    assert %{attest: %{verdictKind: "wait-verified"}} =
+             attest(ctx.db, "V", "verifier", "verdict", "wait-verified", first.wake_id)
+
+    assert effort_snapshot(ctx.db) == before
+    # Reopen a real SQLite snapshot under a fresh database owner.
+    path = Path.join(ctx.base, "relief-restart.db")
+    assert :ok = DB.execute(ctx.db, "VACUUM INTO '#{path}'")
+    restarted = :"relief_restart_#{System.unique_integer([:positive])}"
+    start_supervised!({DB, path: path, name: restarted}, id: restarted)
+    assert :ok = Tightbeam.Schema.ensure_all(restarted)
+
+    assert {:ok, :ok} =
+             DB.transaction(restarted, fn txn ->
+               EffortCheckin.reconcile_wait_relief_in_txn(txn, "A", started + 100)
+             end)
+
+    assert {:ok, [[^started, 0]]} =
+             DB.query(
+               restarted,
+               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+             )
+
+    assert effort_snapshot(restarted) == before
+
+    # Seed elapsed time, not a timeout guess, to prove that overlap is not summed.
+    interval_start = started - 1_000
+
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE effort_checkin_generations SET reliefStartedAt=?1 WHERE assignmentId='A'",
+               [interval_start]
+             )
+
+    assert %{attest: _} =
+             attest(ctx.db, "V", "verifier", "verdict", "wait-challenged", first.wake_id)
+
+    assert covered?(ctx.db, "A")
+
+    assert {:ok, [[^interval_start, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+             )
+
+    assert %{attest: _} =
+             attest(ctx.db, "V", "verifier", "verdict", "wait-challenged", second.wake_id)
+
+    refute covered?(ctx.db, "A")
+
+    assert {:ok, [[nil, excluded]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+             )
+
+    assert excluded == Wakes.get(ctx.db, second.wake_id).recognition_at - interval_start
+    assert effort_snapshot(ctx.db) == before
+
+    assert Wakes.get(ctx.db, generation.wake_id).due_at ==
+             generation.armed_at +
+               generation.base_horizon_ms * generation.multiplier + excluded
+
+    assert :ok = Wakes.fire_due(ctx.scheduler)
+    refute covered?(ctx.db, "A")
+  end
+
+  test "C5: ready-now uses normal effort and self-owed relief requires a policy election", ctx do
+    qualification_policy(ctx)
+
+    assert {:ok, _} =
+             DB.transaction(ctx.db, fn txn ->
+               EffortCheckin.arm_in_txn(txn, %{base_dir: ctx.base}, %{
+                 id: "A",
+                 holderKey: "holder"
+               })
+             end)
+
+    register_wait(ctx.db, due_after(), predicate("R", "open"))
+    assert covered?(ctx.db, "A")
+
+    assert {:ok, [[nil, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+             )
+
+    assignment(ctx.db, "self-R", "holder")
+    register_wait(ctx.db, due_after(), predicate("self-R"))
+
+    assert {:ok, [[nil, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+             )
+
+    qualification_policy(ctx, false)
+    elected = register_wait(ctx.db, due_after(), predicate("self-R"))
+
+    assert {:ok, [[started, 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+             )
+
+    assert started == elected.created_at
+  end
+
+  test "C6-C7: success, resolver termination, fallback and cancellation each end relief once",
+       ctx do
+    qualification_policy(ctx)
+
+    assert {:ok, _} =
+             DB.transaction(ctx.db, fn txn ->
+               Supervision.transition_in_txn(txn, %{
+                 kind: "assignment_open",
+                 assignment_id: "A",
+                 opened_at: 0,
+                 principal: "user:owner-a",
+                 supervision_interval_ms: 60_000
+               })
+
+               EffortCheckin.arm_in_txn(txn, %{base_dir: ctx.base}, %{
+                 id: "A",
+                 holderKey: "holder"
+               })
+             end)
+
+    before = effort_snapshot(ctx.db)
+
+    for ending <- ~w(success terminal fallback cancel) do
+      resolver = "R-#{ending}"
+      assignment(ctx.db, resolver, "resolver")
+      due = if ending == "fallback", do: System.system_time(:millisecond) - 1, else: due_after()
+      wake = register_wait(ctx.db, due, predicate(resolver))
+
+      assert {:ok, [[started, prior]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+               )
+
+      interval_start = started - 1_000
+
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 "UPDATE effort_checkin_generations SET reliefStartedAt=?1 WHERE assignmentId='A'",
+                 [interval_start]
+               )
+
+      case ending do
+        "success" ->
+          assert %{assignment: _} = attest(ctx.db, resolver, "resolver", "completion")
+
+        "terminal" ->
+          assert %{assignment: _} = attest(ctx.db, resolver, "resolver", "surrender")
+
+        "fallback" ->
+          assert :ok = Wakes.fire_due(ctx.scheduler)
+
+        "cancel" ->
+          assert {:ok, {:accepted_in_txn, _, %{canceled: true}}} =
+                   DB.transaction(ctx.db, fn txn ->
+                     {:ok, trigger} = Supervision.liveness_trigger_in_txn(txn, {:assignment, "A"})
+
+                     Wakes.cancel_in_txn(txn, %{
+                       wake_id: wake.wake_id,
+                       expected_origin: wake.origin,
+                       requester: %{kind: "session", id: "holder"},
+                       reason_kind: "requester_withdrew",
+                       causal_source: %{
+                         kind: "verb_call",
+                         accepted_event: %{
+                           origin: wake.origin,
+                           session_key: "holder",
+                           principal: {:session, "holder"}
+                         }
+                       },
+                       outcome: %{kind: "no_replacement", liveness_trigger: trigger}
+                     })
+                   end)
+      end
+
+      ended = Wakes.get(ctx.db, wake.wake_id)
+      endpoint = ended.canceled_at || ended.recognition_at
+      expected = prior + endpoint - interval_start
+
+      assert {:ok, [[nil, ^expected]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+               )
+
+      assert {:ok, :ok} =
+               DB.transaction(
+                 ctx.db,
+                 &EffortCheckin.reconcile_wait_relief_in_txn(&1, "A", endpoint + 100)
+               )
+
+      assert {:ok, [[nil, ^expected]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
+               )
+
+      assert effort_snapshot(ctx.db) == before
+    end
+  end
+
   test "C8: failed and unknown continuation outcomes end coverage without answering work", ctx do
     qualification_policy(ctx)
 
