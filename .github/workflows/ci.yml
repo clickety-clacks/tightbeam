@@ -11,9 +11,18 @@ on:
     branches: [main]
     tags: ["v*.*.*"]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Exact 40-hex candidate commit to verify; no release publication"
+        required: true
+        type: string
 
 permissions:
   contents: read
+
+env:
+  CI_SOURCE_SHA: ${{ github.event_name != 'workflow_dispatch' && github.sha || inputs.candidate_sha }}
 
 jobs:
   test:
@@ -28,9 +37,19 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Validate exact source SHA
+        shell: bash
+        run: |
+          [[ "$CI_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           fetch-depth: 2
+
+      - name: Verify exact checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
 
       - name: Shipped assets contain no internal identifiers
         run: python3 scripts/verify_shipped_privacy.py
@@ -161,7 +180,7 @@ jobs:
   # not pass on that platform.
   release:
     needs: test
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     strategy:
       matrix:
         include:
@@ -172,14 +191,24 @@ jobs:
     name: release ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     steps:
+      - name: Validate exact source SHA
+        shell: bash
+        run: |
+          [[ "$CI_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.CI_SOURCE_SHA }}
           # A tagged release must prove that its commit is the canonical main tip.
           # The full history exposes origin/main for the exact-tip check below.
           fetch-depth: 0
 
+      - name: Verify exact checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+
       - name: Validate the release tag
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
         run: sh scripts/validate_release_tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA"
 
       - name: Install BEAM (pinned, same as the gate)
@@ -206,7 +235,7 @@ jobs:
         run: |
           cd _build/npm
           for f in tightbeam-*.tgz; do
-            mv "$f" "${f%.tgz}-${GITHUB_SHA::7}.tgz"
+            mv "$f" "${f%.tgz}-${CI_SOURCE_SHA::7}.tgz"
           done
           ls -la
 
@@ -223,7 +252,7 @@ jobs:
   # and publishes the checksums and source provenance beside them.
   publish-release:
     needs: release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name != 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
