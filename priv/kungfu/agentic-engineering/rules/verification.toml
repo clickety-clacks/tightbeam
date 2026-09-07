@@ -71,3 +71,29 @@ when = [
   { fact = "verifier.holder_is_other", op = "eq", value = true },
 ]
 verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }
+
+[[policy]]
+name = "holder-continuation-coverage"
+purpose = "wait-prod-coverage"
+when = [
+  { fact = "wait.obligation_matches", op = "eq", value = true },
+  { fact = "wait.admitted", op = "eq", value = true },
+  { fact = "wait.after_turn_eligible", op = "eq", value = true },
+  { fact = "wait.coverage_valid", op = "eq", value = true },
+  { fact = "wait.continuation_state", op = "in", value = ["pending", "queued", "running"] },
+]
+
+[[policy]]
+name = "justified-unresolved-dependency"
+purpose = "wait-effort-relief"
+when = [
+  { fact = "wait.obligation_matches", op = "eq", value = true },
+  { fact = "wait.admitted", op = "eq", value = true },
+  { fact = "wait.continuation_state", op = "eq", value = "pending" },
+  { fact = "wait.recognized", op = "eq", value = false },
+  { fact = "resolver.open", op = "eq", value = true },
+  { fact = "resolver.owed_by_other", op = "eq", value = true },
+  { fact = "wait.declaration_complete", op = "eq", value = true },
+  { fact = "wait.verification_accountable", op = "eq", value = true },
+  { fact = "wait.verification_state", op = "in", value = ["provisional", "confirmed"] },
+]

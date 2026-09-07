@@ -62,6 +62,107 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, %{"post" => fn _ -> %{ok: true} end}, call())
   end
 
+  test "shipped wait qualification matrix follows TOML reload with a fresh query snapshot", ctx do
+    shipped =
+      File.read!(
+        Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__)
+      )
+
+    put_raw(ctx, shipped)
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    facts = %{
+      "wait.obligation_matches" => true,
+      "wait.admitted" => true,
+      "wait.after_turn_eligible" => true,
+      "wait.coverage_valid" => true,
+      "wait.continuation_state" => "pending",
+      "wait.recognized" => false,
+      "resolver.open" => true,
+      "resolver.owed_by_other" => true,
+      "wait.declaration_complete" => true,
+      "wait.verification_accountable" => true,
+      "wait.verification_state" => "provisional"
+    }
+
+    query = fn purpose, snapshot ->
+      DB.transaction(ctx.db, &Rules.select_policy_in_txn(&1, purpose, %{wait_facts: snapshot}))
+    end
+
+    assert {:ok, {:ok, %{name: "holder-continuation-coverage"}}} =
+             query.("wait-prod-coverage", facts)
+
+    assert {:ok, {:ok, %{name: "justified-unresolved-dependency"}}} =
+             query.("wait-effort-relief", facts)
+
+    for field <-
+          ~w(wait.obligation_matches wait.admitted wait.after_turn_eligible wait.coverage_valid) do
+      assert {:ok, :none} = query.("wait-prod-coverage", Map.put(facts, field, false))
+    end
+
+    for state <- ~w(queued running) do
+      snapshot = Map.put(facts, "wait.continuation_state", state)
+      assert {:ok, {:ok, _}} = query.("wait-prod-coverage", snapshot)
+      assert {:ok, :none} = query.("wait-effort-relief", snapshot)
+    end
+
+    for field <-
+          ~w(resolver.open resolver.owed_by_other wait.declaration_complete wait.verification_accountable) do
+      assert {:ok, :none} = query.("wait-effort-relief", Map.put(facts, field, false))
+    end
+
+    assert {:ok, :none} = query.("wait-effort-relief", Map.put(facts, "wait.recognized", true))
+
+    assert {:ok, :none} =
+             query.("wait-effort-relief", Map.put(facts, "wait.verification_state", "challenged"))
+
+    assert {:ok, {:ok, _}} =
+             query.("wait-effort-relief", Map.put(facts, "wait.verification_state", "confirmed"))
+
+    put_raw(
+      ctx,
+      String.replace(
+        shipped,
+        ~s(fact = "resolver.owed_by_other", op = "eq", value = true),
+        ~s(fact = "resolver.owed_by_other", op = "eq", value = false)
+      )
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    assert {:ok, :none} = query.("wait-effort-relief", facts)
+
+    assert {:ok, {:ok, _}} =
+             query.("wait-effort-relief", Map.put(facts, "resolver.owed_by_other", false))
+  end
+
+  test "predicate policy loading refuses incomplete verification and invalid conditions", ctx do
+    valid = """
+    [[policy]]
+    name = "verifier"
+    purpose = "wait-verification-admission"
+    when = [{ fact = "verifier.open", op = "eq", value = true }]
+    verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }
+    """
+
+    for contents <- [
+          String.replace(valid, ~r/^verification.*$/m, ""),
+          String.replace(valid, "registration", "never"),
+          String.replace(valid, "verifier.open", "verifier.unknown"),
+          String.replace(valid, "value = true", "value = 1"),
+          String.replace(valid, ~r/when = .*\n/, "when = []\n"),
+          valid <> "effect = \"deny\"\n",
+          valid <> "\n" <> valid
+        ] do
+      path = put_raw(ctx, contents)
+
+      error =
+        assert_raise ArgumentError, fn -> Rules.load!(ctx.base_dir, Map.keys(ctx.handlers)) end
+
+      assert error.message =~ path
+      assert error.message =~ "verifier"
+    end
+  end
+
   test "file-level validation names only the file", ctx do
     cases = [
       {"", "empty TOML"},
