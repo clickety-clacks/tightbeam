@@ -23,8 +23,16 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
     let binary = env!("CARGO_BIN_EXE_tightbeam");
     let identity_path = dir.join("leader.identity");
 
-    let leader = script(&dir, "leader.sh", "while :; do sleep 1; done\n");
-
+    let child_path = dir.join("member.pid");
+    let leader = script(
+        &dir,
+        "leader.sh",
+        &format!(
+            "/bin/sleep 400 &\necho $! > {child}\nIFS='\t' read pid pgid seconds micros boot launch < {identity}\nexec {binary} harness-group \"$pgid\" {identity} \"$boot\" leader-launch\n",
+            child = child_path.display(),
+            identity = identity_path.display(),
+        ),
+    );
     let mut harness = Command::new(binary)
         .args([
             "harness-exec",
@@ -36,37 +44,45 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("the harness session launcher must start");
-
-    let leader_identity = await_identity(&identity_path);
-
-    let floor_script = script(
-        &dir,
-        "floor.sh",
-        &format!(
-            "{binary} harness-group {pgid} {path} {boot} leader-launch\n",
-            pgid = leader_identity.pgid,
-            path = leader_identity.path,
-            boot = leader_identity.boot,
-        ),
-    );
-
-    let floor = Command::new("/bin/sh")
-        .arg(&floor_script)
-        .output()
-        .expect("same-group floor must run");
-
+    let identity = await_identity(&identity_path);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = harness.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // This fixture's launcher still owns the unreaped group leader.
+            unsafe {
+                libc::killpg(identity.pgid, libc::SIGKILL);
+            }
+            let _ = harness.wait();
+            panic!("in-group helper froze itself");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let child: libc::pid_t = fs::read_to_string(&child_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The exec preserves the leader PID/PGID; this fixture really invokes the floor
+    // from inside its target group, unlike an unrelated shell calling it from outside.
+    assert_eq!(identity.pid, identity.pgid);
+    let member_gone = await_gone(child);
+    if !member_gone {
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+        }
+    }
+    assert!(member_gone, "same-group member survived the floor");
     assert!(
-        floor.status.success(),
-        "same-group floor must not hang or fail: {}",
-        String::from_utf8_lossy(&floor.stderr)
+        status.success(),
+        "in-group helper did not complete successfully"
     );
-
-    let _ = harness.kill();
-    let _ = harness.wait();
-    let _ = fs::remove_dir_all(&dir);
+    fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Identity revalidation at signal time must refuse a boot mismatch before any kill.
@@ -120,7 +136,21 @@ fn signal_time_revalidation_refuses_a_boot_mismatch() {
         "stderr must name the boot mismatch"
     );
 
-    let _ = harness.kill();
+    let cleanup = Command::new(binary)
+        .args([
+            "harness-group",
+            &leader_identity.pgid.to_string(),
+            &leader_identity.path,
+            &leader_identity.boot,
+            "leader-launch",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cleanup.status.success(),
+        "owned fixture cleanup failed: {}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
     let _ = harness.wait();
     let _ = fs::remove_dir_all(&dir);
 }
@@ -172,4 +202,40 @@ fn await_identity(path: &std::path::Path) -> Identity {
     }
 
     panic!("{} was never written", path.display());
+}
+
+fn await_gone(pid: libc::pid_t) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if unsafe { libc::kill(pid, 0) } == -1 {
+            return true;
+        }
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if stat
+                .rsplit_once(')')
+                .is_some_and(|(_, tail)| tail.trim_start().starts_with('Z'))
+            {
+                return true;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    std::ptr::addr_of_mut!(info).cast(),
+                    size_of::<libc::proc_bsdinfo>() as i32,
+                )
+            };
+            if read == size_of::<libc::proc_bsdinfo>() as i32 && info.pbi_status == 5 {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
 }

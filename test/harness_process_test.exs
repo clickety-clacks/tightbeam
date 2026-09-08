@@ -518,14 +518,14 @@ defmodule Tightbeam.HarnessProcessTest do
     end
   end
 
-  test "a helper refusal cannot resolve a launch without attempting the group kill", ctx do
+  test "leader disappearance with a captured survivor stays unresolved and fenced", ctx do
     key = {:claude, "shared", "testhost"}
     {_port, row} = launch_stubborn(ctx, key)
     refusing_helper = Path.join(ctx.test_dir, "refusing-helper")
 
     File.write!(
       refusing_helper,
-      "#!/bin/sh\necho 'harness identity lock is not held' >&2\nexit 1\n"
+      "#!/bin/sh\necho 'harness cleanup incomplete: harness session leader disappeared during cleanup' >&2\nexit 1\n"
     )
 
     File.chmod!(refusing_helper, 0o755)
@@ -537,7 +537,10 @@ defmodule Tightbeam.HarnessProcessTest do
         [row.launch_id, refusing_helper]
       )
 
-    assert {:error, {:kill_failed, {:signal_refused, "harness identity lock is not held"}}} =
+    assert {:error,
+            {:kill_failed,
+             {:signal_refused,
+              "harness cleanup incomplete: harness session leader disappeared during cleanup"}}} =
              HarnessProcess.reconcile_key(ctx.db, key)
 
     assert [
@@ -550,6 +553,7 @@ defmodule Tightbeam.HarnessProcessTest do
            ] = HarnessProcess.list(ctx.db)
 
     assert is_integer(attempted_at)
+    assert HarnessProcess.fenced?(ctx.db, key)
   end
 
   test "a second reconciler losing the terminal race cannot corrupt the resolved row", ctx do

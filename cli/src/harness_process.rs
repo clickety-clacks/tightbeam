@@ -1,6 +1,12 @@
-use crate::process_tree::Snapshot;
-use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use crate::process_tree::{Process, ProcessStartTime, Snapshot, read_process};
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+mod signal;
+use signal::BoundProcess;
+
+#[cfg(test)]
+mod identity_tests;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
@@ -140,7 +146,10 @@ pub fn group(args: &[String]) -> Result<i32, String> {
         return Ok(0);
     }
 
-    kill_harness_tree(&target, freeze_harness_tree(&target)?)
+    match freeze_harness_tree(&target)? {
+        Some(sweep) => kill_harness_tree(&target, sweep),
+        None => Ok(0),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,8 +219,12 @@ fn verify_session_leader_instance(
     pgid: libc::pid_t,
     expected_start_time: ProcessStartTime,
 ) -> Result<HarnessAuthority, String> {
-    match read_process_start_time(pgid) {
-        Ok(current) if current == expected_start_time => {}
+    match read_process(pgid) {
+        Ok(current) if current.start_time == expected_start_time => {
+            if current.zombie {
+                return leader_disappeared_authority(pgid);
+            }
+        }
         Ok(_) => {
             return Err(format!(
                 "process group {pgid} no longer matches its session leader (pid/pgid reuse)"
@@ -251,23 +264,17 @@ fn verify_session_leader_instance(
 fn leader_disappeared_authority(pgid: libc::pid_t) -> Result<HarnessAuthority, String> {
     let snapshot = Snapshot::capture()
         .map_err(|reason| format!("harness session leader {pgid} disappeared; {reason}"))?;
-    if snapshot.group_tree(pgid).is_empty() {
+    if snapshot
+        .group_tree(pgid)
+        .iter()
+        .all(|pid| snapshot.process(*pid).is_some_and(|process| process.zombie))
+    {
         Ok(HarnessAuthority::Gone)
     } else {
         Err(format!(
             "harness session leader {pgid} disappeared while process group still has members; group left unsignalled"
         ))
     }
-}
-
-/// Kernel start time — the stable instance token that survives only for THIS process.
-///
-/// Numeric pids and pgids are reused once a leader is reaped; start time is what
-/// probe.rs and child_process.rs already use to tell the same slot from a new occupant.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProcessStartTime {
-    seconds: libc::time_t,
-    microseconds: i32,
 }
 
 /// One process the freeze proved was ours, bound to the start time read at capture.
@@ -278,113 +285,15 @@ struct ProcessInstance {
     start_time: ProcessStartTime,
 }
 
-impl Ord for ProcessInstance {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.pid.cmp(&other.pid)
-    }
-}
-
-impl PartialOrd for ProcessInstance {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[cfg(target_os = "macos")]
 fn read_process_start_time(pid: libc::pid_t) -> io::Result<ProcessStartTime> {
-    let pid = libc::c_int::try_from(pid)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid exceeds c_int"))?;
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
-    let mut size = 0;
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } == -1
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if size < std::mem::size_of::<libc::timeval>() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "KERN_PROC_PID returned no kinfo_proc",
-        ));
-    }
-
-    let mut buffer = vec![0u8; size];
-    let mut written = buffer.len();
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            mib.len() as libc::c_uint,
-            buffer.as_mut_ptr().cast(),
-            &mut written,
-            std::ptr::null_mut(),
-            0,
-        )
-    } == -1
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if written < std::mem::size_of::<libc::timeval>() {
-        if unsafe { libc::kill(pid, 0) } == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                return Err(error);
-            }
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "KERN_PROC_PID returned truncated kinfo_proc",
-        ));
-    }
-
-    let start = unsafe { buffer.as_ptr().cast::<libc::timeval>().read_unaligned() };
-    Ok(ProcessStartTime {
-        seconds: start.tv_sec,
-        microseconds: start.tv_usec,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn read_process_start_time(pid: libc::pid_t) -> io::Result<ProcessStartTime> {
-    let stat = std::fs::read(format!("/proc/{pid}/stat"))
-        .map_err(|error| io::Error::new(error.kind(), error))?;
-    let start_ticks = parse_proc_starttime(&stat).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "process stat did not carry a start time",
-        )
-    })?;
-    Ok(ProcessStartTime {
-        seconds: start_ticks as libc::time_t,
-        microseconds: 0,
-    })
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_process_start_time(_pid: libc::pid_t) -> io::Result<ProcessStartTime> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "process start time is only available on linux and macOS",
-    ))
+    read_process(pid).map(|process| process.start_time)
 }
 
 /// Field 22 of `/proc/<pid>/stat` after the closing paren — starttime in clock ticks.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 fn parse_proc_starttime(stat: &[u8]) -> Option<u64> {
-    let close = stat.iter().rposition(|byte| *byte == b')')?;
-    let rest = stat.get(close + 2..)?;
-    let fields = rest
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|field| !field.is_empty())
-        .collect::<Vec<_>>();
-    std::str::from_utf8(fields.get(19)?).ok()?.parse().ok()
+    crate::process_tree::parse_proc_stat(4242, std::str::from_utf8(stat).ok()?)
+        .map(|process| process.start_time.seconds as u64)
 }
 
 /// The captured instance must still be the same process before a pid signal is sent.
@@ -429,229 +338,326 @@ fn verify_process_instance(instance: &ProcessInstance) -> Result<ProcessAuthorit
     }
 }
 
-enum EscapeeGroupAuthority {
-    Live,
-    Gone,
+/// Revisit the frozen tree until its membership stops growing. Every signal is delivered
+/// through a retained process capability; group numbers are only discovery metadata.
+const FREEZE_ROUNDS: usize = 8;
+
+struct Sweep {
+    leader: BoundProcess,
+    frozen: BTreeMap<libc::pid_t, BoundProcess>,
+    failures: Vec<String>,
+    caller: libc::pid_t,
 }
 
-/// An inferred escapee group may be signalled only while a captured member still matches.
-fn authorize_escapee_group(
-    pgid: libc::pid_t,
-    frozen: &BTreeSet<ProcessInstance>,
-) -> Result<EscapeeGroupAuthority, String> {
-    let members: Vec<_> = frozen
-        .iter()
-        .filter(|instance| instance.pgid == pgid)
-        .collect();
-    if members.is_empty() {
-        return Ok(EscapeeGroupAuthority::Gone);
+fn freeze_harness_tree(target: &HarnessTarget) -> Result<Option<Sweep>, String> {
+    if target.revalidate_authority()? == HarnessAuthority::Gone {
+        return Ok(None);
     }
-
-    let mut any_live = false;
-    for instance in members {
-        match read_process_start_time(instance.pid) {
-            Ok(current) if current == instance.start_time => {
-                let actual_pgid = match read_process_group(instance.pid) {
-                    Ok(actual_pgid) => actual_pgid,
-                    Err(error) => {
-                        if error.raw_os_error() == Some(libc::ESRCH) {
-                            continue;
-                        }
-                        return Err(format!(
-                            "process {} process group could not be read: {error}",
-                            instance.pid
-                        ));
-                    }
-                };
-                if actual_pgid != pgid {
-                    return Err(format!(
-                        "process group {pgid} no longer matches captured member {} \
-                         (now in group {actual_pgid})",
-                        instance.pid
-                    ));
+    let leader = match BoundProcess::capture(ProcessInstance {
+        pid: target.pgid,
+        pgid: target.pgid,
+        start_time: target.leader_start_time,
+    })? {
+        Some(leader) => leader,
+        None if target.revalidate_authority()? == HarnessAuthority::Gone => return Ok(None),
+        None => {
+            return Err(format!(
+                "harness session leader {} disappeared before freeze",
+                target.pgid
+            ));
+        }
+    };
+    let mut sweep = Sweep {
+        leader,
+        frozen: BTreeMap::new(),
+        failures: Vec::new(),
+        caller: unsafe { libc::getpid() },
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    // Caller exclusion is decided before STOP. There is no group broadcast capable of
+    // stopping the caller, even when it is the recorded leader or shares its group.
+    if sweep.leader.instance.pid != sweep.caller {
+        if target.revalidate_authority()? == HarnessAuthority::Gone {
+            return Ok(None);
+        }
+        match sweep.leader.signal(libc::SIGSTOP)? {
+            ProcessSignalResult::Gone
+                if target.revalidate_authority()? == HarnessAuthority::Gone =>
+            {
+                return Ok(None);
+            }
+            ProcessSignalResult::Gone => sweep
+                .failures
+                .push("leader disappeared before freeze while its group remains".into()),
+            ProcessSignalResult::Failed(error) => sweep.failures.push(format!(
+                "process {} could not be stopped: {error}",
+                target.pgid
+            )),
+            ProcessSignalResult::Delivered => match wait_for_stopped(&sweep.leader, deadline) {
+                Ok(true) => {}
+                Ok(false) if target.revalidate_authority()? == HarnessAuthority::Gone => {
+                    return Ok(None);
                 }
-                any_live = true;
-            }
-            Ok(_) => {
-                return Err(format!(
-                    "process {} no longer matches its captured instance (pid reuse)",
-                    instance.pid
-                ));
-            }
-            Err(error) if process_read_target_gone(&error) => {}
-            Err(error) => {
-                return Err(format!(
-                    "process {} start time could not be read: {error}",
-                    instance.pid
-                ));
-            }
+                Ok(false) => sweep
+                    .failures
+                    .push("leader exited before entering the frozen state".into()),
+                Err(reason) => sweep.failures.push(reason),
+            },
+        }
+        if !sweep.failures.is_empty() {
+            return Ok(Some(sweep));
         }
     }
 
-    if any_live {
-        Ok(EscapeeGroupAuthority::Live)
-    } else {
-        Ok(EscapeeGroupAuthority::Gone)
-    }
-}
-
-/// How many times the sweep re-reads the table looking for something new to freeze.
-///
-/// Each round freezes everything the last one found, so a tree that is merely deep or
-/// merely busy settles in two or three. The bound is what a tree that forks faster than it
-/// can be frozen runs into, and reaching it is not a reason to stop: the frozen majority
-/// still gets killed below, and the alternative to killing what we have is killing nothing.
-const FREEZE_ROUNDS: usize = 8;
-
-/// Stop the harness tree, so the set that is enumerated is the set that exists.
-///
-/// The defect this closes, measured live on pi 0.84.2 (spike 2026-08-23): harnesses spawn
-/// bash children with node's `detached: true`, which `setsid`s each one into a process
-/// group of its own. The floor's single `killpg(10421)` killed the harness and left its
-/// `sleep 400` grandchild — group 10957 — alive and reparented to init. opencode 1.18.18
-/// has the same signature. The harness cannot be asked to tidy up after itself on this
-/// path: the premise of the floor is that it was SIGKILLed and never got the chance.
-///
-/// A running tree cannot be enumerated correctly. Between a snapshot and the kill it forks,
-/// and a child of an escapee we have not found yet is an escapee we never see. SIGSTOP
-/// cannot be caught or blocked, so freezing first turns the walk into a reading of
-/// something that is holding still.
-///
-/// Nothing from here to the kill may return early. A frozen tree that never gets its
-/// SIGKILL never dies at all — strictly worse than the orphan this replaces — so every
-/// failure below is recorded on the sweep rather than silently dropped.
-fn freeze_harness_tree(target: &HarnessTarget) -> Result<Sweep, String> {
-    let pgid = target.pgid;
-    // Us, and the group we are in. `harness-group` run BY HAND from inside the very session
-    // it is parking is a descendant of the group it sweeps: freezing ourselves there stops
-    // this process forever, with the whole tree stopped behind it and nothing left running
-    // to kill any of it. Same-group protection runs BEFORE any killpg(SIGSTOP), so an
-    // in-group caller can exclude itself instead of stopping the whole walk.
-    let me = unsafe { libc::getpid() };
-    let my_group = unsafe { libc::getpgrp() };
-
-    let mut sweep = Sweep {
-        frozen: BTreeSet::new(),
-        groups: BTreeSet::from([pgid]),
-        incomplete: false,
-    };
-    sweep.groups.remove(&my_group);
-
-    target.require_live_before_signal()?;
-
-    if pgid == my_group {
-        // Never killpg the recorded group: we are in it. The first snapshot round below
-        // SIGSTOPs the other members individually.
-    } else {
-        signal_process_group(pgid, libc::SIGSTOP, target)?;
-    }
-
-    let mut rounds = 0;
-    let mut found_more = true;
-    while rounds < FREEZE_ROUNDS {
-        target.require_live_before_signal()?;
-
+    for _ in 0..FREEZE_ROUNDS {
+        if let Err(reason) = require_sweep_authority(target, &sweep.leader) {
+            sweep.failures.push(reason);
+            return Ok(Some(sweep));
+        }
         let snapshot = match Snapshot::capture() {
             Ok(snapshot) => snapshot,
             Err(reason) => {
-                sweep.incomplete = true;
-                eprintln!(
-                    "harness-group: process table unreadable ({reason}); \
-                     signalling the recorded group only"
-                );
-                break;
+                sweep
+                    .failures
+                    .push(format!("harness process table unreadable: {reason}"));
+                return Ok(Some(sweep));
             }
         };
-
-        let tree = snapshot.group_tree(pgid);
-        sweep.groups.extend(snapshot.process_groups(&tree));
-
-        found_more = false;
-        for pid in tree {
-            if pid == me || sweep.frozen.iter().any(|instance| instance.pid == pid) {
-                continue;
-            }
-            let Some(member_pgid) = snapshot.pgid_of(pid) else {
-                continue;
-            };
-            let start_time = match read_process_start_time(pid) {
-                Ok(start_time) => start_time,
-                Err(error) if process_read_target_gone(&error) => continue,
-                Err(error) => {
-                    return Err(format!(
-                        "process {pid} start time could not be read before freeze: {error}"
-                    ));
+        let mut tree = snapshot.group_tree(target.pgid);
+        // A captured escapee can have peers, children, and children reparented inside its
+        // group. Extend the walk only while a captured member still proves that group.
+        for process in sweep.frozen.values() {
+            match verify_process_instance(&process.instance) {
+                Ok(ProcessAuthority::Live) => {
+                    tree.extend(snapshot.group_tree(process.instance.pgid))
                 }
-            };
-            let instance = ProcessInstance {
-                pid,
-                pgid: member_pgid,
-                start_time,
-            };
-            found_more = true;
-            sweep.frozen.insert(instance);
-            signal_process(instance, libc::SIGSTOP, target)?;
+                Ok(ProcessAuthority::Gone) => {}
+                Err(reason) => sweep.failures.push(reason),
+            }
         }
-
-        // The exit condition is the state itself — a reading that adds nobody — not a
-        // count of rounds that usually suffices.
-        if !found_more {
+        let mut pending: Vec<_> = tree
+            .into_iter()
+            .filter(|pid| {
+                *pid != sweep.caller && *pid != target.pgid && !sweep.frozen.contains_key(pid)
+            })
+            .collect();
+        let mut added = false;
+        // Discover parent before child even when numeric PID order has wrapped. A whole
+        // snapshot can contain many generations; FREEZE_ROUNDS does not limit tree depth.
+        loop {
+            let mut advanced = false;
+            let mut remaining = Vec::new();
+            for pid in pending {
+                let Some(observed) = snapshot.process(pid) else {
+                    continue;
+                };
+                if observed.zombie {
+                    continue;
+                }
+                let anchor = std::iter::once(&sweep.leader)
+                    .chain(sweep.frozen.values())
+                    .find(|parent| {
+                        parent.instance.pid == observed.ppid
+                            || parent.instance.pgid == observed.pgid
+                    });
+                let Some(anchor) = anchor else {
+                    remaining.push(pid);
+                    continue;
+                };
+                advanced = true;
+                match capture_member(observed, anchor) {
+                    Ok(Some(process)) => {
+                        sweep.frozen.insert(pid, process);
+                        added = true;
+                        if let Err(reason) =
+                            stop_process(&sweep.frozen[&pid], target, &sweep.leader, deadline)
+                        {
+                            sweep.failures.push(reason);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(reason) => sweep.failures.push(reason),
+                }
+            }
+            if remaining.is_empty() {
+                break;
+            }
+            if !advanced {
+                sweep.failures.push(format!(
+                    "harness ancestry no longer provable for captured table entries {remaining:?}"
+                ));
+                break;
+            }
+            pending = remaining;
+        }
+        if !added {
+            return Ok(Some(sweep));
+        }
+        if Instant::now() >= deadline {
             break;
         }
-        rounds += 1;
     }
-
-    if found_more {
-        sweep.incomplete = true;
-    }
-
-    Ok(sweep)
+    sweep
+        .failures
+        .push("harness tree freeze did not prove complete before kill".into());
+    Ok(Some(sweep))
 }
 
-/// What one freeze pass established: the pids it stopped, and every group they sit in.
-///
-/// Neither set ever names this process or its group — `freeze_harness_tree` is the only
-/// thing that fills them, and it excludes both. Everything in here is signalable.
-struct Sweep {
-    frozen: BTreeSet<ProcessInstance>,
-    groups: BTreeSet<libc::pid_t>,
-    /// True when the walk could not prove it saw the whole tree before the kill.
-    incomplete: bool,
+fn require_sweep_authority(target: &HarnessTarget, leader: &BoundProcess) -> Result<(), String> {
+    target.require_live_before_signal()?;
+    if !leader.alive()? {
+        return Err(format!(
+            "harness session leader {} disappeared during cleanup",
+            target.pgid
+        ));
+    }
+    Ok(())
 }
 
-fn signal_process_group(
-    pgid: libc::pid_t,
-    signal: libc::c_int,
+fn capture_member(
+    observed: &Process,
+    anchor: &BoundProcess,
+) -> Result<Option<BoundProcess>, String> {
+    let require_anchor = || -> Result<(), String> {
+        if !anchor.alive()? || verify_process_instance(&anchor.instance)? != ProcessAuthority::Live
+        {
+            return Err(format!(
+                "process {} lost its captured ancestry/group anchor {}",
+                observed.pid, anchor.instance.pid
+            ));
+        }
+        Ok(())
+    };
+    require_anchor()?;
+    let Some(process) = BoundProcess::capture(ProcessInstance {
+        pid: observed.pid,
+        pgid: observed.pgid,
+        start_time: observed.start_time,
+    })?
+    else {
+        return Ok(None);
+    };
+    let current = match read_process(observed.pid) {
+        Ok(current) => current,
+        Err(error) if process_read_target_gone(&error) => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "process {} ancestry unreadable: {error}",
+                observed.pid
+            ));
+        }
+    };
+    if current.ppid != observed.ppid
+        || current.pgid != observed.pgid
+        || current.start_time != observed.start_time
+    {
+        return Err(format!(
+            "process {} ancestry or instance changed during capture",
+            observed.pid
+        ));
+    }
+    require_anchor()?;
+    Ok(Some(process))
+}
+
+fn stop_process(
+    process: &BoundProcess,
     target: &HarnessTarget,
+    leader: &BoundProcess,
+    deadline: Instant,
 ) -> Result<(), String> {
-    if target.revalidate_authority()? == HarnessAuthority::Gone {
-        return Ok(());
+    require_sweep_authority(target, leader)?;
+    match process.signal(libc::SIGSTOP)? {
+        ProcessSignalResult::Gone => return Ok(()),
+        ProcessSignalResult::Failed(error) => {
+            return Err(format!(
+                "process {} could not be stopped: {error}",
+                process.instance.pid
+            ));
+        }
+        ProcessSignalResult::Delivered => {}
     }
-    if send_group_signal(pgid, signal) == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if group_signal_target_gone(&error) {
-        return Ok(());
-    }
-    Err(format!(
-        "process group {pgid} could not be signalled: {error}"
-    ))
+    wait_for_stopped(process, deadline).map(|_| ())
 }
 
-fn signal_process(
-    instance: ProcessInstance,
-    signal: libc::c_int,
-    target: &HarnessTarget,
-) -> Result<(), String> {
-    if target.revalidate_authority()? == HarnessAuthority::Gone {
-        return Ok(());
+fn wait_for_stopped(process: &BoundProcess, deadline: Instant) -> Result<bool, String> {
+    loop {
+        let current = match read_process(process.instance.pid) {
+            Ok(current) => current,
+            Err(error) if process_read_target_gone(&error) => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "process {} stop state unreadable: {error}",
+                    process.instance.pid
+                ));
+            }
+        };
+        if current.start_time != process.instance.start_time
+            || current.pgid != process.instance.pgid
+        {
+            return Err(format!(
+                "process {} instance changed while awaiting STOP",
+                process.instance.pid
+            ));
+        }
+        if current.zombie {
+            return Ok(false);
+        }
+        if current.stopped {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "process {} did not enter the frozen state",
+                process.instance.pid
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
-    match signal_process_instance(&instance, signal)? {
+}
+
+/// Captured escapees die first, then the recorded group's members, then its leader.
+/// A missing leader during an established sweep is a failure for every captured survivor;
+/// a later empty-group observation never erases that failure (PR30 F1).
+fn kill_harness_tree(target: &HarnessTarget, mut sweep: Sweep) -> Result<i32, String> {
+    for escaped in [true, false] {
+        for process in sweep
+            .frozen
+            .values()
+            .filter(|process| (process.instance.pgid != target.pgid) == escaped)
+        {
+            if let Err(reason) = kill_captured(process, target, &sweep.leader) {
+                sweep.failures.push(reason);
+            }
+        }
+    }
+    if sweep.leader.instance.pid != sweep.caller {
+        if let Err(reason) = kill_captured(&sweep.leader, target, &sweep.leader) {
+            sweep.failures.push(reason);
+        }
+    }
+    if sweep.failures.is_empty() {
+        Ok(0)
+    } else {
+        Err(format!(
+            "harness cleanup incomplete: {}",
+            sweep.failures.join("; ")
+        ))
+    }
+}
+
+fn kill_captured(
+    process: &BoundProcess,
+    target: &HarnessTarget,
+    leader: &BoundProcess,
+) -> Result<(), String> {
+    // Unlike pre-sweep empty-group success, losing the leader cannot settle a capture.
+    require_sweep_authority(target, leader)?;
+    match process.signal(libc::SIGKILL)? {
         ProcessSignalResult::Delivered | ProcessSignalResult::Gone => Ok(()),
         ProcessSignalResult::Failed(error) => Err(format!(
-            "process {} could not be signalled: {error}",
-            instance.pid
+            "captured process {} outlived SIGKILL: {error}",
+            process.instance.pid
         )),
     }
 }
@@ -662,35 +668,15 @@ enum ProcessSignalResult {
     Failed(io::Error),
 }
 
-/// Verify and signal in one seam so a Gone observation cannot authorize a later numeric kill.
+#[cfg(test)]
 fn signal_process_instance(
     instance: &ProcessInstance,
     signal: libc::c_int,
 ) -> Result<ProcessSignalResult, String> {
-    if verify_process_instance(instance)? == ProcessAuthority::Gone {
-        return Ok(ProcessSignalResult::Gone);
+    match BoundProcess::capture(*instance)? {
+        Some(process) => process.signal(signal),
+        None => Ok(ProcessSignalResult::Gone),
     }
-    if send_process_signal(instance.pid, signal) == 0 {
-        return Ok(ProcessSignalResult::Delivered);
-    }
-    let error = io::Error::last_os_error();
-    if process_signal_target_gone(&error) {
-        Ok(ProcessSignalResult::Gone)
-    } else {
-        Ok(ProcessSignalResult::Failed(error))
-    }
-}
-
-fn send_group_signal(pgid: libc::pid_t, signal: libc::c_int) -> libc::c_int {
-    #[cfg(test)]
-    GROUP_SIGNAL_CALLS.with(|calls| calls.set(calls.get() + 1));
-    unsafe { libc::killpg(pgid, signal) }
-}
-
-fn send_process_signal(pid: libc::pid_t, signal: libc::c_int) -> libc::c_int {
-    #[cfg(test)]
-    PROCESS_SIGNAL_CALLS.with(|calls| calls.set(calls.get() + 1));
-    unsafe { libc::kill(pid, signal) }
 }
 
 fn read_process_group(pid: libc::pid_t) -> io::Result<libc::pid_t> {
@@ -698,7 +684,6 @@ fn read_process_group(pid: libc::pid_t) -> io::Result<libc::pid_t> {
     if let Some(errno) = PROCESS_GROUP_ERRNO.with(|value| value.take()) {
         return Err(io::Error::from_raw_os_error(errno));
     }
-
     let pgid = unsafe { libc::getpgid(pid) };
     if pgid == -1 {
         Err(io::Error::last_os_error())
@@ -709,170 +694,26 @@ fn read_process_group(pid: libc::pid_t) -> io::Result<libc::pid_t> {
 
 #[cfg(test)]
 thread_local! {
-    static GROUP_SIGNAL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROCESS_SIGNAL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROCESS_GROUP_ERRNO: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
-/// A group with no live members to signal — linux says ESRCH, darwin often EPERM.
-fn group_signal_target_gone(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(libc::ESRCH)
-        || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM))
-}
-
-/// An individual pid that is already gone. Darwin EPERM is NOT absence here — unlike
-/// killpg, kill(pid) has no leader-exited proof path on this floor.
-fn process_signal_target_gone(error: &std::io::Error) -> bool {
+// Every captured member uses the stricter process errno classification on both
+// platforms. Empty-group success is established by observation, never a member EPERM.
+fn process_signal_target_gone(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH)
 }
 
-/// `/proc/<pid>` disappearance is ENOENT on Linux; the process APIs use ESRCH.
-fn process_read_target_gone(error: &std::io::Error) -> bool {
+fn process_read_target_gone(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::ESRCH) || error.kind() == io::ErrorKind::NotFound
 }
 
-/// SIGKILL everything the freeze proved was ours, then the recorded group last.
-///
-/// SIGKILL reaches a stopped process — neither signal can be caught or blocked, and the
-/// kernel wakes a stopped task to die — so the freeze above needs no SIGCONT to undo.
-///
-/// Escaped groups are signalled BEFORE the recorded one. On the hand-run path the recorded
-/// group can contain this very process, and a sweep that killed its own caller first would
-/// leave behind precisely the escapees it had just finished identifying.
-///
-/// The pid-by-pid pass is not redundant with the group pass: it kills exactly what the walk
-/// proved, where the group pass also reaches anything that appeared inside those groups
-/// since the last reading.
-///
-/// Incomplete cleanup is a loud failure: exit non-zero so the adapter fence stays up until
-/// an operator clears it. A recorded-group kill that succeeded while escapees remain must
-/// not read as success.
-fn kill_harness_tree(target: &HarnessTarget, sweep: Sweep) -> Result<i32, String> {
-    let pgid = target.pgid;
-    let mut cleanup_failures = Vec::new();
-
-    if sweep.incomplete {
-        cleanup_failures.push("harness tree freeze did not prove complete before kill".to_string());
-    }
-
-    for group in sweep.groups.iter().filter(|group| **group != pgid) {
-        if let Some(reason) = sigkill_stray(Stray::Group(*group), target, &sweep.frozen) {
-            cleanup_failures.push(reason);
-        }
-    }
-
-    // Keep the recorded leader alive as the group's authority until the recorded-group
-    // signal. Every stopped member still in that group is reached by the same killpg.
-    for instance in sweep.frozen.iter().filter(|instance| instance.pgid != pgid) {
-        if let Some(reason) = sigkill_stray(Stray::Process(*instance), target, &sweep.frozen) {
-            cleanup_failures.push(reason);
-        }
-    }
-
-    let recorded = signal_process_group(pgid, libc::SIGKILL, target).map(|_| 0);
-
-    if cleanup_failures.is_empty() {
-        recorded
-    } else {
-        Err(format!(
-            "harness cleanup incomplete: {}",
-            cleanup_failures.join("; ")
-        ))
-    }
-}
-
-/// One escapee the walk found — a whole group of them, or a single process.
-enum Stray {
-    Group(libc::pid_t),
-    Process(ProcessInstance),
-}
-
-/// SIGKILL one escapee, and report if it would not die.
-///
-/// The signal and the `errno` read are in the same function on purpose: `errno` describes
-/// the last failing call on this thread, and the file already learned once (`bounded_command`)
-/// what it costs when a failure is reported against a call that did not produce it.
-///
-/// "Already gone" is the ordinary outcome here, not an anomaly: the freeze does not stop a
-/// process that had already exited, and darwin reports an emptied group as EPERM — the same
-/// fact `classify_group_kill` records for the recorded group, for the same reason, which is
-/// that the target was established as ours before it was signalled.
-fn sigkill_stray(
-    stray: Stray,
-    target: &HarnessTarget,
-    frozen: &BTreeSet<ProcessInstance>,
-) -> Option<String> {
-    match target.revalidate_authority() {
-        Ok(HarnessAuthority::Live) => {}
-        Ok(HarnessAuthority::Gone) => return None,
-        Err(error) => return Some(error),
-    }
-
-    match stray {
-        Stray::Group(pgid) => match authorize_escapee_group(pgid, frozen) {
-            Ok(EscapeeGroupAuthority::Gone) => None,
-            Ok(EscapeeGroupAuthority::Live) => report_sigkill_result(
-                send_group_signal(pgid, libc::SIGKILL),
-                format!("process group {pgid}"),
-                group_signal_target_gone,
-            ),
-            Err(reason) => Some(reason),
-        },
-        Stray::Process(instance) => match signal_process_instance(&instance, libc::SIGKILL) {
-            Ok(ProcessSignalResult::Delivered) | Ok(ProcessSignalResult::Gone) => None,
-            Ok(ProcessSignalResult::Failed(error)) => report_sigkill_error(
-                error,
-                format!("process {}", instance.pid),
-                process_signal_target_gone,
-            ),
-            Err(reason) => Some(reason),
-        },
-    }
-}
-
-fn report_sigkill_result(
-    result: libc::c_int,
-    target_label: String,
-    gone: fn(&std::io::Error) -> bool,
-) -> Option<String> {
-    if result == 0 {
-        return None;
-    }
-
-    report_sigkill_error(std::io::Error::last_os_error(), target_label, gone)
-}
-
-fn report_sigkill_error(
-    error: std::io::Error,
-    target_label: String,
-    gone: fn(&std::io::Error) -> bool,
-) -> Option<String> {
-    if gone(&error) {
-        None
-    } else {
-        let reason = format!("escaped {target_label} outlived SIGKILL: {error}");
-        eprintln!("harness-group: {reason}");
-        Some(reason)
-    }
-}
-
-/// A group that is already gone is a success, and darwin says so differently.
-///
-/// linux answers ESRCH when nothing in the group can be signalled. macOS answers EPERM once
-/// the group's members have all exited -- the group id still resolves, but there is nothing
-/// live in it to own. Treating that as a failure turns "already dead" into "could not kill",
-/// which is what it did: a live onboarding aborted with
-/// `kill_failed: process group 62968 could not be signalled: Operation not permitted`
-/// against a group that `kill -0` reported as no such process.
-///
-/// EPERM is only read this way AFTER `authorize_group_signal` has established the group is
-/// ours by identity and boot epoch. Without that check EPERM would be ambiguous with
-/// somebody else's group, which is exactly what it means on linux and why this is
-/// darwin-only. `child_process.rs` already carries the same guard for the same reason; this
-/// is the one place that knew the fact in only one language.
+// Preserve group-cleanup error coverage against the delivery predicate actually used
+// by retained capabilities. Darwin's former numeric-killpg EPERM exception no longer
+// applies; its empty-group success is covered by the real pre-sweep reap regression.
 #[cfg(test)]
 fn classify_group_kill(pgid: libc::pid_t, error: std::io::Error) -> Result<i32, String> {
-    if group_signal_target_gone(&error) {
+    if process_signal_target_gone(&error) {
         Ok(0)
     } else {
         Err(format!(
@@ -896,8 +737,8 @@ mod group_kill_tests {
     /// against a group `kill -0` reported as no such process.
     #[test]
     #[cfg(target_os = "macos")]
-    fn eperm_is_already_gone_on_darwin() {
-        assert!(classify_group_kill(1234, Error::from_raw_os_error(libc::EPERM)).is_ok());
+    fn eperm_is_refused_for_captured_group_members_on_darwin() {
+        assert!(classify_group_kill(1234, Error::from_raw_os_error(libc::EPERM)).is_err());
     }
 
     /// On linux EPERM means somebody else's group, which must stay an error -- the darwin
@@ -919,7 +760,7 @@ mod group_kill_tests {
 
 #[cfg(test)]
 mod signal_target_gone_tests {
-    use super::{group_signal_target_gone, process_signal_target_gone};
+    use super::process_signal_target_gone;
     use std::io::Error;
 
     #[test]
@@ -939,8 +780,8 @@ mod signal_target_gone_tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn eperm_is_gone_for_group_signals_on_darwin() {
-        assert!(group_signal_target_gone(&Error::from_raw_os_error(
+    fn eperm_is_not_gone_for_group_members_on_darwin() {
+        assert!(!process_signal_target_gone(&Error::from_raw_os_error(
             libc::EPERM
         )));
     }
@@ -948,7 +789,7 @@ mod signal_target_gone_tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn eperm_is_not_gone_for_group_signals_on_linux() {
-        assert!(!group_signal_target_gone(&Error::from_raw_os_error(
+        assert!(!process_signal_target_gone(&Error::from_raw_os_error(
             libc::EPERM
         )));
     }
@@ -957,10 +798,10 @@ mod signal_target_gone_tests {
 #[cfg(test)]
 mod instance_authority_tests {
     use super::{
-        GROUP_SIGNAL_CALLS, HarnessTarget, PROCESS_GROUP_ERRNO, PROCESS_SIGNAL_CALLS,
-        ProcessInstance, ProcessSignalResult, ProcessStartTime, boot_identity,
-        parse_proc_starttime, read_process_start_time, signal_process_group,
-        signal_process_instance, verify_process_instance,
+        HarnessTarget, PROCESS_GROUP_ERRNO, PROCESS_SIGNAL_CALLS, ProcessInstance,
+        ProcessSignalResult, ProcessStartTime, boot_identity, freeze_harness_tree, group,
+        parse_proc_starttime, read_process_start_time, signal_process_instance,
+        verify_process_instance,
     };
     use std::fs;
 
@@ -1043,7 +884,7 @@ mod instance_authority_tests {
 
     #[test]
     fn signal_time_pgid_reuse_never_reaches_numeric_killpg() {
-        GROUP_SIGNAL_CALLS.with(|calls| calls.set(0));
+        PROCESS_SIGNAL_CALLS.with(|calls| calls.set(0));
         let pgid = unsafe { libc::getpgrp() };
         let current = read_process_start_time(pgid).expect("live group leader start time readable");
         let captured = stale(current);
@@ -1070,18 +911,18 @@ mod instance_authority_tests {
             leader_start_time: captured,
         };
 
-        let error = signal_process_group(pgid, 0, &target)
+        let error = freeze_harness_tree(&target)
             .err()
             .expect("a pgid now led by another instance must be refused");
 
         assert!(error.contains("pid/pgid reuse"), "{error}");
-        GROUP_SIGNAL_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        PROCESS_SIGNAL_CALLS.with(|calls| assert_eq!(calls.get(), 0));
         fs::remove_file(path).unwrap();
     }
 
     #[test]
     fn disappeared_leader_with_an_empty_group_never_reaches_numeric_killpg() {
-        GROUP_SIGNAL_CALLS.with(|calls| calls.set(0));
+        PROCESS_SIGNAL_CALLS.with(|calls| calls.set(0));
         let pgid = 999_999_123;
         let captured = ProcessStartTime {
             seconds: 1,
@@ -1102,10 +943,15 @@ mod instance_authority_tests {
             leader_start_time: captured,
         };
 
-        signal_process_group(pgid, 0, &target)
-            .expect("an observed-empty group needs no signal delivery");
+        group(&[
+            pgid.to_string(),
+            target.identity_path.clone(),
+            target.boot_identity.clone(),
+            target.launch_id.clone(),
+        ])
+        .expect("an observed-empty group needs no signal delivery");
 
-        GROUP_SIGNAL_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        PROCESS_SIGNAL_CALLS.with(|calls| assert_eq!(calls.get(), 0));
         fs::remove_file(path).unwrap();
     }
 }

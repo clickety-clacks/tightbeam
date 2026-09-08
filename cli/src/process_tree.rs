@@ -6,23 +6,42 @@
 //! fourth: parsing its columns is a second guess on top of the first.
 
 use std::collections::{BTreeSet, HashMap};
+use std::io;
 
-/// The three fields a kill floor needs: who this is, who it came from, which group it is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProcessStartTime {
+    pub(crate) seconds: libc::time_t,
+    pub(crate) microseconds: i32,
+}
+
+/// An observed process identity, ancestry, group, and stop/exit state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Process {
     pub(crate) pid: libc::pid_t,
     pub(crate) ppid: libc::pid_t,
     pub(crate) pgid: libc::pid_t,
+    pub(crate) start_time: ProcessStartTime,
+    pub(crate) stopped: bool,
+    pub(crate) zombie: bool,
+    #[cfg(target_os = "macos")]
+    pub(crate) unique_id: u64,
+    #[cfg(target_os = "macos")]
+    pub(crate) id_version: u32,
 }
 
-/// One reading of the process table. Never refreshed in place: a sweep that needs a newer
-/// answer captures a new one, so no caller can reason over a mix of two moments.
+/// One enumeration retaining each row's birth identity with its ancestry metadata.
+/// Rows can change during enumeration; the sweep validates them against retained process
+/// capabilities before granting signal authority. A new round captures a fresh table.
 pub(crate) struct Snapshot {
     processes: Vec<Process>,
 }
 
 impl Snapshot {
     pub(crate) fn capture() -> Result<Self, String> {
+        #[cfg(test)]
+        if let Some(reason) = CAPTURE_FAILURE.with(|failure| failure.take()) {
+            return Err(reason);
+        }
         Ok(Self {
             processes: read_process_table()?,
         })
@@ -78,14 +97,12 @@ impl Snapshot {
         tree
     }
 
-    pub(crate) fn pgid_of(&self, pid: libc::pid_t) -> Option<libc::pid_t> {
-        self.processes
-            .iter()
-            .find(|process| process.pid == pid)
-            .map(|process| process.pgid)
+    pub(crate) fn process(&self, pid: libc::pid_t) -> Option<&Process> {
+        self.processes.iter().find(|process| process.pid == pid)
     }
 
-    /// The distinct process groups those pids sit in — the groups a sweep has to signal.
+    /// The distinct process groups those pids sit in, including detached escapees.
+    #[cfg(test)]
     pub(crate) fn process_groups(&self, pids: &BTreeSet<libc::pid_t>) -> BTreeSet<libc::pid_t> {
         self.processes
             .iter()
@@ -94,6 +111,11 @@ impl Snapshot {
             .filter(|pgid| *pgid > 1)
             .collect()
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CAPTURE_FAILURE: std::cell::Cell<Option<String>> = const { std::cell::Cell::new(None) };
 }
 
 /// Every pid the kernel will name, into a buffer big enough to have held one more.
@@ -106,8 +128,8 @@ impl Snapshot {
 /// BOUNDED, and the bound is load-bearing rather than a formality: this runs inside the
 /// kill floor, where a loop that never settled would let the gateway's 5s call expire as
 /// `sigkill_delivery_unconfirmed` — a kill_failed row, and a fence on the adapter key —
-/// over a process table. Giving up SAYS SO and lets the floor degrade to the recorded
-/// group, which is what it signalled before this walk existed.
+/// over a process table. Giving up reports incomplete cleanup; the floor retains and
+/// cleans up the process capabilities it already captured.
 ///
 /// `proc_listallpids` answers in PIDS, not bytes. It is a wrapper over `proc_listpids`,
 /// which answers in bytes, and it has already divided by `sizeof(int)` before it returns.
@@ -165,26 +187,10 @@ fn read_process_table() -> Result<Vec<Process>, String> {
 
     let mut processes = Vec::with_capacity(pids.len());
     for pid in pids {
-        if pid <= 0 {
-            continue;
-        }
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        let read = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                std::ptr::addr_of_mut!(info).cast(),
-                size,
-            )
-        };
-        if read == size {
-            processes.push(Process {
-                pid: info.pbi_pid as libc::pid_t,
-                ppid: info.pbi_ppid as libc::pid_t,
-                pgid: info.pbi_pgid as libc::pid_t,
-            });
+        if pid > 0 {
+            if let Ok(process) = read_process(pid) {
+                processes.push(process);
+            }
         }
     }
 
@@ -205,10 +211,7 @@ fn read_process_table() -> Result<Vec<Process>, String> {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<libc::pid_t>() else {
             continue;
         };
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            continue;
-        };
-        if let Some(process) = parse_proc_stat(pid, &stat) {
+        if let Ok(process) = read_process(pid) {
             processes.push(process);
         }
     }
@@ -222,13 +225,90 @@ fn read_process_table() -> Result<Vec<Process>, String> {
 /// ppid and pgrp columns — a process could then NAME ITSELF out of this sweep. The last
 /// `)` in the line is the one unambiguous landmark, so everything is read relative to it.
 #[cfg(any(target_os = "linux", test))]
-fn parse_proc_stat(pid: libc::pid_t, stat: &str) -> Option<Process> {
+pub(crate) fn parse_proc_stat(pid: libc::pid_t, stat: &str) -> Option<Process> {
     let tail = &stat[stat.rfind(')')? + 1..];
-    let mut fields = tail.split_ascii_whitespace();
-    let _state = fields.next()?;
-    let ppid = fields.next()?.parse::<libc::pid_t>().ok()?;
-    let pgid = fields.next()?.parse::<libc::pid_t>().ok()?;
-    Some(Process { pid, ppid, pgid })
+    let fields: Vec<_> = tail.split_ascii_whitespace().collect();
+    let state = *fields.first()?;
+    Some(Process {
+        pid,
+        ppid: fields.get(1)?.parse().ok()?,
+        pgid: fields.get(2)?.parse().ok()?,
+        start_time: ProcessStartTime {
+            seconds: fields.get(19)?.parse().ok()?,
+            microseconds: 0,
+        },
+        stopped: matches!(state, "T" | "t"),
+        zombie: matches!(state, "Z" | "X"),
+        #[cfg(target_os = "macos")]
+        unique_id: 0,
+        #[cfg(target_os = "macos")]
+        id_version: 0,
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn read_process(pid: libc::pid_t) -> io::Result<Process> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    parse_proc_stat(pid, &stat).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "process stat lacks identity metadata",
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn read_process(pid: libc::pid_t) -> io::Result<Process> {
+    // XNU proc_info_private.h: PROC_PIDT_BSDINFOWITHUNIQID (18), with the
+    // BSD fields and the audit identity read under the same proc reference.
+    #[repr(C)]
+    struct UniqueInfo {
+        uuid: [u8; 16],
+        unique_id: u64,
+        parent_unique_id: u64,
+        id_version: i32,
+        parent_id_version: i32,
+        reserved: [u64; 2],
+    }
+    #[repr(C)]
+    struct Info {
+        bsd: libc::proc_bsdinfo,
+        unique: UniqueInfo,
+    }
+    let mut info: Info = unsafe { std::mem::zeroed() };
+    let size = size_of::<Info>() as libc::c_int;
+    let read = unsafe { libc::proc_pidinfo(pid, 18, 0, std::ptr::addr_of_mut!(info).cast(), size) };
+    if read != size {
+        return Err(if read == 0 {
+            io::Error::last_os_error()
+        } else {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "incomplete BSD process identity",
+            )
+        });
+    }
+    Ok(Process {
+        pid: info.bsd.pbi_pid as libc::pid_t,
+        ppid: info.bsd.pbi_ppid as libc::pid_t,
+        pgid: info.bsd.pbi_pgid as libc::pid_t,
+        start_time: ProcessStartTime {
+            seconds: info.bsd.pbi_start_tvsec as libc::time_t,
+            microseconds: info.bsd.pbi_start_tvusec as i32,
+        },
+        stopped: info.bsd.pbi_status == 4, // SSTOP
+        zombie: info.bsd.pbi_status == 5,  // SZOMB
+        unique_id: info.unique.unique_id,
+        id_version: info.unique.id_version as u32,
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn read_process(_: libc::pid_t) -> io::Result<Process> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process identities require Linux or macOS",
+    ))
 }
 
 #[cfg(test)]
@@ -236,7 +316,21 @@ mod tests {
     use super::*;
 
     fn process(pid: libc::pid_t, ppid: libc::pid_t, pgid: libc::pid_t) -> Process {
-        Process { pid, ppid, pgid }
+        Process {
+            pid,
+            ppid,
+            pgid,
+            start_time: ProcessStartTime {
+                seconds: 123,
+                microseconds: 0,
+            },
+            stopped: false,
+            zombie: false,
+            #[cfg(target_os = "macos")]
+            unique_id: 0,
+            #[cfg(target_os = "macos")]
+            id_version: 0,
+        }
     }
 
     /// The measured pi 0.84.2 tree, which one `killpg` could not clear:
@@ -319,31 +413,21 @@ mod tests {
     /// The `comm` field is attacker-controlled text that contains the delimiter.
     #[test]
     fn a_command_name_full_of_parentheses_does_not_move_the_columns() {
-        let stat = "4242 () 1 2 3 (evil)) S 4200 4100 4100 0 -1 4194304";
+        let stat =
+            "4242 () 1 2 3 (evil)) S 4200 4100 4100 0 -1 4194304 0 0 0 0 0 0 0 0 0 0 0 0 123";
 
         assert_eq!(
             parse_proc_stat(4242, stat),
-            Some(Process {
-                pid: 4242,
-                ppid: 4200,
-                pgid: 4100
-            }),
+            Some(process(4242, 4200, 4100)),
             "a process renamed itself out of the sweep"
         );
     }
 
     #[test]
     fn an_ordinary_proc_stat_line_reads_its_parent_and_group() {
-        let stat = "4242 (sleep) S 4200 4100 4100 0 -1 4194304 123 0 0 0";
+        let stat = "4242 (sleep) S 4200 4100 4100 0 -1 4194304 0 0 0 0 0 0 0 0 0 0 0 0 123";
 
-        assert_eq!(
-            parse_proc_stat(4242, stat),
-            Some(Process {
-                pid: 4242,
-                ppid: 4200,
-                pgid: 4100
-            })
-        );
+        assert_eq!(parse_proc_stat(4242, stat), Some(process(4242, 4200, 4100)));
     }
 
     /// The floor runs on the machine the tests run on, so the real table has to be
