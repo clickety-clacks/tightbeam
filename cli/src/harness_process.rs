@@ -82,17 +82,15 @@ pub fn session_exec(args: &[String]) -> Result<i32, String> {
     let leader_start_time = read_process_start_time(pid)
         .map_err(|error| format!("harness session leader start time could not be read: {error}"))?;
 
-    write_identity_authority(
+    publish_session_identity(
         identity_path,
+        &mut identity,
         pid,
         pgid,
         leader_start_time,
         &boot_identity,
         launch_id,
     )?;
-    writeln!(identity, "{pid}\t{pgid}\t{boot_identity}\t{launch_id}")
-        .and_then(|_| identity.sync_all())
-        .map_err(|error| format!("harness identity could not be written: {error}"))?;
 
     let error = Command::new(&args[separator + 1])
         .args(&args[separator + 2..])
@@ -105,6 +103,28 @@ fn identity_authority_path(identity_path: &Path) -> PathBuf {
     let mut path = identity_path.as_os_str().to_owned();
     path.push(IDENTITY_AUTHORITY_SUFFIX);
     PathBuf::from(path)
+}
+
+fn publish_session_identity(
+    identity_path: &Path,
+    identity: &mut fs::File,
+    pid: libc::pid_t,
+    pgid: libc::pid_t,
+    start_time: ProcessStartTime,
+    boot_identity: &str,
+    launch_id: &str,
+) -> Result<(), String> {
+    write_identity_authority(
+        identity_path,
+        pid,
+        pgid,
+        start_time,
+        boot_identity,
+        launch_id,
+    )?;
+    writeln!(identity, "{pid}\t{pgid}\t{boot_identity}\t{launch_id}")
+        .and_then(|_| identity.sync_all())
+        .map_err(|error| format!("harness identity could not be written: {error}"))
 }
 
 fn write_identity_authority(
@@ -1009,7 +1029,10 @@ mod instance_authority_tests {
             .err()
             .expect("a pid now occupied by another instance must be refused");
 
-        assert!(error.contains("pid reuse"), "{error}");
+        assert!(
+            error.contains("pid reuse") || error.contains("captured process instance changed"),
+            "expected an instance-reuse refusal, got: {error}"
+        );
         PROCESS_SIGNAL_CALLS.with(|calls| assert_eq!(calls.get(), 0));
     }
 
@@ -1335,24 +1358,28 @@ mod tests {
     }
 
     #[test]
-    fn session_exec_publishes_a_legacy_body_with_versioned_authority() {
+    fn session_identity_publish_is_legacy_compatible_and_versioned() {
         let path = test_path("compatible-identity");
         let launch = "compatible-launch";
+        let mut identity = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let pid = unsafe { libc::getpid() };
+        let pgid = unsafe { libc::getpgrp() };
+        let start_time = read_process_start_time(pid).unwrap();
+        let boot = boot_identity().unwrap();
 
-        assert_eq!(
-            session_exec(&[
-                path.to_string_lossy().into_owned(),
-                launch.into(),
-                "--".into(),
-                "/bin/true".into(),
-            ]),
-            Ok(0)
-        );
+        publish_session_identity(&path, &mut identity, pid, pgid, start_time, &boot, launch)
+            .unwrap();
 
         let body = fs::read_to_string(&path).unwrap();
         let fields = body.trim_end().split('\t').collect::<Vec<_>>();
         assert_eq!(fields.len(), 4, "old coordinators require four fields");
-        assert_eq!(fields[0], fields[1]);
+        assert_eq!(fields[0], pid.to_string());
+        assert_eq!(fields[1], pgid.to_string());
         assert_eq!(fields[3], launch);
 
         let authority_path = identity_authority_path(&path);

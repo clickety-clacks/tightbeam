@@ -176,9 +176,16 @@ fn an_unreaped_dead_leader_with_no_live_members_needs_no_signal() {
     tree.escapee.signal(libc::SIGKILL).unwrap();
     tree.leader.signal(libc::SIGKILL).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
-    while !read_process(tree.leader.instance.pid).unwrap().zombie {
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(1));
+    loop {
+        match read_process(tree.leader.instance.pid) {
+            Ok(process) if process.zombie => break,
+            Ok(_) => {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => break,
+            Err(error) => panic!("dead leader could not be inspected: {error}"),
+        }
     }
     PROCESS_SIGNAL_CALLS.with(|calls| calls.set(0));
     assert_eq!(
