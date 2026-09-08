@@ -16,7 +16,8 @@ defmodule Tightbeam.Rules do
   ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
-  `assignment.qualifying_review_verdict_kinds`, and
+  `assignment.qualifying_review_verdict_kinds`,
+  `assignment.qualifying_verification_verdict_kinds`, and
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
   holder recorded on its work item, in every artifact state). Assignment
   caller identity comes from the optional dispatch principal rather than the
@@ -112,6 +113,7 @@ defmodule Tightbeam.Rules do
     assignment.verdicts
     assignment.independent_verdict_kinds
     assignment.qualifying_review_verdict_kinds
+    assignment.qualifying_verification_verdict_kinds
     work_item.verdict_kinds
   )
   @linked_review_facts ~w(
@@ -140,6 +142,7 @@ defmodule Tightbeam.Rules do
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
     "assignment.independent_verdict_kinds" => {:list, :string},
     "assignment.qualifying_review_verdict_kinds" => {:list, :string},
+    "assignment.qualifying_verification_verdict_kinds" => {:list, :string},
     "assignment.artifact_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
@@ -917,7 +920,7 @@ defmodule Tightbeam.Rules do
 
     effects = if check, do: Map.values(check.effects), else: [effect]
     notice = validate_notice!(Map.get(rule, "notice"), effect, fail)
-    remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail)
+    remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail, raw_name)
 
     recurrence_suppression =
       validate_recurrence_suppression!(Map.get(rule, "recurrence_suppression"), fail)
@@ -1161,9 +1164,9 @@ defmodule Tightbeam.Rules do
 
   defp validate_check!(_check, _base_dir, fail), do: fail.("check must be a table")
 
-  defp validate_remedy!(nil, _conditions, _check, _effects, _fail), do: nil
+  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name), do: nil
 
-  defp validate_remedy!(remedy, conditions, check, effects, fail) when is_map(remedy) do
+  defp validate_remedy!(remedy, conditions, check, effects, fail, name) when is_map(remedy) do
     unknown = unknown_keys(remedy, @remedy_keys)
     if unknown != [], do: fail.("remedy has unknown keys: #{Enum.join(unknown, ", ")}")
 
@@ -1258,7 +1261,10 @@ defmodule Tightbeam.Rules do
         :ok
     end
 
-    if is_nil(check) and
+    # The completion notice binds its subject through the accountable-owner protocol;
+    # it does not create a review assignment. Other linked remedies retain that binding.
+    if not (name == "completion-requires-review" and action == "wake") and
+         is_nil(check) and
          Enum.any?(requirements, fn {fact, kinds} ->
            fact in @linked_review_facts and produces in kinds
          end) and params["reviews"] != "{assignment_id}" do
@@ -1279,7 +1285,7 @@ defmodule Tightbeam.Rules do
     }
   end
 
-  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail),
+  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _name),
     do: fail.("remedy must be a table")
 
   defp validate_interpolation!(field, value, fail) when field in @embedded_fields do
@@ -1948,10 +1954,37 @@ defmodule Tightbeam.Rules do
         {nil, cache}
 
       assignment, cache ->
-        {Assignments.qualifying_review_verdict_kinds(
+        kinds =
+          if assignment.effect_kind == "code" and get_in(call, [:params, :kind]) == "completion" do
+            Assignments.qualifying_review_verdict_kinds(
+              db,
+              assignment.id,
+              assignment.holder_key,
+              get_in(call, [:params, :commit_refs])
+            )
+          else
+            Assignments.qualifying_review_verdict_kinds(
+              db,
+              assignment.id,
+              assignment.holder_key
+            )
+          end
+
+        {kinds, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.qualifying_verification_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Assignments.qualifying_verification_verdict_kinds(
            db,
            assignment.id,
-           assignment.holder_key
+           assignment.holder_key,
+           get_in(call, [:params, :commit_refs])
          ), cache}
     end)
   end

@@ -307,9 +307,16 @@ defmodule Tightbeam.Gateway do
          delivery_opts: delivery_config,
          internal_consumers: %{
            "effort_probe" => &EffortCheckin.probe(db, config, &1),
-           "effort_deadline" => &EffortCheckin.deadline(db, config, &1)
+           "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
+           "review_remedy_reconcile" =>
+             &Tightbeam.RailRemedy.reconcile_notice(
+               db,
+               Map.put(config, :supervision_interval_ms, supervision_interval_ms(config)),
+               &1
+             )
          },
          tick_ms: config.wake_tick_ms,
+         review_remedy_interval_ms: supervision_interval_ms(config),
          name: Tightbeam.WakeScheduler},
         {Tightbeam.Supervision,
          db: db,
@@ -1073,6 +1080,7 @@ defmodule Tightbeam.Gateway do
           "attest",
           call
           |> maybe_put_progress_interval(config)
+          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           # Referent verification reaches hosts, so it needs the same placement
           # config (and the same injectable runner) the effort probe uses.
@@ -4439,6 +4447,88 @@ defmodule Tightbeam.Gateway do
           p[:condition_kind],
           p[:condition_scope]
         )
+    end
+  end
+
+  @doc false
+  def review_notice_recipient_in_txn(txn, assignment_id) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT a.openedByUser,a.openedBySession,a.workItemId,w.ownerUserId
+           FROM assignments a JOIN work_items w ON w.id=a.workItemId
+           WHERE a.id=?1
+           """,
+           [assignment_id]
+         ) do
+      [[opened_by_user, opened_by_session, work_item_id, owner]] ->
+        opener =
+          cond do
+            is_binary(opened_by_user) and opened_by_user == owner ->
+              Org.personal_session_key(owner)
+
+            is_binary(opened_by_session) ->
+              case DB.Txn.q(
+                     txn,
+                     "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+                     [opened_by_session, owner]
+                   ) do
+                [[1]] -> opened_by_session
+                _ -> nil
+              end
+
+            true ->
+              nil
+          end
+
+        recipient = opener || Org.personal_session_key(owner)
+
+        case DB.Txn.q(
+               txn,
+               "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+               [recipient, owner]
+             ) do
+          [[1]] ->
+            {:ok, %{session_key: recipient, owner_user_id: owner, work_item_id: work_item_id}}
+
+          _ ->
+            {:error,
+             %{
+               reason: :missing_accountable_owner,
+               owner_user_id: owner,
+               work_item_id: work_item_id
+             }}
+        end
+
+      _ ->
+        {:error, %{reason: :missing_assignment}}
+    end
+  end
+
+  @doc false
+  def schedule_review_notice_in_txn(txn, recipient, attrs) do
+    case DB.Txn.q(
+           txn,
+           "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+           [recipient.session_key, recipient.owner_user_id]
+         ) do
+      [[1]] ->
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: attrs.wake_id,
+          session_key: recipient.session_key,
+          origin: "remedy:completion-requires-review",
+          prompt: attrs.prompt,
+          consumer: Map.get(attrs, :consumer, "prompt"),
+          due_at: attrs.due_at,
+          owner_user_id: recipient.owner_user_id,
+          work_item_id: recipient.work_item_id,
+          assignment_id: attrs.assignment_id,
+          target_gate: if(Map.get(attrs, :consumer, "prompt") == "prompt", do: 0, else: 1),
+          sender_scheduled: true
+        })
+
+      _ ->
+        raise ArgumentError, "review remedy recipient no longer belongs to the accountable owner"
     end
   end
 

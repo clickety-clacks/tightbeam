@@ -31,6 +31,7 @@ defmodule Tightbeam.Wakes do
     Escalation,
     EventLog,
     Gateway,
+    Ledger,
     NoticeBatcher,
     RuleRuntime
   }
@@ -549,6 +550,137 @@ defmodule Tightbeam.Wakes do
     else
       wake
     end
+  end
+
+  @doc "Return typed delivery evidence for an explicit remedy wake lineage."
+  @spec delivery_outcomes_in_txn(Txn.t(), map()) :: map()
+  def delivery_outcomes_in_txn(%Txn{} = txn, %{
+        root_wake_id: root,
+        recovery_wake_ids: recovery_ids,
+        assignment_id: assignment_id
+      })
+      when is_binary(root) and is_list(recovery_ids) and is_binary(assignment_id) do
+    explicit_wake_ids = [root | recovery_ids] |> Enum.uniq()
+
+    wake_ids =
+      explicit_wake_ids
+      |> Enum.flat_map(fn wake_id ->
+        retry_ids =
+          Txn.q(
+            txn,
+            "SELECT wakeId FROM wake_retry_attempts WHERE rootWakeId=?1 ORDER BY attempt",
+            [wake_id]
+          )
+          |> Enum.map(&hd/1)
+
+        [wake_id | retry_ids]
+      end)
+      |> Enum.uniq()
+
+    evidence =
+      Enum.flat_map(wake_ids, fn wake_id ->
+        wake_rows =
+          Txn.q(txn, "SELECT state,consumer,sessionKey FROM wakes WHERE wakeId=?1", [wake_id])
+
+        turns = Txn.q(txn, "SELECT seq,status FROM turns WHERE wakeId=?1 ORDER BY seq", [wake_id])
+
+        retry_turns =
+          Txn.q(
+            txn,
+            "SELECT sourceTurnSeq,outcome FROM wake_retry_attempts WHERE rootWakeId=?1 ORDER BY attempt",
+            [wake_id]
+          )
+
+        retry_roots =
+          Txn.q(
+            txn,
+            "SELECT rootWakeId FROM wake_retry_attempts WHERE wakeId=?1",
+            [wake_id]
+          )
+          |> Enum.map(&hd/1)
+
+        repairs =
+          Enum.flat_map(turns, fn [source_seq, _] ->
+            Ledger.repair_delivery_outcomes_in_txn(txn, source_seq, assignment_id)
+          end)
+
+        cancellations =
+          Txn.q(
+            txn,
+            "SELECT reasonKind,causalSourceKind,causalSourceId,outcomeKind FROM wake_cancellations WHERE wakeId=?1",
+            [wake_id]
+          )
+
+        pending_retry? =
+          Txn.q(
+            txn,
+            """
+            SELECT 1 FROM wake_retry_attempts r JOIN wakes w ON w.wakeId=r.wakeId
+            WHERE r.rootWakeId=?1 AND (w.state='pending' OR EXISTS (
+              SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId AND t.status IN ('queued','running')))
+            LIMIT 1
+            """,
+            [wake_id]
+          ) == [[1]]
+
+        [
+          %{
+            wake_id: wake_id,
+            wake: wake_rows,
+            turns: turns,
+            retries: retry_turns,
+            retry_roots: retry_roots,
+            cancellations: cancellations,
+            pending_retry?: pending_retry?,
+            repairs: repairs
+          }
+        ]
+      end)
+
+    Enum.reduce(
+      evidence,
+      %{delivered: [], outstanding: [], terminal: [], inconsistencies: []},
+      fn item, acc ->
+        statuses =
+          Enum.map(item.turns, &Enum.at(&1, 1)) ++ Enum.map(item.repairs, & &1.status)
+
+        acc =
+          if "delivered" in statuses,
+            do: Map.update!(acc, :delivered, &[item | &1]),
+            else: acc
+
+        acc =
+          if Enum.any?(statuses, &(&1 in ["queued", "running"])) or
+               match?([["pending", _, _]], item.wake),
+             do: Map.update!(acc, :outstanding, &[item | &1]),
+             else: acc
+
+        acc =
+          if Enum.any?(statuses, &(&1 in ["failed", "failed_unknown", "canceled"])) or
+               item.cancellations != [],
+             do: Map.update!(acc, :terminal, &[item | &1]),
+             else: acc
+
+        no_consumer_effect? = item.turns == [] and item.repairs == []
+
+        if item.wake == [] or
+             (match?([["fired", _, _]], item.wake) and no_consumer_effect?),
+           do: Map.update!(acc, :inconsistencies, &[item | &1]),
+           else: acc
+      end
+    )
+    |> Map.new(fn {kind, rows} -> {kind, Enum.reverse(rows)} end)
+  end
+
+  @doc false
+  def consume_internal_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    Txn.q(
+      txn,
+      "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1 AND state='pending' AND consumer!='prompt'",
+      [wake_id, now()]
+    )
+
+    if Txn.changes(txn) == 1, do: :ok, else: raise(ArgumentError, "internal wake is not pending")
   end
 
   @doc "Register one obligation-scoped dependency or after-turn continuation atomically."
@@ -2192,6 +2324,7 @@ defmodule Tightbeam.Wakes do
     "tightbeam:assignments" => ~w(obligation_disposed),
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
+    "tightbeam:rail-remedy" => ~w(superseded target_unresolvable),
     "tightbeam:retirement" => ~w(target_retired obligation_disposed),
     # The batcher consumes a digest MEMBER exactly one way: superseded by the
     # digest that carries it, named as the replacement. It has no other verb —
@@ -2213,7 +2346,7 @@ defmodule Tightbeam.Wakes do
     "target_retired" => {~w(session_transition), ~w(replacement no_replacement)},
     "production_unmatched" => {~w(condition_fact), ~w(no_replacement)},
     "consumer_unavailable" => {~w(scheduler_delivery), ~w(no_replacement)},
-    "target_unresolvable" => {~w(scheduler_delivery), ~w(no_replacement)}
+    "target_unresolvable" => {~w(scheduler_delivery), ~w(replacement no_replacement)}
   }
 
   @doc """
@@ -2435,6 +2568,7 @@ defmodule Tightbeam.Wakes do
     source_id = Map.get(causal_source, :id)
 
     with :ok <- compatible?(requester_id, reason_kind, source_kind, outcome_kind),
+         :ok <- rail_remedy_episode_linked(txn, requester_id, command, wake),
          {:ok, tagged} <-
            validate_outcome(txn, outcome_kind, outcome, wake, primary, requester_id, command),
          {:ok, durable_source_id, accepted_event_id} <-
@@ -2456,6 +2590,140 @@ defmodule Tightbeam.Wakes do
   end
 
   defp validate_cancellation(_txn, _command, _wake, _primary, _canceled_at), do: :error
+
+  defp rail_remedy_episode_linked(_txn, requester_id, _command, _wake)
+       when requester_id != "tightbeam:rail-remedy",
+       do: :ok
+
+  defp rail_remedy_episode_linked(txn, "tightbeam:rail-remedy", command, wake) do
+    replacement_id = get_in(command, [:outcome, :replacement_wake_id])
+    reason = Map.get(command, :reason_kind)
+    outcome_kind = get_in(command, [:outcome, :kind])
+
+    linked? =
+      Txn.q(
+        txn,
+        "SELECT subject,noticeState FROM rail_remedy_episodes WHERE status='live' AND noticeState IS NOT NULL",
+        []
+      )
+      |> Enum.any?(fn [subject, encoded] ->
+        case JSON.decode(encoded) do
+          {:ok, %{"version" => 1} = state} ->
+            explicit =
+              [get_in(state, ["root", "wakeId"]), get_in(state, ["reassessment", "wakeId"])] ++
+                Enum.map(state["recoveries"] || [], & &1["wakeId"])
+
+            explicit = Enum.filter(explicit, &is_binary/1)
+
+            wake_linked? =
+              wake.wake_id in explicit or retry_descendant_of?(txn, wake.wake_id, explicit)
+
+            replacement_linked? = is_nil(replacement_id) or replacement_id in explicit
+
+            lifecycle_compatible? =
+              case {reason, outcome_kind} do
+                {"superseded", "no_replacement"} ->
+                  get_in(state, ["need", "state"]) in ~w(satisfied terminal withdrawn)
+
+                {"target_unresolvable", "replacement"} ->
+                  get_in(state, ["need", "state"]) == "requested" or
+                    effects_replacement_allowed?(
+                      txn,
+                      subject,
+                      state,
+                      wake.wake_id,
+                      replacement_id
+                    )
+
+                _ ->
+                  true
+              end
+
+            wake_linked? and replacement_linked? and lifecycle_compatible?
+
+          _ ->
+            false
+        end
+      end)
+
+    if linked?, do: :ok, else: :error
+  end
+
+  defp effects_replacement_allowed?(txn, subject, state, old_id, replacement_id) do
+    edges = state["recoveries"] || []
+    old = Enum.find(edges, &(&1["wakeId"] == old_id))
+    next = Enum.find(edges, &(&1["wakeId"] == replacement_id))
+
+    with true <- get_in(state, ["need", "state"]) in ~w(terminal satisfied),
+         false <- state["blocked"] == "accountable_owner_chain_exhausted",
+         %{"purpose" => "effects-reconcile", "recipient" => old_recipient} <- old,
+         %{
+           "purpose" => "effects-reconcile",
+           "parentWakeId" => ^old_id,
+           "recipient" => next_recipient
+         } <- next,
+         true <- old_recipient != next_recipient,
+         [[owner]] <-
+           Txn.q(
+             txn,
+             "SELECT w.ownerUserId FROM assignments a JOIN work_items w ON w.id=a.workItemId WHERE a.id=?1",
+             [subject]
+           ),
+         [] <-
+           Txn.q(
+             txn,
+             "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+             [old_recipient, owner]
+           ),
+         [[1]] <-
+           Txn.q(
+             txn,
+             "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+             [next_recipient, owner]
+           ),
+         [["pending", ^old_recipient, ^owner, nil, nil]] <-
+           Txn.q(
+             txn,
+             "SELECT state,sessionKey,ownerUserId,assignmentId,work_item_id FROM wakes WHERE wakeId=?1",
+             [old_id]
+           ),
+         [["pending", ^next_recipient, ^owner, nil, nil]] <-
+           Txn.q(
+             txn,
+             "SELECT state,sessionKey,ownerUserId,assignmentId,work_item_id FROM wakes WHERE wakeId=?1",
+             [replacement_id]
+           ),
+         true <-
+           Enum.count(
+             edges,
+             &(&1["recipient"] == next_recipient and &1["purpose"] == "effects-reconcile")
+           ) == 1 do
+      evidence =
+        delivery_outcomes_in_txn(txn, %{
+          root_wake_id: old_id,
+          recovery_wake_ids: [],
+          assignment_id: subject
+        })
+
+      evidence.delivered == [] and evidence.terminal == [] and evidence.inconsistencies == [] and
+        Enum.all?(evidence.outstanding, fn item ->
+          item.wake_id == old_id and item.turns == [] and item.repairs == [] and
+            item.cancellations == [] and not item.pending_retry?
+        end)
+    else
+      _ -> false
+    end
+  end
+
+  defp retry_descendant_of?(txn, wake_id, roots) do
+    Enum.any?(roots, fn root ->
+      Txn.q(
+        txn,
+        "SELECT 1 FROM wake_retry_attempts WHERE wakeId=?1 AND rootWakeId=?2",
+        [wake_id, root]
+      ) == [[1]]
+    end)
+  end
 
   defp durable_source(txn, _command, source_kind, source_id, wake, _canceled_at)
        when source_kind != "verb_call" and is_binary(source_id) and source_id != "" do
@@ -2530,8 +2798,13 @@ defmodule Tightbeam.Wakes do
            do: :ok,
            else: :error
 
-      reason == "superseded" and outcome == "no_replacement" ->
-        :error
+      requester_id == "tightbeam:rail-remedy" ->
+        if {reason, source, outcome} in [
+             {"superseded", "wake", "no_replacement"},
+             {"target_unresolvable", "scheduler_delivery", "replacement"}
+           ],
+           do: :ok,
+           else: :error
 
       true ->
         :ok
@@ -2684,6 +2957,22 @@ defmodule Tightbeam.Wakes do
     end
   end
 
+  defp validate_required_liveness(
+         txn,
+         %{kind: "no_replacement"} = outcome,
+         wake,
+         _primary,
+         %{
+           requester: %{kind: "process", id: "tightbeam:rail-remedy"},
+           reason_kind: "superseded"
+         }
+       ) do
+    if is_nil(Map.get(outcome, :liveness_trigger)) and
+         rail_remedy_terminal_notice?(txn, wake.wake_id),
+       do: {:ok, %{liveness_kind: nil, liveness_id: nil, action_needed: 0}},
+       else: :error
+  end
+
   defp validate_required_liveness(txn, outcome, wake, primary, command) do
     case Map.get(outcome, :liveness_trigger) do
       %{kind: kind, id: id} when kind in @liveness_kinds and is_binary(id) ->
@@ -2700,6 +2989,24 @@ defmodule Tightbeam.Wakes do
       _ ->
         :error
     end
+  end
+
+  defp rail_remedy_terminal_notice?(txn, wake_id) do
+    Txn.q(txn, "SELECT noticeState FROM rail_remedy_episodes WHERE noticeState IS NOT NULL", [])
+    |> Enum.any?(fn [encoded] ->
+      case JSON.decode(encoded) do
+        {:ok, %{"version" => 1} = state} ->
+          explicit =
+            [get_in(state, ["root", "wakeId"]), get_in(state, ["reassessment", "wakeId"])] ++
+              Enum.map(state["recoveries"] || [], & &1["wakeId"])
+
+          (wake_id in explicit or retry_descendant_of?(txn, wake_id, explicit)) and
+            get_in(state, ["need", "state"]) in ~w(satisfied terminal withdrawn)
+
+        _ ->
+          false
+      end
+    end)
   end
 
   # An open effort request is itself the agent's exit. Once the current
@@ -3764,6 +4071,8 @@ defmodule Tightbeam.Wakes do
       deliver: Keyword.fetch!(opts, :deliver),
       db: Keyword.get(opts, :db, Tightbeam.DB),
       tick_ms: Keyword.get(opts, :tick_ms, 1_000),
+      review_remedy_interval_ms:
+        Keyword.get(opts, :review_remedy_interval_ms, Keyword.get(opts, :tick_ms, 1_000)),
       batch: Keyword.get(opts, :batch, 100),
       delivery_opts: Keyword.get(opts, :delivery_opts, []),
       internal_consumers: Keyword.get(opts, :internal_consumers, %{})
@@ -3841,6 +4150,11 @@ defmodule Tightbeam.Wakes do
   # leaves its wake pending for the next tick; a crash between deliver and
   # mark redelivers, deduped by turns.wakeId.
   defp deliver_due(%{db: db, deliver: deliver, internal_consumers: consumers} = state) do
+    if Map.has_key?(consumers, "review_remedy_reconcile") do
+      {:ok, :ok} =
+        Tightbeam.RailRemedy.reconcile_pending_episodes(db, state.review_remedy_interval_ms)
+    end
+
     recognize_due_dependency_waits(db)
     deliver_eligible_waits(db, state.delivery_opts)
 

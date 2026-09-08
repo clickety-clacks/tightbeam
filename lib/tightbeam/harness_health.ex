@@ -337,8 +337,18 @@ defmodule Tightbeam.HarnessHealth do
         nil
 
       failure_class ->
+        # A notification may name a child's assignment as its cause. Only
+        # the executing session's own assignment is health attribution.
         assignment_id =
-          case Txn.q(txn, "SELECT assignmentId FROM turns WHERE seq=?1", [turn.seq]) do
+          case Txn.q(
+                 txn,
+                 """
+                 SELECT a.id FROM turns t LEFT JOIN assignments a
+                   ON a.id=t.assignmentId AND a.holderKey=t.sessionKey
+                 WHERE t.seq=?1
+                 """,
+                 [turn.seq]
+               ) do
             [[assignment_id]] -> assignment_id
             [] -> nil
           end
@@ -373,8 +383,9 @@ defmodule Tightbeam.HarnessHealth do
         Txn.q(
           txn,
           """
-          SELECT t.sessionKey,t.assignmentId,s.harness,s.host
+          SELECT t.sessionKey,a.id,s.harness,s.host
           FROM turns t JOIN sessions s ON s.sessionKey=t.sessionKey
+          LEFT JOIN assignments a ON a.id=t.assignmentId AND a.holderKey=t.sessionKey
           WHERE t.seq=?1
           """,
           [seq]

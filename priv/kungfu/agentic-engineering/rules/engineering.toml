@@ -1,14 +1,14 @@
 # "Pushing the product forwards is the goal of this kung-fu. No rule shall trump this rule. If there is a clear way forward, and that way forward is safe, then no rule, statute, or rail shall block it. If a rule, statute, or rail blocks this, it is necessarily wrong, and should be reported with a decision-request, but this DOES NOT BLOCK WORK. Get it done, and apologize later."
 
-# Flagship enforced loop (roadmap P7): producing effects require one independent review.
-# A holder attesting qualifying completion without a reviewed-clean verdict is not denied — the
-# substrate assigns a reviewer-code session (the remedy), blocks the completion until the review
-# lands, and self-releases. This is the review loop worked example, enforced.
+# Qualifying completion requires an applicable independent reviewed-clean conclusion.
+# When review is needed, O2 sends an accountable notification; the owner directs staffing.
+# The notification does not force a reviewer-code assignment or satisfy completion checks.
+# Completion remains blocked until the required review evidence qualifies.
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
 text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
-external_producer = false
+external_producer = true
 edges = ["verb"]
 effect = "remedy"
 deny_when = [
@@ -17,23 +17,9 @@ deny_when = [
   { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
 [rule.remedy]
-action = "assign"
+action = "wake"
 produces = "reviewed-clean"
-target_role = "reviewer-code"
+target_session = "{holder_key}"
 on_rule_denied = "surface"
 [rule.remedy.params]
-subject = "review of assignment {assignment_id}"
-reviews = "{assignment_id}"
-
-[[rule]]
-name = "code-review-requires-passing-tests"
-verb = "assign"
-text = "code review needs the code author's passing-test receipt: the assignment holder must file a tests-passed verdict with the tested repository, commit, command or suite, and passing result"
-edges = ["verb"]
-effect = "deny"
-deny_when = [
-  { fact = "assignment.is_producing_card", op = "eq", value = true },
-  { fact = "assignment.state", op = "eq", value = "open" },
-  { fact = "assignment.effect_kind", op = "eq", value = "code" },
-  { fact = "assignment.holder_noted_verdict_kinds", op = "not_in", value = ["tests-passed"] },
-]
+prompt = "Coordinate independent review of assignment {assignment_id}; preserve current evidence and direct staffing through its accountable owner."

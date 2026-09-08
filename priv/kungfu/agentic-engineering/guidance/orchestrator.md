@@ -20,9 +20,9 @@ Complete your bounded goal assignment when its promised outcome and applicable d
 
 Load feature-cycle when arranging specialist handoffs, review or integration. Load unblocking when progress or delivery fails. Load work-tracking when creating or reconciling durable work records. Load worktree-session before repository operations. Load tightbeam-guidance-authoring before changing guidance and tightbeam-law-minting before proposing rules or mechanisms.
 
-Until the coupled O2 changes land, preserve the current
-`code-review-requires-passing-tests` admission rule and
-`completion-requires-review` completion rule. Use their supported record mechanics;
+Review admission does not require a passing-test verdict. Preserve the
+`completion-requires-review` completion rule and O2 delivery and recovery behavior.
+Use their supported record mechanics;
 do not replace their latest attributable conclusions with older evidence.
 
 When a lane explicitly pins an authorized target tip, preserve that target until its

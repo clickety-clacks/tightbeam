@@ -48,7 +48,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, Wakes}
 
-  @shape "row-driven-admission-v1-019"
+  @shape "row-driven-o2-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -182,6 +182,23 @@ defmodule Tightbeam.SchemaShapeTest do
   )
   """
 
+  # Historical tests start from captured pre-O2 bytes, not a relabeled current bootstrap.
+  defp load_admission_fixture(db) do
+    fixture = File.read!(Path.join(__DIR__, "fixtures/o2_admission_v1.sql"))
+
+    assert Base.encode16(:crypto.hash(:sha256, fixture), case: :lower) ==
+             "ad7de70a2a921045e5cb78075e3e87d08e821929b86b81b8ef5c479b3292af1e"
+
+    :ok = DB.execute(db, fixture)
+    :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+
+    assert {:ok, [["row-driven-admission-v1-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    refute "noticeState" in table_columns(db, "rail_remedy_episodes")
+    :ok
+  end
+
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
@@ -214,7 +231,7 @@ defmodule Tightbeam.SchemaShapeTest do
   test "historical late-routing and successor markers require unique owning-row provenance", %{
     db: db
   } do
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = load_admission_fixture(db)
 
     assert :ok =
              DB.execute(
@@ -334,7 +351,7 @@ defmodule Tightbeam.SchemaShapeTest do
   test "the row-driven-rules predecessor scopes legacy facts without rewriting wake history", %{
     db: db
   } do
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = load_admission_fixture(db)
 
     assert {:ok, _} =
              DB.query(
@@ -474,7 +491,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = load_admission_fixture(db)
     downgrade_row_driven_rules(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
@@ -491,7 +508,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   test "the exact pre-liveness notice stamp resumes without physical-shape inference", %{db: db} do
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = load_admission_fixture(db)
     downgrade_row_driven_rules(db)
     drop_liveness_activation(db)
     assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
@@ -520,7 +537,7 @@ defmodule Tightbeam.SchemaShapeTest do
       on_exit(fn -> File.rm(path) end)
 
       {:ok, first_pid} = DB.start_link(path: path, name: first)
-      assert :ok = Schema.ensure_all(first)
+      assert :ok = load_admission_fixture(first)
       downgrade_row_driven_rules(first)
       unless activated, do: drop_liveness_activation(first)
       assert :ok = DB.execute(first, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
@@ -575,7 +592,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
-    :ok = Schema.ensure_all(db)
+    :ok = load_admission_fixture(db)
     downgrade_decision_requests_to_model_identity(db)
 
     :ok =
@@ -716,7 +733,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   test "operator-decision migration classifies the complete predecessor census once", %{db: db} do
-    :ok = Schema.ensure_all(db)
+    :ok = load_admission_fixture(db)
     downgrade_row_driven_rules(db)
 
     :ok =
@@ -884,7 +901,7 @@ defmodule Tightbeam.SchemaShapeTest do
     on_exit(fn -> File.rm(path) end)
 
     {:ok, first_pid} = DB.start_link(path: path, name: first)
-    assert :ok = Schema.ensure_all(first)
+    assert :ok = load_admission_fixture(first)
     downgrade_row_driven_rules(first)
 
     :ok =
@@ -1300,7 +1317,7 @@ defmodule Tightbeam.SchemaShapeTest do
 
   test "the exact notice-batching predecessor widens effort cancellation and preserves the stamp",
        %{db: db} do
-    assert :ok = Schema.ensure_all(db)
+    assert :ok = load_admission_fixture(db)
     downgrade_row_driven_rules(db)
 
     {:ok, [[current_ddl]]} =
@@ -1471,7 +1488,7 @@ defmodule Tightbeam.SchemaShapeTest do
       second = :"admission_after_#{unique}"
       on_exit(fn -> File.rm(path) end)
       {:ok, first_pid} = DB.start_link(path: path, name: first)
-      assert :ok = Schema.ensure_all(first)
+      assert :ok = load_admission_fixture(first)
 
       # Exact trigger SQL from accepted G-C 32911d0c; only heredoc indentation removed.
       prior = File.read!(Path.join(__DIR__, "fixtures/row_wakes/admission-trigger-32911d0c.sql"))

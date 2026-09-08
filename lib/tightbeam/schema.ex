@@ -40,6 +40,8 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
+  @o2_shape "row-driven-o2-v1-019"
+  @o2_pre_liveness_shape "row-driven-o2-pre-liveness-v1-019"
   @shape "row-driven-admission-v1-019"
   @admission_previous_shape "row-driven-coverage-v1-019"
   @admission_pre_liveness_previous_shape "row-driven-coverage-pre-liveness-v1-019"
@@ -960,10 +962,61 @@ defmodule Tightbeam.Schema do
   never to deduce a shape and accommodate it. Each migration is selected by an
   exact predecessor stamp; none sniffs stored DDL or infers from a column name.
   """
+  # Keep historical DDL immutable. Only O2 activation uses these two additions.
+  @o2_liveness_objects Enum.map(@supervision_liveness_objects, fn
+                         %{name: "wake_cancellations", sql: sql} = object ->
+                           outcome = """
+                                 (workImpactKind = 'linked_work_open' AND
+                                  livenessTriggerKind IS NULL AND livenessTriggerId IS NULL AND actionNeeded = 0 AND
+                                  requesterKind = 'process' AND requesterId = 'tightbeam:rail-remedy' AND
+                                  reasonKind = 'superseded' AND causalSourceKind = 'wake')
+                           """
+
+                           requester = """
+                                 (requesterId = 'tightbeam:rail-remedy' AND
+                                  ((reasonKind = 'target_unresolvable' AND
+                                    causalSourceKind = 'scheduler_delivery' AND outcomeKind = 'replacement')
+                                   OR
+                                   (reasonKind = 'superseded' AND
+                                    causalSourceKind = 'wake' AND outcomeKind = 'no_replacement')))
+                                 OR
+                           """
+
+                           old_arm = """
+                               (outcomeKind = 'no_replacement' AND replacementWakeId IS NULL AND
+                                dispositionKind IS NULL AND dispositionId IS NULL AND
+                                ((workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NOT NULL AND
+                                  livenessTriggerId IS NOT NULL AND actionNeeded = 1)
+                                 OR
+                           """
+
+                           # Match source-owned DDL, never stored database DDL.
+                           true = String.contains?(sql, old_arm)
+
+                           sql =
+                             String.replace(sql, old_arm, old_arm <> outcome <> " OR\n",
+                               global: false
+                             )
+
+                           sql =
+                             String.replace(
+                               sql,
+                               "(requesterId = 'tightbeam:wake-scheduler' AND",
+                               requester <> "(requesterId = 'tightbeam:wake-scheduler' AND",
+                               global: false
+                             )
+
+                           %{object | sql: sql}
+
+                         object ->
+                           object
+                       end)
+
   @spec ensure_all(DB.server()) :: :ok
   def ensure_all(db) do
     :ok = ensure_stamp_table(db)
     :ok = check_shape(db)
+    :ok = upgrade_o2(db)
 
     Enum.each(@schema_modules, fn module ->
       :ok = module.ensure_schema(db)
@@ -978,9 +1031,9 @@ defmodule Tightbeam.Schema do
            # Activation and its stamp commit together. A restart before this
            # transaction retains the explicit pre-liveness migration state.
            Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
-             @shape,
+             @o2_shape,
              activated_at,
-             @pre_liveness_shape
+             @o2_pre_liveness_shape
            ])
 
            :ok
@@ -1014,12 +1067,12 @@ defmodule Tightbeam.Schema do
   @spec ensure_supervision_liveness_v1_in_txn(Txn.t(), non_neg_integer(), keyword()) :: :ok
   def ensure_supervision_liveness_v1_in_txn(%Txn{} = txn, activated_at, opts)
       when is_integer(activated_at) and activated_at >= 0 and is_list(opts) do
-    present = Enum.filter(@supervision_liveness_objects, &owned_object_present?(txn, &1))
+    present = Enum.filter(@o2_liveness_objects, &owned_object_present?(txn, &1))
     Enum.each(present, &validate_owned_object!(txn, &1))
 
     case length(present) do
       0 ->
-        @supervision_liveness_objects
+        @o2_liveness_objects
         |> Enum.with_index(1)
         |> Enum.each(fn {object, index} ->
           :ok = Txn.exec(txn, object.sql)
@@ -1037,14 +1090,14 @@ defmodule Tightbeam.Schema do
           [activated_at]
         )
 
-        maybe_interrupt_activation!(opts, length(@supervision_liveness_objects) + 1)
+        maybe_interrupt_activation!(opts, length(@o2_liveness_objects) + 1)
 
-      count when count == length(@supervision_liveness_objects) ->
+      count when count == length(@o2_liveness_objects) ->
         :ok
 
       _count ->
         missing =
-          @supervision_liveness_objects
+          @o2_liveness_objects
           |> Kernel.--(present)
           |> Enum.map_join(", ", & &1.name)
 
@@ -1237,6 +1290,9 @@ defmodule Tightbeam.Schema do
 
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[stamp]]} when stamp in [@o2_shape, @o2_pre_liveness_shape] ->
+        :ok
+
       {:ok, [[@shape]]} ->
         :ok
 
@@ -1308,7 +1364,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@shape}
+          this build: #{@o2_shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
@@ -1330,11 +1386,102 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@shape}
+          this build: #{@o2_shape}
 
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
         """
+    end
+  end
+
+  defp upgrade_o2(db) do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[stamp]]} when stamp in [@o2_shape, @o2_pre_liveness_shape] ->
+        :ok
+
+      {:ok, [[predecessor]]} when predecessor in [@shape, @pre_liveness_shape] ->
+        :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+        try do
+          case DB.transaction(db, fn txn ->
+                 [[^predecessor]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+                 # Bootstrap the exact legacy episode shape before any O2 module DDL.
+                 # Existing stamped databases keep their table; no column sniffing.
+                 :ok =
+                   Txn.exec(txn, """
+                   CREATE TABLE IF NOT EXISTS rail_remedy_episodes (
+                     statute TEXT NOT NULL,
+                     subject TEXT NOT NULL,
+                     status TEXT NOT NULL CHECK (status IN ('claimed','dispatched','live','closed')),
+                     producerKey TEXT,
+                     occurrence INTEGER NOT NULL,
+                     rewakeCount INTEGER NOT NULL,
+                     claimToken TEXT NOT NULL,
+                     openedAt INTEGER NOT NULL,
+                     closedAt INTEGER,
+                     PRIMARY KEY (statute, subject)
+                   )
+                   """)
+
+                 Txn.q(txn, "ALTER TABLE rail_remedy_episodes ADD COLUMN noticeState TEXT NULL")
+
+                 if predecessor == @shape do
+                   for name <-
+                         ~w(wakes_typed_cancellation_required wake_cancellations_pending_insert) do
+                     :ok = Txn.exec(txn, "DROP TRIGGER #{name}")
+                   end
+
+                   :ok =
+                     Txn.exec(
+                       txn,
+                       "ALTER TABLE wake_cancellations RENAME TO wake_cancellations_o2_previous"
+                     )
+
+                   table = Enum.find(@o2_liveness_objects, &(&1.name == "wake_cancellations"))
+                   :ok = Txn.exec(txn, table.sql)
+
+                   columns =
+                     "wakeId,wakeState,canceledAt,requesterKind,requesterId,reasonKind," <>
+                       "causalSourceKind,causalSourceId,outcomeKind,replacementWakeId," <>
+                       "dispositionKind,dispositionId,primaryWorkKind,primaryWorkId,workImpactKind," <>
+                       "livenessTriggerKind,livenessTriggerId,actionNeeded"
+
+                   :ok =
+                     Txn.exec(
+                       txn,
+                       "INSERT INTO wake_cancellations (#{columns}) SELECT #{columns} FROM wake_cancellations_o2_previous"
+                     )
+
+                   :ok = Txn.exec(txn, "DROP TABLE wake_cancellations_o2_previous")
+
+                   for name <-
+                         ~w(wake_cancellations_pending_insert wakes_typed_cancellation_required) do
+                     object = Enum.find(@supervision_liveness_objects, &(&1.name == name))
+                     :ok = Txn.exec(txn, object.sql)
+                   end
+                 end
+
+                 successor = if predecessor == @shape, do: @o2_shape, else: @o2_pre_liveness_shape
+
+                 Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                   successor,
+                   System.system_time(:millisecond),
+                   predecessor
+                 ])
+
+                 if Txn.changes(txn) != 1, do: raise(ShapeError, message: "O2 stamp race")
+                 [] = Txn.q(txn, "PRAGMA foreign_key_check")
+                 :ok
+               end) do
+            {:ok, :ok} -> :ok
+            {:error, error} -> raise error
+          end
+        after
+          :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+        end
+
+      other ->
+        raise ShapeError, message: "incompatible O2 predecessor: #{inspect(other)}"
     end
   end
 
@@ -2295,7 +2442,7 @@ defmodule Tightbeam.Schema do
       DB.query(
         db,
         "INSERT OR IGNORE INTO schema_stamp (shape, stampedAt) VALUES (?1, ?2)",
-        [@shape, System.system_time(:millisecond)]
+        [@pre_liveness_shape, System.system_time(:millisecond)]
       )
 
     :ok

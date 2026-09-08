@@ -389,6 +389,136 @@ defmodule Tightbeam.HarnessHealthTest do
            ) == 1
   end
 
+  test "boot recovery commits the batch when an owner turn carries a child assignment", ctx do
+    [child, other | _] = ctx.sessions
+    owner = ctx.main_session
+
+    running =
+      for {key, assignment} <- [{owner, child.assignment}, {other.session, other.assignment}] do
+        {:ok, seq} =
+          Ledger.enqueue(ctx.db, %{
+            session_key: key,
+            message_id: "boot-running-#{key}",
+            origin: "process:tightbeam",
+            prompt: "interrupted",
+            assignment_id: assignment
+          })
+
+        {:ok, turn} = Ledger.claim_next(ctx.db, key, "old-lane")
+        assert turn.seq == seq
+
+        {:ok, queued} =
+          Ledger.enqueue(ctx.db, %{
+            session_key: key,
+            message_id: "boot-queued-#{key}",
+            origin: "process:tightbeam",
+            prompt: "later"
+          })
+
+        {key, assignment, seq, queued}
+      end
+
+    recovered = Ledger.recover_running(ctx.db)
+    assert Enum.sort(recovered) == Enum.sort(Enum.map(running, &elem(&1, 2)))
+    assert Ledger.recover_running(ctx.db) == []
+
+    for {key, assignment, seq, queued} <- running do
+      assert {:ok, [["failed_unknown", ^assignment, ended_at, error]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status,assignmentId,endedAt,error FROM turns WHERE seq=?1",
+                 [seq]
+               )
+
+      assert is_integer(ended_at)
+      assert error == "interrupted: outcome unknown"
+      expected_assignment = if key == owner, do: nil, else: assignment
+
+      assert {:ok, [[^key, ^expected_assignment, nil]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT sessionKey,assignmentId,incidentId FROM harness_health_observations WHERE correlationId=?1",
+                 ["harness-turn:#{seq}:interrupted-outcome-unknown"]
+               )
+
+      {:ok, next} = Ledger.claim_next(ctx.db, key, "recovered-lane")
+      assert next.seq == queued
+
+      assert {:ok, true} =
+               DB.transaction(ctx.db, fn txn ->
+                 Ledger.finish_in_txn(txn, queued, "delivered", nil)
+               end)
+
+      assert Ledger.claim_next(ctx.db, key, "recovered-lane") == :none
+    end
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, """
+             SELECT count(*) FROM harness_health_observations h JOIN assignments a ON a.id=h.assignmentId
+             WHERE a.holderKey != h.sessionKey
+             """)
+  end
+
+  test "owner notification failure retains child cause without child health attribution", ctx do
+    [child | _] = ctx.sessions
+    owner = ctx.main_session
+    session = Org.get(ctx.db, owner)
+
+    for {suffix, reason} <- [
+          {"quota", @captured_codex_rate_limit},
+          {"provider", %{"data" => %{"details" => "auth expired"}}}
+        ] do
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: owner,
+          message_id: "owner-#{suffix}",
+          origin: "process:tightbeam",
+          prompt: "child result",
+          assignment_id: child.assignment
+        })
+
+      {:ok, later} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: owner,
+          message_id: "later-#{suffix}",
+          origin: "process:tightbeam",
+          prompt: "later delivery"
+        })
+
+      {:ok, turn} = Ledger.claim_next(ctx.db, owner, "owner-lane")
+      assert turn.seq == seq
+      turn = Map.put(turn, :session_key, owner)
+
+      assert {:ok, callback} =
+               DB.transaction(ctx.db, fn txn ->
+                 assert Ledger.finish_in_txn(txn, seq, "failed", "provider failure")
+                 HarnessHealth.observe_turn_failure_in_txn(txn, session, turn, :prompt, reason)
+               end)
+
+      if is_function(callback, 0), do: callback.()
+
+      assert {:ok, [["failed", child_assignment]]} =
+               DB.query(ctx.db, "SELECT status,assignmentId FROM turns WHERE seq=?1", [seq])
+
+      assert child_assignment == child.assignment
+
+      assert {:ok, [[^owner, nil]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT sessionKey,assignmentId FROM harness_health_observations WHERE correlationId=?1",
+                 ["harness-turn:#{seq}:#{HarnessHealth.classify_turn_failure(reason)}"]
+               )
+
+      {:ok, next} = Ledger.claim_next(ctx.db, owner, "owner-lane")
+      assert next.seq == later
+
+      assert {:ok, true} =
+               DB.transaction(ctx.db, fn txn ->
+                 Ledger.finish_in_txn(txn, later, "delivered", nil)
+               end)
+    end
+  end
+
   test "failed-turn evidence and normal-turn recovery share their terminal CAS", ctx do
     [first, second, third] = ctx.sessions
 

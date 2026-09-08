@@ -1,7 +1,7 @@
 Code.require_file("../scripts/support/soak_gateway.exs", __DIR__)
 
 defmodule Tightbeam.FullGatewayRecoveryTest do
-  use ExUnit.Case, async: false
+  use Tightbeam.TestCase, async: false
 
   @tag timeout: 240_000
   test "ordinary gateway startup recovers A and both durable wake boundaries after OS death" do

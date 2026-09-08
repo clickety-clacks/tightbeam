@@ -1491,6 +1491,13 @@ defmodule Tightbeam.RowDrivenWaitsTest do
         "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,workItemId,reviewsAssignmentId) VALUES(?1,?2,?3,'owner-a',1,?4,?5)",
         [id, id, holder, work_item_id, reviews_assignment_id]
       )
+
+    {:ok, _} =
+      DB.query(
+        db,
+        "INSERT INTO assignment_effects(assignmentId,effectKind) VALUES(?1,'coordination')",
+        [id]
+      )
   end
 
   defp work_item(db, id) do

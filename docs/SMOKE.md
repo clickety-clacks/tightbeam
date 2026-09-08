@@ -15,6 +15,29 @@ says otherwise). First device to pair becomes the admin user. `tb` = the
 reference CLI with TIGHTBEAM_URL/TIGHTBEAM_TOKEN pointed at GATEWAY (token
 from `<base_dir>/gateway.json`).
 
+## Bounded fresh-agent deploy readiness
+
+The full feature smoke changes org rules, identity and config and sweeps open
+work. Do not run that suite as a production deploy-readiness check.
+Use an already-installed gateway in an explicitly authorized disposable base,
+with existing supported credentials and a permitted non-production test host:
+
+```sh
+TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
+TIGHTBEAM_SMOKE_OWNED_BASE=/absolute/owned/test-base \
+TIGHTBEAM_SMOKE_MODE=readiness \
+mix run --no-start scripts/feature_smoke.exs
+```
+
+Supply per-harness model/effort settings as required by the feature smoke.
+This route only spawns a new session, wakes it, reads its wake-bound delivered
+assistant reply and checks retirement. It does not install rules, edit identity
+or config, redeploy homes, or sweep unrelated work. The base acknowledgment
+records scope; it is not permission to use production. Record the installed
+package/source identity alongside the emitted lifecycle IDs and retirement
+result. No real-harness proof is implied by unit tests. Harness parity below
+still applies; narrowed runs are incomplete for skipped harnesses.
+
 ## Harness parity (normative for every run)
 
 This runbook is a MATRIX, not a list: one full pass PER HARNESS the org

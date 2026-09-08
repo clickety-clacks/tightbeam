@@ -619,7 +619,8 @@ defmodule Tightbeam.LateRulingHandoffTest do
       subject: subject,
       work_item_id: work_item_id,
       idempotency_key: opts[:key],
-      succeeds_assignment_id: opts[:succeeds]
+      succeeds_assignment_id: opts[:succeeds],
+      effect_kind: opts[:effect_kind] || "coordination"
     }
 
     Assignments.__handle__(db, "assign", %{

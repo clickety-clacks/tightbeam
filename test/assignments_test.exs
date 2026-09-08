@@ -872,6 +872,7 @@ defmodule Tightbeam.AssignmentsTest do
     completion_target =
       assign_call({:user, "flynn"}, "outside-list completion")
       |> put_in([:params, :files], ["lib/a.ex"])
+      |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
     completion_call =
@@ -925,7 +926,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "verdict attests freeze provenance and project inert producer history columns", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "verdict stamps"))
+    assignment =
+      assign_call({:user, "flynn"}, "verdict stamps")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
 
     ordinary =
       handle(ctx, "attest", %{
@@ -1225,7 +1229,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a later revoked verdictless review cannot displace holder-reviewed-clean", ctx do
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "Surf Ace producer"))
+    producer =
+      assign_call({:user, "flynn"}, "Surf Ace producer")
+      |> put_in([:params, :effect_kind], "policy")
+      |> then(&handle(ctx, "assign", &1))
 
     clean_review =
       assign_call({:user, "flynn"}, "independent clean review")
@@ -1325,7 +1332,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "attest lifecycle, authorization precedence, and terminal race are atomic", ctx do
-    assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "work"))
+    assignment =
+      assign_call({:session, "holder"}, "work")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
 
     assert %{code: "process_denied"} =
              handle(ctx, "attest", attest_call({:process, "cron"}, assignment.id, "progress"))
@@ -1383,7 +1393,10 @@ defmodule Tightbeam.AssignmentsTest do
     assert completed.assignment.outcome == "completed"
     assert completed.assignment.closingAttestId == completed.attest.id
 
-    race = handle(ctx, "assign", assign_call({:session, "holder"}, "race"))
+    race =
+      assign_call({:session, "holder"}, "race")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
 
     complete =
       Task.async(fn ->
@@ -1423,7 +1436,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "work lifecycle markers land in the actor transcript with exact event text", ctx do
-    completed = handle(ctx, "assign", assign_call({:user, "flynn"}, "completed markers"))
+    completed =
+      assign_call({:user, "flynn"}, "completed markers")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
 
     progress =
       handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "progress"))
@@ -1522,7 +1538,11 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "query filters, deterministic ordering, role-resolved holder input, and open_count", ctx do
-    a = handle(ctx, "assign", assign_call({:user, "flynn"}, "a"))
+    a =
+      assign_call({:user, "flynn"}, "a")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
     b = handle(ctx, "assign", assign_call({:user, "flynn"}, "b"))
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, a.id, "completion"))
     {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET openedAt = 99")
@@ -1581,19 +1601,30 @@ defmodule Tightbeam.AssignmentsTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, assign_call({:session, "holder"}, "denied"))
   end
 
-  test "zero rules allow completion without verdicts and verdict emits one verb event", ctx do
+  test "zero rules cannot bypass code completion evidence and verdict emits one verb event",
+       ctx do
     completion_assignment = dispatch!(ctx, assign_call({:session, "holder"}, "completion"))
 
-    assert {:ok, %{assignment: closed, attest: completion}} =
+    assert {:error, %{code: "inapplicable_code_evidence"}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
                attest_call({:session, "holder"}, completion_assignment.id, "completion")
              )
 
-    assert closed.state == "closed"
-    assert completion.verdictKind == nil
-    assert completion.byUser == nil
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, completion_assignment.id)
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [completion_assignment.id]
+             )
 
     assert {:ok, [[before_verdict]]} =
              DB.query(
@@ -1619,6 +1650,99 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert after_verdict == before_verdict + 1
+  end
+
+  test "a review retraction committed after applicability precheck defeats code completion",
+       ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    refs = [
+      %{
+        "repo" => "eezo:/tmp/o2-result",
+        "commit" => String.duplicate("a", 40)
+      }
+    ]
+
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "retraction producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "retraction review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             refs
+           ) == ["reviewed-clean"]
+
+    assert Assignments.qualifying_verification_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             refs
+           ) == ["verified"]
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO attests
+                   (id,assignmentId,kind,verdictKind,note,bySession,byHarness,byProvider,commitRefs,ts)
+                 VALUES
+                   ('att_concurrent_retraction',?1,'verdict','changes-requested','retracted',
+                    'other-session','claude','anthropic',?2,?3)
+                 """,
+                 [review.id, JSON.encode!(refs), System.system_time(:millisecond) + 1_000]
+               )
+
+      {"", 0}
+    end)
+
+    completion =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> put_in([:params, :commit_refs], refs)
+
+    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
+
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, producer.id)
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [producer.id]
+             )
   end
 
   test "attests returns every kind in timestamp and id order", ctx do

@@ -140,7 +140,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
     assert {:error, %{reason: "remedy_fired", rule: @verification_rule, producer: producer}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert producer == ctx.holder.session_key
+    assert %{session_key: holder_key} = Wakes.get(ctx.db, producer)
+    assert holder_key == ctx.holder.session_key
     assert_receive {:wake_delivered, wake}
     assert wake.session_key == ctx.holder.session_key
     assert wake.prompt =~ "no verification verdict is filed"
@@ -344,7 +345,6 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     assert Enum.map(loaded, & &1.name) == [
              "completion-requires-review",
-             "code-review-requires-passing-tests",
              @verification_rule,
              @artifact_rule,
              "wake-obligation-registration-authority"
@@ -370,7 +370,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
       params: %{
         subject: subject,
         work_item_id: work_item_id,
-        reviews_assignment_id: opts[:reviews_assignment_id]
+        reviews_assignment_id: opts[:reviews_assignment_id],
+        effect_kind: opts[:effect_kind] || "coordination"
       }
     })
   end
@@ -382,6 +383,11 @@ defmodule Tightbeam.VerificationPapertrailTest do
         verdict -> %{assignment_id: assignment_id, kind: kind, verdict_kind: verdict}
       end
 
+    params =
+      if verdict_kind == "verified",
+        do: Map.put(params, :commit_refs, commit_refs()),
+        else: params
+
     %{
       verb: "attest",
       origin: "agent:#{session_key}",
@@ -389,6 +395,18 @@ defmodule Tightbeam.VerificationPapertrailTest do
       session_key: nil,
       params: params
     }
+  end
+
+  defp commit_refs do
+    repo = Path.expand("..", __DIR__)
+    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+
+    [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
+        "commit" => String.trim(commit)
+      }
+    ]
   end
 
   defp record_report_artifact(ctx, work_item_id, session_key) do

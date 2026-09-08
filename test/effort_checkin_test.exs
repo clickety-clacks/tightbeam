@@ -1648,7 +1648,7 @@ defmodule Tightbeam.EffortCheckinTest do
       session_key: holder,
       target_role: nil,
       role_fallback: false,
-      params: params,
+      params: Map.put_new(params, :effect_kind, "coordination"),
       effort_config: ctx.config,
       supervision_interval_ms: ctx.config.wake_tick_ms
     }

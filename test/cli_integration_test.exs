@@ -629,6 +629,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "ship",
           "--session",
           "cli-holder",
+          "--effect-kind",
+          "coordination",
           "--key",
           "assign-cli"
         ],
@@ -848,6 +850,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "implement the feature",
           "--session",
           "cli-coder",
+          "--effect-kind",
+          "coordination",
           "--work-item",
           item_id,
           "--as-user",
@@ -861,6 +865,14 @@ defmodule Tightbeam.CliIntegrationTest do
 
     repo = Path.expand("..", __DIR__)
     {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+
+    commit_refs =
+      JSON.encode!([
+        %{
+          "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
+          "commit" => String.trim(commit)
+        }
+      ])
 
     {_receipt, 0} =
       System.cmd(
@@ -941,7 +953,16 @@ defmodule Tightbeam.CliIntegrationTest do
     {_verified, 0} =
       System.cmd(
         ctx.binary,
-        ["attest", work_id, "--kind", "verdict", "--verdict", "verified"],
+        [
+          "attest",
+          work_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "verified",
+          "--commit-refs",
+          commit_refs
+        ],
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -1030,10 +1051,9 @@ defmodule Tightbeam.CliIntegrationTest do
              RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
   end
 
-  # verification-papertrail-v1 A7 x A5 (macOS half): an org with no learned
-  # statutes completes bare through the real CLI — no denial, no episode, no
-  # remedy wake.
-  test "real CLI bare completion passes on a rule-free org (A5)", ctx do
+  # O2 keeps its code-evidence edge active even when the org has no learned
+  # statutes. The refusal creates no remedy episode or wake.
+  test "real CLI refuses bare code completion on a rule-free org", ctx do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     coder =
@@ -1082,13 +1102,20 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    {completed, 0} =
+    {denied, denied_status} =
       System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
         cd: coder_dir,
         stderr_to_stdout: true
       )
 
-    assert completed =~ "closed"
+    assert denied_status != 0
+    assert denied =~ "inapplicable_code_evidence"
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
+               work_id
+             ])
+
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM rail_remedy_episodes", [])
 
     assert {:ok, [[0]]} =

@@ -640,7 +640,7 @@ defmodule Tightbeam.RulesTest do
     assert Enum.map(EventLog.events_after(ctx.db, 0, 10), & &1.kind) == ["verb", "denied"]
   end
 
-  test "zero rules lets completion close with null verdict filer fields and one verb event",
+  test "zero rules cannot bypass code completion evidence",
        ctx do
     holder = session(ctx.db, "zero-rule-holder", "flynn", archetype: "coder")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
@@ -652,13 +652,17 @@ defmodule Tightbeam.RulesTest do
         kind: "completion"
       })
 
-    assert {:ok,
-            %{
-              assignment: %{state: "closed"},
-              attest: %{kind: "completion", verdictKind: nil, byUser: nil}
-            }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
+    assert {:error, %{code: "inapplicable_code_evidence"}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert [%{kind: "verb", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
+    assert {:ok, [["open", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closingAttestId FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+
+    assert [%{kind: "denied", verb: "attest"}] = EventLog.events_after(ctx.db, 0, 10)
   end
 
   test "matching a constitutional denial is monotonic and leaves domain state unchanged", ctx do
@@ -1004,6 +1008,61 @@ defmodule Tightbeam.RulesTest do
     assert {:deny, %{rule: "needs-review"}} = Rules.evaluate(ctx.db, completion)
   end
 
+  test "completion notice loader exception preserves unrelated wake and review-link validation",
+       ctx do
+    shipped = File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml")
+    put_raw(ctx, shipped)
+    assert [loaded] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    assert loaded.name == "completion-requires-review"
+    assert loaded.external_producer
+    assert loaded.remedy.action == "wake"
+    assert loaded.remedy.produces == "reviewed-clean"
+    refute Map.has_key?(loaded.remedy.params, :reviews)
+
+    put_raw(ctx, String.replace(shipped, "completion-requires-review", "unrelated-review-rule"))
+
+    assert_raise ArgumentError, ~r/linked-review-fact remedy requires reviews/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end
+
+    for extra <- [~s(reviews = "{assignment_id}"), ~s(arbitrary = "value")] do
+      put_raw(ctx, shipped <> "\n" <> extra <> "\n")
+
+      assert_raise ArgumentError, ~r/remedy wake has invalid params/, fn ->
+        Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+      end
+    end
+
+    put_raw(ctx, String.replace(shipped, "external_producer = true", "external_producer = false"))
+
+    assert_raise ArgumentError, ~r/F1 unsatisfied verdict gate/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end
+
+    assigned =
+      shipped
+      |> String.replace(~s(action = "wake"), ~s(action = "assign"))
+      |> String.replace(~s(target_session = "{holder_key}"), ~s(target_role = "reviewer-code"))
+      |> String.replace(~r/^prompt = .*$/m, ~s(subject = "review {assignment_id}"))
+
+    put_raw(ctx, assigned)
+
+    assert_raise ArgumentError, ~r/linked-review-fact remedy requires reviews/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end
+
+    put_raw(ctx, assigned <> ~s(\nreviews = "{holder_key}"\n))
+
+    assert_raise ArgumentError, ~r/linked-review-fact remedy requires reviews/, fn ->
+      Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    end
+
+    put_raw(ctx, assigned <> ~s(\nreviews = "{assignment_id}"\n))
+    assert [linked] = Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    assert linked.remedy.params.reviews == "{assignment_id}"
+    assert linked.conditions == loaded.conditions
+  end
+
   test "restored independent verdict fact accepts the prior linked-review shape", ctx do
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 1, 1)")
@@ -1042,7 +1101,7 @@ defmodule Tightbeam.RulesTest do
     holder = session(ctx.db, "producer", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "reviewer", "other", harness: "claude", provider: "anthropic")
     third = session(ctx.db, "third", "other", harness: "codex", provider: "openai")
-    producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+    producer = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "policy")
 
     verdict(ctx, reviewer.session_key, producer.id, "direct")
 
@@ -1142,7 +1201,7 @@ defmodule Tightbeam.RulesTest do
   test "P3 review and artifact statutes deny before attest and allow after proof", ctx do
     holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "gate-reviewer", "other", archetype: "reviewer")
-    assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    assignment = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "policy")
     parent = self()
     actual_attest = ctx.handlers["attest"]
 
@@ -1198,7 +1257,9 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, %{assignment: %{state: "closed", effectKind: "evidence"}}} =
              Dispatch.dispatch(ctx.db, handlers, evidence_completion)
 
-    artifact_assignment = assignment(ctx, holder.session_key, {:user, "flynn"})
+    artifact_assignment =
+      assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "policy")
+
     attach_work_item(ctx, artifact_assignment.id, "wi_artifact_gate")
     put_raw(ctx, artifact_gate_rule())
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -1224,7 +1285,7 @@ defmodule Tightbeam.RulesTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, artifact_completion)
   end
 
-  test "shipped code-review rail requires the open coder holder's nonblank test receipt", ctx do
+  test "shipped code review opens before any holder test receipt", ctx do
     holder = session(ctx.db, "receipt-holder", "flynn", archetype: "coder")
     other = session(ctx.db, "receipt-other", "other", archetype: "coder")
     reviewer = session(ctx.db, "receipt-reviewer", "reviewer", archetype: "reviewer")
@@ -1245,24 +1306,18 @@ defmodule Tightbeam.RulesTest do
       })
       |> Map.put(:session_key, reviewer.session_key)
 
-    assert {:error,
-            %{
-              code: "rule_denied",
-              rule: "code-review-requires-passing-tests",
-              ref: producer_id
-            }} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
-
-    assert producer_id == producer.id
-    assert review_count(ctx.db, producer.id) == 0
+    assert {:ok, early} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+    producer_id = producer.id
+    assert early.reviewsAssignmentId == producer_id
+    assert early.effectKind == "review"
+    assert early.holderKey != holder.session_key
+    assert review_count(ctx.db, producer.id) == 1
 
     user_verdict(ctx, "flynn", producer.id, "tests-passed", "user claim")
     verdict(ctx, other.session_key, producer.id, "tests-passed", "other session claim")
     verdict(ctx, holder.session_key, producer.id, "tests-passed")
 
-    assert {:error, %{rule: "code-review-requires-passing-tests", ref: ^producer_id}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
-
-    assert review_count(ctx.db, producer.id) == 0
+    assert review_count(ctx.db, producer.id) == 1
 
     verdict(
       ctx,
@@ -1275,10 +1330,10 @@ defmodule Tightbeam.RulesTest do
     assert {:ok, %{reviewsAssignmentId: ^producer_id, effectKind: "review"}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
 
-    assert review_count(ctx.db, producer.id) == 1
+    assert review_count(ctx.db, producer.id) == 2
   end
 
-  test "shipped review receipt rail follows the producer effect, not its holder or label", ctx do
+  test "early review admission is independent of producer effect and holder label", ctx do
     reviewer = session(ctx.db, "effect-reviewer", "reviewer", archetype: "reviewer")
 
     {:ok, _} =
@@ -1315,15 +1370,12 @@ defmodule Tightbeam.RulesTest do
         |> Map.put(:session_key, reviewer.session_key)
 
       if needs_receipt? do
-        assert {:error,
-                %{
-                  code: "rule_denied",
-                  rule: "code-review-requires-passing-tests",
-                  ref: producer_id
-                }} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
+        assert {:ok, early} = Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
 
-        assert producer_id == producer.id
-        assert review_count(ctx.db, producer.id) == 0
+        assert early.reviewsAssignmentId == producer.id
+        assert early.effectKind == "review"
+        assert early.holderKey != holder.session_key
+        assert review_count(ctx.db, producer.id) == 1
 
         verdict(
           ctx,
@@ -1338,19 +1390,21 @@ defmodule Tightbeam.RulesTest do
                Dispatch.dispatch(ctx.db, ctx.handlers, review_call)
 
       assert producer_id == producer.id
-      assert review_count(ctx.db, producer.id) == 1
+      assert review_count(ctx.db, producer.id) == if(needs_receipt?, do: 2, else: 1)
     end
   end
 
-  test "shipped completion remedy waits for the holder receipt and creates one review", ctx do
+  test "shipped completion notifies its owner without forced review staffing", ctx do
     holder = session(ctx.db, "receipt-remedy-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "receipt-remedy-reviewer", "flynn", archetype: "reviewer-code")
+    owner = session(ctx.db, Org.personal_session_key("flynn"), "flynn", archetype: "orchestrator")
 
     {:ok, _} =
       DB.query(ctx.db, "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)")
 
     Roles.create!(ctx.db, "reviewer-code", "flynn", reviewer.session_key)
     producer = assignment(ctx, holder.session_key, {:user, "flynn"})
+    attach_work_item(ctx, producer.id, "wi-accountable-review-notice")
 
     put_raw(ctx, File.read!("priv/kungfu/agentic-engineering/rules/engineering.toml"))
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
@@ -1363,14 +1417,19 @@ defmodule Tightbeam.RulesTest do
 
     assert {:error,
             %{
-              reason: "remedy_blocked",
-              producer: nil,
-              rule: "code-review-requires-passing-tests",
+              reason: "remedy_fired",
+              producer: notice_id,
+              rule: "completion-requires-review",
               ref: producer_id
             }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
     assert producer_id == producer.id
     assert review_count(ctx.db, producer.id) == 0
+    notice = Wakes.get(ctx.db, notice_id)
+    assert notice.session_key == owner.session_key
+    assert notice.owner_user_id == "flynn"
+    assert notice.assignment_id == producer.id
+    assert notice.prompt =~ producer.id
 
     verdict(
       ctx,
@@ -1381,6 +1440,39 @@ defmodule Tightbeam.RulesTest do
         "mix test test/rules_test.exs; passed: 1 test"
     )
 
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    refs = [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:/tmp/o2-result",
+        "commit" => String.duplicate("a", 40)
+      }
+    ]
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, holder.session_key}, %{
+                 assignment_id: producer.id,
+                 kind: "verdict",
+                 verdict_kind: "verified",
+                 commit_refs: refs
+               })
+             )
+
+    completion = put_in(completion, [:params, :commit_refs], refs)
+
     assert {:error,
             %{
               reason: "remedy_fired",
@@ -1388,13 +1480,58 @@ defmodule Tightbeam.RulesTest do
               rule: "completion-requires-review"
             }} = Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert review_count(ctx.db, producer.id) == 1
+    assert review_id == notice_id
+    assert review_count(ctx.db, producer.id) == 0
 
     assert {:error, %{reason: "remedy_fired", producer: ^review_id}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
 
-    assert review_count(ctx.db, producer.id) == 1
-    verdict(ctx, reviewer.session_key, review_id, "reviewed-clean", "reviewed exact receipt tip")
+    assert review_count(ctx.db, producer.id) == 0
+    assert Wakes.get(ctx.db, review_id) != nil
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM wakes WHERE assignmentId=?1 AND consumer='prompt' AND origin='remedy:completion-requires-review'",
+               [producer.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignments WHERE workItemId=?1", [
+               "wi-accountable-review-notice"
+             ])
+
+    assert {:ok, [["open"]]} =
+             DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [producer.id])
+
+    assert {:ok, review} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               p3_call("assign", {:user, "flynn"}, %{
+                 subject: "owner-directed independent review",
+                 reviews_assignment_id: producer.id,
+                 idempotency_key: nil,
+                 files: nil
+               })
+               |> Map.put(:session_key, reviewer.session_key)
+             )
+
+    review_id = review.id
+    assert review.holderKey != holder.session_key
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             Assignments.__handle__(
+               ctx.db,
+               "attest",
+               p3_call("attest", {:session, reviewer.session_key}, %{
+                 assignment_id: review_id,
+                 kind: "verdict",
+                 verdict_kind: "reviewed-clean",
+                 note: "reviewed exact receipt tip",
+                 commit_refs: refs
+               })
+             )
 
     assert {:ok, %{assignment: %{id: completed_id, state: "closed"}}} =
              Dispatch.dispatch(ctx.db, ctx.handlers, completion)
@@ -1407,7 +1544,7 @@ defmodule Tightbeam.RulesTest do
     coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
     noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
     reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")
-    closed = assignment(ctx, coder.session_key, {:user, "flynn"})
+    closed = assignment(ctx, coder.session_key, {:user, "flynn"}, effect_kind: "coordination")
     open_coder = assignment(ctx, coder.session_key, {:user, "flynn"})
 
     policy =

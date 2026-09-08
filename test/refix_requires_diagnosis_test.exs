@@ -63,7 +63,6 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
     assert names == [
              "completion-requires-review",
-             "code-review-requires-passing-tests",
              "completion-requires-verification",
              "completion-requires-results-artifact",
              "wake-obligation-registration-authority"

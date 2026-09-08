@@ -434,6 +434,60 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  @doc "Return the current independent clean review only when it names the submitted result."
+  @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
+          [String.t()]
+  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
+    with {:ok, [_ | _] = expected} <- canonical_commit_refs(commit_refs),
+         {:ok, [["reviewed-clean", review_holder, encoded]]} <-
+           DB.query(
+             db,
+             """
+             SELECT v.verdictKind,r.holderKey,v.commitRefs
+             FROM attests v
+             JOIN assignments r ON r.id=v.assignmentId
+             WHERE r.reviewsAssignmentId=?1
+               AND v.kind='verdict'
+               AND v.bySession=r.holderKey
+               AND v.verdictKind IN ('reviewed-clean','changes-requested')
+             ORDER BY v.ts DESC,v.rowid DESC
+             LIMIT 1
+             """,
+             [assignment_id]
+           ),
+         true <- review_holder != assignment_holder_key,
+         ^expected <- canonical_stored_commit_refs(encoded) do
+      ["reviewed-clean"]
+    else
+      _ -> []
+    end
+  end
+
+  @doc "Return the current producer verification only when it names the submitted result."
+  @spec qualifying_verification_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
+          [String.t()]
+  def qualifying_verification_verdict_kinds(db, assignment_id, holder_key, commit_refs) do
+    with {:ok, [_ | _] = expected} <- canonical_commit_refs(commit_refs),
+         {:ok, [["verified", encoded]]} <-
+           DB.query(
+             db,
+             """
+             SELECT verdictKind,commitRefs
+             FROM attests
+             WHERE assignmentId=?1 AND kind='verdict' AND bySession=?2
+               AND verdictKind IN ('verified','verification-failed')
+             ORDER BY ts DESC,rowid DESC
+             LIMIT 1
+             """,
+             [assignment_id, holder_key]
+           ),
+         ^expected <- canonical_stored_commit_refs(encoded) do
+      ["verified"]
+    else
+      _ -> []
+    end
+  end
+
   @doc "Return the declared file paths for an assignment."
   @spec declared_files(DB.server(), String.t()) :: [String.t()]
   def declared_files(db, assignment_id) do
@@ -791,7 +845,7 @@ defmodule Tightbeam.Assignments do
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
          :ok <- commit_ref_filing_allowed(db, call),
-         :ok <- valid_attest_commit_refs(db, call) do
+         {:ok, call} <- prepare_attest_commit_refs(db, call) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
 
@@ -1507,7 +1561,8 @@ defmodule Tightbeam.Assignments do
           true ->
             with :ok <- valid_kind(call.params[:kind]),
                  :ok <- valid_note(call.params[:note]),
-                 :ok <- absent_verdict_kind(call.params[:verdict_kind]) do
+                 :ok <- absent_verdict_kind(call.params[:verdict_kind]),
+                 :ok <- applicable_code_completion_in_txn(txn, assignment, call) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -2087,15 +2142,26 @@ defmodule Tightbeam.Assignments do
         "commitRefs are only valid on producing completion or review-link verdict attests"
       )
 
-  defp valid_attest_commit_refs(db, call) do
-    case valid_commit_refs(db, call.params[:kind], call.params[:commit_refs]) do
+  defp prepare_attest_commit_refs(db, call) do
+    refs = call.params[:commit_refs]
+
+    case valid_commit_refs(db, call.params[:kind], refs) do
       %{code: "unverifiable_commit_ref"} = error ->
         if late_ruling_receipt?(call.params),
           do: invalid_ruling_consumption_target(),
           else: error
 
-      result ->
-        result
+      :ok ->
+        case canonical_commit_refs(refs) do
+          {:ok, canonical} ->
+            {:ok, put_in(call, [:params, :commit_refs], canonical)}
+
+          :error ->
+            error("invalid_commit_refs", "commitRefs must be unique full immutable commit refs")
+        end
+
+      error ->
+        error
     end
   end
 
@@ -2108,14 +2174,27 @@ defmodule Tightbeam.Assignments do
   end
 
   defp commit_ref_filing_allowed_regular(db, call) do
-    case {call.params[:kind], call.params[:commit_refs]} do
-      {_kind, nil} ->
+    case {call.params[:kind], call.params[:commit_refs], call.params[:verdict_kind]} do
+      {"verdict", nil, "verified"} ->
+        case DB.query(
+               db,
+               "SELECT holderKey,reviewsAssignmentId FROM assignments WHERE id=?1",
+               [call.params[:assignment_id]]
+             ) do
+          {:ok, [[holder, nil]]} when call.principal == {:session, holder} ->
+            error("invalid_commit_refs", "producer verification requires immutable commitRefs")
+
+          _ ->
+            :ok
+        end
+
+      {_kind, nil, _verdict_kind} ->
         :ok
 
-      {kind, _refs} when kind in ["completion", "verdict"] ->
+      {kind, _refs, _verdict_kind} when kind in ["completion", "verdict"] ->
         commit_ref_filing_allowed_for_assignment(db, call, kind)
 
-      {_kind, _refs} ->
+      {_kind, _refs, _verdict_kind} ->
         :ok
     end
   end
@@ -2151,11 +2230,26 @@ defmodule Tightbeam.Assignments do
           "commitRefs are not allowed on non-producing completion attests"
         )
 
-      {:ok, [[_holder, _state, nil]]} when kind == "verdict" ->
-        error(
-          "invalid_commit_refs",
-          "commitRefs on verdict attests require a review-linked assignment"
-        )
+      {:ok, [[holder, state, nil]]} when kind == "verdict" ->
+        cond do
+          call.params[:verdict_kind] not in ["verified", "verification-failed"] ->
+            error(
+              "invalid_commit_refs",
+              "commitRefs on producing verdicts require verified or verification-failed"
+            )
+
+          call.principal != {:session, holder} ->
+            error("not_holder", "assignment is held by session #{holder}")
+
+          state != "open" ->
+            assignment_closed()
+
+          call.params[:verdict_kind] == "verified" and call.params[:commit_refs] == [] ->
+            error("invalid_commit_refs", "producer verification requires immutable commitRefs")
+
+          true ->
+            :ok
+        end
 
       {:ok, [[_holder, _state, _reviews_assignment_id]]} ->
         :ok
@@ -2168,6 +2262,7 @@ defmodule Tightbeam.Assignments do
     with ["commit", "repo"] <- normalized |> Map.keys() |> Enum.sort(),
          repo when is_binary(repo) <- normalized["repo"],
          commit when is_binary(commit) <- normalized["commit"],
+         true <- Regex.match?(~r/\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\z/u, commit),
          [host, path] <- String.split(repo, ":", parts: 2),
          true <- host != "" and Path.type(path) == :absolute,
          {_output, 0} <- run_git_cat_file(db, host, path, commit) do
@@ -2179,6 +2274,127 @@ defmodule Tightbeam.Assignments do
 
   defp validate_commit_ref(_db, _ref),
     do: error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
+
+  defp canonical_commit_refs(nil), do: {:ok, nil}
+
+  defp canonical_commit_refs(refs) when is_list(refs) do
+    with {:ok, canonical} <-
+           Enum.reduce_while(refs, {:ok, []}, fn
+             ref, {:ok, acc} when is_map(ref) ->
+               ref = normalize_commit_ref(ref)
+
+               case {Map.keys(ref) |> Enum.sort(), ref["repo"], ref["commit"]} do
+                 {["commit", "repo"], repo, commit}
+                 when is_binary(repo) and is_binary(commit) and
+                        byte_size(commit) in [40, 64] ->
+                   if Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit) do
+                     {:cont,
+                      {:ok, [%{"repo" => repo, "commit" => String.downcase(commit)} | acc]}}
+                   else
+                     {:halt, :error}
+                   end
+
+                 _ ->
+                   {:halt, :error}
+               end
+
+             _, _ ->
+               {:halt, :error}
+           end) do
+      canonical = Enum.sort_by(canonical, &{&1["repo"], &1["commit"]})
+      if length(canonical) == length(Enum.uniq(canonical)), do: {:ok, canonical}, else: :error
+    end
+  end
+
+  defp canonical_commit_refs(_), do: :error
+
+  defp applicable_code_completion_in_txn(_txn, _assignment, %{params: %{kind: kind}})
+       when kind != "completion",
+       do: :ok
+
+  defp applicable_code_completion_in_txn(txn, %{effectKind: "code"} = assignment, call) do
+    refs = call.params[:commit_refs]
+    review = latest_review_conclusion_in_txn(txn, assignment.id)
+    verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
+
+    with [_ | _] <- refs,
+         %{kind: "reviewed-clean", holder: review_holder, refs: ^refs} <- review,
+         true <- review_holder != assignment.holderKey,
+         %{kind: "verified", holder: assignment_holder, refs: ^refs} <- verification,
+         true <- assignment_holder == assignment.holderKey do
+      :ok
+    else
+      _ ->
+        error(
+          "inapplicable_code_evidence",
+          "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
+        )
+    end
+  end
+
+  defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
+
+  defp latest_review_conclusion_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT v.verdictKind,r.holderKey,v.commitRefs
+           FROM attests v
+           JOIN assignments r ON r.id=v.assignmentId
+           WHERE r.reviewsAssignmentId=?1
+             AND v.kind='verdict'
+             AND v.bySession=r.holderKey
+             AND v.verdictKind IN ('reviewed-clean','changes-requested')
+           ORDER BY v.ts DESC,v.rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      [[kind, holder, refs]] ->
+        %{kind: kind, holder: holder, refs: canonical_stored_commit_refs(refs)}
+
+      [] ->
+        nil
+    end
+  end
+
+  defp latest_verification_conclusion_in_txn(txn, assignment_id, holder) do
+    case Txn.q(
+           txn,
+           """
+           SELECT verdictKind,bySession,commitRefs
+           FROM attests
+           WHERE assignmentId=?1
+             AND kind='verdict'
+             AND bySession=?2
+             AND verdictKind IN ('verified','verification-failed')
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id, holder]
+         ) do
+      [[kind, author, refs]] ->
+        %{kind: kind, holder: author, refs: canonical_stored_commit_refs(refs)}
+
+      [] ->
+        nil
+    end
+  end
+
+  defp canonical_stored_commit_refs(nil), do: nil
+
+  defp canonical_stored_commit_refs(encoded) when is_binary(encoded) do
+    case JSON.decode(encoded) do
+      {:ok, decoded} ->
+        case canonical_commit_refs(decoded) do
+          {:ok, refs} -> refs
+          :error -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
 
   defp run_git_cat_file(db, host, path, commit) do
     base_dir =

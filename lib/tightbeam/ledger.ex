@@ -345,6 +345,26 @@ defmodule Tightbeam.Ledger do
     end
   end
 
+  @doc false
+  @spec repair_delivery_outcomes_in_txn(DB.Txn.t(), integer(), String.t()) :: [map()]
+  def repair_delivery_outcomes_in_txn(%DB.Txn{} = txn, source_seq, assignment_id)
+      when is_integer(source_seq) and is_binary(assignment_id) do
+    DB.Txn.q(
+      txn,
+      """
+      SELECT r.id,t.seq,t.status,r.principal
+      FROM turn_repair_attempts r
+      JOIN turns t ON t.seq=r.attemptSeq
+      WHERE r.sourceSeq=?1 AND r.assignmentId=?2
+      ORDER BY r.createdAt,r.id
+      """,
+      [source_seq, assignment_id]
+    )
+    |> Enum.map(fn [attempt_id, attempt_seq, status, principal] ->
+      %{attempt_id: attempt_id, attempt_seq: attempt_seq, status: status, principal: principal}
+    end)
+  end
+
   defp append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal) do
     case Txn.q(
            txn,
