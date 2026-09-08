@@ -1,5 +1,5 @@
 name = "coder"
-skills = ["worktree-session", "committing-and-pushing", "human-communication"]
+skills = ["worktree-session", "committing-and-pushing"]
 
 [guidance]
 text = """

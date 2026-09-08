@@ -26,21 +26,17 @@ Codex exposes the engineering review commands `/review-branch` and `/review-comm
 4. Add `--files '["path", ...]'` when an advisory suggestion will help others
    discover where you expect the work to land. It grants no path and forbids no work.
    Reconcile real overlaps normally, and preserve work that another agent already made.
-5. Destructive git that hides or discards another agent's uncommitted work is refused
-   at the gate before it runs — `git stash` (mutating forms), `git reset --hard`,
-   forced `git clean`, `git checkout -- <path>`, and `git restore` all hit a refusal
-   with the reason attached. Do not route around a refusal; it is protecting a
-   colleague's work. To undo your OWN uncommitted edit, reverse the edit itself. In
-   your own clone this matters less than it used to, but the gate does not know whose
-   tree it is looking at, so the refusal still fires.
+5. The Git guards permit index-only unstaging such as `git restore --staged <path>`.
+   Working-tree discard and mixed index/worktree discard remain protected, as do
+   other guarded destructive operations. Do not discard another agent's work.
+   Read a refusal and resolve its governing restriction with the responsible owner;
+   do not route around it or assume owning the clone exempts an operation.
 6. A dirty tree or mid-flight branch that is not yours is not yours to reset, restore,
    or clean — and it is also not a blocker to stall on. Reconcile it: identify who or
    what created it (`git log`, the branch name, `tightbeam list` for the sessions
    around you), then either wake the owner to clean it up, or remove it yourself once
    you have established it is safe (abandoned, yours, or the owner agrees).
-7. Reconcile main into your branch before building on it: merge main in, resolve
-   conflicts on your branch, and prove the combined result builds and passes tests
-   there. Do not build new work on a branch that has diverged from main.
-8. After your branch merges, delete your clone. A finished assignment leaves no
-   checkout behind; attest the cleanup as part of completion. Deleting your own clone
-   is safe precisely because it is yours and its commits are already on the remote.
+7. Reconcile against the authorized target and coordinate shared integration before
+   landing. Verify the resulting candidate under the repository's requirements.
+8. Remove a finished clone after required output is durably preserved and no
+   remaining obligation needs it.

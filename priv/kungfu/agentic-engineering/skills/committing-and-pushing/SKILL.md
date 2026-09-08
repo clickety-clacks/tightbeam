@@ -43,16 +43,13 @@ changes the pin.
    before reconciliation is stale where reconciliation changed semantics.
 5. Advancing main is the orchestrator's decision: it happens after the
    orchestrator has cleared the work — the `reviewed-clean` verdict is on
-   record, and, for a substantial change (feature-cycle's spirit-review
-   definition), the product owner's `--kind verdict` attest is on the goal's
-   assignment. A routine change — a wire-spelling fix, not an effort-check-in —
-   advances on `reviewed-clean` alone. You execute the mechanics: confirm main
+   record, and the current product-owner judgment required by the governing intent is recorded.
+   An unchanged authorized fix does not need a new intent ceremony. You execute the mechanics: confirm main
    is an ancestor of the reconciled branch
    (`git merge-base --is-ancestor main <branch>`), then advance main from the
    branch — fast-forward, because the reconciliation already happened on the
    branch.
-6. When main moves during reconciliation, that is a hold violation to report, not a
-   reason to reconcile again. Stop and tell the owner the pinned target moved; do not
-   merge the new tip in and re-prove unless the owner changes the pin. Chasing a moving
-   target invalidates the review that just cleared your work, and on a busy target that
-   loop never ends: reconcile, review goes stale, re-review, target moves, reconcile.
+6. An explicit target pin remains in force until its owner changes it. If that pinned
+   target moves, report it and hold the affected integration. Otherwise reconcile target
+   movement within existing authority and the agreed integration order. Reassess changed
+   interactions and refresh verification or review where prior evidence no longer applies.

@@ -4,18 +4,15 @@ First determine what kind of review the work warrants. Then review it at that we
 
 ## Determine the weight
 
-Start from the posture verdict on the work item, then confirm it against the work itself.
+Choose review scope and depth from the ask, uncertainty and consequences. An understood
+bounded repair can need a focused review; a small authority or contract change can need
+deep scrutiny. Apply the same correctness, data-integrity and trust-boundary bar to every
+review.
 
-HEAVY: a new feature, a change to architecture or an interface, or new infrastructure. A spec exists and is the ask. Review on every axis.
-LIGHT: an already-adjudicated fix, a straightforward bug, or an augmentation inside the existing architecture. No spec; the work item's input is the ask and the orchestrator already ruled it sufficient. Pass unless something is egregiously wrong.
-
-A bounded spike commissioned to answer a named question is LIGHT. Its code is disposable, isolated from product-trusted paths and not a release candidate. A spike remains light when it explores an interface, dependency, service or architecture.
-
-Review a spike for whether it answers the named question with credible evidence, uses realistic inputs where needed and contains its effects. Do not require production completeness, maintainability, compatibility or long-term architecture. If any spike code will be retained or shipped, review that code again under the posture warranted by its product role.
-
-The signals that make it heavy: a new public surface, a changed contract other code depends on, a new process or service, a schema change, a new dependency. None of those, and it is light however large the diff.
-
-When the work disagrees with the verdict (a light card that changes a contract, a heavy card that turns out to be a one-line fix) review at the weight the work warrants and say so in the report.
+Review a bounded spike for whether it answers its named question with credible evidence,
+uses realistic inputs where needed and contains its effects. Do not require production
+completeness when the governing agreement promises only an experiment. Review retained or
+shipping code for its actual product role.
 
 ## Judgment
 
@@ -31,7 +28,7 @@ Beyond the ask is blocking: it ships scope that was never approved. Every line t
 
 Two failures, equal weight: approving with no trace of what you checked, and holding work for a fix the ask does not need. Before filing `changes-requested`, re-read each blocking finding and demote any the ask ships without.
 
-Scope questions go to the product owner via `operator-ask`; review on the merits meanwhile.
+Bring product-intent or scope questions to the responsible owner for PO judgment; review on the merits meanwhile.
 Accept a rejected finding only with evidence.
 
 ## Substrate procedures

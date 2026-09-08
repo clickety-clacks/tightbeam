@@ -22,7 +22,7 @@ Line coverage: not a gate; a percentage is not a finding.
 ## Substrate procedures: code
 
 The report opens with conformance: every clause of the ask marked satisfied, unsatisfied, unproven, or out of scope, each with its evidence.
-Read the ask at its source. Under heavy posture that is the canonical spec at its canonical path; verify the work item's pinned sha256 when present, because conformance is owed to the ruling text. Under light posture the work item's input is the ask.
+Read the ask at its source. When the work item pins a spec, verify its SHA-256 because conformance is owed to that exact ruling text; otherwise use the work item's authoritative input.
 Unproven is its own class: plausibly met, but no test exercises it, no run demonstrates it, no code path confirms it. Do not round it up to satisfied.
 Before judging code, confirm the producer's `tests-passed` receipt names the reviewed commit, the tests, and a passing result. A weak or false receipt is blocking.
 Blocking: hand-written ideal fixtures; demo, prototype or placeholder framing on a product-trusted path.

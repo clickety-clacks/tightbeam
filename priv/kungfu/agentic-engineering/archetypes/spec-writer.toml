@@ -1,5 +1,5 @@
 name = "spec-writer"
-skills = ["drafting-requirements", "spec-homing", "spec-handoff", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
+skills = ["drafting-requirements", "spec-homing", "spec-handoff", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
 
 [guidance]
 text = """

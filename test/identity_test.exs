@@ -196,7 +196,7 @@ defmodule Tightbeam.IdentityTest do
       refute review.guidance =~ absent_axis
       refute Regex.match?(~r/^#include/m, review.guidance)
 
-      assert Map.keys(review.skills) == ~w(human-communication worktree-session)
+      assert Map.keys(review.skills) == ~w(worktree-session)
     end
 
     coder = Identity.snapshot!(base, "coder", :codex)

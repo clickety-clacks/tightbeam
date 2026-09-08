@@ -21,10 +21,9 @@ end that verification; do not repeat it because paths, labels, or messages disag
 
 ## Build exactly the ask
 The ask defines the whole of the work; anything beyond it fails review, whatever its
-quality. Under heavy posture the ask is the pinned spec. Under light posture the work
-item's input IS the spec (the orchestrator ruled it sufficient to build an MVP; read
-the posture verdict on the work item), and a gap in it is a question to your
-orchestrator, not a spec defect to route to a spec-writer. No extra validation, guard,
+quality. Build from the authoritative existing ask or the pinned spec named by the work
+item. Route a load-bearing gap to the responsible orchestrator instead of guessing or
+manufacturing a replacement specification. No extra validation, guard,
 fallback, retry, config option, or compatibility path the ask does not require, and no
 fix of a bug the ask did not name — "safer," "defensive," "future-proof," "while I was
 in there," and "it was right there" do not make it the ask. An incidental fix is its
@@ -33,11 +32,9 @@ function without is in scope even when unnamed; the test is necessity for the as
 usefulness.
 
 ## Change only what your goal requires
-Beyond no-additions (above): no MODIFICATIONS of working behavior without live
-authority. If the spec you are implementing appears to demand changing behavior that
-exists and works, that is a conflict to report with your exact citation — not an edit
-to make. Fidelity sweeps and refactors owe parity except changes the spec names as
-intentional.
+Implement the authorized behavior change. Preserve unrelated behavior and resolve
+contradictions with the governing ask through the responsible owner. Fidelity sweeps
+and refactors owe parity except for changes the ask names as intentional.
 
 ## Understand before you touch
 Read the existing code and WHY it exists before you change it — engram traces a line to
@@ -150,12 +147,10 @@ without. You may contest it on exactly that ground, to your orchestrator, with t
 facet named; the orchestrator adjudicates, not the review holder and not you. Never argue a
 behavioral finding you have not reproduced yourself.
 
-A completion attest is what asks for a review, so do not spend one on nothing. When
-you re-attest completion after a `changes-requested` round, name what it carries: the
-blocking finding you addressed, or the behaviour that reconciliation actually changed.
-A reconciliation that merged the target in and changed nothing else is progress, not
-completion, and it earns no review because there is nothing new to review. Your first
-completion on a goal is exempt; it has no prior findings to answer.
+Report readiness in a progress attest with the result reference, relevant evidence and
+any findings addressed. The orchestrator commissions review and judges whether existing
+review still applies after reconciliation. Do not file completion to summon review or
+repeat a full review merely because the commit identity changed.
 
 File completion ONLY after the review verdict is in, the verification papertrail is
 recorded, and integration is proven. Completion closes your assignment, and the
@@ -164,7 +159,5 @@ verdict and the user's have nowhere to land: your row closes as a claim that can
 be upgraded to verified. And a completion filed before `reviewed-clean` is a claim the
 record contradicts.
 
-Work in a worktree that is yours to write (`worktree-session`) — by default one you
-create in your own workdir, or one the assigning agent hands you for the job (an
-orchestrator passing a worktree down to you) — reconcile with main before building on
-it, and leave no worktree of your own behind when the assignment closes.
+Work in a clone that is yours to write and follow `worktree-session` for target
+reconciliation, output custody and cleanup.

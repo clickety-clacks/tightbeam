@@ -10,12 +10,9 @@ happened and shows which clause carried which evidence; the verdict is the facet
 adjudication applied to it. A verdict without the table is a rubber stamp. A table
 that blocks on every row is the other failure.
 
-1. Read the ask at its source. Under heavy posture that is the canonical spec at its
-   canonical path (verify the work item's pinned sha256 when present; conformance is
-   owed to the ruling text). Under light posture the work item's input is the spec:
-   enumerate its asks as the clauses. Either way, list every requirement clause: every
-   invariant, every acceptance item, every stated behavior. Non-goals enter the list
-   as exclusions to verify.
+1. Read the ask at its source. When the work item pins a canonical spec, verify its
+   SHA-256 because conformance is owed to that ruling text; otherwise use the work
+   item's authoritative input. List every requirement clause and named exclusion.
 2. Mark each clause must-have or post-mvp before you look at the code: can the ask
    ship without it? This is the facet adjudication from `reviewer-code.md`,
    carried down to clause grain.
