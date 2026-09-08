@@ -350,22 +350,8 @@ struct Sweep {
 }
 
 fn freeze_harness_tree(target: &HarnessTarget) -> Result<Option<Sweep>, String> {
-    if target.revalidate_authority()? == HarnessAuthority::Gone {
+    let Some(leader) = capture_sweep_leader(target)? else {
         return Ok(None);
-    }
-    let leader = match BoundProcess::capture(ProcessInstance {
-        pid: target.pgid,
-        pgid: target.pgid,
-        start_time: target.leader_start_time,
-    })? {
-        Some(leader) => leader,
-        None if target.revalidate_authority()? == HarnessAuthority::Gone => return Ok(None),
-        None => {
-            return Err(format!(
-                "harness session leader {} disappeared before freeze",
-                target.pgid
-            ));
-        }
     };
     let mut sweep = Sweep {
         leader,
@@ -374,123 +360,15 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Option<Sweep>, String> 
         caller: unsafe { libc::getpid() },
     };
     let deadline = Instant::now() + Duration::from_secs(2);
-    // Caller exclusion is decided before STOP. There is no group broadcast capable of
-    // stopping the caller, even when it is the recorded leader or shares its group.
-    if sweep.leader.instance.pid != sweep.caller {
-        if target.revalidate_authority()? == HarnessAuthority::Gone {
-            return Ok(None);
-        }
-        match sweep.leader.signal(libc::SIGSTOP)? {
-            ProcessSignalResult::Gone
-                if target.revalidate_authority()? == HarnessAuthority::Gone =>
-            {
-                return Ok(None);
-            }
-            ProcessSignalResult::Gone => sweep
-                .failures
-                .push("leader disappeared before freeze while its group remains".into()),
-            ProcessSignalResult::Failed(error) => sweep.failures.push(format!(
-                "process {} could not be stopped: {error}",
-                target.pgid
-            )),
-            ProcessSignalResult::Delivered => match wait_for_stopped(&sweep.leader, deadline) {
-                Ok(true) => {}
-                Ok(false) if target.revalidate_authority()? == HarnessAuthority::Gone => {
-                    return Ok(None);
-                }
-                Ok(false) => sweep
-                    .failures
-                    .push("leader exited before entering the frozen state".into()),
-                Err(reason) => sweep.failures.push(reason),
-            },
-        }
-        if !sweep.failures.is_empty() {
-            return Ok(Some(sweep));
-        }
+
+    match freeze_sweep_leader(target, &mut sweep, deadline)? {
+        LeaderFreeze::Gone => return Ok(None),
+        LeaderFreeze::Failed => return Ok(Some(sweep)),
+        LeaderFreeze::Ready => {}
     }
 
     for _ in 0..FREEZE_ROUNDS {
-        if let Err(reason) = require_sweep_authority(target, &sweep.leader) {
-            sweep.failures.push(reason);
-            return Ok(Some(sweep));
-        }
-        let snapshot = match Snapshot::capture() {
-            Ok(snapshot) => snapshot,
-            Err(reason) => {
-                sweep
-                    .failures
-                    .push(format!("harness process table unreadable: {reason}"));
-                return Ok(Some(sweep));
-            }
-        };
-        let mut tree = snapshot.group_tree(target.pgid);
-        // A captured escapee can have peers, children, and children reparented inside its
-        // group. Extend the walk only while a captured member still proves that group.
-        for process in sweep.frozen.values() {
-            match verify_process_instance(&process.instance) {
-                Ok(ProcessAuthority::Live) => {
-                    tree.extend(snapshot.group_tree(process.instance.pgid))
-                }
-                Ok(ProcessAuthority::Gone) => {}
-                Err(reason) => sweep.failures.push(reason),
-            }
-        }
-        let mut pending: Vec<_> = tree
-            .into_iter()
-            .filter(|pid| {
-                *pid != sweep.caller && *pid != target.pgid && !sweep.frozen.contains_key(pid)
-            })
-            .collect();
-        let mut added = false;
-        // Discover parent before child even when numeric PID order has wrapped. A whole
-        // snapshot can contain many generations; FREEZE_ROUNDS does not limit tree depth.
-        loop {
-            let mut advanced = false;
-            let mut remaining = Vec::new();
-            for pid in pending {
-                let Some(observed) = snapshot.process(pid) else {
-                    continue;
-                };
-                if observed.zombie {
-                    continue;
-                }
-                let anchor = std::iter::once(&sweep.leader)
-                    .chain(sweep.frozen.values())
-                    .find(|parent| {
-                        parent.instance.pid == observed.ppid
-                            || parent.instance.pgid == observed.pgid
-                    });
-                let Some(anchor) = anchor else {
-                    remaining.push(pid);
-                    continue;
-                };
-                advanced = true;
-                match capture_member(observed, anchor) {
-                    Ok(Some(process)) => {
-                        sweep.frozen.insert(pid, process);
-                        added = true;
-                        if let Err(reason) =
-                            stop_process(&sweep.frozen[&pid], target, &sweep.leader, deadline)
-                        {
-                            sweep.failures.push(reason);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(reason) => sweep.failures.push(reason),
-                }
-            }
-            if remaining.is_empty() {
-                break;
-            }
-            if !advanced {
-                sweep.failures.push(format!(
-                    "harness ancestry no longer provable for captured table entries {remaining:?}"
-                ));
-                break;
-            }
-            pending = remaining;
-        }
-        if !added {
+        if !freeze_tree_round(target, &mut sweep, deadline)? {
             return Ok(Some(sweep));
         }
         if Instant::now() >= deadline {
@@ -501,6 +379,230 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Option<Sweep>, String> 
         .failures
         .push("harness tree freeze did not prove complete before kill".into());
     Ok(Some(sweep))
+}
+
+fn capture_sweep_leader(target: &HarnessTarget) -> Result<Option<BoundProcess>, String> {
+    if target.revalidate_authority()? == HarnessAuthority::Gone {
+        return Ok(None);
+    }
+    match BoundProcess::capture(ProcessInstance {
+        pid: target.pgid,
+        pgid: target.pgid,
+        start_time: target.leader_start_time,
+    })? {
+        Some(leader) => Ok(Some(leader)),
+        None if target.revalidate_authority()? == HarnessAuthority::Gone => Ok(None),
+        None => Err(format!(
+            "harness session leader {} disappeared before freeze",
+            target.pgid
+        )),
+    }
+}
+
+enum LeaderFreeze {
+    Gone,
+    Failed,
+    Ready,
+}
+
+fn freeze_sweep_leader(
+    target: &HarnessTarget,
+    sweep: &mut Sweep,
+    deadline: Instant,
+) -> Result<LeaderFreeze, String> {
+    // Caller exclusion is decided before STOP. There is no group broadcast capable of
+    // stopping the caller, even when it is the recorded leader or shares its group.
+    if sweep.leader.instance.pid == sweep.caller {
+        return Ok(LeaderFreeze::Ready);
+    }
+    if target.revalidate_authority()? == HarnessAuthority::Gone {
+        return Ok(LeaderFreeze::Gone);
+    }
+    match sweep.leader.signal(libc::SIGSTOP)? {
+        ProcessSignalResult::Gone => return record_gone_leader_freeze(target, sweep),
+        ProcessSignalResult::Failed(error) => sweep.failures.push(format!(
+            "process {} could not be stopped: {error}",
+            target.pgid
+        )),
+        ProcessSignalResult::Delivered => {
+            if matches!(
+                wait_for_leader_freeze(target, sweep, deadline)?,
+                LeaderFreeze::Gone
+            ) {
+                return Ok(LeaderFreeze::Gone);
+            }
+        }
+    }
+    if sweep.failures.is_empty() {
+        Ok(LeaderFreeze::Ready)
+    } else {
+        Ok(LeaderFreeze::Failed)
+    }
+}
+
+fn record_gone_leader_freeze(
+    target: &HarnessTarget,
+    sweep: &mut Sweep,
+) -> Result<LeaderFreeze, String> {
+    if target.revalidate_authority()? == HarnessAuthority::Gone {
+        Ok(LeaderFreeze::Gone)
+    } else {
+        sweep
+            .failures
+            .push("leader disappeared before freeze while its group remains".into());
+        Ok(LeaderFreeze::Failed)
+    }
+}
+
+fn wait_for_leader_freeze(
+    target: &HarnessTarget,
+    sweep: &mut Sweep,
+    deadline: Instant,
+) -> Result<LeaderFreeze, String> {
+    match wait_for_stopped(&sweep.leader, deadline) {
+        Ok(true) => {}
+        Ok(false) if target.revalidate_authority()? == HarnessAuthority::Gone => {
+            return Ok(LeaderFreeze::Gone);
+        }
+        Ok(false) => sweep
+            .failures
+            .push("leader exited before entering the frozen state".into()),
+        Err(reason) => sweep.failures.push(reason),
+    }
+    Ok(LeaderFreeze::Ready)
+}
+
+fn freeze_tree_round(
+    target: &HarnessTarget,
+    sweep: &mut Sweep,
+    deadline: Instant,
+) -> Result<bool, String> {
+    if let Err(reason) = require_sweep_authority(target, &sweep.leader) {
+        sweep.failures.push(reason);
+        return Ok(false);
+    }
+    let snapshot = match Snapshot::capture() {
+        Ok(snapshot) => snapshot,
+        Err(reason) => {
+            sweep
+                .failures
+                .push(format!("harness process table unreadable: {reason}"));
+            return Ok(false);
+        }
+    };
+    let pending = pending_tree_members(target, sweep, &snapshot);
+    capture_pending_members(target, sweep, &snapshot, pending, deadline)
+}
+
+fn pending_tree_members(
+    target: &HarnessTarget,
+    sweep: &mut Sweep,
+    snapshot: &Snapshot,
+) -> Vec<libc::pid_t> {
+    let mut tree = snapshot.group_tree(target.pgid);
+    // A captured escapee can have peers, children, and children reparented inside its
+    // group. Extend the walk only while a captured member still proves that group.
+    for process in sweep.frozen.values() {
+        match verify_process_instance(&process.instance) {
+            Ok(ProcessAuthority::Live) => tree.extend(snapshot.group_tree(process.instance.pgid)),
+            Ok(ProcessAuthority::Gone) => {}
+            Err(reason) => sweep.failures.push(reason),
+        }
+    }
+    tree.into_iter()
+        .filter(|pid| {
+            *pid != sweep.caller && *pid != target.pgid && !sweep.frozen.contains_key(pid)
+        })
+        .collect()
+}
+
+fn capture_pending_members(
+    target: &HarnessTarget,
+    sweep: &mut Sweep,
+    snapshot: &Snapshot,
+    mut pending: Vec<libc::pid_t>,
+    deadline: Instant,
+) -> Result<bool, String> {
+    let mut added = false;
+    // Discover parent before child even when numeric PID order has wrapped. A whole
+    // snapshot can contain many generations; FREEZE_ROUNDS does not limit tree depth.
+    loop {
+        let (remaining, advanced, captured) =
+            capture_pending_pass(target, sweep, snapshot, pending, deadline);
+        added |= captured;
+        if remaining.is_empty() {
+            return Ok(added);
+        }
+        if !advanced {
+            sweep.failures.push(format!(
+                "harness ancestry no longer provable for captured table entries {remaining:?}"
+            ));
+            return Ok(added);
+        }
+        pending = remaining;
+    }
+}
+
+fn capture_pending_pass(
+    target: &HarnessTarget,
+    sweep: &mut Sweep,
+    snapshot: &Snapshot,
+    pending: Vec<libc::pid_t>,
+    deadline: Instant,
+) -> (Vec<libc::pid_t>, bool, bool) {
+    let mut remaining = Vec::new();
+    let mut advanced = false;
+    let mut added = false;
+    for pid in pending {
+        let Some(observed) = snapshot.process(pid) else {
+            continue;
+        };
+        if observed.zombie {
+            continue;
+        }
+        let Some(anchor) = find_capture_anchor(sweep, observed) else {
+            remaining.push(pid);
+            continue;
+        };
+        let captured = capture_member(observed, anchor);
+        advanced = true;
+        if record_captured_member(target, sweep, observed.pid, captured, deadline) {
+            added = true;
+        }
+    }
+    (remaining, advanced, added)
+}
+
+fn find_capture_anchor<'a>(sweep: &'a Sweep, observed: &Process) -> Option<&'a BoundProcess> {
+    std::iter::once(&sweep.leader)
+        .chain(sweep.frozen.values())
+        .find(|parent| {
+            parent.instance.pid == observed.ppid || parent.instance.pgid == observed.pgid
+        })
+}
+
+fn record_captured_member(
+    target: &HarnessTarget,
+    sweep: &mut Sweep,
+    pid: libc::pid_t,
+    captured: Result<Option<BoundProcess>, String>,
+    deadline: Instant,
+) -> bool {
+    match captured {
+        Ok(Some(process)) => {
+            sweep.frozen.insert(pid, process);
+            if let Err(reason) = stop_process(&sweep.frozen[&pid], target, &sweep.leader, deadline)
+            {
+                sweep.failures.push(reason);
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(reason) => {
+            sweep.failures.push(reason);
+            false
+        }
+    }
 }
 
 fn require_sweep_authority(target: &HarnessTarget, leader: &BoundProcess) -> Result<(), String> {
