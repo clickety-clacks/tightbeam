@@ -2786,17 +2786,16 @@ defmodule Tightbeam.Gateway do
                 :not_applicable -> {reason, false}
               end
 
-            # A reviewed concrete cause is the whole public reason. The raw ACP
-            # term remains only in `harness_turn_error`, the existing internal
-            # diagnostic below; arbitrary provider prose must not ride the
-            # target marker, terminal state, or stored turn error.
+            # Owner notices keep the classified cause. A Codex usage-limit target
+            # also receives its provider message verbatim, including retry text;
+            # other provider fields stay in the internal diagnostic.
             public_reason =
               cond do
                 match?({:lifecycle_trace_failed_after_prompt, _, _}, raw_reason) ->
                   "turn lifecycle trace failed after prompt dispatch; outcome unknown"
 
                 not is_nil(safe_failure) and not credential_refused? ->
-                  safe_failure.message
+                  target_process_failure_text(safe_failure, raw_reason)
 
                 true ->
                   reason
@@ -2804,7 +2803,7 @@ defmodule Tightbeam.Gateway do
 
             public_state_error =
               if not is_nil(safe_failure) and not credential_refused?,
-                do: safe_failure.message,
+                do: public_reason,
                 else: inspect(reason)
 
             failure_publish = fn _terminal ->
@@ -2940,6 +2939,17 @@ defmodule Tightbeam.Gateway do
       _ -> nil
     end
   end
+
+  defp target_process_failure_text(%{code: "codex_usage_limit", message: message}, reason) do
+    data = map_get_any(reason, ["data", :data])
+
+    case map_get_any(data, ["message", :message]) do
+      text when is_binary(text) and text != "" -> message <> " " <> text
+      _ -> message
+    end
+  end
+
+  defp target_process_failure_text(failure, _reason), do: failure.message
 
   defp safe_process_failure(:prompt, reason) when is_map(reason) do
     data = map_get_any(reason, ["data", :data])
@@ -7392,7 +7402,13 @@ defmodule Tightbeam.Gateway do
     data = map_get_any(reason, ["data", :data]) || %{}
 
     details =
-      if is_map(data), do: map_get_any(data, ["details", :details]) || "", else: to_string(data)
+      if is_map(data) do
+        [map_get_any(data, ["message", :message]), map_get_any(data, ["details", :details])]
+        |> Enum.reject(&(&1 in [nil, ""]))
+        |> Enum.join(" ")
+      else
+        to_string(data)
+      end
 
     String.trim("#{message} #{details}")
   end
