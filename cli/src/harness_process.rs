@@ -185,11 +185,18 @@ pub fn print_boot_identity() -> Result<(), String> {
 }
 
 pub fn group(args: &[String]) -> Result<i32, String> {
-    if args.len() != 4 {
+    if args.len() != 4 && args.len() != 5 {
         return Err(
-            "usage: tightbeam harness-group <process-group-id> <identity-path> <boot-identity> <launch-id>"
+            "usage: tightbeam harness-group <process-group-id> <identity-path> <boot-identity> <launch-id> [authority-version]"
                 .into(),
         );
+    }
+
+    if args
+        .get(4)
+        .is_some_and(|version| version != IDENTITY_AUTHORITY_VERSION)
+    {
+        return Err("harness authority protocol version is not supported".into());
     }
 
     let pgid: libc::pid_t = args[0]
@@ -1311,6 +1318,33 @@ mod tests {
                 "wrong-launch".into()
             ]),
             Err("harness boot identity does not match the current boot".into())
+        );
+
+        assert_eq!(
+            group(&[
+                pgid.to_string(),
+                "/identity/path/that/does/not/exist".into(),
+                "wrong-boot".into(),
+                "wrong-launch".into(),
+                IDENTITY_AUTHORITY_VERSION.into(),
+            ]),
+            Err("harness boot identity does not match the current boot".into())
+        );
+    }
+
+    #[test]
+    fn group_refuses_an_unknown_authority_protocol_before_loading_identity() {
+        let pgid = unsafe { libc::getpgrp() };
+
+        assert_eq!(
+            group(&[
+                pgid.to_string(),
+                "/identity/path/that/does/not/exist".into(),
+                "wrong-boot".into(),
+                "wrong-launch".into(),
+                "tightbeam-harness-identity-unknown".into(),
+            ]),
+            Err("harness authority protocol version is not supported".into())
         );
     }
 

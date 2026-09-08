@@ -1,4 +1,5 @@
 defmodule Tightbeam.HarnessProcess do
+  @identity_authority_version "tightbeam-harness-identity-v2"
   @moduledoc """
   Durable identity and lifecycle for OS harness processes.
 
@@ -675,7 +676,8 @@ defmodule Tightbeam.HarnessProcess do
       Integer.to_string(row.process_group_id),
       row.identity_path,
       row.boot_identity,
-      row.identity_token
+      row.identity_token,
+      @identity_authority_version
     ]
   end
 

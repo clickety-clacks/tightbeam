@@ -276,6 +276,61 @@ defmodule Tightbeam.HarnessProcessTest do
     assert captured.identity_token == launch_id
   end
 
+  test "new coordinator cannot dispatch an authority-less record to a legacy helper", ctx do
+    marker = Path.join(ctx.test_dir, "legacy-harness-group-entered")
+    legacy_helper = Path.join(ctx.test_dir, "legacy-helper")
+
+    File.write!(
+      legacy_helper,
+      """
+      #!/bin/sh
+      if [ "$1" = "boot-identity" ]; then
+        echo boot-marker
+        exit 0
+      fi
+      if [ "$1" = "harness-group" ]; then
+        # The legacy binary requires the command plus exactly four arguments.
+        # It reaches numeric killpg only after this argument-count gate.
+        [ "$#" -eq 5 ] || exit 64
+        touch "#{marker}"
+        exit 0
+      fi
+      exit 64
+      """
+    )
+
+    File.chmod!(legacy_helper, 0o755)
+    key = {:claude, "shared", "legacy-helper-skew"}
+
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: ["unused"],
+          process_identity_dir: ctx.test_dir,
+          process_helper: legacy_helper
+        ],
+        ctx.db,
+        key
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+    [row] = HarnessProcess.list(ctx.db)
+    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
+
+    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
+    refute File.exists?(row.identity_path <> ".authority")
+
+    assert {:error, {:kill_failed, {:sigkill_not_delivered, 64, ""}}} =
+             HarnessProcess.reconcile_key(ctx.db, key)
+
+    refute File.exists?(marker), "legacy helper reached its numeric group-signal body"
+
+    assert [%{state: "kill_failed", resolved_at: nil, kill_sent_at: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    assert HarnessProcess.fenced?(ctx.db, key)
+  end
+
   # The adapter boot path captures identity with `:infinity` — an unbounded wait
   # is the whole point of the no-duration backstop. Computing a deadline from it
   # raised ArithmeticError, so EVERY adapter boot died before the `:infinity`
