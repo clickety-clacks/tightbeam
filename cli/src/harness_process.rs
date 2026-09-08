@@ -404,18 +404,28 @@ fn freeze_harness_tree(target: &HarnessTarget) -> Result<Option<Sweep>, String> 
         LeaderFreeze::Ready => {}
     }
 
+    if freeze_tree_until_stable(target, &mut sweep, deadline)? {
+        sweep
+            .failures
+            .push("harness tree freeze did not prove complete before kill".into());
+    }
+    Ok(Some(sweep))
+}
+
+fn freeze_tree_until_stable(
+    target: &HarnessTarget,
+    sweep: &mut Sweep,
+    deadline: Instant,
+) -> Result<bool, String> {
     for _ in 0..FREEZE_ROUNDS {
-        if !freeze_tree_round(target, &mut sweep, deadline)? {
-            return Ok(Some(sweep));
+        if !freeze_tree_round(target, sweep, deadline)? {
+            return Ok(false);
         }
         if Instant::now() >= deadline {
             break;
         }
     }
-    sweep
-        .failures
-        .push("harness tree freeze did not prove complete before kill".into());
-    Ok(Some(sweep))
+    Ok(true)
 }
 
 fn capture_sweep_leader(target: &HarnessTarget) -> Result<Option<BoundProcess>, String> {
