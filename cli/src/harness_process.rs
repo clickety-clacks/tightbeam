@@ -17,8 +17,11 @@ use std::os::darwin::fs::MetadataExt as DarwinMetadataExt;
 use std::os::unix::fs::MetadataExt as UnixMetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const IDENTITY_AUTHORITY_VERSION: &str = "tightbeam-harness-identity-v2";
+const IDENTITY_AUTHORITY_SUFFIX: &str = ".authority";
 
 pub fn session_exec(args: &[String]) -> Result<i32, String> {
     let separator = args.iter().position(|arg| arg == "--").ok_or_else(|| {
@@ -79,19 +82,53 @@ pub fn session_exec(args: &[String]) -> Result<i32, String> {
     let leader_start_time = read_process_start_time(pid)
         .map_err(|error| format!("harness session leader start time could not be read: {error}"))?;
 
-    writeln!(
-        identity,
-        "{pid}\t{pgid}\t{}\t{}\t{boot_identity}\t{launch_id}",
-        leader_start_time.seconds, leader_start_time.microseconds
-    )
-    .and_then(|_| identity.sync_all())
-    .map_err(|error| format!("harness identity could not be written: {error}"))?;
+    write_identity_authority(
+        identity_path,
+        pid,
+        pgid,
+        leader_start_time,
+        &boot_identity,
+        launch_id,
+    )?;
+    writeln!(identity, "{pid}\t{pgid}\t{boot_identity}\t{launch_id}")
+        .and_then(|_| identity.sync_all())
+        .map_err(|error| format!("harness identity could not be written: {error}"))?;
 
     let error = Command::new(&args[separator + 1])
         .args(&args[separator + 2..])
         .exec();
 
     Err(format!("harness command could not be executed: {error}"))
+}
+
+fn identity_authority_path(identity_path: &Path) -> PathBuf {
+    let mut path = identity_path.as_os_str().to_owned();
+    path.push(IDENTITY_AUTHORITY_SUFFIX);
+    PathBuf::from(path)
+}
+
+fn write_identity_authority(
+    identity_path: &Path,
+    pid: libc::pid_t,
+    pgid: libc::pid_t,
+    start_time: ProcessStartTime,
+    boot_identity: &str,
+    launch_id: &str,
+) -> Result<(), String> {
+    let path = identity_authority_path(identity_path);
+    let mut authority = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("harness identity authority could not be opened: {error}"))?;
+    writeln!(
+        authority,
+        "{IDENTITY_AUTHORITY_VERSION}\t{pid}\t{pgid}\t{}\t{}\t{boot_identity}\t{launch_id}",
+        start_time.seconds, start_time.microseconds
+    )
+    .and_then(|_| authority.sync_all())
+    .map_err(|error| format!("harness identity authority could not be written: {error}"))
 }
 
 fn wait_for_session_child(child: libc::pid_t) -> Result<i32, String> {
@@ -1097,25 +1134,98 @@ fn authorize_group_signal(
         .read_to_string(&mut recorded)
         .map_err(|error| format!("harness identity could not be read: {error}"))?;
     let fields = recorded.trim_end().split('\t').collect::<Vec<_>>();
-    if fields.len() != 6
-        || fields[0] != pgid.to_string()
-        || fields[1] != pgid.to_string()
-        || fields[4] != expected_boot_identity
-        || fields[5] != launch_id
-    {
-        return Err("harness identity does not match the requested process group".into());
+    match fields.as_slice() {
+        [pid, group, seconds, microseconds, boot, launch]
+            if identity_matches(
+                pid,
+                group,
+                boot,
+                launch,
+                pgid,
+                expected_boot_identity,
+                launch_id,
+            ) =>
+        {
+            parse_start_time(seconds, microseconds)
+        }
+        [pid, group, boot, launch]
+            if identity_matches(
+                pid,
+                group,
+                boot,
+                launch,
+                pgid,
+                expected_boot_identity,
+                launch_id,
+            ) =>
+        {
+            read_identity_authority(path, pgid, expected_boot_identity, launch_id)
+        }
+        _ => Err("harness identity does not match the requested process group".into()),
     }
+}
 
-    let seconds = fields[2]
+fn identity_matches(
+    pid: &str,
+    group: &str,
+    boot_identity: &str,
+    launch: &str,
+    pgid: libc::pid_t,
+    expected_boot_identity: &str,
+    launch_id: &str,
+) -> bool {
+    pid == pgid.to_string()
+        && group == pgid.to_string()
+        && boot_identity == expected_boot_identity
+        && launch == launch_id
+}
+
+fn parse_start_time(seconds: &str, microseconds: &str) -> Result<ProcessStartTime, String> {
+    let seconds = seconds
         .parse::<libc::time_t>()
         .map_err(|_| "harness identity carries an invalid leader start time".to_string())?;
-    let microseconds = fields[3]
+    let microseconds = microseconds
         .parse::<i32>()
         .map_err(|_| "harness identity carries an invalid leader start time".to_string())?;
     Ok(ProcessStartTime {
         seconds,
         microseconds,
     })
+}
+
+fn read_identity_authority(
+    identity_path: &Path,
+    pgid: libc::pid_t,
+    expected_boot_identity: &str,
+    launch_id: &str,
+) -> Result<ProcessStartTime, String> {
+    let path = identity_authority_path(identity_path);
+    let mut authority = OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .map_err(|error| format!("harness identity authority could not be opened: {error}"))?;
+    let mut recorded = String::new();
+    authority
+        .read_to_string(&mut recorded)
+        .map_err(|error| format!("harness identity authority could not be read: {error}"))?;
+    let fields = recorded.trim_end().split('\t').collect::<Vec<_>>();
+    match fields.as_slice() {
+        [version, pid, group, seconds, microseconds, boot, launch]
+            if *version == IDENTITY_AUTHORITY_VERSION
+                && identity_matches(
+                    pid,
+                    group,
+                    boot,
+                    launch,
+                    pgid,
+                    expected_boot_identity,
+                    launch_id,
+                ) =>
+        {
+            parse_start_time(seconds, microseconds)
+        }
+        _ => Err("harness identity authority does not match the requested process group".into()),
+    }
 }
 
 #[cfg(test)]
@@ -1212,5 +1322,81 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "target identity");
         fs::remove_file(path).unwrap();
         fs::remove_file(target).unwrap();
+    }
+
+    #[test]
+    fn session_exec_publishes_a_legacy_body_with_versioned_authority() {
+        let path = test_path("compatible-identity");
+        let launch = "compatible-launch";
+
+        assert_eq!(
+            session_exec(&[
+                path.to_string_lossy().into_owned(),
+                launch.into(),
+                "--".into(),
+                "/bin/true".into(),
+            ]),
+            Ok(0)
+        );
+
+        let body = fs::read_to_string(&path).unwrap();
+        let fields = body.trim_end().split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 4, "old coordinators require four fields");
+        assert_eq!(fields[0], fields[1]);
+        assert_eq!(fields[3], launch);
+
+        let authority_path = identity_authority_path(&path);
+        let authority = fs::read_to_string(&authority_path).unwrap();
+        let authority_fields = authority.trim_end().split('\t').collect::<Vec<_>>();
+        assert_eq!(authority_fields.len(), 7);
+        assert_eq!(authority_fields[0], IDENTITY_AUTHORITY_VERSION);
+        assert_eq!(authority_fields[1], fields[0]);
+        assert_eq!(authority_fields[2], fields[1]);
+        assert_eq!(authority_fields[5], fields[2]);
+        assert_eq!(authority_fields[6], fields[3]);
+
+        fs::remove_file(authority_path).unwrap();
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn four_field_identity_without_versioned_authority_refuses() {
+        let path = test_path("legacy-without-authority");
+        let pgid = unsafe { libc::getpgrp() };
+        let boot = boot_identity().unwrap();
+        let launch = "legacy-without-authority";
+        fs::write(&path, format!("{pgid}\t{pgid}\t{boot}\t{launch}\n")).unwrap();
+
+        let error = authorize_group_signal(&path, pgid, &boot, launch).unwrap_err();
+        assert!(
+            error.starts_with("harness identity authority could not be opened:"),
+            "{error}"
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn historical_six_field_identity_still_authorizes() {
+        let path = test_path("historical-six-field");
+        let pgid = unsafe { libc::getpgrp() };
+        let start = read_process_start_time(pgid).unwrap();
+        let boot = boot_identity().unwrap();
+        let launch = "historical-six-field";
+        fs::write(
+            &path,
+            format!(
+                "{pgid}\t{pgid}\t{}\t{}\t{boot}\t{launch}\n",
+                start.seconds, start.microseconds
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            authorize_group_signal(&path, pgid, &boot, launch),
+            Ok(start)
+        );
+
+        fs::remove_file(path).unwrap();
     }
 }

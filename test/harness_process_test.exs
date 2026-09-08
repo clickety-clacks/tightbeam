@@ -167,6 +167,7 @@ defmodule Tightbeam.HarnessProcessTest do
 
     assert is_integer(resolved_at)
     refute File.exists?(identity_path)
+    refute File.exists?(identity_path <> ".authority")
   end
 
   test "boot reconciliation kills a recorded orphan without a live monitor", ctx do
@@ -176,6 +177,7 @@ defmodule Tightbeam.HarnessProcessTest do
     assert :ok = HarnessProcess.reconcile(ctx.db)
     assert [%{state: "killed"}] = HarnessProcess.list(ctx.db)
     refute File.exists?(row.identity_path)
+    refute File.exists?(row.identity_path <> ".authority")
   end
 
   test "remote launch wraps the harness with the same session helper", ctx do
@@ -246,6 +248,32 @@ defmodule Tightbeam.HarnessProcessTest do
     [resolved] = HarnessProcess.list(ctx.db)
     assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
     assert HarnessProcess.list(ctx.db) == [resolved]
+  end
+
+  test "identity capture accepts an unresolved legacy four-field record", ctx do
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: ["unused"],
+          home: ctx.test_dir,
+          stderr_path: Path.join(ctx.test_dir, "legacy-four-field.stderr"),
+          process_identity_dir: ctx.test_dir,
+          process_helper: @helper
+        ],
+        ctx.db,
+        {:claude, "shared", "legacy-four-field"}
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+    [row] = HarnessProcess.list(ctx.db)
+    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
+
+    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
+    [captured] = HarnessProcess.list(ctx.db)
+    assert captured.os_pid == 999_999_123
+    assert captured.process_group_id == 999_999_123
+    assert captured.boot_identity == "boot-marker"
+    assert captured.identity_token == launch_id
   end
 
   # The adapter boot path captures identity with `:infinity` — an unbounded wait

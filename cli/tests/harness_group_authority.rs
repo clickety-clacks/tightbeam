@@ -28,7 +28,7 @@ fn same_group_caller_is_not_frozen_by_the_initial_stop() {
         &dir,
         "leader.sh",
         &format!(
-            "/bin/sleep 400 &\necho $! > {child}\nIFS='\t' read pid pgid seconds micros boot launch < {identity}\nexec {binary} harness-group \"$pgid\" {identity} \"$boot\" leader-launch\n",
+            "/bin/sleep 400 &\necho $! > {child}\nIFS='\t' read pid pgid boot launch < {identity}\nexec {binary} harness-group \"$pgid\" {identity} \"$boot\" leader-launch\n",
             child = child_path.display(),
             identity = identity_path.display(),
         ),
@@ -179,15 +179,7 @@ fn await_identity(path: &std::path::Path) -> Identity {
     while Instant::now() < deadline {
         if let Ok(text) = fs::read_to_string(path) {
             let fields: Vec<&str> = text.trim_end().split('\t').collect();
-            if let [
-                pid,
-                pgid,
-                _start_seconds,
-                _start_microseconds,
-                boot,
-                _launch,
-            ] = fields[..]
-            {
+            if let [pid, pgid, boot, _launch] = fields[..] {
                 if let (Ok(pid), Ok(pgid)) = (pid.parse(), pgid.parse()) {
                     return Identity {
                         path: path.to_string_lossy().into_owned(),

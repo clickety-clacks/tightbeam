@@ -149,22 +149,14 @@ fn script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
     path
 }
 
-/// The launcher writes `pid\tpgid\tstart-sec\tstart-usec\tboot\tlaunch` and syncs it, so a complete line is the
-/// arrival signal. A partial read is retried rather than parsed.
+/// The launcher writes its legacy-compatible four-field body only after the versioned
+/// authority companion is durable, so a complete body is the arrival signal.
 fn await_identity(path: &std::path::Path) -> Identity {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
         if let Ok(text) = fs::read_to_string(path) {
             let fields: Vec<&str> = text.trim_end().split('\t').collect();
-            if let [
-                pid,
-                pgid,
-                _start_seconds,
-                _start_microseconds,
-                boot,
-                _launch,
-            ] = fields[..]
-            {
+            if let [pid, pgid, boot, _launch] = fields[..] {
                 if let (Ok(pid), Ok(pgid)) = (pid.parse(), pgid.parse()) {
                     return Identity {
                         path: path.to_string_lossy().into_owned(),
