@@ -23,14 +23,14 @@ retire-your-hires — is in the operating manual every session carries; this ski
 the dispatcher's deeper ceremony.)
 
 Holding an assignment: every turn must leave a valid durable liveness
-receipt or a scheduled continuation wake. Create a reporting attest or
+receipt or an admitted obligation-scoped continuation. Create a reporting attest or
 reporting wake only for a new material result or evidence, an exact new
 blocker or refusal, a bounded decision request, or one new, unexpired
 bounded checkpoint. The checkpoint names the next action or condition
 and its deadline or scheduled continuation.
 
-A continuation wake is a liveness receipt, not a status report. It names
-concrete continuation work or a dependency recheck and when it resumes.
+For unfinished work, follow the operating manual’s obligation-scoped continuation
+pattern. An ordinary notification does not cover an assignment or pause effort.
 Do not file "still working," "unchanged," "waiting," or "no update."
 Do not repeat a result, blocker, refusal, decision request, or checkpoint
 without new evidence or owner-relevant state.
@@ -40,10 +40,11 @@ moved: the row, commit or artifact, not an assertion of effort. A receipt with n
 evidence in it is not a receipt.
 
 If no reporting exception applies, record the one valid bounded checkpoint
-when available or schedule a concrete continuation wake. Never manufacture
+when available or register a continuation under that manual pattern. Never manufacture
 a generic progress attest. Completion and surrender remain truthful terminal
-receipts. A qualifying progress row resets the prod countdown; scheduled
-wakes pause it; words do neither. If you stall, prods arrive from
+receipts. A qualifying progress row resets the prod countdown; ordinary
+notifications do not cover the obligation. Admitted continuations cover only their
+named obligation; words alone grant no credit. If you stall, prods arrive from
 process:tightbeam and escalate up your spawner chain after N misses.
 
 Retiring: your hires are yours to clean up. When a hire's last open

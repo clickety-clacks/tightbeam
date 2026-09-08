@@ -1,6 +1,42 @@
 defmodule Tightbeam.LateRulingHandoffTest do
   use Tightbeam.TestCase, async: false
 
+  defp marker_waits(db, same_session, other_session, kind, scope) do
+    for session_key <- [same_session, other_session] do
+      Tightbeam.Wakes.schedule(db, %{
+        session_key: session_key,
+        origin: "session:" <> session_key,
+        prompt: "Recognize only this tenant's marker.",
+        due_at: System.system_time(:millisecond) + 3_600_000,
+        condition_kind: kind,
+        condition_scope: scope
+      })
+    end
+  end
+
+  defp assert_marker_recognition(ctx, [same, other], kind, scope) do
+    assert {:ok, [[fact_id, "flynn"]]} =
+             Tightbeam.DB.query(
+               ctx.db,
+               "SELECT id,ownerUserId FROM condition_facts WHERE kind=?1 AND scope=?2 AND origin='process:tightbeam'",
+               [kind, scope]
+             )
+
+    assert :ok = Tightbeam.Wakes.fire_matching(ctx.scheduler, fact_id)
+    assert Tightbeam.Wakes.get(ctx.db, same.wake_id).state == "fired"
+    assert Tightbeam.Wakes.get(ctx.db, other.wake_id).state == "pending"
+
+    assert {:ok, [[1]]} =
+             Tightbeam.DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [
+               same.wake_id
+             ])
+
+    assert {:ok, [[0]]} =
+             Tightbeam.DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [
+               other.wake_id
+             ])
+  end
+
   alias Tightbeam.{Assignments, ConnRegistry, DB, Escalation, Model, Org, Wakes, WorkItems}
 
   @incident_request_id "dr_07bdef13-45ae-435f-bc79-b2dc6b0a5ebf"
@@ -107,6 +143,27 @@ defmodule Tightbeam.LateRulingHandoffTest do
                @incident_request_id
              ])
 
+    insert_user!(ctx.db, "other-owner")
+    other = session(ctx.db, "agent:other-tenant:test", "other-owner")
+
+    late_waits =
+      marker_waits(
+        ctx.db,
+        ctx.opener.session_key,
+        other.session_key,
+        "operator-ruling-late-routed",
+        @incident_request_id
+      )
+
+    successor_waits =
+      marker_waits(
+        ctx.db,
+        ctx.opener.session_key,
+        other.session_key,
+        "assignment-successor-created",
+        nil
+      )
+
     assert %{id: @incident_request_id, status: "ruled"} =
              Escalation.operator_rule(
                ctx.db,
@@ -126,6 +183,13 @@ defmodule Tightbeam.LateRulingHandoffTest do
                "SELECT COUNT(*) FROM condition_facts WHERE kind='operator-ruling-late-routed' AND scope=?1 AND origin='process:tightbeam'",
                [@incident_request_id]
              )
+
+    assert_marker_recognition(
+      ctx,
+      late_waits,
+      "operator-ruling-late-routed",
+      @incident_request_id
+    )
 
     assert {:ok, [[session_key]]} =
              DB.query(
@@ -165,6 +229,13 @@ defmodule Tightbeam.LateRulingHandoffTest do
                "SELECT COUNT(*) FROM condition_facts WHERE kind='assignment-successor-created' AND scope=?1 AND origin='process:tightbeam'",
                [replacement.id]
              )
+
+    assert_marker_recognition(
+      ctx,
+      successor_waits,
+      "assignment-successor-created",
+      replacement.id
+    )
 
     replayed_assignment =
       assign(
@@ -215,6 +286,9 @@ defmodule Tightbeam.LateRulingHandoffTest do
 
     assert %{attest: replayed_receipt} = Assignments.__handle__(ctx.db, "attest", receipt_call)
     assert replayed_receipt.id == first_receipt.id
+    assert replayed_receipt.artifactId == first_receipt.artifactId
+    assert replayed_receipt.contentSha256 == first_receipt.contentSha256
+    assert replayed_receipt.waitId == first_receipt.waitId
 
     assert {:ok, [[1]]} =
              DB.query(

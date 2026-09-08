@@ -131,6 +131,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             at,
             condition_kind,
             condition_scope,
+            predicate,
+            assignment_id,
+            after_turn,
             idempotency_key,
             class,
         } => {
@@ -145,6 +148,18 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = at {
                 params.push(format!("\"at\":{value}"));
+            }
+            if let Some(value) = predicate {
+                params.push(format!(
+                    "\"predicate\":{}",
+                    serde_json::to_string(value).expect("predicate is JSON serializable")
+                ));
+            }
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignmentId", value));
+            }
+            if *after_turn {
+                params.push("\"afterTurn\":true".to_owned());
             }
             for (name, value) in [
                 ("conditionKind", condition_kind),
@@ -180,6 +195,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             description,
             work_item_id,
             content_sha256,
+            produced_by_assignment_id,
         } => {
             let mut params = vec![
                 string_field("kind", kind),
@@ -190,6 +206,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("description", description),
                 ("workItemId", work_item_id),
                 ("contentSha256", content_sha256),
+                ("producedByAssignmentId", produced_by_assignment_id),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -750,6 +767,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             verdict,
             note,
             commit_refs,
+            artifact_id,
+            content_sha256,
+            wait_id,
         } => {
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
@@ -766,6 +786,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     "\"commitRefs\":{}",
                     serde_json::to_string(value).expect("commit refs are JSON serializable")
                 ));
+            }
+            if let Some(value) = artifact_id {
+                params.push(string_field("artifactId", value));
+            }
+            if let Some(value) = content_sha256 {
+                params.push(string_field("contentSha256", value));
+            }
+            if let Some(value) = wait_id {
+                params.push(string_field("waitId", value));
             }
             Ok(request(identity, "attest", vec![], params))
         }
@@ -1991,6 +2020,46 @@ mod tests {
         assert_eq!(
             body(&["condition", "--kind", "review-landed", "--as", "reviewer",]),
             r#"{"as":"reviewer","verb":"condition","params":{"kind":"review-landed"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_structured_wait_and_wait_verdict_bodies() {
+        let predicate = r#"{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"bindings":{"assignmentId":"asg_r"},"resolverRef":{"kind":"assignment","id":"asg_r"},"necessity":"needs output","verificationRef":{"kind":"assignment","id":"asg_v"}}"#;
+
+        assert_eq!(
+            body(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--predicate",
+                predicate,
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "continue",
+                "--as",
+                "holder",
+            ]),
+            r#"{"as":"holder","verb":"wake","sessionKey":"agent:holder","params":{"prompt":"continue","afterMs":7200000,"predicate":{"bindings":{"assignmentId":"asg_r"},"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"necessity":"needs output","resolverRef":{"id":"asg_r","kind":"assignment"},"verificationRef":{"id":"asg_v","kind":"assignment"}},"assignmentId":"asg_a"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_v",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "wait-verified",
+                "--wait",
+                "w_1",
+                "--as",
+                "verifier",
+            ]),
+            r#"{"as":"verifier","verb":"attest","params":{"assignmentId":"asg_v","kind":"verdict","verdictKind":"wait-verified","waitId":"w_1"}}"#
         );
     }
 

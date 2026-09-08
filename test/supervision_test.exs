@@ -147,7 +147,7 @@ defmodule Tightbeam.SupervisionTest do
     names = Enum.map(columns, &Enum.at(&1, 1))
 
     assert names ==
-             ~w(sessionKey lastEvaluatedTerminal pendingBranch pendingAssignment pendingK pendingN)
+             ~w(sessionKey assignmentId lastEvaluatedTerminal pendingBranch pendingAssignment pendingK pendingN)
 
     refute "pendingTarget" in names
   end
@@ -788,6 +788,62 @@ defmodule Tightbeam.SupervisionTest do
 
     assert {:ok, []} =
              DB.query(ctx.db, "SELECT 1 FROM supervision_entitlements WHERE assignmentId='asg_1'")
+  end
+
+  test "Gateway parent retirement rearms an active holder with the supervision override", ctx do
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    # An inactive intermediate ancestor is skipped by lineage resolution and by
+    # the active-subtree retirement walk, leaving the holder available to rearm.
+    session(ctx.db, "retired_bridge", "supervisor")
+    Org.retire(ctx.db, "retired_bridge", "user:flynn", 1_000)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET spawnedBy='retired_bridge' WHERE sessionKey='holder'")
+
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 1_234)
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 10, supervision_interval_ms: 4_321})
+
+    assert {:ok, [[0, 1_234]]} =
+             DB.query(
+               ctx.db,
+               "SELECT dueAt, supervisionIntervalMs FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
+
+    assert {:escalated, 1, "supervisor"} =
+             Supervision.evaluate(ctx.db, handlers, 0, "holder", terminal_seq)
+
+    assert [escalation] = Wakes.list_pending(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, escalation)
+
+    assert %{supervisionState: "parent_elevated", supervisionTransferSessionKey: "supervisor"} =
+             Supervision.prod_state(ctx.db, "asg_1")
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT dueAt FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
+
+    result = handlers["retire"].(%{origin: "user:flynn", session_key: "supervisor", params: %{}})
+    assert result.retired_session_keys == ["supervisor"]
+    assert Org.get(ctx.db, "holder").state == "active"
+    assert {:ok, [["open"]]} = DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_1'")
+
+    assert {:ok, [["parent_retirement", "parent_target_retired", 4_321, due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT basisKind, cause, supervisionIntervalMs, dueAt FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
+
+    assert {:ok, [["child_rearm", epoch]]} =
+             DB.query(
+               ctx.db,
+               "SELECT retirementOutcomeKind, retirementEpoch FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [escalation.wake_id]
+             )
+
+    assert due_at == epoch + 4_321
   end
 
   test "startup uses the newest valid parent transfer when history has earlier transfers", ctx do
@@ -1922,8 +1978,8 @@ defmodule Tightbeam.SupervisionTest do
 
     expected_prod =
       "[from process:tightbeam]\n\n" <>
-        "Your turn ended with no filing and no continuation scheduled for assignment asg_1 — \"ship it\". " <>
-        "File completion, schedule your continuation, or file surrender. This is prod 1 of 3; " <>
+        "Your turn ended with no qualifying receipt or admitted continuation covering assignment asg_1 — \"ship it\". " <>
+        "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or surrender. This is prod 1 of 3; " <>
         "a reply without a row escalates to your spawner."
 
     assert {:ok, [[^expected_prod]]} =
@@ -2021,7 +2077,7 @@ defmodule Tightbeam.SupervisionTest do
     expected_escalation =
       "[from process:tightbeam]\n\n" <>
         "Assignment asg_escalation — \"investigate\" — held by escalating-holder is stalled: " <>
-        "0 prods produced no filing and no continuation. This is escalation 1 for this assignment. " <>
+        "0 prods produced no qualifying receipt and no admitted continuation covering it. This is escalation 1 for this assignment. " <>
         "Why, and what happens next, is your judgment — the substrate only reports the rows."
 
     assert {:ok, [[^expected_escalation]]} =

@@ -350,7 +350,8 @@ defmodule Tightbeam.VerificationPapertrailTest do
              "implementation-requires-posture",
              "implementation-dispatch-requires-posture",
              @verification_rule,
-             @artifact_rule
+             @artifact_rule,
+             "wake-obligation-registration-authority"
            ]
 
     # F1/F2 accept the shipped pair: the verdict gate is remedy-covered, and the

@@ -54,14 +54,19 @@ defmodule Tightbeam.Supervision do
 
   @watermarks_ddl """
   CREATE TABLE IF NOT EXISTS supervision_watermarks (
-    sessionKey TEXT PRIMARY KEY,
+    sessionKey TEXT NOT NULL,
+    assignmentId TEXT NOT NULL DEFAULT '',
     lastEvaluatedTerminal INTEGER NOT NULL,
     pendingBranch TEXT CHECK (pendingBranch IN ('prod','escalation','terminus')),
     pendingAssignment TEXT,
     pendingK INTEGER NULL,
-    pendingN INTEGER NULL
+    pendingN INTEGER NULL,
+    PRIMARY KEY (sessionKey, assignmentId)
   )
   """
+
+  @doc false
+  def watermarks_ddl, do: @watermarks_ddl
 
   @failure_patrol_ddl """
   CREATE TABLE IF NOT EXISTS patrol_failure_boundary (
@@ -1183,7 +1188,7 @@ defmodule Tightbeam.Supervision do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN FROM supervision_watermarks WHERE sessionKey = ?1",
+        "SELECT sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN FROM supervision_watermarks WHERE sessionKey = ?1 ORDER BY pendingBranch IS NULL, lastEvaluatedTerminal DESC, assignmentId LIMIT 1",
         [session_key]
       )
 
@@ -1311,23 +1316,58 @@ defmodule Tightbeam.Supervision do
   @spec prod_production_matches?(DB.server(), String.t(), integer() | nil) ::
           {:match, map()} | {:no_match, atom()} | {:no_match, atom(), map()}
   def prod_production_matches?(db, session_key, terminal_seq) do
-    case oldest_supervised_assignment(db, session_key) ||
-           Assignments.oldest_open(db, session_key) do
-      nil ->
-        {:no_match, :no_open_obligation}
+    selection =
+      transaction!(db, fn txn ->
+        candidates =
+          Txn.q(
+            txn,
+            """
+            SELECT a.id,a.subject,a.holderKey,p.lastEvaluatedTerminal
+            FROM assignments a LEFT JOIN supervision_watermarks p
+              ON p.assignmentId=a.id AND p.sessionKey=a.holderKey
+            WHERE a.holderKey=?1 AND a.state='open' ORDER BY a.openedAt,a.id
+            """,
+            [session_key]
+          )
 
-      assignment ->
-        with :new <- dedupe(watermark(db, session_key), terminal_seq),
-             :quiet <- turn_gate(db, session_key),
-             :live <- holder_state(db, session_key),
+        assignment =
+          Enum.find_value(candidates, fn [id, subject, holder, prior] ->
+            if (is_nil(terminal_seq) or is_nil(prior) or prior < terminal_seq) and
+                 not Wakes.covering_continuation_in_txn?(txn, id),
+               do: %{id: id, subject: subject, holderKey: holder}
+          end)
+
+        cond do
+          assignment ->
+            {:assignment, assignment}
+
+          candidates == [] ->
+            {:no_match, :no_open_obligation}
+
+          Enum.any?(candidates, fn [id, _, _, _] ->
+            Wakes.covering_continuation_in_txn?(txn, id)
+          end) ->
+            {:no_match, :strand_moving}
+
+          Enum.any?(candidates, fn [_, _, _, prior] -> prior == terminal_seq end) ->
+            {:no_match, :terminal_already_evaluated}
+
+          true ->
+            {:no_match, :terminal_coalesced}
+        end
+      end)
+
+    case selection do
+      {:no_match, _} = verdict ->
+        verdict
+
+      {:assignment, assignment} ->
+        with :live <- holder_state(db, session_key),
              :available <- harness_gate(db, session_key),
              :evaluable <- terminal_gate(terminal_seq),
              :unblocked <- block_gate(db, session_key) do
           {:match, assignment}
         else
-          :duplicate -> {:no_match, :terminal_already_evaluated}
-          :coalesced -> {:no_match, :terminal_coalesced}
-          :moving -> {:no_match, :strand_moving}
           :retired -> {:no_match, :holder_retired}
           :no_terminal -> {:no_match, :no_terminal, assignment}
           :unavailable -> {:no_match, :harness_unavailable, assignment}
@@ -1335,27 +1375,6 @@ defmodule Tightbeam.Supervision do
         end
     end
   end
-
-  defp oldest_supervised_assignment(db, session_key) do
-    case query(
-           db,
-           """
-           SELECT a.id, a.subject, a.holderKey
-           FROM assignments a
-           JOIN supervision_entitlements e ON e.assignmentId=a.id
-           WHERE a.holderKey=?1 AND a.state='open' AND e.state IN ('armed','claimed')
-           ORDER BY a.openedAt, a.id
-           LIMIT 1
-           """,
-           [session_key]
-         ) do
-      [[id, subject, holder]] -> %{id: id, subject: subject, holderKey: holder}
-      [] -> nil
-    end
-  end
-
-  defp turn_gate(db, session_key),
-    do: if(Ledger.pending_count(db, session_key) == 0, do: :quiet, else: :moving)
 
   defp terminal_gate(nil), do: :no_terminal
   defp terminal_gate(_terminal_seq), do: :evaluable
@@ -1624,7 +1643,7 @@ defmodule Tightbeam.Supervision do
         {:remedy, statute, ref, _error} ->
           RailRemedy.fire(db, handlers, statute, ref, call)
           rail_sweep_lifecycle(db, session_key, ref, statute.name, "run-remedy")
-          write_watermark(db, session_key, terminal_seq)
+          write_watermark(db, session_key, terminal_seq, assignment.id)
           {:acted, :rail_remedy}
 
         {:escalate, statute, ctx, dr_id} ->
@@ -1650,7 +1669,7 @@ defmodule Tightbeam.Supervision do
                 "escalate-park"
               )
 
-              write_watermark(db, session_key, terminal_seq)
+              write_watermark(db, session_key, terminal_seq, assignment.id)
               {:acted, :rail_escalate}
 
             :skipped ->
@@ -1680,6 +1699,9 @@ defmodule Tightbeam.Supervision do
   # The sweep closes both kinds of episode the verb edge does (§C3.5, §A3).
   defp close_episode(db, {:episodes, statute, position}),
     do: RailEpisodes.recovered(db, statute, position)
+
+  defp close_episode(db, {:notice, rule, call, evidence}),
+    do: Wakes.deliver_rule_notice(db, rule, call, evidence)
 
   defp close_episode(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
@@ -1730,34 +1752,29 @@ defmodule Tightbeam.Supervision do
     best_effort_lifecycle(db, "rail_sweep", session_key, detail)
   end
 
-  defp write_watermark(_db, _session_key, nil), do: :ok
+  defp write_watermark(db, session_key, terminal_seq, assignment_id \\ "")
+  defp write_watermark(_db, _session_key, nil, _assignment_id), do: :ok
 
-  defp write_watermark(db, session_key, terminal_seq) do
+  defp write_watermark(db, session_key, terminal_seq, assignment_id) do
     {:ok, _} =
       DB.query(
         db,
         """
         INSERT INTO supervision_watermarks
-          (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN)
-        VALUES (?1, ?2, NULL, NULL, NULL, NULL)
-        ON CONFLICT(sessionKey) DO UPDATE SET
+          (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN, assignmentId)
+        VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3)
+        ON CONFLICT(sessionKey,assignmentId) DO UPDATE SET
           lastEvaluatedTerminal = excluded.lastEvaluatedTerminal,
           pendingBranch = NULL,
           pendingAssignment = NULL,
           pendingK = NULL,
           pendingN = NULL
         """,
-        [session_key, terminal_seq]
+        [session_key, terminal_seq, assignment_id]
       )
 
     :ok
   end
-
-  defp dedupe(_watermark, nil), do: :new
-  defp dedupe(nil, _terminal), do: :new
-  defp dedupe(%{lastEvaluatedTerminal: terminal}, terminal), do: :duplicate
-  defp dedupe(%{lastEvaluatedTerminal: prior}, terminal) when terminal < prior, do: :coalesced
-  defp dedupe(_watermark, _terminal), do: :new
 
   defp holder_state(db, session_key) do
     case DB.query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [session_key]) do
@@ -1800,15 +1817,15 @@ defmodule Tightbeam.Supervision do
 
             case absorb_liveness_receipts_in_txn(txn, assignment.id, interval) do
               :rebased ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                write_terminal_watermark_in_txn(txn, session_key, terminal_seq, assignment.id)
                 :rebased
 
               :duplicate when state == "claimed" ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                write_terminal_watermark_in_txn(txn, session_key, terminal_seq, assignment.id)
                 :claimed
 
               :duplicate when state == "armed" and due_at > evaluation_clock ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                write_terminal_watermark_in_txn(txn, session_key, terminal_seq, assignment.id)
                 :not_due
 
               :duplicate when state == "armed" ->
@@ -1834,7 +1851,7 @@ defmodule Tightbeam.Supervision do
                 end
 
               :duplicate ->
-                write_terminal_watermark_in_txn(txn, session_key, terminal_seq)
+                write_terminal_watermark_in_txn(txn, session_key, terminal_seq, assignment.id)
                 :duplicate
             end
         end
@@ -1864,19 +1881,19 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp write_terminal_watermark_in_txn(_txn, _session_key, nil), do: :ok
+  defp write_terminal_watermark_in_txn(_txn, _session_key, nil, _assignment_id), do: :ok
 
-  defp write_terminal_watermark_in_txn(txn, session_key, terminal_seq) do
+  defp write_terminal_watermark_in_txn(txn, session_key, terminal_seq, assignment_id) do
     Txn.q(
       txn,
       """
       INSERT INTO supervision_watermarks
-        (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN)
-      VALUES (?1, ?2, NULL, NULL, NULL, NULL)
-      ON CONFLICT(sessionKey) DO UPDATE SET
+        (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN, assignmentId)
+      VALUES (?1, ?2, NULL, NULL, NULL, NULL, ?3)
+      ON CONFLICT(sessionKey,assignmentId) DO UPDATE SET
         lastEvaluatedTerminal=excluded.lastEvaluatedTerminal
       """,
-      [session_key, terminal_seq]
+      [session_key, terminal_seq, assignment_id]
     )
 
     :ok
@@ -1928,13 +1945,15 @@ defmodule Tightbeam.Supervision do
     )
 
     if Txn.changes(txn) == 1 do
+      write_terminal_watermark_in_txn(txn, assignment.holderKey, terminal_seq, assignment.id)
+
       Txn.q(
         txn,
         """
         INSERT INTO supervision_watermarks
-          (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ON CONFLICT(sessionKey) DO UPDATE SET
+          (sessionKey, lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN, assignmentId)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?4)
+        ON CONFLICT(sessionKey,assignmentId) DO UPDATE SET
           lastEvaluatedTerminal=excluded.lastEvaluatedTerminal,
           pendingBranch=excluded.pendingBranch,
           pendingAssignment=excluded.pendingAssignment,
@@ -2445,7 +2464,7 @@ defmodule Tightbeam.Supervision do
        when is_integer(interval) and interval > 0 do
     recovery_clock = now()
 
-    transaction!(state.db, fn txn ->
+    transaction_then!(state.db, fn txn ->
       retired_holders =
         Txn.q(
           txn,
@@ -3134,11 +3153,7 @@ defmodule Tightbeam.Supervision do
       harness_unavailable_in_txn?(txn, holder) ->
         "harness_unavailable"
 
-      Txn.q(
-        txn,
-        "SELECT 1 FROM turns WHERE sessionKey=?1 AND status IN ('queued','running') LIMIT 1",
-        [holder]
-      ) != [] ->
+      Wakes.covering_continuation_in_txn?(txn, assignment_id) ->
         "pending_turn"
 
       Txn.q(
@@ -3305,7 +3320,7 @@ defmodule Tightbeam.Supervision do
     |> Enum.reduce(MapSet.new(), fn session_key, rebased ->
       terminal_seq = Ledger.last_terminal_seq(state.db, session_key)
 
-      if new_terminal?(watermark(state.db, session_key), terminal_seq) do
+      if new_obligation_terminal?(state.db, session_key, terminal_seq) do
         result =
           safe_evaluate(state, session_key, fn ->
             evaluate_with_interval(
@@ -3319,10 +3334,18 @@ defmodule Tightbeam.Supervision do
           end)
 
         if result == :rebased do
-          case oldest_supervised_assignment(state.db, session_key) do
-            %{id: assignment_id} -> MapSet.put(rebased, assignment_id)
-            nil -> rebased
-          end
+          {:ok, rows} =
+            DB.query(
+              state.db,
+              """
+              SELECT p.assignmentId FROM supervision_watermarks p
+              JOIN supervision_entitlements e ON e.assignmentId=p.assignmentId
+              WHERE p.sessionKey=?1 AND p.lastEvaluatedTerminal=?2 AND e.dueAt>?3
+              """,
+              [session_key, terminal_seq, now()]
+            )
+
+          Enum.reduce(rows, rebased, fn [id], acc -> MapSet.put(acc, id) end)
         else
           rebased
         end
@@ -3332,11 +3355,21 @@ defmodule Tightbeam.Supervision do
     end)
   end
 
-  defp new_terminal?(_watermark, nil), do: false
-  defp new_terminal?(nil, _terminal_seq), do: true
+  defp new_obligation_terminal?(_db, _session_key, nil), do: false
 
-  defp new_terminal?(%{lastEvaluatedTerminal: prior}, terminal_seq),
-    do: terminal_seq > prior
+  defp new_obligation_terminal?(db, session_key, terminal_seq) do
+    query(
+      db,
+      """
+      SELECT 1 FROM assignments a LEFT JOIN supervision_watermarks p
+        ON p.assignmentId=a.id AND p.sessionKey=a.holderKey
+      WHERE a.holderKey=?1 AND a.state='open'
+        AND (p.lastEvaluatedTerminal IS NULL OR p.lastEvaluatedTerminal<?2)
+      LIMIT 1
+      """,
+      [session_key, terminal_seq]
+    ) != []
+  end
 
   defp legacy_sweep(state) do
     # Blocked holders are pre-filtered at sweep granularity (review N11): the
@@ -4413,19 +4446,29 @@ defmodule Tightbeam.Supervision do
   end
 
   defp prod_prompt(id, subject, k, n) do
-    "Your turn ended with no filing and no continuation scheduled for assignment #{id} — \"#{subject}\". " <>
-      "File completion, schedule your continuation, or file surrender. This is prod #{k} of #{n}; " <>
+    "Your turn ended with no qualifying receipt or admitted continuation covering assignment #{id} — \"#{subject}\". " <>
+      "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or surrender. This is prod #{k} of #{n}; " <>
       "a reply without a row escalates to your spawner."
   end
 
   defp escalation_prompt(id, subject, holder, n, rung) do
-    "Assignment #{id} — \"#{subject}\" — held by #{holder} is stalled: #{n} prods produced no filing " <>
-      "and no continuation. This is escalation #{rung} for this assignment. Why, and what happens next, " <>
+    "Assignment #{id} — \"#{subject}\" — held by #{holder} is stalled: #{n} prods produced no qualifying receipt " <>
+      "and no admitted continuation covering it. This is escalation #{rung} for this assignment. Why, and what happens next, " <>
       "is your judgment — the substrate only reports the rows."
   end
 
   defp transaction!(db, fun) do
     case DB.transaction(db, fun) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp transaction_then!(db, fun) do
+    case DB.transaction_then(db, fun, fn txn, result ->
+           Tightbeam.Wakes.row_commit_in_txn(txn, [])
+           result
+         end) do
       {:ok, result} -> result
       {:error, error} -> raise error
     end

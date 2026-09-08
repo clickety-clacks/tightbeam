@@ -1949,17 +1949,15 @@ defmodule Tightbeam.ConformanceSupport do
                Escalation.rule(db, escalation_rule_call(request_id, "allow"), authorized: true)
 
       park_wake = Wakes.get(db, park_wake_id)
-      assert {:accepted_in_txn, _event_id, %{canceled: true}} = cancel_wake(db, park_wake)
+      assert %{state: "fired", fired_by: "condition"} = park_wake
 
-      ids =
-        materialize_world(
-          db,
-          %{"turn" => %{"session" => session_key, "seq" => 2, "window_start" => 1}},
-          ids
-        )
+      assert {:ok, %{seq: continuation_seq}} =
+               Ledger.claim_next(db, session_key, "conformance-ruling-wake")
+
+      assert :ok = Ledger.finish(db, continuation_seq, "delivered")
 
       assert {:prodded, 1} =
-               Supervision.evaluate(db, handlers, 3, session_key, ids.turns[session_key])
+               Supervision.evaluate(db, handlers, 3, session_key, continuation_seq)
 
       assert {:ok, [["ruled"]]} =
                DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
@@ -2662,9 +2660,11 @@ defmodule Tightbeam.ConformanceSupport do
 
               cond do
                 fixture["name"] == "busy-or-queued-no-sweep" ->
-                  assert result == :busy
-                  assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
-                  refute lifecycle_kind?(db, "rail_sweep")
+                  # C-R1: this fixture's unscoped queued turn does not cover
+                  # the open obligation. Normal sweep evaluation re-obligates it.
+                  assert result == {:prodded, 1}
+                  assert %{prodCount: 1} = Supervision.prod_state(db, assignment_id)
+                  assert sweep_decision?(db, session_key, rule, "re-obligate")
 
                 self_wake?(db, call) ->
                   assert result == :continuation
@@ -3125,35 +3125,6 @@ defmodule Tightbeam.ConformanceSupport do
   end
 
   defp await_catalog!(_harness, 0), do: flunk("model catalog did not become fresh")
-
-  defp cancel_wake(db, wake) do
-    {:ok, result} =
-      DB.transaction(db, fn txn ->
-        [[assignment_id]] =
-          DB.Txn.q(txn, "SELECT assignmentId FROM wakes WHERE wakeId=?1", [wake.wake_id])
-
-        {:ok, liveness_trigger} =
-          Supervision.liveness_trigger_in_txn(txn, {:assignment, assignment_id})
-
-        Wakes.cancel_in_txn(txn, %{
-          wake_id: wake.wake_id,
-          expected_origin: wake.origin,
-          requester: %{kind: "process", id: "conformance"},
-          reason_kind: "requester_withdrew",
-          causal_source: %{
-            kind: "verb_call",
-            accepted_event: %{
-              origin: wake.origin,
-              session_key: nil,
-              principal: {:process, "conformance"}
-            }
-          },
-          outcome: %{kind: "no_replacement", liveness_trigger: liveness_trigger}
-        })
-      end)
-
-    result
-  end
 
   defp attest_verdict!(db, assignment_id, by_session, verdict_kind) do
     result =

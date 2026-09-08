@@ -82,7 +82,8 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
              "implementation-requires-posture",
              "implementation-dispatch-requires-posture",
              "completion-requires-verification",
-             "completion-requires-results-artifact"
+             "completion-requires-results-artifact",
+             "wake-obligation-registration-authority"
            ]
 
     item = work_item(ctx, true)

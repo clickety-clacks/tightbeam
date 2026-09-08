@@ -927,8 +927,12 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.prompt =~ "one new, unexpired bounded checkpoint"
     assert prod.prompt =~ "next action or condition and its deadline"
     assert prod.prompt =~ "Do not file generic or duplicate status"
-    assert prod.prompt =~ "schedule a concrete continuation wake"
-    assert prod.prompt =~ "next action or dependency condition and when to resume"
+    assert prod.prompt =~ "obligation-scoped continuation pattern"
+
+    assert prod.prompt =~
+             "An ordinary notification does not cover this assignment or pause effort"
+
+    assert prod.prompt =~ "Only a qualifying unresolved dependency wait pauses the effort horizon"
     refute prod.prompt =~ "or say what is happening"
 
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
