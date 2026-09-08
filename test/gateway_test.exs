@@ -265,6 +265,24 @@ defmodule Tightbeam.GatewayTest do
         }}, parent}
     end
 
+    # Actual turns.error specimen: turn 120945, September 6, 2026 at 13:50:30 PT.
+    # The provider supplied no timezone for its retry date.
+    def handle_call({:prompt, _sid, "nested codex failure", opts}, _from, parent) do
+      trace_dispatch(opts)
+
+      {:reply,
+       {:error,
+        %{
+          "code" => -32603,
+          "message" => "Internal error",
+          "data" => %{
+            "codexErrorInfo" => "usageLimitExceeded",
+            "message" =>
+              "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 13th, 2026 6:39 AM."
+          }
+        }}, parent}
+    end
+
     def handle_call({:prompt, _sid, "known claude failure", opts}, _from, parent) do
       trace_dispatch(opts)
 
@@ -8880,7 +8898,13 @@ defmodule Tightbeam.GatewayTest do
 
     create_work_item_deliverable_fixture!(ctx.db, "wi_process_cause")
 
-    for assignment_id <- ["asg_codex", "asg_claude", "asg_unknown", "asg_credential_known"] do
+    for assignment_id <- [
+          "asg_codex",
+          "asg_claude",
+          "asg_unknown",
+          "asg_credential_known",
+          "asg_quota"
+        ] do
       {:ok, _} =
         DB.query(
           ctx.db,
@@ -9129,6 +9153,37 @@ defmodule Tightbeam.GatewayTest do
              EventLog.lifecycle_events(ctx.db),
              &(&1.kind == "harness_turn_error" and &1.subject == "k1")
            ) == 5
+
+    {quota_turn, quota_frames} = run_failure.("nested codex failure", "asg_quota")
+
+    expected_quota =
+      "Codex usage limit reached You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 13th, 2026 6:39 AM."
+
+    assert failed_state_error.(quota_frames, "asg_quota") == expected_quota
+
+    assert Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn marker ->
+             marker.content ==
+               "[turn failed]\n\nThe agent could not answer the message above: " <> expected_quota
+           end)
+
+    assert {:ok, [[^expected_quota]]} =
+             DB.query(ctx.db, "SELECT error FROM turns WHERE seq=?1", [quota_turn.seq])
+
+    quota_notice =
+      EventLog.lifecycle_events(ctx.db)
+      |> Enum.find(&(&1.kind == "assignment_process_failure" and &1.subject == "asg_quota"))
+
+    assert JSON.decode!(quota_notice.detail)["safeCause"] == %{
+             "code" => "codex_usage_limit",
+             "message" => "Codex usage limit reached"
+           }
+
+    quota_owner_marker =
+      Projection.list_after(ctx.db, owner_session, nil, 100)
+      |> Enum.find(&String.contains?(&1.content || "", "Review assignment asg_quota:"))
+
+    assert quota_owner_marker.content ==
+             "[assignment action needed]\n\nReview assignment asg_quota: Codex usage limit reached."
 
     degrade_host_catalog("testhost", "claude", {:needs_onboarding, :missing})
 
