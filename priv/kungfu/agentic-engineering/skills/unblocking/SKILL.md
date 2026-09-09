@@ -14,9 +14,10 @@ within existing authority. Identify the governing restriction behind a refusal a
 its responsible decision-maker; resolve through a supported path or escalate the
 actual decision required. Keep separable authorized work moving.
 
-Use valid obligation-specific coverage for a dependency wait. Name the resolver and
-resolving evidence; reuse a healthy subscription. Preserve supported bounded
-checkpoints and reassessment. Route a delivery or suppression failure to its owner.
+For a dependency wait, name the resolver and resolving evidence, and reuse valid
+coverage for that obligation. For a bounded checkpoint, preserve the supported
+continuation and reassessment point. Choose the form that matches the unfinished
+work; a checkpoint does not require an invented external dependency. Route a delivery or suppression failure to its owner.
 Use supported correction or recovery when coverage is invalid, without duplicating
 healthy subscriptions.
 
