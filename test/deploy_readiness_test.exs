@@ -159,7 +159,7 @@ defmodule Tightbeam.DeployReadinessTest do
              Ready.observe!(db, "new-session", "new-wake")
   end
 
-  test "observer preserves exact reply binding on the composed O2 schema" do
+  test "observer preserves exact reply binding on the composed R1 schema" do
     alias Tightbeam.{DB, Schema}
     dir = Path.join(System.tmp_dir!(), "readiness-o2-#{System.unique_integer([:positive])}")
     File.mkdir_p!(dir)
@@ -168,7 +168,7 @@ defmodule Tightbeam.DeployReadinessTest do
     name = String.to_atom("readiness_o2_#{System.unique_integer([:positive])}")
     db = start_supervised!({DB, name: name, path: path})
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, [["row-driven-o2-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["row-driven-r1-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     :ok =
       DB.execute(db, """

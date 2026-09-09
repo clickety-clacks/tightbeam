@@ -178,8 +178,17 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             kind,
             scope,
             idempotency_key,
+            payload,
         } => {
             let mut params = vec![string_field("kind", kind)];
+            if let Some(encoded) = payload {
+                let value: Value = serde_json::from_str(encoded)
+                    .map_err(|_| "--payload requires a JSON object".to_owned())?;
+                if !value.is_object() {
+                    return Err("--payload requires a JSON object".to_owned());
+                }
+                params.push(format!("\"payload\":{}", value));
+            }
             for (name, value) in [("scope", scope), ("idempotencyKey", idempotency_key)] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));

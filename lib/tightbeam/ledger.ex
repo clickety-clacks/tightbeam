@@ -421,6 +421,8 @@ defmodule Tightbeam.Ledger do
           ]
         )
 
+        Tightbeam.ReminderDelivery.rebind_turn_in_txn(txn, assignment_id, source_seq, attempt_seq)
+
         {:appended, attempt_seq, attempt_id}
 
       [] ->

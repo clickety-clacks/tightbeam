@@ -40,6 +40,7 @@ defmodule Tightbeam.Schema do
   # The shape this build writes. Bump it when a production table changes in a
   # way that makes an older database unreadable, and give the refusal below a
   # sentence saying what changed.
+  @r1_shape "row-driven-r1-v1-019"
   @o2_shape "row-driven-o2-v1-019"
   @o2_pre_liveness_shape "row-driven-o2-pre-liveness-v1-019"
   @shape "row-driven-admission-v1-019"
@@ -1049,6 +1050,8 @@ defmodule Tightbeam.Schema do
           message:
             "incompatible_supervision_liveness_v1: additive activation failed: #{Exception.message(error)}"
     end
+
+    upgrade_r1(db)
   end
 
   @doc false
@@ -1290,7 +1293,7 @@ defmodule Tightbeam.Schema do
 
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[stamp]]} when stamp in [@o2_shape, @o2_pre_liveness_shape] ->
+      {:ok, [[stamp]]} when stamp in [@r1_shape, @o2_shape, @o2_pre_liveness_shape] ->
         :ok
 
       {:ok, [[@shape]]} ->
@@ -1364,7 +1367,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@o2_shape}
+          this build: #{@r1_shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
@@ -1386,7 +1389,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@o2_shape}
+          this build: #{@r1_shape}
 
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
@@ -1394,9 +1397,42 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  # R1 follows completed O2 activation, for both fresh and upgraded databases.
+  # The two nullable columns and exact successor stamp commit atomically.
+  # Historical module DDL stays intact so interrupted older bootstraps cannot
+  # acquire new columns before the exact O2 predecessor is established.
+  defp upgrade_r1(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@r1_shape]] ->
+               :ok
+
+             [[@o2_shape]] ->
+               Txn.q(txn, "ALTER TABLE assignments ADD COLUMN reminderState TEXT NULL")
+               Txn.q(txn, "ALTER TABLE condition_facts ADD COLUMN payload TEXT NULL")
+               [] = Txn.q(txn, "PRAGMA foreign_key_check")
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                 @r1_shape,
+                 System.system_time(:millisecond),
+                 @o2_shape
+               ])
+
+               if Txn.changes(txn) != 1, do: raise(ShapeError, message: "R1 stamp race")
+               :ok
+
+             rows ->
+               raise ShapeError, message: "incompatible R1 predecessor: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
   defp upgrade_o2(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[stamp]]} when stamp in [@o2_shape, @o2_pre_liveness_shape] ->
+      {:ok, [[stamp]]} when stamp in [@r1_shape, @o2_shape, @o2_pre_liveness_shape] ->
         :ok
 
       {:ok, [[predecessor]]} when predecessor in [@shape, @pre_liveness_shape] ->

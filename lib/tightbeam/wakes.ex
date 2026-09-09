@@ -1913,6 +1913,14 @@ defmodule Tightbeam.Wakes do
         due_at = observed_at + retry_delay_ms(next_attempt)
         insert_retry_wake_in_txn(txn, wake, turn.prompt, retry_wake_id, due_at, observed_at)
 
+        Tightbeam.ReminderDelivery.rebind_wake_in_txn(
+          txn,
+          wake.assignment_id,
+          turn.seq,
+          wake.wake_id,
+          retry_wake_id
+        )
+
         Txn.q(
           txn,
           """
@@ -3315,6 +3323,7 @@ defmodule Tightbeam.Wakes do
       )
 
       if is_binary(wake.assignment_id) do
+        Tightbeam.ReminderDelivery.canceled_in_txn(txn, wake.assignment_id, wake.wake_id)
         reconcile_wait_relief_in_txn(txn, wake.assignment_id, canceled_at)
       end
 

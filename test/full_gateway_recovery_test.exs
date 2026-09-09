@@ -59,9 +59,53 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
         before = JSON.decode!(File.read!(Path.join(arena, "prepare-state.json")))
         after_state = JSON.decode!(File.read!(Path.join(arena, "restart-state.json")))
 
-        for table <- ~w(artifacts attests work_items assignments harness_health_incidents) do
+        for table <- ~w(artifacts attests work_items harness_health_incidents) do
           assert before[table] == after_state[table], "unexpected mutation of #{table}"
         end
+
+        # R1 permits the first notice for a legacy-null open obligation. Bind
+        # that one new claim exactly; no other assignment mutation is permitted.
+        assert before["columns"] == after_state["columns"]
+        assignment_columns = before["columns"]["assignments"]
+        assert [prior_row] = before["assignments"]
+        assert [current_row] = after_state["assignments"]
+        prior = Map.new(Enum.zip(assignment_columns, prior_row))
+        current = Map.new(Enum.zip(assignment_columns, current_row))
+        assert {nil, preserved} = Map.pop(prior, "reminderState")
+        assert {encoded, ^preserved} = Map.pop(current, "reminderState")
+        assert prior["id"] == "asg_recovery_preserve"
+        assert prior["holderKey"] == "agent:recovery:a"
+        assert prior["openedByUser"] == "recovery-admin"
+        assert prior["state"] == "open"
+        claim = JSON.decode!(encoded)
+        assert %{"pending" => %{"consumer" => %{"wake" => notice_id}}} = claim
+
+        assert claim == %{
+                 "version" => 1,
+                 "claimEpoch" => 1,
+                 "pending" => %{
+                   "consumer" => %{"wake" => notice_id},
+                   "intent" => notice_id,
+                   "epoch" => 1,
+                   "snapshot" => %{
+                     "kind" => "prod",
+                     "target" => prior["holderKey"],
+                     "consequence" => nil
+                   }
+                 }
+               }
+
+        wake_columns = before["columns"]["wakes"]
+        before_wakes = Enum.map(before["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
+        after_wakes = Enum.map(after_state["wakes"], &Map.new(Enum.zip(wake_columns, &1)))
+        refute Enum.any?(before_wakes, &(&1["wakeId"] == notice_id))
+        assert [notice] = Enum.filter(after_wakes, &(&1["wakeId"] == notice_id))
+        assert notice["assignmentId"] == prior["id"]
+        assert notice["sessionKey"] == prior["holderKey"]
+        assert notice["ownerUserId"] == prior["openedByUser"]
+        assert notice["origin"] == "process:tightbeam"
+        assert notice["state"] == "pending"
+        assert notice["firedAt"] == nil
 
         # Every committed pre-crash message remains byte-identical exactly once.
         assert length(before["artifacts"]) >= 1
@@ -138,7 +182,10 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
       output
     end
 
-    git.(["read-tree", "HEAD"])
+    # Include the composer's staged new source paths, not only HEAD paths and
+    # the historical recovery fixture manifest. The temporary index stays private.
+    {index_tree, 0} = System.cmd("git", ["write-tree"])
+    git.(["read-tree", String.trim(index_tree)])
     git.(["add", "-u"])
 
     git.([

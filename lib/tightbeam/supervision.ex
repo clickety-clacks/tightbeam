@@ -2300,6 +2300,13 @@ defmodule Tightbeam.Supervision do
 
         {:cleared, result}
 
+      {:error, %{code: code}} when code in ["reminder_pending", "reminder_not_eligible"] ->
+        # Coalescing is not notification success or a dispatch failure. Drop
+        # only this evaluation's dispatch branch so later reassessment can run;
+        # the durable reminder consumer and successful-delivery state stay owned.
+        clear_pending(db, pending)
+        {:cleared, :coalesced}
+
       {:error, %{code: code}} when code in ["rule_denied", "rule_error"] ->
         denied_streak = denied_clear(db, pending)
         detail = "code=#{code} deniedStreak=#{denied_streak}"

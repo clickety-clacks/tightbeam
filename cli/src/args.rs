@@ -76,6 +76,7 @@ pub enum Command {
         kind: String,
         scope: Option<String>,
         idempotency_key: Option<String>,
+        payload: Option<String>,
     },
     ArtifactRecord {
         identity: Identity,
@@ -1429,6 +1430,7 @@ fn parse_with_optional_catalog(
                 })?,
                 scope: nonempty(flags, "scope"),
                 idempotency_key: nonempty(flags, "key"),
+                payload: nonempty(flags, "payload"),
             })
         }
         "artifact-record" => {
@@ -3521,6 +3523,7 @@ mod tests {
                 kind: "review-landed".to_owned(),
                 scope: None,
                 idempotency_key: None,
+                payload: None,
             })
         );
     }
@@ -4229,6 +4232,7 @@ mod tests {
                     kind: "build-finished".to_owned(),
                     scope: Some("app".to_owned()),
                     idempotency_key: Some("fact-1".to_owned()),
+                    payload: None,
                 },
             ),
             (

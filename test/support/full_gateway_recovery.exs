@@ -29,6 +29,12 @@ defmodule Tightbeam.RecoveryScenario do
         {table, rows("SELECT * FROM #{table} ORDER BY rowid")}
       end
     )
+    |> Map.put(
+      "columns",
+      Map.new(~w(assignments wakes), fn table ->
+        {table, Enum.map(rows("PRAGMA table_info(#{table})"), &Enum.at(&1, 1))}
+      end)
+    )
   end
 
   def prepare! do

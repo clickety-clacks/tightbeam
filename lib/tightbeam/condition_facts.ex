@@ -98,23 +98,151 @@ defmodule Tightbeam.ConditionFacts do
     origin = Map.fetch!(input, :origin)
 
     case kind_authority(kind, origin) do
-      :ok -> file_admitted_in_txn(txn, kind, origin, input)
-      {:error, _} = error -> error
+      :ok ->
+        with :ok <- consequence_admission(txn, input) do
+          case consequence_replay(txn, input) do
+            :new -> file_admitted_in_txn(txn, kind, origin, input)
+            result -> result
+          end
+        end
+
+      {:error, _} = error ->
+        error
     end
   end
+
+  defp consequence_admission(txn, %{kind: "obligation-consequence-changed"} = input) do
+    payload = input[:payload]
+    scope = input[:scope]
+
+    fields =
+      ~w(assignmentId consequenceKey revision attentionRequestId evidenceAttestId explicitAttention)
+
+    shape = is_map(payload) and Enum.sort(Map.keys(payload)) == Enum.sort(fields)
+
+    valid =
+      shape and payload["assignmentId"] == scope and
+        Enum.all?(fields -- ["explicitAttention"], fn key ->
+          is_binary(payload[key]) and byte_size(payload[key]) > 0
+        end) and is_boolean(payload["explicitAttention"])
+
+    if valid do
+      rows =
+        Txn.q(
+          txn,
+          "SELECT holderKey, openedBySession, openedByUser FROM assignments WHERE id=?1 AND state='open'",
+          [scope]
+        )
+
+      authorized =
+        case {rows, input[:principal]} do
+          {[[holder, opener, _]], {:session, actor}} -> actor == holder or actor == opener
+          {[[_, _, owner]], {:user, actor}} -> actor == owner
+          _ -> false
+        end
+
+      evidence =
+        Txn.q(txn, "SELECT 1 FROM attests WHERE id=?1 AND assignmentId=?2", [
+          payload["evidenceAttestId"],
+          scope
+        ])
+
+      if authorized and evidence != [],
+        do: :ok,
+        else:
+          {:error,
+           %{
+             code: "not_authorized",
+             message: "consequence requires assignment authority and exact-assignment evidence"
+           }}
+    else
+      {:error, %{code: "invalid", message: "invalid consequence payload or assignment scope"}}
+    end
+  end
+
+  defp consequence_admission(_txn, input) do
+    if is_nil(input[:payload]),
+      do: :ok,
+      else: {:error, %{code: "invalid", message: "payload requires consequence kind"}}
+  end
+
+  defp consequence_replay(
+         txn,
+         %{kind: "obligation-consequence-changed", payload: payload} = input
+       ) do
+    rows =
+      Txn.q(
+        txn,
+        "SELECT id, payload FROM condition_facts WHERE kind=?1 AND scope=?2 AND payload IS NOT NULL ORDER BY id",
+        [input.kind, input.scope]
+      )
+
+    case Enum.find(rows, fn [_id, encoded] ->
+           stored = JSON.decode!(encoded)
+           stored["attentionRequestId"] == payload["attentionRequestId"]
+         end) do
+      [id, encoded] ->
+        if JSON.decode!(encoded) == payload,
+          do: fact_in_txn(txn, id),
+          else:
+            {:error,
+             %{
+               code: "conflict",
+               message: "attention request already has different immutable content"
+             }}
+
+      nil ->
+        same =
+          Enum.find(Enum.reverse(rows), fn [_id, encoded] ->
+            stored = JSON.decode!(encoded)
+
+            stored["consequenceKey"] == payload["consequenceKey"] and
+              stored["revision"] == payload["revision"]
+          end)
+
+        case {same, payload["explicitAttention"]} do
+          {[id, _], false} -> fact_in_txn(txn, id)
+          _ -> :new
+        end
+    end
+  end
+
+  defp consequence_replay(_txn, _input), do: :new
 
   defp file_admitted_in_txn(txn, kind, origin, input) do
     ts = System.system_time(:millisecond)
     scope = Map.get(input, :scope)
     owner_user_id = Map.get(input, :owner_user_id) || owner_for_origin_in_txn(txn, origin)
 
-    Txn.q(
-      txn,
-      "INSERT INTO condition_facts (ts, kind, scope, origin, ownerUserId) VALUES (?1, ?2, ?3, ?4, ?5)",
-      [ts, kind, scope, origin, owner_user_id]
-    )
+    if payload = input[:payload] do
+      Txn.q(
+        txn,
+        "INSERT INTO condition_facts (ts, kind, scope, origin, ownerUserId, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        [ts, kind, scope, origin, owner_user_id, JSON.encode!(payload)]
+      )
+    else
+      Txn.q(
+        txn,
+        "INSERT INTO condition_facts (ts, kind, scope, origin, ownerUserId) VALUES (?1, ?2, ?3, ?4, ?5)",
+        [ts, kind, scope, origin, owner_user_id]
+      )
+    end
 
     [[fact_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
+    if payload = input[:payload] do
+      [[encoded]] = Txn.q(txn, "SELECT reminderState FROM assignments WHERE id=?1", [scope])
+
+      state =
+        if is_nil(encoded), do: %{"version" => 1, "claimEpoch" => 0}, else: JSON.decode!(encoded)
+
+      state = Map.put(state, "currentConsequence", payload)
+
+      Txn.q(txn, "UPDATE assignments SET reminderState=?1 WHERE id=?2", [
+        JSON.encode!(state),
+        scope
+      ])
+    end
 
     EventLog.lifecycle_in_txn(
       txn,
@@ -123,7 +251,14 @@ defmodule Tightbeam.ConditionFacts do
       "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
     )
 
-    fact = %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    fact = %{
+      fact_id: fact_id,
+      ts: ts,
+      kind: kind,
+      scope: scope,
+      origin: origin,
+      payload: input[:payload]
+    }
 
     DB.record_row_commit(txn, condition_transition(fact, owner_user_id))
     fact
@@ -141,7 +276,24 @@ defmodule Tightbeam.ConditionFacts do
                if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
 
              if prior do
-               {fact_in_txn(txn, prior.session_key), false}
+               result =
+                 with :ok <- consequence_admission(txn, input) do
+                   fact = fact_in_txn(txn, prior.session_key)
+
+                   if input[:payload] &&
+                        (is_nil(fact) || fact.kind != input.kind || fact.scope != input[:scope] ||
+                           fact.payload != input[:payload]) do
+                     {:error,
+                      %{
+                        code: "conflict",
+                        message: "condition key already has different immutable content"
+                      }}
+                   else
+                     fact
+                   end
+                 end
+
+               {result, false}
              else
                case file_in_txn(txn, input) do
                  %{fact_id: fact_id} = fact ->
@@ -402,11 +554,22 @@ defmodule Tightbeam.ConditionFacts do
   end
 
   defp fact_in_txn(txn, fact_id) do
-    case Txn.q(txn, "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1", [
-           fact_id
-         ]) do
-      [[id, ts, kind, scope, origin]] ->
-        %{fact_id: id, ts: ts, kind: kind, scope: scope, origin: origin}
+    case Txn.q(
+           txn,
+           "SELECT id, ts, kind, scope, origin, payload FROM condition_facts WHERE id = ?1",
+           [
+             fact_id
+           ]
+         ) do
+      [[id, ts, kind, scope, origin, payload]] ->
+        %{
+          fact_id: id,
+          ts: ts,
+          kind: kind,
+          scope: scope,
+          origin: origin,
+          payload: if(is_nil(payload), do: nil, else: JSON.decode!(payload))
+        }
 
       [] ->
         nil

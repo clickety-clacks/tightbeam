@@ -734,6 +734,8 @@ defmodule Tightbeam.Gateway do
                    kind: p.kind,
                    scope: p[:scope],
                    origin: call.origin,
+                   principal: Map.get(call, :principal),
+                   payload: p[:payload],
                    owner_user_id: wait_owner_user_id_in_txn_for_db(db, Map.get(call, :principal)),
                    idempotency_key: p[:idempotency_key]
                  }) do
@@ -2540,6 +2542,7 @@ defmodule Tightbeam.Gateway do
           append_assistant_messages(db, turn, echo, result)
 
           record_in_txn = fn txn ->
+            Tightbeam.ReminderDelivery.delivered_in_txn(txn, turn.seq)
             HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
           end
 
@@ -4396,6 +4399,16 @@ defmodule Tightbeam.Gateway do
     p = call.params
 
     cond do
+      Map.get(call, :principal) == {:process, "tightbeam"} and
+          p[:supervision_wake_kind] in ["prod", "escalation"] ->
+        Tightbeam.ReminderDelivery.schedule_in_txn(
+          txn,
+          p[:assignment_id],
+          p[:supervision_wake_kind],
+          session_key,
+          fn -> schedule_wake_row_in_txn(txn, call, session_key, due_at, nil, nil) end
+        )
+
       is_map(p[:predicate]) or p[:after_turn] == true ->
         Wakes.register_wait_in_txn(txn, %{
           session_key: session_key,

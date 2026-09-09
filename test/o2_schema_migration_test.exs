@@ -15,7 +15,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
 
   test "fresh O2 bootstrap and restart preserve nullable notice state", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "row-driven-o2-v1-019"
+    assert stamp(db) == "row-driven-r1-v1-019"
     seed_episode(db)
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert :ok = Schema.ensure_all(db)
@@ -49,7 +49,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     before_episode = rows(db, "SELECT * FROM rail_remedy_episodes")
     before_triggers = triggers(db)
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "row-driven-o2-v1-019"
+    assert stamp(db) == "row-driven-r1-v1-019"
     assert rows(db, "SELECT * FROM wake_cancellations") == before_rows
     assert rows(db, "SELECT * FROM wakes ORDER BY wakeId") == before_wakes
 
@@ -203,7 +203,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     assert rows(db, "SELECT name FROM sqlite_master WHERE name='wake_cancellations'") == []
     :ok = DB.execute(db, "DROP TRIGGER o2_test_refuse_activation")
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "row-driven-o2-v1-019"
+    assert stamp(db) == "row-driven-r1-v1-019"
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert_two_shapes(db)
   end

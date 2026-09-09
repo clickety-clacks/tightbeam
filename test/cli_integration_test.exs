@@ -178,6 +178,122 @@ defmodule Tightbeam.CliIntegrationTest do
     }
   end
 
+  test "typed consequence crosses the real CLI wire with authenticated assignment custody", ctx do
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       name: Tightbeam.WakeScheduler,
+       tick_ms: 60_000,
+       deliver: fn _ -> flunk("wire admission must not deliver an unrelated wake") end}
+    )
+
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    assert {assigned, 0} =
+             run.(["assign", "--session", "cli-holder", "--subject", "R1 wire proof"])
+
+    assignment = JSON.decode!(assigned)["id"]
+    assert is_binary(assignment)
+
+    assert {attested, 0} =
+             run.([
+               "attest",
+               assignment,
+               "--kind",
+               "progress",
+               "--note",
+               "Wire consequence evidence"
+             ])
+
+    evidence = JSON.decode!(attested)["attest"]["id"]
+    assert is_binary(evidence)
+
+    payload = %{
+      "assignmentId" => assignment,
+      "consequenceKey" => "release",
+      "revision" => "wire-one",
+      "attentionRequestId" => "wire-attention-one",
+      "evidenceAttestId" => evidence,
+      "explicitAttention" => true
+    }
+
+    args = [
+      "condition",
+      "--kind",
+      "obligation-consequence-changed",
+      "--scope",
+      assignment,
+      "--payload",
+      JSON.encode!(payload)
+    ]
+
+    assert {filed, 0} = run.(args)
+    fact_id = JSON.decode!(filed)["factId"]
+    assert is_integer(fact_id) and fact_id > 0
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "condition",
+                      principal: {:session, "cli-holder"},
+                      params: %{payload: ^payload, scope: ^assignment}
+                    }}
+
+    assert {:ok, [[encoded, origin]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload,origin FROM condition_facts WHERE id=?1 AND scope=?2",
+               [fact_id, assignment]
+             )
+
+    assert JSON.decode!(encoded) == payload
+    assert origin == "agent:cli-holder"
+    assert {replay, 0} = run.(args)
+    assert JSON.decode!(replay)["factId"] == fact_id
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM condition_facts WHERE kind='obligation-consequence-changed' AND scope=?1",
+               [assignment]
+             )
+
+    other_dir = session_workdir!(ctx, ctx.worker)
+    assert {refused, 1} = System.cmd(ctx.binary, args, cd: other_dir, stderr_to_stdout: true)
+    assert refused =~ "not_authorized"
+
+    assert {malformed, 1} =
+             run.([
+               "condition",
+               "--kind",
+               "obligation-consequence-changed",
+               "--scope",
+               assignment,
+               "--payload",
+               "[]"
+             ])
+
+    assert malformed =~ "payload"
+
+    assert {:ok, [[^encoded, ^origin]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload,origin FROM condition_facts WHERE id=?1 AND scope=?2",
+               [fact_id, assignment]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM condition_facts WHERE kind='obligation-consequence-changed' AND scope=?1",
+               [assignment]
+             )
+
+    assert {:ok, [[state]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [assignment])
+
+    assert JSON.decode!(state)["currentConsequence"] == payload
+  end
+
   test "manual obligation continuation examples register rows and deliver intact prompts", ctx do
     {help, 0} = System.cmd(ctx.binary, ["wake", "--help"])
     assert help =~ "--after-turn"
