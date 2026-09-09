@@ -162,6 +162,7 @@ defmodule Tightbeam.Identity do
       end)
 
     archetype_render = Archetypes.guidance_render(archetype, catalog)
+    bundle_context = available_bundle_context(archetype_name)
 
     root_parts =
       Enum.flat_map(@universal_roots, fn name ->
@@ -174,7 +175,8 @@ defmodule Tightbeam.Identity do
       end)
 
     guidance =
-      ([archetype_render.bytes] ++ root_parts)
+      ([archetype_render.bytes, bundle_context] ++ root_parts)
+      |> Enum.reject(&is_nil/1)
       |> Enum.join("\n\n")
       |> then(&Harness.module!(harness).session_config(%{identity: true}, &1).guidance)
 
@@ -203,6 +205,27 @@ defmodule Tightbeam.Identity do
       skills: skills
     }
   end
+
+  defp available_bundle_context("default") do
+    bundles =
+      available_bundles()
+      |> Enum.map_join("\n\n", fn bundle ->
+        phrases = Enum.map_join(bundle.phrases, "\n", &"- #{&1}")
+        "### `#{bundle.name}`\nPurpose: #{bundle.purpose}\nPhrases:\n#{phrases}"
+      end)
+
+    """
+    ## Available kungfu bundles in this Tightbeam build
+
+    Use these facts, composed from the installed build's shipped bundle manifests, to match a
+    user's stated goal before any tool call.
+
+    #{bundles}
+    """
+    |> String.trim()
+  end
+
+  defp available_bundle_context(_archetype_name), do: nil
 
   # A fragment the SUBSTRATE requires, which an org's tree may predate.
   #

@@ -63,6 +63,30 @@ defmodule Tightbeam.IdentityTest do
            ]
   end
 
+  test "the default snapshot composes every available bundle's offer facts", ctx do
+    assert :initialized = Identity.init!(ctx.base)
+    assert {:ok, _revision} = learn!(ctx.base, "agentic-engineering", "test")
+
+    default = Identity.snapshot!(ctx.base, "default", :codex)
+    coder = Identity.snapshot!(ctx.base, "coder", :codex)
+
+    assert default.guidance =~ "## Available kungfu bundles in this Tightbeam build"
+    refute coder.guidance =~ "## Available kungfu bundles in this Tightbeam build"
+    assert default.render_contract == Identity.render_contract()
+
+    assert default.guidance_digest ==
+             :crypto.hash(:sha256, default.guidance) |> Base.encode16(case: :lower)
+
+    for bundle <- Identity.available_bundles() do
+      assert default.guidance =~ "### `#{bundle.name}`"
+      assert default.guidance =~ "Purpose: #{bundle.purpose}"
+
+      for phrase <- bundle.phrases do
+        assert default.guidance =~ "- #{phrase}"
+      end
+    end
+  end
+
   test "concurrent neutral-seed initialization publishes one complete repository", ctx do
     results =
       1..2
