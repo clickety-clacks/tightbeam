@@ -659,7 +659,8 @@ COMMANDS:
       [--artifact <artifactId> --sha256 <hash>]
          [--verdict <kind>] [--wait <wakeId>] [--note "..."]
       File against an assignment. Verdicts on review cards require the review
-      holder; producer-card verdicts may be filed by any session or user.
+      holder; producer-card verdicts may be filed by any session or user. A
+      surrender requires --note and uses the session's implicit identity.
   attests <assignmentId>
       List every attest filed against an assignment.
   assignments [--session <key> | --role <name>] [--state open|closed|all]
@@ -2027,6 +2028,12 @@ fn parse_with_optional_catalog(
                         .map_err(|_| "--commit-refs must be a JSON array".to_owned())
                 })
                 .transpose()?;
+            if kind == "surrender" && nonempty(flags, "note").is_none() {
+                return Err("--note is required when --kind is surrender".to_owned());
+            }
+            if kind == "surrender" && commit_refs.is_some() {
+                return Err("--commit-refs is not valid when --kind is surrender".to_owned());
+            }
             let artifact_id = nonempty(flags, "artifact");
             let content_sha256 = nonempty(flags, "sha256");
             let wait_id = nonempty(flags, "wait");
@@ -4180,6 +4187,23 @@ mod tests {
                 "flynn",
             ])),
             Err("--verdict is only valid when --kind is verdict".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&["attest", "asg_1", "--kind", "surrender"])),
+            Err("--note is required when --kind is surrender".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "surrender",
+                "--note",
+                "done",
+                "--commit-refs",
+                "[]",
+            ])),
+            Err("--commit-refs is not valid when --kind is surrender".to_owned())
         );
     }
 

@@ -525,6 +525,38 @@ defmodule Tightbeam.Assignments do
     Enum.map(rows, &attest/1)
   end
 
+  @doc "Classify the fixed same-holder terminal-surrender replay before Rules run."
+  @spec terminal_surrender_precheck(DB.server(), String.t(), String.t()) ::
+          :proceed | {:replay, map()} | {:refuse, map()}
+  def terminal_surrender_precheck(db, assignment_id, holder_key) do
+    case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
+      {:ok, []} ->
+        {:refuse, error("unknown_assignment", "unknown assignment: #{assignment_id}")}
+
+      {:ok, [row]} ->
+        assignment = assignment(row)
+
+        cond do
+          assignment.state == "open" ->
+            :proceed
+
+          assignment.outcome == "surrendered" and assignment.closedBySession == holder_key and
+              is_binary(assignment.closingAttestId) ->
+            terminal_surrender_replay(
+              assignment,
+              holder_key,
+              case DB.query(db, closing_attest_query(), [assignment.closingAttestId]) do
+                {:ok, rows} -> rows
+                _ -> []
+              end
+            )
+
+          true ->
+            {:refuse, terminal_conflict()}
+        end
+    end
+  end
+
   @doc false
   def __for_work_item__(db, work_item_id) do
     {:ok, rows} =
@@ -863,7 +895,8 @@ defmodule Tightbeam.Assignments do
           &attest_commits(&1, &2, call)
         )
 
-      if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
+      if not Map.has_key?(result, :code) and not Map.get(result, :replayed, false) and
+           match?({:ok, _}, from) do
         {:ok, from} = from
         best_effort(fn -> notify(call, :on_assignment_change, assignment_id, from) end)
       end
@@ -880,8 +913,63 @@ defmodule Tightbeam.Assignments do
       end
     end
   rescue
-    TransitionRace -> assignment_closed()
+    TransitionRace ->
+      if call[:terminal_surrender] do
+        terminal_surrender_after_race(db, call)
+      else
+        assignment_closed()
+      end
   end
+
+  defp terminal_surrender_after_race(db, call) do
+    case terminal_surrender_precheck(db, call.params.assignment_id, session_key!(call.principal)) do
+      {:replay, result} -> result
+      {:refuse, error} -> error
+      :proceed -> assignment_closed()
+    end
+  end
+
+  # A terminal caller that passed Dispatch's open-state precheck can lose the
+  # race before this transaction reads its assignment. That ordinary closed
+  # branch must classify the winner too: the fixed same-holder surrender is
+  # idempotent whether the winner committed before or during this transaction.
+  defp terminal_surrender_after_closed_read(txn, assignment, holder_key) do
+    case terminal_surrender_replay(
+           assignment,
+           holder_key,
+           Txn.q(txn, closing_attest_query(), [assignment.closingAttestId])
+         ) do
+      {:replay, result} -> result
+      {:refuse, error} -> error
+    end
+  end
+
+  defp terminal_surrender_replay(assignment, holder_key, [attest_row]) do
+    closing = attest(attest_row)
+
+    if closing.assignmentId == assignment.id and closing.kind == "surrender" and
+         closing.bySession == holder_key do
+      {:replay, %{assignment: assignment, attest: closing, replayed: true}}
+    else
+      {:refuse, terminal_conflict()}
+    end
+  end
+
+  defp terminal_surrender_replay(_assignment, _holder_key, _rows),
+    do: {:refuse, terminal_conflict()}
+
+  defp closing_attest_query do
+    "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts FROM attests WHERE id = ?1"
+  end
+
+  defp session_key!({:session, session_key}), do: session_key
+
+  defp terminal_conflict,
+    do:
+      error(
+        "terminal_conflict",
+        "terminal surrender does not match this assignment's closed outcome"
+      )
 
   # Per effort-checkin-v2 §Design 5 and the provenance it cites verbatim —
   # "Artifacts are the referents" — an attest's referents are the artifacts the
@@ -1556,7 +1644,11 @@ defmodule Tightbeam.Assignments do
             error("not_holder", "assignment is held by session #{holder}")
 
           assignment.state != "open" ->
-            assignment_closed()
+            if call[:terminal_surrender] do
+              terminal_surrender_after_closed_read(txn, assignment, holder)
+            else
+              assignment_closed()
+            end
 
           true ->
             with :ok <- valid_kind(call.params[:kind]),
@@ -2619,6 +2711,8 @@ defmodule Tightbeam.Assignments do
       []
     end
   end
+
+  defp attest_commits(_txn, %{replayed: true}, _call), do: []
 
   defp attest_commits(txn, %{assignment: assignment, attest: attest}, call) do
     owner = assignment_owner_in_txn(txn, assignment.id)
