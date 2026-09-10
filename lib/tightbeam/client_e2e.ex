@@ -273,11 +273,17 @@ defmodule Tightbeam.ClientE2E do
     try do
       File.mkdir_p!(scratch)
 
-      for dir <- ["auth", "homes"], File.dir?(Path.join(base_dir, dir)) do
+      for dir <- ["homes"], File.dir?(Path.join(base_dir, dir)) do
         File.cp_r!(Path.join(base_dir, dir), Path.join(scratch, dir))
       end
 
-      File.rm_rf!(Tightbeam.Credentials.store_dir(scratch, module.credential_provider()))
+      File.rm!(
+        Tightbeam.Credentials.credential_path(
+          scratch,
+          Tightbeam.Placement.local_host_name(),
+          module.credential_provider()
+        )
+      )
 
       case module.fetch_catalog(target(scratch)) do
         {:ok, [_ | _]} -> false

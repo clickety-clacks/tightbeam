@@ -14,7 +14,7 @@ description: Commit and push discipline — build before committing, one concern
    change.
 3. One concern per commit, and never behavior and structure in the same one. A commit
    that both moves code and changes what it does cannot be reviewed under one lens —
-   the reviewer cannot tell which lines are supposed to change output. Split them:
+   the reviewer-code session cannot tell which lines are supposed to change output. Split them:
    structure commits reviewed for direction, behavior commits reviewed for
    correctness. A tangled commit is also permanent damage — it poisons blame, bisect,
    and defect archaeology long after it merges.
@@ -24,6 +24,12 @@ description: Commit and push discipline — build before committing, one concern
 
 ## Merging your branch into main
 Merging is a semantic integration problem, not a text-selection problem.
+
+When a lane pins an authorized target commit, hold that exact target until the reviewed
+candidate lands. If the target moves for unrelated work, stop and report the hold
+violation. Do not reconcile or rebuild on the moved target unless the owner explicitly
+changes the pin.
+
 1. Merge main into your branch first. Every conflict is resolved on your branch.
 2. Resolve conflicts semantically. Never resolve by wholesale accepting ours, theirs,
    or the newer block. For each conflict, determine what each side contributes — read
@@ -37,13 +43,13 @@ Merging is a semantic integration problem, not a text-selection problem.
    before reconciliation is stale where reconciliation changed semantics.
 5. Advancing main is the orchestrator's decision: it happens after the
    orchestrator has cleared the work — the `reviewed-clean` verdict is on
-   record, and, for a substantial change (feature-cycle's spirit-review
-   definition), the product owner's `--kind verdict` attest is on the goal's
-   assignment. A routine change — a wire-spelling fix, not an effort-check-in —
-   advances on `reviewed-clean` alone. You execute the mechanics: confirm main
+   record, and the current product-owner judgment required by the governing intent is recorded.
+   An unchanged authorized fix does not need a new intent ceremony. You execute the mechanics: confirm main
    is an ancestor of the reconciled branch
    (`git merge-base --is-ancestor main <branch>`), then advance main from the
    branch — fast-forward, because the reconciliation already happened on the
    branch.
-6. When main moved during reconciliation, merge it in again and re-prove before
-   advancing.
+6. An explicit target pin remains in force until its owner changes it. If that pinned
+   target moves, report it and hold the affected integration. Otherwise reconcile target
+   movement within existing authority and the agreed integration order. Reassess changed
+   interactions and refresh verification or review where prior evidence no longer applies.

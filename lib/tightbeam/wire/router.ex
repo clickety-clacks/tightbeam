@@ -49,13 +49,60 @@ defmodule Tightbeam.Wire.Router do
 
   use Plug.Router
 
-  alias Tightbeam.{Assets, CliCompatibility, Devices, Dispatch, Org, Roles, WorkState}
-  alias Tightbeam.Wire.{Payloads, Socket}
+  alias Tightbeam.{
+    Assets,
+    CliCompatibility,
+    ConditionFacts,
+    D1Read,
+    Devices,
+    Dispatch,
+    Org,
+    Roles,
+    WorkState
+  }
+
+  alias Tightbeam.Wire.{ChangeSocket, Payloads, Socket}
+  alias Tightbeam.{ModelCatalog, StateResources}
 
   Module.register_attribute(__MODULE__, :agent_verbs, persist: true)
 
-  @agent_verbs ~w(wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend toplines topline harness-processes)
+  @agent_verbs ~w(ask answer return wake condition facts-read artifact-record artifact-get artifacts spawn retire critical inspect cancel tune approve-device deny-device revoke-device promote-user add-user config register-host host-env-set host-env-list host-env-unset host-toolchain-set update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard role-create role-bind role-rm role-list assign dispatch assignment-get attest attests revoke-assignment reopen-assignment assignments work-item-create work-item-get work-item-trace work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list harness-processes)
   @max_upload_bytes 32 * 1024 * 1024
+  @state_not_found_floor_us 3_000
+  @state_malformed_percent_escape ~r/%(?![0-9A-Fa-f]{2})/
+  @core_detail_specs %{
+    work_items: %{resource: "work items", query: :query_work_item, serializer: :work_item},
+    assignments: %{resource: "assignments", query: :query_assignment, serializer: :assignment},
+    wakes: %{resource: "wakes", query: :query_wake, serializer: :wake},
+    turns: %{resource: "turns", query: :query_turn_by_seq, serializer: :turn},
+    decision_requests: %{
+      resource: "decision requests",
+      query: :query_decision_request,
+      serializer: :decision_request
+    },
+    sessions: %{resource: "sessions", query: :query_session, serializer: :session},
+    devices: %{resource: "devices", query: :query_device, serializer: :device},
+    artifacts: %{resource: "artifacts", query: :query_artifact, serializer: :artifact},
+    read_markers: %{resource: "read markers", query: :query_read_marker, serializer: :read_marker}
+  }
+
+  @d1_default_limit 50
+  @d1_max_limit 500
+  @d1_cursor_version 1
+  @d1_resources %{
+    work_items: %{
+      resource: "work items",
+      route: "work_items.collection",
+      filters: ~w(state ownerUserId createdBySession createdByUser isBug specRefName holderKey),
+      order: ~w(createdAt id)
+    },
+    config: D1Read.spec(:config),
+    host_environment: D1Read.spec(:host_environment),
+    hosts: D1Read.spec(:hosts),
+    users: D1Read.spec(:users),
+    identity: D1Read.spec(:identity),
+    kungfu: D1Read.spec(:kungfu)
+  }
   @multipart_opts Plug.Parsers.init(
                     parsers: [{:multipart, length: @max_upload_bytes + 1_000_000}],
                     pass: ["*/*"]
@@ -80,6 +127,17 @@ defmodule Tightbeam.Wire.Router do
 
   get "/ws" do
     upgrade_socket(conn)
+  end
+
+  get "/ws/changes" do
+    conn = Plug.Conn.fetch_query_params(conn)
+
+    if Plug.Conn.get_req_header(conn, "upgrade") == ["websocket"] and
+         conn.query_params["protocolVersion"] == "1" do
+      WebSockAdapter.upgrade(conn, ChangeSocket, deps(conn), max_frame_size: 2 * 1024 * 1024)
+    else
+      error(conn, 426, "unsupported_protocol_version")
+    end
   end
 
   defp upgrade_socket(conn) do
@@ -153,6 +211,17 @@ defmodule Tightbeam.Wire.Router do
     end
   end
 
+  post "/agent/terminal" do
+    with {:ok, {:session, session}} <- terminal_session_auth(conn),
+         :ok <- terminal_version_supported(conn),
+         {:ok, body, conn} <- read_json(conn),
+         {:ok, call} <- terminal_surrender_call(session, body) do
+      dispatch_response(conn, call, 200, &%{"result" => &1})
+    else
+      {:error, status, code, message} -> error(conn, status, code, message)
+    end
+  end
+
   # The hook seam (artifact-carrier-proposal-v1 §4.1). The turn is resolved HERE,
   # at observation time, because the `artifact-record` that follows may arrive
   # after that turn has ended — a slow command spanning a turn boundary, or a
@@ -194,6 +263,88 @@ defmodule Tightbeam.Wire.Router do
     else
       {:error, status, code, message} -> error(conn, status, code, message)
     end
+  end
+
+  # D1 is a read-only public contract. One maintenance seam owns all six
+  # current-line projections; no route may select or serialize a raw row.
+  get "/api/config" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :config))
+  end
+
+  get "/api/config/:key" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :config), key)
+  end
+
+  get "/api/host-env" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :host_environment))
+  end
+
+  get "/api/hosts" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :hosts))
+  end
+
+  get "/api/hosts/:host" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :hosts), host)
+  end
+
+  get "/api/users" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :users))
+  end
+
+  get "/api/users/:user_id" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :users), user_id)
+  end
+
+  get "/api/identity" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :identity))
+  end
+
+  get "/api/identity/:name" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :identity), name)
+  end
+
+  get "/api/kungfu" do
+    d1_collection(conn, Map.fetch!(@d1_resources, :kungfu))
+  end
+
+  get "/api/kungfu/:name" do
+    d1_detail(conn, Map.fetch!(@d1_resources, :kungfu), name)
+  end
+
+  get "/api/assignments/:assignment_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :assignments), assignment_id)
+  end
+
+  get "/api/wakes/:wake_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :wakes), wake_id)
+  end
+
+  get "/api/turns/:turn_seq" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :turns), turn_seq)
+  end
+
+  get "/api/decision-requests/:decision_request_id" do
+    core_detail(
+      conn,
+      Map.fetch!(@core_detail_specs, :decision_requests),
+      decision_request_id
+    )
+  end
+
+  get "/api/sessions/:session_key" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :sessions), session_key)
+  end
+
+  get "/api/devices/:device_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :devices), device_id)
+  end
+
+  get "/api/artifacts/:artifact_id" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :artifacts), artifact_id)
+  end
+
+  get "/api/read-markers/:scope_key" do
+    core_detail(conn, Map.fetch!(@core_detail_specs, :read_markers), scope_key)
   end
 
   post "/api/streams" do
@@ -315,30 +466,11 @@ defmodule Tightbeam.Wire.Router do
   end
 
   get "/api/work-items" do
-    conn = Plug.Conn.fetch_query_params(conn)
-
-    with {:ok, device} <- device_auth(conn) do
-      filters = %{
-        session_key: conn.query_params["sessionKey"],
-        owner_user_id: if(device.is_admin, do: nil, else: device.user_id)
-      }
-
-      json(conn, 200, WorkState.list_items(db(conn), filters))
-    else
-      {:error, status, code, message} -> error(conn, status, code, message)
-    end
+    d1_collection(conn, Map.fetch!(@d1_resources, :work_items))
   end
 
   get "/api/work-items/:id" do
-    with {:ok, device} <- device_auth(conn),
-         detail when not is_nil(detail) <- WorkState.item_detail(db(conn), id),
-         true <- visible_item_detail?(detail, device, conn) do
-      json(conn, 200, detail)
-    else
-      nil -> error(conn, 404, "unknown_work_item")
-      false -> error(conn, 404, "unknown_work_item")
-      {:error, status, code, message} -> error(conn, status, code, message)
-    end
+    core_detail(conn, Map.fetch!(@core_detail_specs, :work_items), id)
   end
 
   post "/api/session-control" do
@@ -396,6 +528,731 @@ defmodule Tightbeam.Wire.Router do
     error(conn, 404, "not_found")
   end
 
+  defp core_detail(conn, spec, raw_key) do
+    started_at = System.monotonic_time(:microsecond)
+
+    with {:ok, auth} <-
+           core_detail_operation(conn, spec.resource, :bearer_auth, fn ->
+             state_bearer_auth(conn)
+           end),
+         {:ok, query} <-
+           core_detail_operation(conn, spec.resource, :query_decode, fn ->
+             decode_state_query(conn)
+           end),
+         {:ok, principal} <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :principal_resolution,
+             fn -> state_principal(auth, query, conn) end
+           ),
+         :ok <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :request_validation,
+             fn -> state_detail_request(query) end
+           ),
+         {:ok, key} <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :key_decode,
+             fn -> core_detail_key(spec.resource, raw_key) end
+           ),
+         :ok <- core_detail_probe(conn, spec.resource, :lookup),
+         row <-
+           core_detail_operation(
+             conn,
+             spec.resource,
+             :row_lookup,
+             fn ->
+               core_detail_row(conn, spec, key, core_detail_trace_principal(conn, principal))
+             end
+           ),
+         true <- not is_nil(row),
+         :ok <- core_detail_probe(conn, spec.resource, :schema),
+         :ok <- core_detail_probe(conn, spec.resource, :serializer),
+         item <- core_detail_serialize(conn, spec, row),
+         :ok <- core_detail_probe(conn, spec.resource, :encoder),
+         item_bytes <- core_detail_encode(conn, spec.resource, item),
+         :ok <- core_detail_probe(conn, spec.resource, :envelope) do
+      core_detail_trace(conn, {:envelope, spec.resource})
+      state_send(conn, 200, state_detail_envelope(spec.resource, item_bytes))
+    else
+      false ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, :not_found} ->
+        state_not_found(conn, spec.resource, started_at)
+
+      {:error, status, code, message} ->
+        state_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      state_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp core_detail_serialize(conn, spec, row) do
+    core_detail_trace(conn, {:serializer, spec.resource, spec.serializer})
+    apply(StateResources, spec.serializer, [row])
+  end
+
+  defp core_detail_encode(conn, resource, item) do
+    core_detail_trace(conn, {:ordered_item_encoder, resource})
+    StateResources.encode_item(resource, item, state_catalog(conn))
+  end
+
+  defp core_detail_trace_principal(conn, principal) do
+    Map.put(principal, :core_detail_trace, deps(conn)[:core_detail_trace])
+  end
+
+  defp core_detail_trace(conn, event) do
+    case deps(conn)[:core_detail_trace] do
+      nil -> :ok
+      pid when is_pid(pid) -> send(pid, {:core_detail_trace, event})
+      trace when is_function(trace, 1) -> trace.(event)
+    end
+
+    :ok
+  end
+
+  defp core_detail_operation(conn, resource, operation, fun) when is_function(fun, 0) do
+    core_detail_trace(conn, {:operation, resource, operation})
+    fun.()
+  end
+
+  defp core_detail_probe(conn, resource, stage) do
+    core_detail_trace(conn, {:probe_stage, resource, stage})
+
+    case deps(conn)[:core_detail_probe] do
+      nil -> :ok
+      probe when is_function(probe, 2) -> probe.(resource, stage)
+    end
+  end
+
+  defp core_detail_row(conn, %{query: query, resource: resource}, key, principal)
+       when resource in ["work items", "assignments"] do
+    core_detail_trace(conn, {:shared_lookup, resource, query})
+
+    call = %{
+      principal: core_detail_principal(principal),
+      rest_principal: principal,
+      params: %{}
+    }
+
+    apply(StateResources, query, [db(conn), key, call])
+  end
+
+  defp core_detail_row(conn, %{query: query, resource: "read markers"}, scope_key, principal) do
+    core_detail_trace(conn, {:shared_lookup, "read markers", query})
+    apply(StateResources, query, [db(conn), %{key: scope_key, principal: principal}, %{}])
+  end
+
+  defp core_detail_row(conn, %{query: query, resource: resource}, key, principal) do
+    core_detail_trace(conn, {:shared_lookup, resource, query})
+    apply(StateResources, query, [db(conn), %{key: key, principal: principal}])
+  end
+
+  defp core_detail_principal(%{kind: "user", id: id}), do: {:user, id}
+  defp core_detail_principal(%{kind: "session", id: id}), do: {:session, id}
+
+  defp core_detail_key("turns", raw_key) do
+    case Integer.parse(raw_key) do
+      {seq, ""} when seq > 0 and seq <= 9_223_372_036_854_775_807 ->
+        if raw_key == Integer.to_string(seq), do: {:ok, seq}, else: {:error, :not_found}
+
+      _ ->
+        {:error, :not_found}
+    end
+  end
+
+  defp core_detail_key(_resource, raw_key) when is_binary(raw_key), do: {:ok, raw_key}
+
+  defp state_bearer_auth(conn) do
+    token =
+      case Plug.Conn.get_req_header(conn, "authorization") do
+        ["Bearer " <> token] when token != "" -> token
+        _ -> nil
+      end
+
+    cond do
+      is_nil(token) ->
+        {:error, 401, "auth_failed", nil}
+
+      token == deps(conn).cli_token ->
+        {:ok, :org}
+
+      session = Org.by_cli_token(db(conn), token) ->
+        {:ok, {:session, session}}
+
+      device = Devices.by_token(db(conn), token) ->
+        {:ok, {:device, device}}
+
+      true ->
+        {:error, 401, "auth_failed", nil}
+    end
+  end
+
+  defp state_principal(:org, query, conn) do
+    case Map.get(query, "asUser", []) do
+      [user_id] when user_id != "" ->
+        with {:ok, principal} <- resolve_cli_as_user(:org, user_id) do
+          {:ok, state_principal_view(principal, conn)}
+        end
+
+      [_empty] ->
+        {:error, 400, "invalid_message", nil}
+
+      [] ->
+        {:error, 400, "invalid_message", nil}
+
+      _repeated ->
+        {:error, 400, "invalid_as_user", nil}
+    end
+  end
+
+  defp state_principal({:session, session}, query, conn) do
+    case Map.get(query, "asUser", []) do
+      [] ->
+        {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
+
+      [as_user] ->
+        with {:ok, principal} <- resolve_cli_as_user({:session, session}, as_user) do
+          {:ok, state_principal_view(principal, conn)}
+        end
+
+      _repeated ->
+        {:error, 400, "invalid_as_user", nil}
+    end
+  end
+
+  defp state_principal({:device, device}, query, _conn) do
+    if Map.has_key?(query, "asUser") do
+      {:error, 400, "invalid_as_user", nil}
+    else
+      {:ok, %{kind: "user", id: device.user_id, is_admin: device.is_admin}}
+    end
+  end
+
+  defp state_user_principal(user_id, conn) do
+    is_admin =
+      case Devices.user(db(conn), user_id) do
+        %{is_admin: true} -> true
+        _ -> false
+      end
+
+    %{kind: "user", id: user_id, is_admin: is_admin}
+  end
+
+  defp state_principal_view({:user, user_id}, conn), do: state_user_principal(user_id, conn)
+
+  defp state_principal_view({:session, session_key}, _conn),
+    do: %{kind: "session", id: session_key, is_admin: false}
+
+  defp resolve_cli_as_user(:org, user_id) when is_binary(user_id) and user_id != "",
+    do: {:ok, {:user, user_id}}
+
+  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, owner)
+       when is_binary(owner) and owner != "",
+       do: {:ok, {:user, owner}}
+
+  defp resolve_cli_as_user({:session, %{owner_user_id: owner}}, _other),
+    do: {:error, 403, "identity_not_yours", "this session belongs to #{owner}"}
+
+  defp decode_state_query(conn), do: decode_state_query_string(conn.query_string)
+
+  defp decode_state_query_string(""), do: {:ok, %{}}
+
+  defp decode_state_query_string(query_string) do
+    Enum.reduce_while(String.split(query_string, "&", trim: false), {:ok, %{}}, fn encoded,
+                                                                                   {:ok, query} ->
+      {raw_key, raw_value} =
+        case String.split(encoded, "=", parts: 2) do
+          [key, value] -> {key, value}
+          [key] -> {key, ""}
+        end
+
+      with {:ok, key} <- decode_state_query_part(raw_key),
+           {:ok, value} <- decode_state_query_part(raw_value) do
+        {:cont, {:ok, Map.update(query, key, [value], &[value | &1])}}
+      else
+        :error -> {:halt, {:error, 400, "malformed_query", nil}}
+      end
+    end)
+  end
+
+  defp decode_state_query_part(part) do
+    if Regex.match?(@state_malformed_percent_escape, part) do
+      :error
+    else
+      decoded = URI.decode_www_form(part)
+      if String.valid?(decoded), do: {:ok, decoded}, else: :error
+    end
+  rescue
+    ArgumentError -> :error
+  end
+
+  defp state_detail_request(query) do
+    if Enum.all?(Map.keys(query), &(&1 == "asUser")),
+      do: :ok,
+      else: {:error, 400, "invalid_filter", nil}
+  end
+
+  defp state_detail_envelope(resource, item_bytes) do
+    "{" <>
+      ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},"item":#{item_bytes}})
+  end
+
+  defp state_not_found(conn, resource, started_at) do
+    wait_for_state_not_found_floor(started_at + @state_not_found_floor_us)
+    state_error(conn, resource, 404, "not_found", nil)
+  end
+
+  defp wait_for_state_not_found_floor(deadline) do
+    remaining = deadline - System.monotonic_time(:microsecond)
+
+    cond do
+      remaining > 2_000 ->
+        Process.sleep(div(remaining, 1_000) - 1)
+        wait_for_state_not_found_floor(deadline)
+
+      remaining > 0 ->
+        wait_for_state_not_found_floor(deadline)
+
+      true ->
+        :ok
+    end
+  end
+
+  defp state_error(conn, resource, status, "identity_not_yours" = code, message) do
+    bytes =
+      "{" <>
+        ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},) <>
+        ~s("error":{"code":#{JSON.encode!(code)},"message":#{JSON.encode!(message)}}})
+
+    state_send(conn, status, bytes)
+  end
+
+  defp state_error(conn, resource, status, code, _message) do
+    bytes =
+      "{" <>
+        ~s("schemaVersion":1,"resource":#{JSON.encode!(resource)},) <>
+        ~s("error":{"code":#{JSON.encode!(code)}}})
+
+    state_send(conn, status, bytes)
+  end
+
+  defp state_send(conn, status, bytes) do
+    conn
+    |> Plug.Conn.put_resp_content_type("application/json")
+    |> Plug.Conn.put_resp_header("cache-control", "no-store")
+    |> Plug.Conn.send_resp(status, bytes)
+  end
+
+  defp state_catalog(conn) do
+    case deps(conn)[:model_catalog] || ModelCatalog do
+      catalog when is_map(catalog) -> catalog
+      server -> ModelCatalog.get(server)
+    end
+  end
+
+  defp d1_work_item_rows(conn, filters, principal) do
+    selections =
+      Enum.reduce(filters, [%{}], fn {field, values}, selections ->
+        for selection <- selections, value <- values, do: Map.put(selection, field, value)
+      end)
+
+    selections
+    |> Enum.flat_map(fn selection ->
+      selection =
+        case selection["isBug"] do
+          "true" -> Map.put(selection, "isBug", 1)
+          "false" -> Map.put(selection, "isBug", 0)
+          _ -> selection
+        end
+
+      StateResources.query_work_item(db(conn), selection, %{rest_principal: principal})
+    end)
+    |> Enum.uniq_by(& &1.id)
+    |> Enum.map(&StateResources.work_item/1)
+    |> Enum.sort_by(&[&1["createdAt"], &1["id"]])
+  end
+
+  defp d1_row_tuple(:work_items, item),
+    do: [Map.fetch!(item, "createdAt"), Map.fetch!(item, "id")]
+
+  defp d1_row_tuple(resource, item), do: D1Read.tuple(resource, item)
+  defp d1_encode(:work_items, item), do: StateResources.encode_item("work items", item, %{})
+  defp d1_encode(resource, item), do: D1Read.encode(resource, item)
+
+  defp d1_collection(conn, spec) do
+    with {:ok, auth} <- d1_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- d1_principal(auth, query, conn),
+         {:ok, request} <- d1_collection_request(query, spec),
+         {:ok, boundary} <- d1_boundary(request, principal, spec, conn) do
+      rows =
+        cond do
+          spec.resource == "work items" ->
+            d1_work_item_rows(conn, request.filters, principal)
+
+          D1Read.visible?(d1_resource(spec), principal.is_admin) ->
+            D1Read.collection(db(conn), deps(conn).base_dir, d1_resource(spec), request.filters)
+
+          true ->
+            []
+        end
+
+      {items, page} = d1_page(rows, boundary, request, principal, spec, conn)
+      d1_send(conn, 200, d1_collection_envelope(spec, items, page))
+    else
+      {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      d1_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d1_detail(conn, spec, id) do
+    with {:ok, auth} <- d1_bearer_auth(conn),
+         {:ok, query} <- d1_query(conn.query_string),
+         {:ok, principal} <- d1_principal(auth, query, conn),
+         :ok <- d1_detail_request(query),
+         true <- D1Read.visible?(d1_resource(spec), principal.is_admin),
+         item when not is_nil(item) <-
+           D1Read.detail(db(conn), deps(conn).base_dir, d1_resource(spec), id) do
+      d1_send(conn, 200, d1_detail_envelope(spec, item))
+    else
+      false -> d1_error(conn, spec.resource, 404, "not_found", nil)
+      nil -> d1_error(conn, spec.resource, 404, "not_found", nil)
+      {:error, status, code, message} -> d1_error(conn, spec.resource, status, code, message)
+    end
+  rescue
+    _error in [ArgumentError, KeyError, MatchError] ->
+      d1_error(conn, spec.resource, 500, "projection_invalid", nil)
+  end
+
+  defp d1_bearer_auth(conn) do
+    case Plug.Conn.get_req_header(conn, "authorization") do
+      ["Bearer " <> token] when token != "" ->
+        cond do
+          token == deps(conn).cli_token -> {:ok, :org}
+          session = Org.by_cli_token(db(conn), token) -> {:ok, {:session, session}}
+          device = Devices.by_token(db(conn), token) -> {:ok, {:device, device}}
+          true -> {:error, 401, "auth_failed", nil}
+        end
+
+      _ ->
+        {:error, 401, "auth_failed", nil}
+    end
+  end
+
+  defp d1_principal(:org, %{"asUser" => [user_id]}, conn) when user_id != "" do
+    {:ok, d1_user_principal(user_id, conn)}
+  end
+
+  defp d1_principal(:org, %{"asUser" => [_]}, _conn), do: {:error, 400, "invalid_message", nil}
+
+  defp d1_principal(:org, query, _conn) when not is_map_key(query, "asUser"),
+    do: {:error, 400, "invalid_message", nil}
+
+  defp d1_principal(:org, _query, _conn), do: {:error, 400, "invalid_as_user", nil}
+
+  defp d1_principal({:session, session}, query, conn) do
+    case Map.get(query, "asUser", []) do
+      [] ->
+        {:ok, %{kind: "session", id: session.session_key, is_admin: false}}
+
+      [user_id] when user_id == session.owner_user_id and user_id != "" ->
+        {:ok, d1_user_principal(user_id, conn)}
+
+      [_user_id] ->
+        {:error, 403, "identity_not_yours", "this session belongs to #{session.owner_user_id}"}
+
+      _repeated ->
+        {:error, 400, "invalid_as_user", nil}
+    end
+  end
+
+  defp d1_principal({:device, device}, query, _conn) do
+    if Map.has_key?(query, "asUser") do
+      {:error, 400, "invalid_as_user", nil}
+    else
+      {:ok, %{kind: "user", id: device.user_id, is_admin: device.is_admin}}
+    end
+  end
+
+  defp d1_user_principal(user_id, conn) do
+    is_admin = match?(%{is_admin: true}, Devices.user(db(conn), user_id))
+    %{kind: "user", id: user_id, is_admin: is_admin}
+  end
+
+  defp d1_query(""), do: {:ok, %{}}
+
+  defp d1_query(query_string) do
+    Enum.reduce_while(String.split(query_string, "&", trim: false), {:ok, %{}}, fn part,
+                                                                                   {:ok, query} ->
+      with [key, value] <- String.split(part, "=", parts: 2),
+           false <- Regex.match?(~r/%(?![0-9A-Fa-f]{2})/, key <> value),
+           key <- URI.decode_www_form(key),
+           value <- URI.decode_www_form(value),
+           true <- String.valid?(key) and String.valid?(value) do
+        {:cont, {:ok, Map.update(query, key, [value], &[value | &1])}}
+      else
+        _ -> {:halt, {:error, 400, "malformed_query", nil}}
+      end
+    end)
+  rescue
+    ArgumentError -> {:error, 400, "malformed_query", nil}
+  end
+
+  defp d1_detail_request(query) do
+    if Enum.all?(Map.keys(query), &(&1 == "asUser")),
+      do: :ok,
+      else: {:error, 400, "invalid_filter", nil}
+  end
+
+  defp d1_collection_request(query, spec) do
+    allowed = spec.filters ++ ~w(asUser before after limit)
+
+    with true <- Enum.all?(Map.keys(query), &(&1 in allowed)),
+         {:ok, before} <- d1_single(query, "before"),
+         {:ok, after_cursor} <- d1_single(query, "after"),
+         true <- is_nil(before) or is_nil(after_cursor),
+         {:ok, limit_value} <- d1_single(query, "limit"),
+         {:ok, limit} <- d1_limit(limit_value),
+         {:ok, filters} <- d1_filters(query, spec.filters, spec.resource) do
+      {:ok, %{before: before, after: after_cursor, limit: limit, filters: filters}}
+    else
+      _ -> {:error, 400, "invalid_filter", nil}
+    end
+  end
+
+  defp d1_single(query, key) do
+    case Map.get(query, key, []) do
+      [] -> {:ok, nil}
+      [value] -> {:ok, value}
+      _ -> :error
+    end
+  end
+
+  defp d1_limit(nil), do: {:ok, @d1_default_limit}
+
+  defp d1_limit(value) when is_binary(value) do
+    if value =~ ~r/^[1-9][0-9]*$/ do
+      {:ok, min(String.to_integer(value), @d1_max_limit)}
+    else
+      :error
+    end
+  end
+
+  defp d1_limit(_value), do: :error
+
+  defp d1_filters(query, fields, resource) do
+    fields
+    |> Enum.reduce_while({:ok, %{}}, fn field, {:ok, filters} ->
+      values = Map.get(query, field, [])
+
+      if Enum.all?(values, &d1_filter_value?(resource, field, &1)) do
+        next =
+          if values == [],
+            do: filters,
+            else: Map.put(filters, field, values |> Enum.uniq() |> Enum.sort())
+
+        {:cont, {:ok, next}}
+      else
+        {:halt, :error}
+      end
+    end)
+  end
+
+  defp d1_filter_value?("work items", "state", value),
+    do: value in ~w(open iceboxed closed failed)
+
+  defp d1_filter_value?("work items", "isBug", value), do: value in ~w(true false)
+  defp d1_filter_value?("work items", _field, value), do: is_binary(value) and value != ""
+  defp d1_filter_value?(_resource, field, value), do: d1_filter_value?(field, value)
+
+  defp d1_filter_value?("state", value), do: value in ~w(ready relearn_conflicted)
+  defp d1_filter_value?("status", value), do: value in ~w(available installed)
+  defp d1_filter_value?(_field, value), do: is_binary(value) and value != ""
+
+  defp d1_boundary(%{before: nil, after: nil}, _principal, _spec, _conn), do: {:ok, :latest}
+
+  defp d1_boundary(%{before: cursor} = request, principal, spec, conn) when is_binary(cursor),
+    do: d1_decode_cursor(cursor, "before", request, principal, spec, conn)
+
+  defp d1_boundary(%{after: cursor} = request, principal, spec, conn) when is_binary(cursor),
+    do: d1_decode_cursor(cursor, "after", request, principal, spec, conn)
+
+  defp d1_decode_cursor(cursor, direction, request, principal, spec, _conn) do
+    with {:ok, payload_bytes} <- Base.url_decode64(cursor, padding: false),
+         {:ok, payload} when is_map(payload) <- JSON.decode(payload_bytes),
+         true <- Enum.sort(Map.keys(payload)) == d1_cursor_keys(),
+         true <- payload["version"] == @d1_cursor_version,
+         true <- payload["route"] == spec.route and payload["resource"] == spec.resource,
+         true <-
+           payload["direction"] == direction and
+             payload["filters"] == d1_filter_fingerprint(request.filters),
+         true <-
+           payload["principalKind"] == principal.kind and payload["principalId"] == principal.id,
+         true <- d1_tuple?(payload["tuple"], d1_resource(spec)) do
+      {:ok, {String.to_atom(direction), payload["tuple"]}}
+    else
+      _ -> {:error, 400, "invalid_cursor", nil}
+    end
+  end
+
+  defp d1_tuple?([created_at, id], :work_items),
+    do: is_integer(created_at) and is_binary(id) and id != ""
+
+  defp d1_tuple?(_tuple, :work_items), do: false
+
+  defp d1_tuple?(tuple, resource),
+    do:
+      is_list(tuple) and length(tuple) == length(D1Read.spec(resource).order) and
+        Enum.all?(tuple, &(is_binary(&1) and &1 != ""))
+
+  defp d1_page(rows, boundary, request, principal, spec, conn) do
+    selected =
+      case boundary do
+        :latest ->
+          Enum.take(rows, -request.limit)
+
+        {:before, tuple} ->
+          rows
+          |> Enum.filter(&(d1_row_tuple(d1_resource(spec), &1) < tuple))
+          |> Enum.take(-request.limit)
+
+        {:after, tuple} ->
+          rows
+          |> Enum.filter(&(d1_row_tuple(d1_resource(spec), &1) > tuple))
+          |> Enum.take(request.limit)
+      end
+
+    tuples = Enum.map(selected, &d1_row_tuple(d1_resource(spec), &1))
+
+    page =
+      case tuples do
+        [] ->
+          d1_empty_page(rows, boundary, spec)
+
+        _ ->
+          oldest = hd(tuples)
+          newest = List.last(tuples)
+
+          %{
+            oldest: d1_cursor(oldest, "before", request.filters, principal, spec, conn),
+            newest: d1_cursor(newest, "after", request.filters, principal, spec, conn),
+            before: Enum.any?(rows, &(d1_row_tuple(d1_resource(spec), &1) < oldest)),
+            after: Enum.any?(rows, &(d1_row_tuple(d1_resource(spec), &1) > newest))
+          }
+      end
+
+    {selected, page}
+  end
+
+  defp d1_empty_page(rows, boundary, spec) do
+    {before_more, after_more} =
+      case boundary do
+        :latest ->
+          {false, false}
+
+        {:before, tuple} ->
+          {false, Enum.any?(rows, &(d1_row_tuple(d1_resource(spec), &1) >= tuple))}
+
+        {:after, tuple} ->
+          {Enum.any?(rows, &(d1_row_tuple(d1_resource(spec), &1) <= tuple)), false}
+      end
+
+    %{oldest: nil, newest: nil, before: before_more, after: after_more}
+  end
+
+  defp d1_cursor(tuple, direction, filters, principal, spec, _conn) do
+    payload =
+      JSON.encode!(%{
+        "version" => @d1_cursor_version,
+        "route" => spec.route,
+        "resource" => spec.resource,
+        "direction" => direction,
+        "filters" => d1_filter_fingerprint(filters),
+        "principalKind" => principal.kind,
+        "principalId" => principal.id,
+        "tuple" => tuple
+      })
+
+    Base.url_encode64(payload, padding: false)
+  end
+
+  defp d1_cursor_keys do
+    Enum.sort(~w(direction filters principalId principalKind resource route tuple version))
+  end
+
+  defp d1_filter_fingerprint(filters),
+    do:
+      filters
+      |> Enum.sort()
+      |> Enum.map(fn {field, values} -> [field, values] end)
+      |> JSON.encode!()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+  defp d1_resource(spec),
+    do:
+      Enum.find_value(@d1_resources, fn {resource, candidate} ->
+        if candidate == spec, do: resource
+      end)
+
+  defp d1_collection_envelope(spec, items, page) do
+    encoded_items = Enum.map_join(items, ",", &d1_encode(d1_resource(spec), &1))
+
+    "{\"schemaVersion\":1,\"resource\":" <>
+      JSON.encode!(spec.resource) <>
+      ",\"items\":[" <>
+      encoded_items <>
+      "],\"page\":{\"oldestCursor\":" <>
+      JSON.encode!(page.oldest) <>
+      ",\"newestCursor\":" <>
+      JSON.encode!(page.newest) <>
+      ",\"hasMoreBefore\":" <>
+      JSON.encode!(page.before) <> ",\"hasMoreAfter\":" <> JSON.encode!(page.after) <> "}}"
+  end
+
+  defp d1_detail_envelope(spec, item),
+    do:
+      "{\"schemaVersion\":1,\"resource\":" <>
+        JSON.encode!(spec.resource) <>
+        ",\"item\":" <> D1Read.encode(d1_resource(spec), item) <> "}"
+
+  defp d1_send(conn, status, body),
+    do:
+      conn
+      |> Plug.Conn.put_resp_content_type("application/json")
+      |> Plug.Conn.put_resp_header("cache-control", "no-store")
+      |> Plug.Conn.send_resp(status, body)
+
+  defp d1_error(conn, resource, status, code, nil),
+    do:
+      d1_send(
+        conn,
+        status,
+        "{\"schemaVersion\":1,\"resource\":" <>
+          JSON.encode!(resource) <> ",\"error\":{\"code\":" <> JSON.encode!(code) <> "}}"
+      )
+
+  defp d1_error(conn, resource, status, code, message),
+    do:
+      d1_send(
+        conn,
+        status,
+        "{\"schemaVersion\":1,\"resource\":" <>
+          JSON.encode!(resource) <>
+          ",\"error\":{\"code\":" <>
+          JSON.encode!(code) <> ",\"message\":" <> JSON.encode!(message) <> "}}"
+      )
+
   defp deps(conn), do: conn.private.tightbeam_deps
   defp db(conn), do: deps(conn)[:db] || Tightbeam.DB
   defp handlers(conn), do: Map.fetch!(deps(conn), :handlers)
@@ -404,12 +1261,13 @@ defmodule Tightbeam.Wire.Router do
     do: deps(conn)[:session_status] || (&Tightbeam.Gateway.session_status/1)
 
   defp cli_auth(conn) do
-    with :ok <- cli_version_compatible(conn) do
-      cli_token_auth(conn)
+    with {:ok, auth} <- cli_token_auth(conn),
+         :ok <- cli_version_compatible(conn, auth) do
+      {:ok, auth}
     end
   end
 
-  defp cli_version_compatible(conn) do
+  defp cli_version_compatible(conn, auth) do
     version =
       case Plug.Conn.get_req_header(conn, "x-tightbeam-cli-version") do
         [version] -> version
@@ -417,8 +1275,36 @@ defmodule Tightbeam.Wire.Router do
       end
 
     case CliCompatibility.check(version) do
-      :ok -> :ok
-      {:error, message} -> {:error, 426, "incompatible_cli", message}
+      :ok ->
+        observe_cli_compatibility(conn, auth, version, :compatible)
+
+      {:error, message} ->
+        case observe_cli_compatibility(conn, auth, version, :incompatible) do
+          :ok -> {:error, 426, "incompatible_cli", message}
+          error -> error
+        end
+    end
+  end
+
+  defp observe_cli_compatibility(_conn, :org, _offered, _state), do: :ok
+
+  defp observe_cli_compatibility(conn, {:session, session}, offered, state) do
+    required = CliCompatibility.required_version()
+    offered = if is_binary(offered), do: offered, else: "missing"
+
+    case ConditionFacts.observe_cli_compatibility(
+           db(conn),
+           session.session_key,
+           state,
+           offered,
+           required,
+           conn.request_path
+         ) do
+      {:error, _reason} ->
+        {:error, 503, "mismatch_state_unavailable", "CLI mismatch state could not be recorded"}
+
+      _ ->
+        :ok
     end
   end
 
@@ -443,6 +1329,58 @@ defmodule Tightbeam.Wire.Router do
       error -> error
     end
   end
+
+  defp terminal_session_auth(conn) do
+    case cli_token_auth(conn) do
+      {:ok, {:session, _session} = session} -> {:ok, session}
+      {:ok, :org} -> {:error, 403, "session_required", "a session token is required"}
+      error -> error
+    end
+  end
+
+  defp terminal_version_supported(conn) do
+    case Plug.Conn.get_req_header(conn, "x-tightbeam-terminal-version") do
+      ["1"] ->
+        :ok
+
+      _ ->
+        {:error, 400, "unsupported_terminal_protocol", "terminal protocol version 1 is required"}
+    end
+  end
+
+  defp terminal_surrender_call(session, body) when is_map(body) do
+    with :ok <- exact_terminal_body(body),
+         {:ok, assignment_id} <- required_string(body["assignmentId"]),
+         :ok <- terminal_disposition(body["disposition"]),
+         {:ok, note} <- required_string(body["note"]) do
+      {:ok,
+       %{
+         verb: "attest",
+         origin: "agent:terminal",
+         principal: {:session, session.session_key},
+         session_key: nil,
+         params: %{assignment_id: assignment_id, kind: "surrender", note: note},
+         terminal_surrender: true
+       }}
+    end
+  end
+
+  defp terminal_surrender_call(_session, _body),
+    do: {:error, 400, "invalid_terminal_request", "terminal request must be a JSON object"}
+
+  defp exact_terminal_body(body) do
+    if Map.keys(body) |> Enum.sort() == ["assignmentId", "disposition", "note"] do
+      :ok
+    else
+      {:error, 400, "invalid_terminal_request",
+       "terminal surrender accepts assignmentId, disposition, and note only"}
+    end
+  end
+
+  defp terminal_disposition("surrender"), do: :ok
+
+  defp terminal_disposition(_),
+    do: {:error, 400, "invalid_terminal_request", "disposition must be surrender"}
 
   defp device_auth(conn) do
     token =
@@ -589,7 +1527,7 @@ defmodule Tightbeam.Wire.Router do
   # `--session <key>` is a COHORT FILTER over creator identity, not a target, so
   # resolving it as one would turn a roster filter into a session-existence
   # oracle. Both verbs' selectors travel as ordinary body params.
-  @non_target_verbs ~w(transcript toplines topline)
+  @non_target_verbs ~w(answer return transcript execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list)
 
   # PRESENCE of the field, not the type of its value. `sessionKey: null` — and a
   # number, a boolean or an object — is still a caller volunteering a typed target
@@ -969,6 +1907,15 @@ defmodule Tightbeam.Wire.Router do
   defp error_status("unknown_assignment"), do: 404
   defp error_status("unknown_work_item"), do: 404
   defp error_status("server_error"), do: 500
+
+  defp error_status(code)
+       when code in [
+              "decision_request_integrity_invalid",
+              "decision_request_integrity_evidence_conflict",
+              "decision_request_integrity_evidence_unavailable"
+            ],
+       do: 500
+
   defp error_status(_), do: 400
 
   defp read_json(conn) do
@@ -1000,10 +1947,9 @@ defmodule Tightbeam.Wire.Router do
   end
 
   # SUBSTRATE-INTERNAL params, PER VERB: fields a client may not set on that verb
-  # because the substrate is their only legitimate author. `wake.assignmentId` is
-  # the wake's attribution CARRIER — a client-supplied one would forge
-  # wake -> turn -> trace attribution, which Law 0 forbids (cross-review F6), so
-  # it is stripped before the handler sees it.
+  # because the substrate is their only legitimate author. Ordinary notifications
+  # cannot supply wake attribution. Typed obligation waits name an assignment for
+  # the existing atomic admission checks; that reference is not authority.
   #
   # An operator ruling's transport provenance follows the same rule: the router
   # derives it from bearer authentication above, so `ruledViaSessionKey` cannot
@@ -1016,7 +1962,7 @@ defmodule Tightbeam.Wire.Router do
   # spec's "stripped from any agent/dispatch param map" is read as scoped to the
   # carrier it is written about, not to the parameter name everywhere.
   @substrate_only_params %{
-    "wake" => ~w(assignment_id request_ref)a,
+    "wake" => ~w(request_ref)a,
     "operator-rule" => ~w(ruled_via_session_key)a,
     "work-item-create" => ~w(created_in_turn_seq created_context_known)a,
     # The artifact's turn edge and the class of evidence behind it are the
@@ -1062,7 +2008,16 @@ defmodule Tightbeam.Wire.Router do
       {Map.get(aliases, atom, atom), value}
     end)
     |> Map.drop(Map.get(@substrate_only_params, verb, []))
+    |> strip_notification_assignment(verb)
   end
+
+  defp strip_notification_assignment(params, "wake") do
+    if params[:after_turn] == true or is_map(params[:predicate]),
+      do: params,
+      else: Map.delete(params, :assignment_id)
+  end
+
+  defp strip_notification_assignment(params, _verb), do: params
 
   defp json(conn, status, body) do
     data = JSON.encode!(wire_value(body))
@@ -1078,6 +2033,15 @@ defmodule Tightbeam.Wire.Router do
   end
 
   defp dispatch_error(conn, %{verb: "tune"}, status, result) do
+    json(conn, status, %{"error" => Map.delete(result, :ok)})
+  end
+
+  defp dispatch_error(conn, _call, status, %{code: code} = result)
+       when code in [
+              "decision_request_integrity_invalid",
+              "decision_request_integrity_evidence_conflict",
+              "decision_request_integrity_evidence_unavailable"
+            ] do
     json(conn, status, %{"error" => Map.delete(result, :ok)})
   end
 

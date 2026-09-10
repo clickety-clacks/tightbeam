@@ -40,6 +40,8 @@ defmodule Tightbeam.TestCase do
 
   @persistent_keys [
     Tightbeam.Rules,
+    {Tightbeam.Rules, :policies},
+    Tightbeam.RuleRuntime,
     Tightbeam.Rails,
     Tightbeam.Archetypes,
     {Tightbeam.Application, :draining}
@@ -53,7 +55,8 @@ defmodule Tightbeam.TestCase do
           catalog_reply: 1,
           catalog_reply: 2,
           catalog_probe_harness: 1,
-          ensure_all_schemas: 1
+          ensure_all_schemas: 1,
+          ensure_main_session: 2
         ]
     end
   end
@@ -62,6 +65,11 @@ defmodule Tightbeam.TestCase do
     assert_hermetic_tmp!()
     snapshot = snapshot()
     on_exit(fn -> restore(snapshot) end)
+
+    Tightbeam.Rules.load!(
+      Path.join(System.tmp_dir!(), "tightbeam-empty-rules-#{System.unique_integer([:positive])}"),
+      []
+    )
 
     # The ONE place the episode writer starts for tests. Not per-suite ceremony and
     # deliberately not lazy: call sites use the named process and a missing one is loud,
@@ -80,7 +88,51 @@ defmodule Tightbeam.TestCase do
   end
 
   @doc "Create the complete production schema for a unit-test database."
-  def ensure_all_schemas(db), do: Tightbeam.Schema.ensure_all(db)
+  def ensure_all_schemas(db) do
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    # The reviewed batching acceptance fixture was captured on main after the
+    # users provenance column landed. The 0.1.9 product schema does not own that
+    # unrelated feature, so expose only its harmless fixture column in tests.
+    {:ok, columns} = Tightbeam.DB.query(db, "PRAGMA table_info(users)")
+
+    if Enum.any?(columns, fn [_cid, name | _rest] -> name == "creationKind" end) do
+      :ok
+    else
+      Tightbeam.DB.execute(
+        db,
+        "ALTER TABLE users ADD COLUMN creationKind TEXT NOT NULL DEFAULT 'legacy'"
+      )
+    end
+  end
+
+  @doc "Create the canonical self-parented Main fixture for an owner when absent."
+  def ensure_main_session(db, owner) do
+    key = Tightbeam.Org.personal_session_key(owner)
+
+    case Tightbeam.Org.get(db, key) do
+      nil ->
+        Tightbeam.Org.create(db, %{
+          session_key: key,
+          display_name: "Main",
+          kind: "main",
+          is_built_in: true,
+          owner_user_id: owner,
+          origin: "user:#{owner}",
+          archetype: "default",
+          harness: "claude",
+          provider: "anthropic",
+          model: Tightbeam.Model.new("fable"),
+          host: "testhost"
+        })
+
+      %{kind: "main"} = session ->
+        session
+
+      session ->
+        raise "invalid Main fixture for #{owner}: #{inspect(session)}"
+    end
+  end
 
   @doc """
   Register satellite hosts the way the product does.

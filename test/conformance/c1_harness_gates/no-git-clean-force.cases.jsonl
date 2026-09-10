@@ -2,4 +2,6 @@
 {"case":"fd-clean-denied","kind":"positive","expect":"deny","reason":"no-git-clean-force","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git clean -fd\"}}"}
 {"case":"short-dry-run-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git clean -n\"}}"}
 {"case":"dry-run-clean-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git clean --dry-run\"}}"}
+{"case":"clean-short-help-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git clean -h\"}}"}
+{"case":"clean-long-help-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git clean --help\"}}"}
 {"case":"clean-denial-is-legible","kind":"legibility","expect":"deny","reason":"no-git-clean-force","emits":"gate:no-git-clean-force","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git clean --force\"}}"}

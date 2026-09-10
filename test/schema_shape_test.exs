@@ -1,40 +1,25 @@
-defmodule Tightbeam.SchemaShapeTest.FailingDb do
-  @moduledoc """
-  A `Tightbeam.DB` interposer that forwards everything to the real server and
-  fails ONE statement — the first whose SQL contains `fragment`.
-
-  It exists because an interrupted bootstrap cannot be simulated by building
-  its end state: the whole question is WHEN the stamp is written relative to
-  the tables, and that is only observable by stopping a real run in the middle.
-  """
-
+defmodule Tightbeam.SchemaShapeTest.LaneStub do
   use GenServer
 
-  def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
-
+  def start_link(name), do: GenServer.start_link(__MODULE__, :ok, name: name)
   @impl true
-  def init(opts), do: {:ok, Map.put(opts, :armed, true)}
-
+  def init(:ok), do: {:ok, :ok}
   @impl true
-  def handle_call(message, _from, state) do
-    if state.armed and holds?(message, state.fragment) do
-      {:reply, {:error, "interrupted"}, %{state | armed: false}}
-    else
-      {:reply, GenServer.call(state.db, message), state}
-    end
-  end
-
-  defp holds?(message, fragment) do
-    message |> Tuple.to_list() |> Enum.any?(&(is_binary(&1) and String.contains?(&1, fragment)))
-  end
+  def handle_call({:ensure_lane, _session_key}, _from, state), do: {:reply, :ok, state}
 end
 
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, DB, Schema}
+  alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, Wakes}
 
-  @shape "operator-decision-requests-v1"
+  @shape "firehose-r1-v1-019"
+  @row_driven_rules_shape "row-driven-rules-v1-019"
+  @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
+  @effort_request_exit_previous_shape "notice-batching-v1-019"
+  @notice_batching_pre_liveness_shape "notice-batching-pre-liveness-v1-019"
+  @terminal_decision_shape "terminal-operator-decision-parity-v1"
+  @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
   @be61_shape "model-identity-message-envelope-v2"
 
@@ -107,12 +92,85 @@ defmodule Tightbeam.SchemaShapeTest do
   )
   """
 
+  # Exact pre-A-R4 tables. Migration fixtures begin from a current in-memory
+  # database, so they must remove the current nullable columns before assigning
+  # an older shape stamp. The stamp remains the production migration authority.
+  @pre_row_driven_artifacts_ddl """
+  CREATE TABLE artifacts (
+    artifactId TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('spec','report','doc','data','other')),
+    title TEXT NOT NULL,
+    description TEXT,
+    createdBySession TEXT NOT NULL REFERENCES sessions(sessionKey),
+    workItemId TEXT NOT NULL REFERENCES work_items(id),
+    parentSession TEXT REFERENCES sessions(sessionKey),
+    originPath TEXT NOT NULL,
+    contentSha256 TEXT,
+    recordedMessageId TEXT REFERENCES messages(id),
+    recordedTurnEvidence TEXT NOT NULL DEFAULT 'none'
+      CHECK (recordedTurnEvidence IN ('tool-call-observed','session-concurrent','none')),
+    state TEXT NOT NULL DEFAULT 'in-workspace'
+      CHECK (state IN ('in-workspace','archived','released')),
+    home TEXT,
+    createdAt INTEGER NOT NULL,
+    updatedAt INTEGER NOT NULL,
+    CHECK ((state = 'archived') = (home IS NOT NULL))
+  )
+  """
+
+  @pre_row_driven_attests_ddl """
+  CREATE TABLE attests (
+    id TEXT PRIMARY KEY,
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    kind TEXT NOT NULL CHECK(kind IN ('progress', 'completion', 'surrender', 'verdict')),
+    verdictKind TEXT NULL,
+    note TEXT NULL CHECK(note IS NULL OR length(trim(note)) BETWEEN 1 AND 2000),
+    bySession TEXT NULL REFERENCES sessions(sessionKey),
+    byUser TEXT NULL REFERENCES users(userId),
+    producer TEXT NULL,
+    producerCommand TEXT NULL,
+    byHarness TEXT NULL,
+    byProvider TEXT NULL,
+    commitRefs TEXT NULL,
+    ts INTEGER NOT NULL,
+    CHECK(
+      (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
+       byUser IS NULL AND verdictKind IS NULL)
+      OR
+      (kind = 'verdict' AND verdictKind IS NOT NULL AND
+       ((bySession IS NOT NULL) != (byUser IS NOT NULL)))
+    ),
+    CHECK(producer IS NULL OR kind = 'verdict'),
+    CHECK(producerCommand IS NULL OR producer IS NOT NULL),
+    CHECK(byHarness IS NULL OR kind = 'verdict'),
+    CHECK(byProvider IS NULL OR kind = 'verdict')
+  )
+  """
+
+  # Historical tests start from captured pre-O2 bytes, not a relabeled current bootstrap.
+  defp load_admission_fixture(db) do
+    fixture = File.read!(Path.join(__DIR__, "fixtures/o2_admission_v1.sql"))
+
+    assert Base.encode16(:crypto.hash(:sha256, fixture), case: :lower) ==
+             "ad7de70a2a921045e5cb78075e3e87d08e821929b86b81b8ef5c479b3292af1e"
+
+    :ok = DB.execute(db, fixture)
+    :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+
+    assert {:ok, [["row-driven-admission-v1-019"]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    refute "noticeState" in table_columns(db, "rail_remedy_episodes")
+    :ok
+  end
+
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
     %{db: name}
   end
 
+  @tag firehose_final_stamp: true
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     assert "executionId" in table_columns(db, "command_executions")
@@ -136,8 +194,315 @@ defmodule Tightbeam.SchemaShapeTest do
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
   end
 
+  test "historical late-routing and successor markers require unique owning-row provenance", %{
+    db: db
+  } do
+    assert :ok = load_admission_fixture(db)
+
+    assert :ok =
+             DB.execute(
+               db,
+               "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('marker-a',0,1),('marker-b',0,1)"
+             )
+
+    for owner <- ["marker-a", "marker-b"] do
+      historical_session!(db, %{
+        session_key: owner,
+        display_name: owner,
+        owner_user_id: owner,
+        origin: "user:" <> owner,
+        archetype: "default",
+        harness: "claude",
+        provider: "anthropic",
+        model: Tightbeam.Model.new("fable"),
+        host: "testhost"
+      })
+    end
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt) VALUES
+               ('successor-good','historical successor','marker-a','marker-a',1),
+               ('successor-conflict','ambiguous successor','marker-a','marker-a',1);
+             INSERT INTO condition_facts(id,ts,kind,scope,origin) VALUES
+               (1,1,'operator-ruling-late-routed','late-good','process:tightbeam'),
+               (2,1,'assignment-successor-created','successor-good','process:tightbeam'),
+               (3,1,'operator-ruling-late-routed','missing-request','process:tightbeam'),
+               (4,1,'assignment-successor-created','missing-assignment','process:tightbeam'),
+               (5,1,'operator-ruling-late-routed','late-conflict','process:tightbeam'),
+               (6,1,'assignment-successor-created','successor-conflict','process:tightbeam'),
+               (7,1,'operator-ruling-late-routed','late-good','process:untrusted');
+             INSERT INTO decision_requests
+               (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
+                actionKey,question,options,context,status,decision,ruledBy,ruledAt,rulingFactId,ruledViaPrincipal,ruledViaSessionState)
+             VALUES
+               ('late-good','operator','session:marker-a','marker-a','marker-a',1,2,
+                'late-good','test','[]','{}','ruled','accept','user:marker-a',2,100,'user:marker-a','none'),
+               ('late-conflict','operator','session:marker-a','marker-a','marker-a',1,2,
+                'late-conflict','test','[]','{}','ruled','accept','user:marker-a',2,101,'user:marker-a','none'),
+               ('conflicting-late-owner','operator','session:marker-b','marker-b','marker-b',1,2,
+                'conflicting-late-owner','test','[]','{}','ruled','accept','user:marker-b',2,5,'user:marker-b','none'),
+               ('conflicting-successor-owner','operator','session:marker-b','marker-b','marker-b',1,2,
+                'conflicting-successor-owner','test','[]','{}','ruled','accept','user:marker-b',2,6,'user:marker-b','none');
+             """)
+
+    # These are real pre-upgrade condition wakes, with no fallback due during the test.
+    for {fact_id, kind, scope} <- [
+          {1, "operator-ruling-late-routed", "late-good"},
+          {2, "assignment-successor-created", "successor-good"},
+          {3, "operator-ruling-late-routed", "missing-request"},
+          {4, "assignment-successor-created", "missing-assignment"},
+          {5, "operator-ruling-late-routed", "late-conflict"},
+          {6, "assignment-successor-created", "successor-conflict"}
+        ],
+        owner <- ["marker-a", "marker-b"] do
+      assert {:ok, _} =
+               DB.query(
+                 db,
+                 """
+                 INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,
+                                   conditionKind,conditionScope,conditionAfterId)
+                 VALUES(?1,?2,'process:tightbeam','historical marker',?3,'pending',1,?4,?5,0)
+                 """,
+                 [
+                   "marker-#{fact_id}-#{owner}",
+                   owner,
+                   System.system_time(:millisecond) + 3_600_000,
+                   kind,
+                   scope
+                 ]
+               )
+    end
+
+    downgrade_row_driven_waits(db)
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok,
+            [[1, "marker-a"], [2, "marker-a"], [3, nil], [4, nil], [5, nil], [6, nil], [7, nil]]} =
+             DB.query(db, "SELECT id,ownerUserId FROM condition_facts ORDER BY id")
+
+    assert {:ok, [["3"], ["4"], ["5"], ["6"], ["7"]]} =
+             DB.query(
+               db,
+               "SELECT subject FROM lifecycle_events WHERE kind='condition_fact_owner_unattributed' ORDER BY subject"
+             )
+
+    for fact_id <- 1..7 do
+      assert {:ok, _} =
+               DB.transaction(db, fn txn ->
+                 Wakes.recognize_condition_fact_in_txn(txn, fact_id)
+               end)
+    end
+
+    for fact_id <- 1..6, owner <- ["marker-a", "marker-b"] do
+      wake_id = "marker-#{fact_id}-#{owner}"
+      expected = if fact_id in [1, 2] and owner == "marker-a", do: "fired", else: "pending"
+      assert Wakes.get(db, wake_id).state == expected
+      expected_turns = if expected == "fired", do: 1, else: 0
+
+      assert {:ok, [[^expected_turns]]} =
+               DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [wake_id])
+    end
+
+    # A second startup must not relabel ambiguous facts or duplicate recognition.
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM turns WHERE wakeId LIKE 'marker-%'"
+             )
+  end
+
+  test "the row-driven-rules predecessor scopes legacy facts without rewriting wake history", %{
+    db: db
+  } do
+    assert :ok = load_admission_fixture(db)
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('owner-a',0,1),('owner-b',0,1)"
+             )
+
+    historical_session!(db, %{
+      session_key: "owner-a-session",
+      display_name: "owner-a-session",
+      owner_user_id: "owner-a",
+      origin: "user:owner-a",
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable"),
+      host: "testhost"
+    })
+
+    historical_session!(db, %{
+      session_key: "owner-b-session",
+      display_name: "owner-b-session",
+      owner_user_id: "owner-b",
+      origin: "user:owner-b",
+      archetype: "default",
+      harness: "claude",
+      provider: "anthropic",
+      model: Tightbeam.Model.new("fable"),
+      host: "testhost"
+    })
+
+    assert %{name: "owner-a-role"} =
+             Tightbeam.Roles.create!(db, "owner-a-role", "owner-a", "owner-a-session")
+
+    # A role's current binding cannot prove who owned a historical agent-origin fact.
+    assert :ok = Tightbeam.Roles.bind(db, "owner-a-role", "owner-b-session")
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO condition_facts(id,ts,kind,scope,origin,ownerUserId) VALUES
+               (1,1,'legacy','user-scope','user:owner-b',NULL),
+               (2,2,'legacy','session-scope','session:owner-a-session',NULL),
+               (3,3,'legacy','system-scope','process:tightbeam',NULL),
+               (4,4,'legacy','agent-scope','agent:owner-a-role',NULL);
+             INSERT INTO wakes(wakeId,sessionKey,origin,prompt,dueAt,state,createdAt,conditionKind,conditionScope,conditionAfterId)
+             VALUES
+               ('w_pending','owner-a-session','agent:test','pending',100,'pending',1,'legacy','session-scope',2),
+               ('w_timed','owner-a-session','agent:test','timed',100,'pending',1,NULL,NULL,NULL),
+               ('w_fired','owner-a-session','agent:test','fired',1,'fired',1,NULL,NULL,NULL),
+               ('w_canceled','owner-a-session','agent:test','canceled',1,'canceled',1,NULL,NULL,NULL);
+             INSERT INTO wake_retry_attempts(wakeId,rootWakeId,attempt,outcome,observedAt)
+             VALUES('w_timed','w_timed',0,'pending',1);
+             """)
+
+    downgrade_row_driven_waits(db)
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [[1, "owner-b"], [2, "owner-a"], [3, nil], [4, nil]]} =
+             DB.query(db, "SELECT id,ownerUserId FROM condition_facts ORDER BY id")
+
+    assert {:ok,
+            [
+              ["w_canceled", "canceled"],
+              ["w_fired", "fired"],
+              ["w_pending", "pending"],
+              ["w_timed", "pending"]
+            ]} =
+             DB.query(db, "SELECT wakeId,state FROM wakes ORDER BY wakeId")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='condition_fact_owner_unattributed' AND subject='3'"
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               db,
+               "SELECT COUNT(*) FROM lifecycle_events WHERE kind='condition_fact_owner_unattributed' AND subject='4'"
+             )
+
+    assert {:ok, [["w_timed", "w_timed", 0, "pending", 1]]} =
+             DB.query(
+               db,
+               "SELECT wakeId,rootWakeId,attempt,outcome,observedAt FROM wake_retry_attempts"
+             )
+
+    scheduler = :"legacy_migration_scheduler_#{System.unique_integer([:positive])}"
+    parent = self()
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    start_supervised!({Tightbeam.SchemaShapeTest.LaneStub, Tightbeam.LaneManager})
+
+    start_supervised!(
+      {Wakes,
+       name: scheduler,
+       db: db,
+       tick_ms: 60_000,
+       deliver: fn wake ->
+         send(parent, {:legacy_migration_delivery, wake.wake_id})
+         :ok
+       end}
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:legacy_migration_delivery, "w_timed"}
+    assert Wakes.get(db, "w_pending").state == "fired"
+    assert Wakes.get(db, "w_timed").state == "fired"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='w_pending'")
+
+    assert :ok = stop_supervised(Wakes)
+
+    start_supervised!(
+      {Wakes,
+       name: scheduler,
+       db: db,
+       tick_ms: 60_000,
+       deliver: fn wake ->
+         send(parent, {:legacy_migration_delivery, wake.wake_id})
+         :ok
+       end}
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    refute_receive {:legacy_migration_delivery, "w_timed"}
+    assert {:ok, [[1]]} = DB.query(db, "SELECT COUNT(*) FROM turns WHERE wakeId='w_pending'")
+
+    assert {:ok,
+            [
+              ["w_canceled", "canceled"],
+              ["w_fired", "fired"],
+              ["w_pending", "fired"],
+              ["w_timed", "fired"]
+            ]} =
+             DB.query(db, "SELECT wakeId,state FROM wakes ORDER BY wakeId")
+  end
+
+  test "the exact effort-request predecessor gains nullable identity render stamps", %{db: db} do
+    assert :ok = load_admission_fixture(db)
+    downgrade_row_driven_rules(db)
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
+
+    assert {:ok, _rows} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               @identity_render_stamp_previous_shape
+             ])
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert "identityRenderContract" in table_columns(db, "sessions")
+    assert "identityGuidanceDigest" in table_columns(db, "sessions")
+  end
+
+  test "the exact pre-liveness notice stamp resumes without physical-shape inference", %{db: db} do
+    assert :ok = load_admission_fixture(db)
+    downgrade_row_driven_rules(db)
+    drop_liveness_activation(db)
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
+    assert :ok = DB.execute(db, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
+
+    assert {:ok, _rows} =
+             DB.query(db, "UPDATE schema_stamp SET shape=?1", [
+               @notice_batching_pre_liveness_shape
+             ])
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert "identityRenderContract" in table_columns(db, "sessions")
+    assert "identityGuidanceDigest" in table_columns(db, "sessions")
+    assert table?(db, "wake_cancellations")
+  end
+
+  for activated <- [false, true], boundary <- [1, 2, 3] do
+    test "activation=#{activated} survives restart after migration boundary #{boundary}" do
+      Tightbeam.SchemaShapeRuntimeFixture.run!("activation", %{
+        activated: unquote(activated),
+        boundary: unquote(boundary)
+      })
+    end
+  end
+
   test "model-identity-v1 migrates exact requests, messages, and wakes", %{db: db} do
-    :ok = Schema.ensure_all(db)
+    :ok = load_admission_fixture(db)
     downgrade_decision_requests_to_model_identity(db)
 
     :ok =
@@ -199,7 +564,8 @@ defmodule Tightbeam.SchemaShapeTest do
         "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
       )
 
-    {:ok, wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    {:ok, wakes_before} =
+      DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
 
     {:ok, messages_before} =
       DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
@@ -217,7 +583,14 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, [[nil], [nil]]} =
              DB.query(db, "SELECT ruledViaSessionKey FROM decision_requests ORDER BY id")
 
-    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert {:ok, ^wakes_before} =
+             DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
+
+    assert {:ok, [[nil, nil, nil, 0, 0], [nil, nil, nil, 0, 0]]} =
+             DB.query(
+               db,
+               "SELECT class, classElection, deliveryRule, digest, summon FROM wakes ORDER BY wakeId"
+             )
 
     assert {:ok, ^messages_before} =
              DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
@@ -262,10 +635,175 @@ defmodule Tightbeam.SchemaShapeTest do
                "SELECT #{model_identity_request_columns()} FROM decision_requests ORDER BY id"
              )
 
-    assert {:ok, ^wakes_before} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    assert {:ok, ^wakes_before} =
+             DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
 
     assert {:ok, ^messages_before} =
              DB.query(db, "SELECT #{model_identity_message_columns()} FROM messages ORDER BY seq")
+  end
+
+  test "operator-decision migration classifies the complete predecessor census once", %{db: db} do
+    :ok = load_admission_fixture(db)
+    downgrade_row_driven_rules(db)
+
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER decision_requests_terminal_insert_guard;
+      DROP TRIGGER decision_requests_terminal_update_guard;
+      PRAGMA ignore_check_constraints=ON;
+      INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES
+        (41,10,'escalation-ruled','dr_00000000-0000-4000-8000-000000000006','process:tightbeam'),
+        (42,11,'escalation-ruled','dr_00000000-0000-4000-8000-000000000007','process:tightbeam'),
+        (43,12,'escalation-ruled','dr_00000000-0000-4000-8000-000000000002','process:tightbeam'),
+        (44,13,'escalation-ruled','dr_00000000-0000-4000-8000-000000000004','process:tightbeam'),
+        (45,14,'escalation-ruled','dr_00000000-0000-4000-8000-000000000001','process:tightbeam'),
+        (46,15,'wrong-ruling-kind','dr_00000000-0000-4000-8000-000000000005','process:tightbeam');
+      INSERT INTO lifecycle_events (ts,kind,subject,detail) VALUES
+        (10,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000006',NULL),
+        (11,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000007',NULL),
+        (12,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000002',NULL),
+        (13,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000004',NULL),
+        (14,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000001',NULL),
+        (15,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000003',NULL),
+        (16,'decision_request_ruled','dr_00000000-0000-4000-8000-000000000005',NULL);
+      INSERT INTO decision_requests
+        (id,kind,raiserId,raiserSessionKey,ownerUserId,raisedAt,deadlineAt,
+         actionKey,question,options,context,status,decision,rationale,ruledBy,
+         ruledViaPrincipal,ruledViaSessionKey,ruledViaSessionState,ruledAt,
+         rulingFactId,consumedAt)
+      VALUES
+        ('dr_00000000-0000-4000-8000-000000000006','operator','agent:legacy','agent:legacy:session','mike',1,86400001,
+         'legacy-session','legacy session?','[{"label":"yes"}]','{}','ruled','yes',NULL,
+         'user:mike','user:mike','agent:presenter:legacy','known',10,41,NULL),
+        ('dr_00000000-0000-4000-8000-000000000007','operator','agent:legacy','agent:legacy:session','mike',2,86400002,
+         'legacy-no-session','legacy no session?','[{"label":"yes"}]','{}','ruled','yes',NULL,
+         'user:mike','user:mike',NULL,'none',11,42,NULL),
+        ('dr_00000000-0000-4000-8000-000000000002','operator','agent:legacy','agent:legacy:session','mike',3,86400003,
+         'missing-decision','missing decision?','[{"label":"yes"}]','{}','ruled',NULL,NULL,
+         'user:mike',NULL,NULL,NULL,12,43,NULL),
+        ('dr_00000000-0000-4000-8000-000000000004','operator','agent:legacy','agent:legacy:session','',4,86400004,
+         'missing-owner','missing owner?','[{"label":"yes"}]','{}','ruled','yes',NULL,
+         'user:',NULL,NULL,NULL,13,44,NULL),
+        ('dr_00000000-0000-4000-8000-000000000001','operator','agent:legacy','agent:legacy:session','mike',5,86400005,
+         'consumed','consumed?','[{"label":"yes"}]','{}','consumed','yes',NULL,
+         'user:mike',NULL,NULL,NULL,14,45,14),
+        ('dr_00000000-0000-4000-8000-000000000003','operator','agent:legacy','agent:legacy:session','mike',6,86400006,
+         'missing-fact','missing fact?','[{"label":"yes"}]','{}','ruled','yes',NULL,
+         'user:mike',NULL,NULL,NULL,15,999,NULL),
+        ('dr_00000000-0000-4000-8000-000000000005','operator','agent:legacy','agent:legacy:session','mike',7,86400007,
+         'wrong-fact','wrong fact?','[{"label":"yes"}]','{}','ruled','yes',NULL,
+         'user:mike',NULL,NULL,NULL,16,46,NULL),
+        ('dr_00000000-0000-4000-8000-000000000008','operator','agent:legacy','agent:legacy:session','mike',8,86400008,
+         'future-open','future open?','[{"label":"yes"}]','{}','open',NULL,NULL,
+         NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+      PRAGMA ignore_check_constraints=OFF;
+      DROP TABLE decision_request_integrity_evidence;
+      DROP TABLE decision_request_terminal_epoch;
+      ALTER TABLE decision_requests DROP COLUMN ruledViaPrincipal;
+      ALTER TABLE decision_requests DROP COLUMN ruledViaSessionState;
+      ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
+      ALTER TABLE sessions DROP COLUMN identityRenderContract;
+      UPDATE schema_stamp SET shape = '#{@operator_decision_shape}', stampedAt = 1;
+      """)
+
+    predecessor_columns =
+      "id, kind, raiserId, raiserSessionKey, ownerUserId, assignmentId, expecterSessionKey, expecterUserId, lineageRung, effortGeneration, deadlineWakeId, raisedAt, deadlineAt, statuteName, actionKey, question, options, context, status, decision, rationale, ruledBy, ruledViaSessionKey, ruledAt, rulingFactId, consumedAt, parkWakeId, withdrawnBy, withdrawnReason, withdrawnAt"
+
+    assert {:ok, before} =
+             DB.query(db, "SELECT #{predecessor_columns} FROM decision_requests ORDER BY id")
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [[0]]} = DB.query(db, "PRAGMA ignore_check_constraints")
+
+    assert {:ok, ^before} =
+             DB.query(db, "SELECT #{predecessor_columns} FROM decision_requests ORDER BY id")
+
+    assert {:ok, [[46, @terminal_decision_shape, @terminal_decision_shape, "process:tightbeam"]]} =
+             DB.query(
+               db,
+               "SELECT legacyRulingFactMaxId,schemaVersion,cause,principal FROM decision_request_terminal_epoch WHERE id=0"
+             )
+
+    call = %{origin: "user:mike", principal: {:user, "mike"}, params: %{}}
+
+    assert %{
+             ruling_attribution: %{
+               performer: %{
+                 principal: %{state: "legacy-unknown"},
+                 session: %{state: "known", key: "agent:presenter:legacy"}
+               }
+             }
+           } = Tightbeam.Escalation.get(db, call, "dr_00000000-0000-4000-8000-000000000006")
+
+    assert %{
+             ruling_attribution: %{
+               performer: %{
+                 principal: %{state: "legacy-unknown"},
+                 session: %{state: "legacy-unknown"}
+               }
+             }
+           } = Tightbeam.Escalation.get(db, call, "dr_00000000-0000-4000-8000-000000000007")
+
+    expected_invalid =
+      ~w(dr_00000000-0000-4000-8000-000000000001 dr_00000000-0000-4000-8000-000000000002 dr_00000000-0000-4000-8000-000000000003 dr_00000000-0000-4000-8000-000000000004 dr_00000000-0000-4000-8000-000000000005)
+
+    assert {:ok, evidence} =
+             DB.query(
+               db,
+               "SELECT requestId,firstSurface,observerPrincipal FROM decision_request_integrity_evidence ORDER BY requestId"
+             )
+
+    assert Enum.map(evidence, &hd/1) == expected_invalid
+
+    assert Enum.all?(evidence, fn [_id, surface, principal] ->
+             surface == "migration-preflight" and principal == "process:tightbeam"
+           end)
+
+    for id <-
+          ~w(dr_00000000-0000-4000-8000-000000000002 dr_00000000-0000-4000-8000-000000000003 dr_00000000-0000-4000-8000-000000000005 dr_00000000-0000-4000-8000-000000000001) do
+      assert %{code: "decision_request_integrity_invalid", request_id: ^id} =
+               Tightbeam.Escalation.get(db, call, id)
+    end
+
+    assert %{id: "dr_00000000-0000-4000-8000-000000000008", status: "open"} =
+             Tightbeam.Escalation.get(
+               db,
+               call,
+               "dr_00000000-0000-4000-8000-000000000008"
+             )
+
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[1, 5, @shape]]} =
+             DB.query(
+               db,
+               "SELECT (SELECT COUNT(*) FROM decision_request_terminal_epoch), (SELECT COUNT(*) FROM decision_request_integrity_evidence), (SELECT shape FROM schema_stamp)"
+             )
+
+    assert {:ok, _} =
+             DB.query(
+               db,
+               "INSERT INTO condition_facts (id,ts,kind,scope,origin) VALUES (47,17,'escalation-ruled','dr_00000000-0000-4000-8000-000000000008','process:tightbeam')"
+             )
+
+    assert {:error, future_error} =
+             DB.query(
+               db,
+               "UPDATE decision_requests SET status='ruled',decision='yes',ruledBy='user:mike',ruledAt=17,rulingFactId=47 WHERE id='dr_00000000-0000-4000-8000-000000000008'"
+             )
+
+    assert Exception.message(future_error) =~ "decision_request_integrity_invalid"
+
+    assert {:ok, [["open"]]} =
+             DB.query(
+               db,
+               "SELECT status FROM decision_requests WHERE id='dr_00000000-0000-4000-8000-000000000008'"
+             )
+  end
+
+  test "operator-decision migration survives a database-owner restart", %{db: _setup_db} do
+    Tightbeam.SchemaShapeRuntimeFixture.run!("operator", %{})
   end
 
   test "a failed exact migration rolls back the rename and stamp", %{db: db} do
@@ -334,6 +872,12 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert table_columns(db, "harness_health_assignments") ==
              ~w(incidentId assignmentId sessionKey)
+
+    assert table_columns(db, "turn_repair_attempts") ==
+             ~w(id repairKey sourceSeq attemptSeq assignmentId principal createdAt)
+
+    assert table_columns(db, "assignment_repair_attempts") ==
+             ~w(id assignmentId repairKey requestFingerprint action principal state resultJson createdAt completedAt)
 
     assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     assert :ok = Schema.ensure_all(db)
@@ -544,9 +1088,13 @@ defmodule Tightbeam.SchemaShapeTest do
     assert {:ok, []} = DB.query(db, "SELECT id FROM supervision_liveness_epoch")
   end
 
-  test "upgraded historical wake rows stay byte-stable and gain no inferred carrier", %{db: db} do
+  test "terminal-decision stamp without the historical liveness carrier refuses before mutation",
+       %{
+         db: db
+       } do
     assert :ok = Schema.ensure_all(db)
     drop_liveness_activation(db)
+    downgrade_wakes_to_terminal_decision(db)
 
     :ok =
       DB.execute(db, """
@@ -558,15 +1106,79 @@ defmodule Tightbeam.SchemaShapeTest do
         ('w_canceled','session-a','process:tightbeam','canceled',90,'canceled',12,NULL,92)
       """)
 
-    {:ok, before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
+    {:ok, before_rows} =
+      DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
+
+    error = assert_raise Schema.ShapeError, fn -> Schema.ensure_all(db) end
+
+    assert error.message =~ "migration #{@terminal_decision_shape} failed and was rolled back"
+    assert error.message =~ "wake_cancellations"
+
+    assert {:ok, ^before_rows} =
+             DB.query(db, "SELECT #{legacy_wake_columns()} FROM wakes ORDER BY wakeId")
+
+    refute table?(db, "wake_cancellations")
+    refute table?(db, "notice_batches")
+    assert {:ok, [[@terminal_decision_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+  end
+
+  test "the exact d483 terminal-liveness database migrates and survives restart", %{db: _db} do
+    Tightbeam.SchemaShapeRuntimeFixture.run!("d483", %{})
+  end
+
+  test "the exact notice-batching predecessor widens effort cancellation and preserves the stamp",
+       %{db: db} do
+    assert :ok = load_admission_fixture(db)
+    downgrade_row_driven_rules(db)
+
+    {:ok, [[current_ddl]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+      )
+
+    effort_arm =
+      ~r/\n\s+OR\n\s+\(workImpactKind = 'linked_work_open' AND livenessTriggerKind IS NULL AND\n\s+livenessTriggerId IS NULL AND actionNeeded = 0 AND\n\s+requesterKind = 'process' AND requesterId = 'tightbeam:effort-checkin' AND\n\s+reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND\n\s+dispositionKind = 'decision_request_transition' AND\n\s+causalSourceId = dispositionId\)/
+
+    predecessor_ddl = Regex.replace(effort_arm, current_ddl, "", global: false)
+    refute predecessor_ddl == current_ddl
+
+    refute predecessor_ddl =~
+             "reasonKind = 'obligation_disposed' AND causalSourceKind = 'decision_request' AND\n" <>
+               "      dispositionKind = 'decision_request_transition' AND\n" <>
+               "      causalSourceId = dispositionId)"
+
+    :ok =
+      DB.execute(db, """
+      DROP TRIGGER wakes_typed_cancellation_required;
+      DROP TRIGGER wake_cancellations_pending_insert;
+      ALTER TABLE wake_cancellations RENAME TO wake_cancellations_current;
+      #{predecessor_ddl};
+      DROP TABLE wake_cancellations_current;
+      ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
+      ALTER TABLE sessions DROP COLUMN identityRenderContract;
+      UPDATE schema_stamp
+        SET shape='#{@effort_request_exit_previous_shape}', stampedAt=1;
+      """)
+
+    assert {:ok, [[@effort_request_exit_previous_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert "identityRenderContract" in table_columns(db, "sessions")
+    assert "identityGuidanceDigest" in table_columns(db, "sessions")
 
-    assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes ORDER BY wakeId")
-    assert {:ok, []} = DB.query(db, "SELECT wakeId FROM wake_cancellations")
+    {:ok, [[migrated_ddl]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='wake_cancellations'"
+      )
 
-    assert {:ok, [[@shape]]} =
-             DB.query(db, "SELECT shape FROM schema_stamp")
+    assert migrated_ddl =~ "requesterId = 'tightbeam:effort-checkin'"
+
+    assert object_sql(db, "trigger", "wakes_typed_cancellation_required") =~
+             "pendingwakecancellationrequirestypedprovenance"
   end
 
   test "the real be61 decision-request shape is refused before it can be read", %{db: db} do
@@ -587,7 +1199,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @be61_shape
     assert error.message =~ @shape
 
-    assert error.message =~ "can migrate only #{@model_identity_shape} to #{@shape}"
+    assert error.message =~ @model_identity_shape
+    assert error.message =~ @operator_decision_shape
+    assert error.message =~ @terminal_decision_shape
+    assert error.message =~ @shape
 
     assert {:ok, [[@be61_shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
     refute "ruledViaSessionKey" in table_columns(db, "decision_requests")
@@ -675,6 +1290,36 @@ defmodule Tightbeam.SchemaShapeTest do
     assert error.message =~ @shape
   end
 
+  for activated <- [false, true] do
+    test "coverage admission predecessor survives restart, activated=#{activated}" do
+      Tightbeam.SchemaShapeRuntimeFixture.run!("coverage", %{activated: unquote(activated)})
+    end
+  end
+
+  defp historical_session!(db, row) do
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,createdAt,updatedAt)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,1)
+               """,
+               [
+                 row.session_key,
+                 row.display_name,
+                 row.owner_user_id,
+                 row.origin,
+                 row.archetype,
+                 row.harness,
+                 row.provider,
+                 row.model.family,
+                 row.host
+               ]
+             )
+
+    :ok
+  end
+
   defp table?(db, name) do
     {:ok, rows} =
       DB.query(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", [name])
@@ -683,6 +1328,8 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   defp downgrade_decision_requests_to_model_identity(db) do
+    downgrade_row_driven_rules(db)
+
     :ok =
       DB.execute(db, """
       DROP INDEX decision_requests_owner;
@@ -709,10 +1356,152 @@ defmodule Tightbeam.SchemaShapeTest do
       CREATE UNIQUE INDEX messages_client_dedupe
         ON messages (sessionKey, deviceId, clientMessageId)
         WHERE clientMessageId IS NOT NULL AND deviceId IS NOT NULL;
+      ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
+      ALTER TABLE sessions DROP COLUMN identityRenderContract;
       UPDATE schema_stamp SET shape = '#{@model_identity_shape}', stampedAt = 1;
       """)
 
     :ok
+  end
+
+  defp downgrade_row_driven_rules(db) do
+    downgrade_row_driven_waits(db)
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      :ok =
+        DB.execute(db, """
+        DROP TABLE attests;
+        DROP INDEX artifacts_producer;
+        DROP INDEX artifacts_work_item;
+        DROP INDEX artifacts_created_by_session;
+        DROP INDEX artifacts_recorded_message;
+        DROP TABLE artifacts;
+        #{@pre_row_driven_artifacts_ddl};
+        CREATE INDEX artifacts_work_item ON artifacts (workItemId);
+        CREATE INDEX artifacts_created_by_session ON artifacts (createdBySession);
+        CREATE INDEX artifacts_recorded_message ON artifacts (recordedMessageId);
+        #{@pre_row_driven_attests_ddl};
+        """)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp downgrade_row_driven_waits(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      # Captured verbatim from the reviewed G-B source, schema.ex:292 and :688.
+      prior_sidecar = File.read!(Path.join(__DIR__, "fixtures/row_wakes/sidecar-40bd6fc1.sql"))
+
+      :ok =
+        DB.execute(db, """
+        CREATE TEMP TABLE gc_sidecar_rows AS SELECT * FROM supervision_liveness_sidecar;
+        DROP TABLE supervision_liveness_sidecar;
+        #{prior_sidecar}
+        DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
+        INSERT INTO supervision_liveness_sidecar SELECT * FROM gc_sidecar_rows;
+        DROP TABLE gc_sidecar_rows;
+        """)
+
+      :ok =
+        DB.execute(db, """
+        ALTER TABLE effort_checkin_generations DROP COLUMN reliefStartedAt;
+        ALTER TABLE effort_checkin_generations DROP COLUMN reliefExcludedMs;
+        DROP INDEX wakes_wait_recognition;
+        DROP INDEX condition_facts_owner_match;
+        ALTER TABLE condition_facts DROP COLUMN ownerUserId;
+        ALTER TABLE wakes DROP COLUMN ownerUserId;
+        ALTER TABLE wakes DROP COLUMN obligationRef;
+        ALTER TABLE wakes DROP COLUMN waitMode;
+        ALTER TABLE wakes DROP COLUMN predicate;
+        ALTER TABLE wakes DROP COLUMN resolverKind;
+        ALTER TABLE wakes DROP COLUMN resolverId;
+        ALTER TABLE wakes DROP COLUMN resolverHolder;
+        ALTER TABLE wakes DROP COLUMN resolverAddressee;
+        ALTER TABLE wakes DROP COLUMN necessity;
+        ALTER TABLE wakes DROP COLUMN verificationAssignmentId;
+        ALTER TABLE wakes DROP COLUMN verificationHolderKey;
+        ALTER TABLE wakes DROP COLUMN selectedPolicyName;
+        ALTER TABLE wakes DROP COLUMN verificationState;
+        ALTER TABLE wakes DROP COLUMN verificationAttestId;
+        ALTER TABLE wakes DROP COLUMN verificationNoticeWakeId;
+        ALTER TABLE wakes DROP COLUMN originatingTurnSeq;
+        ALTER TABLE wakes DROP COLUMN recognitionAt;
+        ALTER TABLE wakes DROP COLUMN recognitionPath;
+        ALTER TABLE wakes DROP COLUMN recognitionReason;
+        ALTER TABLE wakes DROP COLUMN recognitionEvidence;
+        ALTER TABLE wakes DROP COLUMN recognitionDisposition;
+        ALTER TABLE wakes DROP COLUMN recognitionTransition;
+        ALTER TABLE attests DROP COLUMN waitId;
+        UPDATE schema_stamp SET shape='#{@row_driven_rules_shape}', stampedAt=1;
+        """)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp downgrade_wakes_to_terminal_decision(db) do
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+
+    try do
+      :ok =
+        DB.execute(db, """
+        DROP TABLE notice_batch_members;
+        DROP TABLE notice_batches;
+        DROP TABLE notice_delivery_policies;
+        DROP TABLE notice_batching_lane_policies;
+        DROP TABLE admin_projection_versions;
+        DROP INDEX wakes_due;
+        DROP INDEX wakes_delivery;
+        DROP INDEX wakes_condition;
+        DROP TABLE wakes;
+        CREATE TABLE wakes (
+          wakeId     TEXT PRIMARY KEY,
+          sessionKey TEXT NOT NULL,
+          targetRole TEXT,
+          origin     TEXT NOT NULL,
+          prompt     TEXT,
+          consumer   TEXT NOT NULL DEFAULT 'prompt',
+          dueAt      INTEGER NOT NULL,
+          state      TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','fired','canceled')),
+          createdAt  INTEGER NOT NULL,
+          firedAt    INTEGER,
+          reresolve  TEXT NULL CHECK (reresolve IN ('lineage')),
+          reresolveSeed TEXT NULL,
+          reresolveRung INTEGER NULL,
+          conditionKind TEXT NULL,
+          conditionScope TEXT NULL,
+          conditionAfterId INTEGER NULL,
+          firedBy TEXT NULL CHECK (firedBy IN ('condition','fallback')),
+          creatorSessionKey TEXT NULL,
+          rumination INTEGER NOT NULL DEFAULT 0,
+          work_item_id TEXT,
+          assignmentId TEXT,
+          canceledAt INTEGER,
+          targetGate INTEGER NOT NULL DEFAULT 1,
+          CHECK (consumer != 'prompt' OR prompt IS NOT NULL)
+        );
+        CREATE INDEX wakes_due ON wakes (state, dueAt);
+        CREATE INDEX wakes_condition ON wakes (state, conditionKind, conditionScope);
+        ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
+        ALTER TABLE sessions DROP COLUMN identityRenderContract;
+        UPDATE schema_stamp SET shape = '#{@terminal_decision_shape}', stampedAt = 1;
+        """)
+    after
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp legacy_wake_columns do
+    """
+    wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state,
+    createdAt, firedAt, reresolve, reresolveSeed, reresolveRung,
+    conditionKind, conditionScope, conditionAfterId, firedBy,
+    creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt,
+    targetGate
+    """
   end
 
   defp model_identity_request_columns do

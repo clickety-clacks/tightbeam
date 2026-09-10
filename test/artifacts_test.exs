@@ -2,7 +2,7 @@ defmodule Tightbeam.ArtifactsTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Artifacts, DB, Gateway, Ledger, Org, Projection, WorkItems}
+  alias Tightbeam.{Artifacts, Assignments, DB, Gateway, Ledger, Org, Projection, WorkItems}
 
   setup do
     db = :"artifacts_db_#{System.unique_integer([:positive])}"
@@ -11,6 +11,7 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = Projection.ensure_schema(db)
     :ok = WorkItems.ensure_schema(db)
     :ok = Ledger.ensure_schema(db)
+    :ok = Assignments.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
 
     parent = session(db, "parent", nil)
@@ -20,6 +21,297 @@ defmodule Tightbeam.ArtifactsTest do
     seed_running_turn(db, child.session_key)
 
     %{db: db, parent: parent, child: child}
+  end
+
+  alias Tightbeam.StateResources
+
+  @tag artifact_delta: true
+  test "canonical artifact projection rejects missing floors while hidden detail stays silent",
+       ctx do
+    assert :ok = Tightbeam.Assignments.ensure_schema(ctx.db)
+
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Private",
+        origin_path: "eezo:/tmp/private"
+      })
+
+    owner = %{kind: "user", id: "flynn", is_admin: false}
+    hidden = %{kind: "user", id: "outsider", is_admin: false}
+    admin = %{kind: "user", id: "admin", is_admin: true}
+
+    lookup = fn principal ->
+      StateResources.query_artifact(ctx.db, %{key: row.artifact_id, principal: principal})
+    end
+
+    canonical = StateResources.artifact(lookup.(owner))
+    assert StateResources.artifact(lookup.(admin)) == canonical
+    assert lookup.(hidden) == nil
+    assert Artifacts.get(ctx.db, row.artifact_id) == row
+    refute Map.has_key?(row, :row_version)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "DELETE FROM artifact_version_floors WHERE artifactId=?1", [
+               row.artifact_id
+             ])
+
+    assert lookup.(hidden) == nil
+
+    assert_raise ArgumentError, "artifact rowVersion is projection_invalid", fn ->
+      StateResources.artifact(lookup.(owner))
+    end
+
+    assert {:error, %ArgumentError{message: "artifact_projection_invalid: missing floor"}} =
+             DB.transaction(ctx.db, &Artifacts.reserve_version_in_txn(&1, row.artifact_id))
+
+    assert Artifacts.get(ctx.db, row.artifact_id) == row
+    assert {:ok, []} = DB.query(ctx.db, "SELECT * FROM artifact_version_floors")
+  end
+
+  @tag artifact_delta: true
+  test "filtered artifact notices preserve visibility and canonical ordered payloads", ctx do
+    alias Tightbeam.Firehose.Hub
+    start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "outsider",
+        is_admin: false
+      })
+
+    :ok =
+      Hub.subscribe(Hub, self(), "artifact", %{
+        "classes" => ["artifact."],
+        "sessionKey" => ctx.child.session_key,
+        "workItemId" => "wi_banana"
+      })
+
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Filtered",
+        origin_path: "eezo:/tmp/filtered"
+      })
+
+    refute_receive {:firehose_notice, _}
+    assert Hub.sequence(Hub, self()) == 0
+    :ok = Hub.register(Hub, self(), %{user_id: "flynn"})
+
+    :ok =
+      Hub.subscribe(Hub, self(), "wrong-work", %{
+        "classes" => ["artifact."],
+        "workItemId" => "wi_other"
+      })
+
+    assert :ok =
+             Artifacts.archive_session(
+               ctx.db,
+               ctx.child.session_key,
+               nil,
+               "/tmp/unused-artifact-archive"
+             )
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "artifact.released",
+                      "subscriptionId" => "artifact",
+                      "payload" => payload,
+                      "refs" => refs
+                    }}
+
+    assert refs["artifactId"] == row.artifact_id
+    assert refs["sessionKey"] == ctx.child.session_key
+
+    canonical =
+      StateResources.query_artifact(ctx.db, row.artifact_id) |> StateResources.artifact()
+
+    assert payload == canonical
+
+    assert StateResources.encode_item("artifacts", payload) ==
+             StateResources.encode_item("artifacts", canonical)
+
+    assert payload["rowVersion"] == 2
+    :ok = Hub.delivered(Hub, self())
+    refute_receive {:firehose_notice, _}
+    assert Hub.sequence(Hub, self()) == 1
+  end
+
+  @tag artifact_delta: true
+  test "local archive captures its own snapshot before a later release", ctx do
+    alias Tightbeam.Firehose.Hub
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+    base = Path.join(System.tmp_dir!(), "artifact-al-#{System.unique_integer([:positive])}")
+    workspace = Path.join(base, "work")
+    archive = Path.join(base, "archive")
+    File.mkdir_p!(workspace)
+    File.write!(Path.join(workspace, "report.md"), "retained")
+    on_exit(fn -> File.rm_rf(base) end)
+
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Snapshot",
+        origin_path: "report.md"
+      })
+
+    assert_receive {:firehose_notice, %{"class" => "artifact.recorded"}}
+    # Keep creation in flight while both lifecycle commits complete.
+    assert :ok = Artifacts.archive_session(ctx.db, ctx.child.session_key, workspace, archive)
+    archived = StateResources.query_artifact(ctx.db, row.artifact_id) |> StateResources.artifact()
+    assert archived["rowVersion"] == 2
+    assert File.read!(archived["home"]) == "retained"
+    assert Artifacts.release(ctx.db, row.artifact_id).state == "released"
+    :ok = Hub.delivered(Hub, self())
+    assert_receive {:firehose_notice, %{"class" => "artifact.archived", "payload" => ^archived}}
+    :ok = Hub.delivered(Hub, self())
+    assert_receive {:firehose_notice, %{"class" => "artifact.released", "payload" => released}}
+    assert released["rowVersion"] == 3
+    assert released["home"] == nil
+
+    assert released ==
+             StateResources.artifact(StateResources.query_artifact(ctx.db, row.artifact_id))
+
+    :ok = Hub.delivered(Hub, self())
+    assert Artifacts.release(ctx.db, row.artifact_id).state == "released"
+    refute_receive {:firehose_notice, _}
+  end
+
+  @tag artifact_delta: true
+  test "release contenders advance once despite a regressed clock and reject overflow", ctx do
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Race",
+        origin_path: "report.md"
+      })
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE artifacts SET state='archived', home='/tmp/owned-fixture', updatedAt=9223372036854775806 WHERE artifactId=?1",
+        [row.artifact_id]
+      )
+
+    tasks =
+      Enum.map(1..2, fn _ -> Task.async(fn -> Artifacts.release(ctx.db, row.artifact_id) end) end)
+
+    assert Enum.all?(Enum.map(tasks, &Task.await/1), &(&1.state == "released"))
+    assert StateResources.query_artifact(ctx.db, row.artifact_id).row_version == 2
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE artifact_version_floors SET rowVersion=9223372036854775807 WHERE artifactId=?1",
+        [row.artifact_id]
+      )
+
+    assert Artifacts.release(ctx.db, row.artifact_id).state == "released"
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE artifacts SET state='archived',home='/tmp/owned-fixture' WHERE artifactId=?1",
+        [row.artifact_id]
+      )
+
+    before = Artifacts.get(ctx.db, row.artifact_id)
+
+    assert_raise ArgumentError, "artifact_version_invalid_or_exhausted", fn ->
+      Artifacts.release(ctx.db, row.artifact_id)
+    end
+
+    assert Artifacts.get(ctx.db, row.artifact_id) == before
+  end
+
+  @tag artifact_delta: true
+  test "artifact floor and captured lifecycle notice advance independently of timestamp", ctx do
+    alias Tightbeam.Firehose.Hub
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Floor",
+        origin_path: "eezo:/tmp/external-artifact"
+      })
+
+    assert_receive {:firehose_notice, %{"class" => "artifact.recorded", "payload" => creation}}
+    assert creation["rowVersion"] == 1
+    :ok = Hub.delivered(Hub, self())
+    refute Map.has_key?(row, :row_version)
+
+    assert StateResources.artifact(StateResources.query_artifact(ctx.db, row.artifact_id)) ==
+             creation
+
+    assert :ok =
+             Artifacts.archive_session(
+               ctx.db,
+               ctx.child.session_key,
+               nil,
+               "/tmp/unused-artifact-archive"
+             )
+
+    assert_receive {:firehose_notice, %{"class" => "artifact.released", "payload" => released}}
+    assert released["rowVersion"] == 2
+    assert released["state"] == "released"
+    assert released["home"] == nil
+
+    assert StateResources.artifact(StateResources.query_artifact(ctx.db, row.artifact_id)) ==
+             released
+
+    before = Artifacts.get(ctx.db, row.artifact_id)
+    assert Artifacts.release(ctx.db, row.artifact_id) == before
+    assert StateResources.query_artifact(ctx.db, row.artifact_id).row_version == 2
+    refute_receive {:firehose_notice, _}
+
+    assert {:error, %RuntimeError{}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert Artifacts.reserve_version_in_txn(txn, row.artifact_id) == 3
+               raise "rollback"
+             end)
+
+    assert StateResources.query_artifact(ctx.db, row.artifact_id).row_version == 2
+  end
+
+  @tag artifact_delta: true
+  test "supported retained-row migration uses creation plus one and rejects exhausted seed",
+       ctx do
+    row =
+      record(ctx.db, ctx.child.session_key, %{
+        kind: "report",
+        title: "Legacy",
+        origin_path: "eezo:/tmp/legacy"
+      })
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE artifacts SET createdAt=500, updatedAt=600 WHERE artifactId=?1", [
+        row.artifact_id
+      ])
+
+    :ok = DB.execute(ctx.db, "DROP TABLE artifact_version_floors")
+    assert {:ok, :ok} = DB.transaction(ctx.db, &Artifacts.migrate_version_floors_in_txn/1)
+    assert StateResources.query_artifact(ctx.db, row.artifact_id).row_version == 501
+    assert Artifacts.get(ctx.db, row.artifact_id).updated_at == 600
+    :ok = DB.execute(ctx.db, "DROP TABLE artifact_version_floors")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE artifacts SET createdAt=9223372036854775807 WHERE artifactId=?1", [
+        row.artifact_id
+      ])
+
+    assert {:error, %ArgumentError{message: "artifact_version_seed_invalid"}} =
+             DB.transaction(ctx.db, &Artifacts.migrate_version_floors_in_txn/1)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT name FROM sqlite_master WHERE name='artifact_version_floors'"
+             )
   end
 
   test "records pointer provenance and supports exact AND filters newest first", ctx do
@@ -147,7 +439,7 @@ defmodule Tightbeam.ArtifactsTest do
     assert {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(artifacts)")
 
     assert Enum.map(columns, &Enum.at(&1, 1)) == ~w(
-             artifactId kind title description createdBySession workItemId parentSession
+             artifactId kind title description createdBySession workItemId producedByAssignmentId parentSession
              originPath contentSha256 recordedMessageId recordedTurnEvidence state home
              createdAt updatedAt
            )
@@ -189,6 +481,7 @@ defmodule Tightbeam.ArtifactsTest do
              MapSet.new([
                {"createdBySession", "sessions"},
                {"workItemId", "work_items"},
+               {"producedByAssignmentId", "assignments"},
                {"parentSession", "sessions"},
                {"recordedMessageId", "messages"}
              ])

@@ -13,13 +13,19 @@ defmodule Tightbeam.ConditionFacts do
   substrate is forbidden to assert an agent's judgment.
   """
 
-  alias Tightbeam.{DB, EventLog, Idempotency, Wakes}
+  alias Tightbeam.{DB, EventLog, Gateway, Idempotency, Wakes}
   alias Tightbeam.DB.Txn
 
   @reserved_kinds ~w(
-    quota-recovered escalation-ruled user-alerted user-alert-cleared credential-present
+    quota-recovered escalation-ruled operator-ruling-late-routed
+    assignment-successor-created user-alerted user-alert-cleared credential-present
     harness-auth-dead harness-auth-restored
     harness-rate-limit-dead harness-rate-limit-restored
+    harness-adapter-unavailable harness-adapter-restored
+    harness-model-unavailable harness-model-restored
+    harness-task-crash harness-task-restored
+    harness-interrupted-outcome-unknown harness-interrupted-outcome-reconciled
+    cli-incompatible cli-compatible
   )
   @agent_only_kinds ~w(work-blocked work-unblocked)
 
@@ -27,15 +33,32 @@ defmodule Tightbeam.ConditionFacts do
     "work-blocked" => "work-unblocked",
     "user-alerted" => "user-alert-cleared",
     "harness-auth-dead" => "harness-auth-restored",
-    "harness-rate-limit-dead" => "harness-rate-limit-restored"
+    "harness-rate-limit-dead" => "harness-rate-limit-restored",
+    "harness-adapter-unavailable" => "harness-adapter-restored",
+    "harness-model-unavailable" => "harness-model-restored",
+    "harness-task-crash" => "harness-task-restored",
+    "harness-interrupted-outcome-unknown" => "harness-interrupted-outcome-reconciled",
+    "cli-incompatible" => "cli-compatible"
   }
 
   @harness_health_kinds %{
     {"auth-dead", :assert} => "harness-auth-dead",
     {"auth-dead", :retract} => "harness-auth-restored",
     {"rate-limit-dead", :assert} => "harness-rate-limit-dead",
-    {"rate-limit-dead", :retract} => "harness-rate-limit-restored"
+    {"rate-limit-dead", :retract} => "harness-rate-limit-restored",
+    {"adapter_unavailable", :assert} => "harness-adapter-unavailable",
+    {"adapter_unavailable", :retract} => "harness-adapter-restored",
+    {"model_unavailable", :assert} => "harness-model-unavailable",
+    {"model_unavailable", :retract} => "harness-model-restored",
+    {"task_crash", :assert} => "harness-task-crash",
+    {"task_crash", :retract} => "harness-task-restored",
+    {"interrupted-outcome-unknown", :assert} => "harness-interrupted-outcome-unknown",
+    {"interrupted-outcome-unknown", :retract} => "harness-interrupted-outcome-reconciled"
   }
+  @harness_failure_classes ~w(
+    auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
+    interrupted-outcome-unknown
+  )
 
   @ddl """
   CREATE TABLE IF NOT EXISTS condition_facts (
@@ -43,10 +66,13 @@ defmodule Tightbeam.ConditionFacts do
     ts     INTEGER NOT NULL,
     kind   TEXT    NOT NULL,
     scope  TEXT,
-    origin TEXT    NOT NULL
+    origin TEXT    NOT NULL,
+    ownerUserId TEXT NULL
   );
   CREATE INDEX IF NOT EXISTS condition_facts_match
     ON condition_facts (kind, scope, id);
+  CREATE INDEX IF NOT EXISTS condition_facts_owner_match
+    ON condition_facts (ownerUserId, kind, scope, id);
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
@@ -54,14 +80,18 @@ defmodule Tightbeam.ConditionFacts do
 
   @spec file(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file(db, scheduler, input) do
-    result = transaction!(db, &file_in_txn(&1, input))
+    case DB.transaction_then(db, &file_in_txn(&1, input), fn txn, result ->
+           Tightbeam.Wakes.row_commit_in_txn(txn, [])
+           recognize_after_commit(txn, result)
+         end) do
+      {:ok, {result, deliveries}} ->
+        complete_deliveries(db, deliveries)
+        notify_scheduler(scheduler, result)
+        result
 
-    case result do
-      %{fact_id: fact_id} -> Wakes.fire_matching(scheduler, fact_id)
-      _ -> :ok
+      {:error, error} ->
+        raise error
     end
-
-    result
   end
 
   @spec file_in_txn(Txn.t(), map()) :: map() | {:error, map()}
@@ -70,22 +100,151 @@ defmodule Tightbeam.ConditionFacts do
     origin = Map.fetch!(input, :origin)
 
     case kind_authority(kind, origin) do
-      :ok -> file_admitted_in_txn(txn, kind, origin, input)
-      {:error, _} = error -> error
+      :ok ->
+        with :ok <- consequence_admission(txn, input) do
+          case consequence_replay(txn, input) do
+            :new -> file_admitted_in_txn(txn, kind, origin, input)
+            result -> result
+          end
+        end
+
+      {:error, _} = error ->
+        error
     end
   end
+
+  defp consequence_admission(txn, %{kind: "obligation-consequence-changed"} = input) do
+    payload = input[:payload]
+    scope = input[:scope]
+
+    fields =
+      ~w(assignmentId consequenceKey revision attentionRequestId evidenceAttestId explicitAttention)
+
+    shape = is_map(payload) and Enum.sort(Map.keys(payload)) == Enum.sort(fields)
+
+    valid =
+      shape and payload["assignmentId"] == scope and
+        Enum.all?(fields -- ["explicitAttention"], fn key ->
+          is_binary(payload[key]) and byte_size(payload[key]) > 0
+        end) and is_boolean(payload["explicitAttention"])
+
+    if valid do
+      rows =
+        Txn.q(
+          txn,
+          "SELECT holderKey, openedBySession, openedByUser FROM assignments WHERE id=?1 AND state='open'",
+          [scope]
+        )
+
+      authorized =
+        case {rows, input[:principal]} do
+          {[[holder, opener, _]], {:session, actor}} -> actor == holder or actor == opener
+          {[[_, _, owner]], {:user, actor}} -> actor == owner
+          _ -> false
+        end
+
+      evidence =
+        Txn.q(txn, "SELECT 1 FROM attests WHERE id=?1 AND assignmentId=?2", [
+          payload["evidenceAttestId"],
+          scope
+        ])
+
+      if authorized and evidence != [],
+        do: :ok,
+        else:
+          {:error,
+           %{
+             code: "not_authorized",
+             message: "consequence requires assignment authority and exact-assignment evidence"
+           }}
+    else
+      {:error, %{code: "invalid", message: "invalid consequence payload or assignment scope"}}
+    end
+  end
+
+  defp consequence_admission(_txn, input) do
+    if is_nil(input[:payload]),
+      do: :ok,
+      else: {:error, %{code: "invalid", message: "payload requires consequence kind"}}
+  end
+
+  defp consequence_replay(
+         txn,
+         %{kind: "obligation-consequence-changed", payload: payload} = input
+       ) do
+    rows =
+      Txn.q(
+        txn,
+        "SELECT id, payload FROM condition_facts WHERE kind=?1 AND scope=?2 AND payload IS NOT NULL ORDER BY id",
+        [input.kind, input.scope]
+      )
+
+    case Enum.find(rows, fn [_id, encoded] ->
+           stored = JSON.decode!(encoded)
+           stored["attentionRequestId"] == payload["attentionRequestId"]
+         end) do
+      [id, encoded] ->
+        if JSON.decode!(encoded) == payload,
+          do: fact_in_txn(txn, id),
+          else:
+            {:error,
+             %{
+               code: "conflict",
+               message: "attention request already has different immutable content"
+             }}
+
+      nil ->
+        same =
+          Enum.find(Enum.reverse(rows), fn [_id, encoded] ->
+            stored = JSON.decode!(encoded)
+
+            stored["consequenceKey"] == payload["consequenceKey"] and
+              stored["revision"] == payload["revision"]
+          end)
+
+        case {same, payload["explicitAttention"]} do
+          {[id, _], false} -> fact_in_txn(txn, id)
+          _ -> :new
+        end
+    end
+  end
+
+  defp consequence_replay(_txn, _input), do: :new
 
   defp file_admitted_in_txn(txn, kind, origin, input) do
     ts = System.system_time(:millisecond)
     scope = Map.get(input, :scope)
+    owner_user_id = Map.get(input, :owner_user_id) || owner_for_origin_in_txn(txn, origin)
 
-    Txn.q(
-      txn,
-      "INSERT INTO condition_facts (ts, kind, scope, origin) VALUES (?1, ?2, ?3, ?4)",
-      [ts, kind, scope, origin]
-    )
+    if payload = input[:payload] do
+      Txn.q(
+        txn,
+        "INSERT INTO condition_facts (ts, kind, scope, origin, ownerUserId, payload) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        [ts, kind, scope, origin, owner_user_id, JSON.encode!(payload)]
+      )
+    else
+      Txn.q(
+        txn,
+        "INSERT INTO condition_facts (ts, kind, scope, origin, ownerUserId) VALUES (?1, ?2, ?3, ?4, ?5)",
+        [ts, kind, scope, origin, owner_user_id]
+      )
+    end
 
     [[fact_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
+    if payload = input[:payload] do
+      [[encoded]] = Txn.q(txn, "SELECT reminderState FROM assignments WHERE id=?1", [scope])
+
+      state =
+        if is_nil(encoded), do: %{"version" => 1, "claimEpoch" => 0}, else: JSON.decode!(encoded)
+
+      state = Map.put(state, "currentConsequence", payload)
+
+      Txn.q(txn, "UPDATE assignments SET reminderState=?1 WHERE id=?2", [
+        JSON.encode!(state),
+        scope
+      ])
+    end
 
     EventLog.lifecycle_in_txn(
       txn,
@@ -94,43 +253,196 @@ defmodule Tightbeam.ConditionFacts do
       "kind=#{kind} scope=#{scope || "nil"} by=#{origin}"
     )
 
-    %{fact_id: fact_id, ts: ts, kind: kind, scope: scope, origin: origin}
+    fact = %{
+      fact_id: fact_id,
+      ts: ts,
+      kind: kind,
+      scope: scope,
+      origin: origin,
+      payload: input[:payload]
+    }
+
+    DB.record_row_commit(txn, condition_transition(fact, owner_user_id))
+    fact
   end
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file_idempotent(db, scheduler, input) do
-    {result, filed?} =
-      transaction!(db, fn txn ->
-        key = Map.get(input, :idempotency_key)
-        origin = Map.fetch!(input, :origin)
-
-        prior =
-          if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
-
-        if prior do
-          {fact_in_txn(txn, prior.session_key), false}
-        else
-          case file_in_txn(txn, input) do
-            %{fact_id: fact_id} = fact ->
-              if is_binary(key) do
-                Idempotency.put_in_txn(txn, %{
-                  owner_user_id: origin,
-                  operation: "condition",
-                  idempotency_key: key,
-                  session_key: to_string(fact_id)
-                })
-              end
-
-              {fact, true}
-
-            error ->
-              {error, false}
-          end
-        end
-      end)
-
-    if filed?, do: Wakes.fire_matching(scheduler, result.fact_id)
+    {result, _filed?} = file_idempotent_with_effect(db, scheduler, input)
     result
+  end
+
+  @doc false
+  def file_idempotent_with_effect(db, scheduler, input, firehose_call \\ nil) do
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             key = Map.get(input, :idempotency_key)
+             origin = Map.fetch!(input, :origin)
+
+             prior =
+               if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
+
+             outcome =
+               if prior do
+                 result =
+                   with :ok <- consequence_admission(txn, input) do
+                     fact = fact_in_txn(txn, prior.session_key)
+
+                     if input[:payload] &&
+                          (is_nil(fact) || fact.kind != input.kind || fact.scope != input[:scope] ||
+                             fact.payload != input[:payload]) do
+                       {:error,
+                        %{
+                          code: "conflict",
+                          message: "condition key already has different immutable content"
+                        }}
+                     else
+                       fact
+                     end
+                   end
+
+                 {result, false}
+               else
+                 # Typed semantic replay can return an existing fact without a wire key.
+                 [[before_id]] =
+                   Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
+
+                 case file_in_txn(txn, input) do
+                   %{fact_id: fact_id} = fact ->
+                     if is_binary(key) do
+                       Idempotency.put_in_txn(txn, %{
+                         owner_user_id: origin,
+                         operation: "condition",
+                         idempotency_key: key,
+                         session_key: to_string(fact_id)
+                       })
+                     end
+
+                     {fact, fact_id > before_id}
+
+                   error ->
+                     {error, false}
+                 end
+               end
+
+             case {outcome, firehose_call} do
+               {{%{fact_id: _} = fact, true}, %{} = call} ->
+                 Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, fact)
+
+               {{%{fact_id: _}, false}, %{} = call} ->
+                 Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+               _ ->
+                 :ok
+             end
+
+             outcome
+           end,
+           fn txn, {result, filed?} ->
+             Tightbeam.Wakes.row_commit_in_txn(txn, [])
+
+             if filed? do
+               {result, deliveries} = recognize_after_commit(txn, result)
+               {result, deliveries, true}
+             else
+               {result, [], false}
+             end
+           end
+         ) do
+      {:ok, {result, deliveries, filed?}} ->
+        complete_deliveries(db, deliveries)
+        if filed?, do: notify_scheduler(scheduler, result)
+        {result, filed?}
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
+  defp recognize_after_commit(txn, %{fact_id: fact_id} = fact) do
+    {fact, Wakes.recognize_condition_fact_in_txn(txn, fact_id)}
+  end
+
+  defp recognize_after_commit(_txn, result), do: {result, []}
+
+  @doc false
+  @spec recognize_in_txn(Txn.t(), pos_integer()) :: [term()]
+  def recognize_in_txn(%Txn{} = txn, fact_id) do
+    case fact_in_txn(txn, fact_id) do
+      %{fact_id: ^fact_id} = fact ->
+        {_fact, deliveries} = recognize_after_commit(txn, fact)
+        deliveries
+
+      _ ->
+        []
+    end
+  end
+
+  defp owner_for_origin_in_txn(txn, "user:" <> owner_user_id) do
+    case Txn.q(txn, "SELECT userId FROM users WHERE userId=?1", [owner_user_id]) do
+      [[^owner_user_id]] -> owner_user_id
+      _ -> nil
+    end
+  end
+
+  defp owner_for_origin_in_txn(txn, "session:" <> session_key) do
+    case Txn.q(
+           txn,
+           "SELECT s.ownerUserId FROM sessions s JOIN users u ON u.userId=s.ownerUserId WHERE s.sessionKey=?1",
+           [session_key]
+         ) do
+      [[owner_user_id]] -> owner_user_id
+      _ -> nil
+    end
+  end
+
+  defp owner_for_origin_in_txn(txn, "agent:" <> role) do
+    case Txn.q(
+           txn,
+           "SELECT s.ownerUserId FROM roles r JOIN sessions s ON s.sessionKey=r.boundSessionKey JOIN users u ON u.userId=s.ownerUserId WHERE r.name=?1",
+           [role]
+         ) do
+      [[owner_user_id]] -> owner_user_id
+      _ -> nil
+    end
+  end
+
+  defp owner_for_origin_in_txn(_txn, _origin), do: nil
+
+  @doc false
+  def complete_deliveries(db, deliveries) do
+    Enum.each(deliveries, fn delivery ->
+      try do
+        Gateway.complete_delivery(db, delivery)
+      catch
+        :exit, {:noproc, _call} -> :ok
+      end
+    end)
+
+    :ok
+  end
+
+  defp notify_scheduler(scheduler, %{fact_id: fact_id}),
+    do: Wakes.fire_matching(scheduler, fact_id)
+
+  defp notify_scheduler(_scheduler, _result), do: :ok
+
+  defp condition_transition(fact, owner_user_id) do
+    %{
+      verb: "condition",
+      domain: "condition_fact",
+      row_id: fact.fact_id,
+      owner_user_id: owner_user_id,
+      principal: fact.origin,
+      bindings: %{
+        conditionKind: fact.kind,
+        conditionScope: fact.scope,
+        conditionAfterId: fact.fact_id - 1,
+        conditionFactId: fact.fact_id
+      },
+      field: %{name: "id", old: nil, new: fact.fact_id}
+    }
   end
 
   @spec latest(DB.server(), String.t(), String.t() | nil) :: map() | nil
@@ -200,6 +512,50 @@ defmodule Tightbeam.ConditionFacts do
     match?([[^assert_kind]], rows)
   end
 
+  @doc "Record one authenticated CLI-version observation without fabricating an agent judgment."
+  @spec observe_cli_compatibility(
+          DB.server(),
+          String.t(),
+          :compatible | :incompatible,
+          String.t(),
+          String.t(),
+          String.t()
+        ) ::
+          :recorded | :cleared | :unchanged | {:error, term()}
+  def observe_cli_compatibility(db, session_key, state, offered, required, path)
+      when state in [:compatible, :incompatible] and is_binary(session_key) and is_binary(offered) and
+             is_binary(required) and is_binary(path) do
+    kind = if state == :compatible, do: "cli-compatible", else: "cli-incompatible"
+
+    case DB.transaction(db, fn txn ->
+           incompatible? = standing_in_txn?(txn, "cli-incompatible", session_key)
+
+           if (kind == "cli-incompatible" and incompatible?) or
+                (kind == "cli-compatible" and not incompatible?) do
+             :unchanged
+           else
+             fact =
+               file_in_txn(txn, %{
+                 kind: kind,
+                 scope: session_key,
+                 origin: "process:tightbeam"
+               })
+
+             EventLog.lifecycle_in_txn(
+               txn,
+               "cli_compatibility_observed",
+               to_string(fact.fact_id),
+               "session=#{session_key} offered=#{offered} required=#{required} path=#{path}"
+             )
+
+             if kind == "cli-incompatible", do: :recorded, else: :cleared
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @doc "The literal condition scope for one shared harness process."
   @spec harness_scope(String.t(), String.t()) :: String.t()
   def harness_scope(harness, host)
@@ -220,8 +576,22 @@ defmodule Tightbeam.ConditionFacts do
   @doc "Whether either distinct harness failure class currently stands."
   @spec harness_unavailable?(DB.server(), String.t(), String.t()) :: boolean()
   def harness_unavailable?(db, harness, host) do
-    Enum.any?(~w(auth-dead rate-limit-dead), fn failure_class ->
-      harness_failure_standing?(db, harness, host, failure_class)
+    Enum.any?(
+      @harness_failure_classes,
+      fn failure_class ->
+        harness_failure_standing?(db, harness, host, failure_class)
+      end
+    )
+  end
+
+  @doc "The transaction-owned form of the all-class harness availability gate."
+  @spec harness_unavailable_in_txn?(Txn.t(), String.t(), String.t()) :: boolean()
+  def harness_unavailable_in_txn?(%Txn{} = txn, harness, host) do
+    scope = harness_scope(harness, host)
+
+    Enum.any?(@harness_failure_classes, fn failure_class ->
+      assert_kind = Map.fetch!(@harness_health_kinds, {failure_class, :assert})
+      standing_in_txn?(txn, assert_kind, scope)
     end)
   end
 
@@ -254,11 +624,22 @@ defmodule Tightbeam.ConditionFacts do
   end
 
   defp fact_in_txn(txn, fact_id) do
-    case Txn.q(txn, "SELECT id, ts, kind, scope, origin FROM condition_facts WHERE id = ?1", [
-           fact_id
-         ]) do
-      [[id, ts, kind, scope, origin]] ->
-        %{fact_id: id, ts: ts, kind: kind, scope: scope, origin: origin}
+    case Txn.q(
+           txn,
+           "SELECT id, ts, kind, scope, origin, payload FROM condition_facts WHERE id = ?1",
+           [
+             fact_id
+           ]
+         ) do
+      [[id, ts, kind, scope, origin, payload]] ->
+        %{
+          fact_id: id,
+          ts: ts,
+          kind: kind,
+          scope: scope,
+          origin: origin,
+          payload: if(is_nil(payload), do: nil, else: JSON.decode!(payload))
+        }
 
       [] ->
         nil
@@ -285,13 +666,6 @@ defmodule Tightbeam.ConditionFacts do
 
       true ->
         :ok
-    end
-  end
-
-  defp transaction!(db, fun) do
-    case DB.transaction(db, fun) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
     end
   end
 end

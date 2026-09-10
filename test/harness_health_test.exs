@@ -195,6 +195,40 @@ defmodule Tightbeam.HarnessHealthTest do
     assert HarnessHealth.classify_turn_failure(%{"message" => "model not found"}) == nil
   end
 
+  test "captured terminal errors preserve every typed repair class" do
+    assert HarnessHealth.classify_turn_failure(%{"message" => "model unavailable"}) ==
+             "model_unavailable"
+
+    assert HarnessHealth.classify_turn_failure(%{code: "adapter_unavailable"}) ==
+             "adapter_unavailable"
+
+    assert HarnessHealth.classify_turn_failure(:task_crash) == "task_crash"
+
+    assert HarnessHealth.classify_turn_failure("interrupted: outcome unknown") ==
+             "interrupted-outcome-unknown"
+  end
+
+  test "each incident exposes its sanctioned repair route", ctx do
+    [member | _] = ctx.sessions
+
+    expected = %{
+      "adapter_unavailable" => "restart",
+      "model_unavailable" => "tune",
+      "task_crash" => "restart",
+      "interrupted-outcome-unknown" => "rerun"
+    }
+
+    Enum.each(expected, fn {failure_class, action} ->
+      assert {:opened, opened} =
+               HarnessHealth.observe(
+                 ctx.db,
+                 authoritative(member, failure_class, 50, "route-#{failure_class}")
+               )
+
+      assert HarnessHealth.get(ctx.db, opened.id).repair.action == action
+    end)
+  end
+
   test "provider invalidation emits one consolidated auth blocker while rate limiting emits none",
        ctx do
     main_key = ctx.main_session
@@ -353,6 +387,175 @@ defmodule Tightbeam.HarnessHealthTest do
              EventLog.lifecycle_events(ctx.db),
              &(&1.kind == "harness_health_auth_blocker")
            ) == 1
+  end
+
+  test "boot recovery commits the batch when an owner turn carries a child assignment", ctx do
+    [child, other | _] = ctx.sessions
+    owner = ctx.main_session
+
+    running =
+      for {key, assignment} <- [{owner, child.assignment}, {other.session, other.assignment}] do
+        {:ok, seq} =
+          Ledger.enqueue(ctx.db, %{
+            session_key: key,
+            message_id: "boot-running-#{key}",
+            origin: "process:tightbeam",
+            prompt: "interrupted",
+            assignment_id: assignment
+          })
+
+        {:ok, turn} = Ledger.claim_next(ctx.db, key, "old-lane")
+        assert turn.seq == seq
+
+        {:ok, queued} =
+          Ledger.enqueue(ctx.db, %{
+            session_key: key,
+            message_id: "boot-queued-#{key}",
+            origin: "process:tightbeam",
+            prompt: "later"
+          })
+
+        {key, assignment, seq, queued}
+      end
+
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    before_sessions = Map.new(running, fn {key, _, _, _} -> {key, Org.get(ctx.db, key)} end)
+
+    assert Enum.all?(before_sessions, fn {_, session} ->
+             session.mechanical_status == "running"
+           end)
+
+    recovered = Ledger.recover_running(ctx.db)
+    assert Enum.sort(recovered) == Enum.sort(Enum.map(running, &elem(&1, 2)))
+
+    notices =
+      for _ <- 1..2 do
+        assert_receive {:firehose_notice, notice}
+        Hub.delivered(hub, self())
+        notice
+      end
+
+    terminal_notices = Enum.filter(notices, &(&1["class"] == "turn.ended"))
+    assert length(terminal_notices) == 2
+    assert Enum.sort(Enum.map(terminal_notices, & &1["refs"]["turnSeq"])) == Enum.sort(recovered)
+
+    for {key, assignment, seq, _queued} <- running do
+      notice = Enum.find(terminal_notices, &(&1["refs"]["turnSeq"] == seq))
+      assert notice["refs"]["sessionKey"] == key
+      assert notice["refs"]["assignmentId"] == assignment
+      assert notice["payload"]["status"] == "failed_unknown"
+      assert Org.get(ctx.db, key).mechanical_status == "running"
+    end
+
+    # Queued successors keep both sessions running: no public state or version changes.
+    assert Enum.all?(notices, &(&1["class"] == "turn.ended"))
+
+    assert Map.new(running, fn {key, _, _, _} -> {key, Org.get(ctx.db, key)} end) ==
+             before_sessions
+
+    refute_receive {:firehose_notice, _}
+    assert Ledger.recover_running(ctx.db) == []
+    refute_receive {:firehose_notice, _}
+
+    for {key, assignment, seq, queued} <- running do
+      assert {:ok, [["failed_unknown", ^assignment, ended_at, error]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT status,assignmentId,endedAt,error FROM turns WHERE seq=?1",
+                 [seq]
+               )
+
+      assert is_integer(ended_at)
+      assert error == "interrupted: outcome unknown"
+      expected_assignment = if key == owner, do: nil, else: assignment
+
+      assert {:ok, [[^key, ^expected_assignment, nil]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT sessionKey,assignmentId,incidentId FROM harness_health_observations WHERE correlationId=?1",
+                 ["harness-turn:#{seq}:interrupted-outcome-unknown"]
+               )
+
+      {:ok, next} = Ledger.claim_next(ctx.db, key, "recovered-lane")
+      assert next.seq == queued
+
+      assert {:ok, true} =
+               DB.transaction(ctx.db, fn txn ->
+                 Ledger.finish_in_txn(txn, queued, "delivered", nil)
+               end)
+
+      assert Ledger.claim_next(ctx.db, key, "recovered-lane") == :none
+    end
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, """
+             SELECT count(*) FROM harness_health_observations h JOIN assignments a ON a.id=h.assignmentId
+             WHERE a.holderKey != h.sessionKey
+             """)
+  end
+
+  test "owner notification failure retains child cause without child health attribution", ctx do
+    [child | _] = ctx.sessions
+    owner = ctx.main_session
+    session = Org.get(ctx.db, owner)
+
+    for {suffix, reason} <- [
+          {"quota", @captured_codex_rate_limit},
+          {"provider", %{"data" => %{"details" => "auth expired"}}}
+        ] do
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: owner,
+          message_id: "owner-#{suffix}",
+          origin: "process:tightbeam",
+          prompt: "child result",
+          assignment_id: child.assignment
+        })
+
+      {:ok, later} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: owner,
+          message_id: "later-#{suffix}",
+          origin: "process:tightbeam",
+          prompt: "later delivery"
+        })
+
+      {:ok, turn} = Ledger.claim_next(ctx.db, owner, "owner-lane")
+      assert turn.seq == seq
+      turn = Map.put(turn, :session_key, owner)
+
+      assert {:ok, callback} =
+               DB.transaction(ctx.db, fn txn ->
+                 assert Ledger.finish_in_txn(txn, seq, "failed", "provider failure")
+                 HarnessHealth.observe_turn_failure_in_txn(txn, session, turn, :prompt, reason)
+               end)
+
+      if is_function(callback, 0), do: callback.()
+
+      assert {:ok, [["failed", child_assignment]]} =
+               DB.query(ctx.db, "SELECT status,assignmentId FROM turns WHERE seq=?1", [seq])
+
+      assert child_assignment == child.assignment
+
+      assert {:ok, [[^owner, nil]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT sessionKey,assignmentId FROM harness_health_observations WHERE correlationId=?1",
+                 ["harness-turn:#{seq}:#{HarnessHealth.classify_turn_failure(reason)}"]
+               )
+
+      {:ok, next} = Ledger.claim_next(ctx.db, owner, "owner-lane")
+      assert next.seq == later
+
+      assert {:ok, true} =
+               DB.transaction(ctx.db, fn txn ->
+                 Ledger.finish_in_txn(txn, later, "delivered", nil)
+               end)
+    end
   end
 
   test "failed-turn evidence and normal-turn recovery share their terminal CAS", ctx do

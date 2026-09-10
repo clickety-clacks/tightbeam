@@ -363,7 +363,11 @@ defmodule Tightbeam.CheckTierTest do
       Assignments.__handle__(
         ctx.db,
         "assign",
-        call("assign", {:user, "flynn"}, %{subject: "writing", idempotency_key: nil})
+        call("assign", {:user, "flynn"}, %{
+          subject: "writing",
+          idempotency_key: nil,
+          effect_kind: "coordination"
+        })
         |> Map.merge(%{session_key: "writer", target_role: nil, role_fallback: false})
       )
 
@@ -409,7 +413,11 @@ defmodule Tightbeam.CheckTierTest do
     Assignments.__handle__(
       ctx.db,
       "assign",
-      call("assign", {:user, "flynn"}, %{subject: subject, idempotency_key: nil})
+      call("assign", {:user, "flynn"}, %{
+        subject: subject,
+        idempotency_key: nil,
+        effect_kind: "coordination"
+      })
       |> Map.merge(%{session_key: "holder", target_role: nil, role_fallback: false})
     )
   end
@@ -430,7 +438,10 @@ defmodule Tightbeam.CheckTierTest do
     Assignments.__handle__(
       ctx.db,
       "revoke-assignment",
-      call("revoke-assignment", {:user, "flynn"}, %{assignment_id: assignment_id})
+      call("revoke-assignment", {:user, "flynn"}, %{
+        assignment_id: assignment_id,
+        reason: "tier disposition"
+      })
     )
   end
 

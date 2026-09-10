@@ -1,0 +1,12 @@
+[package]
+name = "topline_unicode"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["functions", "loadable_extension"] }
+unicode-normalization = "=0.1.23"

@@ -114,8 +114,8 @@ PASS, all of:
   it with the ssh destination, base dir, cli bin dir and adapter bin dir it reports
 - on the satellite, `<base_dir>/` exists with the adapter packages and a `tightbeam`
   executable at the recorded `cli_bin`
-- **no `auth/` contents were created and nothing was copied there.** Assimilation
-  does not carry credentials. Verify the gateway's own `auth/` files are unchanged
+- no credential file was created or copied. Assimilation does not carry
+  credentials. Verify every existing exact harness-home credential is unchanged
   by hash, and that the satellite has no credential it did not already have.
 
 There is exactly one host registry: `<base_dir>/hosts.json`, written only by
@@ -140,8 +140,9 @@ tightbeam onboard openai    --as-user <admin>     # codex
 tidiness rule — a credential that travels makes every host's blast radius the union
 of all hosts'.
 
-PASS: each provider reaches `onboarded`, and the credential file exists under the
-**satellite's** `<base_dir>/auth/<harness>/`. The gateway's auth store is unchanged.
+PASS: each provider reaches `onboarded`, and the credential file exists only under the
+**satellite's** `<base_dir>/homes/<machine>/<harness>/`. Other machines' harness
+homes are unchanged.
 
 WAIVER: if an authorization cannot be obtained, waive that harness **by name** with
 the blocker stated. The run verdict is then INCOMPLETE, which is honest. Do not

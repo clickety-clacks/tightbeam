@@ -157,6 +157,14 @@ defmodule Tightbeam.ConnRegistry do
         devices: Map.put(state.devices, device_id, %{ref: ref, gen: gen})
     }
 
+    if replaced do
+      Tightbeam.Firehose.Publisher.lifecycle(
+        "lifecycle.takeover",
+        %{device_id: device_id, user_id: conn.user_id, generation: gen},
+        %{"deviceId" => device_id, "userId" => conn.user_id}
+      )
+    end
+
     {:reply, {:ok, ref, replaced}, state}
   end
 

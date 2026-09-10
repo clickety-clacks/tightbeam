@@ -1,8 +1,12 @@
 name = "orchestrator"
-skills = ["feature-cycle", "work-tracking", "unblocking", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
+skills = ["worktree-session", "feature-cycle", "work-tracking", "unblocking", "spirit-review", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
 
 [guidance]
 text = """
+#include "golden-rule.md"
+
+#include "scope-and-architecture.md"
+
 #include "wisdom-core.md"
 
 #include "wisdom-meta.md"
@@ -10,8 +14,6 @@ text = """
 #include "engineering-tenets.md"
 
 #include "preferred-models.md"
-
-#include "model-policy.md"
 
 #include "orchestrator.md"
 """

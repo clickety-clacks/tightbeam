@@ -1116,6 +1116,72 @@ defmodule Tightbeam.Acp.AdapterTest do
              Enum.filter(captured_requests(capture_path), &(&1["method"] == "session/close"))
   end
 
+  test "Claude cold load sends isolated guidance before the first resumed prompt" do
+    # Adapter transport proof only. Pinned Claude 0.73.0 createSession forwards
+    # this append before query; warm guidance-only load is not a refresh.
+    for role <- ["coder", "reviewer"] do
+      {adapter, capture_path} = start_adapter(harness: :claude)
+      cwd = Path.dirname(capture_path)
+      model = Model.new("haiku")
+      mcp = [%{"name" => "local", "command" => "fixture-only", "args" => [], "env" => []}]
+      old = "old #{role} guidance"
+
+      guidance =
+        "#{role}: preserve product constraints\n" <> String.duplicate("bounded context\n", 1000)
+
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, model, cwd, mcp, old)
+      assert :ok = Adapter.close_session(adapter, "sess-1")
+      refute Adapter.knows_session?(adapter, "sess-1")
+
+      assert {:ok, %Model{family: "haiku", effort: nil}} =
+               Adapter.load_session(adapter, "sess-1", model, cwd, mcp, guidance)
+
+      assert Adapter.knows_session?(adapter, "sess-1")
+      assert {:ok, _} = Adapter.prompt(adapter, "sess-1", "hello")
+
+      requests = captured_requests(capture_path)
+
+      assert [created, closed, loaded, prompted] =
+               Enum.filter(
+                 requests,
+                 &(&1["method"] in [
+                     "session/new",
+                     "session/close",
+                     "session/load",
+                     "session/prompt"
+                   ])
+               )
+
+      assert created["meta"]["systemPrompt"]["append"] == old
+      assert closed["sessionId"] == "sess-1"
+      assert loaded["sessionId"] == "sess-1"
+      assert loaded["cwd"] == cwd
+      assert loaded["mcpServers"] == mcp
+
+      assert loaded["meta"] == %{
+               "systemPrompt" => %{
+                 "type" => "preset",
+                 "preset" => "claude_code",
+                 "append" => guidance
+               }
+             }
+
+      assert prompted["sessionId"] == "sess-1"
+      load_index = Enum.find_index(requests, &(&1["method"] == "session/load"))
+      prompt_index = Enum.find_index(requests, &(&1["method"] == "session/prompt"))
+      between = Enum.slice(requests, (load_index + 1)..(prompt_index - 1))
+
+      assert Enum.any?(
+               between,
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+             )
+
+      refute Enum.any?(requests, &(&1["method"] == "session/fork"))
+      other = if role == "coder", do: "reviewer:", else: "coder:"
+      refute loaded["meta"]["systemPrompt"]["append"] =~ other
+    end
+  end
+
   test "new_session and load_session still send an empty mcpServers list" do
     {a, capture_path} = start_adapter()
     assert {:ok, "sess-1"} = Adapter.new_session(a, Model.new("haiku"), "/tmp", [], "guidance")
@@ -1675,9 +1741,25 @@ defmodule Tightbeam.Acp.AdapterTest do
         :ok
       end)
 
+    credential_owner = Tightbeam.Credentials.server("testhost")
+    home = Tightbeam.Homes.home_path(base, "testhost", :codex)
+    metadata_dir = Path.join(home, ".tightbeam")
+    File.mkdir_p!(metadata_dir)
+
+    File.write!(
+      Path.join(metadata_dir, "credential.json"),
+      JSON.encode!(%{
+        "provider" => "openai",
+        "onboarded" => true,
+        "terminal" => false,
+        "kind" => "subscription",
+        "expires_at" => nil
+      })
+    )
+
     start_supervised!(
       {Tightbeam.Credentials,
-       name: Tightbeam.Credentials,
+       name: credential_owner,
        base_dir: base,
        machine: "testhost",
        park_edge: Tightbeam.CommandEdge.request_to(park_receiver)}
@@ -1720,7 +1802,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
 
     Process.demonitor(monitor, [:flush])
-    assert {:needs_onboarding, :revoked} = Tightbeam.Credentials.status(:openai)
+
+    assert {:needs_onboarding, :revoked} =
+             Tightbeam.Credentials.status(:openai, credential_owner)
+
     assert Process.alive?(adapter)
   end
 

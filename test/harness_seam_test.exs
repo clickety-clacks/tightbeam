@@ -40,7 +40,7 @@ defmodule Tightbeam.HarnessSeamTest do
     base_dir =
       Path.join(System.tmp_dir!(), "tightbeam-fixture-seam-#{System.unique_integer([:positive])}")
 
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Homes.home_path(base_dir, "testhost", :fixture)
     home = Homes.home_path(base_dir, "testhost", :fixture)
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -51,7 +51,7 @@ defmodule Tightbeam.HarnessSeamTest do
     assert {:ok, [%{family: "fixture-model", context: nil, provider: :fixture_provider}]} =
              Harness.Fixture.fetch_catalog(%{})
 
-    assert %{home_path: ^home, linked_auth_files: ["fixture.json"]} =
+    assert %{home_path: ^home} =
              Homes.project(base_dir, %{
                harness: :fixture,
                machine: "testhost",
@@ -60,8 +60,9 @@ defmodule Tightbeam.HarnessSeamTest do
 
     assert File.read!(Path.join(home, "durable-session")) == "unchanged"
 
-    assert File.read_link!(Path.join(home, "fixture.json")) ==
-             Path.join(auth_dir, "fixture.json")
+    assert File.read!(Path.join(home, "fixture.json")) == "fixture-token"
+    assert File.lstat!(Path.join(home, "fixture.json")).type == :regular
+    refute File.exists?(Path.join(base_dir, "auth"))
   end
 
   test "literal scan passes, fails on a scoped reintroduction, and wire projection has two consumers" do
@@ -157,7 +158,8 @@ defmodule Tightbeam.HarnessSeamTest do
     # REJECTED row was one environment's snapshot, not an account property.
     assert Enum.sort(selectable) ==
              Enum.sort(~w(default sonnet opus haiku fable claude-sonnet-5 claude-opus-4-8
-                          claude-haiku-4-5-20251001 claude-fable-5 claude-opus-5))
+                          claude-haiku-4-5-20251001 claude-fable-5 claude-opus-5
+                          claude-fable-5-1 claude-fable-5-1[1m]))
 
     # Values the adapter REFUSES must never appear here — listing one would make the
     # gateway offer a model the adapter cannot select. Fable left this list
@@ -169,7 +171,7 @@ defmodule Tightbeam.HarnessSeamTest do
                       claude-opus-4-6 claude-opus-4-5-20251101 claude-sonnet-4-5-20250929
                       claude-opus-4-1-20250805) do
       refute refused in selectable,
-             "#{refused} is refused by claude-agent-acp 0.66.0 and must not be listed " <>
+             "#{refused} is refused by claude-agent-acp 0.73.0 and must not be listed " <>
                "as selectable; if a newer adapter accepts it, re-probe and update the " <>
                "note in claude.ex together with the version stamp"
     end
@@ -178,7 +180,9 @@ defmodule Tightbeam.HarnessSeamTest do
     source = File.read!(Path.join(File.cwd!(), "lib/tightbeam/harness/claude.ex"))
     assert source =~ "claude CLI 2.1.220"
     assert source =~ "claude-agent-acp 0.59.0"
-    assert source =~ ~s(@adapter_version "0.66.0")
+    assert source =~ ~s(@adapter_version "0.73.0")
+    assert source =~ "SDK 0.3.257"
+    assert source =~ "Claude Code 2.1.257"
     assert source =~ "silent downgrade"
 
     # The codex half is PROBED now, and kind-scoped: the 2026-07-28 api-key
@@ -190,5 +194,13 @@ defmodule Tightbeam.HarnessSeamTest do
     assert source =~ "-32602"
     refute source =~ "come from one artifact and cannot diverge"
     refute source =~ "divergence is structurally unlikely"
+  end
+
+  test "claude 0.73.0 aliases select Fable 5.1 at both context widths" do
+    config = Tightbeam.Harness.Claude.session_config(%{}, "guidance")
+
+    assert config.model_option_aliases["fable"] == "claude-fable-5-1"
+    assert config.model_option_aliases["fable[1m]"] == "claude-fable-5-1[1m]"
+    assert Tightbeam.Harness.Claude.adapter_version() == "0.73.0"
   end
 end

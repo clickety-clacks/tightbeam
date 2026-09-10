@@ -39,6 +39,9 @@ defmodule Tightbeam.JobTraceTest do
         ('asg_direct', 'direct', 'holder', 'owner', 2, 'open', 'wi_trace'),
         ('asg_bad', 'invalid ref', 'holder', 'owner', 3, 'open', 'wi_trace');
 
+      INSERT INTO assignment_effects (assignmentId, effectKind)
+      VALUES ('asg_direct', 'policy'), ('asg_bad', 'policy');
+
       INSERT INTO assignments
         (id, subject, holderKey, openedBySession, openedAt, state, reviewsAssignmentId)
       VALUES ('asg_review', 'review', 'reviewer', 'reviewer', 4, 'open', 'asg_direct');
@@ -268,7 +271,10 @@ defmodule Tightbeam.JobTraceTest do
     end)
 
     remote_refs = [
-      %{"repo" => "remote-test:/srv/repo", "commit" => "0123456789abcdef"}
+      %{
+        "repo" => "remote-test:/srv/repo",
+        "commit" => "0123456789abcdef0123456789abcdef01234567"
+      }
     ]
 
     assert %{code: "not_holder"} =
@@ -286,7 +292,7 @@ defmodule Tightbeam.JobTraceTest do
     assert_received {:commit_ref_command, "ssh", args, [stderr_to_stdout: true]}
     assert "git@remote-test" in args
     assert List.last(args) =~ "/srv/repo"
-    assert List.last(args) =~ "0123456789abcdef^{commit}"
+    assert List.last(args) =~ "0123456789abcdef0123456789abcdef01234567^{commit}"
   end
 
   test "equal-time numeric turn ids sort numerically", %{db: db} do

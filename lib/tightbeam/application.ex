@@ -59,7 +59,7 @@ defmodule Tightbeam.Application do
   end
 
   defp start_tree(config) do
-    with {:ok, supervisor} <- Supervisor.start_link(children(), root_opts()) do
+    with {:ok, supervisor} <- Supervisor.start_link(children(config), root_opts()) do
       Enum.each(Tightbeam.Gateway.children_after_preflight(config), fn child ->
         {:ok, _pid} = Supervisor.start_child(supervisor, child)
       end)
@@ -149,16 +149,24 @@ defmodule Tightbeam.Application do
 
   @doc "The production child list (also started manually by the app test)."
   @spec children() :: [Supervisor.child_spec() | {module(), term()} | module()]
-  def children do
-    base_dir = Application.get_env(:tightbeam, :base_dir, default_base_dir())
-    File.mkdir_p!(base_dir)
+  def children, do: children(production_config())
+
+  @doc false
+  @spec children(Tightbeam.Gateway.config()) ::
+          [Supervisor.child_spec() | {module(), term()} | module()]
+  def children(config) do
+    base_dir = config.base_dir
     db_path = Path.join(base_dir, "state.db")
+
+    # Child-list construction never writes the base. DB admission precedes
+    # all startup writes; Boot loads Identity/law before schema/business recovery.
 
     [
       # DB owner first — the serialization seam everything writes through.
-      {Tightbeam.DB, path: db_path, name: Tightbeam.DB},
+      {Tightbeam.DB,
+       path: db_path, name: Tightbeam.DB, guard_inputs: Map.get(config, :guard_inputs, [])},
       # Schema + boot epoch as a transient one-shot after the DB is up.
-      {Tightbeam.Boot, base_dir},
+      {Tightbeam.Boot, config},
       # Lane naming registry and the task supervisor for turn work.
       {Registry, keys: :unique, name: Tightbeam.LaneRegistry},
       {Task.Supervisor, name: Tightbeam.TurnTaskSupervisor},
@@ -238,8 +246,11 @@ defmodule Tightbeam.Application do
   end
 
   defp production_config do
+    wake_tick_ms = Application.get_env(:tightbeam, :wake_tick_ms, 1_000)
+
     %{
       base_dir: Application.get_env(:tightbeam, :base_dir, default_base_dir()),
+      guard_inputs: Application.get_env(:tightbeam, :live_base_guard, []),
       cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
       # 11373: the Expanse's 1373 colonized worlds, plus one for Earth (Flynn's
       # port, agreed at project start). The code defaulted to 4321 long after the
@@ -255,12 +266,14 @@ defmodule Tightbeam.Application do
           Tightbeam.Model.new("claude-sonnet-5", effort: "medium")
         ),
       max_live_sessions_per_user: Application.get_env(:tightbeam, :max_live_sessions_per_user),
-      wake_tick_ms: Application.get_env(:tightbeam, :wake_tick_ms, 1_000),
+      wake_tick_ms: wake_tick_ms,
+      supervision_interval_ms:
+        Application.get_env(:tightbeam, :supervision_interval_ms, wake_tick_ms),
       prod_limit: Application.get_env(:tightbeam, :prod_limit, 3),
       escalation_decision_deadline_ms:
         Application.get_env(:tightbeam, :escalation_decision_deadline_ms, 86_400_000),
       effort_checkin_horizon_ms:
-        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 900_000),
+        Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 14_400_000),
       critical_lease_hard_cap_ms:
         Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000),
       onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000)
@@ -281,6 +294,12 @@ defmodule Tightbeam.Application do
         Application.get_env(:tightbeam, :drain_timeout_ms, 90_000)
 
     drain_until(deadline)
+
+    try do
+      Tightbeam.Firehose.Hub.shutdown()
+    catch
+      _, _ -> :ok
+    end
 
     # Clean-shutdown stamp MUST happen in prep_stop: stop/1 runs after the
     # supervision tree (and the DB) is already down, so stamping there would

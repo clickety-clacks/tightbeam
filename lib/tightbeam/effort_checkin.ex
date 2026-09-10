@@ -1,30 +1,39 @@
 defmodule Tightbeam.EffortCheckin do
   @moduledoc """
-  Event-driven effort-without-effect brackets for dispatched assignments.
+  Event-driven effort-without-effect brackets for assignments.
 
-  EFFECT is any of, since the bracket armed: writes in the workdir, an artifact
-  the holder recorded, an attest on the assignment, or an update to the
-  assignment's work item. Turns are effort, never effect — a spinning session
-  has turns. Git is a change-management system an org may or may not use; it is
-  never a requirement for observation, and work done elsewhere (another machine,
-  a service, a person) is surfaced by RECORDING AN ARTIFACT, not by probing for
-  it.
+  EFFECT is any of, since the bracket armed: an artifact the holder recorded for
+  the assignment's work item, an attest on the assignment, or an update to that
+  work item. Turns and workspace writes are effort, never effect. Work done
+  elsewhere (another machine, a service, a person) is surfaced by RECORDING AN
+  ARTIFACT on the card's work item.
 
-  Zero effect on every channel prods the AGENT first — one wake naming the four
+  Zero effect on every channel prods the AGENT first — one wake naming the three
   channels. Only continued silence at the next bracket escalates to the owner's
   decision request. Owners get decisions, not status.
 
-  Filesystem observation is performed before the callback transaction. The
-  transaction then CASes the exact generation/wake pair and either re-arms,
-  prods, or opens one parent-routed decision request with its durable deadline
-  wake.
+  A placement observation is prepared before the callback transaction for rearm
+  compatibility; it never counts as activity. The transaction then CASes the
+  exact generation/wake pair and either re-arms, prods, or opens one parent-routed
+  decision request with its durable deadline wake.
   """
 
-  alias Tightbeam.{CausalEvents, DB, Org, Placement, Supervision, Wakes}
+  alias Tightbeam.{
+    CausalEvents,
+    ConditionFacts,
+    DB,
+    Escalation,
+    Org,
+    Placement,
+    Supervision,
+    Wakes
+  }
+
   alias Tightbeam.DB.Txn
 
   @origin "process:tightbeam"
-  @default_horizon_ms 900_000
+  @default_horizon_ms 14_400_000
+  @default_priority 4
   @default_deadline_ms 86_400_000
 
   @ddl """
@@ -46,6 +55,8 @@ defmodule Tightbeam.EffortCheckin do
     artifactWatermark INTEGER NOT NULL DEFAULT 0,
     attestWatermark INTEGER NOT NULL DEFAULT 0,
     workItemWatermark INTEGER NOT NULL DEFAULT 0,
+    reliefStartedAt INTEGER,
+    reliefExcludedMs INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (assignmentId, generation)
   );
   CREATE INDEX IF NOT EXISTS effort_checkin_wake
@@ -53,7 +64,79 @@ defmodule Tightbeam.EffortCheckin do
   """
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- DB.execute(db, @ddl) do
+      Tightbeam.RuleRuntime.install_wait_relief(&apply_wait_relief_in_txn/4)
+    end
+  end
+
+  @doc false
+  def reconcile_wait_relief_in_txn(%Txn{} = txn, assignment_id, at) do
+    # One open interval per generation measures the union, even across restart.
+    # Wait transitions never replace the generation or its evidence cursors.
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT generation,wakeId,reliefStartedAt FROM effort_checkin_generations
+        WHERE assignmentId=?1 AND state='armed'
+        """,
+        [assignment_id]
+      )
+
+    if rows != [] do
+      qualifies = Wakes.effort_relief_in_txn?(txn, assignment_id)
+      apply_wait_relief_rows_in_txn(txn, assignment_id, at, qualifies, rows)
+    end
+
+    :ok
+  end
+
+  @doc false
+  def apply_wait_relief_in_txn(%Txn{} = txn, assignment_id, at, qualifies)
+      when is_boolean(qualifies) do
+    rows =
+      Txn.q(
+        txn,
+        "SELECT generation,wakeId,reliefStartedAt FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
+        [assignment_id]
+      )
+
+    apply_wait_relief_rows_in_txn(txn, assignment_id, at, qualifies, rows)
+    :ok
+  end
+
+  # Leaf accounting callback: the caller supplies a checked snapshot in this
+  # same transaction. This path never calls Wakes or re-enters qualification.
+  defp apply_wait_relief_rows_in_txn(txn, assignment_id, at, qualifies, rows) do
+    Enum.each(rows, fn [generation, wake_id, started] ->
+      cond do
+        qualifies and is_nil(started) ->
+          Txn.q(
+            txn,
+            "UPDATE effort_checkin_generations SET reliefStartedAt=?3 WHERE assignmentId=?1 AND generation=?2",
+            [assignment_id, generation, at]
+          )
+
+        not qualifies and is_integer(started) ->
+          elapsed = max(at - started, 0)
+
+          Txn.q(
+            txn,
+            "UPDATE effort_checkin_generations SET reliefStartedAt=NULL,reliefExcludedMs=reliefExcludedMs+?3 WHERE assignmentId=?1 AND generation=?2",
+            [assignment_id, generation, elapsed]
+          )
+
+          Txn.q(txn, "UPDATE wakes SET dueAt=dueAt+?2 WHERE wakeId=?1 AND state='pending'", [
+            wake_id,
+            elapsed
+          ])
+
+        true ->
+          :ok
+      end
+    end)
+  end
 
   @spec valid_workdir_root(term()) :: :ok | {:error, map()}
   def valid_workdir_root(nil), do: :ok
@@ -111,6 +194,64 @@ defmodule Tightbeam.EffortCheckin do
       )
 
     insert_generation(txn, config, assignment.id, session, root, baseline, generation, 1, 0)
+  end
+
+  @doc "Arm an assignment that has no dispatch-time workspace preparation."
+  @spec arm_in_txn(Txn.t(), map(), map()) :: map()
+  def arm_in_txn(%Txn{} = txn, config, assignment) do
+    session = session_in_txn(txn, assignment.holderKey)
+    root = unobserved_root(config, session)
+
+    [[generation]] =
+      Txn.q(
+        txn,
+        "SELECT COALESCE(MAX(generation), 0) + 1 FROM effort_checkin_generations WHERE assignmentId = ?1",
+        [assignment.id]
+      )
+
+    insert_generation(
+      txn,
+      config,
+      assignment.id,
+      session,
+      root,
+      {:error, "workspace activity is not a card activity channel"},
+      generation,
+      1,
+      0
+    )
+  end
+
+  @doc "Capture a fresh workspace baseline before reopening a monitored assignment."
+  @spec prepare_reopen_arm(DB.server(), map(), String.t()) :: map() | nil
+  def prepare_reopen_arm(db, config, assignment_id) do
+    case generation_for_assignment(db, assignment_id, :current) do
+      nil ->
+        nil
+
+      generation ->
+        session = Org.get(db, generation.holder_key)
+
+        %{
+          prior_generation: generation.generation,
+          arm: prepare_arm(config, session, relative_root(config, generation))
+        }
+    end
+  end
+
+  @doc "Arm a fresh inactivity generation when a formerly monitored assignment reopens."
+  @spec arm_reopened_in_txn(Txn.t(), map(), map(), map() | nil) :: :ok
+  def arm_reopened_in_txn(_txn, _config, _assignment, nil), do: :ok
+
+  def arm_reopened_in_txn(%Txn{} = txn, config, assignment, prepared) do
+    case current_generation(txn, assignment.id) do
+      %{generation: generation} when generation == prepared.prior_generation ->
+        arm_in_txn(txn, config, assignment, prepared.arm)
+        :ok
+
+      _ ->
+        raise "effort generation changed before reopen commit"
+    end
   end
 
   @doc "Capture monitored assignments on a holder against a destination placement."
@@ -172,8 +313,8 @@ defmodule Tightbeam.EffortCheckin do
     end)
   end
 
-  @spec cancel_in_txn(Txn.t(), String.t(), map()) :: :ok
-  def cancel_in_txn(%Txn{} = txn, assignment_id, command) do
+  @spec cancel_in_txn(Txn.t(), String.t(), map(), map()) :: :ok
+  def cancel_in_txn(%Txn{} = txn, assignment_id, command, row_context \\ %{}) do
     case current_generation(txn, assignment_id) do
       nil ->
         :ok
@@ -192,7 +333,7 @@ defmodule Tightbeam.EffortCheckin do
         :ok
     end
 
-    dispose_requests_in_txn(txn, assignment_id, command)
+    dispose_requests_in_txn(txn, assignment_id, command, row_context)
     :ok
   end
 
@@ -328,9 +469,13 @@ defmodule Tightbeam.EffortCheckin do
     request_id = call.params[:request_id] || call.params[:request]
     action = call.params[:action]
     request = request_row(db, request_id)
+    actor = actor_id(call.principal)
 
     cond do
       is_nil(request) ->
+        error("not_found", "decision request not found")
+
+      request.kind != "effort" and not visible_request?(db, call, request) ->
         error("not_found", "decision request not found")
 
       request.kind != "effort" ->
@@ -342,7 +487,12 @@ defmodule Tightbeam.EffortCheckin do
       not authorized?(call.principal, request) ->
         error("not_authorized", "current expecter required")
 
-      request.status == "ruled" and request.decision == action ->
+      request.status == "ruled" and request.decision == action and request.ruled_by == actor ->
+        {:ok, :ok} =
+          DB.transaction(db, fn txn ->
+            Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+          end)
+
         request
 
       request.status != "open" ->
@@ -364,17 +514,38 @@ defmodule Tightbeam.EffortCheckin do
             )
           end
 
-        case DB.transaction(db, fn txn ->
-               rule_in_txn(
-                 txn,
-                 config,
-                 request,
-                 action,
-                 call.origin,
-                 call.principal,
-                 fresh
-               )
-             end) do
+        case DB.transaction_then(
+               db,
+               fn txn ->
+                 before = request_for_id(txn, request.id)
+
+                 result =
+                   rule_in_txn(
+                     txn,
+                     config,
+                     request,
+                     action,
+                     actor,
+                     call.principal,
+                     fresh
+                   )
+
+                 if is_map(result) and not Map.has_key?(result, :code) do
+                   if before.status == "open" do
+                     snapshot = Escalation.raw_by_id_in_txn(txn, result.id)
+                     Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, snapshot)
+                   else
+                     Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+                   end
+                 end
+
+                 result
+               end,
+               fn txn, result ->
+                 Tightbeam.Wakes.row_commit_in_txn(txn, [])
+                 result
+               end
+             ) do
           {:ok, result} -> result
           {:error, error} -> raise error
         end
@@ -419,16 +590,39 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp probe_in_txn(txn, config, wake, inspection) do
+    reconcile_wait_relief_in_txn(txn, wake.assignment_id, now())
+
+    case Txn.q(
+           txn,
+           """
+           SELECT 1 FROM effort_checkin_generations g JOIN wakes w ON w.wakeId=g.wakeId
+           WHERE g.wakeId=?1 AND g.state='armed' AND
+             (g.reliefStartedAt IS NOT NULL OR (g.reliefExcludedMs>0 AND w.dueAt>?2))
+           """,
+           [wake.wake_id, now()]
+         ) do
+      [[1]] -> nil
+      [] -> probe_ready_in_txn(txn, config, wake, inspection)
+    end
+  end
+
+  defp probe_ready_in_txn(txn, config, wake, inspection) do
     case generation_for_wake_in_txn(txn, wake.wake_id) do
       %{state: "armed"} = generation ->
-        open? =
+        eligible? =
           Txn.q(
             txn,
-            "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'",
+            """
+            SELECT 1
+            FROM assignments AS a
+            LEFT JOIN work_items AS w ON w.id=a.workItemId
+            WHERE a.id=?1 AND a.state='open'
+              AND (a.workItemId IS NULL OR w.state!='iceboxed')
+            """,
             [generation.assignment_id]
           ) == [[1]]
 
-        if open? do
+        if eligible? do
           Txn.q(
             txn,
             "UPDATE effort_checkin_generations SET state = 'probed' WHERE assignmentId = ?1 AND generation = ?2 AND wakeId = ?3 AND state = 'armed'",
@@ -437,61 +631,90 @@ defmodule Tightbeam.EffortCheckin do
 
           if Txn.changes(txn) == 1 do
             mark_wake_fired(txn, wake.wake_id)
-            channels = channels(txn, generation, inspection)
             session = session_in_txn(txn, generation.holder_key)
 
-            if effect?(channels) do
+            if ConditionFacts.standing_in_txn?(
+                 txn,
+                 "work-blocked",
+                 generation.holder_key
+               ) do
               insert_generation(
                 txn,
                 config,
                 generation.assignment_id,
                 session,
                 generation.root,
-                inspection,
+                advanced_baseline(generation.baseline, inspection),
                 generation.generation + 1,
-                1,
-                0
+                generation.multiplier,
+                generation.agent_prodded
               )
 
               nil
             else
-              evidence = evidence(generation, channels)
+              channels = channels(txn, generation, inspection)
 
-              # The observation consumed this generation's stamp and laid the
-              # next one, so the row advances to it even when nothing moved:
-              # a later `continue` re-arms against a stamp that still exists.
-              Txn.q(
-                txn,
-                "UPDATE effort_checkin_generations SET evidence = ?3, baseline = ?4 WHERE assignmentId = ?1 AND generation = ?2",
-                [
-                  generation.assignment_id,
-                  generation.generation,
-                  JSON.encode!(evidence),
-                  encode_observation(advanced_baseline(generation.baseline, inspection))
-                ]
-              )
-
-              if generation.agent_prodded == 0 do
-                prod_holder_in_txn(txn, generation, evidence)
-
+              if effect?(channels) do
                 insert_generation(
                   txn,
                   config,
                   generation.assignment_id,
                   session,
                   generation.root,
-                  advanced_baseline(generation.baseline, inspection),
+                  inspection,
                   generation.generation + 1,
-                  generation.multiplier,
-                  1
+                  1,
+                  0
                 )
 
                 nil
               else
-                open_request_in_txn(txn, config, generation, evidence)
+                evidence = evidence(generation, channels)
+
+                # The observation consumed this generation's stamp and laid the
+                # next one, so the row advances to it even when nothing moved:
+                # a later `continue` re-arms against a stamp that still exists.
+                Txn.q(
+                  txn,
+                  "UPDATE effort_checkin_generations SET evidence = ?3, baseline = ?4 WHERE assignmentId = ?1 AND generation = ?2",
+                  [
+                    generation.assignment_id,
+                    generation.generation,
+                    JSON.encode!(evidence),
+                    encode_observation(advanced_baseline(generation.baseline, inspection))
+                  ]
+                )
+
+                if generation.agent_prodded == 0 do
+                  prod_holder_in_txn(txn, generation, evidence)
+
+                  insert_generation(
+                    txn,
+                    config,
+                    generation.assignment_id,
+                    session,
+                    generation.root,
+                    advanced_baseline(generation.baseline, inspection),
+                    generation.generation + 1,
+                    generation.multiplier,
+                    1
+                  )
+
+                  nil
+                else
+                  open_request_in_txn(txn, config, generation, evidence)
+                end
               end
             end
           end
+        else
+          mark_wake_fired(txn, wake.wake_id)
+
+          Txn.q(
+            txn,
+            "UPDATE effort_checkin_generations SET state='canceled' WHERE assignmentId=?1 AND generation=?2 AND wakeId=?3 AND state='armed'",
+            [generation.assignment_id, generation.generation, wake.wake_id]
+          )
         end
 
       _ ->
@@ -591,12 +814,16 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  defp rule_in_txn(txn, config, request, action, origin, principal, fresh) do
+  defp rule_in_txn(txn, config, request, action, actor, principal, fresh) do
     current = request_for_id(txn, request.id)
 
     cond do
       not authorized?(principal, current) ->
         error("not_authorized", "current expecter required")
+
+      current.status == "ruled" and current.decision == action and
+          current.ruled_by == actor ->
+        current
 
       action == "dismiss" and
           not prepared_rearms_current?(
@@ -616,11 +843,16 @@ defmodule Tightbeam.EffortCheckin do
         Txn.q(
           txn,
           "UPDATE decision_requests SET status = 'ruled', decision = ?2, ruledBy = ?3, ruledAt = ?4 WHERE id = ?1 AND status = 'open'",
-          [current.id, action, origin, ruled_at]
+          [current.id, action, actor, ruled_at]
         )
 
         if Txn.changes(txn) == 1 do
           ruled = request_for_id(txn, current.id)
+
+          DB.record_row_commit(
+            txn,
+            decision_transition(current, "open", "ruled", actor, "effort-rule")
+          )
 
           cancel_pending_wake_in_txn!(
             txn,
@@ -628,7 +860,7 @@ defmodule Tightbeam.EffortCheckin do
             decision_disposition_command(
               txn,
               ruled,
-              liveness_trigger_in_txn!(txn, ruled.assignment_id)
+              decision_liveness_trigger_in_txn(txn, ruled.assignment_id)
             )
           )
 
@@ -666,7 +898,12 @@ defmodule Tightbeam.EffortCheckin do
 
           request_for_id(txn, current.id)
         else
-          error("not_open", "decision request is not open")
+          winner = request_for_id(txn, current.id)
+
+          if winner.status == "ruled" and winner.decision == action and
+               winner.ruled_by == actor,
+             do: winner,
+             else: error("not_open", "decision request is not open")
         end
 
       true ->
@@ -718,7 +955,6 @@ defmodule Tightbeam.EffortCheckin do
         deadline_at,
         "Assignment #{generation.assignment_id} effort check-in outcome: #{evidence.outcome}. " <>
           "The holder was prodded and stayed silent. Channels checked since arm — " <>
-          "workspace writes: #{evidence.channels.writes} (#{evidence.workspace}); " <>
           "artifacts recorded: #{evidence.channels.artifacts}; " <>
           "attests: #{evidence.channels.attests}; " <>
           "work-item updates: #{evidence.channels.workItems}. " <>
@@ -783,7 +1019,7 @@ defmodule Tightbeam.EffortCheckin do
          agent_prodded
        ) do
     armed_at = now()
-    horizon = horizon_ms(config)
+    horizon = horizon_ms(txn, config, assignment_id)
 
     [[watermark]] =
       Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE sessionKey = ?1", [
@@ -833,36 +1069,74 @@ defmodule Tightbeam.EffortCheckin do
       ]
     )
 
+    reconcile_wait_relief_in_txn(txn, assignment_id, armed_at)
     generation_for_assignment_in_txn(txn, assignment_id, generation)
   end
 
-  defp supersede_requests_in_txn(txn, assignment_id, command) do
-    wake_ids =
-      Txn.q(
-        txn,
-        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-        [assignment_id]
-      )
-      |> List.flatten()
+  @doc "Apply a work-item priority change to its inherited assignment priorities and live probes."
+  @spec reprioritize_work_item_in_txn(Txn.t(), map(), String.t(), integer()) :: :ok
+  def reprioritize_work_item_in_txn(%Txn{} = txn, config, work_item_id, priority) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO assignment_priorities (assignmentId, priority)
+      SELECT id, ?2 FROM assignments WHERE workItemId=?1
+      ON CONFLICT(assignmentId) DO UPDATE SET priority=excluded.priority
+      """,
+      [work_item_id, priority]
+    )
+
+    horizon = horizon_for_priority(txn, config, priority)
 
     Txn.q(
       txn,
-      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
-      [assignment_id]
+      """
+      UPDATE wakes
+      SET dueAt=(
+        SELECT g.armedAt + (?2 * g.multiplier) + g.reliefExcludedMs
+        FROM effort_checkin_generations AS g
+        WHERE g.wakeId=wakes.wakeId AND g.state='armed'
+      )
+      WHERE wakeId IN (
+        SELECT g.wakeId
+        FROM effort_checkin_generations AS g
+        JOIN assignments AS a ON a.id=g.assignmentId
+        WHERE a.workItemId=?1 AND a.state='open' AND g.state='armed'
+          AND g.generation=(
+            SELECT MAX(g2.generation) FROM effort_checkin_generations AS g2
+            WHERE g2.assignmentId=g.assignmentId
+          )
+      ) AND state='pending'
+      """,
+      [work_item_id, horizon]
     )
 
-    Enum.each(wake_ids, &cancel_pending_wake_in_txn!(txn, &1, command))
+    Txn.q(
+      txn,
+      """
+      UPDATE effort_checkin_generations
+      SET baseHorizonMs=?2
+      WHERE assignmentId IN (
+        SELECT id FROM assignments WHERE workItemId=?1 AND state='open'
+      ) AND state='armed'
+        AND generation=(
+          SELECT MAX(g2.generation) FROM effort_checkin_generations AS g2
+          WHERE g2.assignmentId=effort_checkin_generations.assignmentId
+        )
+      """,
+      [work_item_id, horizon]
+    )
+
     :ok
   end
 
-  defp dispose_requests_in_txn(txn, assignment_id, command) do
-    wake_ids =
+  defp supersede_requests_in_txn(txn, assignment_id, command) do
+    requests =
       Txn.q(
         txn,
-        "SELECT deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        "SELECT id, ownerUserId, deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
         [assignment_id]
       )
-      |> List.flatten()
 
     Txn.q(
       txn,
@@ -870,7 +1144,52 @@ defmodule Tightbeam.EffortCheckin do
       [assignment_id]
     )
 
-    Enum.each(wake_ids, &cancel_pending_wake_in_txn!(txn, &1, command))
+    Enum.each(requests, fn [id, owner_user_id, wake_id] ->
+      cancel_pending_wake_in_txn!(txn, wake_id, command)
+
+      DB.record_row_commit(
+        txn,
+        decision_transition(
+          %{id: id, owner_user_id: owner_user_id},
+          "open",
+          "superseded",
+          @origin,
+          "effort-rule"
+        )
+      )
+    end)
+
+    :ok
+  end
+
+  defp dispose_requests_in_txn(txn, assignment_id, command, row_context) do
+    requests =
+      Txn.q(
+        txn,
+        "SELECT id, ownerUserId, deadlineWakeId FROM decision_requests WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+        [assignment_id]
+      )
+
+    Txn.q(
+      txn,
+      "UPDATE decision_requests SET status = 'superseded' WHERE kind = 'effort' AND assignmentId = ?1 AND status = 'open'",
+      [assignment_id]
+    )
+
+    Enum.each(requests, fn [id, owner_user_id, wake_id] ->
+      cancel_pending_wake_in_txn!(txn, wake_id, command)
+
+      DB.record_row_commit(
+        txn,
+        decision_transition(
+          %{id: id, owner_user_id: owner_user_id},
+          "open",
+          "superseded",
+          Map.get(row_context, :principal, @origin),
+          Map.get(row_context, :verb, "attest")
+        )
+      )
+    end)
 
     :ok
   end
@@ -894,7 +1213,8 @@ defmodule Tightbeam.EffortCheckin do
     outcome = %{
       kind: "disposition",
       disposition_kind: "decision_request_transition",
-      disposition_id: request.id
+      disposition_id: request.id,
+      terminal_request: request
     }
 
     %{
@@ -909,6 +1229,17 @@ defmodule Tightbeam.EffortCheckin do
     do: Map.put(outcome, :liveness_trigger, trigger)
 
   defp put_liveness_trigger(outcome, nil), do: outcome
+
+  defp decision_liveness_trigger_in_txn(txn, assignment_id) do
+    primary = decision_liveness_primary_in_txn(txn, assignment_id)
+
+    case primary && Supervision.liveness_trigger_in_txn(txn, primary) do
+      nil -> nil
+      {:ok, trigger} when is_map(trigger) -> trigger
+      :none -> nil
+      {:error, reason} -> raise "invalid liveness trigger: #{inspect(reason)}"
+    end
+  end
 
   defp liveness_trigger_in_txn!(txn, assignment_id) do
     primary = decision_liveness_primary_in_txn(txn, assignment_id)
@@ -1059,17 +1390,11 @@ defmodule Tightbeam.EffortCheckin do
     end
   end
 
-  # The four channels, all read in the verdict's own transaction. Turns ride
+  # The three activity channels, all read in the verdict's own transaction. Turns ride
   # along as EFFORT — they are reported, never counted as effect.
-  defp channels(txn, generation, inspection) do
+  defp channels(txn, generation, _inspection) do
     %{
-      workspace: workspace_channel(generation.baseline, inspection),
-      artifacts:
-        count_since(
-          txn,
-          "SELECT COUNT(*) FROM artifacts WHERE createdBySession = ?1 AND rowid > ?2",
-          [generation.holder_key, generation.artifact_watermark]
-        ),
+      artifacts: artifact_updates(txn, generation),
       attests:
         count_since(
           txn,
@@ -1082,19 +1407,24 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp effect?(channels) do
-    channels.workspace == :writes or channels.artifacts > 0 or channels.attests > 0 or
-      channels.workItems > 0
+    channels.artifacts > 0 or channels.attests > 0 or channels.workItems > 0
   end
 
-  defp workspace_channel({:error, _}, _inspection), do: :unobservable
-  defp workspace_channel(_baseline, {:error, _}), do: :unobservable
+  defp artifact_updates(txn, generation) do
+    case Txn.q(txn, "SELECT workItemId FROM assignments WHERE id = ?1", [
+           generation.assignment_id
+         ]) do
+      [[item]] when is_binary(item) ->
+        count_since(
+          txn,
+          "SELECT COUNT(*) FROM artifacts WHERE workItemId = ?1 AND createdBySession = ?2 AND rowid > ?3",
+          [item, generation.holder_key, generation.artifact_watermark]
+        )
 
-  defp workspace_channel({:ok, baseline}, {:ok, current}) do
-    cond do
-      current.prior != "observed" -> :unobservable
-      current.writes > 0 -> :writes
-      current.digest != baseline.digest -> :writes
-      true -> :none
+      _ ->
+        # Artifacts always belong to a work item. An unthreaded card therefore
+        # has an exact empty artifact set instead of borrowing holder-wide work.
+        0
     end
   end
 
@@ -1153,12 +1483,10 @@ defmodule Tightbeam.EffortCheckin do
       effortGeneration: generation.generation,
       outcome: "zero_effect",
       channels: %{
-        writes: Atom.to_string(channels.workspace),
         artifacts: channels.artifacts,
         attests: channels.attests,
         workItems: channels.workItems
       },
-      workspace: generation.root,
       agentProdded: generation.agent_prodded == 1,
       turnsSinceArmed: channels.turns,
       minutesSinceArmed: div(max(now() - generation.armed_at, 0), 60_000)
@@ -1180,17 +1508,17 @@ defmodule Tightbeam.EffortCheckin do
           "A checkpoint must name the next action or condition and its deadline. " <>
           "Use `artifact-record` for anything produced outside this workdir " <>
           "(another machine, a service, a conversation). Do not file generic or duplicate status. " <>
-          "If no reporting exception applies, schedule a concrete continuation wake that names " <>
-          "the next action or dependency condition and when to resume.",
+          "For unfinished work, follow the manual’s obligation-scoped continuation pattern. " <>
+          "An ordinary notification does not cover this assignment or pause effort. " <>
+          "Only a qualifying unresolved dependency wait pauses the effort horizon.",
       due_at: now(),
       assignment_id: generation.assignment_id
     })
   end
 
   defp channel_sentence(evidence) do
-    "no writes, artifacts, attests, or work-item updates observed since " <>
-      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken; " <>
-      "workspace #{evidence.workspace}: #{evidence.channels.writes})."
+    "no artifacts, attests, or work-item updates observed since " <>
+      "#{evidence.minutesSinceArmed}m ago (#{evidence.turnsSinceArmed} turns taken)."
   end
 
   defp advanced_baseline(_baseline, {:ok, _observation} = inspection), do: inspection
@@ -1233,6 +1561,15 @@ defmodule Tightbeam.EffortCheckin do
     if root in [nil, ""], do: base, else: Path.join(base, root)
   end
 
+  defp unobserved_root(config, session) do
+    digest =
+      :crypto.hash(:sha256, session.session_key)
+      |> Base.encode16(case: :lower)
+      |> binary_part(0, 12)
+
+    Path.join([config.base_dir, "work", digest])
+  end
+
   defp relative_root(config, generation) do
     base =
       Placement.workdir_path(config, %{
@@ -1266,20 +1603,81 @@ defmodule Tightbeam.EffortCheckin do
     })
   end
 
-  defp authorized?({:session, key}, request), do: request.expecter_session_key == key
+  defp authorized?({:session, _key}, _request), do: true
   defp authorized?({:user, user}, request), do: request.expecter_user_id == user
   defp authorized?(_, _request), do: false
+
+  defp actor_id({:session, key}), do: "session:" <> key
+  defp actor_id({:user, user}), do: "user:" <> user
+  defp actor_id(_principal), do: nil
+
+  defp visible_request?(db, call, request) do
+    owner_user_id =
+      case call.principal do
+        {:session, key} ->
+          case Org.get(db, key) do
+            %{owner_user_id: owner} -> owner
+            _ -> nil
+          end
+
+        {:user, user_id} ->
+          user_id
+
+        _ ->
+          nil
+      end
+
+    not is_nil(Escalation.get(db, call, request.id, owner_user_id: owner_user_id))
+  end
 
   defp invalid_root,
     do: {:error, error("invalid_workdir_root", "workdirRoot must be relative and contain no ..")}
 
-  defp horizon_ms(config),
-    do:
+  defp horizon_ms(txn, config, assignment_id) do
+    priority = assignment_priority_in_txn(txn, assignment_id)
+    horizon_for_priority(txn, config, priority)
+  end
+
+  defp horizon_for_priority(txn, config, priority) do
+    base =
       Map.get(
         config,
         :effort_checkin_horizon_ms,
         Application.get_env(:tightbeam, :effort_checkin_horizon_ms, @default_horizon_ms)
       )
+
+    default_priority = default_priority_in_txn(txn)
+    steps = priority - default_priority
+
+    if steps >= 0,
+      do: max(div(base, Integer.pow(2, steps)), 1),
+      else: base * Integer.pow(2, -steps)
+  end
+
+  defp assignment_priority_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT COALESCE(
+             (SELECT priority FROM assignment_priorities WHERE assignmentId=a.id),
+             (SELECT priority FROM work_item_priorities WHERE workItemId=a.workItemId),
+             CAST(COALESCE((SELECT value FROM org_settings WHERE key='default-priority'),'4') AS INTEGER)
+           )
+           FROM assignments AS a WHERE a.id=?1
+           """,
+           [assignment_id]
+         ) do
+      [[priority]] -> priority
+      [] -> default_priority_in_txn(txn)
+    end
+  end
+
+  defp default_priority_in_txn(txn) do
+    case Txn.q(txn, "SELECT value FROM org_settings WHERE key='default-priority'") do
+      [[value]] -> String.to_integer(value)
+      [] -> @default_priority
+    end
+  end
 
   defp deadline_ms(config),
     do:
@@ -1544,6 +1942,18 @@ defmodule Tightbeam.EffortCheckin do
 
   defp expecter_ref(_session_key, user_id) when is_binary(user_id), do: "user:" <> user_id
   defp expecter_ref(_session_key, _user_id), do: nil
+
+  defp decision_transition(request, old_status, new_status, principal, verb) do
+    %{
+      verb: verb,
+      domain: "decision_request",
+      row_id: request.id,
+      owner_user_id: request.owner_user_id,
+      principal: principal,
+      bindings: %{decisionRequestId: request.id},
+      field: %{name: "status", old: old_status, new: new_status}
+    }
+  end
 
   defp error(code, message), do: %{code: code, message: message}
   defp now, do: System.system_time(:millisecond)

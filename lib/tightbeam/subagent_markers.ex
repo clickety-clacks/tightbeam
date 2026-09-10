@@ -6,6 +6,9 @@ defmodule Tightbeam.SubagentMarkers do
 
   alias Tightbeam.{ConditionFacts, DB, Org, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
+
+  @firehose_sources %{insert: "subagent_marker.appended"}
 
   @type marker :: %{
           kind: String.t(),
@@ -40,16 +43,31 @@ defmodule Tightbeam.SubagentMarkers do
     DB.execute(db, String.replace(@ddl, "__TIGHTBEAM_HARNESSES__", harnesses))
   end
 
+  @doc false
+  @spec firehose_sources() :: %{atom() => String.t()}
+  def firehose_sources, do: @firehose_sources
+
   @doc "Append one canonical marker and nudge a matching wake after commit."
   @spec append(DB.server(), GenServer.server(), map()) :: map()
   def append(db \\ DB, scheduler \\ Tightbeam.WakeScheduler, input) do
-    {result, fact_id} =
-      transaction!(db, fn txn ->
-        result = append_in_txn(txn, input)
-        {result, result[:fact_id]}
-      end)
+    {:ok, {result, deliveries}} =
+      DB.transaction_then(
+        db,
+        fn txn -> append_in_txn(txn, input) end,
+        fn txn, result ->
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
 
-    if is_integer(fact_id), do: Wakes.fire_matching(scheduler, fact_id)
+          deliveries =
+            if is_integer(result[:fact_id]),
+              do: ConditionFacts.recognize_in_txn(txn, result.fact_id),
+              else: []
+
+          {result, deliveries}
+        end
+      )
+
+    ConditionFacts.complete_deliveries(db, deliveries)
+    if is_integer(result[:fact_id]), do: Wakes.fire_matching(scheduler, result.fact_id)
     result
   end
 
@@ -83,6 +101,17 @@ defmodule Tightbeam.SubagentMarkers do
     )
 
     if Txn.changes(txn) == 1 do
+      [[marker_id]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
+      Publisher.source_invalidation_in_txn(
+        txn,
+        Map.get(input, :firehose_hub, Tightbeam.Firehose.Hub),
+        Map.fetch!(@firehose_sources, :insert),
+        marker_id,
+        at,
+        marker_refs_in_txn(txn, marker_id, principal, assignment_id)
+      )
+
       marker = %{
         kind: kind,
         principal: principal,
@@ -98,7 +127,8 @@ defmodule Tightbeam.SubagentMarkers do
           ConditionFacts.file_in_txn(txn, %{
             kind: "subagent_stop",
             scope: subagent_ref,
-            origin: "process:tightbeam"
+            origin: "process:tightbeam",
+            owner_user_id: owner_for_session_in_txn(txn, principal)
           })
 
         Map.merge(marker, %{appended: true, fact_id: fact.fact_id})
@@ -115,6 +145,12 @@ defmodule Tightbeam.SubagentMarkers do
 
       existing
       |> Map.merge(%{appended: false, fact_id: nil})
+    end
+  end
+
+  defp owner_for_session_in_txn(txn, session_key) do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[owner_user_id]] -> owner_user_id
     end
   end
 
@@ -181,18 +217,7 @@ defmodule Tightbeam.SubagentMarkers do
   def consume_captured(:skip, _db, _scheduler), do: :skip
   def consume_captured({:error, _error} = error, _db, _scheduler), do: error
 
-  def consume_captured({:ok, input}, db, scheduler) do
-    result = transaction!(db, &append_in_txn(&1, input))
-
-    case result do
-      %{fact_id: fact_id} = marker when is_integer(fact_id) ->
-        Wakes.fire_matching(scheduler, fact_id)
-        marker
-
-      value ->
-        value
-    end
-  end
+  def consume_captured({:ok, input}, db, scheduler), do: append(db, scheduler, input)
 
   @doc "Resolve a parent-visible tool-call handle to its canonical subagent ref."
   @spec resolve_subagent_in_txn(Txn.t(), String.t(), String.t()) :: String.t() | nil
@@ -304,6 +329,28 @@ defmodule Tightbeam.SubagentMarkers do
          ) do
       [row] -> to_marker(row)
       [] -> nil
+    end
+  end
+
+  defp marker_refs_in_txn(txn, marker_id, principal, assignment_id) do
+    base = %{
+      "markerId" => Integer.to_string(marker_id),
+      "sessionKey" => principal
+    }
+
+    case Txn.q(
+           txn,
+           "SELECT workItemId FROM assignments WHERE id = ?1 AND holderKey = ?2 AND workItemId IS NOT NULL",
+           [assignment_id, principal]
+         ) do
+      [[work_item_id]] ->
+        Map.merge(base, %{
+          "assignmentId" => assignment_id,
+          "workItemId" => work_item_id
+        })
+
+      [] ->
+        base
     end
   end
 

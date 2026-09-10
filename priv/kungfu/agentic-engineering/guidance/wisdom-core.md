@@ -3,7 +3,7 @@
 The numbered map of the project's design wisdom, sections every archetype carries. Each
 rule's WORKING TEXT lives in exactly one home; cite "wisdom N" and open the home for the
 directive. Rules 1-10 and 15-22 are the meta sections (enforcement, substrate-vs-inference,
-guidance authoring) — carried by orchestrator, reviewer, and spec-writer, homed in the
+guidance authoring) — carried by orchestrator, reviewer-code, reviewer-spec, and spec-writer, homed in the
 `tightbeam-law-minting` and `tightbeam-guidance-authoring` skills.
 
 ## Work and accountability — homes: operating manual; accountability-constitution-v1
@@ -17,6 +17,6 @@ guidance authoring) — carried by orchestrator, reviewer, and spec-writer, home
 ## Process — homes: engineering tenets; coder kernel; merge-gate rules
 23. Pause beats guess; unpinned defaults match the existing pattern (tenets + ringdown meta-ruling)
 24. Smoke against reality before boot-path/external-I/O ships (tenets + merge gate)
-25. When an incident closes, leave material behind — a catalog row, fixture, or statute (tightbeam-law-minting skill)
+25. Preserve useful incident evidence and choose a proportionate corrective action (tightbeam-law-minting skill)
 26. Make the wrong thing unrepresentable (tenets) — the code-structure sibling of rule 3's
     ladder and of rule 10's "existence is physics"

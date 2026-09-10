@@ -402,6 +402,7 @@ defmodule Tightbeam.WorkStateTest do
     result =
       handlers["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: "retiring",
         params: %{}
       })
@@ -447,7 +448,11 @@ defmodule Tightbeam.WorkStateTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: %{subject: subject, work_item_id: work_item_id},
+      params: %{
+        subject: subject,
+        work_item_id: work_item_id,
+        effect_kind: "coordination"
+      },
       on_assignment_change: ctx.assignment_change,
       on_work_item_change: ctx.item_change
     })
@@ -461,7 +466,11 @@ defmodule Tightbeam.WorkStateTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: %{subject: subject, work_item_id: work_item_id}
+      params: %{
+        subject: subject,
+        work_item_id: work_item_id,
+        effect_kind: "coordination"
+      }
     }
   end
 
@@ -478,14 +487,33 @@ defmodule Tightbeam.WorkStateTest do
     {:ok, [[holder]]} =
       DB.query(ctx.db, "SELECT holderKey FROM assignments WHERE id = ?1", [assignment_id])
 
+    params = %{assignment_id: assignment_id, kind: kind, verdict_kind: verdict_kind}
+
+    params =
+      if verdict_kind == "verified",
+        do: Map.put(params, :commit_refs, commit_refs()),
+        else: params
+
     Assignments.__handle__(ctx.db, "attest", %{
       verb: "attest",
       origin: "agent:#{holder}",
       principal: {:session, holder},
       session_key: holder,
-      params: %{assignment_id: assignment_id, kind: kind, verdict_kind: verdict_kind},
+      params: params,
       on_assignment_change: ctx.assignment_change
     })
+  end
+
+  defp commit_refs do
+    repo = Path.expand("..", __DIR__)
+    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+
+    [
+      %{
+        "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
+        "commit" => String.trim(commit)
+      }
+    ]
   end
 
   defp revoke(ctx, assignment_id) do
@@ -494,7 +522,7 @@ defmodule Tightbeam.WorkStateTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{assignment_id: assignment_id},
+      params: %{assignment_id: assignment_id, reason: "work-state abandoned fixture"},
       on_assignment_change: ctx.assignment_change
     })
   end

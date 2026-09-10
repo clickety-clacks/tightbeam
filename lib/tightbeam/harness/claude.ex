@@ -1,13 +1,14 @@
 defmodule Tightbeam.Harness.Claude do
   @moduledoc false
   @behaviour Tightbeam.Harness
+  @credential_file ".credentials.json"
 
   alias Tightbeam.Harness.Support
   alias Tightbeam.Model
 
   require Logger
 
-  @adapter_version "0.66.0"
+  @adapter_version "0.73.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
   @warm_timeout_ms 30_000
@@ -100,7 +101,9 @@ defmodule Tightbeam.Harness.Claude do
   # default-pin vocabulary, not the grant; the operator's own picker offered
   # Opus 5 all along). Same lesson, second occurrence: re-probe from a second
   # vantage before trusting any row here, in either direction.
-  # UPGRADED 2026-08-08 on gibson to claude-agent-acp 0.66.0 / SDK 0.3.220.
+  # UPGRADED 2026-09-01 on gibson to claude-agent-acp 0.73.0 / SDK 0.3.257 /
+  # bundled Claude Code 2.1.257. This version offers and accepts claude-fable-5-1
+  # plus its 1M-context variant.
   # Its public picker still exposes aliases, but their meaning changed: opus[1m]
   # now identifies Opus 5. Tightbeam therefore tries a requested canonical id
   # first and treats this table only as fallback candidates. The selected
@@ -109,7 +112,7 @@ defmodule Tightbeam.Harness.Claude do
 
   @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
                                 claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5
-                                claude-opus-5)
+                                claude-opus-5 claude-fable-5-1 claude-fable-5-1[1m])
 
   @doc """
   Model values this adapter version accepts at `session/set_config_option`.
@@ -179,7 +182,7 @@ defmodule Tightbeam.Harness.Claude do
     binary = adapter_binary(target)
     common = Keyword.fetch!(opts, :common_env)
     kind = Keyword.fetch!(opts, :credential_kind)
-    credential_path = credential_path(target.host_config.base_dir)
+    credential_path = Path.join(home, @credential_file)
 
     if Support.local?(target) do
       credential_env =
@@ -225,19 +228,12 @@ defmodule Tightbeam.Harness.Claude do
   defp credential_env_var(kind), do: Map.fetch!(@credential_env_vars, kind)
 
   # ONE file per provider, holding whichever kind is active, and the name is Claude Code's
-  # own: the file is LINKED into the harness home, where the harness reads it directly.
-  # `Homes.reconcile` uses a single name for both the store and the home entry, so the store
-  # takes the harness's name rather than the harness taking ours.
+  # own. The exact harness home is its only location.
   #
   # It is still deliberately NOT read as evidence of the kind -- `credential.json` is the
   # authority. A subscription credential is the OAuth record Claude Code refreshes in place;
   # an API key is a bare secret that never expires. Same path, different contents, and only
   # the subscription one is ever handed to the harness as a file.
-  @credential_file ".credentials.json"
-
-  defp credential_path(base_dir),
-    do: Path.join([base_dir, "auth", "claude", @credential_file])
-
   @impl true
   def ensure_adapter(target) do
     target =
@@ -274,8 +270,8 @@ defmodule Tightbeam.Harness.Claude do
         "haiku" => "claude-haiku-4-5-20251001",
         "opus" => "claude-opus-4-8",
         "opus[1m]" => "claude-opus-4-8[1m]",
-        "fable" => "claude-fable-5",
-        "fable[1m]" => "claude-fable-5[1m]"
+        "fable" => "claude-fable-5-1",
+        "fable[1m]" => "claude-fable-5-1[1m]"
       },
       canonical_model_prefixes: ["claude-"]
     }
@@ -283,7 +279,7 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def owned_home_entries,
-    do: Support.owned_home_entries(@credential_file, "settings.json")
+    do: Support.owned_home_entries("settings.json")
 
   @impl true
   def reconcile_home(target, home, desired) do
@@ -316,10 +312,7 @@ defmodule Tightbeam.Harness.Claude do
 
     desired = %{desired | rails: rails}
 
-    Tightbeam.Homes.reconcile(target, home, desired,
-      credential_names: [@credential_file],
-      rails_filename: "settings.json"
-    )
+    Tightbeam.Homes.reconcile(target, home, desired, rails_filename: "settings.json")
   end
 
   defp packed_model(%Model{family: family, context: nil}), do: family
@@ -336,14 +329,8 @@ defmodule Tightbeam.Harness.Claude do
   end
 
   @impl true
-  def credential_ready?(target, _home) do
-    store =
-      Tightbeam.Credentials.store_dir(
-        target.host_config.base_dir,
-        credential_provider()
-      )
-
-    Tightbeam.Homes.credential_ready?(target, store, [@credential_file])
+  def credential_ready?(target, home) do
+    Tightbeam.Homes.credential_ready?(target, home, [@credential_file])
   end
 
   # One real turn, so the harness asks the server what this account may use and caches the
@@ -407,11 +394,6 @@ defmodule Tightbeam.Harness.Claude do
       {:error, reason} ->
         {:error, reason}
     end
-  end
-
-  @impl true
-  def harvest_credential(target, home) do
-    Tightbeam.Homes.harvest_credential(target, home, @credential_file)
   end
 
   @impl true
@@ -537,7 +519,13 @@ defmodule Tightbeam.Harness.Claude do
   # credential moves between them — only the model list comes back.
   defp catalog_getter(state) do
     kind = Map.fetch!(state, :credential_kind)
-    credential_path = credential_path(state.base_dir)
+
+    credential_path =
+      Tightbeam.Credentials.credential_path(
+        state.base_dir,
+        Map.get(state, :host_name, Tightbeam.Placement.local_host_name()),
+        credential_provider()
+      )
 
     case Map.get(state, :host_config, %{ssh: nil}).ssh do
       nil -> local_getter(state, credential_path, kind)
@@ -743,14 +731,14 @@ defmodule Tightbeam.Harness.Claude do
         api_key: [{"ANTHROPIC_API_KEY", "vector-token"}]
       },
       rails_env: nil,
-      remote_prefix: fn base, home, kind ->
+      remote_prefix: fn _base, home, kind ->
         case kind do
           :subscription ->
             ["CLAUDE_CONFIG_DIR=#{home}"]
 
           :api_key ->
             [
-              "#{credential_env_var(kind)}=$(cat #{Path.join([base, "auth", "claude", @credential_file])} 2>/dev/null)",
+              "#{credential_env_var(kind)}=$(cat #{Path.join(home, @credential_file)} 2>/dev/null)",
               "CLAUDE_CONFIG_DIR=#{home}"
             ]
         end
@@ -815,7 +803,7 @@ defmodule Tightbeam.Harness.Claude do
         "unavailable" => {:error, :unavailable}
       },
       catalog_state: fn case_name, base ->
-        token = Path.join([base, "auth", "claude", @credential_file])
+        token = Path.join([base, "homes", "vector", "claude", @credential_file])
         File.mkdir_p!(Path.dirname(token))
         kind = if(case_name == "valid_api_key", do: :api_key, else: :subscription)
 
@@ -873,6 +861,7 @@ defmodule Tightbeam.Harness.Claude do
         # of the table.
         %{
           base_dir: base,
+          host_name: "vector",
           credential_kind: kind,
           options: %{claude_fetch: fetch, claude_selectable_models: :all}
         }

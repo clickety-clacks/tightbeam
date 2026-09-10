@@ -58,10 +58,10 @@ intentional.
   After `wi_8f90c5b3` merges, the suite is immune to the
   known `TIGHTBEAM_*` config leaks. Keep stripping both prefixes: that proof covers
   only config, while `RELEASE_ROOT` is read directly from the environment in `lib/`.
-- First run the applicable gates on an unmodified tree in a clean environment and
-  record the counts on the card. Repeat after the change and record those counts too.
-  Accept only a green gate with both records; `tests pass` without a baseline is a
-  claim a reviewer cannot check.
+- Make the requested change first. Then run the focused tests that exercise it, followed
+  by only the broader verification that its risk warrants. Do not run a full-suite
+  baseline before writing code; an untouched-tree replay delays the change without
+  proving its result.
 - A docs-only change (`*.md`) skips these gates. Run `sh packaging/assemble.sh`
   instead; it must succeed.
 

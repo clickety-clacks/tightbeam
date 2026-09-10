@@ -16,21 +16,25 @@ item pins a spec-ref, the sha256 names the exact spec text your goal owes confor
 to — build from the ruling text at the canonical path, never a copy in the dispatch
 note or your memory of it.
 
-## Build exactly the spec
-The spec defines the whole of the work; anything beyond it is a defect, whatever its
-quality. No extra validation, guard, fallback, retry, config option, or compatibility
-path the spec does not require — "safer," "defensive," "future-proof," and "while I was
-in there" do not create a spec clause. An unrequested addition adds untested surface,
-obscures the change, and widens the review beyond what the spec can prove. Code the
-spec's behavior genuinely cannot function without is in scope even when unnamed; the
-test is necessity for a specified clause, not usefulness.
+If someone claims two unchanged copies differ, hash their exact bytes. Matching hashes
+end that verification; do not repeat it because paths, labels, or messages disagree.
+
+## Build exactly the ask
+The ask defines the whole of the work; anything beyond it fails review, whatever its
+quality. Build from the authoritative existing ask or the pinned spec named by the work
+item. Route a load-bearing gap to the responsible orchestrator instead of guessing or
+manufacturing a replacement specification. No extra validation, guard,
+fallback, retry, config option, or compatibility path the ask does not require, and no
+fix of a bug the ask did not name — "safer," "defensive," "future-proof," "while I was
+in there," and "it was right there" do not make it the ask. An incidental fix is its
+own card; report it, do not fold it in. Code the ask's behavior genuinely cannot
+function without is in scope even when unnamed; the test is necessity for the ask, not
+usefulness.
 
 ## Change only what your goal requires
-Beyond no-additions (above): no MODIFICATIONS of working behavior without live
-authority. If the spec you are implementing appears to demand changing behavior that
-exists and works, that is a conflict to report with your exact citation — not an edit
-to make. Fidelity sweeps and refactors owe parity except changes the spec names as
-intentional.
+Implement the authorized behavior change. Preserve unrelated behavior and resolve
+contradictions with the governing ask through the responsible owner. Fidelity sweeps
+and refactors owe parity except for changes the ask names as intentional.
 
 ## Understand before you touch
 Read the existing code and WHY it exists before you change it — engram traces a line to
@@ -71,7 +75,7 @@ a missing or unknown stamp is a refusal and a report, never an inference.
 
 ## Keep the change reviewable
 At any moment you are changing behavior or changing structure — never both in one diff.
-Sort them into separate commits: a behavior diff a reviewer reads for correctness, a
+Sort them into separate commits: a behavior diff a reviewer-code session reads for correctness, a
 structure diff read for direction. When the change you need is hard, do the preparatory
 refactor first as its own structure-only step, then the feature becomes an easy behavior
 add. Keep each diff to a single concern and small — review effectiveness falls off a
@@ -105,13 +109,13 @@ Where the spec is simply silent on an unimportant default, match the pattern the
 already uses rather than inventing one.
 
 ## Prove it, then close
-Compile clean and pass the tests the change touches before you report — a commit that
+Write the code first. Run its focused tests next, then broaden verification only in
+proportion to the change's risk. Never run a full-suite baseline before writing. Compile
+clean and pass the tests the change touches before you report — a commit that
 does not build is never pushed. But green is not working: passing on the inputs you chose
 does not prove the behavior, and a parity or hand-written fixture proves equivalence, not
-correctness. Capture fixtures from real responses. Make the capture release-blocking only
-when it protects an incredibly detrimental failure mode; otherwise keep it as a post-MVP
-sanity check. Never substitute a hand-written ideal fixture. For anything touching live
-inputs, run it against real inputs before you call it done. Your completion must carry a
+correctness. Capture fixtures from real responses, and for anything touching live inputs,
+run it against real inputs before you call it done. Your completion must carry a
 verification papertrail, and you produce it: verify the work the way the repository
 defines verification — its AGENTS.md or equivalent prose says what verification means
 there — then record the results (output, logs, evidence) with `tightbeam artifact-record`
@@ -138,6 +142,16 @@ is where the author catches them. That ready-for-review attest, like your comple
 names the repo as `host:absolute-path` and the commit id — "it shipped" without an
 address sends your verifier hunting the wrong repo.
 
+A review may come back `changes-requested` on a finding you believe the ask ships
+without. You may contest it on exactly that ground, to your orchestrator, with the
+facet named; the orchestrator adjudicates, not the review holder and not you. Never argue a
+behavioral finding you have not reproduced yourself.
+
+Report readiness in a progress attest with the result reference, relevant evidence and
+any findings addressed. The orchestrator commissions review and judges whether existing
+review still applies after reconciliation. Do not file completion to summon review or
+repeat a full review merely because the commit identity changed.
+
 File completion ONLY after the review verdict is in, the verification papertrail is
 recorded, and integration is proven. Completion closes your assignment, and the
 substrate accepts verdicts only on open ones — complete early and your `verified`
@@ -145,7 +159,5 @@ verdict and the user's have nowhere to land: your row closes as a claim that can
 be upgraded to verified. And a completion filed before `reviewed-clean` is a claim the
 record contradicts.
 
-Work in a worktree that is yours to write (`worktree-session`) — by default one you
-create in your own workdir, or one the assigning agent hands you for the job (an
-orchestrator passing a worktree down to you) — reconcile with main before building on
-it, and leave no worktree of your own behind when the assignment closes.
+Work in a clone that is yours to write and follow `worktree-session` for target
+reconciliation, output custody and cleanup.

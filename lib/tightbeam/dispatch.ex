@@ -14,7 +14,7 @@ defmodule Tightbeam.Dispatch do
   the CALLER's process (a socket, an HTTP request task, the scheduler), and
   anything long-running goes through the Ledger/lane pipeline, never inline.
 
-  Before a known handler runs, the deny-only `Tightbeam.Rules` tier evaluates
+  Before a known handler runs, the `Tightbeam.Rules` tier evaluates
   the raw call. A statute denial or fact error appends kind "denied" and
   returns immediately; that audit append is best-effort so an unavailable
   sink cannot fail open. All calls that pass statutes retain the existing
@@ -29,10 +29,12 @@ defmodule Tightbeam.Dispatch do
     DB,
     Escalation,
     EventLog,
+    Firehose.Publisher,
     Placement,
     RailEpisodes,
     RailRemedy,
-    Rules
+    Rules,
+    Wakes
   }
 
   @typedoc """
@@ -84,8 +86,34 @@ defmodule Tightbeam.Dispatch do
       {:replay, assignment} ->
         # A keyed replay bypasses the rail entirely (statute inertness): the
         # original assignment is returned, no rumination, no terminal guard.
-        :ok = EventLog.append_event(db, "verb", verb, origin, session_key, assignment, principal)
+        :ok =
+          EventLog.append_event_with_handoff(
+            db,
+            "verb",
+            verb,
+            origin,
+            session_key,
+            assignment,
+            principal,
+            &Publisher.observed_accepted_in_txn(&1, call)
+          )
+
         {:ok, assignment}
+
+      {:terminal_replay, result} ->
+        :ok =
+          EventLog.append_event_with_handoff(
+            db,
+            "verb",
+            verb,
+            origin,
+            session_key,
+            result,
+            principal,
+            &Publisher.observed_accepted_in_txn(&1, call)
+          )
+
+        {:ok, result}
 
       {:refuse, error} ->
         # Terminal guard fires BEFORE Rules.decide: no statute or remedy episode
@@ -100,6 +128,18 @@ defmodule Tightbeam.Dispatch do
   # before the rail so both the guard and Rules.decide see the replay outcome.
   defp bracket_precheck(db, call, verb) when verb in ["assign", "dispatch"] do
     Assignments.dispatch_precheck(db, call)
+  end
+
+  defp bracket_precheck(
+         db,
+         %{terminal_surrender: true, principal: {:session, holder}, params: params},
+         "attest"
+       ) do
+    case Assignments.terminal_surrender_precheck(db, params.assignment_id, holder) do
+      :proceed -> :proceed
+      {:replay, result} -> {:terminal_replay, result}
+      {:refuse, error} -> {:refuse, error}
+    end
   end
 
   defp bracket_precheck(_db, _call, _verb), do: :proceed
@@ -142,7 +182,7 @@ defmodule Tightbeam.Dispatch do
         {:error, ctx.error}
 
       :allow ->
-        consumed = Enum.map(to_consume, &{&1, Escalation.consume(db, &1)})
+        consumed = Enum.map(to_consume, &{&1, Escalation.consume(db, &1, verb, origin)})
 
         case Enum.find(consumed, fn {_id, won?} -> not won? end) do
           nil ->
@@ -174,47 +214,159 @@ defmodule Tightbeam.Dispatch do
   defp close(db, {:episodes, statute, position}),
     do: RailEpisodes.recovered(db, statute, position)
 
+  defp close(db, {:notice, rule, call, evidence}),
+    do: Wakes.deliver_rule_notice(db, rule, call, evidence)
+
   defp close(db, {statute, subject, occurrence}),
     do: RailRemedy.close(db, statute, subject, occurrence)
 
   defp dispatch_to_handler(db, handlers, call, verb, origin, principal, session_key) do
+    call =
+      if verb in ["identity-edit", "identity-relearn", "learn", "unlearn", "kungfu-scaffold"] do
+        Map.put_new_lazy(call, :invocation_id, fn ->
+          identity_invocation_id(call, verb, origin)
+        end)
+      else
+        call
+      end
+
+    publisher_call = Publisher.capture_before(db, call)
+
     case Map.fetch(handlers, verb) do
       :error ->
         error = %{code: "unknown_verb"}
-        :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
+
+        :ok =
+          EventLog.append_event_with_handoff(
+            db,
+            "denied",
+            verb,
+            origin,
+            session_key,
+            error,
+            principal,
+            &Publisher.denied_in_txn(&1, publisher_call, error)
+          )
+
         {:error, error}
 
       {:ok, handler} ->
+        publisher_call =
+          if Publisher.transactional_verb?(verb),
+            do: Map.put(publisher_call, :firehose_in_txn, true),
+            else: publisher_call
+
         handler_call =
-          if verb in ["assign", "dispatch"],
-            do: Map.put(call, :accepted_event_in_txn, true),
-            else: call
+          case verb do
+            verb when verb in ["assign", "dispatch"] ->
+              Map.put(publisher_call, :accepted_event_in_txn, true)
+
+            "condition" ->
+              Map.put(publisher_call, :firehose_effect_requested, true)
+
+            _ ->
+              publisher_call
+          end
 
         case invoke(handler, handler_call) do
           {:returned, %{code: _} = error} ->
-            :ok = EventLog.append_event(db, "denied", verb, origin, session_key, error, principal)
+            :ok =
+              EventLog.append_event_with_handoff(
+                db,
+                "denied",
+                verb,
+                origin,
+                session_key,
+                error,
+                principal,
+                &Publisher.denied_in_txn(&1, publisher_call, error)
+              )
+
             {:error, error}
 
           {:returned, {:accepted_in_txn, event_id, %{canceled: true} = result}}
           when is_integer(event_id) and event_id > 0 and map_size(result) == 1 ->
+            :ok = Publisher.accepted_after_handler(db, publisher_call, result)
             {:ok, result}
 
           {:returned, {:accepted_in_txn, event_id, %{assignment: assignment} = envelope}}
           when is_integer(event_id) and event_id > 0 and map_size(envelope) == 1 and
                  is_map(assignment) ->
+            :ok = Publisher.accepted_after_handler(db, publisher_call, assignment)
             {:ok, assignment}
+
+          {:returned, {:firehose_effect, result, changed?}} when is_boolean(changed?) ->
+            payload = outcome_payload(verb, call, {:returned, result})
+            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
+
+            :ok =
+              Publisher.accepted_after_handler(
+                db,
+                Map.put(publisher_call, :firehose_changed, changed?),
+                result
+              )
+
+            {:ok, result}
 
           {:returned, result} ->
             payload = outcome_payload(verb, call, {:returned, result})
-            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
+
+            if Publisher.transactional_verb?(verb) do
+              :ok =
+                EventLog.append_event(
+                  db,
+                  "verb",
+                  verb,
+                  origin,
+                  session_key,
+                  payload,
+                  principal
+                )
+            else
+              :ok =
+                EventLog.append_event_with_handoff(
+                  db,
+                  "verb",
+                  verb,
+                  origin,
+                  session_key,
+                  payload,
+                  principal,
+                  &Publisher.accepted_in_txn(&1, publisher_call, result)
+                )
+            end
+
             {:ok, result}
 
           {:raised, exception} ->
             error = %{code: "server_error", message: Exception.message(exception)}
             payload = outcome_payload(verb, call, {:raised, exception})
-            :ok = EventLog.append_event(db, "verb", verb, origin, session_key, payload, principal)
+
+            :ok =
+              EventLog.append_event_with_handoff(
+                db,
+                "verb",
+                verb,
+                origin,
+                session_key,
+                payload,
+                principal,
+                &Publisher.denied_in_txn(&1, publisher_call, error)
+              )
+
             {:error, error}
         end
+    end
+  end
+
+  defp identity_invocation_id(call, verb, origin) do
+    case call.params[:idempotency_key] do
+      key when is_binary(key) and byte_size(key) > 0 ->
+        digest = :crypto.hash(:sha256, [origin, 0, verb, 0, key]) |> Base.encode16(case: :lower)
+        "identity-" <> digest
+
+      _ ->
+        "identity-" <> Tightbeam.Id.uuid4()
     end
   end
 
@@ -277,15 +429,29 @@ defmodule Tightbeam.Dispatch do
 
   defp best_effort_denial(db, verb, origin, principal, session_key, error) do
     try do
-      EventLog.append_event(
-        db,
-        "denied",
-        verb,
-        origin,
-        session_key,
-        JSON.encode!(error),
-        principal
-      )
+      :ok =
+        EventLog.append_event_with_handoff(
+          db,
+          "denied",
+          verb,
+          origin,
+          session_key,
+          JSON.encode!(error),
+          principal,
+          fn txn ->
+            Publisher.denied_in_txn(
+              txn,
+              %{
+                verb: verb,
+                origin: origin,
+                principal: principal,
+                session_key: session_key,
+                params: %{}
+              },
+              error
+            )
+          end
+        )
     catch
       _kind, _reason -> :ok
     end

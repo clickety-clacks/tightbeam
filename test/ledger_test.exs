@@ -38,6 +38,153 @@ defmodule Tightbeam.LedgerTest do
     seq
   end
 
+  test "Firehose terminal publication follows winning commit and excludes rollback and replay", %{
+    db: db
+  } do
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    seq = enqueue!(db, "k1", "terminal publication")
+    assert {:ok, _} = Ledger.claim_next(db, "k1", "lane")
+    :ok = DB.execute(db, "UPDATE sessions SET mechanicalStatus='running' WHERE sessionKey='k1'")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+
+    assert {:error, %RuntimeError{message: "rollback terminal"}} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, seq, "delivered", nil)
+               raise "rollback terminal"
+             end)
+
+    refute_receive {:firehose_notice, _}
+    assert {:ok, [["running"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [["running"]]} =
+             DB.query(db, "SELECT mechanicalStatus FROM sessions WHERE sessionKey='k1'")
+
+    assert :ok = Ledger.finish(db, seq, "delivered")
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "turn.ended", "refs" => refs, "payload" => payload}}
+
+    assert refs["turnSeq"] == seq
+    assert refs["sessionKey"] == "k1"
+    assert payload["status"] == "delivered"
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "session.updated"}}
+    Hub.delivered(hub, self())
+
+    assert {:ok, [["idle"]]} =
+             DB.query(db, "SELECT mechanicalStatus FROM sessions WHERE sessionKey='k1'")
+
+    assert :already_terminal = Ledger.finish(db, seq, "failed", "late callback")
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [["delivered", nil]]} =
+             DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [seq])
+  end
+
+  test "Firehose enqueue and claim publish mechanical state and one winning start", %{db: db} do
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+    seq = enqueue!(db, "k1", "start publication")
+    assert_receive {:firehose_notice, %{"class" => "session.updated", "payload" => session}}
+    assert session["mechanicalStatus"] == "running"
+    Hub.delivered(hub, self())
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "lane")
+    assert turn.seq == seq
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "turn.started", "refs" => refs, "payload" => payload}}
+
+    assert refs["turnSeq"] == seq
+    assert payload["status"] == "running"
+    Hub.delivered(hub, self())
+    assert Tightbeam.Org.get(db, "k1").mechanical_status == "running"
+    assert :busy = Ledger.claim_next(db, "k1", "loser")
+    assert :none = Ledger.claim_next(db, "k2", "empty")
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [["running", "lane"]]} =
+             DB.query(db, "SELECT status,owner FROM turns WHERE seq=?1", [seq])
+  end
+
+  test "Firehose retirement drain preserves row commits and suppresses rollback and replay", %{
+    db: db
+  } do
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    seq = enqueue!(db, "k1", "retirement")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+
+    assert {:error, %RuntimeError{message: "retire rollback"}} =
+             DB.transaction(db, fn txn ->
+               assert [^seq] = Ledger.drain_queued_for_retire_in_txn(txn, "k1", "retired")
+
+               assert [%{domain: "turn", row_id: ^seq, field: %{new: "canceled"}}] =
+                        DB.take_row_commits(txn)
+
+               raise "retire rollback"
+             end)
+
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [["queued", nil]]} =
+             DB.query(db, "SELECT status,endedAt FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [^seq]} =
+             DB.transaction(db, fn txn ->
+               result = Ledger.drain_queued_for_retire_in_txn(txn, "k1", "retired")
+
+               assert [%{domain: "turn", row_id: ^seq, field: %{old: "queued", new: "canceled"}}] =
+                        DB.take_row_commits(txn)
+
+               result
+             end)
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "turn.ended", "refs" => refs, "payload" => payload}}
+
+    assert refs["turnSeq"] == seq
+    assert payload["status"] == "canceled"
+    Hub.delivered(hub, self())
+
+    assert {:ok, []} =
+             DB.transaction(db, &Ledger.drain_queued_for_retire_in_txn(&1, "k1", "retired"))
+
+    refute_receive {:firehose_notice, _}
+  end
+
+  test "Firehose unclaimable emits only newly failed turns and preserves active queued work", %{
+    db: db
+  } do
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    failed = enqueue!(db, "k1", "unclaimable")
+    active = enqueue!(db, "k2", "active")
+    :ok = DB.execute(db, "UPDATE sessions SET state='retired' WHERE sessionKey='k1'")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+    assert [^failed] = Ledger.fail_unclaimable(db, "k1", :session_retired)
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "turn.ended", "refs" => refs, "payload" => payload}}
+
+    assert refs["turnSeq"] == failed
+    assert payload["status"] == "failed"
+    assert payload["error"] =~ "session retired"
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "session.updated"}}
+    Hub.delivered(hub, self())
+    assert Tightbeam.Org.get(db, "k1").mechanical_status == "idle"
+    assert [] = Ledger.fail_unclaimable(db, "k1", :session_retired)
+    assert [] = Ledger.fail_unclaimable(db, "k2", :session_retired)
+    refute_receive {:firehose_notice, _}
+    assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [active])
+  end
+
   test "seq is the authoritative execution order", %{db: db} do
     s1 = enqueue!(db, "k1", "first")
     s2 = enqueue!(db, "k1", "second")
@@ -99,6 +246,145 @@ defmodule Tightbeam.LedgerTest do
     enqueue!(db, "k1", "next")
     {:ok, t2} = Ledger.claim_next(db, "k1", "lane")
     assert t2.prompt == "next"
+  end
+
+  test "explicit repair appends one deduplicated attempt without rewriting the terminal", %{
+    db: db
+  } do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+      VALUES ('asg_repair','repair me','k1','k1',1,'open','claude','anthropic')
+      """)
+
+    {:ok, source_seq} =
+      Ledger.enqueue(db, %{
+        session_key: "k1",
+        message_id: "m-repair",
+        origin: "agent:test",
+        prompt: "continue the same work",
+        assignment_id: "asg_repair",
+        job_ref: "wi_repair"
+      })
+
+    {:ok, _turn} = Ledger.claim_next(db, "k1", "lane")
+
+    :ok = Ledger.finish(db, source_seq, "failed", "adapter unavailable")
+
+    assert {:ok, {:appended, attempt_seq, attempt_id}} =
+             Ledger.repair_terminal(db, source_seq, "asg_repair", "repair-key", "agent:test")
+
+    assert {:ok, {:duplicate, ^attempt_seq, ^attempt_id}} =
+             Ledger.repair_terminal(db, source_seq, "asg_repair", "repair-key", "agent:test")
+
+    assert {:ok,
+            [
+              [^source_seq, "failed", "asg_repair", "continue the same work"],
+              [^attempt_seq, "queued", "asg_repair", "continue the same work"]
+            ]} =
+             DB.query(
+               db,
+               "SELECT seq,status,assignmentId,prompt FROM turns ORDER BY seq"
+             )
+  end
+
+  test "assignment repair claims before effects and replays one terminal result", %{db: db} do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+      VALUES
+        ('asg_operation_one','repair one','k1','k1',1,'open','claude','anthropic'),
+        ('asg_operation_two','repair two','k1','k1',2,'open','claude','anthropic')
+      """)
+
+    assert {:ok, {:claimed, attempt_id}} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_one",
+               "same-key",
+               ~s(["restart",null]),
+               "restart",
+               "agent:test"
+             )
+
+    assert {:ok, {:in_progress, ^attempt_id}} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_one",
+               "same-key",
+               ~s(["restart",null]),
+               "restart",
+               "agent:test"
+             )
+
+    result = %{ok: false, code: "repair_failed", message: "adapter stayed down"}
+    assert :ok = Ledger.finish_assignment_repair(db, attempt_id, result)
+
+    assert {:ok, {:replay, ^result}} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_one",
+               "same-key",
+               ~s(["restart",null]),
+               "restart",
+               "agent:test"
+             )
+
+    assert {:error, :repair_key_conflict} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_one",
+               "same-key",
+               ~s(["resume",null]),
+               "resume",
+               "agent:test"
+             )
+
+    assert {:ok, {:claimed, other_attempt_id}} =
+             Ledger.begin_assignment_repair(
+               db,
+               "asg_operation_two",
+               "same-key",
+               ~s(["restart",null]),
+               "restart",
+               "agent:test"
+             )
+
+    assert other_attempt_id != attempt_id
+  end
+
+  test "concurrent assignment repair callers elect exactly one effect owner", %{db: db} do
+    :ok =
+      DB.execute(db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+      VALUES ('asg_operation_race','repair race','k1','k1',1,'open','claude','anthropic')
+      """)
+
+    results =
+      1..8
+      |> Task.async_stream(
+        fn _ ->
+          Ledger.begin_assignment_repair(
+            db,
+            "asg_operation_race",
+            "race-key",
+            ~s(["restart",null]),
+            "restart",
+            "agent:test"
+          )
+        end,
+        max_concurrency: 8,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, result} -> result end)
+
+    assert [{:ok, {:claimed, attempt_id}}] =
+             Enum.filter(results, &match?({:ok, {:claimed, _}}, &1))
+
+    assert Enum.count(results, &match?({:ok, {:in_progress, ^attempt_id}}, &1)) == 7
   end
 
   # The stamp is the WHOLE identity, in fields. A context variant and a

@@ -10,7 +10,9 @@ defmodule Tightbeam.SupervisionTest do
     EventLog,
     Gateway,
     HarnessHealth,
+    HarnessProcess,
     Ledger,
+    NoticeBatcher,
     Org,
     Projection,
     RailRemedy,
@@ -72,7 +74,7 @@ defmodule Tightbeam.SupervisionTest do
       do: {:reply, GenServer.call(state.db, request), state}
 
     defp current_request_query?(sql) do
-      String.contains?(sql, "FROM decision_requests WHERE raiserId") and
+      String.contains?(sql, "FROM decision_requests WHERE kind = 'statute' AND raiserId") and
         String.contains?(sql, "ORDER BY rowid DESC LIMIT 1")
     end
 
@@ -145,7 +147,7 @@ defmodule Tightbeam.SupervisionTest do
     names = Enum.map(columns, &Enum.at(&1, 1))
 
     assert names ==
-             ~w(sessionKey lastEvaluatedTerminal pendingBranch pendingAssignment pendingK pendingN)
+             ~w(sessionKey assignmentId lastEvaluatedTerminal pendingBranch pendingAssignment pendingK pendingN)
 
     refute "pendingTarget" in names
   end
@@ -202,6 +204,31 @@ defmodule Tightbeam.SupervisionTest do
              end)
   end
 
+  test "prod fired observation is tied to the winning evaluation", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: true})
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    drain = fn drain, remaining ->
+      assert remaining > 0
+      assert_receive {:firehose_notice, notice}
+      Hub.delivered(hub, self())
+      if notice["class"] == "prod.fired", do: notice, else: drain.(drain, remaining - 1)
+    end
+
+    notice = drain.(drain, 20)
+    assert notice["refs"]["assignmentId"] == "asg_1"
+    assert notice["refs"]["sessionKey"] == "holder"
+    assert notice["payload"]["kind"] == "prod_fired"
+    assert notice["payload"]["detail"]["tier"] == 1
+    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 99, "holder", seq)
+    refute_receive {:firehose_notice, %{"class" => "prod.fired"}}
+    assert %{prodCount: 1} = Supervision.prod_state(ctx.db, "asg_1")
+  end
+
   test "prod claims once, counts delivery once, and freezes its outbox numbers", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq = terminal!(ctx.db, "holder")
@@ -245,17 +272,47 @@ defmodule Tightbeam.SupervisionTest do
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
   end
 
-  test "progress prose does not reset delivered or attempted counters", ctx do
+  test "the August 31 Cards 1, 3, 4, and 5 durable filings rebase liveness", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
     assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq1)
     [wake] = Wakes.list_pending(ctx.db)
     cancel_wake!(ctx.db, wake)
 
+    # Exact wi_4ee303fa liveness specimens: Card 1's four filings; Card 3's
+    # dependency fallback; Card 4's durable progress; and Card 5's dependency
+    # fallback. att_99c4c115 remains the original valid dependency receipt.
+    # This receipt-selection fixture deliberately does not model stale
+    # post-closure state or unexpired-wake eligibility, which have separate
+    # boundaries.
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id, assignmentId, kind, bySession, ts) VALUES ('att_1','asg_1','progress','holder',2)"
+        """
+        INSERT INTO attests (id, assignmentId, kind, bySession, ts)
+        VALUES
+          ('att_44706a9f','asg_1','progress','holder',2),
+          ('att_38a1a229','asg_1','progress','holder',3),
+          ('att_f0f735ae','asg_1','progress','holder',4),
+          ('att_7b4d29c1','asg_1','progress','holder',5),
+          ('att_a6051dd2','asg_1','progress','holder',6),
+          ('att_c532a60d','asg_1','progress','holder',7),
+          ('att_de16e957','asg_1','progress','holder',8),
+          ('att_99c4c115','asg_1','progress','holder',9)
+        """
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO attests (id, assignmentId, kind, verdictKind, byUser, ts)
+        VALUES
+          ('att_cc66ba00','asg_1','verdict','cannot-proceed-external-main-red','flynn',10),
+          ('att_c4f2d593','asg_1','verdict','liveness-crediting-false-stall','flynn',11),
+          ('att_46f3b9a5','asg_1','verdict','liveness-crediting-false-stall','flynn',12),
+          ('att_8ca4dfcd','asg_1','verdict','liveness-crediting-false-stall','flynn',13)
+        """
       )
 
     {:ok, _} =
@@ -265,13 +322,30 @@ defmodule Tightbeam.SupervisionTest do
       )
 
     seq2 = terminal!(ctx.db, "holder")
-    assert {:prodded, 2} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
+    assert :rebased = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq2)
 
-    assert %{attemptCount: 2, prodCount: 2, attestCount: 1, stalledAt: nil} =
+    assert %{attemptCount: 0, prodCount: 0, attestCount: 12, stalledAt: nil} =
              Supervision.prod_state(ctx.db, "asg_1")
 
-    assert {:ok, []} =
-             DB.query(ctx.db, "SELECT receiptId FROM supervision_liveness_receipts")
+    assert {:ok,
+            [
+              ["progress", "att_44706a9f"],
+              ["progress", "att_38a1a229"],
+              ["progress", "att_f0f735ae"],
+              ["progress", "att_7b4d29c1"],
+              ["progress", "att_a6051dd2"],
+              ["progress", "att_c532a60d"],
+              ["progress", "att_de16e957"],
+              ["progress", "att_99c4c115"],
+              ["verdict", "att_cc66ba00"],
+              ["verdict", "att_c4f2d593"],
+              ["verdict", "att_46f3b9a5"],
+              ["verdict", "att_8ca4dfcd"]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT sourceKind,sourceId FROM supervision_liveness_receipts ORDER BY receiptId"
+             )
   end
 
   # Immutable authority: art_201ab36d, SHA-256
@@ -279,6 +353,167 @@ defmodule Tightbeam.SupervisionTest do
   # These cases drive explicit durable rows or synchronous process barriers. They
   # deliberately do not sleep, poll, widen a timeout, or infer a deadline from the
   # wall clock.
+  test "pending reminder coalescing releases reassessment without recording notification success",
+       ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+
+    assert {:ok, [[claim]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
+
+    assert is_map(JSON.decode!(claim)["pending"])
+
+    assert {:ok, before_prods} =
+             DB.query(
+               ctx.db,
+               "SELECT prodCount,lastProdAt FROM assignment_prods WHERE assignmentId='asg_1'"
+             )
+
+    before_events = EventLog.lifecycle_events(ctx.db)
+    # Reconstruct the outstanding dispatch branch left by an earlier evaluation.
+    assert {:ok, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE supervision_watermarks SET pendingBranch='prod',pendingAssignment='asg_1',pendingK=2,pendingN=2 WHERE sessionKey='holder'"
+             )
+
+    result = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+    refute match?({:refused, _}, result)
+
+    assert {:ok, [[nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT pendingBranch FROM supervision_watermarks WHERE sessionKey='holder'"
+             )
+
+    assert {:ok, [[^claim]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
+
+    assert {:ok, ^before_prods} =
+             DB.query(
+               ctx.db,
+               "SELECT prodCount,lastProdAt FROM assignment_prods WHERE assignmentId='asg_1'"
+             )
+
+    assert EventLog.lifecycle_events(ctx.db) == before_events
+    assert length(Wakes.list_pending(ctx.db)) == 1
+  end
+
+  test "only proven unconsumed cancellation releases a reminder without success", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    seq = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
+    [wake] = Wakes.list_pending(ctx.db)
+
+    assert {:ok, [[encoded]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
+
+    assert {:ok, :unresolved_consumer} =
+             DB.transaction(
+               ctx.db,
+               &Tightbeam.ReminderDelivery.canceled_in_txn(&1, "asg_1", wake.wake_id)
+             )
+
+    assert {:ok, [[^encoded]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
+
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: true})
+    cancel_wake!(ctx.db, wake)
+    assert_receive {:firehose_notice, %{"class" => "wake.canceled", "payload" => payload}}
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["state"] == "canceled"
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [[canceled]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
+
+    state = JSON.decode!(canceled)
+    assert state["pending"] == nil
+    assert state["claimEpoch"] == 2
+
+    assert state["lastDisposition"] == %{
+             "kind" => "canceled",
+             "consumer" => %{"wake" => wake.wake_id},
+             "epoch" => 1,
+             "intent" => wake.wake_id
+           }
+
+    refute Map.has_key?(state, "lastDeliveredAt")
+    refute Map.has_key?(state, "nextEligibleAt")
+
+    assert {:ok, :no_claim} =
+             DB.transaction(
+               ctx.db,
+               &Tightbeam.ReminderDelivery.canceled_in_txn(&1, "asg_1", wake.wake_id)
+             )
+
+    assert {:ok, [[^canceled]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
+  end
+
+  for authority <- [:opener, :admin] do
+    @tag repair_authority: authority
+    test "external #{authority} repair requires matching incident and delivers its owned successor",
+         %{repair_authority: authority} = ctx do
+      Tightbeam.SupervisionConsumerFixture.run!(1, authority)
+    end
+  end
+
+  test "attributed consequence API preserves newer pending evidence through real terminal success",
+       ctx do
+    Tightbeam.SupervisionConsumerFixture.run!(2, nil)
+  end
+
+  test "an unknown consumed reminder cannot be canceled or lose its owned claim", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", terminal!(ctx.db, "holder"))
+
+    [wake] = Wakes.list_pending(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, wake)
+    assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "unknown-consumer")
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "failed_unknown")
+
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: true})
+
+    assert {:ok, [[claim]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
+
+    assert {:ok, false} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, %{
+                 wake_id: wake.wake_id,
+                 expected_origin: wake.origin,
+                 requester: %{kind: "process", id: "tightbeam"},
+                 reason_kind: "requester_withdrew",
+                 causal_source: %{kind: "verb_call"},
+                 outcome: %{kind: "no_replacement"}
+               })
+             end)
+
+    assert {:ok, :unresolved_consumer} =
+             DB.transaction(
+               ctx.db,
+               &Tightbeam.ReminderDelivery.canceled_in_txn(&1, "asg_1", wake.wake_id)
+             )
+
+    assert {:ok, [[^claim]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id='asg_1'")
+
+    assert {:ok, [["failed_unknown"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [turn.seq])
+
+    refute Map.has_key?(JSON.decode!(claim), "lastDeliveredAt")
+    refute_receive {:firehose_notice, _}
+  end
+
   test "a verdict is a typed fact receipt and resets the ladder once", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     seq1 = terminal!(ctx.db, "holder")
@@ -427,7 +662,7 @@ defmodule Tightbeam.SupervisionTest do
     refute second.wake_id in [first_id, third_id]
   end
 
-  test "vague progress and unbound, unrelated, or expired wakes are not receipts", ctx do
+  test "unrelated progress and unbound, unrelated, or expired wakes are not receipts", ctx do
     assignment(ctx.db, "asg_other", "holder", "other work", 2)
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
     now = System.system_time(:millisecond)
@@ -453,7 +688,7 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(
         ctx.db,
-        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_vague','asg_1','progress','blocked, no state change','holder',?1)",
+        "INSERT INTO attests (id,assignmentId,kind,note,bySession,ts) VALUES ('att_unrelated','asg_other','progress','other work','holder',?1)",
         [now]
       )
 
@@ -493,6 +728,11 @@ defmodule Tightbeam.SupervisionTest do
            } = Supervision.prod_state(ctx.db, "asg_1")
 
     assert Ledger.last_terminal_seq(ctx.db, "holder") == turn.seq
+  end
+
+  test "settled controller verdict reset then holder typed wait survives restart and suppresses due sweep",
+       ctx do
+    Tightbeam.SupervisionConsumerFixture.run!(3, nil)
   end
 
   test "restart preserves an armed deadline and a later receipt captures the replacement interval",
@@ -648,11 +888,7 @@ defmodule Tightbeam.SupervisionTest do
         "UPDATE assignments SET state='closed', outcome='surrendered', closedAt=11, closedBySession='holder', closingAttestId='att_surrendered' WHERE id='asg_surrendered'"
       )
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE assignments SET state='closed', outcome='revoked', closedAt=12, closedByUser='flynn' WHERE id='asg_revoked'"
-      )
+    :ok = persist_terminal_race!(ctx.db, "asg_revoked", 12)
 
     _name = start_liveness!(ctx, sweep_ms: 60_000)
 
@@ -741,39 +977,83 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(ctx.db, "SELECT 1 FROM supervision_entitlements WHERE assignmentId='asg_1'")
   end
 
-  test "startup uses the newest valid parent transfer when history has earlier transfers", ctx do
-    first_terminal_seq = terminal!(ctx.db, "holder")
-    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+  test "Gateway parent retirement rearms an active holder with the supervision override", ctx do
+    start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
+    # An inactive intermediate ancestor is skipped by lineage resolution and by
+    # the active-subtree retirement walk, leaving the holder available to rearm.
+    session(ctx.db, "retired_bridge", "supervisor")
+    Org.retire(ctx.db, "retired_bridge", "user:flynn", 1_000)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET spawnedBy='retired_bridge' WHERE sessionKey='holder'")
+
+    terminal_seq = terminal!(ctx.db, "holder")
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0, interval: 1_234)
+    handlers = Gateway.handlers(%{db: ctx.db, wake_tick_ms: 10, supervision_interval_ms: 4_321})
+
+    assert {:ok, [[0, 1_234]]} =
+             DB.query(
+               ctx.db,
+               "SELECT dueAt, supervisionIntervalMs FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
 
     assert {:escalated, 1, "supervisor"} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", first_terminal_seq)
+             Supervision.evaluate(ctx.db, handlers, 0, "holder", terminal_seq)
 
-    assert [first_wake] = Wakes.list_pending(ctx.db)
-    assert :appended = admit_supervision_wake!(ctx.db, first_wake)
+    assert [escalation] = Wakes.list_pending(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, escalation)
 
-    second_terminal_seq = terminal!(ctx.db, "holder")
-    insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0)
+    assert %{supervisionState: "parent_elevated", supervisionTransferSessionKey: "supervisor"} =
+             Supervision.prod_state(ctx.db, "asg_1")
 
-    assert {:escalated, 2, main_session_key} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", second_terminal_seq)
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT dueAt FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
 
-    assert main_session_key == ctx.main.session_key
+    assert {:ok, [["running"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT mechanicalStatus FROM sessions WHERE sessionKey=\'supervisor\'"
+             )
 
-    assert [second_wake] = Wakes.list_pending(ctx.db)
-    assert :appended = admit_supervision_wake!(ctx.db, second_wake)
+    result =
+      handlers["retire"].(%{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: "supervisor",
+        params: %{}
+      })
 
-    name = start_liveness!(ctx, sweep_ms: 60_000)
+    assert result.retired_session_keys == ["supervisor"]
+    assert Org.get(ctx.db, "holder").state == "active"
+    assert {:ok, [["open"]]} = DB.query(ctx.db, "SELECT state FROM assignments WHERE id='asg_1'")
 
-    assert is_pid(Process.whereis(name))
+    assert {:ok, [["parent_retirement", "parent_target_retired", 4_321, due_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT basisKind, cause, supervisionIntervalMs, dueAt FROM supervision_entitlements WHERE assignmentId='asg_1'"
+             )
 
-    assert %{
-             supervisionState: "parent_elevated",
-             supervisionTransferWakeId: transfer_wake,
-             supervisionTransferSessionKey: ^main_session_key
-           } = Supervision.prod_state(ctx.db, "asg_1")
+    assert {:ok, [["child_rearm", epoch]]} =
+             DB.query(
+               ctx.db,
+               "SELECT retirementOutcomeKind, retirementEpoch FROM supervision_liveness_sidecar WHERE wakeId=?1",
+               [escalation.wake_id]
+             )
 
-    assert transfer_wake == second_wake.wake_id
-    refute transfer_wake == first_wake.wake_id
+    assert due_at == epoch + 4_321
+
+    assert {:ok, [["retired", "idle", ^epoch]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,mechanicalStatus,updatedAt FROM sessions WHERE sessionKey=\'supervisor\'"
+             )
+  end
+
+  test "startup uses the newest valid parent transfer when history has earlier transfers", ctx do
+    Tightbeam.SupervisionConsumerFixture.run!(4, nil)
   end
 
   test "startup normalizes legacy lineage markers and starts fresh bounded supervision", ctx do
@@ -983,6 +1263,12 @@ defmodule Tightbeam.SupervisionTest do
     assert {:ok, [[source_turn_seq]]} =
              DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [source_wake.wake_id])
 
+    assert {:ok, [["running"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT mechanicalStatus FROM sessions WHERE sessionKey=\'supervisor\'"
+             )
+
     source_evidence = "asg_1##{source_turn_seq}"
 
     {:ok, _} =
@@ -1024,6 +1310,12 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert main_key == ctx.main.session_key
+
+    assert {:ok, [["retired", "idle"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,mechanicalStatus FROM sessions WHERE sessionKey=\'supervisor\'"
+             )
 
     assert {:ok, [["canceled"]]} =
              DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [
@@ -1418,7 +1710,53 @@ defmodule Tightbeam.SupervisionTest do
     Supervision.notify_terminal(name, "holder", retry_seq)
 
     assert_receive {:request_changed_before_park, :withdraw, ^stale_id}
-    assert_receive {:request_rechecked, :withdraw, 2}
+
+    try do
+      assert_receive {:request_rechecked, :withdraw, 2}
+    rescue
+      error in ExUnit.AssertionError ->
+        # Capture only this synthetic arena after the original assertion fails.
+        # Never trigger a sweep, retry a query through the proxy, or extend the wait.
+        for {label, read} <- [
+              {:supervisor,
+               fn ->
+                 case Process.whereis(name) do
+                   nil -> :not_running
+                   pid -> Process.info(pid, [:status, :current_stacktrace, :message_queue_len])
+                 end
+               end},
+              {:proxy, fn -> :sys.get_state(proxy, 100) end},
+              {:watermarks, fn -> DB.query(ctx.db, "SELECT * FROM supervision_watermarks") end},
+              {:requests,
+               fn ->
+                 DB.query(
+                   ctx.db,
+                   "SELECT id,status,parkWakeId FROM decision_requests ORDER BY rowid"
+                 )
+               end},
+              {:wakes, fn -> DB.query(ctx.db, "SELECT wakeId,state,assignmentId FROM wakes") end},
+              {:lifecycle,
+               fn ->
+                 DB.query(
+                   ctx.db,
+                   "SELECT kind,subject,detail FROM lifecycle_events ORDER BY id DESC LIMIT 20"
+                 )
+               end}
+            ] do
+          result =
+            try do
+              read.()
+            rescue
+              diagnostic_error -> {:diagnostic_error, Exception.message(diagnostic_error)}
+            catch
+              kind, reason -> {:diagnostic_error, kind, reason}
+            end
+
+          IO.inspect(result, label: "park-race-failure #{label}", limit: :infinity)
+        end
+
+        reraise error, __STACKTRACE__
+    end
 
     assert eventually(fn ->
              match?(
@@ -1477,6 +1815,77 @@ defmodule Tightbeam.SupervisionTest do
 
     assert Wakes.get(ctx.db, reminder.wake_id).state == "pending"
     assert Supervision.prod_state(ctx.db, "asg_1") == nil
+  end
+
+  test "an unrelated selected classed fyi wake does not suppress the turn-end remedy", ctx do
+    prepare_review_gate(ctx)
+
+    {:ok, _policy} =
+      DB.transaction(ctx.db, fn txn ->
+        Org.apply_notice_batching_lane_policy_in_txn(
+          txn,
+          %{session_key: "holder", target_role: nil},
+          true,
+          "notice-batching-test-policy:supervision-held-fyi",
+          "agent:test-policy",
+          "supervision-fixture",
+          1
+        )
+      end)
+
+    held =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "process:tightbeam",
+        prompt: "unrelated fyi, held by the batcher",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder",
+        class: "fyi"
+      })
+
+    assert held.delivery_rule == Wakes.digest_rule()
+    refute held.digest
+    assert Wakes.self_pending_count(ctx.db, "holder") == 0
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:acted, :rail_remedy} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{status: "live"} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1")
+
+    assert Wakes.get(ctx.db, held.wake_id).state == "pending"
+  end
+
+  test "a default-off legacy fyi wake does not suppress the turn-end remedy", ctx do
+    prepare_review_gate(ctx)
+
+    held =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "process:tightbeam",
+        prompt: "default-off unrelated fyi",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder",
+        class: "fyi"
+      })
+
+    assert held.delivery_rule == "turn-boundary-digest r1"
+    assert NoticeBatcher.source_refs(ctx.db, held.wake_id) == []
+    assert Wakes.self_pending_count(ctx.db, "holder") == 0
+
+    seq = terminal!(ctx.db, "holder")
+
+    assert {:acted, :rail_remedy} =
+             Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert %{status: "live"} =
+             RailRemedy.episode(ctx.db, "completion-needs-review", "asg_1")
+
+    assert Wakes.get(ctx.db, held.wake_id).state == "pending"
   end
 
   test "turn-end denial without a remedy records re-obligate and uses the normal prod", ctx do
@@ -1637,49 +2046,7 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "supervision wake is fired in the enqueue transaction before its provoked terminal", ctx do
-    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
-    seq = terminal!(ctx.db, "holder")
-    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", seq)
-    [originating] = Wakes.list_pending(ctx.db)
-
-    parent = self()
-    registry = start_supervised!({ConnRegistry, name: :atomic_fire_registry})
-
-    lane =
-      start_supervised!(
-        {RaceLane,
-         {:atomic_fire_lane,
-          fn "holder" ->
-            state_at_nudge = Wakes.get(ctx.db, originating.wake_id).state
-            assert {:ok, turn} = Ledger.claim_next(ctx.db, "holder", "atomic-fire-race")
-            assert turn.wake_id == originating.wake_id
-            assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-
-            {:ok, _} =
-              DB.query(
-                ctx.db,
-                "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_1' AND state='armed'"
-              )
-
-            result = Supervision.evaluate(ctx.db, ctx.handlers, 2, "holder", turn.seq)
-            send(parent, {:race_result, state_at_nudge, result})
-          end}}
-      )
-
-    scheduler =
-      start_supervised!(
-        {Wakes,
-         db: ctx.db,
-         deliver: delivery_fun(ctx.db, registry, lane),
-         tick_ms: 60_000,
-         name: :atomic_fire_scheduler}
-      )
-
-    assert :ok = Wakes.fire_due(scheduler)
-    assert_receive {:race_result, "fired", {:prodded, 2}}
-    assert Wakes.get(ctx.db, originating.wake_id).state == "fired"
-    assert [%{prompt: next_prompt}] = Wakes.list_pending(ctx.db)
-    assert next_prompt =~ "prod 2 of 2"
+    Tightbeam.SupervisionConsumerFixture.run!(5, nil)
   end
 
   test "external direct wake keeps deliver-then-mark ordering", ctx do
@@ -1720,64 +2087,7 @@ defmodule Tightbeam.SupervisionTest do
 
   test "repeated synchronous delivery racer advances every prod and quiesces only at Main terminus",
        ctx do
-    n = 12
-    assignment(ctx.db, "asg_main", ctx.main.session_key, "main work", 2)
-    insert_entitlement!(ctx.db, "asg_main", generation: 1, due_at: 0)
-    seq = terminal!(ctx.db, ctx.main.session_key)
-
-    assert {:prodded, 1} =
-             Supervision.evaluate(ctx.db, ctx.handlers, n, ctx.main.session_key, seq)
-
-    parent = self()
-    registry = start_supervised!({ConnRegistry, name: :repeated_race_registry})
-
-    lane =
-      start_supervised!(
-        {RaceLane,
-         {:repeated_race_lane,
-          fn session_key ->
-            assert {:ok, turn} = Ledger.claim_next(ctx.db, session_key, "repeated-race")
-            state_at_nudge = Wakes.get(ctx.db, turn.wake_id).state
-            assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-
-            {:ok, _} =
-              DB.query(
-                ctx.db,
-                "UPDATE supervision_entitlements SET dueAt=0 WHERE assignmentId='asg_main' AND state='armed'"
-              )
-
-            result = Supervision.evaluate(ctx.db, ctx.handlers, n, session_key, turn.seq)
-            send(parent, {:iteration_result, turn.wake_id, state_at_nudge, result})
-          end}}
-      )
-
-    scheduler =
-      start_supervised!(
-        {Wakes,
-         db: ctx.db,
-         deliver: delivery_fun(ctx.db, registry, lane),
-         tick_ms: 60_000,
-         name: :repeated_race_scheduler}
-      )
-
-    for iteration <- 1..n do
-      assert :ok = Wakes.fire_due(scheduler)
-      assert_receive {:iteration_result, wake_id, "fired", result}
-      assert Wakes.get(ctx.db, wake_id).state == "fired"
-
-      if iteration < n do
-        assert result == {:prodded, iteration + 1}
-      else
-        assert result == :terminus
-      end
-    end
-
-    assert Wakes.pending_count(ctx.db, ctx.main.session_key) == 0
-    assert Ledger.pending_count(ctx.db, ctx.main.session_key) == 0
-    assert %{pendingBranch: nil} = Supervision.watermark(ctx.db, ctx.main.session_key)
-
-    assert Enum.count(EventLog.lifecycle_events(ctx.db), &(&1.kind == "supervision_terminus")) ==
-             1
+    Tightbeam.SupervisionConsumerFixture.run!(6, nil)
   end
 
   test "delivered prod and escalation prompts match the stamped templates byte for byte", ctx do
@@ -1802,8 +2112,8 @@ defmodule Tightbeam.SupervisionTest do
 
     expected_prod =
       "[from process:tightbeam]\n\n" <>
-        "Your turn ended with no filing and no continuation scheduled for assignment asg_1 — \"ship it\". " <>
-        "File completion, schedule your continuation, or file surrender. This is prod 1 of 3; " <>
+        "Your turn ended with no qualifying receipt or admitted continuation covering assignment asg_1 — \"ship it\". " <>
+        "File a qualifying receipt, register an obligation-scoped continuation, or file truthful completion or surrender. This is prod 1 of 3; " <>
         "a reply without a row escalates to your spawner."
 
     assert {:ok, [[^expected_prod]]} =
@@ -1901,7 +2211,7 @@ defmodule Tightbeam.SupervisionTest do
     expected_escalation =
       "[from process:tightbeam]\n\n" <>
         "Assignment asg_escalation — \"investigate\" — held by escalating-holder is stalled: " <>
-        "0 prods produced no filing and no continuation. This is escalation 1 for this assignment. " <>
+        "0 prods produced no qualifying receipt and no admitted continuation covering it. This is escalation 1 for this assignment. " <>
         "Why, and what happens next, is your judgment — the substrate only reports the rows."
 
     assert {:ok, [[^expected_escalation]]} =
@@ -2344,11 +2654,7 @@ defmodule Tightbeam.SupervisionTest do
     seq = terminal!(ctx.db, "holder")
     assert {:refused, "server_error"} = Supervision.evaluate(ctx.db, transient, 3, "holder", seq)
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE assignments SET state='closed', outcome='revoked', closedAt=2, closedByUser='flynn' WHERE id='asg_1'"
-      )
+    :ok = persist_terminal_race!(ctx.db, "asg_1", 2)
 
     assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
 
@@ -2499,66 +2805,12 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   test "N=0 cross-assignment re-entry exceeds N+1 and then quiesces at Main", ctx do
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE sessions SET spawnedBy='holder' WHERE sessionKey='supervisor'")
-
-    assignment(ctx.db, "asg_2", "supervisor", "second", 2)
-    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
-    insert_entitlement!(ctx.db, "asg_2", generation: 1, due_at: 0)
-
-    h1 = terminal!(ctx.db, "holder")
-
-    assert {:escalated, 1, "supervisor"} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", h1)
-
-    fire_all_pending(ctx.db)
-    s1 = terminal!(ctx.db, "supervisor")
-
-    assert {:escalated, 1, "holder"} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 0, "supervisor", s1)
-
-    fire_all_pending(ctx.db)
-    insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0)
-    h2 = terminal!(ctx.db, "holder")
-
-    assert {:escalated, 2, main} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", h2)
-
-    assert main == ctx.main.session_key
-    assert Supervision.prod_state(ctx.db, "asg_1").prodCount == 2
-    assert Supervision.prod_state(ctx.db, "asg_1").prodCount > 0 + 1
-
-    fire_all_pending(ctx.db)
-    main_terminal = terminal!(ctx.db, ctx.main.session_key)
-
-    assert :idle =
-             Supervision.evaluate(ctx.db, ctx.handlers, 0, ctx.main.session_key, main_terminal)
-
-    assert Wakes.list_pending(ctx.db) == []
+    Tightbeam.SupervisionConsumerFixture.run!(7, nil)
   end
 
   test "past-sink open assignment emits one escalation per external terminal and duplicate re-entry is inert",
        ctx do
-    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET spawnedBy=NULL WHERE sessionKey='holder'")
-    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
-
-    first = terminal!(ctx.db, "holder")
-
-    assert {:escalated, 1, main} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", first)
-
-    assert main == ctx.main.session_key
-    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", first)
-    assert length(Wakes.list_pending(ctx.db)) == 1
-
-    fire_all_pending(ctx.db)
-    insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0)
-    second = terminal!(ctx.db, "holder")
-
-    assert {:escalated, 2, ^main} =
-             Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", second)
-
-    assert length(Wakes.list_pending(ctx.db)) == 1
+    Tightbeam.SupervisionConsumerFixture.run!(8, nil)
   end
 
   test "atomic delivery concurrent-retirement race has only before-or-after outcomes", ctx do
@@ -2825,6 +3077,203 @@ defmodule Tightbeam.SupervisionTest do
              Supervision.prod_state(ctx.db, "asg_1")
 
     assert Wakes.list_pending(ctx.db) == []
+  end
+
+  test "both supervision gates suppress every typed harness failure class", ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+
+    classes = [
+      "auth-dead",
+      "rate-limit-dead",
+      "adapter_unavailable",
+      "model_unavailable",
+      "task_crash",
+      "interrupted-outcome-unknown"
+    ]
+
+    Enum.with_index(classes, 1)
+    |> Enum.each(fn {failure_class, index} ->
+      open_authoritative_harness_incident!(ctx, failure_class, index)
+
+      assert {:no_match, :harness_unavailable, %{id: "asg_1"}} =
+               Supervision.prod_production_matches?(ctx.db, ctx.holder.session_key, nil)
+
+      assert {:ok, true} =
+               DB.transaction(
+                 ctx.db,
+                 &Supervision.harness_unavailable_in_txn?(&1, ctx.holder.session_key)
+               )
+
+      resolve_harness_incident!(ctx, failure_class, index)
+
+      assert {:ok, false} =
+               DB.transaction(
+                 ctx.db,
+                 &Supervision.harness_unavailable_in_txn?(&1, ctx.holder.session_key)
+               )
+    end)
+  end
+
+  defp real_consumer_fixture!(ctx, opts \\ []) do
+    alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
+
+    unless Process.whereis(Tightbeam.LaneRegistry),
+      do: start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
+
+    unless Process.whereis(Tightbeam.ConnRegistry),
+      do:
+        start_supervised!(
+          Supervisor.child_spec({ConnRegistry, name: Tightbeam.ConnRegistry},
+            id: :r1_consumer_registry
+          )
+        )
+
+    task_sup = start_supervised!({Task.Supervisor, []})
+
+    {:ok, responder} =
+      Task.Supervisor.start_child(task_sup, fn ->
+        loop = fn loop ->
+          receive do
+            {:prompt_started, adapter} ->
+              send(adapter, :continue_prompt)
+              loop.(loop)
+
+            _ ->
+              loop.(loop)
+          end
+        end
+
+        loop.(loop)
+      end)
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE sessions SET host=?1", [
+               Tightbeam.Placement.local_host_name()
+             ])
+
+    adapter = start_supervised!({AdapterStub, {:unique_sessions, responder}})
+    start_supervised!({CoordinatorStub, adapter})
+
+    config = %{
+      base_dir: Path.join(ctx.base, "gateway-consumer"),
+      cwd: ctx.base,
+      port: 0,
+      db: ctx.db,
+      default_harness: :claude,
+      default_model: Model.new("claude-fable-5"),
+      max_live_sessions_per_user: 50,
+      wake_tick_ms: 60_000,
+      onboarding_lease_ms: 1_800_000
+    }
+
+    {Tightbeam.LaneManager, options} =
+      Enum.find(Gateway.children(config), &match?({Tightbeam.LaneManager, _}, &1))
+
+    runner = Keyword.fetch!(options, :runner)
+
+    fn key ->
+      assert {:ok, [[seq, wake_id, assignment_id]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT seq,wakeId,assignmentId FROM turns WHERE sessionKey=?1 AND status='queued' ORDER BY seq",
+                 [key]
+               )
+
+      receiver = self()
+
+      {:ok, lane} =
+        Tightbeam.SessionLane.start_link(
+          session_key: key,
+          db: ctx.db,
+          task_sup: task_sup,
+          runner: runner,
+          on_terminal: fn _key, terminal_seq ->
+            send(receiver, {:consumer_terminal, terminal_seq})
+          end
+        )
+
+      try do
+        assert_receive {:consumer_terminal, ^seq}, 60_000
+
+        assert {:ok, [["delivered"]]} =
+                 DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+        assert {:ok, [[encoded]]} =
+                 DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [
+                   assignment_id
+                 ])
+
+        state = JSON.decode!(encoded)
+        assert state["pending"] == nil
+        expected_consumer = if is_nil(wake_id), do: %{"turn" => seq}, else: %{"wake" => wake_id}
+        assert state["lastConsumer"] == expected_consumer
+
+        assert (state["nextEligibleAt"] - state["lastDeliveredAt"]) in [
+                 300_000,
+                 900_000,
+                 1_800_000
+               ]
+
+        # Explicit ladder-test clock setup, only AFTER actual successful terminal
+        # delivery and its selected gap are proved. Do not fabricate success.
+        if Keyword.get(opts, :expire_gap, true) do
+          assert {:ok, _} =
+                   DB.query(ctx.db, "UPDATE assignments SET reminderState=?2 WHERE id=?1", [
+                     assignment_id,
+                     JSON.encode!(Map.put(state, "nextEligibleAt", 0))
+                   ])
+        end
+
+        %{seq: seq, wake_id: wake_id}
+      after
+        if Process.alive?(lane), do: GenServer.stop(lane)
+      end
+    end
+  end
+
+  # Model a committed terminal row before its downstream reconciliation. Keep the
+  # real audit and generation constraints; using the full revoke handler here
+  # would consume the callback race that these three tests exercise.
+  defp persist_terminal_race!(db, assignment_id, at) do
+    revocation_id = "rev_race_#{System.unique_integer([:positive])}"
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id, assignmentId, revokedAt, revokedByUser, reason)
+                 VALUES (?1, ?2, ?3, 'flynn', 'synthetic terminal race')
+                 """,
+                 [revocation_id, assignment_id, at]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocation_generations
+                   (revocationId, assignmentId, reopeningId)
+                 VALUES (?1, ?2, NULL)
+                 """,
+                 [revocation_id, assignment_id]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 """
+                 UPDATE assignments SET state='closed', outcome='revoked',
+                   closedAt=?2, closedByUser='flynn'
+                 WHERE id=?1 AND state='open'
+                 """,
+                 [assignment_id, at]
+               )
+
+               assert DB.Txn.changes(txn) == 1
+               :ok
+             end)
+
+    :ok
   end
 
   defp cancel_wake!(db, wake) do
@@ -3154,6 +3603,8 @@ defmodule Tightbeam.SupervisionTest do
   end
 
   defp resolve_rate_limit_incident!(ctx, terminal_seq) do
+    :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "eezo"})
+
     assert {:resolved, _} =
              HarnessHealth.resolve(ctx.db, %{
                harness: "claude",
@@ -3164,6 +3615,45 @@ defmodule Tightbeam.SupervisionTest do
                observed_at: 200,
                correlation_id: "supervision-normal-turn-#{terminal_seq}",
                cause: "normal turn delivered",
+               principal: "process:tightbeam"
+             })
+
+    :ok
+  end
+
+  defp open_authoritative_harness_incident!(ctx, failure_class, index) do
+    assert {:opened, _} =
+             HarnessHealth.observe(ctx.db, %{
+               harness: "claude",
+               host: "eezo",
+               failure_class: failure_class,
+               evidence_kind: "authoritative-provider",
+               session_key: ctx.holder.session_key,
+               assignment_id: "asg_1",
+               observed_at: 1_000 + index,
+               correlation_id: "supervision-all-class-#{failure_class}-#{index}",
+               cause: "typed harness failure #{failure_class}",
+               principal: "process:tightbeam"
+             })
+
+    :ok
+  end
+
+  defp resolve_harness_incident!(ctx, failure_class, index) do
+    if failure_class == "rate-limit-dead" do
+      :ok = HarnessProcess.complete_park(ctx.db, {:claude, "shared", "eezo"})
+    end
+
+    assert {:resolved, _} =
+             HarnessHealth.resolve(ctx.db, %{
+               harness: "claude",
+               host: "eezo",
+               failure_class: failure_class,
+               session_key: ctx.holder.session_key,
+               assignment_id: "asg_1",
+               observed_at: 2_000 + index,
+               correlation_id: "supervision-all-class-resolved-#{failure_class}-#{index}",
+               cause: "typed harness recovered #{failure_class}",
                principal: "process:tightbeam"
              })
 
@@ -3264,7 +3754,7 @@ defmodule Tightbeam.SupervisionTest do
     })
   end
 
-  defp fire_all_pending(db) do
+  defp fire_all_pending(db, consume \\ nil) do
     for wake <- Wakes.list_pending(db) do
       case DB.query(
              db,
@@ -3273,8 +3763,13 @@ defmodule Tightbeam.SupervisionTest do
            ) do
         {:ok, [[1]]} ->
           assert :appended = admit_supervision_wake!(db, wake)
-          assert {:ok, %{seq: seq}} = Ledger.claim_next(db, wake.session_key, "test-controller")
-          assert :ok = Ledger.finish(db, seq, "delivered")
+
+          if consume do
+            consume.(wake.session_key)
+          else
+            assert {:ok, %{seq: seq}} = Ledger.claim_next(db, wake.session_key, "test-controller")
+            assert :ok = Ledger.finish(db, seq, "delivered")
+          end
 
         {:ok, []} ->
           {:ok, _} =

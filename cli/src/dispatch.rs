@@ -117,6 +117,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
@@ -131,7 +132,11 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             at,
             condition_kind,
             condition_scope,
+            predicate,
+            assignment_id,
+            after_turn,
             idempotency_key,
+            class,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -145,10 +150,23 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = at {
                 params.push(format!("\"at\":{value}"));
             }
+            if let Some(value) = predicate {
+                params.push(format!(
+                    "\"predicate\":{}",
+                    serde_json::to_string(value).expect("predicate is JSON serializable")
+                ));
+            }
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignmentId", value));
+            }
+            if *after_turn {
+                params.push("\"afterTurn\":true".to_owned());
+            }
             for (name, value) in [
                 ("conditionKind", condition_kind),
                 ("conditionScope", condition_scope),
                 ("idempotencyKey", idempotency_key),
+                ("class", class),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -161,8 +179,17 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             kind,
             scope,
             idempotency_key,
+            payload,
         } => {
             let mut params = vec![string_field("kind", kind)];
+            if let Some(encoded) = payload {
+                let value: Value = serde_json::from_str(encoded)
+                    .map_err(|_| "--payload requires a JSON object".to_owned())?;
+                if !value.is_object() {
+                    return Err("--payload requires a JSON object".to_owned());
+                }
+                params.push(format!("\"payload\":{}", value));
+            }
             for (name, value) in [("scope", scope), ("idempotencyKey", idempotency_key)] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -178,6 +205,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             description,
             work_item_id,
             content_sha256,
+            produced_by_assignment_id,
         } => {
             let mut params = vec![
                 string_field("kind", kind),
@@ -188,6 +216,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("description", description),
                 ("workItemId", work_item_id),
                 ("contentSha256", content_sha256),
+                ("producedByAssignmentId", produced_by_assignment_id),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -311,6 +340,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             reviews,
             effect_kind,
             files,
+            succeeds,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -336,6 +366,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     serde_json::to_string(value).expect("strings are JSON serializable")
                 ));
             }
+            if let Some(value) = succeeds {
+                params.push(string_field("succeedsAssignmentId", value));
+            }
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
@@ -347,6 +380,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             workdir_root,
             brief,
             idempotency_key,
+            succeeds,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
@@ -363,6 +397,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
+            }
+            if let Some(value) = succeeds {
+                params.push(string_field("succeedsAssignmentId", value));
             }
             Ok(request(
                 identity,
@@ -382,6 +419,49 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![
                 string_field("request", request_id),
                 string_field("action", action),
+            ],
+        )),
+        Command::Ask {
+            identity,
+            target,
+            question,
+            assignment_id,
+        } => {
+            let target = match target {
+                Target::Session(value) => string_field("sessionKey", value),
+                Target::Role(value) => string_field("role", value),
+                Target::User(value) => string_field("userId", value),
+            };
+            let mut params = vec![string_field("question", question)];
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignmentId", value));
+            }
+            Ok(request(identity, "ask", vec![target], params))
+        }
+        Command::Answer {
+            identity,
+            request_id,
+            answer,
+        } => Ok(request(
+            identity,
+            "answer",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("answer", answer),
+            ],
+        )),
+        Command::Return {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "return",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
             ],
         )),
         Command::OperatorAsk {
@@ -457,20 +537,78 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "decision-requests", vec![], params))
         }
+        Command::DecisionRequest {
+            identity,
+            request_id,
+        } => Ok(request(
+            identity,
+            "decision-request",
+            vec![],
+            vec![string_field("request", request_id)],
+        )),
         Command::RevokeAssignment {
             identity,
             assignment_id,
+            reason,
         } => Ok(request(
             identity,
             "revoke-assignment",
             vec![],
-            vec![string_field("assignmentId", assignment_id)],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
         )),
+        Command::ReopenAssignment {
+            identity,
+            assignment_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "reopen-assignment",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
+        )),
+        Command::RepairAssignment {
+            identity,
+            assignment_id,
+            action,
+            model,
+            effort,
+            context,
+            outcome,
+            turn_seq,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("assignmentId", assignment_id),
+                string_field("action", action),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+            for (name, value) in [
+                ("model", model),
+                ("effort", effort),
+                ("context", context),
+                ("outcome", outcome),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            if let Some(value) = turn_seq {
+                params.push(format!("\"turnSeq\":{value}"));
+            }
+            Ok(request(identity, "repair-assignment", vec![], params))
+        }
         Command::WorkItemCreate {
             identity,
             title,
             spec_ref_name,
             spec_ref_sha256,
+            priority,
             idempotency_key,
         } => {
             let mut params = vec![string_field("title", title)];
@@ -480,10 +618,42 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if let Some(value) = spec_ref_sha256 {
                 params.push(string_field("specRefSha256", value));
             }
+            if let Some(value) = priority {
+                params.push(format!("\"priority\":{value}"));
+            }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
             }
             Ok(request(identity, "work-item-create", vec![], params))
+        }
+        Command::WorkItemUpdate {
+            identity,
+            work_item_id,
+            title,
+            spec_ref_name,
+            spec_ref_sha256,
+            clear_spec_ref,
+            priority,
+        } => {
+            let mut params = vec![string_field("workItemId", work_item_id)];
+            if let Some(value) = title {
+                params.push(string_field("title", value));
+            }
+            if *clear_spec_ref {
+                params.push("\"specRefName\":null".to_owned());
+                params.push("\"specRefSha256\":null".to_owned());
+            } else {
+                if let Some(value) = spec_ref_name {
+                    params.push(string_field("specRefName", value));
+                }
+                if let Some(value) = spec_ref_sha256 {
+                    params.push(string_field("specRefSha256", value));
+                }
+            }
+            if let Some(value) = priority {
+                params.push(format!("\"priority\":{value}"));
+            }
+            Ok(request(identity, "work-item-update", vec![], params))
         }
         Command::WorkItemGet {
             identity,
@@ -551,7 +721,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if *tree {
                 params.push("\"tree\":true".to_owned());
             }
-            Ok(request(identity, "toplines", vec![], params))
+            Ok(request(identity, "execution-map", vec![], params))
         }
         // Every selector travels as an ordinary body PARAM: both verbs are declared
         // non-target at the router, and --session is a COHORT FILTER over creator
@@ -570,7 +740,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         } => {
             let mut params = filter_params(filters);
             params.push(string_field("under", work_item_id));
-            Ok(request(identity, "topline", vec![], params))
+            Ok(request(identity, "execution-map-select", vec![], params))
         }
         Command::Topline {
             identity,
@@ -583,13 +753,44 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
 
             Ok(request(
                 identity,
-                "topline",
+                "execution-map-select",
                 vec![],
                 vec![format!(
                     "\"assignments\":{}",
                     serde_json::Value::Array(list)
                 )],
             ))
+        }
+        Command::ToplineMutation {
+            identity,
+            verb,
+            params,
+        } => Ok(request(
+            identity,
+            verb,
+            vec![],
+            params
+                .iter()
+                .map(|(name, value)| string_field(name, value))
+                .collect(),
+        )),
+        Command::DurableToplines { identity, state } => {
+            let params = state
+                .as_ref()
+                .map(|value| vec![string_field("state", value)])
+                .unwrap_or_default();
+            Ok(request(identity, "toplines", vec![], params))
+        }
+        Command::DurableTopline {
+            identity,
+            topline_id,
+            history,
+        } => {
+            let mut params = vec![string_field("toplineId", topline_id)];
+            if *history {
+                params.push("\"history\":true".to_owned());
+            }
+            Ok(request(identity, "topline", vec![], params))
         }
         Command::WorkItemIcebox {
             identity,
@@ -636,7 +837,42 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             verdict,
             note,
             commit_refs,
+            artifact_id,
+            content_sha256,
+            wait_id,
         } => {
+            // A surrender is the sole terminal operation a stale session may make.
+            // Keep its wire shape apart from generic dispatch: that endpoint remains
+            // release-gated, and this one must never accept an asserted identity or
+            // ordinary attest fields.
+            if kind == "surrender" {
+                if !matches!(identity, Identity::Session) {
+                    return Err(
+                        "terminal surrender must use the session's implicit identity".to_owned(),
+                    );
+                }
+                let note = note
+                    .as_deref()
+                    .ok_or_else(|| "--note is required when --kind is surrender".to_owned())?;
+                if verdict.is_some()
+                    || commit_refs.is_some()
+                    || artifact_id.is_some()
+                    || content_sha256.is_some()
+                    || wait_id.is_some()
+                {
+                    return Err(
+                        "terminal surrender accepts only --kind surrender and --note".to_owned(),
+                    );
+                }
+                return Ok(RequestSpec {
+                    path: "/agent/terminal",
+                    body_json: object(vec![
+                        string_field("assignmentId", assignment_id),
+                        string_field("disposition", "surrender"),
+                        string_field("note", note),
+                    ]),
+                });
+            }
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
                 string_field("kind", kind),
@@ -652,6 +888,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     "\"commitRefs\":{}",
                     serde_json::to_string(value).expect("commit refs are JSON serializable")
                 ));
+            }
+            if let Some(value) = artifact_id {
+                params.push(string_field("artifactId", value));
+            }
+            if let Some(value) = content_sha256 {
+                params.push(string_field("contentSha256", value));
+            }
+            if let Some(value) = wait_id {
+                params.push(string_field("waitId", value));
             }
             Ok(request(identity, "attest", vec![], params))
         }
@@ -692,6 +937,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         )),
         Command::IdentityEdit {
             identity,
+            idempotency_key,
             archetype,
             manifest,
             skill,
@@ -699,6 +945,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             content,
         } => {
             let mut params = vec![
+                string_field("idempotencyKey", idempotency_key),
                 string_field("archetype", archetype),
                 format!("\"manifest\":{manifest}"),
                 format!("\"remove\":{remove}"),
@@ -723,14 +970,17 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 .map(|value| vec![string_field("archetype", value)])
                 .unwrap_or_default(),
         )),
-        Command::IdentityRelearn { identity, action } => Ok(request(
+        Command::IdentityRelearn {
+            identity,
+            idempotency_key,
+            action,
+        } => Ok(request(
             identity,
             "identity-relearn",
             vec![],
-            action
-                .as_ref()
-                .map(|value| vec![string_field("action", value)])
-                .unwrap_or_default(),
+            std::iter::once(string_field("idempotencyKey", idempotency_key))
+                .chain(action.as_ref().map(|value| string_field("action", value)))
+                .collect(),
         )),
         Command::IdentityRepoint {
             identity,
@@ -742,17 +992,31 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![string_field("sessionKey", session_key)],
             vec![string_field("archetype", archetype)],
         )),
-        Command::Learn { identity, name } => Ok(request(
+        Command::Learn {
+            identity,
+            idempotency_key,
+            name,
+        } => Ok(request(
             identity,
             "learn",
             vec![],
-            vec![string_field("name", name)],
+            vec![
+                string_field("idempotencyKey", idempotency_key),
+                string_field("name", name),
+            ],
         )),
-        Command::Unlearn { identity, name } => Ok(request(
+        Command::Unlearn {
+            identity,
+            idempotency_key,
+            name,
+        } => Ok(request(
             identity,
             "unlearn",
             vec![],
-            vec![string_field("name", name)],
+            vec![
+                string_field("idempotencyKey", idempotency_key),
+                string_field("name", name),
+            ],
         )),
         Command::KungfuList { identity } => Ok(request(identity, "kungfu-list", vec![], vec![])),
         Command::IdentityApply {
@@ -800,16 +1064,23 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             identity,
             setting,
             value,
-        } => Ok(request(
-            identity,
-            "config",
-            vec![],
-            vec![
-                string_field("action", "set"),
-                string_field("setting", setting),
-                string_field("value", value),
-            ],
-        )),
+        } => {
+            let encoded_value = if setting == "default-priority" {
+                format!("\"value\":{value}")
+            } else {
+                string_field("value", value)
+            };
+            Ok(request(
+                identity,
+                "config",
+                vec![],
+                vec![
+                    string_field("action", "set"),
+                    string_field("setting", setting),
+                    encoded_value,
+                ],
+            ))
+        }
         Command::HostEnvSet {
             identity,
             host,
@@ -1212,11 +1483,16 @@ pub(crate) fn gateway_request(
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout).timeout_connect(timeout);
     }
-    builder
+    let request = builder
         .build()
         .request(method, &format!("{}{path}", endpoint.base))
         .set("authorization", &format!("Bearer {}", endpoint.token))
-        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
+        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"));
+    if path == "/agent/terminal" {
+        request.set("x-tightbeam-terminal-version", "1")
+    } else {
+        request
+    }
 }
 
 /// LOAD-BEARING WORDING. This sentence is control flow, not just prose.
@@ -1250,9 +1526,14 @@ pub(crate) fn parse_response(status: u16, encoded: &str) -> Result<Option<Value>
             .and_then(Value::as_str)
             .unwrap_or("undefined");
         let message = json.pointer("/error/message").and_then(Value::as_str);
-        return Err(match message {
+        let request_id = json.pointer("/error/requestId").and_then(Value::as_str);
+        let rendered = match message {
             Some(message) if !message.is_empty() => format!("{code}: {message}"),
             _ => code.to_owned(),
+        };
+        return Err(match request_id {
+            Some(request_id) if !request_id.is_empty() => format!("{rendered} ({request_id})"),
+            _ => rendered,
         });
     }
 
@@ -1318,6 +1599,7 @@ where
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
         }
+        Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::AddUser {
             identity,
@@ -1470,18 +1752,28 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
+        | Command::Ask { identity, .. }
+        | Command::Answer { identity, .. }
+        | Command::Return { identity, .. }
         | Command::OperatorAsk { identity, .. }
         | Command::OperatorRule { identity, .. }
         | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }
+        | Command::DecisionRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
+        | Command::ReopenAssignment { identity, .. }
+        | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
+        | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
         | Command::WorkItemTrace { identity, .. }
         | Command::Attend { identity, .. }
         | Command::Transcript { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
+        | Command::ToplineMutation { identity, .. }
+        | Command::DurableToplines { identity, .. }
+        | Command::DurableTopline { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
@@ -1509,6 +1801,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::ToolCallObserved
         | Command::GithubAuthCheck
@@ -1540,8 +1833,158 @@ fn tune_model_params(
     params
 }
 
+fn print_current_session_identity() -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let session_key = current_session_key_from(&cwd)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"sessionKey": session_key}))
+            .expect("session identity serializes")
+    );
+    Ok(())
+}
+
+fn current_session_key_from(cwd: &Path) -> Result<String, String> {
+    for directory in cwd.ancestors() {
+        let path = directory.join(".tightbeam-session");
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(format!(
+                    "session identity unavailable: cannot inspect marker '{}'",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+        }
+        // An existing but unreadable/broken nearest marker must never fall back
+        // to another session's ancestor. Errors omit both bytes and parser excerpts.
+        let encoded = fs::read_to_string(&path)
+            .map_err(|_| format!("malformed session marker '{}': unreadable", path.display()))?;
+        let config: Value = serde_json::from_str(&encoded).map_err(|_| {
+            format!(
+                "malformed session marker '{}': invalid JSON",
+                path.display()
+            )
+        })?;
+        return config
+            .get("sessionKey")
+            .and_then(Value::as_str)
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "malformed session marker '{}': missing sessionKey",
+                    path.display()
+                )
+            });
+    }
+    Err("session identity unavailable: no .tightbeam-session marker".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn builds_agent_decision_bodies() {
+        assert_eq!(
+            body(&[
+                "ask",
+                "--session",
+                "agent:r",
+                "--question",
+                "Why?",
+                "--about",
+                "asg_1",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"ask","sessionKey":"agent:r","params":{"question":"Why?","assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "answer",
+                "--request",
+                "dr_1",
+                "--answer",
+                "Yes",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"answer","params":{"request":"dr_1","answer":"Yes"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "return",
+                "--request",
+                "dr_1",
+                "--reason",
+                "Need proof",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"return","params":{"request":"dr_1","reason":"Need proof"}}"#
+        );
+    }
+
+    #[test]
+    fn identity_current_projects_nearest_key_and_refuses_wrong_session_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-current-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("nested");
+        let cwd = nested.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = nested.join(".tightbeam-session");
+        std::fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"sessionKey":"ancestor","token":"ancestor-secret"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &marker,
+            r#"{"sessionKey":"nearest","token":"nearest-secret","url":"https://unused.invalid"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::current_session_key_from(&cwd).unwrap(), "nearest");
+        for malformed in [
+            r#"{"token":"private-value"}"#,
+            r#"{"sessionKey":42}"#,
+            r#"{"sessionKey":" "}"#,
+            r#"{"sessionKey":"private-value", broken"#,
+        ] {
+            std::fs::write(&marker, malformed).unwrap();
+            let error = super::current_session_key_from(&cwd).unwrap_err();
+            assert!(error.starts_with("malformed session marker"));
+            assert!(!error.contains("private-value"));
+            assert!(!error.contains("ancestor-secret"));
+        }
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&marker).unwrap();
+            std::os::unix::fs::symlink(nested.join("missing-target"), &marker).unwrap();
+            assert!(
+                super::current_session_key_from(&cwd)
+                    .unwrap_err()
+                    .contains("unreadable")
+            );
+            std::fs::remove_file(&marker).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::remove_file(root.join(".tightbeam-session")).unwrap();
+        assert!(
+            super::current_session_key_from(&cwd)
+                .unwrap_err()
+                .starts_with("session identity unavailable")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use crate::args;
     use std::collections::HashMap;
@@ -1662,10 +2105,11 @@ mod tests {
             origin: Origin::Provisioned,
         };
 
-        for (method, path) in [
-            ("POST", "/agent/dispatch"),
-            ("POST", "/agent/tool-call-observed"),
-            ("GET", "/harnesses"),
+        for (method, path, terminal_protocol) in [
+            ("POST", "/agent/dispatch", false),
+            ("POST", "/agent/tool-call-observed", false),
+            ("POST", "/agent/terminal", true),
+            ("GET", "/harnesses", false),
         ] {
             let request = gateway_request(method, &endpoint, path, None);
             assert_eq!(request.method(), method);
@@ -1675,7 +2119,42 @@ mod tests {
                 request.header("x-tightbeam-cli-version"),
                 Some(env!("CARGO_PKG_VERSION"))
             );
+            assert_eq!(
+                request.header("x-tightbeam-terminal-version"),
+                terminal_protocol.then_some("1")
+            );
         }
+    }
+
+    #[test]
+    fn terminal_surrender_has_its_own_fixed_request_shape() {
+        let request = build_request(&parse(&[
+            "attest",
+            "asg_1",
+            "--kind",
+            "surrender",
+            "--note",
+            "incompatible client",
+        ]))
+        .unwrap();
+        assert_eq!(request.path, "/agent/terminal");
+        assert_eq!(
+            request.body_json,
+            r#"{"assignmentId":"asg_1","disposition":"surrender","note":"incompatible client"}"#
+        );
+        assert_eq!(
+            build_request(&parse(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "surrender",
+                "--note",
+                "no",
+                "--as",
+                "coder",
+            ])),
+            Err("terminal surrender must use the session's implicit identity".to_owned())
+        );
     }
 
     #[test]
@@ -1750,6 +2229,39 @@ mod tests {
             ]),
             r#"{"asUser":"flynn","verb":"wake","userId":"mike","params":{"prompt":"go","at":16}}"#
         );
+        assert_eq!(
+            body(&[
+                "wake", "--role", "owner", "--prompt", "finished", "--class", "fyi", "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"finished","class":"fyi"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "wake",
+                "--role",
+                "owner",
+                "--prompt",
+                "extension",
+                "--class",
+                "kungfu:deploy-window",
+                "--as",
+                "coder",
+            ]),
+            r#"{"as":"coder","verb":"wake","role":"owner","params":{"prompt":"extension","class":"kungfu:deploy-window"}}"#
+        );
+        assert_eq!(
+            args::parse(
+                [
+                    "wake", "--role", "owner", "--prompt", "go", "--class", "", "--as", "coder",
+                ]
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+            )
+            .unwrap_err(),
+            "--class requires a class name"
+        );
     }
 
     #[test]
@@ -1807,6 +2319,46 @@ mod tests {
         assert_eq!(
             body(&["condition", "--kind", "review-landed", "--as", "reviewer",]),
             r#"{"as":"reviewer","verb":"condition","params":{"kind":"review-landed"}}"#
+        );
+    }
+
+    #[test]
+    fn builds_byte_exact_structured_wait_and_wait_verdict_bodies() {
+        let predicate = r#"{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"bindings":{"assignmentId":"asg_r"},"resolverRef":{"kind":"assignment","id":"asg_r"},"necessity":"needs output","verificationRef":{"kind":"assignment","id":"asg_v"}}"#;
+
+        assert_eq!(
+            body(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--predicate",
+                predicate,
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "continue",
+                "--as",
+                "holder",
+            ]),
+            r#"{"as":"holder","verb":"wake","sessionKey":"agent:holder","params":{"prompt":"continue","afterMs":7200000,"predicate":{"bindings":{"assignmentId":"asg_r"},"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"necessity":"needs output","resolverRef":{"id":"asg_r","kind":"assignment"},"verificationRef":{"id":"asg_v","kind":"assignment"}},"assignmentId":"asg_a"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_v",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "wait-verified",
+                "--wait",
+                "w_1",
+                "--as",
+                "verifier",
+            ]),
+            r#"{"as":"verifier","verb":"attest","params":{"assignmentId":"asg_v","kind":"verdict","verdictKind":"wait-verified","waitId":"w_1"}}"#
         );
     }
 
@@ -1887,6 +2439,7 @@ mod tests {
         );
         let command = Command::IdentityEdit {
             identity: Identity::User("flynn".to_owned()),
+            idempotency_key: "identity-edit-1".to_owned(),
             archetype: "coder".to_owned(),
             manifest: false,
             skill: Some("swift".to_owned()),
@@ -1895,7 +2448,7 @@ mod tests {
         };
         assert_eq!(
             build_request(&command).unwrap().body_json,
-            r#"{"asUser":"flynn","verb":"identity-edit","params":{"archetype":"coder","manifest":false,"remove":false,"skill":"swift","content":"line one\nline two"}}"#
+            r#"{"asUser":"flynn","verb":"identity-edit","params":{"idempotencyKey":"identity-edit-1","archetype":"coder","manifest":false,"remove":false,"skill":"swift","content":"line one\nline two"}}"#
         );
     }
 
@@ -1937,6 +2490,32 @@ mod tests {
 
     #[test]
     fn builds_byte_exact_assignment_bodies() {
+        assert_eq!(
+            body(&[
+                "assign",
+                "--subject",
+                "continue",
+                "--session",
+                "agent:builder",
+                "--succeeds",
+                "asg_full",
+            ]),
+            r#"{"verb":"assign","sessionKey":"agent:builder","params":{"subject":"continue","succeedsAssignmentId":"asg_full"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "dispatch",
+                "--holder",
+                "agent:builder",
+                "--subject",
+                "continue",
+                "--brief",
+                "Continue it.",
+                "--succeeds",
+                "asg_full",
+            ]),
+            r#"{"verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"continue","brief":"Continue it.","succeedsAssignmentId":"asg_full"}}"#
+        );
         assert_eq!(
             body(&[
                 "assign",
@@ -1999,6 +2578,16 @@ mod tests {
         );
         assert_eq!(
             body(&[
+                "decision-request",
+                "--request",
+                "dr_12345678-1234-4234-9234-123456789abc",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"decision-request","params":{"request":"dr_12345678-1234-4234-9234-123456789abc"}}"#
+        );
+        assert_eq!(
+            body(&[
                 "operator-ask",
                 "--question",
                 "ship window?",
@@ -2042,8 +2631,26 @@ mod tests {
             r#"{"as":"parent","verb":"operator-withdraw","params":{"request":"dr_2","reason":"moot after 013"}}"#
         );
         assert_eq!(
-            body(&["revoke-assignment", "asg_1", "--as", "parent",]),
-            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
+            body(&[
+                "revoke-assignment",
+                "asg_1",
+                "--as",
+                "parent",
+                "--reason",
+                "superseded"
+            ]),
+            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1","reason":"superseded"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "reopen-assignment",
+                "asg_1",
+                "--reason",
+                "continue work",
+                "--as",
+                "parent"
+            ]),
+            r#"{"as":"parent","verb":"reopen-assignment","params":{"assignmentId":"asg_1","reason":"continue work"}}"#
         );
         assert_eq!(
             body(&[
@@ -2109,6 +2716,7 @@ mod tests {
     #[test]
     fn builds_byte_exact_work_item_bodies() {
         let sha = "a".repeat(64);
+        let class_a_sha = "d4e8260c8a82faf07ab2659e1f317bef961441af6ba43a4b9d1ef62fa01d4b86";
         assert_eq!(
             body(&[
                 "work-item-create",
@@ -2130,6 +2738,69 @@ mod tests {
             r#"{"asUser":"flynn","verb":"work-item-get","params":{"workItemId":"wi_1"}}"#
         );
         assert_eq!(
+            body(&["work-item-update", "wi_1", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "Retitled",
+                "--spec-sha256",
+                &sha,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Retitled","specRefSha256":"{sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--title",
+                "Together",
+                "--spec-ref",
+                "governing.md",
+                "--spec-sha256",
+                &sha,
+                "--priority",
+                "7",
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_1","title":"Together","specRefName":"governing.md","specRefSha256":"{sha}","priority":7}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_6d418db1-26b4-4ad0-9886-86e757e93342",
+                "--spec-ref",
+                "patrol-failure-classification-and-escalation-v1.md",
+                "--spec-sha256",
+                class_a_sha,
+                "--as-user",
+                "flynn",
+            ]),
+            format!(
+                r#"{{"asUser":"flynn","verb":"work-item-update","params":{{"workItemId":"wi_6d418db1-26b4-4ad0-9886-86e757e93342","specRefName":"patrol-failure-classification-and-escalation-v1.md","specRefSha256":"{class_a_sha}"}}}}"#
+            )
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--as-user",
+                "flynn",
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null}}"#
+        );
+        assert_eq!(
             body(&["work-item-trace", "wi_1", "--as-user", "flynn"]),
             r#"{"asUser":"flynn","verb":"work-item-trace","params":{"workItemId":"wi_1"}}"#
         );
@@ -2144,6 +2815,41 @@ mod tests {
                 "flynn"
             ]),
             r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Ship","idempotencyKey":"k1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-create",
+                "--title",
+                "Urgent",
+                "--priority",
+                "7",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-create","params":{"title":"Urgent","priority":7}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--priority",
+                "2",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","priority":2}}"#
+        );
+        assert_eq!(
+            body(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--priority",
+                "1",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"work-item-update","params":{"workItemId":"wi_1","specRefName":null,"specRefSha256":null,"priority":1}}"#
         );
         assert_eq!(
             body(&["work-item-icebox", "wi_1", "--as-user", "flynn"]),
@@ -2171,6 +2877,166 @@ mod tests {
     }
 
     #[test]
+    fn builds_byte_exact_durable_topline_bodies() {
+        for (argv, expected) in [
+            (
+                &["toplines", "--state", "open", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"toplines","params":{"state":"open"}}"#,
+            ),
+            (
+                &["topline", "tl_1", "--history", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"topline","params":{"toplineId":"tl_1","history":true}}"#,
+            ),
+            (
+                &[
+                    "topline-work-leave-unlinked",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-work-leave-unlinked","params":{"workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-placement-list",
+                    "--state",
+                    "resolved",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-placement-list","params":{"state":"resolved"}}"#,
+            ),
+            (
+                &[
+                    "topline-create",
+                    "--title",
+                    "Ship",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-create","params":{"title":"Ship","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-update",
+                    "tl_1",
+                    "--title",
+                    "Ship",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-update","params":{"toplineId":"tl_1","title":"Ship","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-close",
+                    "tl_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-close","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-reopen",
+                    "tl_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-reopen","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-link-work",
+                    "tl_1",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-link-work","params":{"toplineId":"tl_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-unlink-work",
+                    "tlm_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-unlink-work","params":{"membershipId":"tlm_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-concern-create",
+                    "tl_1",
+                    "--title",
+                    "Risk",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-concern-create","params":{"toplineId":"tl_1","title":"Risk","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-concern-link-work",
+                    "tlc_1",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-concern-link-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-concern-unlink-work",
+                    "tlc_1",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-concern-unlink-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+        ] {
+            assert_eq!(body(argv), expected);
+        }
+    }
+
+    #[test]
     fn builds_byte_exact_config_bodies() {
         assert_eq!(
             body(&["config", "get", "default-archetype", "--as-user", "flynn"]),
@@ -2186,6 +3052,21 @@ mod tests {
                 "flynn",
             ]),
             r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-archetype","value":"coder"}}"#
+        );
+        assert_eq!(
+            body(&["config", "get", "default-priority", "--as-user", "flynn"]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"get","setting":"default-priority"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "config",
+                "set",
+                "default-priority",
+                "6",
+                "--as-user",
+                "flynn"
+            ]),
+            r#"{"asUser":"flynn","verb":"config","params":{"action":"set","setting":"default-priority","value":6}}"#
         );
     }
 
@@ -2333,12 +3214,38 @@ mod tests {
                 r#"{"asUser":"flynn","verb":"kungfu-list","params":{}}"#,
             ),
             (
-                &["learn", "agentic-engineering", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"learn","params":{"name":"agentic-engineering"}}"#,
+                &[
+                    "learn",
+                    "agentic-engineering",
+                    "--key",
+                    "learn-1",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"learn","params":{"idempotencyKey":"learn-1","name":"agentic-engineering"}}"#,
             ),
             (
-                &["unlearn", "agentic-engineering", "--as-user", "flynn"][..],
-                r#"{"asUser":"flynn","verb":"unlearn","params":{"name":"agentic-engineering"}}"#,
+                &[
+                    "unlearn",
+                    "agentic-engineering",
+                    "--key",
+                    "unlearn-1",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"unlearn","params":{"idempotencyKey":"unlearn-1","name":"agentic-engineering"}}"#,
+            ),
+            (
+                &[
+                    "identity",
+                    "relearn",
+                    "--resolve",
+                    "--key",
+                    "relearn-1",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"identity-relearn","params":{"idempotencyKey":"relearn-1","action":"resolve"}}"#,
             ),
         ] {
             assert_eq!(body(args), expected);
@@ -3027,6 +3934,16 @@ mod tests {
         assert_eq!(
             parse_response(403, r#"{"error":{"code":"denied","message":"no"}}"#),
             Err("denied: no".to_owned())
+        );
+        assert_eq!(
+            parse_response(
+                500,
+                r#"{"error":{"code":"decision_request_integrity_invalid","message":"decision request integrity check failed","requestId":"dr_exact"}}"#
+            ),
+            Err(
+                "decision_request_integrity_invalid: decision request integrity check failed (dr_exact)"
+                    .to_owned()
+            )
         );
     }
 

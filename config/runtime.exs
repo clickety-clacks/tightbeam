@@ -32,6 +32,10 @@ if config_env() != :test do
     config :tightbeam, :wake_tick_ms, String.to_integer(value)
   end
 
+  if value = System.get_env("TIGHTBEAM_SUPERVISION_INTERVAL_MS") do
+    config :tightbeam, :supervision_interval_ms, String.to_integer(value)
+  end
+
   if value = System.get_env("TIGHTBEAM_PROD_LIMIT") do
     config :tightbeam, :prod_limit, String.to_integer(value)
   end

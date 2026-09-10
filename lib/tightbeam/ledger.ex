@@ -17,8 +17,9 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, HarnessHealth, Org}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   require Logger
 
@@ -73,6 +74,41 @@ defmodule Tightbeam.Ledger do
     ON turns (endedAt) WHERE endedAt IS NOT NULL AND publishedAt IS NULL;
   CREATE INDEX IF NOT EXISTS turns_job_ref ON turns (jobRef);
   CREATE INDEX IF NOT EXISTS turns_assignment_id ON turns (assignmentId);
+
+  CREATE TABLE IF NOT EXISTS turn_repair_attempts (
+    id            TEXT PRIMARY KEY,
+    repairKey     TEXT NOT NULL,
+    sourceSeq     INTEGER NOT NULL REFERENCES turns(seq),
+    attemptSeq    INTEGER NOT NULL UNIQUE REFERENCES turns(seq),
+    assignmentId TEXT NOT NULL REFERENCES assignments(id),
+    principal     TEXT NOT NULL CHECK(length(trim(principal)) > 0),
+    createdAt     INTEGER NOT NULL CHECK(createdAt >= 0),
+    UNIQUE (assignmentId, repairKey)
+  );
+  CREATE INDEX IF NOT EXISTS turn_repair_source
+    ON turn_repair_attempts (sourceSeq, createdAt, id);
+
+  CREATE TABLE IF NOT EXISTS assignment_repair_attempts (
+    id                 TEXT PRIMARY KEY,
+    assignmentId       TEXT NOT NULL REFERENCES assignments(id),
+    repairKey          TEXT NOT NULL,
+    requestFingerprint TEXT NOT NULL CHECK(length(trim(requestFingerprint)) > 0),
+    action             TEXT NOT NULL CHECK(action IN
+                       ('tune','restart','rerun','resume','relaunch')),
+    principal          TEXT NOT NULL CHECK(length(trim(principal)) > 0),
+    state              TEXT NOT NULL CHECK(state IN ('claimed','succeeded','failed')),
+    resultJson         TEXT,
+    createdAt          INTEGER NOT NULL CHECK(createdAt >= 0),
+    completedAt        INTEGER,
+    UNIQUE (assignmentId, repairKey),
+    CHECK(
+      (state = 'claimed' AND resultJson IS NULL AND completedAt IS NULL)
+      OR
+      (state IN ('succeeded','failed') AND resultJson IS NOT NULL AND completedAt >= createdAt)
+    )
+  );
+  CREATE INDEX IF NOT EXISTS assignment_repair_history
+    ON assignment_repair_attempts (assignmentId, createdAt, id);
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
@@ -128,6 +164,7 @@ defmodule Tightbeam.Ledger do
       )
 
       [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+      Org.sync_mechanical_status_in_txn(txn, session_key)
       {:ok, seq}
     else
       {:error, :no_session}
@@ -168,6 +205,230 @@ defmodule Tightbeam.Ledger do
 
       {:error, e} ->
         {:error, e}
+    end
+  end
+
+  @doc """
+  Claim one assignment repair before any external side effect.
+
+  The assignment scopes the caller key. An exact replay returns the persisted
+  terminal result; a conflicting request is refused, and an interrupted claim
+  remains claimed so recovery never repeats an outcome-unknown side effect.
+  """
+  @spec begin_assignment_repair(
+          db(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t()
+        ) ::
+          {:ok, {:claimed, String.t()} | {:replay, map()} | {:in_progress, String.t()}}
+          | {:error, :repair_key_conflict | term()}
+  def begin_assignment_repair(
+        db \\ Tightbeam.DB,
+        assignment_id,
+        repair_key,
+        request_fingerprint,
+        action,
+        principal
+      ) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  """
+                  SELECT id,requestFingerprint,state,resultJson
+                  FROM assignment_repair_attempts
+                  WHERE assignmentId=?1 AND repairKey=?2
+                  """,
+                  [assignment_id, repair_key]
+                ) do
+             [[id, ^request_fingerprint, "claimed", nil]] ->
+               {:in_progress, id}
+
+             [[_id, ^request_fingerprint, state, result_json]]
+             when state in ["succeeded", "failed"] and is_binary(result_json) ->
+               {:replay, decode_repair_result(result_json)}
+
+             [[_id, _other_fingerprint, _state, _result_json]] ->
+               {:error, :repair_key_conflict}
+
+             [] ->
+               id = "ara_" <> Tightbeam.Id.uuid4()
+
+               Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_repair_attempts
+                   (id,assignmentId,repairKey,requestFingerprint,action,principal,state,createdAt)
+                 VALUES (?1,?2,?3,?4,?5,?6,'claimed',?7)
+                 """,
+                 [
+                   id,
+                   assignment_id,
+                   repair_key,
+                   request_fingerprint,
+                   action,
+                   principal,
+                   System.system_time(:millisecond)
+                 ]
+               )
+
+               {:claimed, id}
+           end
+         end) do
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:ok, result} -> {:ok, result}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc "Persist the terminal repair result that every exact replay returns."
+  @spec finish_assignment_repair(db(), String.t(), map()) :: :ok | {:error, term()}
+  def finish_assignment_repair(db \\ Tightbeam.DB, attempt_id, result) when is_map(result) do
+    state = if result[:ok] == true, do: "succeeded", else: "failed"
+    result_json = JSON.encode!(result)
+
+    case DB.transaction(db, fn txn ->
+           Txn.q(
+             txn,
+             """
+             UPDATE assignment_repair_attempts
+             SET state=?2,resultJson=?3,completedAt=?4
+             WHERE id=?1 AND state='claimed'
+             """,
+             [attempt_id, state, result_json, System.system_time(:millisecond)]
+           )
+
+           if Txn.changes(txn) == 1, do: :ok, else: {:error, :repair_attempt_not_claimed}
+         end) do
+      {:ok, :ok} -> :ok
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  defp decode_repair_result(result_json) do
+    result_json
+    |> JSON.decode!()
+    |> Map.new(fn {key, value} -> {String.to_existing_atom(key), value} end)
+  end
+
+  @doc """
+  Append one explicit retry attempt for a terminal failed turn.
+
+  The terminal source row remains immutable. The new queued row carries the
+  same prompt, assignment, work-item reference, and visible message identity;
+  `turn_repair_attempts` gives the attempt its own durable identity and makes a
+  caller-supplied repair key replay-safe.
+  """
+  @spec repair_terminal(db(), integer(), String.t(), String.t(), String.t()) ::
+          {:ok, {:appended | :duplicate, integer(), String.t()}} | {:error, atom() | term()}
+  def repair_terminal(db \\ Tightbeam.DB, source_seq, assignment_id, repair_key, principal) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(
+                  txn,
+                  """
+                  SELECT attemptSeq,id FROM turn_repair_attempts
+                  WHERE assignmentId=?1 AND repairKey=?2
+                  """,
+                  [assignment_id, repair_key]
+                ) do
+             [[attempt_seq, attempt_id]] ->
+               {:duplicate, attempt_seq, attempt_id}
+
+             [] ->
+               append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal)
+           end
+         end) do
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:ok, result} -> {:ok, result}
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  @doc false
+  @spec repair_delivery_outcomes_in_txn(DB.Txn.t(), integer(), String.t()) :: [map()]
+  def repair_delivery_outcomes_in_txn(%DB.Txn{} = txn, source_seq, assignment_id)
+      when is_integer(source_seq) and is_binary(assignment_id) do
+    DB.Txn.q(
+      txn,
+      """
+      SELECT r.id,t.seq,t.status,r.principal
+      FROM turn_repair_attempts r
+      JOIN turns t ON t.seq=r.attemptSeq
+      WHERE r.sourceSeq=?1 AND r.assignmentId=?2
+      ORDER BY r.createdAt,r.id
+      """,
+      [source_seq, assignment_id]
+    )
+    |> Enum.map(fn [attempt_id, attempt_seq, status, principal] ->
+      %{attempt_id: attempt_id, attempt_seq: attempt_seq, status: status, principal: principal}
+    end)
+  end
+
+  defp append_repair_attempt(txn, source_seq, assignment_id, repair_key, principal) do
+    case Txn.q(
+           txn,
+           """
+           SELECT sessionKey,messageId,origin,prompt,roleRef,roleFallback,assignmentId,jobRef
+           FROM turns
+           WHERE seq=?1 AND assignmentId=?2 AND status IN ('failed','failed_unknown')
+           """,
+           [source_seq, assignment_id]
+         ) do
+      [
+        [
+          session_key,
+          message_id,
+          origin,
+          prompt,
+          role_ref,
+          role_fallback,
+          ^assignment_id,
+          job_ref
+        ]
+      ] ->
+        {:ok, attempt_seq} =
+          enqueue_in_txn(txn, %{
+            session_key: session_key,
+            message_id: message_id,
+            origin: origin,
+            prompt: prompt,
+            role_ref: role_ref,
+            role_fallback: role_fallback == 1,
+            assignment_id: assignment_id,
+            job_ref: job_ref,
+            request_ref: repair_key,
+            principal: principal
+          })
+
+        attempt_id = "tra_" <> Tightbeam.Id.uuid4()
+
+        Txn.q(
+          txn,
+          """
+          INSERT INTO turn_repair_attempts
+            (id,repairKey,sourceSeq,attemptSeq,assignmentId,principal,createdAt)
+          VALUES (?1,?2,?3,?4,?5,?6,?7)
+          """,
+          [
+            attempt_id,
+            repair_key,
+            source_seq,
+            attempt_seq,
+            assignment_id,
+            principal,
+            System.system_time(:millisecond)
+          ]
+        )
+
+        Tightbeam.ReminderDelivery.rebind_turn_in_txn(txn, assignment_id, source_seq, attempt_seq)
+
+        {:appended, attempt_seq, attempt_id}
+
+      [] ->
+        {:error, :terminal_turn_not_found}
     end
   end
 
@@ -254,6 +515,9 @@ defmodule Tightbeam.Ledger do
                   [session_key]
                 )
 
+              Publisher.turn_in_txn(txn, "turn.started", seq)
+              Org.sync_mechanical_status_in_txn(txn, session_key)
+
               {:ok,
                %{
                  seq: seq,
@@ -333,23 +597,58 @@ defmodule Tightbeam.Ledger do
   @spec fail_unclaimable(db(), String.t(), unclaimable()) :: [integer()]
   def fail_unclaimable(db \\ Tightbeam.DB, session_key, reason) do
     {:ok, seqs} =
-      DB.transaction(db, fn txn ->
-        txn
-        |> Txn.q(
-          """
-          UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
-          WHERE sessionKey = ?1 AND status = 'queued'
-            AND NOT EXISTS (
-              SELECT 1 FROM sessions AS s
-              WHERE s.sessionKey = ?1 AND s.state = 'active'
+      DB.transaction_then(
+        db,
+        fn txn ->
+          candidates =
+            Txn.q(
+              txn,
+              """
+              SELECT seq FROM turns
+              WHERE sessionKey=?1 AND status='queued'
+                AND NOT EXISTS (
+                  SELECT 1 FROM sessions AS s
+                  WHERE s.sessionKey=?1 AND s.state='active'
+                )
+              ORDER BY seq
+              """,
+              [session_key]
             )
-          RETURNING seq
-          """,
-          [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
-        )
-        |> Enum.map(&hd/1)
-        |> Enum.sort()
-      end)
+
+          transitions =
+            candidates
+            |> Enum.map(fn [seq] ->
+              turn_terminal_transition_in_txn(txn, seq, "queued", "failed")
+            end)
+            |> Enum.reject(&is_nil/1)
+
+          seqs =
+            txn
+            |> Txn.q(
+              """
+              UPDATE turns SET status = 'failed', endedAt = ?2, error = ?3
+              WHERE sessionKey = ?1 AND status = 'queued'
+                AND NOT EXISTS (
+                  SELECT 1 FROM sessions AS s
+                  WHERE s.sessionKey = ?1 AND s.state = 'active'
+                )
+              RETURNING seq
+              """,
+              [session_key, System.system_time(:millisecond), unclaimable_error(reason)]
+            )
+            |> Enum.map(&hd/1)
+            |> Enum.sort()
+
+          Enum.each(transitions, &DB.record_row_commit(txn, &1))
+          Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
+          if seqs != [], do: Org.sync_mechanical_status_in_txn(txn, session_key)
+          seqs
+        end,
+        fn txn, seqs ->
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
+          seqs
+        end
+      )
 
     seqs
   end
@@ -368,9 +667,14 @@ defmodule Tightbeam.Ledger do
   def finish(db \\ Tightbeam.DB, seq, terminal, error \\ nil)
       when terminal in ~w(delivered canceled failed failed_unknown) do
     {:ok, won} =
-      DB.transaction(db, fn txn ->
-        finish_in_txn(txn, seq, terminal, error)
-      end)
+      DB.transaction_then(
+        db,
+        fn txn -> finish_in_txn(txn, seq, terminal, error) end,
+        fn txn, won ->
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
+          won
+        end
+      )
 
     if won, do: :ok, else: :already_terminal
   end
@@ -380,6 +684,7 @@ defmodule Tightbeam.Ledger do
   def finish_in_txn(%Txn{} = txn, seq, terminal, error \\ nil)
       when terminal in ~w(delivered canceled failed failed_unknown) do
     now = System.system_time(:millisecond)
+    transition = turn_terminal_transition_in_txn(txn, seq, "running", terminal)
 
     Txn.q(
       txn,
@@ -387,7 +692,44 @@ defmodule Tightbeam.Ledger do
       [seq, terminal, now, error]
     )
 
-    Txn.changes(txn) == 1
+    won = Txn.changes(txn) == 1
+    if won and transition, do: DB.record_row_commit(txn, transition)
+
+    if won do
+      Publisher.turn_in_txn(txn, "turn.ended", seq)
+      [[session_key]] = Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq = ?1", [seq])
+      Org.sync_mechanical_status_in_txn(txn, session_key)
+    end
+
+    won
+  end
+
+  defp turn_terminal_transition_in_txn(txn, seq, old_status, terminal) do
+    case Txn.q(
+           txn,
+           """
+           SELECT t.wakeId, t.origin, t.assignmentId, a.workItemId, s.ownerUserId
+           FROM turns t
+           JOIN sessions s ON s.sessionKey=t.sessionKey
+           LEFT JOIN assignments a ON a.id=t.assignmentId
+           WHERE t.seq=?1 AND t.status=?2
+           """,
+           [seq, old_status]
+         ) do
+      [[wake_id, origin, assignment_id, work_item_id, owner_user_id]] ->
+        %{
+          verb: if(is_binary(wake_id), do: "wake", else: "post"),
+          domain: "turn",
+          row_id: seq,
+          owner_user_id: owner_user_id,
+          principal: origin,
+          bindings: %{assignmentId: assignment_id, workItemId: work_item_id},
+          field: %{name: "status", old: old_status, new: terminal}
+        }
+
+      [] ->
+        nil
+    end
   end
 
   @doc """
@@ -406,6 +748,11 @@ defmodule Tightbeam.Ledger do
         [session_key]
       )
 
+    transitions =
+      rows
+      |> Enum.map(fn [seq] -> turn_terminal_transition_in_txn(txn, seq, "queued", "canceled") end)
+      |> Enum.reject(&is_nil/1)
+
     Txn.q(
       txn,
       """
@@ -415,7 +762,11 @@ defmodule Tightbeam.Ledger do
       [session_key, System.system_time(:millisecond), reason]
     )
 
-    Enum.map(rows, &hd/1)
+    Enum.each(transitions, &DB.record_row_commit(txn, &1))
+
+    seqs = Enum.map(rows, &hd/1)
+    Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
+    seqs
   end
 
   @doc """
@@ -427,23 +778,58 @@ defmodule Tightbeam.Ledger do
   def recover_running(db \\ Tightbeam.DB) do
     now = System.system_time(:millisecond)
 
-    {:ok, seqs} =
-      DB.transaction(db, fn txn ->
-        rows = Txn.q(txn, "SELECT seq FROM turns WHERE status = 'running'")
-        seqs = Enum.map(rows, fn [seq] -> seq end)
+    {:ok, {seqs, publications}} =
+      DB.transaction_then(
+        db,
+        fn txn ->
+          rows = Txn.q(txn, "SELECT seq, sessionKey FROM turns WHERE status = 'running'")
+          seqs = Enum.map(rows, fn [seq, _session_key] -> seq end)
 
-        Txn.q(
-          txn,
-          """
-            UPDATE turns SET status = 'failed_unknown', endedAt = ?1,
-                             error = COALESCE(error, 'interrupted: outcome unknown')
-            WHERE status = 'running'
-          """,
-          [now]
-        )
+          transitions =
+            Enum.map(seqs, &turn_terminal_transition_in_txn(txn, &1, "running", "failed_unknown"))
 
-        seqs
-      end)
+          Txn.q(
+            txn,
+            """
+              UPDATE turns SET status = 'failed_unknown', endedAt = ?1,
+                               error = COALESCE(error, 'interrupted: outcome unknown')
+              WHERE status = 'running'
+            """,
+            [now]
+          )
+
+          publications =
+            Enum.map(seqs, fn seq ->
+              HarnessHealth.observe_terminal_in_txn(
+                txn,
+                seq,
+                "interrupted-outcome-unknown",
+                "boot recovery interrupted the running turn; outcome unknown",
+                "process:tightbeam"
+              )
+            end)
+
+          Enum.each(seqs, &Publisher.turn_in_txn(txn, "turn.ended", &1))
+
+          rows
+          |> Enum.map(fn [_seq, session_key] -> session_key end)
+          |> Enum.uniq()
+          |> Enum.each(&Org.sync_mechanical_status_in_txn(txn, &1))
+
+          {seqs, publications}
+          |> tap(fn _ ->
+            Enum.each(Enum.reject(transitions, &is_nil/1), &DB.record_row_commit(txn, &1))
+          end)
+        end,
+        fn txn, result ->
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
+          result
+        end
+      )
+
+    Enum.each(publications, fn publication ->
+      if is_function(publication, 0), do: publication.()
+    end)
 
     seqs
   end

@@ -1,0 +1,23 @@
+{
+  "proofArm": "rest-absent",
+  "specCommit": "f3b15654ca8880dd147a0fbe41a770a1c8570727",
+  "specFileSha256": "7a0affca1a550eb23bd6be0b331e8107bb6e85825d2496f207ba40042684187c",
+  "baseline": {
+    "sourceCommit": "3125dfb6df4f1ab62c82e77fb93694eb1ad5015b",
+    "fixture": "baseline-3125dfb6.json",
+    "fixtureSha256": "ad42b79c9e6a0675277f40bf632ed656097cb62e6b934b8d1cfdcffffbadb611",
+    "builtCliSha256": "1f6ecfea90c5107003aadf7efbc945cc5d93806e6c6061abd813690edfcfc040"
+  },
+  "candidate": {
+    "sourceCommit": "cabce9b12917dcf0a1552f729d70d98cdd2b8ee2",
+    "fixture": "candidate-cabce9b1.json",
+    "fixtureSha256": "b52bf76192404f026750e7dc7ff0b3f0656e161a8cde65ad8f9799b947f7fd45",
+    "builtCliSha256": "9cc66319038a8c117b9ceeffb89f24e8b2c53b22f80a668bf053692a999eab9f"
+  },
+  "routeInventoryCommand": "rg -n '^[[:space:]]*get \"/api/decision-requests' lib/tightbeam/wire/router.ex",
+  "gatewayInvocation": {
+    "route": "/agent/dispatch",
+    "transport": "real Tightbeam.Wire.Router with real Gateway handlers"
+  },
+  "fixtureSetupPath": "test/support/terminal_decision_a27a_capture.exs"
+}

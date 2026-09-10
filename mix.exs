@@ -6,6 +6,7 @@ defmodule Tightbeam.MixProject do
       app: :tightbeam,
       version: cli_version(),
       elixir: "~> 1.19",
+      compilers: [:live_base_lock, :topline_unicode] ++ Mix.compilers(),
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -65,5 +66,120 @@ defmodule Tightbeam.MixProject do
       {:toml, "~> 0.7"},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
+  end
+end
+
+defmodule Mix.Tasks.Compile.ToplineUnicode do
+  @moduledoc false
+  use Mix.Task.Compiler
+
+  @impl Mix.Task.Compiler
+  def run(_args) do
+    root = File.cwd!()
+    manifest = Path.join(root, "native/topline_unicode/Cargo.toml")
+    target = Path.join(root, "priv/#{target_name()}")
+
+    if current?(root, target) do
+      {:noop, []}
+    else
+      build(root, manifest, target)
+    end
+  end
+
+  defp build(root, manifest, target) do
+    cargo = System.find_executable("cargo") || Mix.raise("cargo is required to build Toplines")
+
+    {output, status} =
+      System.cmd(
+        cargo,
+        ["build", "--locked", "--release", "--manifest-path", manifest],
+        cd: root,
+        stderr_to_stdout: true
+      )
+
+    if status != 0, do: Mix.raise("Toplines Unicode extension build failed:\n#{output}")
+
+    source = Path.join(root, "native/topline_unicode/target/release/#{source_name()}")
+    File.mkdir_p!(Path.dirname(target))
+    File.cp!(source, target)
+    {:ok, []}
+  end
+
+  defp current?(root, target) do
+    with {:ok, target_stat} <- File.stat(target, time: :posix) do
+      sources =
+        [
+          Path.join(root, "native/topline_unicode/Cargo.toml"),
+          Path.join(root, "native/topline_unicode/Cargo.lock")
+          | Path.wildcard(Path.join(root, "native/topline_unicode/src/**/*.rs"))
+        ]
+
+      Enum.all?(sources, fn source ->
+        {:ok, source_stat} = File.stat(source, time: :posix)
+        source_stat.mtime <= target_stat.mtime
+      end)
+    else
+      _ -> false
+    end
+  end
+
+  defp source_name do
+    case :os.type() do
+      {:unix, :darwin} -> "libtopline_unicode.dylib"
+      {:unix, _} -> "libtopline_unicode.so"
+      other -> Mix.raise("Toplines Unicode extension does not support #{inspect(other)}")
+    end
+  end
+
+  defp target_name do
+    case :os.type() do
+      {:unix, :darwin} -> "topline_unicode.dylib"
+      {:unix, _} -> "topline_unicode.so"
+      other -> Mix.raise("Toplines Unicode extension does not support #{inspect(other)}")
+    end
+  end
+end
+
+defmodule Mix.Tasks.Compile.LiveBaseLock do
+  use Mix.Task.Compiler
+  @impl true
+  def run(_args) do
+    unless :os.type() in [{:unix, :linux}, {:unix, :darwin}],
+      do: Mix.raise("live base lock requires Linux or macOS")
+
+    source = Path.expand("native/live_base_lock.c")
+    target = Path.expand("priv/live_base_lock.so")
+    include = Path.join([List.to_string(:code.root_dir()), "usr", "include"])
+    cc = System.find_executable("cc") || Mix.raise("C compiler required for live base lock")
+    flags = if :os.type() == {:unix, :darwin}, do: ["-undefined", "dynamic_lookup"], else: []
+    File.mkdir_p!(Path.dirname(target))
+    # Never truncate a library mapped by another VM. Publish a complete inode.
+    temporary = target <> ".build-" <> Integer.to_string(System.unique_integer([:positive]))
+
+    {output, status} =
+      System.cmd(
+        cc,
+        [
+          "-std=c11",
+          "-D_GNU_SOURCE",
+          "-Wall",
+          "-Wextra",
+          "-Werror",
+          "-fPIC",
+          "-shared",
+          "-I",
+          include,
+          "-I",
+          Path.expand("deps/exqlite/c_src"),
+          source,
+          "-o",
+          temporary
+        ] ++ flags,
+        stderr_to_stdout: true
+      )
+
+    if status != 0, do: Mix.raise("live base lock build failed: #{output}")
+    File.rename!(temporary, target)
+    {:ok, []}
   end
 end
