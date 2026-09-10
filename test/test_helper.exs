@@ -76,7 +76,7 @@ if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
 
     for {file, value} <- [{"vm.json", receipt}, {"libraries.json", %{diskLibraries: libraries}}] do
       temporary = Path.join(directory, file <> ".pending")
-      File.write!(temporary, Tightbeam.JSON.encode!(value), [:exclusive])
+      File.write!(temporary, IO.iodata_to_binary(:json.encode(value)), [:exclusive])
       File.rename!(temporary, Path.join(directory, file))
     end
   end
