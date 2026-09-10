@@ -40,6 +40,8 @@ defmodule Tightbeam.TestCase do
 
   @persistent_keys [
     Tightbeam.Rules,
+    {Tightbeam.Rules, :policies},
+    Tightbeam.RuleRuntime,
     Tightbeam.Rails,
     Tightbeam.Archetypes,
     {Tightbeam.Application, :draining}
@@ -63,6 +65,11 @@ defmodule Tightbeam.TestCase do
     assert_hermetic_tmp!()
     snapshot = snapshot()
     on_exit(fn -> restore(snapshot) end)
+
+    Tightbeam.Rules.load!(
+      Path.join(System.tmp_dir!(), "tightbeam-empty-rules-#{System.unique_integer([:positive])}"),
+      []
+    )
 
     # The ONE place the episode writer starts for tests. Not per-suite ceremony and
     # deliberately not lazy: call sites use the named process and a missing one is loud,

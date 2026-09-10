@@ -117,6 +117,7 @@ defmodule Tightbeam.Gateway do
           default_model: Model.t(),
           max_live_sessions_per_user: pos_integer() | nil,
           wake_tick_ms: pos_integer(),
+          supervision_interval_ms: pos_integer(),
           prod_limit: non_neg_integer(),
           escalation_decision_deadline_ms: pos_integer(),
           effort_checkin_horizon_ms: pos_integer(),
@@ -152,10 +153,6 @@ defmodule Tightbeam.Gateway do
     :ok = Schema.ensure_all(db)
 
     :ok = Assignments.audit_review_item_conflicts(db)
-
-    # Recover durable liveness before any runtime child can consume wakes or
-    # accept traffic. The Supervision child skips its duplicate recovery below.
-    :ok = Supervision.recover_liveness!(db, config.wake_tick_ms)
 
     gateway_path = Path.join(config.base_dir, "gateway.json")
 
@@ -198,7 +195,14 @@ defmodule Tightbeam.Gateway do
 
     # Identity is loaded at composition time; a malformed manifest fails the
     # boot (bad law stops the boot). Placement owns every host mechanic.
-    reload_law!(config, Map.keys(handler_table))
+    load_law!(config, Map.keys(handler_table))
+
+    # Recover durable liveness only after row-commit recognition is installed,
+    # and before any runtime child can consume wakes or accept traffic. The
+    # Supervision child skips its duplicate recovery below.
+    :ok = Wakes.activate_wait_recognition(db)
+    :ok = Supervision.recover_liveness!(db, supervision_interval_ms(config))
+
     Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
 
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
@@ -300,18 +304,26 @@ defmodule Tightbeam.Gateway do
         {Tightbeam.Wakes,
          db: db,
          deliver: deliver,
+         delivery_opts: delivery_config,
          internal_consumers: %{
            "effort_probe" => &EffortCheckin.probe(db, config, &1),
-           "effort_deadline" => &EffortCheckin.deadline(db, config, &1)
+           "effort_deadline" => &EffortCheckin.deadline(db, config, &1),
+           "review_remedy_reconcile" =>
+             &Tightbeam.RailRemedy.reconcile_notice(
+               db,
+               Map.put(config, :supervision_interval_ms, supervision_interval_ms(config)),
+               &1
+             )
          },
          tick_ms: config.wake_tick_ms,
+         review_remedy_interval_ms: supervision_interval_ms(config),
          name: Tightbeam.WakeScheduler},
         {Tightbeam.Supervision,
          db: db,
          handlers: handler_table,
          prod_limit: prod_limit,
          recover: false,
-         sweep_ms: config.wake_tick_ms,
+         sweep_ms: supervision_interval_ms(config),
          name: Tightbeam.Supervision},
         {Tightbeam.Spinup.Flight, name: Tightbeam.Spinup.Flight},
         {DynamicSupervisor, strategy: :one_for_one, name: Tightbeam.AdapterSupervisor},
@@ -417,14 +429,22 @@ defmodule Tightbeam.Gateway do
     fn provider ->
       scope = "#{machine}:#{provider}"
 
-      case DB.transaction(db, fn txn ->
-             ConditionFacts.file_in_txn(txn, %{
-               kind: "credential-present",
-               scope: scope,
-               origin: "process:tightbeam"
-             })
-           end) do
-        {:ok, %{fact_id: fact_id}} ->
+      case DB.transaction_then(
+             db,
+             fn txn ->
+               ConditionFacts.file_in_txn(txn, %{
+                 kind: "credential-present",
+                 scope: scope,
+                 origin: "process:tightbeam"
+               })
+             end,
+             fn txn, fact ->
+               Tightbeam.Wakes.row_commit_in_txn(txn, [])
+               {fact, ConditionFacts.recognize_in_txn(txn, fact.fact_id)}
+             end
+           ) do
+        {:ok, {%{fact_id: fact_id}, deliveries}} ->
+          Enum.each(deliveries, &complete_delivery(db, &1))
           Tightbeam.Productions.CatalogRederive.recognize(db, catalog, fact_id)
 
         other ->
@@ -683,6 +703,13 @@ defmodule Tightbeam.Gateway do
               message: "a condition wake requires a fallback (--fallback-after / --at)"
             }
 
+          not valid_wait_request_shape?(p) ->
+            %{
+              code: "invalid",
+              message:
+                "--predicate and --after-turn are exclusive; each requires --assignment, and dependency waits require a fallback"
+            }
+
           not wake_principal_allowed?(db, call) ->
             %{code: "unknown_caller"}
 
@@ -718,6 +745,9 @@ defmodule Tightbeam.Gateway do
                    kind: p.kind,
                    scope: p[:scope],
                    origin: call.origin,
+                   principal: Map.get(call, :principal),
+                   payload: p[:payload],
+                   owner_user_id: wait_owner_user_id_in_txn_for_db(db, Map.get(call, :principal)),
                    idempotency_key: p[:idempotency_key]
                  }) do
               {:error, error} -> error
@@ -1039,7 +1069,7 @@ defmodule Tightbeam.Gateway do
       "assign" => fn call ->
         call =
           call
-          |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
+          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
           |> Map.put(:effort_config, config)
@@ -1049,7 +1079,7 @@ defmodule Tightbeam.Gateway do
       "dispatch" => fn call ->
         call =
           call
-          |> Map.put(:supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
+          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           |> Map.put(:on_work_item_change, item_change)
           |> Map.put(:effort_config, config)
@@ -1063,6 +1093,7 @@ defmodule Tightbeam.Gateway do
           "attest",
           call
           |> maybe_put_progress_interval(config)
+          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
           |> Map.put(:on_assignment_change, assignment_change)
           # Referent verification reaches hosts, so it needs the same placement
           # config (and the same injectable runner) the effort probe uses.
@@ -2522,6 +2553,7 @@ defmodule Tightbeam.Gateway do
           append_assistant_messages(db, turn, echo, result)
 
           record_in_txn = fn txn ->
+            Tightbeam.ReminderDelivery.delivered_in_txn(txn, turn.seq)
             HarnessHealth.resolve_normal_turn_in_txn(txn, session, turn)
           end
 
@@ -3174,7 +3206,7 @@ defmodule Tightbeam.Gateway do
         })
 
       {:noop, revision} ->
-        reload_law!(config)
+        load_law!(config)
         %{state: "already-learned", kungfu: call.params.name, live_revision: revision}
 
       {:conflict, paths} ->
@@ -3219,7 +3251,7 @@ defmodule Tightbeam.Gateway do
     case Org.release_archetypes(db, archetypes, prepare, fn {candidate, marker} ->
            case Identity.publish_live!(config.base_dir, candidate) do
              {:ok, revision} ->
-               reload_law!(config)
+               load_law!(config)
                {:published, marker, revision}
 
              {:error, error} ->
@@ -3273,7 +3305,7 @@ defmodule Tightbeam.Gateway do
         "pending" ->
           case Identity.publish_live!(config.base_dir, candidate) do
             {:ok, revision} ->
-              reload_law!(config)
+              load_law!(config)
 
               {:ok, :ok} =
                 DB.transaction(db, fn txn ->
@@ -3436,7 +3468,9 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp reload_law!(config, verbs \\ nil) do
+  @doc false
+  @spec load_law!(config(), Enumerable.t() | nil) :: [Rules.rule()]
+  def load_law!(config, verbs \\ nil) do
     verbs = verbs || config |> handlers() |> Map.keys()
     Archetypes.load!(config.base_dir)
     Rails.load!(config.base_dir)
@@ -4281,8 +4315,12 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp supervision_interval_ms(config) do
+    Map.get(config, :supervision_interval_ms, Map.get(config, :wake_tick_ms, 1_000))
+  end
+
   defp maybe_put_progress_interval(%{params: %{kind: "progress"}} = call, config) do
-    Map.put(call, :supervision_interval_ms, Map.fetch!(config, :wake_tick_ms))
+    Map.put(call, :supervision_interval_ms, supervision_interval_ms(config))
   end
 
   defp maybe_put_progress_interval(call, _config), do: call
@@ -4349,10 +4387,7 @@ defmodule Tightbeam.Gateway do
                 do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
 
             if prior do
-              case DB.Txn.q(txn, select_wake_in_txn_sql(), [prior.session_key]) do
-                [row] -> wake_from_in_txn_row(row)
-                [] -> nil
-              end
+              Wakes.get_in_txn(txn, prior.session_key)
             else
               wake = schedule_wake_in_txn(txn, call, session_key, due_at)
 
@@ -4371,13 +4406,15 @@ defmodule Tightbeam.Gateway do
 
         wake =
           case result do
+            {:ok, {:error, error}} -> error
             {:ok, wake} -> wake
             {:error, error} -> raise error
           end
 
-        if is_binary(wake[:wake_id]) do
-          if due_at <= System.system_time(:millisecond) and p[:nudge] != false,
-            do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
+        if is_map(wake) and is_binary(wake[:wake_id]) do
+          if (due_at <= System.system_time(:millisecond) or is_binary(wake[:wait_mode])) and
+               p[:nudge] != false,
+             do: Wakes.fire_due(Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler))
 
           wake_response(wake)
         else
@@ -4392,42 +4429,186 @@ defmodule Tightbeam.Gateway do
   defp schedule_wake_in_txn(txn, call, session_key, due_at) do
     p = call.params
 
-    if p[:condition_kind] == "subagent_stop" do
-      caller_session = creator_session_key(call[:principal])
+    cond do
+      Map.get(call, :principal) == {:process, "tightbeam"} and
+          p[:supervision_wake_kind] in ["prod", "escalation"] ->
+        Tightbeam.ReminderDelivery.schedule_in_txn(
+          txn,
+          p[:assignment_id],
+          p[:supervision_wake_kind],
+          session_key,
+          fn -> schedule_wake_row_in_txn(txn, call, session_key, due_at, nil, nil) end
+        )
 
-      case SubagentMarkers.resolve_subagent_in_txn(txn, caller_session, p[:condition_scope]) do
-        nil ->
-          %{
-            code: "subagent_not_found",
-            message: "no subagent for this session and tool call"
-          }
+      is_map(p[:predicate]) or p[:after_turn] == true ->
+        Wakes.register_wait_in_txn(txn, %{
+          session_key: session_key,
+          target_role: Map.get(call, :target_role),
+          origin: call.origin,
+          prompt: p.prompt,
+          due_at: due_at,
+          assignment_id: p[:assignment_id],
+          predicate: p[:predicate],
+          after_turn: p[:after_turn] == true,
+          registrant_session_key: creator_session_key(call[:principal]),
+          owner_user_id: wait_owner_user_id_in_txn(txn, call[:principal])
+        })
 
-        subagent_ref ->
-          if SubagentMarkers.stopped_in_txn?(txn, subagent_ref) do
+      p[:condition_kind] == "subagent_stop" ->
+        caller_session = creator_session_key(call[:principal])
+
+        case SubagentMarkers.resolve_subagent_in_txn(txn, caller_session, p[:condition_scope]) do
+          nil ->
             %{
-              code: "subagent_already_stopped",
-              subagent_ref: subagent_ref
+              code: "subagent_not_found",
+              message: "no subagent for this session and tool call"
             }
-          else
-            schedule_wake_row_in_txn(
-              txn,
-              call,
-              session_key,
-              due_at,
-              "subagent_stop",
-              subagent_ref
-            )
+
+          subagent_ref ->
+            if SubagentMarkers.stopped_in_txn?(txn, subagent_ref) do
+              %{
+                code: "subagent_already_stopped",
+                subagent_ref: subagent_ref
+              }
+            else
+              schedule_wake_row_in_txn(
+                txn,
+                call,
+                session_key,
+                due_at,
+                "subagent_stop",
+                subagent_ref
+              )
+            end
+        end
+
+      true ->
+        schedule_wake_row_in_txn(
+          txn,
+          call,
+          session_key,
+          due_at,
+          p[:condition_kind],
+          p[:condition_scope]
+        )
+    end
+  end
+
+  @doc false
+  def review_notice_recipient_in_txn(txn, assignment_id) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT a.openedByUser,a.openedBySession,a.workItemId,w.ownerUserId
+           FROM assignments a JOIN work_items w ON w.id=a.workItemId
+           WHERE a.id=?1
+           """,
+           [assignment_id]
+         ) do
+      [[opened_by_user, opened_by_session, work_item_id, owner]] ->
+        opener =
+          cond do
+            is_binary(opened_by_user) and opened_by_user == owner ->
+              Org.personal_session_key(owner)
+
+            is_binary(opened_by_session) ->
+              case DB.Txn.q(
+                     txn,
+                     "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+                     [opened_by_session, owner]
+                   ) do
+                [[1]] -> opened_by_session
+                _ -> nil
+              end
+
+            true ->
+              nil
           end
-      end
-    else
-      schedule_wake_row_in_txn(
-        txn,
-        call,
-        session_key,
-        due_at,
-        p[:condition_kind],
-        p[:condition_scope]
-      )
+
+        recipient = opener || Org.personal_session_key(owner)
+
+        case DB.Txn.q(
+               txn,
+               "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+               [recipient, owner]
+             ) do
+          [[1]] ->
+            {:ok, %{session_key: recipient, owner_user_id: owner, work_item_id: work_item_id}}
+
+          _ ->
+            {:error,
+             %{
+               reason: :missing_accountable_owner,
+               owner_user_id: owner,
+               work_item_id: work_item_id
+             }}
+        end
+
+      _ ->
+        {:error, %{reason: :missing_assignment}}
+    end
+  end
+
+  @doc false
+  def schedule_review_notice_in_txn(txn, recipient, attrs) do
+    case DB.Txn.q(
+           txn,
+           "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+           [recipient.session_key, recipient.owner_user_id]
+         ) do
+      [[1]] ->
+        Wakes.schedule_in_txn(txn, %{
+          wake_id: attrs.wake_id,
+          session_key: recipient.session_key,
+          origin: "remedy:completion-requires-review",
+          prompt: attrs.prompt,
+          consumer: Map.get(attrs, :consumer, "prompt"),
+          due_at: attrs.due_at,
+          owner_user_id: recipient.owner_user_id,
+          work_item_id: recipient.work_item_id,
+          assignment_id: attrs.assignment_id,
+          target_gate: if(Map.get(attrs, :consumer, "prompt") == "prompt", do: 0, else: 1),
+          sender_scheduled: true
+        })
+
+      _ ->
+        raise ArgumentError, "review remedy recipient no longer belongs to the accountable owner"
+    end
+  end
+
+  defp valid_wait_request_shape?(p) do
+    predicate_present? = Map.has_key?(p, :predicate)
+    predicate? = is_map(p[:predicate])
+    after_turn_present? = Map.has_key?(p, :after_turn)
+    after_turn? = p[:after_turn] == true
+    wait? = predicate? or after_turn?
+
+    cond do
+      predicate_present? and not predicate? -> false
+      after_turn_present? and not after_turn? -> false
+      predicate? and after_turn? -> false
+      wait? and not (is_binary(p[:assignment_id]) and p.assignment_id != "") -> false
+      wait? and is_binary(p[:condition_kind]) -> false
+      predicate? and is_nil(p[:after_ms]) and is_nil(p[:at]) -> false
+      after_turn? and (not is_nil(p[:after_ms]) or not is_nil(p[:at])) -> false
+      true -> true
+    end
+  end
+
+  defp wait_owner_user_id_in_txn(txn, {:session, session_key}) do
+    case DB.Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[owner_user_id]] -> owner_user_id
+      [] -> nil
+    end
+  end
+
+  defp wait_owner_user_id_in_txn(_txn, {:user, owner_user_id}), do: owner_user_id
+  defp wait_owner_user_id_in_txn(_txn, _principal), do: nil
+
+  defp wait_owner_user_id_in_txn_for_db(db, principal) do
+    case DB.transaction(db, &wait_owner_user_id_in_txn(&1, principal)) do
+      {:ok, owner_user_id} -> owner_user_id
+      {:error, error} -> raise error
     end
   end
 
@@ -4534,18 +4715,15 @@ defmodule Tightbeam.Gateway do
   defp creator_session_key({:session, key}), do: key
   defp creator_session_key(_principal), do: nil
 
-  defp select_wake_in_txn_sql do
-    "SELECT wakeId, dueAt, state, class, deliveryRule FROM wakes WHERE wakeId = ?1"
-  end
-
-  defp wake_from_in_txn_row([wake_id, due_at, state, class, delivery_rule]),
-    do: %{
-      wake_id: wake_id,
-      due_at: due_at,
-      state: state,
-      class: class,
-      delivery_rule: delivery_rule
+  defp wake_response(%{wait_mode: mode} = wake) when is_binary(mode) do
+    %{
+      wake_id: wake.wake_id,
+      due_at: wake.due_at,
+      state: wake.state,
+      recognition_path: wake.recognition_path,
+      eligible: wait_response_eligible?(wake)
     }
+  end
 
   defp wake_response(%{class: class} = wake) when is_binary(class) do
     %{
@@ -4560,6 +4738,9 @@ defmodule Tightbeam.Gateway do
   defp wake_response(wake) do
     %{wake_id: wake.wake_id, due_at: wake.due_at, state: wake.state}
   end
+
+  defp wait_response_eligible?(%{originating_turn_seq: nil}), do: true
+  defp wait_response_eligible?(_wake), do: false
 
   defp valid_reresolve?(p) do
     case {p[:reresolve], p[:reresolve_seed], p[:reresolve_rung]} do
@@ -6530,28 +6711,35 @@ defmodule Tightbeam.Gateway do
           %{owner_user_id: ^owner} = session ->
             if session.state == "active" do
               {:ok, result} =
-                DB.transaction(db, fn txn ->
-                  result =
-                    retire_cascade_in_txn(
-                      txn,
-                      session.session_key,
-                      owner,
-                      call.origin,
-                      Map.fetch!(config, :wake_tick_ms),
-                      "retired: session retired before execution"
-                    )
+                DB.transaction_then(
+                  db,
+                  fn txn ->
+                    result =
+                      retire_cascade_in_txn(
+                        txn,
+                        session.session_key,
+                        owner,
+                        call.origin,
+                        supervision_interval_ms(config),
+                        "retired: session retired before execution"
+                      )
 
-                  if result.retired != [] and p[:idempotency_key] do
-                    Idempotency.put_in_txn(txn, %{
-                      owner_user_id: owner,
-                      operation: "retire",
-                      idempotency_key: p.idempotency_key,
-                      session_key: session.session_key
-                    })
+                    if result.retired != [] and p[:idempotency_key] do
+                      Idempotency.put_in_txn(txn, %{
+                        owner_user_id: owner,
+                        operation: "retire",
+                        idempotency_key: p.idempotency_key,
+                        session_key: session.session_key
+                      })
+                    end
+
+                    result
+                  end,
+                  fn txn, result ->
+                    Tightbeam.Wakes.row_commit_in_txn(txn, [])
+                    result
                   end
-
-                  result
-                end)
+                )
 
               Enum.each(result.retired, fn retired ->
                 broadcast(db, owner, Payloads.stream_deleted(retired.session_key))
@@ -6865,36 +7053,43 @@ defmodule Tightbeam.Gateway do
         %{session | host: host}
       )
 
-    case DB.transaction(db, fn txn ->
-           [[current_host]] =
-             Txn.q(txn, "SELECT host FROM sessions WHERE sessionKey=?1", [
-               session.session_key
-             ])
+    case DB.transaction_then(
+           db,
+           fn txn ->
+             [[current_host]] =
+               Txn.q(txn, "SELECT host FROM sessions WHERE sessionKey=?1", [
+                 session.session_key
+               ])
 
-           cond do
-             current_host != session.host ->
-               :placement_changed
+             cond do
+               current_host != session.host ->
+                 :placement_changed
 
-             not EffortCheckin.prepared_rearms_current?(
-               txn,
-               session.session_key,
-               prepared
-             ) ->
-               :retry
-
-             true ->
-               Org.set_host_in_txn(txn, session.session_key, host)
-
-               EffortCheckin.apply_prepared_rearms_in_txn(
+               not EffortCheckin.prepared_rearms_current?(
                  txn,
-                 config,
                  session.session_key,
                  prepared
-               )
+               ) ->
+                 :retry
 
-               :ok
+               true ->
+                 Org.set_host_in_txn(txn, session.session_key, host)
+
+                 EffortCheckin.apply_prepared_rearms_in_txn(
+                   txn,
+                   config,
+                   session.session_key,
+                   prepared
+                 )
+
+                 :ok
+             end
+           end,
+           fn txn, result ->
+             Tightbeam.Wakes.row_commit_in_txn(txn, [])
+             result
            end
-         end) do
+         ) do
       {:ok, :ok} ->
         :ok
 

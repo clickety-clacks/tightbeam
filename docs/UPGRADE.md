@@ -191,7 +191,7 @@ kill -TERM <gateway pid>          # verified: this runs prep_stop, which drains
 git -C <checkout> pull            # or checkout the tag you are deploying
 mix deps.get && mix compile
 # 3. start
-# 4. verify — the four checks below
+# 4. verify — the restart checks and fresh-agent proof below
 ```
 
 ## What the stop actually does
@@ -270,6 +270,22 @@ faster than the work in flight would explain, treat it as a kill and check
    sender's decision — so anything that mattered has to be re-asked.
 4. **Queued work is moving.** `SELECT count(*) FROM turns WHERE status='queued';`
    should fall as lanes pick it up. If it does not, the lanes are not claiming.
+
+### Fresh-agent deploy readiness is a separate proof
+
+A boot response, an existing session answering, and an empty queue do not prove
+that newly installed bits can spawn a new agent. On an explicitly authorized
+disposable test deployment, run the bounded readiness mode described in
+`docs/SMOKE.md`. It must spawn a new session, dispatch a wake, observe that
+wake's delivered turn and matching assistant reply, and confirm retirement.
+Failed, canceled, missing, or unanswered turns are not success. Retirement
+failure also fails the proof. Record the installed package/source identity,
+host, selected harnesses, session key, wake ID, turn/message/reply IDs and
+retirement result. A skipped harness remains incomplete.
+
+This does not authorize production smoke, installation, credentials, identity
+changes or a full feature smoke against a live org. Keep migration evidence
+and restart preservation evidence separate from this lifecycle proof.
 
 ## What does NOT survive the restart
 

@@ -388,6 +388,64 @@ defmodule Tightbeam.EffortCheckinTest do
     assert after_count == before
   end
 
+  test "required effort deadlines and attributed notices bypass an owned pending ordinary reminder",
+       ctx do
+    personal_key = Org.personal_session_key("h1")
+    session(ctx.db, personal_key, "h1", Placement.local_host_name())
+
+    item =
+      assignment(ctx, "dispatch", {:user, "h1"}, "holder", %{
+        subject: "effort remains due",
+        brief: "effort remains due"
+      })
+
+    assert {:ok, ordinary} =
+             DB.transaction(ctx.db, fn txn ->
+               Tightbeam.ReminderDelivery.schedule_in_txn(txn, item.id, "prod", "holder", fn ->
+                 Wakes.schedule_in_txn(txn, %{
+                   session_key: "holder",
+                   origin: "process:tightbeam",
+                   prompt: "Ordinary reminder remains owned",
+                   due_at: 9_000_000_000_000,
+                   assignment_id: item.id
+                 })
+               end)
+             end)
+
+    assert [[claim]] =
+             rows(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [item.id])
+
+    assert JSON.decode!(claim)["pending"]["consumer"] == %{"wake" => ordinary.wake_id}
+    request = escalate(ctx, item.id)
+    assert request.deadline_wake_id != nil
+
+    assert :ok =
+             EffortCheckin.deadline(
+               ctx.db,
+               ctx.config,
+               Wakes.get(ctx.db, request.deadline_wake_id)
+             )
+
+    notices = Enum.reject(notification_wakes(ctx.db), &(&1.wake_id == ordinary.wake_id))
+    assert length(notices) == 2
+    assert Enum.all?(notices, &(&1.assignment_id == item.id))
+    drain_notifications!(ctx)
+
+    assert [[3]] =
+             rows(
+               ctx.db,
+               "SELECT count(*) FROM turns WHERE assignmentId=?1 AND prompt LIKE '%effort check-in%'",
+               [item.id]
+             )
+
+    assert [[^claim]] =
+             rows(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [item.id])
+
+    assert Wakes.get(ctx.db, ordinary.wake_id).state == "pending"
+    assert [] == rows(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [ordinary.wake_id])
+    assert Enum.all?(notices, &(Wakes.get(ctx.db, &1.wake_id).state == "fired"))
+  end
+
   test "job-linked initial and deadline effort notifications stamp assignment and job", ctx do
     personal_key = Org.personal_session_key("h1")
     session(ctx.db, personal_key, "h1", Placement.local_host_name())
@@ -927,8 +985,12 @@ defmodule Tightbeam.EffortCheckinTest do
     assert prod.prompt =~ "one new, unexpired bounded checkpoint"
     assert prod.prompt =~ "next action or condition and its deadline"
     assert prod.prompt =~ "Do not file generic or duplicate status"
-    assert prod.prompt =~ "schedule a concrete continuation wake"
-    assert prod.prompt =~ "next action or dependency condition and when to resume"
+    assert prod.prompt =~ "obligation-scoped continuation pattern"
+
+    assert prod.prompt =~
+             "An ordinary notification does not cover this assignment or pause effort"
+
+    assert prod.prompt =~ "Only a qualifying unresolved dependency wait pauses the effort horizon"
     refute prod.prompt =~ "or say what is happening"
 
     assert rows(ctx.db, "SELECT COUNT(*) FROM decision_requests WHERE assignmentId=?1", [
@@ -1644,7 +1706,7 @@ defmodule Tightbeam.EffortCheckinTest do
       session_key: holder,
       target_role: nil,
       role_fallback: false,
-      params: params,
+      params: Map.put_new(params, :effect_kind, "coordination"),
       effort_config: ctx.config,
       supervision_interval_ms: ctx.config.wake_tick_ms
     }

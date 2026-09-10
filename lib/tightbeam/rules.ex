@@ -1,7 +1,8 @@
 defmodule Tightbeam.Rules do
   @moduledoc """
-  Operator-authored, deny-only verb statutes loaded from
-  `identity/rules/*.toml` and evaluated at the dispatch chokepoint.
+  Operator-authored conditional statutes loaded from `identity/rules/*.toml`.
+  Verb and turn-end rules evaluate at their existing chokepoints; row-commit
+  notice rules evaluate after the owning business mutation commits.
 
   Facts are demand-driven, cached once per dispatch call, and are
   best-effort point-in-time snapshots. Their reads are intentionally not
@@ -15,7 +16,8 @@ defmodule Tightbeam.Rules do
   ["reviewed-clean"]` fires for an assignment with no verdicts. List facts are
   `caller.roles`, `assignment.verdicts`,
   `assignment.independent_verdict_kinds`,
-  `assignment.qualifying_review_verdict_kinds`, and
+  `assignment.qualifying_review_verdict_kinds`,
+  `assignment.qualifying_verification_verdict_kinds`, and
   `assignment.artifact_kinds` (the distinct artifact kinds the assignment's
   holder recorded on its work item, in every artifact state). Assignment
   caller identity comes from the optional dispatch principal rather than the
@@ -53,12 +55,14 @@ defmodule Tightbeam.Rules do
     RailEpisodes,
     RailRemedy,
     RailScript,
+    RuleRuntime,
     Roles
   }
 
   import Bitwise
 
   @persist_key __MODULE__
+  @policy_key {__MODULE__, :policies}
   @rule_keys MapSet.new([
                "name",
                "verb",
@@ -67,11 +71,15 @@ defmodule Tightbeam.Rules do
                "edges",
                "check",
                "effect",
+               "notice",
                "remedy",
                "external_producer",
                "recurrence_suppression"
              ])
   @condition_keys MapSet.new(["fact", "op", "value"])
+  @policy_keys MapSet.new(["name", "purpose", "when", "verification"])
+  @verification_keys MapSet.new(["trigger", "terminal", "fallback"])
+  @policy_purposes ~w(wait-prod-coverage wait-effort-relief wait-verification-admission)
   @recurrence_keys MapSet.new([
                      "scope",
                      "fingerprint",
@@ -82,6 +90,7 @@ defmodule Tightbeam.Rules do
   @rearm_keys MapSet.new(["recovered_when", "recurred_when"])
   @recurrence_fingerprint ~w(statute target_session subject failure_class failure_code)
   @check_keys MapSet.new(["script", "returns", "timeout_ms", "effects"])
+  @notice_keys MapSet.new(["target_role", "target_session", "prompt"])
   @remedy_keys MapSet.new([
                  "action",
                  "produces",
@@ -104,6 +113,7 @@ defmodule Tightbeam.Rules do
     assignment.verdicts
     assignment.independent_verdict_kinds
     assignment.qualifying_review_verdict_kinds
+    assignment.qualifying_verification_verdict_kinds
     work_item.verdict_kinds
   )
   @linked_review_facts ~w(
@@ -128,22 +138,50 @@ defmodule Tightbeam.Rules do
     "assignment.is_producing_card" => :bool,
     "assignment.effect_kind" => :string,
     "assignment.state" => :string,
+    "assignment.outcome" => :string,
     "assignment.holder_noted_verdict_kinds" => {:list, :string},
     "assignment.independent_verdict_kinds" => {:list, :string},
     "assignment.qualifying_review_verdict_kinds" => {:list, :string},
+    "assignment.qualifying_verification_verdict_kinds" => {:list, :string},
     "assignment.artifact_kinds" => {:list, :string},
     "assignment.holder_archetype" => :string,
     "assignment.caller_is_holder" => :bool,
     "work_item.is_bug" => :bool,
+    "work_item.state" => :string,
     "work_item.has_topline" => :bool,
     "work_item.has_spec_ref" => :bool,
     "work_item.verdict_kinds" => {:list, :string},
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
-    "assign.declared_files_overlap_open" => :bool
+    "assign.declared_files_overlap_open" => :bool,
+    "decision_request.status" => :string,
+    "artifact.present" => :bool,
+    "artifact.content_sha256" => :string,
+    "review.qualifying_verdict_kinds" => {:list, :string},
+    "condition_fact.matches" => :bool,
+    "wait.obligation_matches" => :bool,
+    "wait.admitted" => :bool,
+    "wait.after_turn_eligible" => :bool,
+    "wait.coverage_valid" => :bool,
+    "wait.continuation_state" => :string,
+    "wait.recognized" => :bool,
+    "wait.declaration_complete" => :bool,
+    "wait.verification_accountable" => :bool,
+    "wait.verification_state" => :string,
+    "resolver.open" => :bool,
+    "resolver.owed_by_other" => :bool,
+    "wake.has_obligation" => :bool,
+    "wake.registrant_is_holder" => :bool,
+    "wake.registrant_is_ancestor" => :bool,
+    "verifier.open" => :bool,
+    "verifier.holder_is_other" => :bool
   }
   @operators ~w(eq ne gt gte lt lte in not_in)
-
+  @predicate_binding_keys ~w(
+    workItemId assignmentId decisionRequestId artifact
+    conditionKind conditionScope conditionAfterId conditionFactId
+  )
+  @artifact_facts ~w(artifact.present artifact.content_sha256 review.qualifying_verdict_kinds)
   @type condition :: %{fact: String.t(), op: String.t(), value: term()}
   @type rule :: %{
           name: String.t(),
@@ -153,6 +191,7 @@ defmodule Tightbeam.Rules do
           edges: [String.t()],
           effect: String.t(),
           check: map() | nil,
+          notice: map() | nil,
           remedy: map() | nil,
           external_producer: boolean()
         }
@@ -164,14 +203,19 @@ defmodule Tightbeam.Rules do
 
     identity_manifest_sha = identity_manifest_sha(base_dir)
 
-    rules =
+    entries =
       base_dir
       |> Path.join("identity/rules/*.toml")
       |> Path.wildcard()
       |> Enum.sort()
       |> Enum.flat_map(&load_file!(&1, verbs, base_dir, identity_manifest_sha))
 
-    case Enum.find(rules, fn rule -> Enum.count(rules, &(&1.name == rule.name)) > 1 end) do
+    rules = for {:rule, rule} <- entries, do: rule
+    policies = for {:policy, policy} <- entries, do: policy
+
+    named = rules ++ policies
+
+    case Enum.find(named, fn entry -> Enum.count(named, &(&1.name == entry.name)) > 1 end) do
       %{name: name, source: source} ->
         raise ArgumentError, "#{source}: rule #{inspect(name)}: duplicate name"
 
@@ -181,7 +225,41 @@ defmodule Tightbeam.Rules do
 
     validate_satisfiability!(rules, verbs)
     :persistent_term.put(@persist_key, rules)
+    :persistent_term.put(@policy_key, policies)
+
+    RuleRuntime.install_admission(&evaluate/2)
+
+    RuleRuntime.install(%{
+      row_commit_effects: &row_commit_effects_in_txn/2,
+      resolve_notice: &resolve_notice_in_txn/3,
+      evaluate_predicate: &evaluate_predicate_in_txn/2,
+      select_policy: &select_policy_in_txn/3
+    })
+
     rules
+  end
+
+  @doc "Select the bytewise-smallest matching predicate-only policy for one snapshot."
+  @spec select_policy_in_txn(DB.Txn.t(), String.t(), map()) :: {:ok, map()} | :none
+  def select_policy_in_txn(%DB.Txn{} = txn, purpose, context) do
+    @policy_key
+    |> :persistent_term.get([])
+    |> Enum.filter(&(&1.purpose == purpose))
+    |> Enum.sort_by(& &1.name)
+    |> Enum.find_value(:none, fn policy ->
+      call = %{origin: "process:tightbeam", params: %{}, policy_context: context}
+
+      case evaluate_conditions(policy.conditions, policy, txn, call, %{}) do
+        {:match, cache} ->
+          {:ok, %{name: policy.name, facts: evidence_facts(policy.conditions, cache)}}
+
+        {:no_match, _cache} ->
+          false
+
+        {:error, fact} ->
+          raise ArgumentError, "failed to compute #{fact} for policy #{policy.name}"
+      end
+    end)
   end
 
   @doc "Evaluate the active statutes for a raw dispatch call."
@@ -201,7 +279,7 @@ defmodule Tightbeam.Rules do
   def decide(db, call) do
     rules = :persistent_term.get(@persist_key, [])
     verb = Map.fetch!(call, :verb)
-    edge = if Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb"
+    edge = edge(call)
 
     rules
     |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
@@ -216,6 +294,474 @@ defmodule Tightbeam.Rules do
     |> Enum.find_value(& &1.identity_manifest_sha)
   end
 
+  @doc "Validate and evaluate an ad hoc predicate against one transaction snapshot."
+  @spec evaluate_predicate(DB.server() | DB.Txn.t(), map()) ::
+          {:ok, map()} | {:error, map()}
+  def evaluate_predicate(%DB.Txn{} = txn, predicate),
+    do: evaluate_predicate_in_txn(txn, predicate)
+
+  def evaluate_predicate(db, predicate) do
+    case DB.transaction(db, &evaluate_predicate_in_txn(&1, predicate)) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc "Evaluate one validated predicate through the common condition and fact engine."
+  @spec evaluate_predicate_in_txn(DB.Txn.t(), map()) :: {:ok, map()} | {:error, map()}
+  def evaluate_predicate_in_txn(%DB.Txn{} = txn, predicate) when is_map(predicate) do
+    owner_user_id = field(predicate, :owner_user_id)
+    raw_conditions = field(predicate, :conditions)
+    raw_bindings = field(predicate, :bindings) || %{}
+
+    try do
+      unless is_binary(owner_user_id) and String.trim(owner_user_id) != "",
+        do: raise(ArgumentError, "predicate ownerUserId must be nonblank")
+
+      conditions = normalize_predicate_conditions(raw_conditions)
+      fail = fn message -> raise ArgumentError, message end
+      validate_predicate_conditions!(conditions, fail)
+      conditions = validate_conditions!(conditions, fail)
+      bindings = validate_bindings_in_txn!(txn, conditions, raw_bindings, owner_user_id)
+
+      candidates = artifact_candidates_in_txn(txn, conditions, bindings, owner_user_id)
+
+      result =
+        Enum.reduce_while(candidates, nil, fn candidate, _acc ->
+          call = predicate_call(owner_user_id, bindings, candidate, field(predicate, :transition))
+
+          case evaluate_conditions(conditions, %{name: "ad-hoc-predicate"}, txn, call, %{}) do
+            {:match, cache} ->
+              {:halt,
+               %{
+                 matched: true,
+                 facts: evidence_facts(conditions, cache),
+                 condition_match: Map.get(cache, "$condition_match"),
+                 artifact_revision: candidate,
+                 canonical: %{conditions: conditions, bindings: bindings}
+               }}
+
+            {:no_match, cache} ->
+              {:cont,
+               %{
+                 matched: false,
+                 facts: evidence_facts(conditions, cache),
+                 condition_match: Map.get(cache, "$condition_match"),
+                 artifact_revision: candidate,
+                 canonical: %{conditions: conditions, bindings: bindings}
+               }}
+
+            {:error, fact} ->
+              raise ArgumentError, "failed to compute #{fact}"
+          end
+        end)
+
+      {:ok,
+       result ||
+         %{
+           matched: false,
+           facts: [],
+           condition_match: nil,
+           artifact_revision: nil,
+           canonical: %{conditions: conditions, bindings: bindings}
+         }}
+    rescue
+      error in ArgumentError -> {:error, %{code: "invalid_predicate", message: error.message}}
+    end
+  end
+
+  def evaluate_predicate_in_txn(%DB.Txn{}, _predicate),
+    do: {:error, %{code: "invalid_predicate", message: "predicate must be an object"}}
+
+  @doc "Evaluate loaded row-commit notice rules into effects for Wakes to record."
+  @spec row_commit_effects_in_txn(DB.Txn.t(), [map()] | map()) :: [tuple()]
+  def row_commit_effects_in_txn(%DB.Txn{} = txn, transitions) do
+    List.wrap(transitions)
+    |> Enum.flat_map(&evaluate_row_transition_in_txn(txn, &1))
+  end
+
+  @doc "Resolve a validated notice against the same transaction snapshot as its rule."
+  @spec resolve_notice_in_txn(DB.Txn.t(), map(), map()) :: {:ok, map()} | {:error, term()}
+  def resolve_notice_in_txn(%DB.Txn{} = txn, rule, call) do
+    RailRemedy.resolve_notice(txn, rule.notice, notice_bindings(txn, call))
+  end
+
+  defp normalize_predicate_conditions(conditions) when is_list(conditions) do
+    Enum.map(conditions, fn
+      condition when is_map(condition) ->
+        Map.new(condition, fn {key, value} -> {predicate_key(key), value} end)
+
+      other ->
+        other
+    end)
+  end
+
+  defp normalize_predicate_conditions(other), do: other
+
+  defp predicate_key(key) when is_atom(key),
+    do: key |> Atom.to_string() |> Macro.camelize() |> lower_first()
+
+  defp predicate_key(key), do: key
+
+  defp lower_first(value) do
+    String.downcase(String.first(value)) <> String.slice(value, 1..-1//1)
+  end
+
+  defp validate_bindings_in_txn!(txn, conditions, raw_bindings, owner_user_id)
+       when is_map(raw_bindings) do
+    bindings = normalize_bindings(raw_bindings)
+    unknown = Map.keys(bindings) -- @predicate_binding_keys
+
+    if unknown != [],
+      do:
+        raise(ArgumentError, "bindings have unknown keys: #{Enum.join(Enum.sort(unknown), ", ")}")
+
+    facts = MapSet.new(conditions, & &1.fact)
+
+    if MapSet.member?(facts, "work_item.state") do
+      id = required_binding!(bindings, "workItemId")
+      ensure_owned_row!(txn, "work item", id, owner_user_id, "work_items", "id", "ownerUserId")
+    end
+
+    if Enum.any?(facts, &(&1 in ~w(assignment.state assignment.outcome))) do
+      id = required_binding!(bindings, "assignmentId")
+
+      unless owned_assignment?(txn, id, owner_user_id),
+        do: raise(ArgumentError, "unknown or inaccessible assignment binding")
+    end
+
+    if MapSet.member?(facts, "decision_request.status") do
+      id = required_binding!(bindings, "decisionRequestId")
+
+      ensure_owned_row!(
+        txn,
+        "decision request",
+        id,
+        owner_user_id,
+        "decision_requests",
+        "id",
+        "ownerUserId"
+      )
+    end
+
+    bindings =
+      if Enum.any?(facts, &(&1 in @artifact_facts)) do
+        Map.put(
+          bindings,
+          "artifact",
+          validate_artifact_binding_in_txn!(txn, Map.get(bindings, "artifact"), owner_user_id)
+        )
+      else
+        bindings
+      end
+
+    if MapSet.member?(facts, "condition_fact.matches") do
+      kind = required_binding!(bindings, "conditionKind")
+      after_id = required_binding!(bindings, "conditionAfterId")
+
+      unless is_binary(kind) and String.trim(kind) != "",
+        do: raise(ArgumentError, "conditionKind binding must be nonblank")
+
+      unless is_integer(after_id) and after_id >= 0,
+        do: raise(ArgumentError, "conditionAfterId binding must be a nonnegative integer")
+
+      scope = Map.get(bindings, "conditionScope")
+
+      unless is_nil(scope) or is_binary(scope),
+        do: raise(ArgumentError, "conditionScope binding must be text or null")
+    end
+
+    bindings
+  end
+
+  defp validate_bindings_in_txn!(_txn, _conditions, _raw_bindings, _owner_user_id),
+    do: raise(ArgumentError, "predicate bindings must be an object")
+
+  defp predicate_binding_key(key) when is_atom(key) do
+    case key do
+      :work_item_id -> "workItemId"
+      :assignment_id -> "assignmentId"
+      :decision_request_id -> "decisionRequestId"
+      :artifact_id -> "artifactId"
+      :content_sha256 -> "contentSha256"
+      :produced_by_assignment_id -> "producedByAssignmentId"
+      :condition_kind -> "conditionKind"
+      :condition_scope -> "conditionScope"
+      :condition_after_id -> "conditionAfterId"
+      :condition_fact_id -> "conditionFactId"
+      _ -> Atom.to_string(key)
+    end
+  end
+
+  defp predicate_binding_key(key), do: key
+
+  defp required_binding!(bindings, key) do
+    case Map.get(bindings, key) do
+      value when is_binary(value) and value != "" -> value
+      value when key == "conditionAfterId" and is_integer(value) -> value
+      _ -> raise ArgumentError, "bindings are missing #{key}"
+    end
+  end
+
+  defp ensure_owned_row!(txn, label, id, owner, table, id_column, owner_column) do
+    sql = "SELECT 1 FROM #{table} WHERE #{id_column}=?1 AND #{owner_column}=?2"
+
+    if DB.Txn.q(txn, sql, [id, owner]) != [[1]],
+      do: raise(ArgumentError, "unknown or inaccessible #{label} binding")
+  end
+
+  defp owned_assignment?(txn, id, owner) do
+    DB.Txn.q(
+      txn,
+      """
+      SELECT 1
+      FROM assignments a
+      JOIN sessions s ON s.sessionKey=a.holderKey
+      LEFT JOIN work_items wi ON wi.id=a.workItemId
+      WHERE a.id=?1 AND s.ownerUserId=?2
+        AND (a.workItemId IS NULL OR wi.ownerUserId=?2)
+      """,
+      [id, owner]
+    ) == [[1]]
+  end
+
+  defp validate_artifact_binding_in_txn!(txn, binding, owner) when is_map(binding) do
+    binding = Map.new(binding, fn {key, value} -> {predicate_binding_key(key), value} end)
+    keys = Map.keys(binding) |> Enum.sort()
+
+    cond do
+      keys == ["artifactId", "contentSha256"] ->
+        artifact_id = Map.get(binding, "artifactId")
+        hash = Map.get(binding, "contentSha256")
+
+        unless is_binary(artifact_id) and artifact_id != "" and is_binary(hash) and hash != "",
+          do:
+            raise(
+              ArgumentError,
+              "artifact identity binding requires nonblank artifactId and contentSha256"
+            )
+
+        ensure_owned_artifact!(txn, artifact_id, owner)
+
+      keys in [["producedByAssignmentId"], ["contentSha256", "producedByAssignmentId"]] ->
+        producer = Map.get(binding, "producedByAssignmentId")
+        hash = Map.get(binding, "contentSha256")
+
+        unless is_binary(producer) and producer != "" and
+                 (is_nil(hash) or (is_binary(hash) and hash != "")),
+               do: raise(ArgumentError, "artifact producer binding is malformed")
+
+        unless owned_assignment?(txn, producer, owner),
+          do: raise(ArgumentError, "unknown or inaccessible artifact producer binding")
+
+      true ->
+        raise ArgumentError,
+              "artifact binding must name artifactId/contentSha256 or producedByAssignmentId with optional contentSha256"
+    end
+
+    binding
+  end
+
+  defp validate_artifact_binding_in_txn!(_txn, _binding, _owner),
+    do: raise(ArgumentError, "bindings are missing artifact")
+
+  defp ensure_owned_artifact!(txn, artifact_id, owner) do
+    rows =
+      DB.Txn.q(
+        txn,
+        """
+        SELECT 1 FROM artifacts art
+        JOIN work_items wi ON wi.id=art.workItemId
+        WHERE art.artifactId=?1 AND wi.ownerUserId=?2
+        """,
+        [artifact_id, owner]
+      )
+
+    if rows != [[1]], do: raise(ArgumentError, "unknown or inaccessible artifact binding")
+  end
+
+  defp artifact_candidates_in_txn(txn, conditions, bindings, owner) do
+    if Enum.any?(conditions, &(&1.fact in @artifact_facts)) do
+      binding = Map.get(bindings, "artifact")
+
+      rows =
+        case binding do
+          %{"artifactId" => artifact_id} ->
+            DB.Txn.q(
+              txn,
+              """
+              SELECT art.artifactId, art.contentSha256, art.producedByAssignmentId
+              FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId
+              WHERE art.artifactId=?1 AND wi.ownerUserId=?2
+              """,
+              [artifact_id, owner]
+            )
+
+          %{"producedByAssignmentId" => producer} = artifact_binding ->
+            expected_hash = Map.get(artifact_binding, "contentSha256")
+            hash_clause = if is_binary(expected_hash), do: " AND art.contentSha256=?3", else: ""
+
+            params =
+              if is_binary(expected_hash),
+                do: [producer, owner, expected_hash],
+                else: [producer, owner]
+
+            DB.Txn.q(
+              txn,
+              """
+              SELECT art.artifactId, art.contentSha256, art.producedByAssignmentId
+              FROM artifacts art JOIN work_items wi ON wi.id=art.workItemId
+              WHERE art.producedByAssignmentId=?1 AND wi.ownerUserId=?2#{hash_clause}
+              ORDER BY art.createdAt, art.artifactId
+              """,
+              params
+            )
+
+          _ ->
+            []
+        end
+
+      case rows do
+        [] ->
+          [nil]
+
+        rows ->
+          Enum.map(rows, fn [id, hash, producer] -> %{id: id, hash: hash, producer: producer} end)
+      end
+    else
+      [nil]
+    end
+  end
+
+  defp predicate_call(owner, bindings, artifact_candidate, transition) do
+    params = %{
+      work_item_id: Map.get(bindings, "workItemId"),
+      assignment_id: Map.get(bindings, "assignmentId"),
+      decision_request_id: Map.get(bindings, "decisionRequestId")
+    }
+
+    %{
+      verb: "wake",
+      edge: :row_commit,
+      origin: "process:tightbeam",
+      principal: {:user, owner},
+      params: params,
+      predicate_owner_user_id: owner,
+      predicate_bindings: bindings,
+      artifact_candidate: artifact_candidate,
+      transition: transition
+    }
+  end
+
+  defp evaluate_row_transition_in_txn(txn, transition) when is_map(transition) do
+    verb = field(transition, :verb)
+    owner = field(transition, :owner_user_id)
+    bindings = field(transition, :bindings) || %{}
+    {origin, principal} = row_commit_principal(field(transition, :principal), owner)
+
+    call =
+      predicate_call(owner, normalize_bindings(bindings), nil, transition)
+      |> Map.merge(%{verb: verb, origin: origin, principal: principal, edge: :row_commit})
+
+    domain = field(transition, :domain)
+
+    :persistent_term.get(@persist_key, [])
+    |> Enum.filter(fn rule ->
+      rule.verb == verb and "row-commit" in rule.edges and rule.effect == "notice" and
+        row_domain_candidate?(rule, domain)
+    end)
+    |> Enum.flat_map(fn rule ->
+      try do
+        candidates =
+          artifact_candidates_in_txn(txn, rule.conditions, call.predicate_bindings, owner)
+
+        Enum.reduce_while(candidates, [], fn candidate, [] ->
+          candidate_call = Map.put(call, :artifact_candidate, candidate)
+
+          case evaluate_conditions(rule.conditions, rule, txn, candidate_call, %{}) do
+            {:match, cache} ->
+              {:halt, [{:notice, rule, candidate_call, evidence_facts(rule.conditions, cache)}]}
+
+            {:no_match, _cache} ->
+              {:cont, []}
+
+            {:error, fact} ->
+              raise "row-commit rule #{rule.name} failed to compute #{fact}"
+          end
+        end)
+      rescue
+        error ->
+          [{:error, rule, Exception.message(error)}]
+      end
+    end)
+  end
+
+  defp evaluate_row_transition_in_txn(_txn, _transition), do: []
+
+  defp row_domain_candidate?(rule, domain) do
+    Enum.any?(rule.conditions, fn condition ->
+      domain in RuleRuntime.predicate_row_domains(condition.fact)
+    end)
+  end
+
+  defp notice_bindings(db, call) do
+    assignment =
+      case fetch_fact("$assignment", db, call, %{}) do
+        {:ok, value, _cache} -> value
+        _ -> nil
+      end
+
+    %{
+      assignment_id: assignment && assignment.id,
+      work_item_id:
+        (assignment && assignment.work_item_id) || Map.get(call.params, :work_item_id),
+      holder_key: assignment && assignment.holder_key,
+      holder_role: assignment && assignment[:holder_role],
+      holder_archetype: assignment && assignment.holder_archetype,
+      caller_origin: call.origin
+    }
+  end
+
+  defp row_commit_principal("session:" <> session_key, _owner) do
+    origin =
+      case Tightbeam.Origin.parse(session_key) do
+        {:agent, _} -> session_key
+        _ -> "agent:#{session_key}"
+      end
+
+    {origin, {:session, session_key}}
+  end
+
+  defp row_commit_principal("user:" <> user_id, _owner),
+    do: {"user:#{user_id}", {:user, user_id}}
+
+  defp row_commit_principal("process:" <> process, _owner),
+    do: {"process:#{process}", {:process, process}}
+
+  defp row_commit_principal("remedy:" <> statute, owner),
+    do: {"remedy:#{statute}", {:remedy, %{statute: statute, owner: owner}}}
+
+  defp row_commit_principal(origin, owner) when is_binary(origin), do: {origin, {:user, owner}}
+  defp row_commit_principal(_origin, owner), do: {"process:tightbeam", {:user, owner}}
+
+  defp normalize_bindings(bindings) do
+    bindings = Map.new(bindings, fn {key, value} -> {predicate_binding_key(key), value} end)
+
+    case Map.get(bindings, "artifact") do
+      artifact when is_map(artifact) ->
+        Map.put(
+          bindings,
+          "artifact",
+          Map.new(artifact, fn {key, value} -> {predicate_binding_key(key), value} end)
+        )
+
+      _ ->
+        bindings
+    end
+  end
+
+  defp field(map, key), do: Map.get(map, key) || Map.get(map, Atom.to_string(key))
+
   defp load_file!(path, valid_verbs, base_dir, identity_manifest_sha) do
     contents = File.read!(path)
 
@@ -229,23 +775,117 @@ defmodule Tightbeam.Rules do
         {:error, error} -> raise ArgumentError, "#{path}: invalid TOML: #{inspect(error)}"
       end
 
-    unknown = unknown_keys(manifest, MapSet.new(["rule"]))
+    unknown = unknown_keys(manifest, MapSet.new(["rule", "policy"]))
 
     if unknown != [],
       do: raise(ArgumentError, "#{path}: unknown root keys: #{Enum.join(unknown, ", ")}")
 
-    case Map.get(manifest, "rule") do
-      rules when is_list(rules) and rules != [] ->
-        rules
-        |> Enum.with_index(1)
-        |> Enum.map(fn {rule, ordinal} ->
-          validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)
-        end)
+    rules =
+      case Map.fetch(manifest, "rule") do
+        {:ok, rules} when is_list(rules) and rules != [] ->
+          rules
+          |> Enum.with_index(1)
+          |> Enum.map(fn {rule, ordinal} ->
+            {:rule,
+             validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)}
+          end)
 
-      _ ->
-        raise ArgumentError, "#{path}: must contain one or more [[rule]] tables"
-    end
+        :error ->
+          []
+
+        _ ->
+          raise ArgumentError, "#{path}: [[rule]] must be a non-empty array of tables"
+      end
+
+    policies =
+      case Map.fetch(manifest, "policy") do
+        {:ok, policies} when is_list(policies) and policies != [] ->
+          policies
+          |> Enum.with_index(1)
+          |> Enum.map(fn {policy, ordinal} ->
+            {:policy, validate_policy!(path, ordinal, policy, identity_manifest_sha)}
+          end)
+
+        :error ->
+          []
+
+        _ ->
+          raise ArgumentError, "#{path}: [[policy]] must be a non-empty array of tables"
+      end
+
+    if rules == [] and policies == [],
+      do: raise(ArgumentError, "#{path}: must contain one or more [[rule]] or [[policy]] tables")
+
+    rules ++ policies
   end
+
+  defp validate_policy!(path, ordinal, policy, identity_manifest_sha) when is_map(policy) do
+    raw_name = Map.get(policy, "name")
+
+    label =
+      if valid_name?(raw_name), do: "policy #{inspect(raw_name)}", else: "policy ##{ordinal}"
+
+    fail = fn message -> raise ArgumentError, "#{path}: #{label}: #{message}" end
+
+    unknown = unknown_keys(policy, @policy_keys)
+    if unknown != [], do: fail.("unknown keys: #{Enum.join(unknown, ", ")}")
+    unless valid_name?(raw_name), do: fail.("invalid or missing name: #{inspect(raw_name)}")
+
+    purpose = Map.get(policy, "purpose")
+    unless purpose in @policy_purposes, do: fail.("unsupported purpose: #{inspect(purpose)}")
+
+    conditions = validate_policy_conditions!(Map.get(policy, "when"), fail)
+    verification = validate_policy_verification!(purpose, Map.get(policy, "verification"), fail)
+
+    %{
+      name: raw_name,
+      purpose: purpose,
+      conditions: conditions,
+      verification: verification,
+      source: path,
+      identity_manifest_sha: identity_manifest_sha
+    }
+  end
+
+  defp validate_policy!(path, ordinal, _policy, _identity_manifest_sha),
+    do: raise(ArgumentError, "#{path}: policy ##{ordinal}: policy must be a table")
+
+  defp validate_policy_conditions!(conditions, fail) do
+    unless is_list(conditions) and conditions != [] and Enum.all?(conditions, &is_map/1),
+      do: fail.("when must be a non-empty list of condition tables")
+
+    conditions
+    |> Enum.with_index(1)
+    |> Enum.map(fn {condition, index} -> validate_condition!(condition, index, fail) end)
+  end
+
+  defp validate_policy_verification!("wait-verification-admission", verification, fail)
+       when is_map(verification) do
+    unknown = unknown_keys(verification, @verification_keys)
+    if unknown != [], do: fail.("verification has unknown keys: #{Enum.join(unknown, ", ")}")
+
+    expected = %{
+      "trigger" => "registration",
+      "terminal" => "bound-verdict-or-obligation-terminal",
+      "fallback" => "wake-due-at"
+    }
+
+    unless verification == expected,
+      do:
+        fail.(
+          "verification must declare registration, bound-verdict-or-obligation-terminal, and wake-due-at"
+        )
+
+    expected
+  end
+
+  defp validate_policy_verification!("wait-verification-admission", _verification, fail),
+    do: fail.("verification admission requires a verification table")
+
+  defp validate_policy_verification!(_purpose, nil, _fail), do: nil
+
+  defp validate_policy_verification!(_purpose, _verification, fail),
+    do: fail.("verification is valid only for wait-verification-admission")
 
   defp validate_rule!(path, ordinal, rule, valid_verbs, base_dir, identity_manifest_sha)
        when is_map(rule) do
@@ -275,8 +915,12 @@ defmodule Tightbeam.Rules do
     effect =
       validate_effect!(Map.get(rule, "effect", "deny"), check, Map.has_key?(rule, "effect"), fail)
 
+    if "row-commit" in edges and effect != "notice",
+      do: fail.(~s(edge "row-commit" requires effect = "notice"))
+
     effects = if check, do: Map.values(check.effects), else: [effect]
-    remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail)
+    notice = validate_notice!(Map.get(rule, "notice"), effect, fail)
+    remedy = validate_remedy!(Map.get(rule, "remedy"), conditions, check, effects, fail, raw_name)
 
     recurrence_suppression =
       validate_recurrence_suppression!(Map.get(rule, "recurrence_suppression"), fail)
@@ -304,6 +948,7 @@ defmodule Tightbeam.Rules do
       edges: edges,
       effect: effect,
       check: check,
+      notice: notice,
       remedy: remedy,
       recurrence_suppression: recurrence_suppression,
       external_producer: external_producer,
@@ -327,6 +972,12 @@ defmodule Tightbeam.Rules do
     conditions
     |> Enum.with_index(1)
     |> Enum.map(fn {condition, index} -> validate_condition!(condition, index, fail) end)
+  end
+
+  defp validate_predicate_conditions!(conditions, fail) do
+    unless is_list(conditions) and conditions != [] do
+      fail.("predicate conditions must be a non-empty list of condition objects")
+    end
   end
 
   defp validate_recurrence_suppression!(nil, _fail), do: nil
@@ -419,9 +1070,10 @@ defmodule Tightbeam.Rules do
   end
 
   defp validate_edges!(edges, verb, fail) do
-    unless is_list(edges) and edges != [] and Enum.all?(edges, &(&1 in ~w(verb turn-end))) and
+    unless is_list(edges) and edges != [] and
+             Enum.all?(edges, &(&1 in ~w(verb turn-end row-commit))) and
              Enum.uniq(edges) == edges do
-      fail.(~s(edges must be a non-empty subset of ["verb", "turn-end"]))
+      fail.(~s(edges must be a non-empty subset of ["verb", "turn-end", "row-commit"]))
     end
 
     if "turn-end" in edges and verb != "attest",
@@ -431,14 +1083,44 @@ defmodule Tightbeam.Rules do
   end
 
   defp validate_effect!(effect, check, explicit?, fail) do
-    unless effect in ~w(deny remedy escalate),
-      do: fail.("effect must be one of deny, remedy, escalate")
+    unless effect in ~w(deny remedy escalate notice),
+      do: fail.("effect must be one of deny, remedy, escalate, notice")
 
     if check && explicit?,
       do: fail.("effect is valid only on predicate-only statutes")
 
     effect
   end
+
+  defp validate_notice!(nil, "notice", fail),
+    do: fail.(~s(effect notice requires [rule.notice]))
+
+  defp validate_notice!(nil, _effect, _fail), do: nil
+
+  defp validate_notice!(notice, "notice", fail) when is_map(notice) do
+    unknown = unknown_keys(notice, @notice_keys)
+    if unknown != [], do: fail.("notice has unknown keys: #{Enum.join(unknown, ", ")}")
+
+    targets = Enum.filter(~w(target_role target_session), &Map.has_key?(notice, &1))
+
+    if length(targets) != 1,
+      do: fail.("notice requires exactly one of target_role or target_session")
+
+    prompt = Map.get(notice, "prompt")
+
+    unless is_binary(prompt) and String.trim(prompt) != "",
+      do: fail.("notice prompt must be nonblank")
+
+    Enum.each(notice, fn {field, value} -> validate_interpolation!(field, value, fail) end)
+
+    notice
+    |> Map.new(fn {key, value} -> {String.to_atom(key), value} end)
+  end
+
+  defp validate_notice!(_notice, "notice", fail), do: fail.("notice must be a table")
+
+  defp validate_notice!(_notice, _effect, fail),
+    do: fail.(~s([rule.notice] requires effect = "notice"))
 
   defp validate_check!(nil, _base_dir, _fail), do: nil
 
@@ -482,9 +1164,9 @@ defmodule Tightbeam.Rules do
 
   defp validate_check!(_check, _base_dir, fail), do: fail.("check must be a table")
 
-  defp validate_remedy!(nil, _conditions, _check, _effects, _fail), do: nil
+  defp validate_remedy!(nil, _conditions, _check, _effects, _fail, _name), do: nil
 
-  defp validate_remedy!(remedy, conditions, check, effects, fail) when is_map(remedy) do
+  defp validate_remedy!(remedy, conditions, check, effects, fail, name) when is_map(remedy) do
     unknown = unknown_keys(remedy, @remedy_keys)
     if unknown != [], do: fail.("remedy has unknown keys: #{Enum.join(unknown, ", ")}")
 
@@ -579,7 +1261,10 @@ defmodule Tightbeam.Rules do
         :ok
     end
 
-    if is_nil(check) and
+    # The completion notice binds its subject through the accountable-owner protocol;
+    # it does not create a review assignment. Other linked remedies retain that binding.
+    if not (name == "completion-requires-review" and action == "wake") and
+         is_nil(check) and
          Enum.any?(requirements, fn {fact, kinds} ->
            fact in @linked_review_facts and produces in kinds
          end) and params["reviews"] != "{assignment_id}" do
@@ -600,7 +1285,7 @@ defmodule Tightbeam.Rules do
     }
   end
 
-  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail),
+  defp validate_remedy!(_remedy, _conditions, _check, _effects, fail, _name),
     do: fail.("remedy must be a table")
 
   defp validate_interpolation!(field, value, fail) when field in @embedded_fields do
@@ -944,6 +1629,19 @@ defmodule Tightbeam.Rules do
         to_consume
       )
 
+  defp fold_effect("notice", rule, rest, db, call, cache, to_close, to_consume, _exit_class) do
+    evidence = evidence_facts(rule.conditions, cache)
+
+    decide_rules(
+      rest,
+      db,
+      call,
+      cache,
+      [{:notice, rule, call, evidence} | maybe_close(rule, db, call, to_close)],
+      to_consume
+    )
+  end
+
   defp fold_effect("deny", rule, _rest, _db, call, _cache, to_close, to_consume, exit_class) do
     error = denial_error(rule, call, "rule_denied", exit_class)
     {{:deny, error}, Enum.reverse(to_close), Enum.reverse(to_consume)}
@@ -1016,7 +1714,13 @@ defmodule Tightbeam.Rules do
     denial_error(rule, call, reason, script_exit_class) |> Map.merge(error)
   end
 
-  defp edge(call), do: if(Map.get(call, :edge, :verb) == :turn_end, do: "turn-end", else: "verb")
+  defp edge(call) do
+    case Map.get(call, :edge, :verb) do
+      :turn_end -> "turn-end"
+      :row_commit -> "row-commit"
+      _ -> "verb"
+    end
+  end
 
   defp gated_ref(call) do
     params = Map.fetch!(call, :params)
@@ -1205,6 +1909,13 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("assignment.outcome", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache -> {nil, cache}
+      assignment, cache -> {assignment.outcome, cache}
+    end)
+  end
+
   defp compute_fact("assignment.holder_noted_verdict_kinds", db, call, cache) do
     with_dependency("$assignment", db, call, cache, fn
       nil, cache ->
@@ -1243,10 +1954,37 @@ defmodule Tightbeam.Rules do
         {nil, cache}
 
       assignment, cache ->
-        {Assignments.qualifying_review_verdict_kinds(
+        kinds =
+          if assignment.effect_kind == "code" and get_in(call, [:params, :kind]) == "completion" do
+            Assignments.qualifying_review_verdict_kinds(
+              db,
+              assignment.id,
+              assignment.holder_key,
+              get_in(call, [:params, :commit_refs])
+            )
+          else
+            Assignments.qualifying_review_verdict_kinds(
+              db,
+              assignment.id,
+              assignment.holder_key
+            )
+          end
+
+        {kinds, cache}
+    end)
+  end
+
+  defp compute_fact("assignment.qualifying_verification_verdict_kinds", db, call, cache) do
+    with_dependency("$assignment", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      assignment, cache ->
+        {Assignments.qualifying_verification_verdict_kinds(
            db,
            assignment.id,
-           assignment.holder_key
+           assignment.holder_key,
+           get_in(call, [:params, :commit_refs])
          ), cache}
     end)
   end
@@ -1291,6 +2029,190 @@ defmodule Tightbeam.Rules do
 
         {value, cache}
     end)
+  end
+
+  defp compute_fact("work_item.state", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        owner = Map.get(call, :predicate_owner_user_id)
+
+        {sql, params} =
+          if is_binary(owner) do
+            {"SELECT state FROM work_items WHERE id=?1 AND ownerUserId=?2", [work_item_id, owner]}
+          else
+            {"SELECT state FROM work_items WHERE id=?1", [work_item_id]}
+          end
+
+        value =
+          case DB.query(db, sql, params) do
+            {:ok, [[state]]} -> state
+            {:ok, []} -> nil
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("decision_request.status", db, call, cache) do
+    decision_id = Map.get(call.params, :decision_request_id)
+    owner = Map.get(call, :predicate_owner_user_id)
+
+    value =
+      case DB.query(
+             db,
+             "SELECT status FROM decision_requests WHERE id=?1 AND ownerUserId=?2",
+             [decision_id, owner]
+           ) do
+        {:ok, [[status]]} -> status
+        {:ok, []} -> nil
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("artifact.present", _db, call, cache) do
+    candidate = Map.get(call, :artifact_candidate)
+    binding = get_in(call, [:predicate_bindings, "artifact"]) || %{}
+    expected_hash = Map.get(binding, "contentSha256")
+
+    present =
+      is_map(candidate) and is_binary(candidate.hash) and
+        (is_nil(expected_hash) or candidate.hash == expected_hash)
+
+    {present, cache}
+  end
+
+  defp compute_fact("artifact.content_sha256", _db, call, cache) do
+    value =
+      case Map.get(call, :artifact_candidate) do
+        %{hash: hash} -> hash
+        _ -> nil
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("review.qualifying_verdict_kinds", db, call, cache) do
+    value =
+      case Map.get(call, :artifact_candidate) do
+        %{id: artifact_id, hash: hash, producer: producer}
+        when is_binary(hash) and is_binary(producer) ->
+          qualifying_revision_verdicts(db, artifact_id, hash, producer)
+
+        _ ->
+          []
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("condition_fact.matches", db, call, cache) do
+    bindings = Map.get(call, :predicate_bindings, %{})
+    kind = Map.get(bindings, "conditionKind")
+    scope = Map.get(bindings, "conditionScope")
+    after_id = Map.get(bindings, "conditionAfterId")
+    fact_id = Map.get(bindings, "conditionFactId")
+    owner_user_id = Map.get(call, :predicate_owner_user_id)
+
+    {owner_clause, params} =
+      if owner_user_id == "legacy-unscoped" do
+        {"ownerUserId IS NULL", [after_id, kind]}
+      else
+        {"ownerUserId=?3", [after_id, kind, owner_user_id]}
+      end
+
+    {scope_clause, params} =
+      if is_nil(scope) do
+        {"", params}
+      else
+        {" AND scope=?#{length(params) + 1}", params ++ [scope]}
+      end
+
+    {id_clause, params} =
+      if is_integer(fact_id) do
+        {" AND id=?#{length(params) + 1}", params ++ [fact_id]}
+      else
+        {"", params}
+      end
+
+    rows =
+      case DB.query(
+             db,
+             "SELECT id, scope FROM condition_facts WHERE id>?1 AND kind=?2 AND #{owner_clause}#{scope_clause}#{id_clause} ORDER BY id LIMIT 1",
+             params
+           ) do
+        {:ok, rows} -> rows
+      end
+
+    case rows do
+      [[id, matched_scope]] ->
+        {true, Map.put(cache, "$condition_match", %{id: id, scope: matched_scope})}
+
+      [] ->
+        {false, cache}
+    end
+  end
+
+  defp compute_fact("wake.has_obligation", _db, call, cache) do
+    {is_binary(call.params[:assignment_id]), cache}
+  end
+
+  defp compute_fact(fact, db, call, cache)
+       when fact in ~w(wake.registrant_is_holder wake.registrant_is_ancestor) do
+    registrant =
+      case call[:principal] do
+        {:session, key} -> key
+        _ -> nil
+      end
+
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        WITH RECURSIVE lineage(sessionKey,spawnedBy,holderKey,ownerUserId) AS (
+          SELECT s.sessionKey,s.spawnedBy,s.sessionKey,s.ownerUserId
+          FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
+          JOIN sessions caller ON caller.sessionKey=?2 AND caller.ownerUserId=s.ownerUserId
+          WHERE a.id=?1 AND a.state='open'
+          UNION
+          SELECT s.sessionKey,s.spawnedBy,l.holderKey,l.ownerUserId
+          FROM sessions s JOIN lineage l ON s.sessionKey=l.spawnedBy AND s.ownerUserId=l.ownerUserId
+        )
+        SELECT sessionKey=holderKey FROM lineage WHERE sessionKey=?2
+        """,
+        [call.params[:assignment_id], registrant]
+      )
+
+    value =
+      case {fact, rows} do
+        {"wake.registrant_is_holder", [[1]]} -> true
+        {"wake.registrant_is_ancestor", [[0]]} -> true
+        _ -> false
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("verifier.open", _db, call, cache) do
+    {get_in(call, [:policy_context, :verifier_state]) == "open", cache}
+  end
+
+  defp compute_fact(fact, _db, call, cache)
+       when fact in ~w(wait.obligation_matches wait.admitted wait.after_turn_eligible
+                      wait.coverage_valid wait.continuation_state wait.recognized
+                      wait.declaration_complete wait.verification_accountable
+                      wait.verification_state resolver.open resolver.owed_by_other) do
+    # Only the bound, checked wake snapshot supplies these facts. Missing context
+    # remains nil (including for ne), never an invented negative observation.
+    {get_in(call, [:policy_context, :wait_facts, fact]), cache}
+  end
+
+  defp compute_fact("verifier.holder_is_other", _db, call, cache) do
+    context = Map.get(call, :policy_context, %{})
+    {context[:verifier_holder_key] != context[:obligation_holder_key], cache}
   end
 
   # Explicit active membership is the sole Topline truth. Visibility is checked
@@ -1495,11 +2417,17 @@ defmodule Tightbeam.Rules do
     assignment =
       case Map.get(call.params, :assignment_id) || Map.get(call.params, "assignment_id") do
         id when is_binary(id) ->
-          assignment_context(
-            db,
-            "WHERE a.id = ?1",
-            [id]
-          )
+          case Map.get(call, :predicate_owner_user_id) do
+            owner when is_binary(owner) ->
+              assignment_context(
+                db,
+                "WHERE a.id = ?1 AND s.ownerUserId = ?2 AND (a.workItemId IS NULL OR wi.ownerUserId = ?2)",
+                [id, owner]
+              )
+
+            _ ->
+              assignment_context(db, "WHERE a.id = ?1", [id])
+          end
 
         _ ->
           case Map.get(call.params, :reviews_assignment_id) ||
@@ -1559,16 +2487,46 @@ defmodule Tightbeam.Rules do
     |> Enum.uniq()
   end
 
+  defp qualifying_revision_verdicts(db, artifact_id, hash, producer_assignment_id) do
+    case DB.query(
+           db,
+           """
+           WITH winner AS (
+             SELECT v.verdictKind, r.holderKey AS reviewHolder, p.holderKey AS producerHolder
+             FROM attests v
+             JOIN assignments r ON r.id=v.assignmentId
+             JOIN assignments p ON p.id=r.reviewsAssignmentId
+             WHERE r.reviewsAssignmentId=?1
+               AND v.kind='verdict'
+               AND v.bySession=r.holderKey
+               AND v.verdictKind IN ('reviewed-clean','changes-requested')
+               AND v.artifactId=?2
+               AND v.contentSha256=?3
+             ORDER BY v.ts DESC, v.rowid DESC
+             LIMIT 1
+           )
+           SELECT verdictKind FROM winner
+           WHERE verdictKind='reviewed-clean' AND reviewHolder != producerHolder
+           """,
+           [producer_assignment_id, artifact_id, hash]
+         ) do
+      {:ok, [["reviewed-clean"]]} -> ["reviewed-clean"]
+      {:ok, _} -> []
+    end
+  end
+
   defp assignment_context(db, where, params) do
     case DB.query(
            db,
            """
-           SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, a.state, s.archetype,
+           SELECT a.id, a.workItemId, a.reviewsAssignmentId, a.holderKey, a.holderRole,
+                  a.state, a.outcome, s.archetype,
                   a.holderHarness, a.holderProvider,
                   COALESCE(e.effectKind,
                     CASE WHEN a.reviewsAssignmentId IS NULL THEN 'code' ELSE 'review' END)
            FROM assignments a
            JOIN sessions s ON s.sessionKey = a.holderKey
+           LEFT JOIN work_items wi ON wi.id = a.workItemId
            LEFT JOIN assignment_effects e ON e.assignmentId = a.id
            #{where}
            """,
@@ -1581,7 +2539,9 @@ defmodule Tightbeam.Rules do
            work_item_id,
            reviews_assignment_id,
            holder_key,
+           holder_role,
            state,
+           outcome,
            holder_archetype,
            holder_harness,
            holder_provider,
@@ -1593,7 +2553,9 @@ defmodule Tightbeam.Rules do
           work_item_id: work_item_id,
           reviews_assignment_id: reviews_assignment_id,
           holder_key: holder_key,
+          holder_role: holder_role,
           state: state,
+          outcome: outcome,
           holder_archetype: holder_archetype,
           holder_harness: holder_harness,
           holder_provider: holder_provider,
@@ -1606,6 +2568,22 @@ defmodule Tightbeam.Rules do
   end
 
   defp caller_user(db, call, cache) do
+    case {Map.get(call, :edge), Map.get(call, :principal)} do
+      {:row_commit, {:session, session_key}} ->
+        value =
+          case Org.get(db, session_key) do
+            nil -> nil
+            session -> session.owner_user_id
+          end
+
+        {value, cache}
+
+      _ ->
+        caller_user_from_origin(db, call, cache)
+    end
+  end
+
+  defp caller_user_from_origin(db, call, cache) do
     case parse_origin(call.origin) do
       :malformed ->
         {nil, cache}

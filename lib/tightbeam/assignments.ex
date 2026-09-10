@@ -6,7 +6,18 @@ defmodule Tightbeam.Assignments do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
   alias Tightbeam.Harness.Support
-  alias Tightbeam.{EffortCheckin, EventLog, Org, Placement, Projection, Supervision, Wakes}
+
+  alias Tightbeam.{
+    ConditionFacts,
+    EffortCheckin,
+    Escalation,
+    EventLog,
+    Org,
+    Placement,
+    Projection,
+    Supervision,
+    Wakes
+  }
 
   @effect_kinds ~w(code policy release live_mutation evidence review coordination)
   @effect_kind_sql Enum.map_join(@effect_kinds, ", ", &"'#{&1}'")
@@ -80,6 +91,9 @@ defmodule Tightbeam.Assignments do
     byHarness TEXT NULL,
     byProvider TEXT NULL,
     commitRefs TEXT NULL,
+    artifactId TEXT NULL REFERENCES artifacts(artifactId),
+    contentSha256 TEXT NULL,
+    waitId TEXT NULL REFERENCES wakes(wakeId),
     ts INTEGER NOT NULL,
     CHECK(
       (kind IN ('progress', 'completion', 'surrender') AND bySession IS NOT NULL AND
@@ -91,7 +105,9 @@ defmodule Tightbeam.Assignments do
     CHECK(producer IS NULL OR kind = 'verdict'),
     CHECK(producerCommand IS NULL OR producer IS NOT NULL),
     CHECK(byHarness IS NULL OR kind = 'verdict'),
-    CHECK(byProvider IS NULL OR kind = 'verdict')
+    CHECK(byProvider IS NULL OR kind = 'verdict'),
+    CHECK((artifactId IS NULL) = (contentSha256 IS NULL)),
+    CHECK(artifactId IS NULL OR kind = 'verdict')
   )
   """
 
@@ -205,8 +221,22 @@ defmodule Tightbeam.Assignments do
           assignment_id,
           "tightbeam:retirement",
           liveness_trigger
-        )
+        ),
+        %{verb: "retire", principal: principal}
       )
+
+      DB.record_row_commit(txn, %{
+        verb: "retire",
+        domain: "assignment",
+        row_id: assignment_id,
+        owner_user_id: owner_user_id,
+        principal: principal,
+        bindings: %{assignmentId: assignment_id, workItemId: work_item_id},
+        fields: %{
+          state: %{old: "open", new: "closed"},
+          outcome: %{old: nil, new: "revoked"}
+        }
+      })
     end)
 
     assignments
@@ -404,6 +434,60 @@ defmodule Tightbeam.Assignments do
     end
   end
 
+  @doc "Return the current independent clean review only when it names the submitted result."
+  @spec qualifying_review_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
+          [String.t()]
+  def qualifying_review_verdict_kinds(db, assignment_id, assignment_holder_key, commit_refs) do
+    with {:ok, [_ | _] = expected} <- canonical_commit_refs(commit_refs),
+         {:ok, [["reviewed-clean", review_holder, encoded]]} <-
+           DB.query(
+             db,
+             """
+             SELECT v.verdictKind,r.holderKey,v.commitRefs
+             FROM attests v
+             JOIN assignments r ON r.id=v.assignmentId
+             WHERE r.reviewsAssignmentId=?1
+               AND v.kind='verdict'
+               AND v.bySession=r.holderKey
+               AND v.verdictKind IN ('reviewed-clean','changes-requested')
+             ORDER BY v.ts DESC,v.rowid DESC
+             LIMIT 1
+             """,
+             [assignment_id]
+           ),
+         true <- review_holder != assignment_holder_key,
+         ^expected <- canonical_stored_commit_refs(encoded) do
+      ["reviewed-clean"]
+    else
+      _ -> []
+    end
+  end
+
+  @doc "Return the current producer verification only when it names the submitted result."
+  @spec qualifying_verification_verdict_kinds(DB.server(), String.t(), String.t(), list() | nil) ::
+          [String.t()]
+  def qualifying_verification_verdict_kinds(db, assignment_id, holder_key, commit_refs) do
+    with {:ok, [_ | _] = expected} <- canonical_commit_refs(commit_refs),
+         {:ok, [["verified", encoded]]} <-
+           DB.query(
+             db,
+             """
+             SELECT verdictKind,commitRefs
+             FROM attests
+             WHERE assignmentId=?1 AND kind='verdict' AND bySession=?2
+               AND verdictKind IN ('verified','verification-failed')
+             ORDER BY ts DESC,rowid DESC
+             LIMIT 1
+             """,
+             [assignment_id, holder_key]
+           ),
+         ^expected <- canonical_stored_commit_refs(encoded) do
+      ["verified"]
+    else
+      _ -> []
+    end
+  end
+
   @doc "Return the declared file paths for an assignment."
   @spec declared_files(DB.server(), String.t()) :: [String.t()]
   def declared_files(db, assignment_id) do
@@ -434,7 +518,7 @@ defmodule Tightbeam.Assignments do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
+        "SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer, producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts FROM attests WHERE assignmentId = ?1 ORDER BY ts ASC, id ASC",
         [assignment_id]
       )
 
@@ -677,16 +761,20 @@ defmodule Tightbeam.Assignments do
       key = call.params[:idempotency_key]
 
       result =
-        transaction(db, fn txn ->
-          case open_assignment_in_txn(txn, call, owner, key, files, verb) do
-            {:created, assignment} ->
-              created = after_create.(txn, assignment)
-              accept_assignment_in_txn(created, txn, call)
+        transaction_with_row_commits(
+          db,
+          fn txn ->
+            case open_assignment_in_txn(txn, call, owner, key, files, verb) do
+              {:created, assignment} ->
+                created = after_create.(txn, assignment)
+                accept_assignment_in_txn(created, txn, call)
 
-            other ->
-              other
-          end
-        end)
+              other ->
+                other
+            end
+          end,
+          &opened_assignment_commits(&1, &2, call, verb)
+        )
 
       case result do
         {:accepted_in_txn, event_id, {:created, assignment, delivery}} ->
@@ -757,7 +845,7 @@ defmodule Tightbeam.Assignments do
   defp attest_result(db, call) do
     with :ok <- principal_allowed(call.principal, "attest"),
          :ok <- commit_ref_filing_allowed(db, call),
-         :ok <- valid_commit_refs(db, call.params[:kind], call.params[:commit_refs]) do
+         {:ok, call} <- prepare_attest_commit_refs(db, call) do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
 
@@ -767,7 +855,13 @@ defmodule Tightbeam.Assignments do
       # transaction is deliberate — a registry this cannot read is reported as
       # such, and a failed CHECK never rejects the claim (§Design 5).
       artifact_cursor = artifact_cursor(db)
-      result = transaction(db, fn txn -> attest_in_txn(txn, call) end)
+
+      result =
+        transaction_with_row_commits(
+          db,
+          fn txn -> attest_in_txn(txn, call) end,
+          &attest_commits(&1, &2, call)
+        )
 
       if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
         {:ok, from} = from
@@ -936,7 +1030,13 @@ defmodule Tightbeam.Assignments do
     with :ok <- principal_allowed(call.principal, "revoke-assignment") do
       assignment_id = call.params[:assignment_id]
       from = best_effort_value(fn -> Tightbeam.WorkState.status(db, assignment_id) end)
-      result = transaction(db, fn txn -> revoke_in_txn(txn, call) end)
+
+      result =
+        transaction_with_row_commits(
+          db,
+          fn txn -> revoke_in_txn(txn, call) end,
+          &revocation_commits(&1, &2, call)
+        )
 
       if not Map.has_key?(result, :code) and match?({:ok, _}, from) do
         {:ok, from} = from
@@ -1030,6 +1130,8 @@ defmodule Tightbeam.Assignments do
           end
         end
 
+        {subject, succeeds_assignment_id} = prepare_successor_in_txn!(txn, call)
+
         # In-txn state='open' INTERLOCK (r4-F1): the pre-statute guard and this
         # insert are different transactions; a disposition committing between
         # them must not let a terminal item acquire an open assignment. The
@@ -1051,7 +1153,7 @@ defmodule Tightbeam.Assignments do
           """,
           [
             id,
-            call.params.subject,
+            subject,
             call.session_key,
             call.target_role,
             if(call.role_fallback, do: 1, else: 0),
@@ -1121,6 +1223,16 @@ defmodule Tightbeam.Assignments do
 
         assignment = fetch_assignment!(txn, id)
         append_assignment_marker(txn, assignment, :opened)
+
+        if succeeds_assignment_id do
+          ConditionFacts.file_in_txn(txn, %{
+            kind: "assignment-successor-created",
+            scope: id,
+            origin: "process:tightbeam",
+            owner_user_id: assignment_owner_in_txn(txn, id)
+          })
+        end
+
         assignment
 
       [] ->
@@ -1138,7 +1250,197 @@ defmodule Tightbeam.Assignments do
 
     :review_of_review ->
       error("review_of_review", "a review assignment cannot itself be reviewed")
+
+    {:successor_error, error} ->
+      error
   end
+
+  defp prepare_successor_in_txn!(txn, call) do
+    supplied = call.params[:succeeds_assignment_id]
+
+    if is_nil(supplied) do
+      {call.params.subject, nil}
+    else
+      prepare_successor_link_in_txn!(txn, call, supplied)
+    end
+  end
+
+  defp prepare_successor_link_in_txn!(txn, call, supplied) do
+    predecessor_id =
+      case resolve_assignment_id_in_txn(txn, supplied) do
+        {:ok, id} -> id
+        _ -> successor_error!("unknown_assignment", "unknown assignment: #{supplied}")
+      end
+
+    predecessor = fetch_assignment(txn, predecessor_id)
+
+    if is_nil(predecessor) or not successor_predecessor_visible?(txn, call.principal, predecessor),
+      do: successor_error!("unknown_assignment", "unknown assignment: #{supplied}")
+
+    if predecessor.state != "closed",
+      do:
+        successor_error!(
+          "predecessor_not_terminal",
+          "predecessor assignment is not terminal: #{predecessor_id}"
+        )
+
+    {assignment_ids, work_item_ids, carried_ids} =
+      successor_chain_in_txn!(txn, predecessor_id, MapSet.new(), [], [], [])
+
+    decision_ids =
+      Escalation.applicable_late_rulings_in_txn(
+        txn,
+        assignment_ids,
+        work_item_ids,
+        carried_ids
+      )
+
+    decisions = if decision_ids == [], do: "none", else: Enum.join(decision_ids, ", ")
+
+    subject =
+      call.params.subject <>
+        "\n\nRuled-but-unconsumed decisions carried from #{predecessor_id}: #{decisions}"
+
+    if subject |> String.codepoints() |> length() > 2000,
+      do:
+        successor_error!(
+          "successor_brief_too_long",
+          "successor subject exceeds 2000 Unicode codepoints"
+        )
+
+    {subject, predecessor_id}
+  end
+
+  defp resolve_assignment_id_in_txn(_txn, supplied) when not is_binary(supplied), do: :unknown
+
+  defp resolve_assignment_id_in_txn(txn, supplied) do
+    case Txn.q(txn, "SELECT id FROM assignments WHERE id = ?1", [supplied]) do
+      [[^supplied]] ->
+        {:ok, supplied}
+
+      [] ->
+        if String.starts_with?(supplied, "asg_") do
+          case Txn.q(
+                 txn,
+                 "SELECT id FROM assignments WHERE substr(id, 1, length(?1)) = ?1 ORDER BY id",
+                 [supplied]
+               ) do
+            [[id]] -> {:ok, id}
+            [] -> :unknown
+            _many -> :ambiguous
+          end
+        else
+          :unknown
+        end
+    end
+  end
+
+  defp successor_predecessor_visible?(txn, principal, predecessor) do
+    work_owner =
+      case predecessor.workItemId do
+        nil ->
+          nil
+
+        work_item_id ->
+          case Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id = ?1", [work_item_id]) do
+            [[owner_user_id]] -> owner_user_id
+            [] -> nil
+          end
+      end
+
+    principal in Enum.reject(
+      [
+        {:session, predecessor.holderKey},
+        predecessor.openedBySession && {:session, predecessor.openedBySession},
+        predecessor.openedByUser && {:user, predecessor.openedByUser},
+        work_owner && {:user, work_owner},
+        work_owner && {:session, Org.personal_session_key(work_owner)}
+      ],
+      &is_nil/1
+    )
+  end
+
+  defp successor_chain_in_txn!(
+         txn,
+         assignment_id,
+         visited,
+         assignment_ids,
+         work_item_ids,
+         carried_ids
+       ) do
+    if MapSet.member?(visited, assignment_id),
+      do: invalid_successor_chain!()
+
+    case Txn.q(txn, "SELECT subject, workItemId FROM assignments WHERE id = ?1", [assignment_id]) do
+      [] ->
+        invalid_successor_chain!()
+
+      [[subject, work_item_id]] ->
+        next_visited = MapSet.put(visited, assignment_id)
+        next_assignments = [assignment_id | assignment_ids]
+        next_work_items = if work_item_id, do: [work_item_id | work_item_ids], else: work_item_ids
+
+        case successor_marker_count_in_txn(txn, assignment_id) do
+          0 ->
+            {Enum.reverse(next_assignments), Enum.uniq(next_work_items), Enum.uniq(carried_ids)}
+
+          1 ->
+            case parse_successor_suffix(subject) do
+              {:ok, predecessor_id, ids} ->
+                successor_chain_in_txn!(
+                  txn,
+                  predecessor_id,
+                  next_visited,
+                  next_assignments,
+                  next_work_items,
+                  ids ++ carried_ids
+                )
+
+              :error ->
+                invalid_successor_chain!()
+            end
+
+          _ ->
+            invalid_successor_chain!()
+        end
+    end
+  end
+
+  defp successor_marker_count_in_txn(txn, assignment_id) do
+    [[count]] =
+      Txn.q(
+        txn,
+        "SELECT COUNT(*) FROM condition_facts WHERE kind = 'assignment-successor-created' AND scope = ?1 AND origin = 'process:tightbeam'",
+        [assignment_id]
+      )
+
+    count
+  end
+
+  defp parse_successor_suffix(subject) do
+    pattern =
+      ~r/\n\nRuled-but-unconsumed decisions carried from (asg_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}): (none|dr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}(?:, dr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})*)\z/u
+
+    case Regex.run(pattern, subject) do
+      [_, predecessor_id, "none"] ->
+        {:ok, predecessor_id, []}
+
+      [_, predecessor_id, ids] ->
+        {:ok, predecessor_id, String.split(ids, ", ")}
+
+      _ ->
+        :error
+    end
+  end
+
+  defp invalid_successor_chain!,
+    do:
+      successor_error!(
+        "invalid_successor_chain",
+        "successor chain is missing, malformed, repeated, or cyclic"
+      )
+
+  defp successor_error!(code, message), do: throw({:successor_error, error(code, message)})
 
   defp resolve_work_item_id_in_txn(txn, assignment_id, visited) do
     if MapSet.member?(visited, assignment_id) do
@@ -1183,9 +1485,62 @@ defmodule Tightbeam.Assignments do
   end
 
   defp attest_in_txn(txn, call) do
-    if call.params[:kind] == "verdict",
-      do: verdict_in_txn(txn, call),
-      else: lifecycle_attest_in_txn(txn, call)
+    with :ok <- validate_revision_binding_in_txn(txn, call) do
+      if call.params[:kind] == "verdict",
+        do: verdict_in_txn(txn, call),
+        else: lifecycle_attest_in_txn(txn, call)
+    end
+  end
+
+  defp validate_revision_binding_in_txn(txn, call) do
+    artifact_id = call.params[:artifact_id]
+    hash = call.params[:content_sha256]
+
+    cond do
+      is_nil(artifact_id) and is_nil(hash) ->
+        :ok
+
+      is_nil(artifact_id) or is_nil(hash) ->
+        error("invalid_revision_binding", "artifact and sha256 must be supplied together")
+
+      call.params[:kind] != "verdict" ->
+        error(
+          "invalid_revision_binding",
+          "artifact revision binding is valid only for verdict attests"
+        )
+
+      not (is_binary(artifact_id) and artifact_id != "" and is_binary(hash) and hash != "") ->
+        error("invalid_revision_binding", "artifact and sha256 must be nonblank text")
+
+      true ->
+        case Txn.q(
+               txn,
+               """
+               SELECT 1
+               FROM assignments review
+               JOIN artifacts art ON art.artifactId=?2
+               JOIN assignments producer ON producer.id=art.producedByAssignmentId
+               JOIN work_items wi ON wi.id=art.workItemId
+               JOIN sessions rs ON rs.sessionKey=review.holderKey
+               JOIN sessions ps ON ps.sessionKey=producer.holderKey
+               WHERE review.id=?1
+                 AND review.reviewsAssignmentId=art.producedByAssignmentId
+                 AND art.contentSha256=?3
+                 AND rs.ownerUserId=wi.ownerUserId
+                 AND ps.ownerUserId=wi.ownerUserId
+               """,
+               [call.params[:assignment_id], artifact_id, hash]
+             ) do
+          [[1]] ->
+            :ok
+
+          [] ->
+            error(
+              "invalid_revision_binding",
+              "artifact revision must match the assignment reviewed by this review card"
+            )
+        end
+    end
   end
 
   defp lifecycle_attest_in_txn(txn, call) do
@@ -1206,7 +1561,8 @@ defmodule Tightbeam.Assignments do
           true ->
             with :ok <- valid_kind(call.params[:kind]),
                  :ok <- valid_note(call.params[:note]),
-                 :ok <- absent_verdict_kind(call.params[:verdict_kind]) do
+                 :ok <- absent_verdict_kind(call.params[:verdict_kind]),
+                 :ok <- applicable_code_completion_in_txn(txn, assignment, call) do
               if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
                    assignment_id
                  ]) != [[1]],
@@ -1253,7 +1609,8 @@ defmodule Tightbeam.Assignments do
                     assignment_id,
                     "tightbeam:assignments",
                     liveness_trigger
-                  )
+                  ),
+                  %{verb: "attest", principal: principal_id(call.principal)}
                 )
 
                 append_attest_marker(txn, attest)
@@ -1273,28 +1630,170 @@ defmodule Tightbeam.Assignments do
         error("unknown_assignment", "unknown assignment: #{assignment_id}")
 
       assignment ->
-        cond do
-          assignment.state != "open" ->
-            assignment_closed()
+        case late_ruling_receipt_request_id(call.params[:verdict_kind]) do
+          {:ok, request_id} ->
+            late_ruling_receipt_in_txn(txn, call, assignment, request_id)
 
-          not is_nil(assignment.reviewsAssignmentId) and
-              call.principal != {:session, assignment.holderKey} ->
-            error("not_holder", "assignment is held by session #{assignment.holderKey}")
+          :ordinary ->
+            cond do
+              assignment.state != "open" ->
+                assignment_closed()
 
-          true ->
-            with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
-                 :ok <- valid_note(call.params[:note]) do
-              if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
-                   assignment_id
-                 ]) != [[1]],
-                 do: raise(TransitionRace)
+              not is_nil(assignment.reviewsAssignmentId) and
+                  call.principal != {:session, assignment.holderKey} ->
+                error("not_holder", "assignment is held by session #{assignment.holderKey}")
 
-              attest = insert_attest(txn, call, assignment_id)
-              append_attest_marker(txn, attest)
-              %{assignment: assignment, attest: attest}
+              true ->
+                with :ok <- valid_verdict_kind(call.params[:verdict_kind]),
+                     :ok <- valid_note(call.params[:note]),
+                     {by_user, by_session} = opener(call.principal),
+                     :ok <-
+                       Wakes.validate_verification_verdict_in_txn(txn, %{
+                         assignment_id: assignment_id,
+                         verdict_kind: call.params[:verdict_kind],
+                         wait_id: call.params[:wait_id],
+                         by_user: by_user,
+                         by_session: by_session
+                       }) do
+                  if Txn.q(txn, "SELECT 1 FROM assignments WHERE id = ?1 AND state = 'open'", [
+                       assignment_id
+                     ]) != [[1]],
+                     do: raise(TransitionRace)
+
+                  attest = insert_attest(txn, call, assignment_id)
+
+                  :ok =
+                    Wakes.verification_verdict_in_txn(txn, %{
+                      assignment_id: assignment_id,
+                      verdict_kind: attest.verdictKind,
+                      wait_id: attest.waitId,
+                      by_user: attest.byUser,
+                      by_session: attest.bySession,
+                      attest_id: attest.id
+                    })
+
+                  append_attest_marker(txn, attest)
+                  %{assignment: assignment, attest: attest}
+                else
+                  {:error, error} -> error
+                  %{code: _} = error -> error
+                end
             end
         end
     end
+  end
+
+  defp late_ruling_receipt_request_id(verdict_kind) when is_binary(verdict_kind) do
+    case Regex.run(
+           ~r/^ruling-consumed:(dr_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/u,
+           verdict_kind
+         ) do
+      [_, request_id] -> {:ok, request_id}
+      _ -> :ordinary
+    end
+  end
+
+  defp late_ruling_receipt_request_id(_), do: :ordinary
+
+  defp late_ruling_receipt_in_txn(txn, call, assignment, request_id) do
+    with :ok <-
+           Escalation.late_ruling_receipt_context_in_txn(
+             txn,
+             request_id,
+             assignment.id,
+             call.principal
+           ),
+         {:ok, target} <- late_ruling_receipt_call_target(call.params) do
+      verdict_kind = "ruling-consumed:" <> request_id
+
+      case late_ruling_receipt_rows_in_txn(txn, assignment.id, verdict_kind) do
+        [] ->
+          resolved_call = put_in(call, [:params, :verdict_kind], verdict_kind)
+          attest = insert_attest(txn, resolved_call, assignment.id, true)
+
+          append_attest_marker(txn, attest)
+          %{assignment: assignment, attest: attest}
+
+        [attest] ->
+          if stored_late_ruling_receipt_target(attest) == target do
+            %{assignment: assignment, attest: attest}
+          else
+            ruling_consumption_conflict()
+          end
+
+        _ ->
+          ruling_consumption_conflict()
+      end
+    else
+      :not_found -> error("not_found", "decision request not found")
+      %{code: _} = error -> error
+    end
+  end
+
+  defp late_ruling_receipt_call_target(params) do
+    refs = params[:commit_refs]
+    note = params[:note]
+
+    case {refs, note} do
+      {[ref], nil} ->
+        {:ok, {:commit, normalize_commit_ref(ref)}}
+
+      {refs, note} when refs in [nil, []] and is_binary(note) ->
+        prefix = "operational-action: "
+
+        if String.starts_with?(note, prefix) and
+             note |> String.replace_prefix(prefix, "") |> String.trim() != "" and
+             note |> String.codepoints() |> length() <= 2000 do
+          {:ok, {:operational_action, note}}
+        else
+          invalid_ruling_consumption_target()
+        end
+
+      _ ->
+        invalid_ruling_consumption_target()
+    end
+  end
+
+  defp stored_late_ruling_receipt_target(%{commitRefs: [ref], note: nil}),
+    do: {:commit, normalize_commit_ref(ref)}
+
+  defp stored_late_ruling_receipt_target(%{commitRefs: refs, note: note})
+       when refs in [nil, []],
+       do: {:operational_action, note}
+
+  defp stored_late_ruling_receipt_target(_), do: :invalid
+
+  defp normalize_commit_ref(ref),
+    do: Map.new(ref, fn {key, value} -> {to_string(key), value} end)
+
+  defp invalid_ruling_consumption_target,
+    do:
+      error(
+        "invalid_ruling_consumption_target",
+        "ruling consumption requires one verified commit ref or an operational-action note"
+      )
+
+  defp ruling_consumption_conflict,
+    do:
+      error(
+        "ruling_consumption_conflict",
+        "ruling consumption already has a different durable target"
+      )
+
+  defp late_ruling_receipt_rows_in_txn(txn, assignment_id, verdict_kind) do
+    txn
+    |> Txn.q(
+      """
+      SELECT id, assignmentId, kind, verdictKind, note, bySession, byUser, producer,
+             producerCommand, byHarness, byProvider, commitRefs,
+             artifactId, contentSha256, waitId, ts
+      FROM attests
+      WHERE assignmentId = ?1 AND kind = 'verdict' AND verdictKind = ?2
+      ORDER BY ts ASC, id ASC
+      """,
+      [assignment_id, verdict_kind]
+    )
+    |> Enum.map(&attest/1)
   end
 
   defp revoke_in_txn(txn, call) do
@@ -1347,7 +1846,8 @@ defmodule Tightbeam.Assignments do
                 assignment_id,
                 "tightbeam:assignments",
                 liveness_trigger
-              )
+              ),
+              %{verb: "revoke-assignment", principal: principal_id(call.principal)}
             )
 
             append_assignment_marker(txn, revoked_assignment, :revoked)
@@ -1405,7 +1905,7 @@ defmodule Tightbeam.Assignments do
   defp revoke_allowed?(_txn, {:session, session}, assignment),
     do: assignment.openedBySession == session
 
-  defp insert_attest(txn, call, assignment_id) do
+  defp insert_attest(txn, call, assignment_id, allow_closed \\ false) do
     {by_user, by_session} = opener(call.principal)
     {by_harness, by_provider} = verdict_author_family(txn, call.params.kind, by_session)
 
@@ -1420,7 +1920,11 @@ defmodule Tightbeam.Assignments do
       producer_command: nil,
       by_harness: by_harness,
       by_provider: by_provider,
-      commit_refs: call.params[:commit_refs]
+      commit_refs: call.params[:commit_refs],
+      allow_closed: allow_closed,
+      artifact_id: call.params[:artifact_id],
+      content_sha256: call.params[:content_sha256],
+      wait_id: call.params[:wait_id]
     })
   end
 
@@ -1433,9 +1937,12 @@ defmodule Tightbeam.Assignments do
       """
       INSERT INTO attests
         (id, assignmentId, kind, verdictKind, note, bySession, byUser, producer,
-         producerCommand, byHarness, byProvider, commitRefs, ts)
-      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
-      WHERE EXISTS (SELECT 1 FROM assignments WHERE id = ?2 AND state = 'open')
+         producerCommand, byHarness, byProvider, commitRefs, artifactId, contentSha256, waitId, ts)
+      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+      WHERE EXISTS (
+        SELECT 1 FROM assignments
+        WHERE id = ?2 AND (state = 'open' OR ?17 = 1)
+      )
       """,
       [
         id,
@@ -1450,7 +1957,11 @@ defmodule Tightbeam.Assignments do
         attrs.by_harness,
         attrs.by_provider,
         attrs[:commit_refs] && JSON.encode!(attrs.commit_refs),
-        ts
+        attrs[:artifact_id],
+        attrs[:content_sha256],
+        attrs[:wait_id],
+        ts,
+        if(Map.get(attrs, :allow_closed, false), do: 1, else: 0)
       ]
     )
 
@@ -1469,6 +1980,9 @@ defmodule Tightbeam.Assignments do
       attrs.by_harness,
       attrs.by_provider,
       attrs[:commit_refs] && JSON.encode!(attrs.commit_refs),
+      attrs[:artifact_id],
+      attrs[:content_sha256],
+      attrs[:wait_id],
       ts
     ])
   end
@@ -1628,17 +2142,66 @@ defmodule Tightbeam.Assignments do
         "commitRefs are only valid on producing completion or review-link verdict attests"
       )
 
+  defp prepare_attest_commit_refs(db, call) do
+    refs = call.params[:commit_refs]
+
+    case valid_commit_refs(db, call.params[:kind], refs) do
+      %{code: "unverifiable_commit_ref"} = error ->
+        if late_ruling_receipt?(call.params),
+          do: invalid_ruling_consumption_target(),
+          else: error
+
+      :ok ->
+        case canonical_commit_refs(refs) do
+          {:ok, canonical} ->
+            {:ok, put_in(call, [:params, :commit_refs], canonical)}
+
+          :error ->
+            error("invalid_commit_refs", "commitRefs must be unique full immutable commit refs")
+        end
+
+      error ->
+        error
+    end
+  end
+
   defp commit_ref_filing_allowed(db, call) do
-    case {call.params[:kind], call.params[:commit_refs]} do
-      {_kind, nil} ->
+    if late_ruling_receipt?(call.params) do
+      :ok
+    else
+      commit_ref_filing_allowed_regular(db, call)
+    end
+  end
+
+  defp commit_ref_filing_allowed_regular(db, call) do
+    case {call.params[:kind], call.params[:commit_refs], call.params[:verdict_kind]} do
+      {"verdict", nil, "verified"} ->
+        case DB.query(
+               db,
+               "SELECT holderKey,reviewsAssignmentId FROM assignments WHERE id=?1",
+               [call.params[:assignment_id]]
+             ) do
+          {:ok, [[holder, nil]]} when call.principal == {:session, holder} ->
+            error("invalid_commit_refs", "producer verification requires immutable commitRefs")
+
+          _ ->
+            :ok
+        end
+
+      {_kind, nil, _verdict_kind} ->
         :ok
 
-      {kind, _refs} when kind in ["completion", "verdict"] ->
+      {kind, _refs, _verdict_kind} when kind in ["completion", "verdict"] ->
         commit_ref_filing_allowed_for_assignment(db, call, kind)
 
-      {_kind, _refs} ->
+      {_kind, _refs, _verdict_kind} ->
         :ok
     end
+  end
+
+  defp late_ruling_receipt?(params) do
+    params[:kind] == "verdict" and
+      match?({:ok, _request_id}, late_ruling_receipt_request_id(params[:verdict_kind]))
   end
 
   defp commit_ref_filing_allowed_for_assignment(db, call, kind) do
@@ -1667,11 +2230,26 @@ defmodule Tightbeam.Assignments do
           "commitRefs are not allowed on non-producing completion attests"
         )
 
-      {:ok, [[_holder, _state, nil]]} when kind == "verdict" ->
-        error(
-          "invalid_commit_refs",
-          "commitRefs on verdict attests require a review-linked assignment"
-        )
+      {:ok, [[holder, state, nil]]} when kind == "verdict" ->
+        cond do
+          call.params[:verdict_kind] not in ["verified", "verification-failed"] ->
+            error(
+              "invalid_commit_refs",
+              "commitRefs on producing verdicts require verified or verification-failed"
+            )
+
+          call.principal != {:session, holder} ->
+            error("not_holder", "assignment is held by session #{holder}")
+
+          state != "open" ->
+            assignment_closed()
+
+          call.params[:verdict_kind] == "verified" and call.params[:commit_refs] == [] ->
+            error("invalid_commit_refs", "producer verification requires immutable commitRefs")
+
+          true ->
+            :ok
+        end
 
       {:ok, [[_holder, _state, _reviews_assignment_id]]} ->
         :ok
@@ -1684,6 +2262,7 @@ defmodule Tightbeam.Assignments do
     with ["commit", "repo"] <- normalized |> Map.keys() |> Enum.sort(),
          repo when is_binary(repo) <- normalized["repo"],
          commit when is_binary(commit) <- normalized["commit"],
+         true <- Regex.match?(~r/\A(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\z/u, commit),
          [host, path] <- String.split(repo, ":", parts: 2),
          true <- host != "" and Path.type(path) == :absolute,
          {_output, 0} <- run_git_cat_file(db, host, path, commit) do
@@ -1695,6 +2274,127 @@ defmodule Tightbeam.Assignments do
 
   defp validate_commit_ref(_db, _ref),
     do: error("unverifiable_commit_ref", "commitRefs contains an unverifiable commit")
+
+  defp canonical_commit_refs(nil), do: {:ok, nil}
+
+  defp canonical_commit_refs(refs) when is_list(refs) do
+    with {:ok, canonical} <-
+           Enum.reduce_while(refs, {:ok, []}, fn
+             ref, {:ok, acc} when is_map(ref) ->
+               ref = normalize_commit_ref(ref)
+
+               case {Map.keys(ref) |> Enum.sort(), ref["repo"], ref["commit"]} do
+                 {["commit", "repo"], repo, commit}
+                 when is_binary(repo) and is_binary(commit) and
+                        byte_size(commit) in [40, 64] ->
+                   if Regex.match?(~r/\A[0-9a-fA-F]+\z/u, commit) do
+                     {:cont,
+                      {:ok, [%{"repo" => repo, "commit" => String.downcase(commit)} | acc]}}
+                   else
+                     {:halt, :error}
+                   end
+
+                 _ ->
+                   {:halt, :error}
+               end
+
+             _, _ ->
+               {:halt, :error}
+           end) do
+      canonical = Enum.sort_by(canonical, &{&1["repo"], &1["commit"]})
+      if length(canonical) == length(Enum.uniq(canonical)), do: {:ok, canonical}, else: :error
+    end
+  end
+
+  defp canonical_commit_refs(_), do: :error
+
+  defp applicable_code_completion_in_txn(_txn, _assignment, %{params: %{kind: kind}})
+       when kind != "completion",
+       do: :ok
+
+  defp applicable_code_completion_in_txn(txn, %{effectKind: "code"} = assignment, call) do
+    refs = call.params[:commit_refs]
+    review = latest_review_conclusion_in_txn(txn, assignment.id)
+    verification = latest_verification_conclusion_in_txn(txn, assignment.id, assignment.holderKey)
+
+    with [_ | _] <- refs,
+         %{kind: "reviewed-clean", holder: review_holder, refs: ^refs} <- review,
+         true <- review_holder != assignment.holderKey,
+         %{kind: "verified", holder: assignment_holder, refs: ^refs} <- verification,
+         true <- assignment_holder == assignment.holderKey do
+      :ok
+    else
+      _ ->
+        error(
+          "inapplicable_code_evidence",
+          "code completion requires the latest independent clean review and holder verification to match its immutable commitRefs"
+        )
+    end
+  end
+
+  defp applicable_code_completion_in_txn(_txn, _assignment, _call), do: :ok
+
+  defp latest_review_conclusion_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           """
+           SELECT v.verdictKind,r.holderKey,v.commitRefs
+           FROM attests v
+           JOIN assignments r ON r.id=v.assignmentId
+           WHERE r.reviewsAssignmentId=?1
+             AND v.kind='verdict'
+             AND v.bySession=r.holderKey
+             AND v.verdictKind IN ('reviewed-clean','changes-requested')
+           ORDER BY v.ts DESC,v.rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id]
+         ) do
+      [[kind, holder, refs]] ->
+        %{kind: kind, holder: holder, refs: canonical_stored_commit_refs(refs)}
+
+      [] ->
+        nil
+    end
+  end
+
+  defp latest_verification_conclusion_in_txn(txn, assignment_id, holder) do
+    case Txn.q(
+           txn,
+           """
+           SELECT verdictKind,bySession,commitRefs
+           FROM attests
+           WHERE assignmentId=?1
+             AND kind='verdict'
+             AND bySession=?2
+             AND verdictKind IN ('verified','verification-failed')
+           ORDER BY ts DESC,rowid DESC
+           LIMIT 1
+           """,
+           [assignment_id, holder]
+         ) do
+      [[kind, author, refs]] ->
+        %{kind: kind, holder: author, refs: canonical_stored_commit_refs(refs)}
+
+      [] ->
+        nil
+    end
+  end
+
+  defp canonical_stored_commit_refs(nil), do: nil
+
+  defp canonical_stored_commit_refs(encoded) when is_binary(encoded) do
+    case JSON.decode(encoded) do
+      {:ok, decoded} ->
+        case canonical_commit_refs(decoded) do
+          {:ok, refs} -> refs
+          :error -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
 
   defp run_git_cat_file(db, host, path, commit) do
     base_dir =
@@ -1826,6 +2526,9 @@ defmodule Tightbeam.Assignments do
   defp principal_id({:session, session}), do: "session:" <> session
   defp principal_id({:remedy, %{owner: owner}}), do: "user:" <> owner
 
+  defp row_commit_principal_id({:remedy, %{statute: statute}}), do: "remedy:" <> statute
+  defp row_commit_principal_id(principal), do: principal_id(principal)
+
   defp supervision_transition!(txn, expected, observation) do
     case Supervision.transition_in_txn(txn, observation) do
       ^expected -> expected
@@ -1899,6 +2602,106 @@ defmodule Tightbeam.Assignments do
       _ -> :error
     catch
       _, _ -> :error
+    end
+  end
+
+  defp opened_assignment_commits(txn, result, call, verb) do
+    assignment =
+      case result do
+        {:created, assignment, _delivery} -> assignment
+        {:accepted_in_txn, _event_id, {:created, assignment, _delivery}} -> assignment
+        _ -> nil
+      end
+
+    if assignment do
+      [assignment_transition(txn, assignment, call, verb, %{state: %{old: nil, new: "open"}})]
+    else
+      []
+    end
+  end
+
+  defp attest_commits(txn, %{assignment: assignment, attest: attest}, call) do
+    owner = assignment_owner_in_txn(txn, assignment.id)
+
+    attest_transition = %{
+      verb: "attest",
+      domain: "attest",
+      row_id: attest.id,
+      owner_user_id: owner,
+      principal: row_commit_principal_id(call.principal),
+      bindings: %{
+        assignmentId: assignment.id,
+        workItemId: assignment.workItemId,
+        artifact: revision_binding(call)
+      },
+      fields: %{
+        kind: %{old: nil, new: attest.kind},
+        verdictKind: %{old: nil, new: attest.verdictKind}
+      }
+    }
+
+    if assignment.state == "closed" do
+      [
+        attest_transition,
+        assignment_transition(txn, assignment, call, "attest", %{
+          state: %{old: "open", new: "closed"},
+          outcome: %{old: nil, new: assignment.outcome}
+        })
+      ]
+    else
+      [attest_transition]
+    end
+  end
+
+  defp attest_commits(_txn, _result, _call), do: []
+
+  defp revocation_commits(txn, %{id: _id} = assignment, call) do
+    [
+      assignment_transition(txn, assignment, call, "revoke-assignment", %{
+        state: %{old: "open", new: "closed"},
+        outcome: %{old: nil, new: "revoked"}
+      })
+    ]
+  end
+
+  defp revocation_commits(_txn, _result, _call), do: []
+
+  defp assignment_transition(txn, assignment, call, verb, fields) do
+    %{
+      verb: verb,
+      domain: "assignment",
+      row_id: assignment.id,
+      owner_user_id: assignment_owner_in_txn(txn, assignment.id),
+      principal: row_commit_principal_id(call.principal),
+      bindings: %{assignmentId: assignment.id, workItemId: assignment.workItemId},
+      fields: fields
+    }
+  end
+
+  defp assignment_owner_in_txn(txn, assignment_id) do
+    case Txn.q(
+           txn,
+           "SELECT s.ownerUserId FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey WHERE a.id=?1",
+           [assignment_id]
+         ) do
+      [[owner]] -> owner
+    end
+  end
+
+  defp revision_binding(call) do
+    case {call.params[:artifact_id], call.params[:content_sha256]} do
+      {id, hash} when is_binary(id) and is_binary(hash) -> %{artifactId: id, contentSha256: hash}
+      _ -> nil
+    end
+  end
+
+  defp transaction_with_row_commits(db, fun, transitions) do
+    case DB.transaction_then(db, fun, fn txn, result ->
+           Tightbeam.Wakes.row_commit_in_txn(txn, transitions.(txn, result))
+           result
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
     end
   end
 
@@ -1998,6 +2801,9 @@ defmodule Tightbeam.Assignments do
          by_harness,
          by_provider,
          commit_refs,
+         artifact_id,
+         content_sha256,
+         wait_id,
          ts
        ]) do
     %{
@@ -2013,6 +2819,9 @@ defmodule Tightbeam.Assignments do
       byHarness: by_harness,
       byProvider: by_provider,
       commitRefs: commit_refs && JSON.decode!(commit_refs),
+      artifactId: artifact_id,
+      contentSha256: content_sha256,
+      waitId: wait_id,
       ts: ts
     }
   end

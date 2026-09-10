@@ -67,6 +67,40 @@ defmodule FeatureSmoke do
   @lane_slack_ms 60_000
 
   def run do
+    Tightbeam.DeployReadiness.route!(
+      System.get_env("TIGHTBEAM_SMOKE_MODE"),
+      &run_readiness/0,
+      &run_full/0
+    )
+  end
+
+  defp run_readiness do
+    base_dir = System.fetch_env!("TIGHTBEAM_BASE_DIR")
+
+    unless System.get_env("TIGHTBEAM_SMOKE_OWNED_BASE") == Path.expand(base_dir) do
+      raise "readiness requires explicit TIGHTBEAM_SMOKE_OWNED_BASE for its authorized disposable base"
+    end
+
+    gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+    announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
+
+    for leg <- Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all()) do
+      preflight!(leg, base_dir)
+      state = %{port: gw["port"], token: gw["cliToken"], base_dir: base_dir, leg: leg, pass: 0}
+
+      proof =
+        Tightbeam.DeployReadiness.run!(
+          fn verb, params -> post(state, verb, params) end,
+          fn session, wake ->
+            Tightbeam.DeployReadiness.observe!(Path.join(base_dir, "state.db"), session, wake)
+          end
+        )
+
+      IO.puts("PASS fresh-agent readiness #{leg.wire_name}: #{JSON.encode!(proof)}")
+    end
+  end
+
+  defp run_full do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
     install_smoke_rule!(base_dir)
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
@@ -172,11 +206,12 @@ defmodule FeatureSmoke do
         "local deployment elected no skills for reviewer-code at #{cwd}"
       )
 
-      ok!(state, "wake", %{
-        "sessionKey" => session_key,
-        "prompt" => "Reply with exactly: LOCAL DEPLOYMENT READY",
-        "idempotencyKey" => "local-deploy-wake-#{unique()}"
-      })
+      wake =
+        ok!(state, "wake", %{
+          "sessionKey" => session_key,
+          "prompt" => "Reply with exactly: LOCAL DEPLOYMENT READY",
+          "idempotencyKey" => "local-deploy-wake-#{unique()}"
+        })
 
       await_materialized_skills!(state, cwd, snapshot.skills)
 
@@ -207,7 +242,18 @@ defmodule FeatureSmoke do
         %{"title" => "smoke agent-created wi #{unique()}", "idempotencyKey" => "awi-#{unique()}"}
       )
 
-      await_turn_boundary!(state, session_key)
+      Tightbeam.DeployReadiness.await_reply!(
+        fn session, wake_id ->
+          Tightbeam.DeployReadiness.observe!(
+            Path.join(state.base_dir, "state.db"),
+            session,
+            wake_id
+          )
+        end,
+        session_key,
+        wake["wakeId"],
+        "LOCAL DEPLOYMENT READY"
+      )
 
       sentinel_bytes = "durable-local-deployment-#{unique()}\n"
       File.write!(sentinel, sentinel_bytes)
@@ -2373,8 +2419,7 @@ defmodule FeatureSmoke do
   end
 
   defp retire(state, spawn) do
-    key = get_in(spawn, ["stream", "sessionKey"]) || spawn["sessionKey"]
-    if is_binary(key), do: post(state, "retire", %{"sessionKey" => key})
+    Tightbeam.DeployReadiness.retire!(fn verb, params -> post(state, verb, params) end, spawn)
   end
 
   defp leaf_entries(root), do: leaf_entries(root, root, [])
@@ -2442,33 +2487,6 @@ defmodule FeatureSmoke do
       true ->
         Process.sleep(100)
         await_materialized_skills!(state, cwd, skills, deadline)
-    end
-  end
-
-  defp await_turn_boundary!(state, session_key) do
-    deadline = System.monotonic_time(:millisecond) + 30_000
-    await_turn_boundary!(state, session_key, deadline)
-  end
-
-  defp await_turn_boundary!(state, session_key, deadline) do
-    db = Path.join(state.base_dir, "state.db")
-
-    {out, 0} =
-      System.cmd("sqlite3", [
-        db,
-        "SELECT count(*) FROM turns WHERE sessionKey = #{sql_quote(session_key)} AND status IN ('queued','running')"
-      ])
-
-    cond do
-      String.trim(out) == "0" ->
-        state
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        assert(state, false, "local deployment turn did not settle for CWD: #{session_key}")
-
-      true ->
-        Process.sleep(100)
-        await_turn_boundary!(state, session_key, deadline)
     end
   end
 

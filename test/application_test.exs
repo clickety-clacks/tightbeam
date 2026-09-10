@@ -1,10 +1,32 @@
 defmodule Tightbeam.ApplicationTest do
   use Tightbeam.TestCase, async: false
-  alias Tightbeam.{DB, Escalation, EventLog, Ledger}
 
-  setup do
+  alias Tightbeam.{
+    DB,
+    Escalation,
+    EventLog,
+    Identity,
+    Ledger,
+    Model,
+    Org,
+    RuleRuntime,
+    Rules,
+    Wakes
+  }
+
+  setup context do
     base = Path.join(System.tmp_dir!(), "tb_app_#{System.unique_integer([:positive])}")
     Application.put_env(:tightbeam, :base_dir, base)
+    :initialized = Identity.init!(base)
+
+    seeded =
+      if context[:retired_decision_notice] do
+        seed_retired_decision!(base)
+      else
+        %{}
+      end
+
+    :persistent_term.erase(RuleRuntime)
 
     sup =
       start_supervised!(%{
@@ -13,7 +35,7 @@ defmodule Tightbeam.ApplicationTest do
           {Supervisor, :start_link, [Tightbeam.Application.children(), [strategy: :rest_for_one]]}
       })
 
-    %{sup: sup}
+    Map.put(seeded, :sup, sup)
   end
 
   test "boot on a fresh database creates every schema before recovery" do
@@ -47,6 +69,29 @@ defmodule Tightbeam.ApplicationTest do
 
     assert File.read!(Path.join(Application.fetch_env!(:tightbeam, :base_dir), "harnesses.json")) ==
              expected
+  end
+
+  @tag retired_decision_notice: true
+  test "production child sequence installs row recognition before Boot recovery", ctx do
+    assert {:ok, [["withdrawn"]]} =
+             DB.query(DB, "SELECT status FROM decision_requests WHERE id=?1", [
+               ctx.decision_request_id
+             ])
+
+    assert [wake] =
+             DB
+             |> Wakes.list_pending()
+             |> Enum.filter(&(&1.prompt == "boot recovered retired decision"))
+
+    assert wake.session_key == "agent:boot-target:app"
+  end
+
+  test "row commits refuse when recognition has not been installed" do
+    :persistent_term.erase(RuleRuntime)
+
+    assert_raise RuntimeError, "row rule recognition is not loaded", fn ->
+      RuleRuntime.row_commit_effects_in_txn(%DB.Txn{conn: nil}, [])
+    end
   end
 
   test "harness projection publication never exposes truncated bytes" do
@@ -168,4 +213,84 @@ defmodule Tightbeam.ApplicationTest do
 
   defp restore_path(nil), do: System.delete_env("PATH")
   defp restore_path(path), do: System.put_env("PATH", path)
+
+  defp seed_retired_decision!(base) do
+    # Fixture writes happen before the production boot under test, so give the
+    # writer a valid empty evaluator and erase it before Application.children/0.
+    Rules.load!(base, ["attest"])
+
+    db = :"application_seed_db_#{System.unique_integer([:positive])}"
+    path = Path.join(base, "state.db")
+    {:ok, pid} = DB.start_link(path: path, name: db)
+    :ok = Tightbeam.Schema.ensure_all(db)
+
+    raiser =
+      Org.create(db, %{
+        session_key: "agent:boot-raiser:app",
+        display_name: "boot raiser",
+        owner_user_id: "boot-owner",
+        origin: "user:boot-owner",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    _target =
+      Org.create(db, %{
+        session_key: "agent:boot-target:app",
+        display_name: "boot target",
+        owner_user_id: "boot-owner",
+        origin: "user:boot-owner",
+        archetype: "default",
+        host: "testhost",
+        harness: "claude",
+        provider: "anthropic",
+        model: Model.new("fable")
+      })
+
+    call = %{
+      verb: "attest",
+      origin: "agent:boot-raiser",
+      principal: {:session, raiser.session_key},
+      session_key: nil,
+      params: %{assignment_id: "asg-boot", kind: "completion"}
+    }
+
+    {:decision_pending, request_id} =
+      Escalation.escalate(
+        db,
+        call,
+        %{name: "boot-review", text: "boot review required"},
+        %{question: "Allow boot action?", options: nil}
+      )
+
+    :ok =
+      DB.execute(
+        db,
+        "UPDATE sessions SET state='retired' WHERE sessionKey='agent:boot-raiser:app'"
+      )
+
+    GenServer.stop(pid)
+
+    rules_dir = Path.join(base, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    File.write!(Path.join(rules_dir, "boot-decision-recovery.toml"), """
+    [[rule]]
+    name = "observe-boot-decision-recovery"
+    verb = "retire"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "record recovered decision withdrawal"
+    deny_when = [{ fact = "decision_request.status", op = "eq", value = "withdrawn" }]
+
+    [rule.notice]
+    target_session = "agent:boot-target:app"
+    prompt = "boot recovered retired decision"
+    """)
+
+    %{decision_request_id: request_id}
+  end
 end

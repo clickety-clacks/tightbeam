@@ -31,8 +31,7 @@ unlike client scope creep, it bypassed every change-control conversation on its 
    the ask, not usefulness. (YAGNI bounds unrequested CAPABILITY; it never excuses
    sloppy structure inside the scoped change itself.)
 6. When an addition looks genuinely needed but no facet covers it, the ask has a hole.
-   The finding stands. Under heavy posture the question goes to the spec-writer
-   (`tightbeam wake --role spec-writer --prompt "<the addition and the missing requirement>"`);
-   under light posture it goes to the orchestrator. The addition enters through an
+   Route the question through the responsible owner. Change an authoritative spec before
+   implementation when the agreed requirement changes. The addition enters through an
    amended ask or not at all.
 7. Report each addition with its location and the absent facet.

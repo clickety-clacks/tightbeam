@@ -1,3 +1,5 @@
+Code.require_file("support/soak_gateway.exs", __DIR__)
+
 defmodule Tightbeam.Soak do
   @moduledoc false
 
@@ -249,7 +251,6 @@ defmodule Tightbeam.Soak do
   end
 
   defp start_gateway(state) do
-    mix = System.find_executable("mix") || raise "mix executable not found in PATH"
     base_dir = state.options.base_dir
 
     env = [
@@ -266,14 +267,7 @@ defmodule Tightbeam.Soak do
     ]
 
     port =
-      Port.open({:spawn_executable, String.to_charlist(mix)}, [
-        :binary,
-        :exit_status,
-        :stderr_to_stdout,
-        args: [~c"run", ~c"--no-halt"],
-        cd: String.to_charlist(File.cwd!()),
-        env: env
-      ])
+      Tightbeam.Soak.GatewayProcess.open(base_dir, state.options.port, env)
 
     Process.put(:tightbeam_soak_gateway, port)
     state = %{state | gateway: port, token: nil}

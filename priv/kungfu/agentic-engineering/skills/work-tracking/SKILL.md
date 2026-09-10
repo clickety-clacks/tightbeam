@@ -28,5 +28,6 @@ work-items, assignments, attests; this is the policy for using them well.)
   something the next reader needs; completion only with the evidence in the note;
   surrender with the exact blocker in the note; a verdict when the obligation was a
   judgment.
-- Write every note for a reader with no context: state what an identifier means, cite
-  the file and line, log line, or commit that supports each claim.
+- Record material outcomes, decisions and changed dependencies with enough evidence
+  for the next responsible agent to act. Preserve returned record IDs. Do not repeat
+  unchanged progress prose merely to demonstrate activity.

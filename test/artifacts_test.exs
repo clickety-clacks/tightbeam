@@ -2,7 +2,7 @@ defmodule Tightbeam.ArtifactsTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
-  alias Tightbeam.{Artifacts, DB, Gateway, Ledger, Org, Projection, WorkItems}
+  alias Tightbeam.{Artifacts, Assignments, DB, Gateway, Ledger, Org, Projection, WorkItems}
 
   setup do
     db = :"artifacts_db_#{System.unique_integer([:positive])}"
@@ -11,6 +11,7 @@ defmodule Tightbeam.ArtifactsTest do
     :ok = Projection.ensure_schema(db)
     :ok = WorkItems.ensure_schema(db)
     :ok = Ledger.ensure_schema(db)
+    :ok = Assignments.ensure_schema(db)
     :ok = Artifacts.ensure_schema(db)
 
     parent = session(db, "parent", nil)
@@ -147,7 +148,7 @@ defmodule Tightbeam.ArtifactsTest do
     assert {:ok, columns} = DB.query(ctx.db, "PRAGMA table_info(artifacts)")
 
     assert Enum.map(columns, &Enum.at(&1, 1)) == ~w(
-             artifactId kind title description createdBySession workItemId parentSession
+             artifactId kind title description createdBySession workItemId producedByAssignmentId parentSession
              originPath contentSha256 recordedMessageId recordedTurnEvidence state home
              createdAt updatedAt
            )
@@ -189,6 +190,7 @@ defmodule Tightbeam.ArtifactsTest do
              MapSet.new([
                {"createdBySession", "sessions"},
                {"workItemId", "work_items"},
+               {"producedByAssignmentId", "assignments"},
                {"parentSession", "sessions"},
                {"recordedMessageId", "messages"}
              ])

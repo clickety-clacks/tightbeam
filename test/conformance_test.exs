@@ -705,7 +705,7 @@ defmodule Tightbeam.ConformanceSupport do
       ids = materialize_world(db, Map.get(kase, "world", %{}))
       assert_fixture_world(fixture, kase, db, ids)
       seed_script_checkout!(base, fixture, kase, db)
-      call = build_call(kase["call"], ids)
+      call = build_call(kase["call"], ids) |> fixture_refs_for(fixture)
 
       assert_rule_result(
         kase["case"],
@@ -745,7 +745,9 @@ defmodule Tightbeam.ConformanceSupport do
 
       if phase2 = kase["phase2"] do
         ids = materialize_world(db, Map.get(phase2, "world", %{}), ids)
-        phase2_call = build_call(phase2["call"] || kase["call"], ids)
+
+        phase2_call =
+          build_call(phase2["call"] || kase["call"], ids) |> fixture_refs_for(fixture)
 
         assert_rule_result(
           "#{kase["case"]} phase2",
@@ -1949,17 +1951,15 @@ defmodule Tightbeam.ConformanceSupport do
                Escalation.rule(db, escalation_rule_call(request_id, "allow"), authorized: true)
 
       park_wake = Wakes.get(db, park_wake_id)
-      assert {:accepted_in_txn, _event_id, %{canceled: true}} = cancel_wake(db, park_wake)
+      assert %{state: "fired", fired_by: "condition"} = park_wake
 
-      ids =
-        materialize_world(
-          db,
-          %{"turn" => %{"session" => session_key, "seq" => 2, "window_start" => 1}},
-          ids
-        )
+      assert {:ok, %{seq: continuation_seq}} =
+               Ledger.claim_next(db, session_key, "conformance-ruling-wake")
+
+      assert :ok = Ledger.finish(db, continuation_seq, "delivered")
 
       assert {:prodded, 1} =
-               Supervision.evaluate(db, handlers, 3, session_key, ids.turns[session_key])
+               Supervision.evaluate(db, handlers, 3, session_key, continuation_seq)
 
       assert {:ok, [["ruled"]]} =
                DB.query(db, "SELECT status FROM decision_requests WHERE id=?1", [request_id])
@@ -2662,9 +2662,11 @@ defmodule Tightbeam.ConformanceSupport do
 
               cond do
                 fixture["name"] == "busy-or-queued-no-sweep" ->
-                  assert result == :busy
-                  assert %{supervisionState: "armed"} = Supervision.prod_state(db, assignment_id)
-                  refute lifecycle_kind?(db, "rail_sweep")
+                  # C-R1: this fixture's unscoped queued turn does not cover
+                  # the open obligation. Normal sweep evaluation re-obligates it.
+                  assert result == {:prodded, 1}
+                  assert %{prodCount: 1} = Supervision.prod_state(db, assignment_id)
+                  assert sweep_decision?(db, session_key, rule, "re-obligate")
 
                 self_wake?(db, call) ->
                   assert result == :continuation
@@ -2784,7 +2786,8 @@ defmodule Tightbeam.ConformanceSupport do
               idempotency_key: nil,
               reviews_assignment_id: assignment_ids[assignment["reviews"]],
               work_item_id: work_items[assignment["work_item"]],
-              files: assignment["files"]
+              files: assignment["files"],
+              effect_kind: assignment["effect_kind"] || "policy"
             }
           })
 
@@ -2797,17 +2800,31 @@ defmodule Tightbeam.ConformanceSupport do
     Enum.each(Map.get(world, "attests", []), fn attest ->
       by = principal(attest["by"])
 
+      assignment_id = assignments[attest["assignment"]]
+
+      {:ok, [[reviews_assignment_id]]} =
+        DB.query(db, "SELECT reviewsAssignmentId FROM assignments WHERE id=?1", [assignment_id])
+
+      params = %{
+        assignment_id: assignment_id,
+        kind: attest["kind"],
+        verdict_kind: attest["verdict_kind"]
+      }
+
+      params =
+        if attest["kind"] == "verdict" and
+             (reviews_assignment_id ||
+                attest["verdict_kind"] in ["verified", "verification-failed"]),
+           do: Map.put(params, :commit_refs, fixture_refs()),
+           else: params
+
       result =
         Assignments.__handle__(db, "attest", %{
           verb: "attest",
           origin: origin(by),
           principal: by,
           session_key: nil,
-          params: %{
-            assignment_id: assignments[attest["assignment"]],
-            kind: attest["kind"],
-            verdict_kind: attest["verdict_kind"]
-          }
+          params: params
         })
 
       refute Map.has_key?(result, :code), "failed to materialize attest: #{inspect(result)}"
@@ -3106,7 +3123,7 @@ defmodule Tightbeam.ConformanceSupport do
         target_role: nil,
         role_fallback: false,
         supervision_interval_ms: 1_000,
-        params: %{subject: subject, idempotency_key: nil}
+        params: %{subject: subject, idempotency_key: nil, effect_kind: "policy"}
       })
 
     assert is_binary(result.id)
@@ -3126,47 +3143,28 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp await_catalog!(_harness, 0), do: flunk("model catalog did not become fresh")
 
-  defp cancel_wake(db, wake) do
-    {:ok, result} =
-      DB.transaction(db, fn txn ->
-        [[assignment_id]] =
-          DB.Txn.q(txn, "SELECT assignmentId FROM wakes WHERE wakeId=?1", [wake.wake_id])
-
-        {:ok, liveness_trigger} =
-          Supervision.liveness_trigger_in_txn(txn, {:assignment, assignment_id})
-
-        Wakes.cancel_in_txn(txn, %{
-          wake_id: wake.wake_id,
-          expected_origin: wake.origin,
-          requester: %{kind: "process", id: "conformance"},
-          reason_kind: "requester_withdrew",
-          causal_source: %{
-            kind: "verb_call",
-            accepted_event: %{
-              origin: wake.origin,
-              session_key: nil,
-              principal: {:process, "conformance"}
-            }
-          },
-          outcome: %{kind: "no_replacement", liveness_trigger: liveness_trigger}
-        })
-      end)
-
-    result
-  end
-
   defp attest_verdict!(db, assignment_id, by_session, verdict_kind) do
+    {:ok, [[reviews_assignment_id]]} =
+      DB.query(db, "SELECT reviewsAssignmentId FROM assignments WHERE id=?1", [assignment_id])
+
+    params = %{
+      assignment_id: assignment_id,
+      kind: "verdict",
+      verdict_kind: verdict_kind
+    }
+
+    params =
+      if reviews_assignment_id,
+        do: Map.put(params, :commit_refs, fixture_refs()),
+        else: params
+
     result =
       Assignments.__handle__(db, "attest", %{
         verb: "attest",
         origin: "agent:#{by_session}",
         principal: {:session, by_session},
         session_key: nil,
-        params: %{
-          assignment_id: assignment_id,
-          kind: "verdict",
-          verdict_kind: verdict_kind
-        }
+        params: params
       })
 
     refute Map.has_key?(result, :code)
@@ -3285,6 +3283,26 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp atomize(list) when is_list(list), do: Enum.map(list, &atomize/1)
   defp atomize(value), do: value
+
+  defp fixture_refs_for(call, %{"class" => "C4"}) do
+    if call.verb == "attest" and call.params[:kind] == "completion",
+      do: put_in(call, [:params, :commit_refs], fixture_refs()),
+      else: call
+  end
+
+  defp fixture_refs_for(call, _fixture), do: call
+
+  defp fixture_refs do
+    repo = Path.expand("..", __DIR__)
+    {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+
+    [
+      %{
+        "repo" => "#{Placement.local_host_name()}:#{repo}",
+        "commit" => String.trim(commit)
+      }
+    ]
+  end
 
   defp serialize_rules(rules) do
     Enum.map_join(rules, "\n", fn rule ->

@@ -1,14 +1,14 @@
 # "Pushing the product forwards is the goal of this kung-fu. No rule shall trump this rule. If there is a clear way forward, and that way forward is safe, then no rule, statute, or rail shall block it. If a rule, statute, or rail blocks this, it is necessarily wrong, and should be reported with a decision-request, but this DOES NOT BLOCK WORK. Get it done, and apologize later."
 
-# Flagship enforced loop (roadmap P7): producing effects require one independent review.
-# A holder attesting qualifying completion without a reviewed-clean verdict is not denied — the
-# substrate assigns a reviewer-code session (the remedy), blocks the completion until the review
-# lands, and self-releases. This is the review loop worked example, enforced.
+# Qualifying completion requires an applicable independent reviewed-clean conclusion.
+# When review is needed, O2 sends an accountable notification; the owner directs staffing.
+# The notification does not force a reviewer-code assignment or satisfy completion checks.
+# Completion remains blocked until the required review evidence qualifies.
 [[rule]]
 name = "completion-requires-review"
 verb = "attest"
 text = "code, policy, release, and live-mutation completion needs the most recent holder-filed review-conclusion verdict (reviewed-clean or changes-requested), pooled across all --reviews-linked cards, to be reviewed-clean on a card held by a different session; verdicts of other kinds are ignored; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only"
-external_producer = false
+external_producer = true
 edges = ["verb"]
 effect = "remedy"
 deny_when = [
@@ -17,127 +17,9 @@ deny_when = [
   { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
 ]
 [rule.remedy]
-action = "assign"
+action = "wake"
 produces = "reviewed-clean"
-target_role = "reviewer-code"
+target_session = "{holder_key}"
 on_rule_denied = "surface"
 [rule.remedy.params]
-subject = "review of assignment {assignment_id}"
-reviews = "{assignment_id}"
-
-# Re-entry twin of completion-requires-review: after one completed fix on a bug
-# work item, the next implementation dispatch first commissions a dedicated
-# recon. The recon archetype elects bug-provenance; its diagnosed verdict releases
-# the work-item-grain remedy episode and permits the re-fix dispatch.
-[[rule]]
-name = "refix-requires-diagnosis"
-verb = "dispatch"
-text = "a repeated bug fix requires a diagnosed verdict on its work item"
-external_producer = false
-edges = ["verb"]
-effect = "remedy"
-deny_when = [
-  { fact = "work_item.is_bug", op = "eq", value = true },
-  { fact = "assignment.prior_completed_fix_count", op = "gte", value = 1 },
-  { fact = "work_item.verdict_kinds", op = "not_in", value = ["diagnosed"] },
-]
-[rule.remedy]
-action = "assign"
-produces = "diagnosed"
-target_role = "recon"
-[rule.remedy.params]
-subject = "diagnosis of prior fix for work item {work_item_id}"
-reviews = "{assignment_id}"
-work_item = "{work_item_id}"
-
-[[rule]]
-name = "code-review-requires-passing-tests"
-verb = "assign"
-text = "code review needs the code author's passing-test receipt: the assignment holder must file a tests-passed verdict with the tested repository, commit, command or suite, and passing result"
-edges = ["verb"]
-effect = "deny"
-deny_when = [
-  { fact = "assignment.is_producing_card", op = "eq", value = true },
-  { fact = "assignment.state", op = "eq", value = "open" },
-  { fact = "assignment.effect_kind", op = "eq", value = "code" },
-  { fact = "assignment.holder_noted_verdict_kinds", op = "not_in", value = ["tests-passed"] },
-]
-
-# Spec-backed work is a slice of product: before its implementation
-# dispatches, the product owner has rendered a spirit verdict on the spec.
-# The rail checks that the verdict EXISTS; what it says — and who arranges
-# the review — is entirely inference's (substrate records, inference acts).
-# A DENY rather than an auto-summoning remedy, deliberately: the remedy
-# engine anchors on an existing assignment, and a spec item's FIRST dispatch
-# has none — and per the subtraction doctrine, teaching the engine a new
-# anchor loses to naming the missing paper and letting a mind fetch it.
-# Born from the adjudication postmortem: an 11-round spec pipeline ran
-# spec->review->implementation with no product-owner edge to cross.
-[[rule]]
-name = "spec-dispatch-requires-spirit"
-verb = "dispatch"
-text = "spec-backed work needs a product-owner spirit verdict first: assign your product-owner a spirit review of this work item; a spirit-approved verdict releases this dispatch"
-external_producer = true
-edges = ["verb"]
-effect = "deny"
-deny_when = [
-  { fact = "work_item.has_spec_ref", op = "eq", value = true },
-  { fact = "work_item.verdict_kinds", op = "not_in", value = ["spirit-approved"] },
-]
-
-# Posture gate (org ruling, 2026-08-31). Every piece of implementation work runs under
-# one of two postures, ruled by its orchestrator on receiving the slice: HEAVY (a
-# new feature, an architectural change, new infrastructure: full spec cycle) or
-# LIGHT (an adjudicated fix, a straightforward bug, an augmentation within the
-# architecture: the input is the spec, one coder, one review at the light bar).
-# The orchestrator files the ruling as a verdict on a card on the SAME work item
-# the coder card will use: `--verdict posture-light` or `--verdict posture-heavy`,
-# reasoning in the note. These two rails refuse to open a coder card until that
-# verdict exists. Deny, not remedy, for the spirit rule's reason: the missing
-# paper is a judgment, and the orchestrator is the mind that supplies it
-# (`external_producer`: no remedy mints this verdict). The rail checks that a
-# posture was ruled, never whether it was ruled well.
-# `target.archetype` names the session about to hold the card; the assignment
-# facts describe the reviewed or prior card, never the one being opened.
-[[rule]]
-name = "implementation-requires-posture"
-verb = "assign"
-text = "implementation needs a posture ruling first: file posture-light or posture-heavy as a verdict on a card on this work item, with the reasoning, then assign"
-external_producer = true
-edges = ["verb"]
-effect = "deny"
-deny_when = [
-  { fact = "target.archetype", op = "eq", value = "coder" },
-  { fact = "work_item.verdict_kinds", op = "not_in", value = ["posture-light", "posture-heavy"] },
-]
-
-[[rule]]
-name = "implementation-dispatch-requires-posture"
-verb = "dispatch"
-text = "implementation needs a posture ruling first: file posture-light or posture-heavy as a verdict on a card on this work item, with the reasoning, then dispatch"
-external_producer = true
-edges = ["verb"]
-effect = "deny"
-deny_when = [
-  { fact = "target.archetype", op = "eq", value = "coder" },
-  { fact = "work_item.verdict_kinds", op = "not_in", value = ["posture-light", "posture-heavy"] },
-]
-
-# STAGED, NOT ARMED — the review-rounds doorbell. Product goal:
-# at round four (recent norm is 1-2; the old process ran 4-10; grace built
-# in), SHINE LIGHT on a review that may be spinning by summoning the product
-# owner — while limiting nothing. The rails grammar has no non-blocking
-# effect today (deny/remedy/escalate all gate the verb), and a doorbell that
-# blocks IS the artificial limit the ruling forbids. Armed the day the
-# grammar grows a `notice` effect (record + summon + allow); the fact it
-# needs (assignment.review_verdict_count) ships now.
-#
-# [[rule]]
-# name = "review-rounds-doorbell"
-# verb = "attest"
-# text = "four or more review rounds on one assignment — the product owner should look"
-# effect = "notice"
-# deny_when = [
-#   { fact = "attest.kind", op = "eq", value = "verdict" },
-#   { fact = "assignment.review_verdict_count", op = "gte", value = 4 },
-# ]
+prompt = "Coordinate independent review of assignment {assignment_id}; preserve current evidence and direct staffing through its accountable owner."

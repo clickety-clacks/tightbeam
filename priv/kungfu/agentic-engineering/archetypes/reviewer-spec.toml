@@ -1,5 +1,5 @@
 name = "reviewer-spec"
-skills = ["worktree-session", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication"]
+skills = ["worktree-session", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
 
 [guidance]
 text = """

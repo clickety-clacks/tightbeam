@@ -3,7 +3,12 @@ defmodule Tightbeam.ArchetypesTest do
 
   alias Tightbeam.{Archetypes, Identity, Rails, Rules}
 
-  @golden_rule ~S("Pushing the product forwards is the goal of this kung-fu. No rule shall trump this rule. If there is a clear way forward, and that way forward is safe, then no rule, statute, or rail shall block it. If a rule, statute, or rail blocks this, it is necessarily wrong, and should be reported with a decision-request, but this DOES NOT BLOCK WORK. Get it done, and apologize later.")
+  @golden_rule """
+  # Operating principle
+
+  Own the approved outcome through judgment, coordination and durable evidence. The
+  scope and authority section defines the boundary for every supported path.
+  """
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-archetypes-#{System.unique_integer([:positive])}")
@@ -202,20 +207,23 @@ defmodule Tightbeam.ArchetypesTest do
     manual = Archetypes.builtin_fragments()["operating-manual.md"]
 
     assert manual =~ heading
-    assert manual =~ "No row holds a release line and no verb binds one"
     assert manual =~ "The default is both active lines"
-    assert manual =~ "names the principal who must clear it"
-    assert manual =~ "This duty does not transfer to the user"
-    assert manual =~ ~s("done awaiting target" and "candidate remains unintegrated")
+    assert Regex.match?(~r/Commission\s+integration\s+when\s+delivery\s+requires\s+it/, manual)
+    assert manual =~ "A recorded dependency retains ownership"
+    refute manual =~ "No row holds a release line and no verb binds one"
+    refute manual =~ ~s("done awaiting target" and "candidate remains unintegrated")
+
+    role_guidance = fn role ->
+      Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/guidance/#{role}.md")
+      |> File.read!()
+    end
+
+    assert role_guidance.("product-owner") =~ "finished-work carry"
+    assert role_guidance.("orchestrator") =~ "Carry returned work"
 
     for role <- ~w(product-owner orchestrator) do
-      role_guidance =
-        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/guidance/#{role}.md")
-        |> File.read!()
-
-      assert role_guidance =~ "the operating manual's finished-work carry"
-      refute role_guidance =~ heading
-      refute role_guidance =~ "The default is both active lines"
+      refute role_guidance.(role) =~ heading
+      refute role_guidance.(role) =~ "The default is both active lines"
     end
 
     Identity.init!(ctx.base_dir)
@@ -226,7 +234,7 @@ defmodule Tightbeam.ArchetypesTest do
       served = Identity.snapshot_at!(ctx.base_dir, revision, role, harness).guidance
 
       assert length(String.split(served, heading)) == 2
-      assert served =~ "the operating manual's finished-work carry"
+      assert Regex.match?(~r/Commission\s+integration\s+when\s+delivery\s+requires\s+it/, served)
       refute Regex.match?(~r/^#include/m, served)
     end
   end
@@ -246,12 +254,18 @@ defmodule Tightbeam.ArchetypesTest do
              "worktree-session",
              "tightbeam-dispatching",
              "product-discovery",
-             "human-communication"
+             "spirit-review"
            ]
 
     for role <- ~w(coder orchestrator product-owner reviewer-code reviewer-spec) do
       assert "worktree-session" in loaded[role].skills
     end
+
+    assert "spirit-review" in loaded["orchestrator"].skills
+
+    assert Enum.all?(loaded, fn {_role, archetype} ->
+             "human-communication" not in archetype.skills
+           end)
 
     refute Map.has_key?(loaded, "reviewer")
 
@@ -295,10 +309,13 @@ defmodule Tightbeam.ArchetypesTest do
       )
 
     assert Map.keys(product_owner.skills) == [
-             "human-communication",
              "product-discovery",
+             "spirit-review",
              "worktree-session"
            ]
+
+    assert product_owner.skills["spirit-review"] =~
+             "A historical verdict does not establish applicability to changed intent"
 
     assert product_owner.skills["worktree-session"] =~
              "Clone your own copy, into your own workdir"
@@ -307,7 +324,7 @@ defmodule Tightbeam.ArchetypesTest do
              "Push, so the remote holds the record"
 
     assert product_owner.skills["worktree-session"] =~
-             "After your branch merges, delete your clone"
+             "Remove a finished clone after required output"
 
     refute product_owner.skills["worktree-session"] =~
              "hands you a specific checkout"
@@ -323,7 +340,7 @@ defmodule Tightbeam.ArchetypesTest do
            )
   end
 
-  test "every engineering archetype serves the shared golden rule first", ctx do
+  test "every engineering archetype serves the shared operating principle first", ctx do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =

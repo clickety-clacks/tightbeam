@@ -3,17 +3,17 @@ name: tightbeam-law-minting
 description: The rules for designing tightbeam law and mechanisms — statutes, rails, substrate contracts. Use before minting or reviewing any of them.
 ---
 
-Working projection of wisdom.md rules 1-10 and 25 (doctrine is
+Working projection of wisdom.md rules 1-10 and 25 (the doctrine is
 canonical; cite by number there):
 
 Designing a rail:
 - Enforce only where BOTH condition and action leave rows; judgment-shaped norms stay
   guidance. (1)
-- One side missing only a marker? Mint a convention (prefix, flag row) — pattern-match
-  on convention is evidence; comprehension of content never is. (2)
+- Use a convention when one side needs an observable marker. Pattern matching on a
+  convention is evidence; comprehension of content never is. (2)
 - Climb the ladder: teach it, then make the right path the easiest single action,
-  then rail what still drifts. Never build a threshold-guessing detector for
-  evidence-free violations. (3)
+  then rail only the explicit boundary that still needs mechanical protection. Never
+  build a threshold-guessing detector for evidence-free violations. (3)
 - Red-tape test before shipping: silent when satisfied, evidence as byproduct, remedy
   named before deny, outcome verbs only. One false positive = defective rail. (4)
 - Every marker your mechanism writes carries cause and principal. (5)
@@ -27,6 +27,7 @@ Designing a mechanism:
   verification — split exactly where mechanical merge gives up. (9)
 - Policy is org law over substrate facts; existence guarantees are constitutional.
   Never hardcode a topology. (10)
-- Every failure leaves a durable artifact: unclassified errors record their raw
-  envelopes, and every incident ends with a catalog row, a fixture, or a statute
-  behind it — never just a fix. (25)
+- Use durable evidence and helpful reminders to support the responsible agent's
+  judgment. Justify a hard gate by the explicit authority limit or concrete protection
+  it preserves. Preserve useful incident evidence and choose a proportionate corrective
+  action. Do not add a workflow marker merely to make compliance enforceable. (25)

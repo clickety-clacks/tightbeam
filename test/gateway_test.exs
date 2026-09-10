@@ -1,4 +1,5 @@
 defmodule Tightbeam.GatewayTest do
+  alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
@@ -69,6 +70,7 @@ defmodule Tightbeam.GatewayTest do
     Placement,
     Projection,
     Rails,
+    RuleRuntime,
     Roles,
     Rules,
     SessionLane,
@@ -95,49 +97,6 @@ defmodule Tightbeam.GatewayTest do
     def handle_call({:ensure_lane_quiet, key}, _from, parent) do
       send(parent, {:ensure_lane_quiet, key})
       {:reply, :ok, parent}
-    end
-  end
-
-  defmodule CoordinatorStub do
-    use GenServer
-
-    def start_link({adapter, parent}),
-      do: GenServer.start_link(__MODULE__, {adapter, parent}, name: Tightbeam.AdapterCoordinator)
-
-    def start_link(adapter),
-      do: GenServer.start_link(__MODULE__, {adapter, nil}, name: Tightbeam.AdapterCoordinator)
-
-    def init({adapter, parent}), do: {:ok, {adapter, parent}}
-
-    def handle_call({:adapter_for, key}, _from, {adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, {:adapter_key, key})
-      reply = if is_function(adapter, 1), do: adapter.(key), else: {:ok, adapter, 1}
-      {:reply, reply, state}
-    end
-
-    def handle_call({:adapter_for, key, _context}, from, state),
-      do: handle_call({:adapter_for, key}, from, state)
-
-    def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
-      do: {:reply, make_ref(), state}
-
-    def handle_call({:close_adapter, key}, _from, {adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, {:close_adapter, key})
-      GenServer.stop(adapter)
-      {:reply, :ok, state}
-    end
-
-    def handle_call(:harness_processes, _from, {_adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, :harness_processes)
-      {:reply, [%{launch_id: "launch-1", state: "kill_failed"}], state}
-    end
-
-    def handle_cast({:release_load_slot, _machine, _slot}, state), do: {:noreply, state}
-
-    def handle_cast({:close_adapter, key}, {adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, {:close_adapter, key})
-      GenServer.stop(adapter)
-      {:noreply, state}
     end
   end
 
@@ -184,87 +143,6 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call(request, _from, state),
       do: {:reply, GenServer.call(state.db, request), state}
-  end
-
-  defmodule AdapterStub do
-    use GenServer
-    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
-    def init(parent), do: {:ok, parent}
-
-    def handle_call({:new_session, _model, _cwd, mcp_servers, _guidance}, _from, parent) do
-      send(parent, {:new_session_mcp_servers, mcp_servers})
-      {:reply, {:ok, "harness-1"}, parent}
-    end
-
-    def handle_call({:new_candidate_session, model, cwd, mcp_servers, guidance}, from, parent),
-      do: handle_call({:new_session, model, cwd, mcp_servers, guidance}, from, parent)
-
-    def handle_call(
-          {:new_session, model, cwd, mcp_servers, guidance, _request_timeout},
-          from,
-          parent
-        ),
-        do: handle_call({:new_session, model, cwd, mcp_servers, guidance}, from, parent)
-
-    def handle_call(:conn, _from, parent), do: {:reply, parent, parent}
-
-    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
-
-    def handle_call({:current_model, "harness-1"}, _from, parent),
-      do: {:reply, {:ok, Model.new("gpt-5.6-sol", effort: "medium")}, parent}
-
-    def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers, _guidance}, _from, parent),
-      do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
-
-    def handle_call(
-          {:load_session, sid, model, cwd, mcp_servers, guidance, _request_timeout},
-          from,
-          parent
-        ),
-        do: handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, from, parent)
-
-    def handle_call({:close_session, sid}, _from, parent) do
-      send(parent, {:close_session, sid})
-      {:reply, :ok, parent}
-    end
-
-    def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
-      do:
-        {:reply,
-         {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
-         parent}
-
-    def handle_call({:prompt, _sid, "fail with " <> json, _opts}, _from, parent),
-      do: {:reply, {:error, JSON.decode!(json)}, parent}
-
-    def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
-      send(parent, {:prompt_started, self()})
-
-      messages =
-        case prompt do
-          "split assistant messages" ->
-            [
-              %{message_id: "fake-message-1", text: "FIRST"},
-              %{message_id: "fake-message-2", text: "SECOND"}
-            ]
-
-          _ ->
-            [%{message_id: "fake-message", text: String.upcase(prompt)}]
-        end
-
-      receive do: (:continue_prompt ->
-                     GenServer.reply(
-                       from,
-                       {:ok,
-                        %{
-                          text: Enum.map_join(messages, & &1.text),
-                          messages: messages,
-                          stop_reason: "end_turn"
-                        }}
-                     ))
-
-      {:noreply, parent}
-    end
   end
 
   defmodule CandidateAdapterStub do
@@ -603,73 +481,130 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
+    Rules.load!(catalog_base, Map.keys(Gateway.handlers(%{db: db})))
+
     %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, device: device}
   end
 
-  test "assignment handlers inject configured supervision and effort settings before mutation",
-       ctx do
-    ensure_global_registry()
-    base_dir = role_test_base("gateway-supervision-interval")
+  for {cadence, expected_interval} <- [
+        {%{}, 1_000},
+        {%{wake_tick_ms: 1_234}, 1_234},
+        {%{wake_tick_ms: 10, supervision_interval_ms: 4_321}, 4_321},
+        {%{wake_tick_ms: 900, supervision_interval_ms: 4_321}, 4_321}
+      ] do
+    test "assignment interval wiring #{inspect(cadence)}",
+         ctx do
+      ensure_global_registry()
+      base_dir = role_test_base("gateway-supervision-interval")
 
-    register_hosts(ctx.db, %{
-      "testhost" => %{ssh: "testhost", base_dir: base_dir, cli_bin: nil}
-    })
+      register_hosts(ctx.db, %{
+        "testhost" => %{ssh: "testhost", base_dir: base_dir, cli_bin: nil}
+      })
 
-    handlers =
-      Gateway.handlers(
-        gateway_config(base_dir, ctx.db, 0)
-        |> Map.put(:wake_tick_ms, 1_234)
-        |> Map.put(:effort_checkin_horizon_ms, 123)
-      )
+      cadence = unquote(Macro.escape(cadence))
+      expected_interval = unquote(expected_interval)
 
-    common = %{
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      session_key: "k1",
-      target_role: nil,
-      role_fallback: false
-    }
+      handlers =
+        Gateway.handlers(
+          gateway_config(base_dir, ctx.db, 0)
+          |> Map.delete(:wake_tick_ms)
+          |> Map.merge(cadence)
+          |> Map.put(:effort_checkin_horizon_ms, 123)
+        )
 
-    assert %{id: assign_id} =
-             handlers["assign"].(
-               Map.merge(common, %{
-                 verb: "assign",
-                 params: %{subject: "gateway interval assign"}
-               })
-             )
+      common = %{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: "k1",
+        target_role: nil,
+        role_fallback: false
+      }
 
-    assert %{id: dispatch_id} =
-             handlers["dispatch"].(
-               Map.merge(common, %{
-                 verb: "dispatch",
-                 params: %{
-                   subject: "gateway interval dispatch",
-                   brief: "prove the configured interval"
-                 }
-               })
-             )
+      assert %{id: assign_id} =
+               handlers["assign"].(
+                 Map.merge(common, %{
+                   verb: "assign",
+                   params: %{subject: "gateway interval assign"}
+                 })
+               )
 
-    assert {:ok, [[123, effort_root]]} =
-             DB.query(
-               ctx.db,
-               "SELECT baseHorizonMs,root FROM effort_checkin_generations WHERE assignmentId=?1",
-               [assign_id]
-             )
+      assert %{id: dispatch_id} =
+               handlers["dispatch"].(
+                 Map.merge(common, %{
+                   verb: "dispatch",
+                   params: %{
+                     subject: "gateway interval dispatch",
+                     brief: "prove the configured interval"
+                   }
+                 })
+               )
 
-    assert Path.dirname(effort_root) == Path.join(base_dir, "work")
-
-    for assignment_id <- [assign_id, dispatch_id] do
-      assert {:ok, [[1_234, 1_234]]} =
+      assert {:ok, [[123, effort_root]]} =
                DB.query(
                  ctx.db,
-                 """
-                 SELECT e.dueAt - a.openedAt, e.supervisionIntervalMs
-                 FROM assignments a
-                 JOIN supervision_entitlements e ON e.assignmentId=a.id
-                 WHERE a.id=?1
-                 """,
-                 [assignment_id]
+                 "SELECT baseHorizonMs,root FROM effort_checkin_generations WHERE assignmentId=?1",
+                 [assign_id]
                )
+
+      assert Path.dirname(effort_root) == Path.join(base_dir, "work")
+
+      for assignment_id <- [assign_id, dispatch_id] do
+        assert {:ok, [[^expected_interval, ^expected_interval]]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT e.dueAt - a.openedAt, e.supervisionIntervalMs
+                   FROM assignments a
+                   JOIN supervision_entitlements e ON e.assignmentId=a.id
+                   WHERE a.id=?1
+                   """,
+                   [assignment_id]
+                 )
+
+        assert %{attest: %{id: _}} =
+                 handlers["attest"].(%{
+                   origin: "agent:k1",
+                   principal: {:session, "k1"},
+                   session_key: "k1",
+                   params: %{assignment_id: assignment_id, kind: "progress"}
+                 })
+
+        assert {:ok, [["assignment_open", ^expected_interval, ^expected_interval]]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT e.basisKind, e.supervisionIntervalMs, e.dueAt - a.openedAt
+                   FROM supervision_entitlements e
+                   JOIN assignments a ON a.id=e.assignmentId
+                   WHERE e.assignmentId=?1
+                   ORDER BY e.generation DESC LIMIT 1
+                   """,
+                   [assignment_id]
+                 )
+      end
+    end
+  end
+
+  test "wake polling and supervision child cadence are independent", ctx do
+    base_dir = role_test_base("gateway-independent-cadence")
+    ensure_global_registry()
+
+    for wake_tick <- [10, 900] do
+      config =
+        gateway_config(base_dir, ctx.db, 0)
+        |> Map.put(:wake_tick_ms, wake_tick)
+        |> Map.put(:supervision_interval_ms, 4_321)
+        |> Map.put(:conn_registry, ctx.registry)
+        |> Map.put(:lane_manager, ctx.lane)
+
+      children = Gateway.children(config)
+      {Tightbeam.Wakes, wake_opts} = Enum.find(children, &match?({Tightbeam.Wakes, _}, &1))
+
+      {Tightbeam.Supervision, supervision_opts} =
+        Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
+
+      assert Keyword.fetch!(wake_opts, :tick_ms) == wake_tick
+      assert Keyword.fetch!(supervision_opts, :sweep_ms) == 4_321
     end
   end
 
@@ -1049,44 +984,104 @@ defmodule Tightbeam.GatewayTest do
     assert File.stat!(Path.join(base_dir, "gateway.json")).mode |> Bitwise.band(0o777) == 0o600
   end
 
-  test "children recovers liveness before any runtime child can start", ctx do
+  for {override, expected} <- [{%{}, 1_234}, {%{supervision_interval_ms: 4_321}, 4_321}] do
+    test "children recovers liveness with interval #{inspect(override)}", ctx do
+      :ok =
+        DB.execute(
+          ctx.db,
+          "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_recovery', 'boot recovery', 'k1', 'flynn', 1)"
+        )
+
+      expected = unquote(expected)
+
+      children =
+        Gateway.children(
+          gateway_config(gateway_children_base!(), ctx.db, 0)
+          |> Map.put(:wake_tick_ms, 1_234)
+          |> Map.merge(unquote(Macro.escape(override)))
+        )
+
+      assert {:ok,
+              [
+                [
+                  1,
+                  "armed",
+                  "recovery_backfill",
+                  "asg_boot_recovery",
+                  "recovery_backfill",
+                  "process:tightbeam",
+                  ^expected
+                ]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 """
+                 SELECT generation,state,basisKind,basisId,cause,principal,supervisionIntervalMs
+                 FROM supervision_entitlements
+                 WHERE assignmentId='asg_boot_recovery'
+                 """
+               )
+
+      {Tightbeam.Supervision, supervision_opts} =
+        Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
+
+      assert Keyword.fetch!(supervision_opts, :recover) == false
+    end
+  end
+
+  test "children installs row recognition before recovery closes retired assignments", ctx do
+    base_dir = gateway_children_base!()
+    :initialized = Identity.init!(base_dir)
+    retired = create_session(ctx.db, "boot-retired", "flynn")
+
     :ok =
       DB.execute(
         ctx.db,
-        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_recovery', 'boot recovery', 'k1', 'flynn', 1)"
+        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_retired', 'retired at boot', '#{retired.session_key}', 'flynn', 1)"
       )
 
-    children =
-      Gateway.children(
-        gateway_config(gateway_children_base!(), ctx.db, 0)
-        |> Map.put(:wake_tick_ms, 1_234)
+    :ok =
+      DB.execute(
+        ctx.db,
+        "UPDATE sessions SET state='retired' WHERE sessionKey='#{retired.session_key}'"
       )
 
-    assert {:ok,
-            [
-              [
-                1,
-                "armed",
-                "recovery_backfill",
-                "asg_boot_recovery",
-                "recovery_backfill",
-                "process:tightbeam",
-                1_234
-              ]
-            ]} =
+    rules_dir = Path.join(base_dir, "identity/rules")
+    File.mkdir_p!(rules_dir)
+
+    File.write!(Path.join(rules_dir, "boot-recovery.toml"), """
+    [[rule]]
+    name = "observe-boot-recovery"
+    verb = "retire"
+    edges = ["row-commit"]
+    effect = "notice"
+    text = "record recovered assignment closure"
+    deny_when = [{ fact = "assignment.state", op = "eq", value = "closed" }]
+
+    [rule.notice]
+    target_session = "k1"
+    prompt = "boot recovery closed {assignment_id}"
+    """)
+
+    :persistent_term.erase(RuleRuntime)
+
+    Gateway.children(
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:wake_tick_ms, 1_234)
+    )
+
+    assert {:ok, [["closed", "revoked"]]} =
              DB.query(
                ctx.db,
-               """
-               SELECT generation,state,basisKind,basisId,cause,principal,supervisionIntervalMs
-               FROM supervision_entitlements
-               WHERE assignmentId='asg_boot_recovery'
-               """
+               "SELECT state, outcome FROM assignments WHERE id='asg_boot_retired'"
              )
 
-    {Tightbeam.Supervision, supervision_opts} =
-      Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
+    assert [wake] =
+             ctx.db
+             |> Wakes.list_pending()
+             |> Enum.filter(&(&1.prompt == "boot recovery closed asg_boot_retired"))
 
-    assert Keyword.fetch!(supervision_opts, :recover) == false
+    assert wake.session_key == "k1"
   end
 
   test "repair-assignment requires outcome reconciliation and appends one deduped rerun", ctx do
@@ -9926,6 +9921,12 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp make_model_unknown(db, session_key) do
+    {:ok, [[sidecar_trigger]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+      )
+
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
 
     try do
@@ -9933,11 +9934,13 @@ defmodule Tightbeam.GatewayTest do
         DB.execute(
           db,
           """
+          DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
           CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
           DROP TABLE sessions;
           ALTER TABLE sessions_with_unknown RENAME TO sessions;
           CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
           UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
+          #{sidecar_trigger};
           """
         )
     after
