@@ -7,6 +7,7 @@ mod child_process;
 mod command_execution;
 mod contain;
 mod cursor_execution_identity;
+mod cursor_rails;
 mod dispatch;
 mod github_auth;
 mod harness_process;
@@ -72,6 +73,19 @@ fn main() {
     if args.first().is_some_and(|arg| arg == "catalog-probe") {
         match catalog_probe::probe(&args[1..]) {
             Ok(status) => std::process::exit(status),
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if args
+        .first()
+        .is_some_and(|arg| arg == "cursor-rails-publish")
+    {
+        match cursor_rails::publish(&args[1..]) {
+            Ok(()) => std::process::exit(0),
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(1);

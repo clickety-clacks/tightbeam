@@ -1655,7 +1655,13 @@ defmodule Tightbeam.Placement do
         Tightbeam.Harness.Cursor.project_execution_rails!(
           Map.get(config, :cursor_execution_home),
           rails,
-          path: rails_path
+          path: rails_path,
+          publisher:
+            Map.get(
+              config,
+              :cursor_rails_publisher,
+              Path.join(local_cli_bin(config), "tightbeam")
+            )
         )
       end
 

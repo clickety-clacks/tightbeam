@@ -2,6 +2,8 @@ defmodule Tightbeam.PlacementTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
+  @release_binary Path.expand("../cli/target/release/tightbeam", __DIR__)
+
   alias Tightbeam.{
     Archetypes,
     Credentials,
@@ -686,12 +688,16 @@ defmodule Tightbeam.PlacementTest do
   # path passed the whole suite — the exact regression the ticket is about.
   test "every harness resolves its local adapter under base_dir, never a sibling checkout",
        %{base_dir: base_dir, db: db} do
+    execution_home = Path.join(base_dir, "cursor-execution-test-home")
+    File.mkdir_p!(execution_home)
+
     config = %{
       base_dir: base_dir,
       db: db,
       cwd: "/work",
       cli_bin: Path.join(base_dir, "bin"),
-      cursor_execution_home: Path.join(base_dir, "cursor-execution-test-home"),
+      cursor_execution_home: execution_home,
+      cursor_rails_publisher: @release_binary,
       credential_kind: :api_key,
       harness_target_overrides: %{
         find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
@@ -762,6 +768,7 @@ defmodule Tightbeam.PlacementTest do
   } do
     execution_home = Path.join(base_dir, "cursor-execution-test-home")
     hooks_path = Path.join(execution_home, ".cursor/hooks.json")
+    File.mkdir_p!(execution_home)
 
     expected_digest =
       Rails.hook_settings()
@@ -780,6 +787,7 @@ defmodule Tightbeam.PlacementTest do
       cwd: "/work",
       cli_bin: Path.join(base_dir, "bin"),
       cursor_execution_home: execution_home,
+      cursor_rails_publisher: @release_binary,
       credential_kind: :api_key,
       harness_target_overrides: %{
         find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
@@ -808,6 +816,62 @@ defmodule Tightbeam.PlacementTest do
              Base.encode16(:crypto.hash(:sha256, "tampered-after-projection"), case: :lower)
   end
 
+  test "Cursor rails delivery refuses a planted leaf symlink and preserves its target", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    execution_home = Path.join(base_dir, "cursor-execution-leaf-symlink")
+    cursor_dir = Path.join(execution_home, ".cursor")
+    File.mkdir_p!(cursor_dir)
+    external = Path.join(base_dir, "operator-hooks-target")
+    File.write!(external, "operator bytes")
+    File.chmod!(external, 0o600)
+    File.ln_s!(external, Path.join(cursor_dir, "hooks.json"))
+
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Placement.adapter_opts!(
+          cursor_config(base_dir, db, execution_home),
+          {:cursor, "shared", "testhost"}
+        )
+      end
+
+    assert error.message =~ "hooks.json is not a regular file"
+    assert File.read!(external) == "operator bytes"
+    assert Bitwise.band(File.stat!(external).mode, 0o777) == 0o600
+  end
+
+  test "Cursor rails delivery refuses a planted parent symlink and preserves its target", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    execution_home = Path.join(base_dir, "cursor-execution-parent-symlink")
+    external = Path.join(base_dir, "operator-cursor-target")
+    File.mkdir_p!(execution_home)
+    File.mkdir_p!(external)
+    File.write!(Path.join(external, "hooks.json"), "operator bytes")
+    File.ln_s!(external, Path.join(execution_home, ".cursor"))
+
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+
+    error =
+      assert_raise ArgumentError, fn ->
+        Placement.adapter_opts!(
+          cursor_config(base_dir, db, execution_home),
+          {:cursor, "shared", "testhost"}
+        )
+      end
+
+    assert error.message =~ ".cursor is not a no-follow directory"
+    assert File.read!(Path.join(external, "hooks.json")) == "operator bytes"
+  end
+
   defp cursor_config(base_dir, db, execution_home) do
     %{
       base_dir: base_dir,
@@ -815,6 +879,7 @@ defmodule Tightbeam.PlacementTest do
       cwd: "/work",
       cli_bin: Path.join(base_dir, "bin"),
       cursor_execution_home: execution_home,
+      cursor_rails_publisher: @release_binary,
       credential_kind: :api_key,
       harness_target_overrides: %{
         find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
@@ -939,6 +1004,7 @@ defmodule Tightbeam.PlacementTest do
       db: db,
       cwd: "/work",
       cursor_execution_home: execution_home,
+      cursor_rails_publisher: @release_binary,
       harness_target_overrides: %{
         find_executable: fn _ -> Path.join([base_dir, "2026.08.11-e8db854", "cursor-agent"]) end,
         realpath: fn path -> {:ok, path} end,
@@ -1685,7 +1751,8 @@ defmodule Tightbeam.PlacementTest do
       cwd: "/work",
       cli_bin: "/local/bin",
       default_model: Model.new("auto"),
-      cursor_execution_home: execution_home
+      cursor_execution_home: execution_home,
+      cursor_rails_publisher: @release_binary
     }
 
     projected = Placement.deliver_home(config, {:cursor, "default", "testhost"})

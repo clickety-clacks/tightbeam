@@ -163,12 +163,41 @@ defmodule Tightbeam.Harness.Cursor do
 
   @doc false
   def project_execution_rails!(home_override, settings, opts \\ []) do
-    path = Path.join(execution_home(home_override), @rails_file)
     bytes = settings |> CursorRails.compile(rails_opts(opts)) |> JSON.encode!()
-    File.mkdir_p!(Path.dirname(path))
-    File.write!(path, bytes)
-    File.chmod!(path, 0o644)
-    Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+    publisher = Keyword.fetch!(opts, :publisher)
+
+    payload =
+      Path.join(
+        System.tmp_dir!(),
+        "tightbeam-cursor-rails-" <>
+          Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+      )
+
+    try do
+      File.write!(payload, bytes, [:binary, :exclusive])
+      File.chmod!(payload, 0o600)
+
+      case System.cmd(
+             publisher,
+             ["cursor-rails-publish", execution_home(home_override), payload, digest],
+             stderr_to_stdout: true
+           ) do
+        {output, 0} ->
+          if String.trim(output) == digest do
+            digest
+          else
+            raise ArgumentError,
+                  "Cursor rails publication refused: publisher returned an unexpected digest"
+          end
+
+        {output, status} ->
+          raise ArgumentError,
+                "Cursor rails publication refused (exit #{status}): #{String.trim(output)}"
+      end
+    after
+      File.rm(payload)
+    end
   end
 
   # Both hooks.json writers (projection home and execution home) MUST compile
