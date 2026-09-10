@@ -12,7 +12,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     db: db
   } do
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["row-driven-r1-v1-019"]]
+    assert shape(db) == [["cursor-provider-v1-020"]]
     assert_columns(db)
     seed(db)
     assert rows(db, "SELECT reminderState FROM assignments") == [[nil]]
@@ -31,7 +31,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     facts = rows(db, "SELECT * FROM condition_facts")
     objects = guards(db)
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["row-driven-r1-v1-019"]]
+    assert shape(db) == [["cursor-provider-v1-020"]]
     assert rows(db, "SELECT * FROM assignments") == Enum.map(assignments, &(&1 ++ [nil]))
     assert rows(db, "SELECT * FROM condition_facts") == Enum.map(facts, &(&1 ++ [nil]))
     assert guards(db) == objects

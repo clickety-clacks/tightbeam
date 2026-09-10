@@ -2588,7 +2588,8 @@ defmodule Tightbeam.Schema do
         CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
         CREATE UNIQUE INDEX subagent_markers_one_stop
           ON subagent_markers (subagentRef) WHERE kind = 'subagent_stop';
-        CREATE INDEX subagent_markers_principal ON subagent_markers (principal, id);
+        CREATE INDEX subagent_markers_principal
+          ON subagent_markers (principal, id);
         """
       )
 

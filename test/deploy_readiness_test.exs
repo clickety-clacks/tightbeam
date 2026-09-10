@@ -168,7 +168,7 @@ defmodule Tightbeam.DeployReadinessTest do
     name = String.to_atom("readiness_o2_#{System.unique_integer([:positive])}")
     db = start_supervised!({DB, name: name, path: path})
     assert :ok = Schema.ensure_all(db)
-    assert {:ok, [["row-driven-r1-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["cursor-provider-v1-020"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     :ok =
       DB.execute(db, """
