@@ -1,4 +1,5 @@
 defmodule Tightbeam.HarnessProcess do
+  @identity_authority_version "tightbeam-harness-identity-v2"
   @moduledoc """
   Durable identity and lifecycle for OS harness processes.
 
@@ -626,19 +627,39 @@ defmodule Tightbeam.HarnessProcess do
   defp read_identity(row, timeout_ms) do
     case read_identity_file(row, timeout_ms) do
       {:ok, output} ->
-        with [pid, process_group_id, boot_identity, launch_id] <-
-               output |> String.trim() |> String.split("\t", parts: 4),
-             {pid, ""} when pid > 0 <- Integer.parse(pid),
-             {process_group_id, ""} when process_group_id > 0 <- Integer.parse(process_group_id),
-             true <- pid == process_group_id,
-             true <- launch_id == row.launch_id do
-          {:ok, pid, process_group_id, boot_identity, launch_id}
+        parse_identity(output, row.launch_id)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp parse_identity(output, expected_launch_id) do
+    case output |> String.trim() |> String.split("\t") do
+      [pid, process_group_id, boot_identity, launch_id] ->
+        validate_identity(pid, process_group_id, boot_identity, launch_id, expected_launch_id)
+
+      [pid, process_group_id, start_seconds, start_microseconds, boot_identity, launch_id] ->
+        with {_start_seconds, ""} <- Integer.parse(start_seconds),
+             {_start_microseconds, ""} <- Integer.parse(start_microseconds) do
+          validate_identity(pid, process_group_id, boot_identity, launch_id, expected_launch_id)
         else
           _ -> {:error, :identity_file_invalid}
         end
 
-      {:error, reason} ->
-        {:error, reason}
+      _ ->
+        {:error, :identity_file_invalid}
+    end
+  end
+
+  defp validate_identity(pid, process_group_id, boot_identity, launch_id, expected_launch_id) do
+    with {pid, ""} when pid > 0 <- Integer.parse(pid),
+         {process_group_id, ""} when process_group_id > 0 <- Integer.parse(process_group_id),
+         true <- pid == process_group_id,
+         true <- launch_id == expected_launch_id do
+      {:ok, pid, process_group_id, boot_identity, launch_id}
+    else
+      _ -> {:error, :identity_file_invalid}
     end
   end
 
@@ -688,7 +709,8 @@ defmodule Tightbeam.HarnessProcess do
       Integer.to_string(row.process_group_id),
       row.identity_path,
       row.boot_identity,
-      row.identity_token
+      row.identity_token,
+      @identity_authority_version
     ]
   end
 
@@ -988,17 +1010,28 @@ defmodule Tightbeam.HarnessProcess do
   end
 
   defp remove_identity(%{ssh: nil, identity_path: path}) do
-    case File.rm(path) do
-      :ok -> :ok
-      {:error, :enoent} -> :ok
-      {:error, reason} -> {:error, {:identity_remove_failed, reason}}
-    end
+    [path, identity_authority_path(path)]
+    |> Enum.reduce(:ok, fn candidate, result ->
+      case File.rm(candidate) do
+        :ok -> result
+        {:error, :enoent} -> result
+        {:error, reason} -> {:error, {:identity_remove_failed, reason}}
+      end
+    end)
   end
 
   defp remove_identity(%{ssh: destination, identity_path: path}) do
     case bounded_command(
            "ssh",
-           @ssh_opts ++ [destination, "rm", "-f", "--", shell_quote(path)],
+           @ssh_opts ++
+             [
+               destination,
+               "rm",
+               "-f",
+               "--",
+               shell_quote(path),
+               shell_quote(identity_authority_path(path))
+             ],
            command_timeout_ms()
          ) do
       {_output, 0} -> :ok
@@ -1167,6 +1200,7 @@ defmodule Tightbeam.HarnessProcess do
   # boot died in `capture_identity/3`.
   defp deadline(:infinity), do: :infinity
   defp deadline(timeout_ms), do: System.monotonic_time(:millisecond) + timeout_ms
+  defp identity_authority_path(path), do: path <> ".authority"
   defp now, do: System.system_time(:millisecond)
   defp one_line(value), do: value |> String.trim() |> String.replace(~r/\s+/, " ")
   defp shell_quote(value), do: "'" <> String.replace(value, "'", "'\\''") <> "'"

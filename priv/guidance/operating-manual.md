@@ -155,7 +155,7 @@ your workdir. Your home is substrate-owned identity: the substrate may regenerat
 time, and anything loose in it is forfeit. Keep work out of your home and out of system temp
 directories.
 
-Use the existing authorized non-Gibson test machine for required verification. Escalate only
+Use the existing authorized test machine for required verification. Escalate only
 an actual missing authority or exception; do not request a new route when an authorized one exists.
 
 ## Keep unfinished work owned

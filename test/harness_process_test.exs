@@ -80,7 +80,7 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 17)
   end
 
-  test "a helper refusal cannot resolve a launch without attempting the group kill", %{
+  test "leader disappearance with a captured survivor stays unresolved and fenced", %{
     tmp_dir: tmp
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 18)
@@ -132,5 +132,25 @@ defmodule Tightbeam.HarnessProcessTest do
     tmp_dir: tmp
   } do
     Tightbeam.HarnessProcessFixture.run!(tmp, 27)
+  end
+
+  test "identity capture accepts an unresolved legacy four-field record", %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 28)
+  end
+
+  test "new coordinator cannot dispatch an authority-less record to a legacy helper", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 29)
+  end
+
+  test "harness-group refuses a boot identity mismatch at signal time", %{tmp_dir: tmp} do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 30)
+  end
+
+  test "harness-group run from inside the recorded group does not hang the caller", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.HarnessProcessFixture.run!(tmp, 31)
   end
 end

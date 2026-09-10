@@ -201,6 +201,7 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     assert is_integer(resolved_at)
     refute File.exists?(identity_path)
+    refute File.exists?(identity_path <> ".authority")
   end
 
   defp scenario(5, ctx) do
@@ -210,6 +211,7 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert :ok = HarnessProcess.reconcile(ctx.db)
     assert [%{state: "killed"}] = HarnessProcess.list(ctx.db)
     refute File.exists?(row.identity_path)
+    refute File.exists?(row.identity_path <> ".authority")
   end
 
   defp scenario(6, ctx) do
@@ -264,7 +266,7 @@ defmodule Tightbeam.HarnessProcessFixture do
     # OS pid ceiling (macOS ~99998, linux default 4194304), so the kill is
     # ESRCH by construction and can never reach a real process. Never forge a
     # low number here.
-    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
+    File.write!(row.identity_path, "999999123\t999999123\t0\t0\tboot-marker\t#{launch_id}\n")
 
     {:ok, _} =
       DB.query(
@@ -297,7 +299,7 @@ defmodule Tightbeam.HarnessProcessFixture do
     launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
     [row] = HarnessProcess.list(ctx.db)
     # See the forged-pgid note above: 999999123 is unallocatable by construction.
-    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
+    File.write!(row.identity_path, "999999123\t999999123\t0\t0\tboot-marker\t#{launch_id}\n")
 
     assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id, :infinity)
   end
@@ -552,7 +554,7 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     File.write!(
       refusing_helper,
-      "#!/bin/sh\necho 'harness identity lock is not held' >&2\nexit 1\n"
+      "#!/bin/sh\necho 'harness cleanup incomplete: harness session leader disappeared during cleanup' >&2\nexit 1\n"
     )
 
     File.chmod!(refusing_helper, 0o755)
@@ -564,7 +566,10 @@ defmodule Tightbeam.HarnessProcessFixture do
         [row.launch_id, refusing_helper]
       )
 
-    assert {:error, {:kill_failed, {:signal_refused, "harness identity lock is not held"}}} =
+    assert {:error,
+            {:kill_failed,
+             {:signal_refused,
+              "harness cleanup incomplete: harness session leader disappeared during cleanup"}}} =
              HarnessProcess.reconcile_key(ctx.db, key)
 
     assert [
@@ -577,6 +582,7 @@ defmodule Tightbeam.HarnessProcessFixture do
            ] = HarnessProcess.list(ctx.db)
 
     assert is_integer(attempted_at)
+    assert HarnessProcess.fenced?(ctx.db, key)
   end
 
   defp scenario(19, ctx) do
@@ -1019,10 +1025,10 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert [%{identity_path: identity_path, launch_id: launch_id}] =
              HarnessProcess.list(ctx.db)
 
-    # The identity file exactly as the launcher writes it — pid, pgid, boot
-    # identity, launch id — but with a boot identity no running kernel has.
+    # The identity file exactly as the launcher writes it — pid, pgid, leader
+    # start time, boot identity, launch id — but with a boot identity no running kernel has.
     File.mkdir_p!(Path.dirname(identity_path))
-    File.write!(identity_path, "999999	999999	boot-that-ended	#{launch_id}
+    File.write!(identity_path, "999999	999999	0	0	boot-that-ended	#{launch_id}
 ")
 
     assert :ok = HarnessProcess.reconcile(ctx.db)
@@ -1076,6 +1082,150 @@ defmodule Tightbeam.HarnessProcessFixture do
 
     AdapterCoordinator.adapter_for(coordinator, key)
     assert_receive :adapter_started
+  end
+
+  defp scenario(28, ctx) do
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: ["unused"],
+          home: ctx.test_dir,
+          stderr_path: Path.join(ctx.test_dir, "legacy-four-field.stderr"),
+          process_identity_dir: ctx.test_dir,
+          process_helper: @helper
+        ],
+        ctx.db,
+        {:claude, "shared", "legacy-four-field"}
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+    [row] = HarnessProcess.list(ctx.db)
+    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
+
+    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
+    [captured] = HarnessProcess.list(ctx.db)
+    assert captured.os_pid == 999_999_123
+    assert captured.process_group_id == 999_999_123
+    assert captured.boot_identity == "boot-marker"
+    assert captured.identity_token == launch_id
+  end
+
+  defp scenario(29, ctx) do
+    marker = Path.join(ctx.test_dir, "legacy-harness-group-entered")
+    legacy_helper = Path.join(ctx.test_dir, "legacy-helper")
+
+    File.write!(
+      legacy_helper,
+      """
+      #!/bin/sh
+      if [ "$1" = "boot-identity" ]; then
+        echo boot-marker
+        exit 0
+      fi
+      if [ "$1" = "harness-group" ]; then
+        # The legacy binary requires the command plus exactly four arguments.
+        # It reaches numeric killpg only after this argument-count gate.
+        [ "$#" -eq 5 ] || exit 64
+        touch "#{marker}"
+        exit 0
+      fi
+      exit 64
+      """
+    )
+
+    File.chmod!(legacy_helper, 0o755)
+    key = {:claude, "shared", "legacy-helper-skew"}
+
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: ["unused"],
+          process_identity_dir: ctx.test_dir,
+          process_helper: legacy_helper
+        ],
+        ctx.db,
+        key
+      )
+
+    launch_id = Keyword.fetch!(opts, :harness_process_launch_id)
+    [row] = HarnessProcess.list(ctx.db)
+    File.write!(row.identity_path, "999999123\t999999123\tboot-marker\t#{launch_id}\n")
+
+    assert :ok = HarnessProcess.capture_identity(ctx.db, launch_id)
+    refute File.exists?(row.identity_path <> ".authority")
+
+    assert {:error, {:kill_failed, {:sigkill_not_delivered, 64, ""}}} =
+             HarnessProcess.reconcile_key(ctx.db, key)
+
+    refute File.exists?(marker), "legacy helper reached its numeric group-signal body"
+
+    assert [%{state: "kill_failed", resolved_at: nil, kill_sent_at: nil}] =
+             HarnessProcess.list(ctx.db)
+
+    assert HarnessProcess.fenced?(ctx.db, key)
+  end
+
+  defp scenario(30, ctx) do
+    helper = grouped_helper(ctx, "boot-mismatch.sh", "while :; do sleep 60; done")
+    {port, row} = launch(ctx, {:claude, "shared", "boot-mismatch"}, [helper])
+
+    assert eventually(fn -> match?({^port, _}, {port, %{state: "running"}}) end)
+
+    {output, exit} =
+      System.cmd(
+        @helper,
+        [
+          "harness-group",
+          Integer.to_string(row.process_group_id),
+          row.identity_path,
+          "boot-that-ended",
+          row.launch_id
+        ],
+        stderr_to_stdout: true
+      )
+
+    assert exit != 0
+    assert output =~ "boot identity"
+
+    Port.close(port)
+  end
+
+  defp scenario(31, ctx) do
+    launch_id = "same-group-#{System.unique_integer([:positive, :monotonic])}"
+
+    identity_path =
+      Path.join([ctx.test_dir, "helper", "harness-processes", launch_id <> ".identity"])
+
+    File.mkdir_p!(Path.dirname(identity_path))
+
+    helper = Path.join(ctx.test_dir, "same-group-inner.sh")
+
+    File.write!(
+      helper,
+      """
+      #!/bin/sh
+      exec "#{@helper}" harness-exec "#{identity_path}" "#{launch_id}" -- /bin/sh -c '
+        while :; do
+          if [ -f "#{identity_path}" ]; then
+            pgid=$(awk -F"\\t" "{print \\$2}" "#{identity_path}")
+            exec "#{@helper}" harness-group "$pgid" "#{identity_path}" "$("#{@helper}" boot-identity)" "#{launch_id}"
+          fi
+          sleep 0.05
+        done
+      '
+      """
+    )
+
+    File.chmod!(helper, 0o755)
+
+    task =
+      Task.async(fn ->
+        System.cmd("/bin/sh", [helper], stderr_to_stdout: true)
+      end)
+
+    assert {:ok, {_output, _exit}} =
+             Task.yield(task, 20_000) ||
+               flunk("same-group harness-group timed out — caller frozen")
   end
 
   defp launch_stubborn(ctx, key) do
