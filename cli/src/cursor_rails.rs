@@ -89,6 +89,20 @@ fn publish_bytes<F>(
 where
     F: FnOnce(&Path),
 {
+    publish_bytes_with_after_publish(home, bytes, expected, before_commit, |_| {})
+}
+
+fn publish_bytes_with_after_publish<F, G>(
+    home: &Path,
+    bytes: &[u8],
+    expected: &str,
+    before_commit: F,
+    after_publish: G,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+    G: FnOnce(&Path),
+{
     let home_fd = open_dir_path(home)
         .map_err(|error| refusal(format!("execution home is not a stable directory: {error}")))?;
     let cursor_name = cstring(CURSOR_DIR)?;
@@ -118,14 +132,9 @@ where
         ".hooks.json.tightbeam.{}.{nonce}",
         std::process::id()
     ))?;
-    let backup_name = cstring(&format!(
-        ".hooks.json.previous.{}.{nonce}",
-        std::process::id()
-    ))?;
-
     let mut temporary = open_new_at(cursor_fd.as_raw_fd(), &temporary_name)?;
     let mut temporary_present = true;
-    let mut backup_present = false;
+    let mut recovery_present = false;
     let mut published = false;
 
     let result = (|| {
@@ -151,73 +160,126 @@ where
         }
 
         if let Some(previous) = observed {
-            rename_at(
-                cursor_fd.as_raw_fd(),
-                &hooks_name,
-                cursor_fd.as_raw_fd(),
-                &backup_name,
-            )?;
-            backup_present = true;
+            exchange_at(cursor_fd.as_raw_fd(), &temporary_name, &hooks_name)?;
+            published = true;
+            recovery_present = true;
 
-            if entry_at(cursor_fd.as_raw_fd(), &backup_name)? != Some(previous) {
-                restore_previous(cursor_fd.as_raw_fd(), &backup_name, &hooks_name);
-                backup_present = false;
+            if entry_at(cursor_fd.as_raw_fd(), &hooks_name)? != Some(staged)
+                || entry_at(cursor_fd.as_raw_fd(), &temporary_name)? != Some(previous)
+            {
                 return Err(refusal("hooks.json changed while it was secured"));
             }
+        } else {
+            link_at(
+                cursor_fd.as_raw_fd(),
+                &temporary_name,
+                cursor_fd.as_raw_fd(),
+                &hooks_name,
+            )?;
+            published = true;
         }
 
-        link_at(
-            cursor_fd.as_raw_fd(),
-            &temporary_name,
-            cursor_fd.as_raw_fd(),
-            &hooks_name,
-        )?;
-        published = true;
+        after_publish(&home.join(CURSOR_DIR));
 
         if entry_at(cursor_fd.as_raw_fd(), &hooks_name)? != Some(staged) {
             return Err(refusal("published hooks.json was replaced"));
         }
 
-        unlink_at(cursor_fd.as_raw_fd(), &temporary_name)?;
-        temporary_present = false;
+        if observed.is_none() {
+            unlink_at(cursor_fd.as_raw_fd(), &temporary_name)?;
+            temporary_present = false;
+        }
 
         ensure_same_dir(home_fd.as_raw_fd(), cursor_fd.as_raw_fd(), &cursor_name)?;
         verify_published(cursor_fd.as_raw_fd(), &hooks_name, staged, expected)?;
+        sync_fd(cursor_fd.as_raw_fd())?;
 
-        if backup_present {
-            if entry_at(cursor_fd.as_raw_fd(), &backup_name)? != observed {
+        if recovery_present {
+            if entry_at(cursor_fd.as_raw_fd(), &temporary_name)? != observed {
                 return Err(refusal("secured previous hooks.json was replaced"));
             }
-            unlink_at(cursor_fd.as_raw_fd(), &backup_name)?;
-            backup_present = false;
+            unlink_at(cursor_fd.as_raw_fd(), &temporary_name)?;
+            temporary_present = false;
+            recovery_present = false;
+            published = false;
+            sync_fd(cursor_fd.as_raw_fd())?;
         }
-
-        sync_fd(cursor_fd.as_raw_fd())?;
         Ok(())
     })();
 
-    if result.is_err() {
-        if published
-            && entry_at(cursor_fd.as_raw_fd(), &hooks_name).ok().flatten()
-                == fstat(temporary.as_raw_fd()).ok()
-        {
-            let _ = unlink_at(cursor_fd.as_raw_fd(), &hooks_name);
+    if let Err(error) = result {
+        let mut recovery_errors = Vec::new();
+        let staged = fstat(temporary.as_raw_fd()).ok();
+
+        if published {
+            match observed {
+                Some(previous) => {
+                    let hooks_entry = entry_at(cursor_fd.as_raw_fd(), &hooks_name).ok().flatten();
+                    let recovery_entry = entry_at(cursor_fd.as_raw_fd(), &temporary_name)
+                        .ok()
+                        .flatten();
+                    let recovery_path = managed_path(&temporary_name);
+
+                    if hooks_entry == staged && recovery_entry == Some(previous) {
+                        match exchange_at(cursor_fd.as_raw_fd(), &temporary_name, &hooks_name) {
+                            Ok(()) => {
+                                recovery_present = false;
+                            }
+                            Err(restore_error) => recovery_errors.push(format!(
+                                "automatic restore failed ({restore_error}); previous hooks.json \
+                                 is preserved at {recovery_path}"
+                            )),
+                        }
+                    } else if recovery_entry == Some(previous) {
+                        recovery_errors.push(format!(
+                            "automatic restore refused because managed entries changed; previous \
+                             hooks.json is preserved at {recovery_path}"
+                        ));
+                    } else {
+                        recovery_errors.push(format!(
+                            "automatic restore refused because recovery entry {recovery_path} is \
+                             not the secured previous hooks.json"
+                        ));
+                    }
+                }
+                None => {
+                    if entry_at(cursor_fd.as_raw_fd(), &hooks_name).ok().flatten() == staged {
+                        match unlink_at(cursor_fd.as_raw_fd(), &hooks_name) {
+                            Ok(()) => {}
+                            Err(rollback_error) => recovery_errors.push(format!(
+                                "rollback failed to remove published hooks.json \
+                                 ({rollback_error})"
+                            )),
+                        }
+                    } else {
+                        recovery_errors.push(
+                            "rollback refused because published hooks.json identity changed"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
         }
 
-        if backup_present
-            && entry_at(cursor_fd.as_raw_fd(), &hooks_name)
+        if temporary_present && !recovery_present {
+            if entry_at(cursor_fd.as_raw_fd(), &temporary_name)
                 .ok()
                 .flatten()
-                .is_none()
-        {
-            restore_previous(cursor_fd.as_raw_fd(), &backup_name, &hooks_name);
+                == staged
+            {
+                if let Err(cleanup_error) = unlink_at(cursor_fd.as_raw_fd(), &temporary_name) {
+                    recovery_errors.push(format!(
+                        "staged entry cleanup failed at {} ({cleanup_error})",
+                        managed_path(&temporary_name)
+                    ));
+                }
+            }
         }
+
+        return Err(with_recovery(error, recovery_errors));
     }
 
-    if temporary_present {
-        let _ = unlink_at(cursor_fd.as_raw_fd(), &temporary_name);
-    }
-    result
+    Ok(())
 }
 
 fn verify_published(
@@ -338,17 +400,43 @@ fn entry_at(directory: libc::c_int, name: &CStr) -> Result<Option<Entry>, String
     }
 }
 
-fn rename_at(
-    from_dir: libc::c_int,
-    from: &CStr,
-    to_dir: libc::c_int,
-    to: &CStr,
-) -> Result<(), String> {
-    if unsafe { libc::renameat(from_dir, from.as_ptr(), to_dir, to.as_ptr()) } == 0 {
+#[cfg(target_os = "linux")]
+fn exchange_at(directory: libc::c_int, left: &CStr, right: &CStr) -> Result<(), String> {
+    if unsafe {
+        libc::renameat2(
+            directory,
+            left.as_ptr(),
+            directory,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    } == 0
+    {
         Ok(())
     } else {
         Err(refusal(format!(
-            "cannot secure previous hooks.json: {}",
+            "cannot atomically exchange hooks.json: {}",
+            io::Error::last_os_error()
+        )))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn exchange_at(directory: libc::c_int, left: &CStr, right: &CStr) -> Result<(), String> {
+    if unsafe {
+        libc::renameatx_np(
+            directory,
+            left.as_ptr(),
+            directory,
+            right.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(refusal(format!(
+            "cannot atomically exchange hooks.json: {}",
             io::Error::last_os_error()
         )))
     }
@@ -381,9 +469,15 @@ fn unlink_at(directory: libc::c_int, name: &CStr) -> Result<(), String> {
     }
 }
 
-fn restore_previous(directory: libc::c_int, backup: &CStr, hooks: &CStr) {
-    if entry_at(directory, hooks).ok().flatten().is_none() {
-        let _ = unsafe { libc::renameat(directory, backup.as_ptr(), directory, hooks.as_ptr()) };
+fn managed_path(name: &CStr) -> String {
+    format!("{CURSOR_DIR}/{}", name.to_string_lossy())
+}
+
+fn with_recovery(error: String, recovery_errors: Vec<String>) -> String {
+    if recovery_errors.is_empty() {
+        error
+    } else {
+        format!("{error}; {}", recovery_errors.join("; "))
     }
 }
 
@@ -443,6 +537,15 @@ mod tests {
     fn publish_fixture(home: &Path, before_commit: impl FnOnce(&Path)) -> Result<(), String> {
         let bytes = b"{\"version\":1}";
         publish_bytes(home, bytes, &sha256(bytes), before_commit)
+    }
+
+    fn publish_fixture_with_after(
+        home: &Path,
+        before_commit: impl FnOnce(&Path),
+        after_publish: impl FnOnce(&Path),
+    ) -> Result<(), String> {
+        let bytes = b"{\"version\":1}";
+        publish_bytes_with_after_publish(home, bytes, &sha256(bytes), before_commit, after_publish)
     }
 
     #[test]
@@ -556,6 +659,134 @@ mod tests {
         publish_fixture(&home, |_| {}).unwrap();
         assert_ne!(fs::metadata(&hooks).unwrap().ino(), first_inode);
         assert_eq!(fs::read(&hooks).unwrap(), b"{\"version\":1}");
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn replacement_commit_has_no_missing_managed_name_checkpoint() {
+        let home = fixture();
+        let cursor = home.join(CURSOR_DIR);
+        fs::create_dir(&cursor).unwrap();
+        fs::write(cursor.join(RAILS_FILE), b"managed before").unwrap();
+
+        publish_fixture_with_after(
+            &home,
+            |_| {},
+            |opened| {
+                let hooks = opened.join(RAILS_FILE);
+                assert!(fs::symlink_metadata(&hooks).unwrap().is_file());
+                assert_eq!(fs::read(hooks).unwrap(), b"{\"version\":1}");
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(cursor.join(RAILS_FILE)).unwrap(),
+            b"{\"version\":1}"
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn failed_automatic_restore_reports_and_preserves_exact_recovery_path() {
+        let home = fixture();
+        let cursor = home.join(CURSOR_DIR);
+        fs::create_dir(&cursor).unwrap();
+        fs::write(cursor.join(RAILS_FILE), b"managed before").unwrap();
+        let external = home.join("external");
+        fs::write(&external, b"operator bytes").unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = publish_fixture_with_after(
+            &home,
+            |_| {},
+            |opened| {
+                fs::set_permissions(opened, fs::Permissions::from_mode(0o555)).unwrap();
+            },
+        )
+        .unwrap_err();
+        fs::set_permissions(&cursor, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let recovery = fs::read_dir(&cursor)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.file_name().unwrap() != RAILS_FILE)
+            .unwrap();
+        let recovery_name = recovery.file_name().unwrap().to_string_lossy();
+        assert!(error.contains("automatic restore failed"));
+        assert!(error.contains(&format!(".cursor/{recovery_name}")));
+        assert_eq!(fs::read(recovery).unwrap(), b"managed before");
+        assert_eq!(fs::read(&external).unwrap(), b"operator bytes");
+        assert_eq!(
+            fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn failed_new_publication_rollback_reports_the_unremoved_hooks_file() {
+        let home = fixture();
+        let external = home.join("external");
+        fs::write(&external, b"operator bytes").unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = publish_fixture_with_after(
+            &home,
+            |_| {},
+            |opened| {
+                fs::set_permissions(opened, fs::Permissions::from_mode(0o555)).unwrap();
+            },
+        )
+        .unwrap_err();
+        let cursor = home.join(CURSOR_DIR);
+        fs::set_permissions(&cursor, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(error.contains("rollback failed to remove published hooks.json"));
+        assert_eq!(
+            fs::read(cursor.join(RAILS_FILE)).unwrap(),
+            b"{\"version\":1}"
+        );
+        assert_eq!(fs::read(&external).unwrap(), b"operator bytes");
+        assert_eq!(
+            fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn successful_automatic_restore_returns_the_publication_error_only() {
+        let home = fixture();
+        let cursor = home.join(CURSOR_DIR);
+        fs::create_dir(&cursor).unwrap();
+        fs::write(cursor.join(RAILS_FILE), b"managed before").unwrap();
+        let external = home.join("external");
+        fs::write(&external, b"operator bytes").unwrap();
+        let external_mode = fs::metadata(&external).unwrap().permissions().mode();
+
+        let error = publish_fixture_with_after(
+            &home,
+            |_| {},
+            |opened| {
+                fs::write(opened.join(RAILS_FILE), b"corrupt staged bytes").unwrap();
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("published hooks.json digest changed"));
+        assert!(!error.contains("automatic restore failed"));
+        assert!(!error.contains("is preserved at"));
+        assert_eq!(
+            fs::read(cursor.join(RAILS_FILE)).unwrap(),
+            b"managed before"
+        );
+        assert_eq!(fs::read_dir(&cursor).unwrap().count(), 1);
+        assert_eq!(fs::read(&external).unwrap(), b"operator bytes");
+        assert_eq!(
+            fs::metadata(&external).unwrap().permissions().mode(),
+            external_mode
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
