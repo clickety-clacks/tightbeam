@@ -1967,17 +1967,21 @@ mod tests {
         {
             std::fs::remove_file(&marker).unwrap();
             std::os::unix::fs::symlink(nested.join("missing-target"), &marker).unwrap();
-            assert!(super::current_session_key_from(&cwd)
-                .unwrap_err()
-                .contains("unreadable"));
+            assert!(
+                super::current_session_key_from(&cwd)
+                    .unwrap_err()
+                    .contains("unreadable")
+            );
             std::fs::remove_file(&marker).unwrap();
         }
         #[cfg(not(unix))]
         std::fs::remove_file(&marker).unwrap();
         std::fs::remove_file(root.join(".tightbeam-session")).unwrap();
-        assert!(super::current_session_key_from(&cwd)
-            .unwrap_err()
-            .starts_with("session identity unavailable"));
+        assert!(
+            super::current_session_key_from(&cwd)
+                .unwrap_err()
+                .starts_with("session identity unavailable")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2248,10 +2252,12 @@ mod tests {
         );
         assert_eq!(
             args::parse(
-                ["wake", "--role", "owner", "--prompt", "go", "--class", "", "--as", "coder",]
-                    .iter()
-                    .map(|value| (*value).to_owned())
-                    .collect()
+                [
+                    "wake", "--role", "owner", "--prompt", "go", "--class", "", "--as", "coder",
+                ]
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
             )
             .unwrap_err(),
             "--class requires a class name"
@@ -3532,13 +3538,15 @@ mod tests {
         fs::write(ancestor.join("work").join(".tightbeam-session"), "{").unwrap();
         let error = discover_with(|name| env.get(name).cloned(), &cwd, &root).unwrap_err();
         assert!(error.starts_with("malformed session file"));
-        assert!(error.contains(
-            &ancestor
-                .join("work")
-                .join(".tightbeam-session")
-                .display()
-                .to_string()
-        ));
+        assert!(
+            error.contains(
+                &ancestor
+                    .join("work")
+                    .join(".tightbeam-session")
+                    .display()
+                    .to_string()
+            )
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

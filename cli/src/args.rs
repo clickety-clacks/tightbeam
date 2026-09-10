@@ -1259,11 +1259,7 @@ fn js_number_json(value: f64) -> String {
         format!("{}{fraction}e{sign}{exponent}", &digits[..1])
     };
 
-    if negative {
-        format!("-{body}")
-    } else {
-        body
-    }
+    if negative { format!("-{body}") } else { body }
 }
 
 fn generated_key() -> String {
@@ -4154,9 +4150,11 @@ mod tests {
             "revoke-device",
             "promote-user",
         ] {
-            assert!(parse(strings(&[command]))
-                .unwrap_err()
-                .starts_with(&format!("unknown command: {command} —")));
+            assert!(
+                parse(strings(&[command]))
+                    .unwrap_err()
+                    .starts_with(&format!("unknown command: {command} —"))
+            );
         }
     }
 
@@ -4188,16 +4186,18 @@ mod tests {
 
     #[test]
     fn artifacts_accepts_only_work_item_and_session_filters() {
-        assert!(parse(strings(&[
-            "artifacts",
-            "--work-item",
-            "wi_1",
-            "--session",
-            "agent:writer:app",
-            "--as-user",
-            "flynn",
-        ]))
-        .is_ok());
+        assert!(
+            parse(strings(&[
+                "artifacts",
+                "--work-item",
+                "wi_1",
+                "--session",
+                "agent:writer:app",
+                "--as-user",
+                "flynn",
+            ]))
+            .is_ok()
+        );
 
         for unsupported in ["kind", "after", "before", "since", "from", "to"] {
             assert_eq!(
@@ -4218,17 +4218,19 @@ mod tests {
 
     #[test]
     fn restored_command_usage_rules_are_pinned() {
-        assert!(parse(strings(&[
-            "work-item-create",
-            "--title",
-            "x",
-            "--spec-ref",
-            "spec.md",
-            "--as-user",
-            "flynn",
-        ]))
-        .unwrap_err()
-        .contains("supplied together"));
+        assert!(
+            parse(strings(&[
+                "work-item-create",
+                "--title",
+                "x",
+                "--spec-ref",
+                "spec.md",
+                "--as-user",
+                "flynn",
+            ]))
+            .unwrap_err()
+            .contains("supplied together")
+        );
 
         assert!(matches!(
             parse(strings(&[
@@ -4278,28 +4280,32 @@ mod tests {
                 && priority == "6"
         ));
 
-        assert!(parse(strings(&[
-            "work-item-update",
-            "wi_1",
-            "--clear-spec-ref",
-            "--spec-ref",
-            "spec.md",
-            "--as-user",
-            "flynn",
-        ]))
-        .unwrap_err()
-        .contains("conflicts"));
+        assert!(
+            parse(strings(&[
+                "work-item-update",
+                "wi_1",
+                "--clear-spec-ref",
+                "--spec-ref",
+                "spec.md",
+                "--as-user",
+                "flynn",
+            ]))
+            .unwrap_err()
+            .contains("conflicts")
+        );
 
-        assert!(parse(strings(&[
-            "work-item-update",
-            "wi_1",
-            "--is-bug",
-            "true",
-            "--as-user",
-            "flynn",
-        ]))
-        .unwrap_err()
-        .starts_with("usage: tightbeam work-item-update"));
+        assert!(
+            parse(strings(&[
+                "work-item-update",
+                "wi_1",
+                "--is-bug",
+                "true",
+                "--as-user",
+                "flynn",
+            ]))
+            .unwrap_err()
+            .starts_with("usage: tightbeam work-item-update")
+        );
 
         assert_eq!(
             parse(strings(&[

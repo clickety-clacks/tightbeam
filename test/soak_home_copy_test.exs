@@ -7,6 +7,8 @@ defmodule Tightbeam.SoakHomeCopyTest do
 
   setup do
     root = Path.join(System.tmp_dir!(), "soak-home-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    root = Tightbeam.LiveBaseAdmission.canonical!(root)
     source = Path.join(root, "source")
     arena = Path.join(root, "arena")
     home = Tightbeam.Homes.home_path(source, "testhost", :claude)

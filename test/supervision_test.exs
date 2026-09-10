@@ -1710,7 +1710,53 @@ defmodule Tightbeam.SupervisionTest do
     Supervision.notify_terminal(name, "holder", retry_seq)
 
     assert_receive {:request_changed_before_park, :withdraw, ^stale_id}
-    assert_receive {:request_rechecked, :withdraw, 2}
+
+    try do
+      assert_receive {:request_rechecked, :withdraw, 2}
+    rescue
+      error in ExUnit.AssertionError ->
+        # Capture only this synthetic arena after the original assertion fails.
+        # Never trigger a sweep, retry a query through the proxy, or extend the wait.
+        for {label, read} <- [
+              {:supervisor,
+               fn ->
+                 case Process.whereis(name) do
+                   nil -> :not_running
+                   pid -> Process.info(pid, [:status, :current_stacktrace, :message_queue_len])
+                 end
+               end},
+              {:proxy, fn -> :sys.get_state(proxy, 100) end},
+              {:watermarks, fn -> DB.query(ctx.db, "SELECT * FROM supervision_watermarks") end},
+              {:requests,
+               fn ->
+                 DB.query(
+                   ctx.db,
+                   "SELECT id,status,parkWakeId FROM decision_requests ORDER BY rowid"
+                 )
+               end},
+              {:wakes, fn -> DB.query(ctx.db, "SELECT wakeId,state,assignmentId FROM wakes") end},
+              {:lifecycle,
+               fn ->
+                 DB.query(
+                   ctx.db,
+                   "SELECT kind,subject,detail FROM lifecycle_events ORDER BY id DESC LIMIT 20"
+                 )
+               end}
+            ] do
+          result =
+            try do
+              read.()
+            rescue
+              diagnostic_error -> {:diagnostic_error, Exception.message(diagnostic_error)}
+            catch
+              kind, reason -> {:diagnostic_error, kind, reason}
+            end
+
+          IO.inspect(result, label: "park-race-failure #{label}", limit: :infinity)
+        end
+
+        reraise error, __STACKTRACE__
+    end
 
     assert eventually(fn ->
              match?(

@@ -77,6 +77,7 @@ jobs:
 
   test:
     needs: metadata
+    if: needs.metadata.outputs.candidate_branch != 'release-candidate/dd36-darwin-diagnostic-8664'
     strategy:
       fail-fast: false
       matrix:
@@ -132,8 +133,78 @@ jobs:
           scripts/verify_mix.sh
           (cd cli && cargo fmt --check && cargo test)
 
+  darwin-diagnostic:
+    needs: metadata
+    if: needs.metadata.outputs.candidate_branch == 'release-candidate/dd36-darwin-diagnostic-8664'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    env:
+      CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
+      GIT_AUTHOR_NAME: tightbeam ci
+      GIT_AUTHOR_EMAIL: ci@tightbeam.invalid
+      GIT_COMMITTER_NAME: tightbeam ci
+      GIT_COMMITTER_EMAIL: ci@tightbeam.invalid
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify exact diagnostic checkout
+        run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "28"
+          elixir-version: "1.19.5"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Put synthetic harness CLI on PATH
+        run: echo "$GITHUB_WORKSPACE/priv/harness_cli" >> "$GITHUB_PATH"
+      - name: Build existing release CLI prerequisite
+        run: cargo build --locked --release --manifest-path cli/Cargo.toml
+      - name: Resolve existing locked Mix prerequisites
+        run: |
+          mix deps.get
+          git diff --exit-code -- mix.lock cli/Cargo.lock
+      - name: Compile existing source
+        run: mix compile
+      - name: Prepare isolated diagnostic evidence
+        run: |
+          directory=$(mktemp -d "$RUNNER_TEMP/dd36-darwin.XXXXXXXX")
+          directory=$(cd "$directory" && pwd -P)
+          printf 'DD36_DARWIN_DIAGNOSTIC_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+          python3 scripts/collect_darwin_diagnostic.py prepare "$directory" "$CANDIDATE_SHA"
+      - name: Run only four synthetic diagnostic subjects
+        run: |
+          set +e
+          scripts/verify_mix.sh test/supervision_test.exs:1672 \
+            test/live_base_lock_test.exs:62 \
+            test/live_base_lock_test.exs:113 \
+            test/live_base_lock_test.exs:128 \
+            > "$DD36_DARWIN_DIAGNOSTIC_DIR/focused.log" 2>&1
+          status=$?
+          printf '%s\n' "$status" > "$DD36_DARWIN_DIAGNOSTIC_DIR/exit.txt"
+          exit "$status"
+      - name: Collect only the recorded test VM crash
+        if: always() && env.DD36_DARWIN_DIAGNOSTIC_DIR != ''
+        run: python3 scripts/collect_darwin_diagnostic.py collect "$DD36_DARWIN_DIAGNOSTIC_DIR" "$CANDIDATE_SHA"
+      - uses: actions/upload-artifact@v4
+        if: always() && env.DD36_DARWIN_DIAGNOSTIC_DIR != ''
+        with:
+          name: darwin-diagnostic-${{ needs.metadata.outputs.candidate_sha }}
+          retention-days: 1
+          if-no-files-found: warn
+          path: |
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/runtime.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/vm.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/libraries.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/exit.txt
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/crash.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/focused.log
+
   package:
     needs: [metadata, test]
+    if: needs.metadata.outputs.candidate_branch != 'release-candidate/dd36-darwin-diagnostic-8664' && success()
     strategy:
       fail-fast: false
       matrix:

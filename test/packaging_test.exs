@@ -122,6 +122,8 @@ defmodule Tightbeam.PackagingTest do
 
   defp artifact_fixture(cli_version, gateway_version, manifest_version \\ "0.1.6", opts \\ []) do
     root = Path.join(System.tmp_dir!(), "tightbeam-package-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    root = Tightbeam.LiveBaseAdmission.canonical!(root)
     package = Path.join(root, "tightbeam")
     File.mkdir_p!(Path.join(package, "bin"))
     File.mkdir_p!(Path.join(package, "release/releases"))

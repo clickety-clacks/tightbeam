@@ -155,6 +155,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
 
   def run!(proof, opts) do
     tmp = Path.join(System.tmp_dir!(), "schema-shape-cold-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(tmp)
+    tmp = Tightbeam.LiveBaseAdmission.canonical!(tmp)
     prepared = Tightbeam.GuardRuntimeFixture.prepare!(tmp, "schema_shape_runtime.exs")
 
     try do

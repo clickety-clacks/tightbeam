@@ -39,6 +39,48 @@ if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
     System.halt(1)
   end
 
+  # One top-level synthetic diagnostic VM; never inherit this capture in children.
+  diagnostic_dir = System.get_env("DD36_DARWIN_DIAGNOSTIC_DIR")
+  System.delete_env("DD36_DARWIN_DIAGNOSTIC_DIR")
+
+  if diagnostic_dir do
+    true = :os.type() == {:unix, :darwin}
+    runner_tmp = Tightbeam.LiveBaseAdmission.canonical!(System.fetch_env!("RUNNER_TEMP"))
+    directory = Tightbeam.LiveBaseAdmission.canonical!(diagnostic_dir)
+    true = directory == diagnostic_dir
+    true = String.starts_with?(directory, runner_tmp <> "/")
+    :directory = File.lstat!(directory).type
+    candidate = System.fetch_env!("CANDIDATE_SHA")
+    true = Regex.match?(~r/\A[0-9a-f]{40}\z/, candidate)
+    {executable, 0} = System.cmd("/bin/ps", ["-p", System.pid(), "-o", "comm="])
+    executable = Tightbeam.LiveBaseAdmission.canonical!(String.trim(executable))
+    "beam.smp" = Path.basename(executable)
+
+    receipt = %{
+      pid: String.to_integer(System.pid()),
+      node: actual_node,
+      startedAtMs: System.system_time(:millisecond),
+      candidate: candidate,
+      executable: executable
+    }
+
+    libraries =
+      for {app, file} <- [{:tightbeam, "live_base_lock.so"}, {:exqlite, "sqlite3_nif.so"}] do
+        path = Tightbeam.LiveBaseAdmission.canonical!(Application.app_dir(app, "priv/" <> file))
+
+        %{
+          path: path,
+          sha256: Base.encode16(:crypto.hash(:sha256, File.read!(path)), case: :lower)
+        }
+      end
+
+    for {file, value} <- [{"vm.json", receipt}, {"libraries.json", %{diskLibraries: libraries}}] do
+      temporary = Path.join(directory, file <> ".pending")
+      File.write!(temporary, Tightbeam.JSON.encode!(value), [:exclusive])
+      File.rename!(temporary, Path.join(directory, file))
+    end
+  end
+
   # The claim is consumed by this top-level VM. Some conformance tests launch
   # nested focused Mix tests, and an argv-level node name deliberately does not
   # propagate to them. Leaving the claim in the environment would make those
