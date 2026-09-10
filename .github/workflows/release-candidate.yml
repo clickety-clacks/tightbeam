@@ -127,11 +127,53 @@ jobs:
       - name: Compile
         run: mix compile
 
+      - name: Prepare bounded Darwin failure evidence
+        if: runner.os == 'macOS'
+        env:
+          CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
+        run: |
+          directory=$(mktemp -d "$RUNNER_TEMP/dd36-darwin.XXXXXXXX")
+          directory=$(cd "$directory" && pwd -P)
+          printf 'DD36_DARWIN_DIAGNOSTIC_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+          python3 scripts/collect_darwin_diagnostic.py prepare "$directory" "$CANDIDATE_SHA"
+
       - name: Run authoritative gates
+        id: gates
+        env:
+          CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
         run: |
           mix format --check-formatted
-          scripts/verify_mix.sh
+          if [ "$RUNNER_OS" = macOS ]; then
+            set +e
+            scripts/verify_mix.sh > "$DD36_DARWIN_DIAGNOSTIC_DIR/full.log" 2>&1
+            status=$?
+            printf '%s\n' "$status" > "$DD36_DARWIN_DIAGNOSTIC_DIR/exit.txt"
+            cat "$DD36_DARWIN_DIAGNOSTIC_DIR/full.log"
+            [ "$status" -eq 0 ] || exit "$status"
+            set -e
+          else
+            scripts/verify_mix.sh
+          fi
           (cd cli && cargo fmt --check && cargo test)
+
+      - name: Collect bounded Darwin failure evidence
+        if: failure() && runner.os == 'macOS' && steps.gates.outcome == 'failure'
+        env:
+          CANDIDATE_SHA: ${{ needs.metadata.outputs.candidate_sha }}
+        run: python3 scripts/collect_darwin_diagnostic.py collect "$DD36_DARWIN_DIAGNOSTIC_DIR" "$CANDIDATE_SHA"
+      - uses: actions/upload-artifact@v4
+        if: failure() && runner.os == 'macOS' && steps.gates.outcome == 'failure'
+        with:
+          name: darwin-failure-${{ needs.metadata.outputs.candidate_sha }}
+          retention-days: 1
+          if-no-files-found: warn
+          path: |
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/runtime.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/vm.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/libraries.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/exit.txt
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/crash.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/full.log
 
   darwin-diagnostic:
     needs: metadata
