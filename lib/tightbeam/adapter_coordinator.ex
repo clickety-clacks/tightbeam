@@ -41,6 +41,7 @@ defmodule Tightbeam.AdapterCoordinator do
   """
 
   use GenServer
+  require Logger
 
   @type adapter_key :: Tightbeam.Placement.adapter_key()
 
@@ -60,6 +61,19 @@ defmodule Tightbeam.AdapterCoordinator do
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+  end
+
+  @doc false
+  def child_spec(opts) do
+    %{
+      id: Keyword.get(opts, :name, __MODULE__),
+      start: {__MODULE__, :start_link, [opts]},
+      type: :worker,
+      restart: :permanent,
+      # The normal worker default (5s) is shorter than identity recovery plus
+      # signal delivery. Let terminate/2 settle the durable process group.
+      shutdown: 30_000
+    }
   end
 
   @doc """
@@ -168,6 +182,10 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def init(opts) do
+    # Supervisor shutdown must reach terminate/2 before AdapterSupervisor goes
+    # away, because that callback settles the OS process group it owns.
+    Process.flag(:trap_exit, true)
+
     db = Keyword.get(opts, :db, Tightbeam.DB)
     :ok = Tightbeam.HarnessProcess.ensure_schema(db)
     :ok = Tightbeam.HarnessProcess.reconcile(db)
@@ -196,6 +214,21 @@ defmodule Tightbeam.AdapterCoordinator do
        load_active: %{},
        load_queue: %{}
      }}
+  end
+
+  @impl true
+  def terminate(_reason, state) do
+    Enum.reduce(Map.keys(state.adapters), state, fn key, state ->
+      {result, state} = shutdown_adapter(key, state)
+
+      if result != :ok do
+        Logger.error("adapter shutdown cleanup failed for #{key_name(key)}: #{inspect(result)}")
+      end
+
+      state
+    end)
+
+    :ok
   end
 
   @impl true
@@ -396,6 +429,26 @@ defmodule Tightbeam.AdapterCoordinator do
       end
 
     result = if reconcile_result == :already_resolved, do: :ok, else: reconcile_result
+    state = retire_adapter(key, state)
+    if result == :ok, do: Tightbeam.HarnessProcess.complete_park(state.db, key)
+
+    {result, state}
+  end
+
+  defp shutdown_adapter(key, state) do
+    {:ok, process_row} = Tightbeam.HarnessProcess.begin_park(state.db, key)
+    state = cancel_pending_starts(key, state)
+
+    # Keep the BEAM adapter alive until park has authorized and signalled its
+    # recorded group. Retiring it first can remove the leader while detached
+    # descendants remain, forcing the signal helper to refuse the stale group.
+    result =
+      case process_row do
+        :no_launch -> :ok
+        row -> Tightbeam.HarnessProcess.park(state.db, row)
+      end
+
+    result = if result == :already_resolved, do: :ok, else: result
     state = retire_adapter(key, state)
     if result == :ok, do: Tightbeam.HarnessProcess.complete_park(state.db, key)
 
@@ -663,6 +716,8 @@ defmodule Tightbeam.AdapterCoordinator do
         {:noreply, finish_context_request(request, result, state)}
     end
   end
+
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
 
   defp start_adapter(key, entry, state, context) do
     if Tightbeam.HarnessProcess.fenced?(state.db, key) do
