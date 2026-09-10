@@ -160,7 +160,7 @@ defmodule GuardCheckoutRefusal do
                client_message_id: "c_cursor_refusal"
              )
 
-    assert_receive {:ensure_lane, "k1"}
+    assert_receive {:ensure_lane, "k1"}, 2_000
     assert {:ok, turn} = Ledger.claim_next(db, "k1", "test")
 
     assert {:error, %{reason: ^refusal, terminal_publish: publish}} =
