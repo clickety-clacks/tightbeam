@@ -452,8 +452,12 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A group this process may hand files to that is not its primary group —
+    /// A group this process can hand files to that is not its primary group —
     /// the shape of a provisioned `tightbeam-workspace` grant on any host.
+    ///
+    /// Some container runtimes report an unmapped overflow group in the
+    /// supplementary list but reject it as a chown operand. Probe the actual
+    /// filesystem operation so those hosts skip an impossible grant fixture.
     fn supplementary_group() -> Option<u32> {
         let own = unsafe { libc::getgid() };
         let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
@@ -466,7 +470,13 @@ mod tests {
             return None;
         }
         groups.truncate(written as usize);
-        groups.into_iter().find(|gid| *gid != own)
+        let probe = fresh_root("group-probe");
+        fs::write(&probe, []).ok()?;
+        let usable = groups
+            .into_iter()
+            .find(|gid| *gid != own && std::os::unix::fs::chown(&probe, None, Some(*gid)).is_ok());
+        fs::remove_file(&probe).unwrap();
+        usable
     }
 
     fn fresh_root(label: &str) -> PathBuf {
