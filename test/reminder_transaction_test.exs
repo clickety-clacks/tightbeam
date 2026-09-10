@@ -61,6 +61,16 @@ defmodule Tightbeam.ReminderTransactionTest do
 
       successor_seq =
         if recovery == :wake do
+          alias Tightbeam.Firehose.Hub
+
+          :ok =
+            DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('fixture',0,1)")
+
+          hub = start_supervised!({Hub, name: Hub})
+
+          :ok =
+            Hub.register(hub, self(), %{mode: :all, db: db, user_id: "fixture", is_admin: false})
+
           assert {:ok, [[request_ref]]} =
                    DB.query(db, "SELECT requestRef FROM turns WHERE seq=?1", [source_seq])
 
@@ -75,6 +85,11 @@ defmodule Tightbeam.ReminderTransactionTest do
 
           rebound = state(db)
 
+          assert_receive {:firehose_notice, %{"class" => "wake.scheduled", "payload" => notice}}
+          assert notice["wakeId"] == successor_wake
+          assert notice["assignmentId"] == "r1-assignment"
+          Hub.delivered(hub, self())
+
           assert {:ok, {:retry, ^successor_wake}} =
                    DB.transaction(
                      db,
@@ -82,6 +97,7 @@ defmodule Tightbeam.ReminderTransactionTest do
                    )
 
           assert state(db) == rebound
+          refute_receive {:firehose_notice, _}
           assert rebound["pending"]["consumer"] == %{"wake" => successor_wake}
           assert Tightbeam.Wakes.get(db, successor_wake).assignment_id == "r1-assignment"
 
@@ -277,6 +293,79 @@ defmodule Tightbeam.ReminderTransactionTest do
 
     assert {:ok, [["{malformed"]]} =
              DB.query(db, "SELECT reminderState FROM assignments WHERE id='r1-assignment'")
+  end
+
+  test "Firehose typed legacy consequence publishes only newly inserted facts", %{db: db} do
+    alias Tightbeam.{ConditionFacts, Wakes, Firehose.Hub}
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('fixture',0,1)")
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO attests(id,assignmentId,kind,bySession,ts) VALUES('att-public','r1-assignment','progress','r1-holder',1)"
+      )
+
+    :ok =
+      DB.execute(
+        db,
+        "INSERT INTO condition_facts(ts,kind,scope,origin,ownerUserId,payload) VALUES(1,'obligation-consequence-changed','r1-assignment','session:r1-holder','fixture',NULL)"
+      )
+
+    assert {:ok, [legacy]} = DB.query(db, "SELECT * FROM condition_facts")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "fixture", is_admin: false})
+
+    scheduler =
+      start_supervised!({Wakes, name: nil, db: db, tick_ms: 60_000, deliver: fn _ -> :ok end})
+
+    payload = %{
+      "assignmentId" => "r1-assignment",
+      "consequenceKey" => "public",
+      "revision" => "r1",
+      "attentionRequestId" => "attention-public",
+      "evidenceAttestId" => "att-public",
+      "explicitAttention" => true
+    }
+
+    input = %{
+      kind: "obligation-consequence-changed",
+      scope: "r1-assignment",
+      origin: "session:r1-holder",
+      principal: {:session, "r1-holder"},
+      payload: payload
+    }
+
+    call = %{
+      verb: "condition",
+      origin: input.origin,
+      principal: input.principal,
+      session_key: "r1-holder",
+      params: %{},
+      firehose_in_txn: true
+    }
+
+    file = fn input -> ConditionFacts.file_idempotent_with_effect(db, scheduler, input, call) end
+    assert {fact, true} = file.(input)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "condition_fact.filed", "payload" => notice}}
+    assert notice["factId"] == fact.fact_id
+    Hub.delivered(hub, self())
+    assert {^fact, false} = file.(input)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {{:error, %{code: "conflict"}}, false} =
+             file.(%{input | payload: Map.put(payload, "revision", "changed")})
+
+    assert {{:error, %{code: "not_authorized"}}, false} =
+             file.(%{input | principal: {:session, "other"}})
+
+    refute_receive {:firehose_notice, _}
+    assert {:ok, [^legacy]} = DB.query(db, "SELECT * FROM condition_facts WHERE payload IS NULL")
+    assert {:ok, [[2]]} = DB.query(db, "SELECT count(*) FROM condition_facts")
+    assert state(db)["currentConsequence"] == payload
   end
 
   test "legacy null consequence remains intact through authorized typed admission and replay", %{

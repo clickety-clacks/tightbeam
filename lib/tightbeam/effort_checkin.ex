@@ -222,6 +222,38 @@ defmodule Tightbeam.EffortCheckin do
     )
   end
 
+  @doc "Capture a fresh workspace baseline before reopening a monitored assignment."
+  @spec prepare_reopen_arm(DB.server(), map(), String.t()) :: map() | nil
+  def prepare_reopen_arm(db, config, assignment_id) do
+    case generation_for_assignment(db, assignment_id, :current) do
+      nil ->
+        nil
+
+      generation ->
+        session = Org.get(db, generation.holder_key)
+
+        %{
+          prior_generation: generation.generation,
+          arm: prepare_arm(config, session, relative_root(config, generation))
+        }
+    end
+  end
+
+  @doc "Arm a fresh inactivity generation when a formerly monitored assignment reopens."
+  @spec arm_reopened_in_txn(Txn.t(), map(), map(), map() | nil) :: :ok
+  def arm_reopened_in_txn(_txn, _config, _assignment, nil), do: :ok
+
+  def arm_reopened_in_txn(%Txn{} = txn, config, assignment, prepared) do
+    case current_generation(txn, assignment.id) do
+      %{generation: generation} when generation == prepared.prior_generation ->
+        arm_in_txn(txn, config, assignment, prepared.arm)
+        :ok
+
+      _ ->
+        raise "effort generation changed before reopen commit"
+    end
+  end
+
   @doc "Capture monitored assignments on a holder against a destination placement."
   @spec prepare_holder_rearms(DB.server(), map(), map()) :: [map()]
   def prepare_holder_rearms(db, config, destination_session) do
@@ -456,6 +488,11 @@ defmodule Tightbeam.EffortCheckin do
         error("not_authorized", "current expecter required")
 
       request.status == "ruled" and request.decision == action and request.ruled_by == actor ->
+        {:ok, :ok} =
+          DB.transaction(db, fn txn ->
+            Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+          end)
+
         request
 
       request.status != "open" ->
@@ -480,15 +517,29 @@ defmodule Tightbeam.EffortCheckin do
         case DB.transaction_then(
                db,
                fn txn ->
-                 rule_in_txn(
-                   txn,
-                   config,
-                   request,
-                   action,
-                   actor,
-                   call.principal,
-                   fresh
-                 )
+                 before = request_for_id(txn, request.id)
+
+                 result =
+                   rule_in_txn(
+                     txn,
+                     config,
+                     request,
+                     action,
+                     actor,
+                     call.principal,
+                     fresh
+                   )
+
+                 if is_map(result) and not Map.has_key?(result, :code) do
+                   if before.status == "open" do
+                     snapshot = Escalation.raw_by_id_in_txn(txn, result.id)
+                     Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, snapshot)
+                   else
+                     Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+                   end
+                 end
+
+                 result
                end,
                fn txn, result ->
                  Tightbeam.Wakes.row_commit_in_txn(txn, [])

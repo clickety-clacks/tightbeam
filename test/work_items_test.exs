@@ -35,6 +35,283 @@ defmodule Tightbeam.WorkItemsTest do
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
+  test "Firehose Gateway wake replay and cancel have one state notice", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    request =
+      call("wake", {:user, "flynn"}, %{
+        prompt: "Synthetic wake",
+        at: System.system_time(:millisecond) + 60_000,
+        idempotency_key: "published-wake"
+      })
+      |> Map.put(:session_key, ctx.holder.session_key)
+
+    assert {:ok, wake} = Dispatch.dispatch(ctx.db, ctx.handlers, request)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "wake.scheduled", "payload" => payload}}
+    assert payload["wakeId"] == wake.wake_id
+    Hub.delivered(hub, self())
+    assert {:ok, ^wake} = Dispatch.dispatch(ctx.db, ctx.handlers, request)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+    cancel = %{request | params: %{cancel_wake_id: wake.wake_id}}
+    assert {:ok, %{canceled: true}} = Dispatch.dispatch(ctx.db, ctx.handlers, cancel)
+
+    notices =
+      for _ <- 1..2 do
+        assert_receive {:firehose_notice, notice}
+        Hub.delivered(hub, self())
+        notice
+      end
+
+    assert Enum.sort(Enum.map(notices, & &1["class"])) == ["verb.accepted", "wake.canceled"]
+    refute_receive {:firehose_notice, _}
+    assert {:ok, %{canceled: false}} = Dispatch.dispatch(ctx.db, ctx.handlers, cancel)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+  end
+
+  test "Firehose timer publication commits once and rolled-back handoff stays silent", ctx do
+    alias Tightbeam.{Wakes, Firehose.Hub}
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+    parent = self()
+
+    scheduler =
+      start_supervised!(
+        {Wakes,
+         name: nil,
+         db: ctx.db,
+         tick_ms: 60_000,
+         deliver: fn wake -> send(parent, {:timer_delivered, wake.wake_id}) end}
+      )
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.holder.session_key,
+        origin: "user:flynn",
+        prompt: "Synthetic timer",
+        due_at: System.system_time(:millisecond)
+      })
+
+    assert {:error, %RuntimeError{message: "rollback publication"}} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
+               raise "rollback publication"
+             end)
+
+    refute_receive {:firehose_notice, _}
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_receive {:timer_delivered, wake_id}
+    assert wake_id == wake.wake_id
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["state"] == "fired"
+    Hub.delivered(hub, self())
+    assert :ok = Wakes.fire_due(scheduler)
+    refute_receive {:timer_delivered, _}
+    refute_receive {:firehose_notice, _}
+    assert {:ok, nil} = DB.transaction(ctx.db, fn txn -> Wakes.get_in_txn(txn, "missing") end)
+  end
+
+  test "Firehose lifecycle publishes exact changed versions and observation-only noops", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    Enum.each(["close", "fail"], fn terminal ->
+      item = create(ctx, {:user, "flynn"}, %{title: "Lifecycle item"})
+
+      Enum.reduce(
+        [
+          {"work-item-update", %{title: "Changed lifecycle"}, "work_item.updated"},
+          {"work-item-icebox", %{}, "work_item.iceboxed"},
+          {"work-item-reopen", %{}, "work_item.reopened"},
+          {"work-item-#{terminal}", %{reason: "explicit fixture disposition"},
+           "work_item.#{if terminal == "close", do: "closed", else: "failed"}"}
+        ],
+        item.rowVersion,
+        fn {verb, params, class}, previous_version ->
+          request =
+            call(verb, {:user, "flynn"}, Map.put(params, :work_item_id, item.id))
+            |> Map.put(:firehose_hub, hub)
+
+          assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, request)
+          assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+          Hub.delivered(hub, self())
+          assert_receive {:firehose_notice, %{"class" => ^class, "payload" => payload}}
+          Hub.delivered(hub, self())
+          assert payload["id"] == item.id
+          assert payload["rowVersion"] > previous_version
+
+          assert {:ok, [[version]]} =
+                   DB.query(
+                     ctx.db,
+                     "SELECT rowVersion FROM work_item_versions WHERE workItemId=?1",
+                     [item.id]
+                   )
+
+          assert payload["rowVersion"] == version
+          assert {:ok, ^result} = Dispatch.dispatch(ctx.db, ctx.handlers, request)
+          assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+          Hub.delivered(hub, self())
+          refute_receive {:firehose_notice, _}
+
+          assert {:ok, [[^version]]} =
+                   DB.query(
+                     ctx.db,
+                     "SELECT rowVersion FROM work_item_versions WHERE workItemId=?1",
+                     [item.id]
+                   )
+
+          version
+        end
+      )
+
+      assert %{code: "not_authorized"} =
+               WorkItems.__handle__(
+                 ctx.db,
+                 "work-item-reopen",
+                 call("work-item-reopen", {:user, "other"}, %{work_item_id: item.id})
+                 |> Map.merge(%{firehose_in_txn: true, firehose_hub: hub})
+               )
+
+      refute_receive {:firehose_notice, _}
+      assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+    end)
+  end
+
+  test "Firehose Gateway routing creation publishes committed wake once", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    call =
+      create_call({:user, "flynn"}, %{
+        title: "Gateway routed item",
+        idempotency_key: "gateway-route"
+      })
+
+    assert {:ok, item} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+
+    notices =
+      for _ <- 1..3 do
+        assert_receive {:firehose_notice, notice}
+        Hub.delivered(hub, self())
+        notice
+      end
+
+    assert Enum.sort(Enum.map(notices, & &1["class"])) == [
+             "verb.accepted",
+             "wake.scheduled",
+             "work_item.created"
+           ]
+
+    wake_notice = Enum.find(notices, &(&1["class"] == "wake.scheduled"))
+
+    assert {:ok, [[wake_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert wake_notice["refs"]["workItemId"] == item.id
+    assert wake_notice["payload"]["wakeId"] == wake_id
+    assert {:ok, ^item} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE wakeId=?1", [wake_id])
+  end
+
+  test "Firehose work-item creation commits routing once and replay is observation only", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+    parent = self()
+
+    call =
+      create_call({:user, "flynn"}, %{title: "Published item", idempotency_key: "firehose-item"})
+      |> Map.merge(%{
+        firehose_in_txn: true,
+        firehose_hub: hub,
+        on_routing_wake_scheduled_in_txn: fn txn, wake ->
+          assert [[1]] =
+                   Tightbeam.DB.Txn.q(txn, "SELECT COUNT(*) FROM wakes WHERE wakeId=?1", [
+                     wake.wake_id
+                   ])
+
+          DB.Txn.handoff(txn, parent, {:routing_commit, wake.wake_id})
+        end,
+        on_routing_wake_scheduled: fn wake -> send(parent, {:routing_after, wake.wake_id}) end
+      })
+
+    item = WorkItems.__handle__(ctx.db, "work-item-create", call)
+    assert_receive {:"$gen_cast", {:routing_commit, wake_id}}
+    assert_receive {:routing_after, ^wake_id}
+
+    assert {:ok, [[^wake_id]]} =
+             DB.query(ctx.db, "SELECT routingWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "work_item.created", "payload" => payload}}
+    assert payload["id"] == item.id
+    Hub.delivered(hub, self())
+    assert WorkItems.__handle__(ctx.db, "work-item-create", call) == item
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+    refute_receive {:"$gen_cast", {:routing_commit, _}}
+    refute_receive {:routing_after, _}
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE wakeId=?1", [wake_id])
+
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
+  test "Firehose work-item routing callback failure rolls back rows and notices", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    call =
+      create_call({:user, "flynn"}, %{title: "Rolled back item", idempotency_key: "failed-item"})
+      |> Map.merge(%{
+        firehose_in_txn: true,
+        firehose_hub: hub,
+        on_routing_wake_scheduled_in_txn: fn _txn, _wake -> raise "routing callback refused" end
+      })
+
+    assert {:ok, before_wakes} = DB.query(ctx.db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert_raise RuntimeError, "routing callback refused", fn ->
+      WorkItems.__handle__(ctx.db, "work-item-create", call)
+    end
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM work_items WHERE title='Rolled back item'")
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM wire_idempotency WHERE idempotencyKey='failed-item'"
+             )
+
+    assert {:ok, ^before_wakes} = DB.query(ctx.db, "SELECT * FROM wakes ORDER BY wakeId")
+    refute_receive {:firehose_notice, _}
+  end
+
   test "schema pins typed creator, paired spec ref, owner, and the four disposition states",
        %{db: db} do
     assert {:ok, [[1]]} = DB.query(db, "PRAGMA foreign_keys")
@@ -502,7 +779,12 @@ defmodule Tightbeam.WorkItemsTest do
     Assignments.__handle__(ctx.db, "assign", assignment_call)
   end
 
-  defp revoke_call(id), do: call("revoke-assignment", {:user, "flynn"}, %{assignment_id: id})
+  defp revoke_call(id),
+    do:
+      call("revoke-assignment", {:user, "flynn"}, %{
+        assignment_id: id,
+        reason: "work item disposition"
+      })
 
   defp dispatch!(ctx, call) do
     assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)

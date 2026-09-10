@@ -17,43 +17,54 @@ The full proof table lives in `harness-support.md`.
   ACP contract.
 - CAP-002 model+effort: Codex PARITY; Claude
   `DIV-MODEL-CLAUDE-ENVIRONMENT` because its offered set can depend on cwd and
-  settings. A refusal must preserve a loaded session. Cursor's local authenticated inventory is
-  intersected with its ACP-selectable refs. Cursor exposes no separate effort.
-- CAP-003 slash commands: Claude and Codex PARITY passthrough. Claude
-  `/clear /compact /model` are verified. Codex vocabulary includes
-  `/status /mcp /skills /review /compact /logout /new /clear`, plus configured
-  skills and domain commands. Cursor has local ACP passthrough, but its vendor
+  settings. A refusal must preserve a loaded session. Cursor's local
+  authenticated inventory is intersected with its ACP-selectable refs. Cursor
+  exposes no separate effort.
+- CAP-003 slash commands: PARITY passthrough for Claude and Codex. Claude
+  `/clear /compact /model` are verified. Codex vocabulary includes `/status
+  /mcp /skills /review /compact /logout /new /clear`, plus configured skills
+  and domain commands. Cursor has local ACP passthrough, but its vendor
   vocabulary is not enumerated or promised.
-- CAP-004 projected identity: Claude and Codex PARITY through system-prompt and
-  developer-instruction metadata. Cursor has local harness instruction metadata.
-- CAP-005 native skills: Claude and Codex PARITY progressive disclosure under
+- CAP-004 projected identity: keep Claude system-prompt append metadata and
+  Codex developer-instruction metadata. Apply changed Claude guidance at the
+  next cold load; do not claim guidance-only warm refresh. Retain the dr4409
+  Codex new/resume/load transport anchors until an equivalent channel is
+  accepted. Keep session guidance separate from skill materialization and
+  shared homes. A malformed, missing, or wrong-session identity must fail
+  closed; do not use hook source inspection as proof of authenticated
+  first-request delivery. Cursor has local harness instruction metadata.
+- CAP-005 native skills: Claude and Codex use progressive disclosure under
   `.claude/skills` / `.codex/skills`. Cursor materializes local skills under
   `.cursor/skills`; Tightbeam owns `tightbeam__*` only.
-- CAP-006 vendor-native skills/commands: Claude and Codex PARITY and preserved
-  additively. Cursor local reconciliation sentinels prove leaves outside its
-  owned set survive.
-- CAP-007 gate statutes: Claude and Codex PARITY through Claude PreToolUse
-  settings and Codex PreToolUse hooks after the fail-closed boot wiring-check.
-  Cursor compiles faithful
+- CAP-006 vendor-native skills/commands: preserved additively. Cursor local
+  reconciliation sentinels prove leaves outside its owned set survive.
+- CAP-007 gate statutes: Claude uses PreToolUse settings and Codex uses
+  PreToolUse hooks after the fail-closed boot wiring-check. Cursor compiles faithful
   before hooks, but negatively refuses MCP and every matcher with no enforcing
   before-event as `DIV-RAILS-CURSOR-UNMAPPABLE-BEFORE-HOOK`.
-- CAP-008 future block/check tiers: reserved divergence on every harness.
-- CAP-009 credential lifecycle: Claude and Codex include stopped-runtime
-  harvest. Cursor has local API-key readiness and rotation and harvests nothing.
-- CAP-010 token environment: Cursor locally injects only
-  `CURSOR_API_KEY`. No subscription-longevity equivalence is claimed.
+- CAP-008 future block/check tiers: reserved named divergence on every harness;
+  do not claim allow/ask/rewrite support.
+- CAP-009 harness-home credential ownership: use one regular credential file
+  per exact machine/harness home for Claude and Codex. Reconciliation must not
+  copy, link, or harvest it. Preserve the non-rotating Claude setup-token
+  contract and the single Codex refresher; do not claim rotation or
+  provider-longevity parity. Cursor instead has a local owner-only API-key bank,
+  projects only non-secret preferences, and harvests nothing.
+- CAP-010 token environment: Claude and Codex retain their current mechanisms.
+  Cursor locally injects only `CURSOR_API_KEY`. No subscription-longevity
+  equivalence is claimed.
 - CAP-011 onboarding: Cursor is API-key-only `DIV-CURSOR-API-KEY-ONLY`.
   Subscription vectors are explicitly unsupported, fail closed, and inject no key.
-- CAP-012 progress: Claude and Codex PARITY rich ACP updates. Cursor has a local
+- CAP-012 progress: Claude and Codex provide rich ACP updates. Cursor has a local
   ACP contract; no live Cursor run is claimed.
-- CAP-013 usage telemetry: Claude and Codex PARITY emission. Cursor has a local
+- CAP-013 usage telemetry: Claude and Codex emit usage. Cursor has a local
   ACP contract; no live Cursor run is claimed.
 - CAP-014 compaction: Claude `DIV-COMPACTION-CLAUDE-ABSENT`; Codex
   `DIV-COMPACTION-CODEX-UNPROJECTED`; Cursor
   `DIV-COMPACTION-CURSOR-UNPROJECTED`.
-- CAP-015 hash-gated homes: Claude and Codex PARITY preservation. Cursor has a
+- CAP-015 hash-gated homes: Claude and Codex preserve their owned entries. Cursor has a
   local contract and owns only `cli-config.json` and compiled `hooks.json`.
-- CAP-016 harness switching: Claude and Codex PARITY with the history barrier;
+- CAP-016 harness switching: Claude and Codex retain the history barrier;
   the generic history barrier applies to Cursor locally.
 - CAP-017 auth-event classification: Claude `DIV-AUTH-CLAUDE-UNKNOWN`; Codex
   classifies account updates; Cursor is negative-tested as always unknown under

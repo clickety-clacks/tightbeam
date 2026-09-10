@@ -44,10 +44,9 @@ defmodule Tightbeam.Placement do
        the gateway over the network; the org token is never placed in remote env.
 
   3. `deliver_home/3` — materialize the generic `{harness, machine}` home on
-     the session's host. Regeneration owns only the credential entry, rails
-     artifact, and `.tightbeam/`; every other harness-owned byte survives.
-     Remote regeneration follows the same stop, harvest, replace, and relink
-     order without ever deleting the home. Credentials remain host-local.
+     the session's host. Regeneration owns only the rails artifact, projection
+     manifest, and baseline skills; every harness-owned byte survives.
+     It never reads, removes, copies, links, or writes the credential file.
 
      `materialize_identity/4` separately projects elected skills into the
      exact session cwd and writes the reserved git exclusion only when that
@@ -70,7 +69,19 @@ defmodule Tightbeam.Placement do
 
   require Logger
 
-  alias Tightbeam.{Archetypes, DB, Harness, HarnessHealth, Homes, Identity, Org, Rails}
+  alias Tightbeam.{
+    AdminProjection,
+    Archetypes,
+    DB,
+    Harness,
+    HarnessHealth,
+    Homes,
+    Identity,
+    Org,
+    Rails,
+    StateResources
+  }
+
   import Bitwise
 
   defmodule Refusal do
@@ -248,6 +259,79 @@ defmodule Tightbeam.Placement do
     end
   end
 
+  @doc false
+  def set_env_overlay_with_firehose(db, host, harness, name, value, set_by, call) do
+    with :ok <- valid_env_name(name),
+         {:ok, _module} <- known_harness(harness),
+         :ok <- unreserved_env_name(name) do
+      updated_at = System.system_time(:millisecond)
+
+      case DB.transaction(db, fn txn ->
+             if known_host_in_txn?(txn, host) do
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO harness_env_overlays (host, harness, name, value, setBy, setAt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(host, harness, name) DO UPDATE SET
+                   value = excluded.value,
+                   setBy = excluded.setBy,
+                   setAt = excluded.setAt
+                 WHERE harness_env_overlays.value != excluded.value
+                 """,
+                 [host, harness, name, value, set_by, updated_at]
+               )
+
+               changed = DB.Txn.changes(txn) == 1
+               Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+               if changed do
+                 row_version =
+                   AdminProjection.allocate_in_txn(
+                     txn,
+                     "host environment",
+                     [host, harness, name],
+                     updated_at
+                   )
+
+                 DB.Txn.q(
+                   txn,
+                   """
+                   INSERT INTO host_environment_projection
+                     (host, harness, name, valuePresent, updatedAt, rowVersion)
+                   VALUES (?1, ?2, ?3, 1, ?4, ?5)
+                   ON CONFLICT(host, harness, name) DO UPDATE SET
+                     valuePresent = 1, updatedAt = excluded.updatedAt,
+                     rowVersion = excluded.rowVersion
+                   """,
+                   [host, harness, name, updated_at, row_version]
+                 )
+
+                 projection = StateResources.query_host_environment(txn, host, harness, name)
+
+                 Tightbeam.Firehose.Publisher.committed_in_txn(
+                   txn,
+                   "host_env.updated",
+                   projection,
+                   %{"host" => host, "harness" => harness, "name" => name}
+                 )
+               end
+
+               %{
+                 projection: StateResources.query_host_environment(txn, host, harness, name),
+                 changed: changed
+               }
+             else
+               denial = unknown_host_denial(host, harness)
+               {:error, %{denial | message: "unknown_host rule: " <> denial.message}}
+             end
+           end) do
+        {:ok, result} -> result
+        {:error, error} -> raise error
+      end
+    end
+  end
+
   @doc "List stored overlay rows, optionally filtered by exact host and harness."
   @spec env_overlays(DB.server(), String.t() | nil, String.t() | nil) :: [map()]
   def env_overlays(db, host \\ nil, harness \\ nil) do
@@ -294,6 +378,61 @@ defmodule Tightbeam.Placement do
       end)
 
     %{host: host, harness: harness, name: name, removed: removed}
+  end
+
+  @doc false
+  def unset_env_overlay_with_firehose(db, host, harness, name, call) do
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        DB.Txn.q(
+          txn,
+          "DELETE FROM harness_env_overlays WHERE host = ?1 AND harness = ?2 AND name = ?3",
+          [host, harness, name]
+        )
+
+        changed = DB.Txn.changes(txn) == 1
+        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+        if changed do
+          updated_at = System.system_time(:millisecond)
+
+          row_version =
+            AdminProjection.allocate_in_txn(
+              txn,
+              "host environment",
+              [host, harness, name],
+              updated_at
+            )
+
+          DB.Txn.q(
+            txn,
+            """
+            INSERT INTO host_environment_projection
+              (host, harness, name, valuePresent, updatedAt, rowVersion)
+            VALUES (?1, ?2, ?3, 0, ?4, ?5)
+            ON CONFLICT(host, harness, name) DO UPDATE SET
+              valuePresent = 0, updatedAt = excluded.updatedAt,
+              rowVersion = excluded.rowVersion
+            """,
+            [host, harness, name, updated_at, row_version]
+          )
+
+          item = StateResources.query_host_environment(txn, host, harness, name)
+
+          Tightbeam.Firehose.Publisher.committed_in_txn(
+            txn,
+            "host_env.updated",
+            item,
+            %{"host" => host, "harness" => harness, "name" => name}
+          )
+        end
+
+        projection = StateResources.query_host_environment(txn, host, harness, name)
+
+        %{projection: projection, changed: changed}
+      end)
+
+    result
   end
 
   @doc "Replace one host's ordered toolchain directories in the host registry."
@@ -571,6 +710,54 @@ defmodule Tightbeam.Placement do
       end)
 
     {:ok, entry}
+  end
+
+  @doc false
+  def register_host_with_firehose(db, name, config, call) do
+    entry = %{
+      ssh: Map.fetch!(config, :ssh),
+      base_dir: Map.fetch!(config, :base_dir),
+      cli_bin: Map.get(config, :cli_bin),
+      adapter_bin_dir: Map.get(config, :adapter_bin_dir)
+    }
+
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        new_host? = DB.Txn.q(txn, "SELECT 1 FROM hosts WHERE name = ?1", [name]) == []
+
+        needs_projection? =
+          new_host? or AdminProjection.version(txn, "hosts", name) == nil
+
+        upsert_host_in_txn(txn, name, entry)
+        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+        projection =
+          if needs_projection? do
+            AdminProjection.allocate_in_txn(
+              txn,
+              "hosts",
+              name,
+              System.system_time(:millisecond)
+            )
+
+            item = StateResources.query_host(txn, name)
+
+            Tightbeam.Firehose.Publisher.committed_in_txn(
+              txn,
+              "host.registered",
+              item,
+              %{"host" => name}
+            )
+
+            item
+          else
+            StateResources.query_host(txn, name)
+          end
+
+        %{entry: entry, projection: projection, changed: new_host?}
+      end)
+
+    {:ok, result}
   end
 
   @doc """
@@ -1613,6 +1800,31 @@ defmodule Tightbeam.Placement do
       if harness == :cursor,
         do: Tightbeam.Harness.Cursor.helper_path_dir() <> ":" <> adapter_path(config, host_config)
 
+    desired = %{
+      harness: harness,
+      machine: host,
+      rails: rails,
+      rails_path: rails_path,
+      # The pinned model tracks the SESSION'S resolved selection when the caller
+      # supplies one (`:model`), falling back to the org default only when there
+      # is no session context (adapter cold-boot). The claude adapter's offered
+      # /accepted model set follows this home pin (wi_263814d3), so pinning the
+      # selected model is what makes the adapter accept it at session/new — the
+      # cure for the accepted-then-dead class.
+      default_model: Keyword.get(opts, :model) || Map.get(config, :default_model)
+    }
+
+    desired =
+      if harness == :cursor do
+        Map.put(
+          desired,
+          :auth_dir,
+          Tightbeam.Credentials.store_dir(host_config.base_dir, :cursor)
+        )
+      else
+        desired
+      end
+
     result =
       module.reconcile_home(
         %{
@@ -1623,24 +1835,7 @@ defmodule Tightbeam.Placement do
           sh_out: sh_out
         },
         home,
-        %{
-          harness: harness,
-          machine: host,
-          rails: rails,
-          rails_path: rails_path,
-          # The pinned model tracks the SESSION'S resolved selection when the caller
-          # supplies one (`:model`), falling back to the org default only when there
-          # is no session context (adapter cold-boot). The claude adapter's offered
-          # /accepted model set follows this home pin (wi_263814d3), so pinning the
-          # selected model is what makes the adapter accept it at session/new — the
-          # cure for the accepted-then-dead class.
-          default_model: Keyword.get(opts, :model) || Map.get(config, :default_model),
-          auth_dir:
-            Tightbeam.Credentials.store_dir(
-              host_config.base_dir,
-              module.credential_provider()
-            )
-        }
+        desired
       )
 
     cursor_rails_sha256 =

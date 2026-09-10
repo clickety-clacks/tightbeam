@@ -13,7 +13,7 @@ defmodule Tightbeam.HomesTest do
   end
 
   test "projects one generic home per machine and harness", %{base_dir: base_dir} do
-    auth = Path.join([base_dir, "auth", "codex", "auth.json"])
+    auth = Path.join(Homes.home_path(base_dir, "machine-a", :codex), "auth.json")
     File.mkdir_p!(Path.dirname(auth))
     File.write!(auth, ~S({"token":"machine-a"}))
 
@@ -23,7 +23,9 @@ defmodule Tightbeam.HomesTest do
     assert coder.home_path == Path.join([base_dir, "homes", "machine-a", "codex"])
     assert reviewer.home_path == coder.home_path
     assert File.read!(Path.join(coder.home_path, "hooks.json")) == "v1"
-    assert File.lstat!(Path.join(coder.home_path, "auth.json")).type == :symlink
+    assert File.lstat!(auth).type == :regular
+    assert File.read!(auth) == ~S({"token":"machine-a"})
+    refute File.exists?(Path.join(base_dir, "auth"))
     refute File.exists?(Path.join(coder.home_path, "AGENTS.md"))
 
     assert MapSet.new(File.ls!(Path.join(coder.home_path, "skills"))) ==
@@ -38,7 +40,7 @@ defmodule Tightbeam.HomesTest do
   test "regeneration replaces only owned paths and preserves durable Codex state", %{
     base_dir: base_dir
   } do
-    auth = Path.join([base_dir, "auth", "codex", "auth.json"])
+    auth = Path.join(Homes.home_path(base_dir, "eezo", :codex), "auth.json")
     File.mkdir_p!(Path.dirname(auth))
     File.write!(auth, "old")
 
@@ -69,12 +71,14 @@ defmodule Tightbeam.HomesTest do
     assert File.read!(Path.join(regenerated.home_path, "config.toml")) == "runtime-config"
     assert File.read!(Path.join(regenerated.home_path, "hooks.json")) == "v2"
     assert File.read!(auth) == "runtime-rotated"
-    assert File.lstat!(Path.join(regenerated.home_path, "auth.json")).type == :symlink
+    assert File.lstat!(auth).type == :regular
+    refute File.exists?(Path.join(base_dir, "auth"))
   end
 
-  test "fresh credential store wins over a rotated regular file with an unchanged manifest", %{
-    base_dir: base_dir
-  } do
+  test "legacy credential store cannot overwrite the authoritative home with an unchanged manifest",
+       %{
+         base_dir: base_dir
+       } do
     auth_dir = Path.join([base_dir, "auth", "codex"])
     auth = Path.join(auth_dir, "auth.json")
     File.mkdir_p!(auth_dir)
@@ -82,7 +86,6 @@ defmodule Tightbeam.HomesTest do
 
     projected = Homes.project(base_dir, %{machine: "eezo", harness: :codex, rails: "v1"})
     entry = Path.join(projected.home_path, "auth.json")
-    File.rm!(entry)
     File.write!(entry, "runtime-rotated")
     File.write!(auth, "fresh-onboarding")
 
@@ -98,18 +101,17 @@ defmodule Tightbeam.HomesTest do
         harness: :codex,
         machine: "eezo",
         rails: "v1",
-        auth_dir: auth_dir,
-        harvest_auth: false
+        credential_home: projected.home_path
       }
     )
 
-    assert File.lstat!(entry).type == :symlink
-    assert File.read!(entry) == "fresh-onboarding"
+    assert File.lstat!(entry).type == :regular
+    assert File.read!(entry) == "runtime-rotated"
     assert File.read!(auth) == "fresh-onboarding"
   end
 
   test "regeneration preserves Claude projects and memory", %{base_dir: base_dir} do
-    token = Path.join([base_dir, "auth", "claude", ".credentials.json"])
+    token = Path.join(Homes.home_path(base_dir, "eezo", :claude), ".credentials.json")
     File.mkdir_p!(Path.dirname(token))
     File.write!(token, "token")
 
@@ -123,6 +125,9 @@ defmodule Tightbeam.HomesTest do
     assert File.read!(Path.join(projected.home_path, "projects/repo/transcript.jsonl")) == "chat"
     assert File.read!(Path.join(projected.home_path, "projects/repo/memory/notes.md")) == "memory"
     assert File.read!(Path.join(projected.home_path, "settings.json")) == "v2"
+    assert File.read!(token) == "token"
+    assert File.lstat!(token).type == :regular
+    refute File.exists?(Path.join(base_dir, "auth"))
   end
 
   test "observed local write set is exactly the owned projection", %{base_dir: base_dir} do
@@ -160,15 +165,18 @@ defmodule Tightbeam.HomesTest do
       |> MapSet.new()
 
     expected =
-      ["auth.json", "hooks.json", ".tightbeam"] ++
+      ["hooks.json", ".tightbeam"] ++
         Enum.map(Homes.baseline_skill_names(), &Path.join("skills", &1))
 
     assert changed == MapSet.new(expected)
+    assert after_snapshot["auth.json"] == before["auth.json"]
+    assert after_snapshot[".tightbeam/stale"] == before[".tightbeam/stale"]
+    assert File.read!(Path.join(auth_dir, "auth.json")) == "store-old"
     assert after_snapshot["skills/custom/SKILL.md"] == before["skills/custom/SKILL.md"]
     assert after_snapshot["sessions/turn.jsonl"] == before["sessions/turn.jsonl"]
   end
 
-  test "remote reconciliation harvests before replacing only owned paths", %{
+  test "remote reconciliation replaces only owned paths without credential transport", %{
     base_dir: base_dir
   } do
     parent = self()
@@ -202,14 +210,16 @@ defmodule Tightbeam.HomesTest do
     )
 
     commands = collect_commands([])
-    assert [stamp, read_back, cleanup, rsync, link] = commands
+    assert [stamp, cleanup, rsync] = commands
     assert "cat" in stamp
 
-    read_back_script = List.last(read_back)
-    assert read_back_script =~ "credential-harvest"
-    assert read_back_script =~ "cp"
-    assert read_back_script =~ "/remote/tb/homes/worker/codex/auth.json"
-    assert read_back_script =~ "cat"
+    joined = Enum.map_join(commands, "\n", &Enum.join(&1, " "))
+    refute joined =~ "credential-harvest"
+    refute joined =~ "auth.json"
+    refute joined =~ "/auth/"
+    refute joined =~ "ln -s"
+    staged_home = rsync |> Enum.at(-2) |> String.trim_trailing("/")
+    refute File.exists?(Path.join(staged_home, "auth.json"))
 
     cleanup_script = List.last(cleanup)
     refute cleanup_script =~ "cp \"/remote/tb/homes/worker/codex/auth.json\""
@@ -220,12 +230,12 @@ defmodule Tightbeam.HomesTest do
     refute cleanup_script =~ "projects"
     refute cleanup_script =~ "memory"
     refute "--delete" in rsync
-    assert List.last(link) =~ "ln -s"
   end
 
-  test "remote reconciliation refuses a hollow vendor record before it reaches the store", %{
-    base_dir: base_dir
-  } do
+  test "remote reconciliation leaves hollow credentials untouched and admission still refuses them",
+       %{
+         base_dir: base_dir
+       } do
     remote = Path.join(base_dir, "remote-hollow")
     home = Path.join([remote, "homes", "worker", "claude"])
     store = Path.join([remote, "auth", "claude", ".credentials.json"])
@@ -241,33 +251,26 @@ defmodule Tightbeam.HomesTest do
 
     sh = fn command ->
       send(parent, {:command, command})
-
-      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
-           Enum.any?(command, &String.contains?(&1, "cat")) do
-        flunk("credential bytes must use the stdout-only runner")
-      else
-        run_local_ssh(command)
-      end
+      if hd(command) == "rsync", do: {"", 0}, else: run_local_ssh(command)
     end
 
-    sh_out = fn command ->
-      send(parent, {:command, command})
-      run_local_ssh(command)
-    end
+    assert %{home_path: ^home} =
+             Tightbeam.Harness.Claude.reconcile_home(
+               %{
+                 base_dir: base_dir,
+                 host_name: "worker",
+                 host_config: %{ssh: "worker", base_dir: remote},
+                 sh: sh
+               },
+               home,
+               %{harness: :claude, machine: "worker", rails: "v1"}
+             )
 
     assert_raise RuntimeError, ~r/accessToken is empty/, fn ->
-      Tightbeam.Harness.Claude.reconcile_home(
-        %{
-          base_dir: base_dir,
-          host_name: "worker",
-          host_config: %{ssh: "worker", base_dir: remote},
-          sh: sh,
-          sh_out: sh_out
-        },
-        home,
-        %{harness: :claude, machine: "worker", rails: "v1", auth_dir: Path.dirname(store)}
-      )
+      Tightbeam.Credentials.refuse_hollow!(:anthropic, File.read!(entry), entry)
     end
+
+    assert File.lstat!(entry).type == :regular
 
     assert File.read!(store) == good
     assert File.read!(entry) == @hollow_vendor_record
@@ -279,9 +282,10 @@ defmodule Tightbeam.HomesTest do
     refute joined =~ @hollow_vendor_record
   end
 
-  test "remote reconciliation promotes the bytes it judged even if the vendor file rotates", %{
-    base_dir: base_dir
-  } do
+  test "remote reconciliation preserves a concurrent credential write without promoting stale bytes",
+       %{
+         base_dir: base_dir
+       } do
     remote = Path.join(base_dir, "remote-race")
     home = Path.join([remote, "homes", "worker", "claude"])
     store = Path.join([remote, "auth", "claude", ".credentials.json"])
@@ -297,18 +301,11 @@ defmodule Tightbeam.HomesTest do
     sh = fn command ->
       send(parent, {:command, command})
 
-      cond do
-        hd(command) == "rsync" ->
-          {"", 0}
-
-        Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
-            Enum.any?(command, &String.contains?(&1, "cat")) ->
-          result = run_local_ssh(command)
-          File.write!(entry, @hollow_vendor_record)
-          result
-
-        true ->
-          run_local_ssh(command)
+      if hd(command) == "rsync" do
+        File.write!(entry, @hollow_vendor_record)
+        {"", 0}
+      else
+        run_local_ssh(command)
       end
     end
 
@@ -329,7 +326,8 @@ defmodule Tightbeam.HomesTest do
                }
              )
 
-    assert File.read!(store) == @healthy_vendor_record
+    assert File.read!(store) == "standing"
+    assert File.lstat!(entry).type == :regular
     assert File.read!(entry) == @hollow_vendor_record
     assert Path.wildcard(Path.join([remote, "staging", "credential-harvest", "*"])) == []
 
@@ -339,7 +337,7 @@ defmodule Tightbeam.HomesTest do
     refute joined =~ @healthy_vendor_record
   end
 
-  test "unchanged remote reconciliation preserves the credential link when rsync fails", %{
+  test "unchanged remote reconciliation preserves the credential when rsync fails", %{
     base_dir: base_dir
   } do
     desired = %{

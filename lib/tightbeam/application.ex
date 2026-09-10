@@ -156,21 +156,17 @@ defmodule Tightbeam.Application do
           [Supervisor.child_spec() | {module(), term()} | module()]
   def children(config) do
     base_dir = config.base_dir
-    File.mkdir_p!(base_dir)
     db_path = Path.join(base_dir, "state.db")
 
-    # Install recognition before the supervisor starts any child. Boot is the
-    # first child after the database and performs every startup business-row
-    # recovery, so loading from inside Gateway composition is already too late.
-    # Keeping this outside the child list also covers future children inserted
-    # before Gateway: no startup child can run while row recognition is absent.
-    Tightbeam.Gateway.load_law!(config)
+    # Child-list construction never writes the base. DB admission precedes
+    # all startup writes; Boot loads Identity/law before schema/business recovery.
 
     [
       # DB owner first — the serialization seam everything writes through.
-      {Tightbeam.DB, path: db_path, name: Tightbeam.DB},
+      {Tightbeam.DB,
+       path: db_path, name: Tightbeam.DB, guard_inputs: Map.get(config, :guard_inputs, [])},
       # Schema + boot epoch as a transient one-shot after the DB is up.
-      {Tightbeam.Boot, base_dir},
+      {Tightbeam.Boot, config},
       # Lane naming registry and the task supervisor for turn work.
       {Registry, keys: :unique, name: Tightbeam.LaneRegistry},
       {Task.Supervisor, name: Tightbeam.TurnTaskSupervisor},
@@ -254,6 +250,7 @@ defmodule Tightbeam.Application do
 
     %{
       base_dir: Application.get_env(:tightbeam, :base_dir, default_base_dir()),
+      guard_inputs: Application.get_env(:tightbeam, :live_base_guard, []),
       cwd: Application.get_env(:tightbeam, :cwd, File.cwd!()),
       # 11373: the Expanse's 1373 colonized worlds, plus one for Earth (Flynn's
       # port, agreed at project start). The code defaulted to 4321 long after the
@@ -297,6 +294,12 @@ defmodule Tightbeam.Application do
         Application.get_env(:tightbeam, :drain_timeout_ms, 90_000)
 
     drain_until(deadline)
+
+    try do
+      Tightbeam.Firehose.Hub.shutdown()
+    catch
+      _, _ -> :ok
+    end
 
     # Clean-shutdown stamp MUST happen in prep_stop: stop/1 runs after the
     # supervision tree (and the DB) is already down, so stamping there would

@@ -75,7 +75,6 @@ defmodule Tightbeam.Gateway do
     Harness,
     HarnessHealth,
     HarnessProcess,
-    Homes,
     Identity,
     Idempotency,
     LaneManager,
@@ -90,6 +89,7 @@ defmodule Tightbeam.Gateway do
     Roles,
     Schema,
     Spinup,
+    StateResources,
     SubagentMarkers,
     Supervision,
     Unroutable,
@@ -142,6 +142,9 @@ defmodule Tightbeam.Gateway do
   @spec children_after_preflight(config()) :: [Supervisor.child_spec() | {module(), term()}]
   def children_after_preflight(config) do
     db = Map.get(config, :db, Tightbeam.DB)
+    :ok = DB.assert_base_admitted!(db, config.base_dir)
+    Identity.init_after_admission!(config.base_dir, db)
+    load_law!(config)
     prod_limit = Map.get(config, :prod_limit, 3)
 
     unless is_integer(prod_limit) and prod_limit >= 0 do
@@ -151,6 +154,7 @@ defmodule Tightbeam.Gateway do
     File.mkdir_p!(config.base_dir)
 
     :ok = Schema.ensure_all(db)
+    :ok = AdminProjection.bootstrap_served(db, config.base_dir)
 
     :ok = Assignments.audit_review_item_conflicts(db)
 
@@ -203,8 +207,6 @@ defmodule Tightbeam.Gateway do
     :ok = Wakes.activate_wait_recognition(db)
     :ok = Supervision.recover_liveness!(db, supervision_interval_ms(config))
 
-    Enum.each(Harness.all(), &Homes.sweep_auth(config.base_dir, &1.id()))
-
     adapter_config = config |> Map.put(:cli_bin, cli_bin) |> Map.put(:db, db)
     adapter_context = fn key -> Placement.adapter_context(adapter_config, key) end
 
@@ -218,6 +220,7 @@ defmodule Tightbeam.Gateway do
       db: db,
       handlers: handler_table,
       conn_registry: Tightbeam.ConnRegistry,
+      firehose_hub: Tightbeam.Firehose.Hub,
       defaults: defaults
     }
 
@@ -292,6 +295,7 @@ defmodule Tightbeam.Gateway do
       [
         {ModelCatalog, base_dir: config.base_dir, db: db},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
+        {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
         # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
         # statute, and the episode writer must already own the ordering before the first
         # evaluation runs. Explicitly a child rather than lazily started — a lazy start
@@ -357,7 +361,8 @@ defmodule Tightbeam.Gateway do
   @spec preflight(config()) :: {:ok, [atom()]} | {:error, {:no_harness_cli, String.t()}}
   def preflight(config) do
     with {:ok, installed} <- harness_binary_readiness(Path.join(config.base_dir, "bin")) do
-      Identity.init!(config.base_dir)
+      # Readiness only. Identity writes require the persistent DB's admission
+      # and occur in Boot or guarded direct Gateway composition, not here.
       {:ok, installed}
     end
   end
@@ -651,9 +656,7 @@ defmodule Tightbeam.Gateway do
     :ok
   end
 
-  @doc "The immutable verb-handler table (see moduledoc list) — built once, passed to Dispatch."
-  @spec handlers(config()) :: Tightbeam.Dispatch.handlers()
-  def handlers(config) do
+  defp handler_specs(config) do
     db = Map.get(config, :db, Tightbeam.DB)
 
     assignment_change = fn assignment_id, from ->
@@ -663,7 +666,7 @@ defmodule Tightbeam.Gateway do
     item_change = fn work_item_id, kind -> emit_item_change(db, work_item_id, kind) end
 
     %{
-      "post" => fn call ->
+      {"post", ["message.created", "session.updated"]} => fn call ->
         p = call.params
 
         outcome =
@@ -678,114 +681,139 @@ defmodule Tightbeam.Gateway do
           do: %{ack: p.client_message_id},
           else: %{dedupe: to_string(outcome)}
       end,
-      "wake" => fn call ->
-        p = call.params
+      {"wake",
+       ["wake.scheduled", "wake.canceled", "wake.fired", "message.created", "session.updated"]} =>
+        fn call ->
+          p = call.params
 
-        cond do
-          is_binary(p[:cancel_wake_id]) ->
-            cancel_wake_result(db, call, p.cancel_wake_id)
+          cond do
+            is_binary(p[:cancel_wake_id]) ->
+              cancel_wake_result(db, call, p.cancel_wake_id)
 
-          not (is_binary(p[:prompt]) and p.prompt != "") ->
-            %{code: "invalid", message: "a wake must carry a prompt"}
+            not (is_binary(p[:prompt]) and p.prompt != "") ->
+              %{code: "invalid", message: "a wake must carry a prompt"}
 
-          Map.has_key?(p, :class) and not (is_binary(p[:class]) and p[:class] != "") ->
-            %{code: "invalid", message: "--class requires a class name"}
+            Map.has_key?(p, :class) and not (is_binary(p[:class]) and p[:class] != "") ->
+              %{code: "invalid", message: "--class requires a class name"}
 
-          not valid_reresolve?(p) ->
-            %{code: "invalid", message: "reresolve lineage requires seed and rung"}
+            not valid_reresolve?(p) ->
+              %{code: "invalid", message: "reresolve lineage requires seed and rung"}
 
-          is_binary(p[:condition_scope]) and not is_binary(p[:condition_kind]) ->
-            %{code: "invalid", message: "--when-scope requires --when-fact"}
+            is_binary(p[:condition_scope]) and not is_binary(p[:condition_kind]) ->
+              %{code: "invalid", message: "--when-scope requires --when-fact"}
 
-          is_binary(p[:condition_kind]) and is_nil(p[:after_ms]) and is_nil(p[:at]) ->
-            %{
-              code: "invalid",
-              message: "a condition wake requires a fallback (--fallback-after / --at)"
-            }
+            is_binary(p[:condition_kind]) and is_nil(p[:after_ms]) and is_nil(p[:at]) ->
+              %{
+                code: "invalid",
+                message: "a condition wake requires a fallback (--fallback-after / --at)"
+              }
 
-          not valid_wait_request_shape?(p) ->
-            %{
-              code: "invalid",
-              message:
-                "--predicate and --after-turn are exclusive; each requires --assignment, and dependency waits require a fallback"
-            }
+            not valid_wait_request_shape?(p) ->
+              %{
+                code: "invalid",
+                message:
+                  "--predicate and --after-turn are exclusive; each requires --assignment, and dependency waits require a fallback"
+              }
 
-          not wake_principal_allowed?(db, call) ->
-            %{code: "unknown_caller"}
+            not wake_principal_allowed?(db, call) ->
+              %{code: "unknown_caller"}
 
-          true ->
-            wake_result(config, db, call)
-        end
-      end,
-      "condition" => fn call ->
-        p = call.params
+            true ->
+              wake_result(config, db, call)
+          end
+        end,
+      {"condition", ["condition_fact.filed", "wake.fired", "message.created", "session.updated"]} =>
+        fn call ->
+          p = call.params
 
-        cond do
-          not (is_binary(p[:kind]) and p.kind != "") ->
-            %{code: "invalid", message: "a condition fact requires a kind"}
+          cond do
+            not (is_binary(p[:kind]) and p.kind != "") ->
+              %{code: "invalid", message: "a condition fact requires a kind"}
 
-          # `work-blocked`/`work-unblocked` assert an authority's judgment
-          # over a session (spec production-machine-v1 §Standing facts): the
-          # scope must be a session, and the caller must sit ABOVE it in the
-          # spawnedBy lineage, or be its owner (user or admin). ConditionFacts
-          # itself refuses the substrate; this seam refuses the unauthorized.
-          p.kind in ~w(work-blocked work-unblocked) and
-              not work_block_authority?(db, call, p[:scope]) ->
-            %{
-              code: "not_authorized",
-              message:
-                "#{p.kind} may only be asserted by the scope session's lineage " <>
-                  "above it or its owner, over an existing session scope"
-            }
+            # `work-blocked`/`work-unblocked` assert an authority's judgment
+            # over a session (spec production-machine-v1 §Standing facts): the
+            # scope must be a session, and the caller must sit ABOVE it in the
+            # spawnedBy lineage, or be its owner (user or admin). ConditionFacts
+            # itself refuses the substrate; this seam refuses the unauthorized.
+            p.kind in ~w(work-blocked work-unblocked) and
+                not work_block_authority?(db, call, p[:scope]) ->
+              %{
+                code: "not_authorized",
+                message:
+                  "#{p.kind} may only be asserted by the scope session's lineage " <>
+                    "above it or its owner, over an existing session scope"
+              }
 
-          true ->
-            scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
+            true ->
+              scheduler = Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
 
-            case ConditionFacts.file_idempotent(db, scheduler, %{
-                   kind: p.kind,
-                   scope: p[:scope],
-                   origin: call.origin,
-                   principal: Map.get(call, :principal),
-                   payload: p[:payload],
-                   owner_user_id: wait_owner_user_id_in_txn_for_db(db, Map.get(call, :principal)),
-                   idempotency_key: p[:idempotency_key]
-                 }) do
-              {:error, error} -> error
-              fact -> fact
-            end
-        end
-      end,
-      "facts-read" => fn call -> facts_read_result(db, call) end,
-      "artifact-record" => fn call -> Artifacts.record(db, call) end,
-      "artifact-get" => fn call ->
+              case ConditionFacts.file_idempotent_with_effect(
+                     db,
+                     scheduler,
+                     %{
+                       kind: p.kind,
+                       scope: p[:scope],
+                       origin: call.origin,
+                       principal: Map.get(call, :principal),
+                       payload: p[:payload],
+                       owner_user_id:
+                         wait_owner_user_id_in_txn_for_db(db, Map.get(call, :principal)),
+                       idempotency_key: p[:idempotency_key]
+                     },
+                     call
+                   ) do
+                {{:error, error}, _filed?} ->
+                  error
+
+                {fact, filed?} ->
+                  if call[:firehose_effect_requested],
+                    do: {:firehose_effect, fact, filed?},
+                    else: fact
+              end
+          end
+        end,
+      {"facts-read", []} => fn call -> facts_read_result(db, call) end,
+      {"artifact-record", ["artifact.recorded"]} => fn call -> Artifacts.record(db, call) end,
+      {"artifact-get", []} => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
       end,
-      "artifacts" => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
-      "rule" => fn call ->
+      {"artifacts", []} => fn call -> %{artifacts: Artifacts.list(db, call.params)} end,
+      {"rule", ["decision_request.ruled"]} => fn call ->
         Escalation.rule(db, call,
           authorized: admin_origin?(db, call.origin),
           scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
         )
       end,
-      "effort-rule" => fn call -> EffortCheckin.rule(db, config, call) end,
-      "waive" => fn call ->
+      {"effort-rule", ["decision_request.ruled"]} => fn call ->
+        EffortCheckin.rule(db, config, call)
+      end,
+      {"waive", []} => fn call ->
         Escalation.waive(db, call,
           authorized: admin_origin?(db, call.origin),
           scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
         )
       end,
-      "revoke-waiver" => fn call ->
+      {"revoke-waiver", []} => fn call ->
         Escalation.revoke_waiver(db, call, authorized: admin_origin?(db, call.origin))
       end,
-      "withdraw" => fn call -> Escalation.withdraw(db, call) end,
-      "operator-ask" => fn call -> Escalation.operator_ask(db, call) end,
-      "operator-rule" => fn call ->
+      {"withdraw", ["decision_request.withdrawn"]} => fn call -> Escalation.withdraw(db, call) end,
+      {"ask", ["decision_request.opened"]} => fn call -> Escalation.ask(db, call) end,
+      {"answer", ["decision_request.ruled"]} => fn call -> Escalation.answer(db, call) end,
+      {"return", ["decision_request.returned"]} => fn call ->
+        Escalation.return_request(db, call)
+      end,
+      {"operator-ask", ["decision_request.opened"]} => fn call ->
+        Escalation.operator_ask(db, call)
+      end,
+      {"operator-rule", ["decision_request.ruled"]} => fn call ->
         Escalation.operator_rule(db, call,
           scheduler: Map.get(config, :wake_scheduler, Tightbeam.WakeScheduler)
         )
       end,
-      "operator-withdraw" => fn call -> Escalation.operator_withdraw(db, call) end,
-      "decision-requests" => fn call ->
+      {"operator-withdraw", ["decision_request.withdrawn"]} => fn call ->
+        Escalation.operator_withdraw(db, call)
+      end,
+      {"decision-requests", []} => fn call ->
         case Escalation.list_status(call.params[:status]) do
           {:ok, status} ->
             caller = resolve_caller(db, call.origin)
@@ -802,7 +830,7 @@ defmodule Tightbeam.Gateway do
             err
         end
       end,
-      "decision-request" => fn call ->
+      {"decision-request", []} => fn call ->
         caller = resolve_caller(db, call.origin)
         id = call.params[:request_id] || call.params[:request]
 
@@ -833,55 +861,72 @@ defmodule Tightbeam.Gateway do
           request -> %{decision_request: request}
         end
       end,
-      "approve-device" =>
-        admin_handler(db, fn p ->
-          d = Devices.approve(db, p.device_id, p[:user_id])
+      {"approve-device", ["device.approved"]} =>
+        admin_call_handler(db, fn call ->
+          p = call.params
+          d = Devices.approve_with_firehose(db, p.device_id, p[:user_id], call)
           %{approved: %{device_id: d.device_id, user_id: d.user_id, is_admin: d.is_admin}}
         end),
-      "deny-device" =>
-        admin_handler(db, fn p ->
-          Devices.deny(db, p.device_id)
+      {"deny-device", ["device.denied"]} =>
+        admin_call_handler(db, fn call ->
+          p = call.params
+          Devices.deny_with_firehose(db, p.device_id, call)
           %{denied: p.device_id}
         end),
-      "revoke-device" =>
-        admin_handler(db, fn p ->
-          Devices.revoke(db, p.device_id)
+      {"revoke-device", ["device.revoked"]} =>
+        admin_call_handler(db, fn call ->
+          p = call.params
+          Devices.revoke_with_firehose(db, p.device_id, call)
           %{revoked: p.device_id}
         end),
-      "host-env-set" =>
+      {"host-env-set", ["host_env.updated"]} =>
         admin_call_handler(db, fn call ->
           p = call.params
 
-          case Placement.set_env_overlay(
+          case Placement.set_env_overlay_with_firehose(
                  db,
                  p.host,
                  p.harness,
                  p.name,
                  p.value,
-                 call.origin
+                 call.origin,
+                 call
                ) do
-            {:ok, row} ->
-              Map.put(
-                row,
-                :effect,
-                "takes effect on next #{p.harness} adapter start on #{p.host}"
-              )
+            %{projection: projection, changed: changed} ->
+              %{
+                host_environment: StateResources.host_environment(projection),
+                changed: changed,
+                effect: "takes effect on next #{p.harness} adapter start on #{p.host}"
+              }
 
             {:error, denial} ->
               denial
           end
         end),
-      "host-env-list" => fn call ->
-        %{
-          overlays: Placement.env_overlays(db, call.params[:host], call.params[:harness])
-        }
-      end,
-      "host-env-unset" =>
+      {"host-env-list", []} =>
+        admin_call_handler(db, fn call ->
+          %{
+            overlays:
+              db
+              |> StateResources.query_host_environment(call.params)
+              |> Enum.map(&StateResources.host_environment/1)
+          }
+        end),
+      {"host-env-unset", ["host_env.updated"]} =>
         admin_call_handler(db, fn call ->
           p = call.params
-          Placement.unset_env_overlay(db, p.host, p.harness, p.name)
+
+          result =
+            Placement.unset_env_overlay_with_firehose(db, p.host, p.harness, p.name, call)
+
+          %{
+            host_environment:
+              result.projection && StateResources.host_environment(result.projection),
+            changed: result.changed,
+            removed: result.changed
+          }
         end),
-      "host-toolchain-set" =>
+      {"host-toolchain-set", []} =>
         admin_call_handler(db, fn call ->
           p = call.params
 
@@ -906,20 +951,28 @@ defmodule Tightbeam.Gateway do
               denial
           end
         end),
-      "register-host" =>
-        admin_handler(db, fn p ->
+      {"register-host", ["host.registered"]} =>
+        admin_call_handler(db, fn call ->
+          p = call.params
           # The dumb half of assimilation (spec §Placement): the CLI ceremony
           # prepared the machine; this records the fact. The topology is the
           # operator's to declare.
           previous_entry = Placement.hosts(config.base_dir, db)[p.name]
 
-          {:ok, entry} =
-            Placement.register_host(db, p.name, %{
-              ssh: p[:ssh] || p.name,
-              base_dir: Map.fetch!(p, :base_dir),
-              cli_bin: p[:cli_bin],
-              adapter_bin_dir: p[:adapter_bin_dir]
-            })
+          {:ok, registration} =
+            Placement.register_host_with_firehose(
+              db,
+              p.name,
+              %{
+                ssh: p[:ssh] || p.name,
+                base_dir: Map.fetch!(p, :base_dir),
+                cli_bin: p[:cli_bin],
+                adapter_bin_dir: p[:adapter_bin_dir]
+              },
+              call
+            )
+
+          entry = registration.entry
 
           :ok = start_credential_child(config, db, p.name, previous_entry, entry)
 
@@ -933,13 +986,16 @@ defmodule Tightbeam.Gateway do
                  provision_opts(config)
                ) do
             :ok ->
-              %{host: p.name, config: entry}
+              %{
+                host: StateResources.host(registration.projection),
+                changed: registration.changed
+              }
 
             {:error, reason} ->
               %{code: to_string(reason), message: endpoint_failure_message(reason, p.name)}
           end
         end),
-      "update-clients" =>
+      {"update-clients", []} =>
         admin_handler(db, fn _params ->
           hosts =
             config.base_dir
@@ -955,30 +1011,30 @@ defmodule Tightbeam.Gateway do
 
           %{hosts: hosts}
         end),
-      "identity-edit" =>
+      {"identity-edit", ["identity.updated"]} =>
         identity_mutation_handler(config, db, fn call ->
           identity_edit_result(config, db, call)
         end),
-      "identity-status" =>
+      {"identity-status", []} =>
         admin_call_handler(db, fn call -> identity_status_result(config, db, call) end),
-      "identity-relearn" =>
+      {"identity-relearn", ["identity.updated", "kungfu.updated"]} =>
         identity_mutation_handler(config, db, fn call ->
           identity_relearn_result(config, db, call)
         end),
-      "identity-repoint" =>
+      {"identity-repoint", []} =>
         admin_call_handler(db, fn call -> identity_repoint_result(config, db, call) end),
-      "learn" =>
+      {"learn", ["identity.updated", "kungfu.updated"]} =>
         identity_mutation_handler(config, db, fn call ->
           identity_learn_result(config, db, call)
         end),
-      "unlearn" =>
+      {"unlearn", ["identity.updated", "kungfu.updated"]} =>
         identity_mutation_handler(config, db, fn call ->
           identity_unlearn_result(config, db, call)
         end),
-      "kungfu-list" => fn _call -> %{bundles: Identity.available_bundles()} end,
-      "identity-apply" =>
+      {"kungfu-list", []} => fn _call -> %{bundles: Identity.available_bundles()} end,
+      {"identity-apply", []} =>
         admin_call_handler(db, fn call -> identity_apply_result(config, db, call) end),
-      "kungfu-scaffold" =>
+      {"kungfu-scaffold", ["identity.updated", "kungfu.updated"]} =>
         identity_mutation_handler(config, db, fn call ->
           candidate =
             Archetypes.scaffold_kungfu!(
@@ -993,67 +1049,107 @@ defmodule Tightbeam.Gateway do
             paths: candidate.paths
           })
         end),
-      "onboard" => admin_call_handler(db, fn call -> onboard_result(config, call) end),
-      "promote-user" =>
-        admin_handler(db, fn p ->
-          %{user: Devices.set_user_admin(db, p.user_id, Map.get(p, :is_admin, true))}
+      {"onboard", []} => admin_call_handler(db, fn call -> onboard_result(config, call) end),
+      {"promote-user", ["user.promoted", "user.demoted"]} =>
+        admin_call_handler(db, fn call ->
+          p = call.params
+
+          result =
+            Devices.promote_user_with_firehose(db, p.user_id, Map.get(p, :is_admin, true), call)
+
+          %{user: StateResources.user(result.user), changed: result.changed}
         end),
-      "add-user" =>
-        admin_handler(db, fn p ->
-          %{user: Devices.add_user(db, p.user_id, Map.get(p, :is_admin, false))}
+      {"add-user", ["user.added"]} =>
+        admin_call_handler(db, fn call ->
+          p = call.params
+
+          %{
+            user:
+              db
+              |> Devices.add_user_with_firehose(
+                p.user_id,
+                Map.get(p, :is_admin, false),
+                call
+              )
+              |> StateResources.user()
+          }
         end),
-      "config" => admin_handler(db, fn p -> config_result(db, p) end),
-      "harness-processes" =>
+      {"read-marker-set", ["read_marker.updated"]} => fn call ->
+        read_marker_result(db, call, :set)
+      end,
+      {"read-marker-clear", ["read_marker.updated"]} => fn call ->
+        read_marker_result(db, call, :clear)
+      end,
+      {"config", ["config.updated"]} =>
+        admin_call_handler(db, fn call -> config_result(db, call) end),
+      {"harness-processes", []} =>
         admin_handler(db, fn _params ->
           coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
           %{harness_processes: AdapterCoordinator.harness_processes(coordinator)}
         end),
-      "role-create" => fn call -> role_create_result(db, call) end,
-      "role-bind" => fn call -> role_bind_result(db, call) end,
-      "role-rm" => fn call -> role_rm_result(db, call) end,
-      "role-list" => fn _call -> role_list_result(db) end,
-      "work-item-create" => fn call ->
+      {"role-create", ["role.created"]} => fn call -> role_create_result(db, call) end,
+      {"role-bind", ["role.bound"]} => fn call -> role_bind_result(db, call) end,
+      {"role-rm", ["role.removed"]} => fn call -> role_rm_result(db, call) end,
+      {"role-list", []} => fn _call -> role_list_result(db) end,
+      {"work-item-create", ["work_item.created", "wake.scheduled"]} => fn call ->
         WorkItems.__handle__(
           db,
           "work-item-create",
-          Map.put(call, :on_work_item_change, item_change)
+          call
+          |> Map.put(:on_work_item_change, item_change)
+          |> Map.put(:on_routing_wake_scheduled_in_txn, fn txn, wake ->
+            Tightbeam.Firehose.Publisher.committed_in_txn(
+              txn,
+              "wake.scheduled",
+              wake,
+              %{"workItemId" => wake.work_item_id}
+            )
+          end)
         )
       end,
-      "work-item-get" => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
-      "work-item-trace" => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
-      "transcript" => fn call -> Tightbeam.Transcript.read(db, call) end,
-      "attend" => fn call -> attend_result(db, call) end,
-      "execution-map" => fn call -> Tightbeam.ExecutionMap.roster(db, call) end,
-      "execution-map-select" => fn call -> Tightbeam.ExecutionMap.topline(db, call) end,
-      "toplines" => fn call -> Tightbeam.Toplines.__handle__(db, "toplines", call) end,
-      "topline" => fn call -> Tightbeam.Toplines.__handle__(db, "topline", call) end,
-      "topline-create" => fn call -> Tightbeam.Toplines.__handle__(db, "topline-create", call) end,
-      "topline-update" => fn call -> Tightbeam.Toplines.__handle__(db, "topline-update", call) end,
-      "topline-close" => fn call -> Tightbeam.Toplines.__handle__(db, "topline-close", call) end,
-      "topline-reopen" => fn call -> Tightbeam.Toplines.__handle__(db, "topline-reopen", call) end,
-      "topline-link-work" => fn call ->
+      {"work-item-get", []} => fn call -> WorkItems.__handle__(db, "work-item-get", call) end,
+      {"work-item-trace", []} => fn call -> WorkItems.__handle__(db, "work-item-trace", call) end,
+      {"transcript", []} => fn call -> Tightbeam.Transcript.read(db, call) end,
+      {"attend", []} => fn call -> attend_result(db, call) end,
+      {"execution-map", []} => fn call -> Tightbeam.ExecutionMap.roster(db, call) end,
+      {"execution-map-select", []} => fn call -> Tightbeam.ExecutionMap.topline(db, call) end,
+      {"toplines", []} => fn call -> Tightbeam.Toplines.__handle__(db, "toplines", call) end,
+      {"topline", []} => fn call -> Tightbeam.Toplines.__handle__(db, "topline", call) end,
+      {"topline-create", []} => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-create", call)
+      end,
+      {"topline-update", []} => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-update", call)
+      end,
+      {"topline-close", []} => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-close", call)
+      end,
+      {"topline-reopen", []} => fn call ->
+        Tightbeam.Toplines.__handle__(db, "topline-reopen", call)
+      end,
+      {"topline-link-work", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-link-work", call)
       end,
-      "topline-unlink-work" => fn call ->
+      {"topline-unlink-work", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-unlink-work", call)
       end,
-      "topline-concern-create" => fn call ->
+      {"topline-concern-create", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-concern-create", call)
       end,
-      "topline-concern-link-work" => fn call ->
+      {"topline-concern-link-work", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-concern-link-work", call)
       end,
-      "topline-concern-unlink-work" => fn call ->
+      {"topline-concern-unlink-work", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-concern-unlink-work", call)
       end,
-      "topline-work-leave-unlinked" => fn call ->
+      {"topline-work-leave-unlinked", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-work-leave-unlinked", call)
       end,
-      "topline-placement-list" => fn call ->
+      {"topline-placement-list", []} => fn call ->
         Tightbeam.Toplines.__handle__(db, "topline-placement-list", call)
       end,
-      "work-item-list" => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
-      "work-item-update" => fn call ->
+      {"work-item-list", []} => fn call -> WorkItems.__handle__(db, "work-item-list", call) end,
+      {"work-item-update", ["work_item.updated"]} => fn call ->
         WorkItems.__handle__(
           db,
           "work-item-update",
@@ -1062,11 +1158,15 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:effort_config, config)
         )
       end,
-      "work-item-icebox" => work_item_disposition(db, "work-item-icebox", item_change),
-      "work-item-reopen" => work_item_disposition(db, "work-item-reopen", item_change),
-      "work-item-close" => work_item_disposition(db, "work-item-close", item_change),
-      "work-item-fail" => work_item_disposition(db, "work-item-fail", item_change),
-      "assign" => fn call ->
+      {"work-item-icebox", ["work_item.iceboxed"]} =>
+        work_item_disposition(db, "work-item-icebox", item_change),
+      {"work-item-reopen", ["work_item.reopened"]} =>
+        work_item_disposition(db, "work-item-reopen", item_change),
+      {"work-item-close", ["work_item.closed"]} =>
+        work_item_disposition(db, "work-item-close", item_change),
+      {"work-item-fail", ["work_item.failed"]} =>
+        work_item_disposition(db, "work-item-fail", item_change),
+      {"assign", ["assignment.opened"]} => fn call ->
         call =
           call
           |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
@@ -1076,18 +1176,21 @@ defmodule Tightbeam.Gateway do
 
         Assignments.__handle__(db, "assign", call)
       end,
-      "dispatch" => fn call ->
-        call =
-          call
-          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
-          |> Map.put(:on_assignment_change, assignment_change)
-          |> Map.put(:on_work_item_change, item_change)
-          |> Map.put(:effort_config, config)
-          |> Map.put(:on_dispatch_delivery, fn delivery, _ -> complete_delivery(db, delivery) end)
+      {"dispatch", ["assignment.opened", "message.created", "wake.scheduled", "session.updated"]} =>
+        fn call ->
+          call =
+            call
+            |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
+            |> Map.put(:on_assignment_change, assignment_change)
+            |> Map.put(:on_work_item_change, item_change)
+            |> Map.put(:effort_config, config)
+            |> Map.put(:on_dispatch_delivery, fn delivery, _ ->
+              complete_delivery(db, delivery)
+            end)
 
-        Assignments.__handle__(db, "dispatch", call)
-      end,
-      "attest" => fn call ->
+          Assignments.__handle__(db, "dispatch", call)
+        end,
+      {"attest", ["attest.filed", "assignment.closed", "wake.canceled"]} => fn call ->
         Assignments.__handle__(
           db,
           "attest",
@@ -1100,24 +1203,100 @@ defmodule Tightbeam.Gateway do
           |> Map.put(:effort_config, config)
         )
       end,
-      "attests" => fn call -> Assignments.__handle__(db, "attests", call) end,
-      "assignment-get" => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
-      "revoke-assignment" => fn call ->
+      {"attests", []} => fn call -> Assignments.__handle__(db, "attests", call) end,
+      {"assignment-get", []} => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
+      {"revoke-assignment", ["assignment.closed"]} => fn call ->
         Assignments.__handle__(
           db,
           "revoke-assignment",
           Map.put(call, :on_assignment_change, assignment_change)
         )
       end,
-      "repair-assignment" => fn call -> repair_assignment_result(config, db, call) end,
-      "assignments" => fn call -> Assignments.__handle__(db, "assignments", call) end,
-      "inspect" => fn call -> inspect_result(config, db, call) end,
-      "cancel" => fn call -> cancel_result(db, call) end,
-      "critical" => fn call -> critical_result(config, db, call) end,
-      "spawn" => fn call -> spawn_result(config, db, call) end,
-      "tune" => fn call -> tune_result(config, db, call) end,
-      "retire" => fn call -> retire_result(config, db, call) end
+      {"reopen-assignment", ["assignment.reopened"]} => fn call ->
+        Assignments.__handle__(
+          db,
+          "reopen-assignment",
+          call
+          |> Map.put(:supervision_interval_ms, supervision_interval_ms(config))
+          |> Map.put(:effort_config, config)
+          |> Map.put(:on_assignment_change, assignment_change)
+        )
+      end,
+      {"repair-assignment", ["message.created", "session.updated"]} => fn call ->
+        repair_assignment_result(config, db, call)
+      end,
+      {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
+      {"inspect", []} => fn call -> inspect_result(config, db, call) end,
+      {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,
+      {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
+      {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
+      {"tune", ["message.created", "session.updated"]} => fn call ->
+        tune_result(config, db, call)
+      end,
+      {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
+        retire_result(config, db, call)
+      end
     }
+    |> compile_handler_specs!()
+  end
+
+  @direct_state_classes ~w(message.created wake.fired turn.started turn.ended artifact.archived artifact.released)
+
+  @doc false
+  @spec compile_handler_specs!(map()) ::
+          %{String.t() => %{handler: (map() -> term()), effects: [String.t()]}}
+  def compile_handler_specs!(raw_specs) when is_map(raw_specs) do
+    specs =
+      Enum.map(raw_specs, fn
+        {{verb, effects}, handler}
+        when is_binary(verb) and is_list(effects) and is_function(handler, 1) ->
+          if Enum.all?(effects, &is_binary/1) and Enum.uniq(effects) == effects do
+            {verb, %{handler: handler, effects: effects}}
+          else
+            raise ArgumentError,
+                  "invalid gateway handler spec for #{inspect(verb)}: effects must be unique class names"
+          end
+
+        {key, _handler} ->
+          raise ArgumentError,
+                "invalid gateway handler spec entry #{inspect(key)}: " <>
+                  "every executable handler must bind its accepted-result effects"
+      end)
+
+    duplicates =
+      specs
+      |> Enum.group_by(&elem(&1, 0))
+      |> Enum.filter(fn {_verb, entries} -> length(entries) > 1 end)
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.sort()
+
+    if duplicates != [] do
+      raise ArgumentError, "duplicate gateway handler specs: #{inspect(duplicates)}"
+    end
+
+    Map.new(specs)
+  end
+
+  @doc "The immutable verb-handler table (see moduledoc list) — built once, passed to Dispatch."
+  @spec handlers(config()) :: Tightbeam.Dispatch.handlers()
+  def handlers(config) do
+    Map.new(handler_specs(config), fn {verb, spec} -> {verb, spec.handler} end)
+  end
+
+  @doc "Accepted-result state effects from the same entries as the immutable handler table."
+  @spec handler_effects(config()) :: %{String.t() => [String.t()]}
+  def handler_effects(config) do
+    Map.new(handler_specs(config), fn {verb, spec} -> {verb, spec.effects} end)
+  end
+
+  @spec emitted_state_classes(%{String.t() => [String.t()]}) :: [String.t()]
+  def emitted_state_classes(handler_effects) do
+    handler_effects
+    |> Map.values()
+    |> List.flatten()
+    |> Kernel.++(@direct_state_classes)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
   # A terminal-disposition handler routes the owner doorbell through the same
@@ -1638,6 +1817,7 @@ defmodule Tightbeam.Gateway do
             # No-ops for every non-bracket wake (the discriminator is the item's
             # routing/slate wake-id matching this wake).
             WorkItems.rearm_on_fire_in_txn(txn, opts[:wake_id], opts[:target_gate])
+            Tightbeam.Firehose.Publisher.message_in_txn(txn, target, message)
 
             {:appended, target, message, opts}
 
@@ -1674,6 +1854,9 @@ defmodule Tightbeam.Gateway do
         "UPDATE wakes SET state = 'fired', firedAt = ?2 WHERE wakeId = ?1 AND state = 'pending'",
         [opts[:wake_id], System.system_time(:millisecond)]
       )
+
+      if DB.Txn.changes(txn) == 1,
+        do: Wakes.publish_change_in_txn(txn, "wake.fired", opts[:wake_id])
     end
   end
 
@@ -3133,7 +3316,13 @@ defmodule Tightbeam.Gateway do
                  caller.owner_user_id,
                  call.params[:bind]
                ) do
-          case Roles.create!(db, call.params[:name], caller.owner_user_id, call.params[:bind]) do
+          case Roles.create_with_firehose!(
+                 db,
+                 call.params[:name],
+                 caller.owner_user_id,
+                 call.params[:bind],
+                 call
+               ) do
             {:error, error} -> error
             role -> %{role: role}
           end
@@ -3232,7 +3421,7 @@ defmodule Tightbeam.Gateway do
     archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
     invocation_id = Map.fetch!(call, :invocation_id)
 
-    release_identity_unlearn(config, db, name, archetypes, fn txn ->
+    release_identity_unlearn(config, db, call, name, archetypes, fn txn ->
       candidate = Identity.unlearn!(config.base_dir, name, call.origin)
 
       marker =
@@ -3247,7 +3436,7 @@ defmodule Tightbeam.Gateway do
     end)
   end
 
-  defp release_identity_unlearn(config, db, name, archetypes, prepare) do
+  defp release_identity_unlearn(config, db, call, name, archetypes, prepare) do
     case Org.release_archetypes(db, archetypes, prepare, fn {candidate, marker} ->
            case Identity.publish_live!(config.base_dir, candidate) do
              {:ok, revision} ->
@@ -3262,12 +3451,15 @@ defmodule Tightbeam.Gateway do
         unlearn_referenced_result(name, references)
 
       {:released, {:published, marker, revision}} ->
-        {:ok, :ok} =
-          DB.transaction(db, fn txn ->
+        stamp_served_publication(
+          config,
+          db,
+          call,
+          %{state: "published", kungfu: name, live_revision: revision},
+          before_stamp: fn txn ->
             AdminProjection.finish_identity_publication_in_txn(txn, marker, "accepted")
-          end)
-
-        %{state: "published", kungfu: name, live_revision: revision}
+          end
+        )
 
       {:released, {:denied, marker, error}} ->
         {:ok, :ok} =
@@ -3285,6 +3477,27 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp stamp_served_publication(config, db, call, result, opts \\ []) do
+    case AdminProjection.stamp_publication(
+           db,
+           call,
+           AdminProjection.served_entries(db, config.base_dir),
+           opts
+         ) do
+      {:ok, _changed} -> result
+      {:error, error} -> error
+    end
+  end
+
+  defp accepted_without_state(db, call) do
+    case DB.transaction(db, fn txn ->
+           Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
   defp publish_identity_candidate(config, db, call, candidate, result) do
     invocation_id = Map.get(call, :invocation_id, "identity-" <> Tightbeam.Id.uuid4())
 
@@ -3297,7 +3510,12 @@ defmodule Tightbeam.Gateway do
            ) do
       case marker.state do
         "accepted" ->
-          Map.put(result, :live_revision, marker.candidate_revision)
+          stamp_served_publication(
+            config,
+            db,
+            call,
+            Map.put(result, :live_revision, marker.candidate_revision)
+          )
 
         "denied" ->
           identity_denial_result(marker)
@@ -3307,12 +3525,15 @@ defmodule Tightbeam.Gateway do
             {:ok, revision} ->
               load_law!(config)
 
-              {:ok, :ok} =
-                DB.transaction(db, fn txn ->
+              stamp_served_publication(
+                config,
+                db,
+                call,
+                Map.put(result, :live_revision, revision),
+                before_stamp: fn txn ->
                   AdminProjection.finish_identity_publication_in_txn(txn, marker, "accepted")
-                end)
-
-              Map.put(result, :live_revision, revision)
+                end
+              )
 
             {:error, error} ->
               {:ok, :ok} =
@@ -3860,7 +4081,7 @@ defmodule Tightbeam.Gateway do
          {:ok, caller} <- caller_for_role_mutation(db, call.origin),
          :ok <- role_mutation_allowed(db, caller, call.origin, role),
          :ok <- binding_owner_allowed(db, call.origin, role, session_key),
-         :ok <- Roles.bind(db, name, session_key) do
+         :ok <- Roles.bind_with_firehose(db, name, session_key, call) do
       %{role: Roles.get(db, name)}
     else
       nil -> %{code: "unknown_role", message: "unknown role: #{name}"}
@@ -3874,13 +4095,44 @@ defmodule Tightbeam.Gateway do
     with role when not is_nil(role) <- Roles.get(db, name),
          {:ok, caller} <- caller_for_role_mutation(db, call.origin),
          :ok <- role_mutation_allowed(db, caller, call.origin, role),
-         :ok <- Roles.rm(db, name) do
+         :ok <- Roles.rm_with_firehose(db, name, call) do
       %{removed: name}
     else
       nil -> %{code: "unknown_role", message: "unknown role: #{name}"}
       {:error, error} -> error
     end
   end
+
+  defp read_marker_result(db, call, operation) do
+    scope_key = call.params[:scope_key]
+    marker = if operation == :clear, do: nil, else: call.params[:marker]
+
+    with true <- is_binary(scope_key) and scope_key != "",
+         true <- operation == :clear or valid_read_marker?(marker),
+         %{owner_user_id: user_id} when is_binary(user_id) <- resolve_caller(db, call.origin) do
+      case Tightbeam.ReadMarkers.set(db, user_id, scope_key, marker,
+             expected?: Map.has_key?(call.params, :expected_current),
+             expected: call.params[:expected_current],
+             firehose_call: call
+           ) do
+        {:error, error} ->
+          error
+
+        {:ok, changed, row} ->
+          %{changed: changed, read_marker: row, user_id: user_id}
+      end
+    else
+      false ->
+        %{code: "invalid", message: "scopeKey and a row-id or timestamp marker are required"}
+
+      _ ->
+        %{code: "unknown_caller"}
+    end
+  end
+
+  defp valid_read_marker?(marker) when is_integer(marker), do: marker >= 0
+  defp valid_read_marker?(marker) when is_binary(marker), do: marker != ""
+  defp valid_read_marker?(_marker), do: false
 
   defp role_list_result(db) do
     roles =
@@ -3990,27 +4242,54 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp config_result(db, %{action: "get", setting: "default-archetype"}) do
+  defp config_result(db, %{params: %{action: "get", setting: "default-archetype"}}) do
+    item = StateResources.query_config(db, "default-archetype")
+
     %{
       setting: "default-archetype",
-      value: Org.get_setting(db, "default-archetype") || "default"
+      value: Org.get_setting(db, "default-archetype") || "default",
+      config: item && StateResources.config(item)
     }
   end
 
-  defp config_result(db, %{
-         action: "set",
-         setting: "default-archetype",
-         value: archetype_name
-       }) do
+  defp config_result(
+         db,
+         %{
+           params: %{
+             action: "set",
+             setting: "default-archetype",
+             value: archetype_name
+           }
+         } = call
+       ) do
     case DB.transaction(db, fn txn ->
            if Archetypes.get(archetype_name) do
-             put_setting_in_txn(txn, "default-archetype", archetype_name)
+             result =
+               Org.put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
+
+             Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+             if result.changed do
+               Tightbeam.Firehose.Publisher.committed_in_txn(
+                 txn,
+                 "config.updated",
+                 result.projection,
+                 %{"key" => "default-archetype"}
+               )
+             end
+
+             {:ok, result}
            else
              {:error, :unknown_archetype}
            end
          end) do
-      {:ok, :ok} ->
-        %{setting: "default-archetype", value: archetype_name}
+      {:ok, {:ok, result}} ->
+        %{
+          setting: "default-archetype",
+          value: archetype_name,
+          config: StateResources.config(result.projection),
+          changed: result.changed
+        }
 
       {:ok, {:error, :unknown_archetype}} ->
         %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
@@ -4020,22 +4299,59 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp config_result(db, %{action: "get", setting: "default-priority"}) do
+  defp config_result(db, %{params: %{action: "get", setting: "default-priority"}}) do
+    item = StateResources.query_config(db, "default-priority")
+
     %{
       setting: "default-priority",
-      value: parse_default_priority(Org.get_setting(db, "default-priority"))
+      value: parse_default_priority(Org.get_setting(db, "default-priority")),
+      config: item && StateResources.config(item)
     }
   end
 
-  defp config_result(db, %{action: "set", setting: "default-priority", value: priority}) do
+  defp config_result(
+         db,
+         %{params: %{action: "set", setting: "default-priority", value: priority}} = call
+       ) do
     if is_integer(priority) and priority in 0..8 do
       value = Integer.to_string(priority)
 
       case DB.transaction(db, fn txn ->
-             put_setting_in_txn(txn, "default-priority", value)
+             previous_value =
+               case DB.Txn.q(txn, "SELECT value FROM org_settings WHERE key = ?1", [
+                      "default-priority"
+                    ]) do
+                 [[stored]] -> stored
+                 [] -> nil
+               end
+
+             :ok = Org.put_setting_in_txn(txn, "default-priority", value)
+
+             result = %{
+               changed: previous_value != value,
+               projection: StateResources.query_config(txn, "default-priority")
+             }
+
+             Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+             if result.changed do
+               Tightbeam.Firehose.Publisher.committed_in_txn(
+                 txn,
+                 "config.updated",
+                 result.projection,
+                 %{"key" => "default-priority"}
+               )
+             end
+
+             result
            end) do
-        {:ok, :ok} ->
-          %{setting: "default-priority", value: priority, changed: true}
+        {:ok, result} ->
+          %{
+            setting: "default-priority",
+            value: priority,
+            changed: result.changed,
+            config: StateResources.config(result.projection)
+          }
 
         {:error, error} ->
           raise error
@@ -4054,8 +4370,6 @@ defmodule Tightbeam.Gateway do
 
   defp parse_default_priority(nil), do: 4
   defp parse_default_priority(value), do: String.to_integer(value)
-
-  defp put_setting_in_txn(txn, key, value), do: Org.put_setting_in_txn(txn, key, value)
 
   defp admin_handler(db, fun) do
     fn call ->
@@ -4101,6 +4415,7 @@ defmodule Tightbeam.Gateway do
           end
 
         %{state: "accepted"} = marker ->
+          accepted_without_state(db, call)
           %{state: "published", live_revision: marker.candidate_revision}
 
         %{state: "denied"} = marker ->
@@ -4120,7 +4435,7 @@ defmodule Tightbeam.Gateway do
 
     candidate = identity_candidate_from_marker(marker)
 
-    release_identity_unlearn(config, db, name, archetypes, fn _txn ->
+    release_identity_unlearn(config, db, call, name, archetypes, fn _txn ->
       {candidate, marker}
     end)
   end
@@ -4343,7 +4658,12 @@ defmodule Tightbeam.Gateway do
         outcome: %{kind: "no_replacement"}
       }
 
-      case DB.transaction(db, fn txn -> Wakes.cancel_in_txn(txn, command) end) do
+      case DB.transaction(db, fn txn ->
+             result = Wakes.cancel_in_txn(txn, command)
+             # The central cancellation winner owns the state notice.
+             Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+             result
+           end) do
         {:ok, {:accepted_in_txn, event_id, %{canceled: true}}}
         when is_integer(event_id) and event_id > 0 ->
           {:accepted_in_txn, event_id, %{canceled: true}}
@@ -4387,7 +4707,12 @@ defmodule Tightbeam.Gateway do
                 do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
 
             if prior do
-              Wakes.get_in_txn(txn, prior.session_key)
+              wake = Wakes.get_in_txn(txn, prior.session_key)
+
+              if is_map(wake),
+                do: Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+              wake
             else
               wake = schedule_wake_in_txn(txn, call, session_key, due_at)
 
@@ -4399,6 +4724,9 @@ defmodule Tightbeam.Gateway do
                   session_key: wake.wake_id
                 })
               end
+
+              if is_map(wake) and is_binary(wake[:wake_id]),
+                do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, wake)
 
               wake
             end
@@ -6463,12 +6791,33 @@ defmodule Tightbeam.Gateway do
        ) do
     Enum.each(sessions, fn session ->
       best_effort(fn ->
-        case Projection.append(db, %{
-               session_key: session.session_key,
-               role: "user",
-               content: credential_transition_message(provider, machine, transition),
-               sender: "process:tightbeam"
-             }) do
+        {:ok, outcome} =
+          DB.transaction(db, fn txn ->
+            outcome =
+              Projection.append_in_txn(txn, %{
+                session_key: session.session_key,
+                role: "user",
+                content: credential_transition_message(provider, machine, transition),
+                sender: "process:tightbeam"
+              })
+
+            case outcome do
+              {:appended, message} ->
+                Tightbeam.Firehose.Publisher.message_in_txn(
+                  txn,
+                  session.session_key,
+                  message,
+                  session.owner_user_id
+                )
+
+              _ ->
+                :ok
+            end
+
+            outcome
+          end)
+
+        case outcome do
           {:appended, message} -> publish_message(db, session.session_key, message)
           _ -> :ok
         end
@@ -6685,16 +7034,16 @@ defmodule Tightbeam.Gateway do
     # `resolve_caller/2` handles all three origin classes and yields a nil owner
     # for a process, which cannot match a NOT NULL ownerUserId, so unknown and
     # process callers keep getting `not_found`.
-    owner = resolve_caller(db, call.origin)[:owner_user_id]
+    owner = principal_caller(db, call)[:owner_user_id]
     prior = if p[:idempotency_key], do: Idempotency.get(db, owner, "retire", p.idempotency_key)
 
     cond do
       prior && prior.session_key == call.session_key ->
-        %{
+        retire_replay_observation(db, call, %{
           deleted_session_key: call.session_key,
           retired_session_keys: retired_subtree_keys(db, call.session_key),
           deferred: []
-        }
+        })
 
       true ->
         case Org.get(db, call.session_key) do
@@ -6714,12 +7063,17 @@ defmodule Tightbeam.Gateway do
                 DB.transaction_then(
                   db,
                   fn txn ->
+                    Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
                     result =
                       retire_cascade_in_txn(
                         txn,
                         session.session_key,
                         owner,
-                        call.origin,
+                        case call.principal do
+                          {:user, id} -> "user:" <> id
+                          {:session, key} -> "session:" <> key
+                        end,
                         supervision_interval_ms(config),
                         "retired: session retired before execution"
                       )
@@ -6758,7 +7112,11 @@ defmodule Tightbeam.Gateway do
                 deferred: result.deferred
               }
             else
-              %{deleted_session_key: session.session_key, retired_session_keys: [], deferred: []}
+              retire_replay_observation(db, call, %{
+                deleted_session_key: session.session_key,
+                retired_session_keys: [],
+                deferred: []
+              })
             end
 
           _ ->
@@ -6767,13 +7125,22 @@ defmodule Tightbeam.Gateway do
     end
   end
 
+  defp retire_replay_observation(db, call, result) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+      end)
+
+    result
+  end
+
   defp critical_result(config, db, call) do
     with {:session, session_key} <- call[:principal],
          %{state: "active"} <- Org.get(db, session_key),
          duration when is_integer(duration) and duration > 0 <- call.params[:for_ms],
          reason when is_binary(reason) and reason != "" <- call.params[:reason] do
       hard_cap = Map.get(config, :critical_lease_hard_cap_ms, 14_400_000)
-      lease = CriticalLeases.declare(db, session_key, duration, reason, hard_cap)
+      lease = CriticalLeases.declare(db, session_key, duration, reason, hard_cap, call)
 
       %{
         session_key: session_key,
@@ -6901,14 +7268,17 @@ defmodule Tightbeam.Gateway do
 
     case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId=?1", [wake_id]) do
       [] ->
-        Wakes.schedule_in_txn(txn, %{
-          wake_id: wake_id,
-          session_key: session_key,
-          origin: "user:#{owner}",
-          prompt:
-            "FINAL RETIRE INSTRUCTION: clean up critical section '#{lease.reason}'; retirement is deferred only until hard deadline #{lease.hard_deadline}.",
-          due_at: lease.hard_deadline
-        })
+        wake =
+          Wakes.schedule_in_txn(txn, %{
+            wake_id: wake_id,
+            session_key: session_key,
+            origin: "user:#{owner}",
+            prompt:
+              "FINAL RETIRE INSTRUCTION: clean up critical section '#{lease.reason}'; retirement is deferred only until hard deadline #{lease.hard_deadline}.",
+            due_at: lease.hard_deadline
+          })
+
+        Wakes.publish_change_in_txn(txn, "wake.scheduled", wake.wake_id)
 
       [[1]] ->
         :ok

@@ -451,7 +451,7 @@ defmodule Tightbeam.CliIntegrationTest do
     assert String.ends_with?(after_delivered, after_prompt)
 
     {_, 0} =
-      System.cmd(ctx.binary, ["revoke-assignment", resolver],
+      System.cmd(ctx.binary, ["revoke-assignment", resolver, "--reason", "Resolver disposition"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -715,7 +715,7 @@ defmodule Tightbeam.CliIntegrationTest do
     {revoked, 0} =
       System.cmd(
         ctx.binary,
-        ["revoke-assignment", assignment_id, "--as-user", "flynn"],
+        ["revoke-assignment", assignment_id, "--reason", "CLI disposition", "--as-user", "flynn"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -848,7 +848,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {revoked, 0} =
-      System.cmd(ctx.binary, ["revoke-assignment", dispatch_id],
+      System.cmd(ctx.binary, ["revoke-assignment", dispatch_id, "--reason", "CLI disposition"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )

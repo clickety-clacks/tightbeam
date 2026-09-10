@@ -25,6 +25,7 @@ defmodule Tightbeam.ConditionFacts do
     harness-model-unavailable harness-model-restored
     harness-task-crash harness-task-restored
     harness-interrupted-outcome-unknown harness-interrupted-outcome-reconciled
+    cli-incompatible cli-compatible
   )
   @agent_only_kinds ~w(work-blocked work-unblocked)
 
@@ -36,7 +37,8 @@ defmodule Tightbeam.ConditionFacts do
     "harness-adapter-unavailable" => "harness-adapter-restored",
     "harness-model-unavailable" => "harness-model-restored",
     "harness-task-crash" => "harness-task-restored",
-    "harness-interrupted-outcome-unknown" => "harness-interrupted-outcome-reconciled"
+    "harness-interrupted-outcome-unknown" => "harness-interrupted-outcome-reconciled",
+    "cli-incompatible" => "cli-compatible"
   }
 
   @harness_health_kinds %{
@@ -266,6 +268,12 @@ defmodule Tightbeam.ConditionFacts do
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file_idempotent(db, scheduler, input) do
+    {result, _filed?} = file_idempotent_with_effect(db, scheduler, input)
+    result
+  end
+
+  @doc false
+  def file_idempotent_with_effect(db, scheduler, input, firehose_call \\ nil) do
     case DB.transaction_then(
            db,
            fn txn ->
@@ -275,43 +283,61 @@ defmodule Tightbeam.ConditionFacts do
              prior =
                if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
 
-             if prior do
-               result =
-                 with :ok <- consequence_admission(txn, input) do
-                   fact = fact_in_txn(txn, prior.session_key)
+             outcome =
+               if prior do
+                 result =
+                   with :ok <- consequence_admission(txn, input) do
+                     fact = fact_in_txn(txn, prior.session_key)
 
-                   if input[:payload] &&
-                        (is_nil(fact) || fact.kind != input.kind || fact.scope != input[:scope] ||
-                           fact.payload != input[:payload]) do
-                     {:error,
-                      %{
-                        code: "conflict",
-                        message: "condition key already has different immutable content"
-                      }}
-                   else
-                     fact
+                     if input[:payload] &&
+                          (is_nil(fact) || fact.kind != input.kind || fact.scope != input[:scope] ||
+                             fact.payload != input[:payload]) do
+                       {:error,
+                        %{
+                          code: "conflict",
+                          message: "condition key already has different immutable content"
+                        }}
+                     else
+                       fact
+                     end
                    end
+
+                 {result, false}
+               else
+                 # Typed semantic replay can return an existing fact without a wire key.
+                 [[before_id]] =
+                   Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
+
+                 case file_in_txn(txn, input) do
+                   %{fact_id: fact_id} = fact ->
+                     if is_binary(key) do
+                       Idempotency.put_in_txn(txn, %{
+                         owner_user_id: origin,
+                         operation: "condition",
+                         idempotency_key: key,
+                         session_key: to_string(fact_id)
+                       })
+                     end
+
+                     {fact, fact_id > before_id}
+
+                   error ->
+                     {error, false}
                  end
-
-               {result, false}
-             else
-               case file_in_txn(txn, input) do
-                 %{fact_id: fact_id} = fact ->
-                   if is_binary(key) do
-                     Idempotency.put_in_txn(txn, %{
-                       owner_user_id: origin,
-                       operation: "condition",
-                       idempotency_key: key,
-                       session_key: to_string(fact_id)
-                     })
-                   end
-
-                   {fact, true}
-
-                 error ->
-                   {error, false}
                end
+
+             case {outcome, firehose_call} do
+               {{%{fact_id: _} = fact, true}, %{} = call} ->
+                 Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, fact)
+
+               {{%{fact_id: _}, false}, %{} = call} ->
+                 Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+               _ ->
+                 :ok
              end
+
+             outcome
            end,
            fn txn, {result, filed?} ->
              Tightbeam.Wakes.row_commit_in_txn(txn, [])
@@ -327,7 +353,7 @@ defmodule Tightbeam.ConditionFacts do
       {:ok, {result, deliveries, filed?}} ->
         complete_deliveries(db, deliveries)
         if filed?, do: notify_scheduler(scheduler, result)
-        result
+        {result, filed?}
 
       {:error, error} ->
         raise error
@@ -484,6 +510,50 @@ defmodule Tightbeam.ConditionFacts do
       )
 
     match?([[^assert_kind]], rows)
+  end
+
+  @doc "Record one authenticated CLI-version observation without fabricating an agent judgment."
+  @spec observe_cli_compatibility(
+          DB.server(),
+          String.t(),
+          :compatible | :incompatible,
+          String.t(),
+          String.t(),
+          String.t()
+        ) ::
+          :recorded | :cleared | :unchanged | {:error, term()}
+  def observe_cli_compatibility(db, session_key, state, offered, required, path)
+      when state in [:compatible, :incompatible] and is_binary(session_key) and is_binary(offered) and
+             is_binary(required) and is_binary(path) do
+    kind = if state == :compatible, do: "cli-compatible", else: "cli-incompatible"
+
+    case DB.transaction(db, fn txn ->
+           incompatible? = standing_in_txn?(txn, "cli-incompatible", session_key)
+
+           if (kind == "cli-incompatible" and incompatible?) or
+                (kind == "cli-compatible" and not incompatible?) do
+             :unchanged
+           else
+             fact =
+               file_in_txn(txn, %{
+                 kind: kind,
+                 scope: session_key,
+                 origin: "process:tightbeam"
+               })
+
+             EventLog.lifecycle_in_txn(
+               txn,
+               "cli_compatibility_observed",
+               to_string(fact.fact_id),
+               "session=#{session_key} offered=#{offered} required=#{required} path=#{path}"
+             )
+
+             if kind == "cli-incompatible", do: :recorded, else: :cleared
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   @doc "The literal condition scope for one shared harness process."

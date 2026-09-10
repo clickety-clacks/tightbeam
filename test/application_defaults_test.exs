@@ -35,7 +35,10 @@ defmodule Tightbeam.ApplicationDefaultsTest do
   # Write the same onboarded-credential metadata that a real onboard leaves, so
   # Credentials.kind_at reads a non-:none kind for the provider.
   defp onboard!(base, provider) do
-    meta = Path.join([Credentials.store_dir(base, provider), ".tightbeam", "credential.json"])
+    harness = if provider == :anthropic, do: :claude, else: :codex
+    home = Tightbeam.Homes.home_path(base, Tightbeam.Placement.local_host_name(), harness)
+    meta = Path.join([home, ".tightbeam", "credential.json"])
+
     File.mkdir_p!(Path.dirname(meta))
 
     File.write!(

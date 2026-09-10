@@ -90,7 +90,7 @@ defmodule Tightbeam.Credentials do
   """
   @spec kind_at(String.t(), provider()) :: kind() | :none
   def kind_at(base_dir, provider) do
-    case File.read(metadata_path(base_dir, provider)) do
+    case File.read(metadata_path(base_dir, local_machine_name(), provider)) do
       {:ok, bytes} ->
         case JSON.decode(bytes) do
           {:ok, %{"onboarded" => true} = metadata} -> decode_kind(metadata["kind"])
@@ -150,20 +150,6 @@ defmodule Tightbeam.Credentials do
       nil -> false
       module -> module.classify_auth_event(evidence) == :terminal
     end
-  end
-
-  @doc false
-  def store_harvested(base_dir, provider, bytes, source \\ "a harness home") do
-    path =
-      case provider do
-        :openai -> Path.join([base_dir, "auth", "codex", "auth.json"])
-        :anthropic -> Path.join([base_dir, "auth", "claude", ".credentials.json"])
-        :fixture_provider -> Path.join([base_dir, "auth", "fixture", "fixture.json"])
-      end
-
-    refuse_hollow!(provider, bytes, source)
-    atomic_write!(path, bytes)
-    :ok
   end
 
   @doc """
@@ -289,8 +275,33 @@ defmodule Tightbeam.Credentials do
   defp blank_token?(token) when is_binary(token), do: String.trim(token) == ""
   defp blank_token?(_other), do: true
 
+  @doc "The exact harness-home credential path for one provider on one machine."
+  def credential_path(base_dir, machine, provider) do
+    Path.join([
+      Homes.home_path(base_dir, machine, harness_id(provider)),
+      credential_filename(provider)
+    ])
+  end
+
   @doc false
-  def store_dir(base_dir, provider), do: Path.join([base_dir, "auth", harness_name(provider)])
+  def credential_secret_paths(base_dir) do
+    active =
+      for module <- Harness.all(),
+          path <-
+            Path.wildcard(
+              Path.join([
+                base_dir,
+                "homes",
+                "*",
+                Atom.to_string(module.id()),
+                credential_filename(module.credential_provider())
+              ])
+            ),
+          do: path
+
+    legacy = Path.wildcard(Path.join([base_dir, "auth", "**", "*"]))
+    Enum.uniq(active ++ legacy)
+  end
 
   @impl true
   def init(opts) do
@@ -741,7 +752,7 @@ defmodule Tightbeam.Credentials do
   # refusal it is, while a raise would kill this GenServer and surface as an exit.
   defp write_credential!(state, :openai, credential) do
     with :ok <- refuse_hollow(:openai, credential.bytes, "the onboarding ceremony") do
-      atomic_write!(credential_store_path(state, :openai), credential.bytes)
+      atomic_write!(credential_home_path(state, :openai), credential.bytes)
       reconcile_provider_homes(state, :openai)
       :ok
     end
@@ -750,7 +761,7 @@ defmodule Tightbeam.Credentials do
   defp write_credential!(state, :anthropic, credential) do
     with :ok <- refuse_hollow(:anthropic, credential.bytes, "the onboarding ceremony") do
       atomic_write!(
-        credential_store_path(state, :anthropic),
+        credential_home_path(state, :anthropic),
         String.trim(credential.bytes) <> "\n"
       )
 
@@ -781,7 +792,7 @@ defmodule Tightbeam.Credentials do
 
   defp write_credential!(state, :fixture_provider, credential) do
     with :ok <- refuse_hollow(:fixture_provider, credential.bytes, "the onboarding ceremony") do
-      atomic_write!(credential_store_path(state, :fixture_provider), credential.bytes)
+      atomic_write!(credential_home_path(state, :fixture_provider), credential.bytes)
       reconcile_provider_homes(state, :fixture_provider)
       :ok
     end
@@ -817,16 +828,22 @@ defmodule Tightbeam.Credentials do
     Enum.each(harnesses_for_provider(provider), fn module ->
       home = Homes.home_path(state.base_dir, state.machine, module.id())
 
+      desired = %{
+        harness: module.id(),
+        machine: state.machine,
+        rails: Rails.hook_settings(),
+        credential_home: home
+      }
+
+      desired =
+        if module.id() == :cursor,
+          do: Map.put(desired, :auth_dir, store_dir(state.base_dir, :cursor)),
+          else: desired
+
       module.reconcile_home(
         target,
         home,
-        %{
-          harness: module.id(),
-          machine: state.machine,
-          rails: Rails.hook_settings(),
-          auth_dir: Path.dirname(credential_store_path(state, provider)),
-          harvest_auth: false
-        }
+        desired
       )
 
       warm_home(module, target, home)
@@ -1057,20 +1074,18 @@ defmodule Tightbeam.Credentials do
   end
 
   defp metadata_path(state, provider) when is_map(state),
-    do: metadata_path(state.base_dir, provider)
+    do: metadata_path(state.base_dir, state.machine, provider)
 
-  defp metadata_path(base_dir, provider) when is_binary(base_dir) do
+  defp metadata_path(base_dir, machine, provider) when is_binary(base_dir) do
     Path.join([
-      base_dir,
-      "auth",
-      harness_name(provider),
+      Homes.home_path(base_dir, machine, harness_id(provider)),
       ".tightbeam",
       "credential.json"
     ])
   end
 
   defp read_metadata(%{ssh: nil} = state, provider) do
-    store = store_dir(state.base_dir, provider)
+    store = Homes.home_path(state.base_dir, state.machine, harness_id(provider))
 
     case File.lstat(store) do
       {:ok, %{type: :directory}} -> read_local_metadata(state, provider)
@@ -1081,7 +1096,7 @@ defmodule Tightbeam.Credentials do
   end
 
   defp read_metadata(state, provider) do
-    store = store_dir(state.base_dir, provider)
+    store = Homes.home_path(state.base_dir, state.machine, harness_id(provider))
 
     case remote_test(state, "-L", store) do
       true ->
@@ -1198,23 +1213,41 @@ defmodule Tightbeam.Credentials do
     remote_ok!(state, ["sh", "-c", shell_quote(script)])
   end
 
-  defp credential_store_path(state, :openai),
-    do: Path.join([state.base_dir, "auth", "codex", "auth.json"])
+  defp credential_home_path(state, provider),
+    do: credential_path(state.base_dir, state.machine, provider)
 
-  defp credential_store_path(state, :anthropic),
-    do: Path.join([state.base_dir, "auth", "claude", ".credentials.json"])
+  defp harness_id(:openai), do: :codex
+  defp harness_id(:anthropic), do: :claude
+  defp harness_id(:cursor), do: :cursor
+  defp harness_id(:fixture_provider), do: :fixture
+
+  @doc false
+  def store_dir(base_dir, :cursor), do: Path.join([base_dir, "auth", "cursor"])
 
   defp credential_store_path(state, :cursor),
     do: Path.join([state.base_dir, "auth", "cursor", "api-key"])
 
-  defp credential_store_path(state, :fixture_provider),
-    do: Path.join([state.base_dir, "auth", "fixture", "fixture.json"])
+  defp credential_filename(:openai), do: "auth.json"
+  defp credential_filename(:anthropic), do: ".credentials.json"
+  defp credential_filename(:cursor), do: "api-key"
+  defp credential_filename(:fixture_provider), do: "fixture.json"
 
-  defp harness_name(:openai), do: "codex"
-  defp harness_name(:anthropic), do: "claude"
-  defp harness_name(:opencode), do: "opencode"
-  defp harness_name(:cursor), do: "cursor"
-  defp harness_name(:fixture_provider), do: "fixture"
+  defp credential_present_at?(base_dir, machine, provider) do
+    module = Harness.module!(harness_id(provider))
+
+    module.credential_ready?(
+      %{base_dir: base_dir, host_name: machine, host_config: %{ssh: nil, base_dir: base_dir}},
+      Homes.home_path(base_dir, machine, module.id())
+    )
+  end
+
+  defp local_machine_name do
+    Application.get_env(:tightbeam, :local_host_name) ||
+      (
+        {:ok, name} = :inet.gethostname()
+        List.to_string(name)
+      )
+  end
 
   # The mode a provider's bank directory must carry, or nil to leave whatever
   # `mkdir` created. Cursor is the one owner-only (0700) provider: its key is a
@@ -1319,19 +1352,23 @@ defmodule Tightbeam.Credentials do
 
   defp install_staged!(state, provider, kind, path) do
     source = staged_path(provider, path)
-    store = credential_store_path(state, provider)
-    dir = Path.dirname(store)
 
-    # Cursor's bank directory is owner-only, remotely as it is locally: the key
-    # is a bare secret with no harness home, so a 0755 directory that any
-    # same-box account can traverse to a 0600 file is exactly the exposure the
-    # credential-park store exists to close. Scoped to cursor on purpose — the
-    # other providers' remote directories keep the perms they have always had.
-    dir_chmod =
-      case bank_dir_mode(provider) do
-        nil -> ""
-        mode -> "chmod #{Integer.to_string(mode, 8)} #{shell_quote(dir)} && "
+    {store, dir_chmod} =
+      case provider do
+        :cursor ->
+          store = credential_store_path(state, :cursor)
+
+          # Cursor's bank directory is owner-only, remotely as it is locally:
+          # the key is injected at spawn and never belongs in a harness home.
+          {store, "chmod 700 #{shell_quote(Path.dirname(store))} && "}
+
+        _other ->
+          # The live target keeps all file-backed harness credentials in the
+          # harness home. Preserve that layout for every existing provider.
+          {credential_home_path(state, provider), ""}
       end
+
+    dir = Path.dirname(store)
 
     script =
       "test -f #{shell_quote(source)} && " <>

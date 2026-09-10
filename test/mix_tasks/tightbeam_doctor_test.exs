@@ -410,22 +410,13 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     refute File.exists?(db_path)
   end
 
-  test "org_hosts reads a present hosts table through the read-only open", ctx do
-    db = :"doctor_org_hosts_#{System.unique_integer([:positive])}"
-    start_supervised!({Tightbeam.DB, path: Path.join(ctx.base_dir, "state.db"), name: db})
-    :ok = Tightbeam.Placement.ensure_schema(db)
-
-    {:ok, _entry} =
-      Tightbeam.Placement.register_host(db, "worker", %{
-        ssh: "tb@worker",
-        base_dir: "/srv/tb",
-        cli_bin: "/srv/tb/bin"
-      })
-
-    hosts = Doctor.org_hosts(ctx.base_dir)
-
-    assert hosts["worker"] == %{ssh: "tb@worker", base_dir: "/srv/tb", cli_bin: "/srv/tb/bin"}
-    assert hosts[Tightbeam.Placement.local_host_name()].ssh == nil
+  @tag :tmp_dir
+  test "org_hosts reads a present hosts table through the read-only open", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "guard_doctor_runtime.exs",
+      "guarded-doctor-readonly: ok"
+    )
   end
 
   test "human and JSON formats expose status, detail, fixes, and readiness", ctx do

@@ -105,13 +105,13 @@
       ],
       "oracle": "cwd entries under the reserved namespace equal the expected entries"
     },
-    "credential_ready?/harvest_credential": {
+    "credential_ready?": {
       "required_cases": [
         "present",
         "absent",
         "rotated"
       ],
-      "oracle": "credential readiness boolean and harvested bytes equal the vector's expected values"
+      "oracle": "selected-home credential readiness boolean equals the vector's expected value; no credential harvesting occurs"
     },
     "credential_live?": {
       "capability_id": "CAP-018",

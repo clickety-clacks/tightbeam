@@ -1684,14 +1684,23 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "refused operator ask does not publish a fabricated supersession", ctx do
-    raiser = session(ctx.db, "ask-raiser", "flynn")
-    closed_assignment = assignment(ctx, raiser.session_key, {:user, "flynn"})
-
     assert {:ok, _} =
              DB.query(
                ctx.db,
-               "UPDATE assignments SET state='closed', outcome='revoked', closedAt=1, closedByUser='flynn' WHERE id=?1",
-               [closed_assignment.id]
+               "INSERT INTO users (userId, isAdmin, createdAt) VALUES ('flynn', 0, 1)"
+             )
+
+    raiser = session(ctx.db, "ask-raiser", "flynn")
+    closed_assignment = assignment(ctx, raiser.session_key, {:user, "flynn"})
+
+    assert %{state: "closed", outcome: "revoked"} =
+             Assignments.__handle__(
+               ctx.db,
+               "revoke-assignment",
+               p3_call("revoke-assignment", {:user, "flynn"}, %{
+                 assignment_id: closed_assignment.id,
+                 reason: "closed assignment refusal fixture"
+               })
              )
 
     old =

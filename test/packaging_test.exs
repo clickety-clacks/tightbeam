@@ -23,8 +23,9 @@ defmodule Tightbeam.PackagingTest do
     assert output =~ "version smoke: manifest=0.1.6 cli=0.1.6 gateway=0.1.6"
   end
 
+  @tag :manifest_finalizer
   test "a rejected temporary artifact never receives the final installable name" do
-    temporary = artifact_fixture("0.1.6", "0.1.5")
+    temporary = artifact_fixture("0.1.6", "0.1.5", "0.1.6", payload: true)
     final = temporary <> ".final.tgz"
 
     {output, status} =
@@ -89,8 +90,9 @@ defmodule Tightbeam.PackagingTest do
     end
   end
 
+  @tag :manifest_finalizer
   test "a metadata-poisoned temporary artifact never receives the final installable name" do
-    temporary = artifact_fixture("0.1.6", "0.1.6")
+    temporary = artifact_fixture("0.1.6", "0.1.6", "0.1.6", payload: true)
     poison_pax_header!(temporary, "SCHILY.fflags")
     final = temporary <> ".final.tgz"
 
@@ -102,8 +104,26 @@ defmodule Tightbeam.PackagingTest do
     refute File.exists?(final)
   end
 
+  @tag :manifest_finalizer
+  test "valid manifested archive passes all finalizer checks without changing archive bytes" do
+    temporary = artifact_fixture("0.1.6", "0.1.6", "0.1.6", payload: true)
+    original = File.read!(temporary)
+    final = temporary <> ".final.tgz"
+
+    {output, status} =
+      System.cmd("sh", [@finalize, temporary, final, "0.1.6"], stderr_to_stdout: true)
+
+    assert status == 0, output
+    assert output =~ "version smoke: manifest=0.1.6 cli=0.1.6 gateway=0.1.6"
+    assert output =~ "package purity: clean"
+    assert File.read!(final) == original
+    refute File.exists?(temporary)
+  end
+
   defp artifact_fixture(cli_version, gateway_version, manifest_version \\ "0.1.6", opts \\ []) do
     root = Path.join(System.tmp_dir!(), "tightbeam-package-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(root)
+    root = Tightbeam.LiveBaseAdmission.canonical!(root)
     package = Path.join(root, "tightbeam")
     File.mkdir_p!(Path.join(package, "bin"))
     File.mkdir_p!(Path.join(package, "release/releases"))
@@ -123,6 +143,16 @@ defmodule Tightbeam.PackagingTest do
 
     if opts[:apple_double] do
       File.write!(Path.join(package, "._package.json"), "host metadata")
+    end
+
+    if opts[:payload] do
+      app = Path.join(package, "release/lib/tightbeam-0.1.6")
+      File.mkdir_p!(Path.join(app, "ebin"))
+      File.mkdir_p!(Path.join(app, "priv"))
+      File.write!(Path.join(app, "ebin/tightbeam.app"), "synthetic app metadata")
+      File.write!(Path.join(app, "priv/resource"), "synthetic resource")
+      File.write!(Path.join(package, "bin/tightbeam-gateway"), "#!/bin/sh\nexit 64\n")
+      Tightbeam.LiveBasePayload.generate!(package)
     end
 
     artifact = Path.join(root, "artifact.tgz")

@@ -117,6 +117,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
@@ -420,6 +421,49 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("action", action),
             ],
         )),
+        Command::Ask {
+            identity,
+            target,
+            question,
+            assignment_id,
+        } => {
+            let target = match target {
+                Target::Session(value) => string_field("sessionKey", value),
+                Target::Role(value) => string_field("role", value),
+                Target::User(value) => string_field("userId", value),
+            };
+            let mut params = vec![string_field("question", question)];
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignmentId", value));
+            }
+            Ok(request(identity, "ask", vec![target], params))
+        }
+        Command::Answer {
+            identity,
+            request_id,
+            answer,
+        } => Ok(request(
+            identity,
+            "answer",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("answer", answer),
+            ],
+        )),
+        Command::Return {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "return",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::OperatorAsk {
             identity,
             question,
@@ -505,11 +549,28 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::RevokeAssignment {
             identity,
             assignment_id,
+            reason,
         } => Ok(request(
             identity,
             "revoke-assignment",
             vec![],
-            vec![string_field("assignmentId", assignment_id)],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
+        )),
+        Command::ReopenAssignment {
+            identity,
+            assignment_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "reopen-assignment",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
         )),
         Command::RepairAssignment {
             identity,
@@ -780,6 +841,38 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             content_sha256,
             wait_id,
         } => {
+            // A surrender is the sole terminal operation a stale session may make.
+            // Keep its wire shape apart from generic dispatch: that endpoint remains
+            // release-gated, and this one must never accept an asserted identity or
+            // ordinary attest fields.
+            if kind == "surrender" {
+                if !matches!(identity, Identity::Session) {
+                    return Err(
+                        "terminal surrender must use the session's implicit identity".to_owned(),
+                    );
+                }
+                let note = note
+                    .as_deref()
+                    .ok_or_else(|| "--note is required when --kind is surrender".to_owned())?;
+                if verdict.is_some()
+                    || commit_refs.is_some()
+                    || artifact_id.is_some()
+                    || content_sha256.is_some()
+                    || wait_id.is_some()
+                {
+                    return Err(
+                        "terminal surrender accepts only --kind surrender and --note".to_owned(),
+                    );
+                }
+                return Ok(RequestSpec {
+                    path: "/agent/terminal",
+                    body_json: object(vec![
+                        string_field("assignmentId", assignment_id),
+                        string_field("disposition", "surrender"),
+                        string_field("note", note),
+                    ]),
+                });
+            }
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
                 string_field("kind", kind),
@@ -1390,11 +1483,16 @@ pub(crate) fn gateway_request(
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout).timeout_connect(timeout);
     }
-    builder
+    let request = builder
         .build()
         .request(method, &format!("{}{path}", endpoint.base))
         .set("authorization", &format!("Bearer {}", endpoint.token))
-        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
+        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"));
+    if path == "/agent/terminal" {
+        request.set("x-tightbeam-terminal-version", "1")
+    } else {
+        request
+    }
 }
 
 /// LOAD-BEARING WORDING. This sentence is control flow, not just prose.
@@ -1501,6 +1599,7 @@ where
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
         }
+        Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::AddUser {
             identity,
@@ -1653,12 +1752,16 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
+        | Command::Ask { identity, .. }
+        | Command::Answer { identity, .. }
+        | Command::Return { identity, .. }
         | Command::OperatorAsk { identity, .. }
         | Command::OperatorRule { identity, .. }
         | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }
         | Command::DecisionRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
+        | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
@@ -1698,6 +1801,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::ToolCallObserved
         | Command::GithubAuthCheck
@@ -1729,8 +1833,158 @@ fn tune_model_params(
     params
 }
 
+fn print_current_session_identity() -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let session_key = current_session_key_from(&cwd)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"sessionKey": session_key}))
+            .expect("session identity serializes")
+    );
+    Ok(())
+}
+
+fn current_session_key_from(cwd: &Path) -> Result<String, String> {
+    for directory in cwd.ancestors() {
+        let path = directory.join(".tightbeam-session");
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(format!(
+                    "session identity unavailable: cannot inspect marker '{}'",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+        }
+        // An existing but unreadable/broken nearest marker must never fall back
+        // to another session's ancestor. Errors omit both bytes and parser excerpts.
+        let encoded = fs::read_to_string(&path)
+            .map_err(|_| format!("malformed session marker '{}': unreadable", path.display()))?;
+        let config: Value = serde_json::from_str(&encoded).map_err(|_| {
+            format!(
+                "malformed session marker '{}': invalid JSON",
+                path.display()
+            )
+        })?;
+        return config
+            .get("sessionKey")
+            .and_then(Value::as_str)
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "malformed session marker '{}': missing sessionKey",
+                    path.display()
+                )
+            });
+    }
+    Err("session identity unavailable: no .tightbeam-session marker".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn builds_agent_decision_bodies() {
+        assert_eq!(
+            body(&[
+                "ask",
+                "--session",
+                "agent:r",
+                "--question",
+                "Why?",
+                "--about",
+                "asg_1",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"ask","sessionKey":"agent:r","params":{"question":"Why?","assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "answer",
+                "--request",
+                "dr_1",
+                "--answer",
+                "Yes",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"answer","params":{"request":"dr_1","answer":"Yes"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "return",
+                "--request",
+                "dr_1",
+                "--reason",
+                "Need proof",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"return","params":{"request":"dr_1","reason":"Need proof"}}"#
+        );
+    }
+
+    #[test]
+    fn identity_current_projects_nearest_key_and_refuses_wrong_session_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-current-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("nested");
+        let cwd = nested.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = nested.join(".tightbeam-session");
+        std::fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"sessionKey":"ancestor","token":"ancestor-secret"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &marker,
+            r#"{"sessionKey":"nearest","token":"nearest-secret","url":"https://unused.invalid"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::current_session_key_from(&cwd).unwrap(), "nearest");
+        for malformed in [
+            r#"{"token":"private-value"}"#,
+            r#"{"sessionKey":42}"#,
+            r#"{"sessionKey":" "}"#,
+            r#"{"sessionKey":"private-value", broken"#,
+        ] {
+            std::fs::write(&marker, malformed).unwrap();
+            let error = super::current_session_key_from(&cwd).unwrap_err();
+            assert!(error.starts_with("malformed session marker"));
+            assert!(!error.contains("private-value"));
+            assert!(!error.contains("ancestor-secret"));
+        }
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&marker).unwrap();
+            std::os::unix::fs::symlink(nested.join("missing-target"), &marker).unwrap();
+            assert!(
+                super::current_session_key_from(&cwd)
+                    .unwrap_err()
+                    .contains("unreadable")
+            );
+            std::fs::remove_file(&marker).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::remove_file(root.join(".tightbeam-session")).unwrap();
+        assert!(
+            super::current_session_key_from(&cwd)
+                .unwrap_err()
+                .starts_with("session identity unavailable")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use crate::args;
     use std::collections::HashMap;
@@ -1851,10 +2105,11 @@ mod tests {
             origin: Origin::Provisioned,
         };
 
-        for (method, path) in [
-            ("POST", "/agent/dispatch"),
-            ("POST", "/agent/tool-call-observed"),
-            ("GET", "/harnesses"),
+        for (method, path, terminal_protocol) in [
+            ("POST", "/agent/dispatch", false),
+            ("POST", "/agent/tool-call-observed", false),
+            ("POST", "/agent/terminal", true),
+            ("GET", "/harnesses", false),
         ] {
             let request = gateway_request(method, &endpoint, path, None);
             assert_eq!(request.method(), method);
@@ -1864,7 +2119,42 @@ mod tests {
                 request.header("x-tightbeam-cli-version"),
                 Some(env!("CARGO_PKG_VERSION"))
             );
+            assert_eq!(
+                request.header("x-tightbeam-terminal-version"),
+                terminal_protocol.then_some("1")
+            );
         }
+    }
+
+    #[test]
+    fn terminal_surrender_has_its_own_fixed_request_shape() {
+        let request = build_request(&parse(&[
+            "attest",
+            "asg_1",
+            "--kind",
+            "surrender",
+            "--note",
+            "incompatible client",
+        ]))
+        .unwrap();
+        assert_eq!(request.path, "/agent/terminal");
+        assert_eq!(
+            request.body_json,
+            r#"{"assignmentId":"asg_1","disposition":"surrender","note":"incompatible client"}"#
+        );
+        assert_eq!(
+            build_request(&parse(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "surrender",
+                "--note",
+                "no",
+                "--as",
+                "coder",
+            ])),
+            Err("terminal surrender must use the session's implicit identity".to_owned())
+        );
     }
 
     #[test]
@@ -2341,8 +2631,26 @@ mod tests {
             r#"{"as":"parent","verb":"operator-withdraw","params":{"request":"dr_2","reason":"moot after 013"}}"#
         );
         assert_eq!(
-            body(&["revoke-assignment", "asg_1", "--as", "parent",]),
-            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
+            body(&[
+                "revoke-assignment",
+                "asg_1",
+                "--as",
+                "parent",
+                "--reason",
+                "superseded"
+            ]),
+            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1","reason":"superseded"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "reopen-assignment",
+                "asg_1",
+                "--reason",
+                "continue work",
+                "--as",
+                "parent"
+            ]),
+            r#"{"as":"parent","verb":"reopen-assignment","params":{"assignmentId":"asg_1","reason":"continue work"}}"#
         );
         assert_eq!(
             body(&[

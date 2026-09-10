@@ -75,7 +75,9 @@ defmodule Tightbeam.RailsTest do
       {%{"on" => ~s("turn-end")}, ~r/unknown statute event/},
       {%{"on" => :omit}, ~r/statute no-history-rewrites is missing "on"/},
       {%{"tool" => :omit}, ~r/is missing "tool"/},
-      {%{"pattern" => :omit}, ~r/is missing "pattern"/},
+      {%{"pattern" => :omit}, ~r/requires exactly one of "pattern" or "action"/},
+      {%{"pattern" => :omit, "action" => ~s("unknown")}, ~r/unknown gate action/},
+      {%{"action" => ~s("git-stash")}, ~r/requires exactly one of "pattern" or "action"/},
       {%{"text" => :omit}, ~r/is missing "text"/},
       {%{"text" => ~s("  ")}, ~r/is missing "text"/},
       {%{"name" => :omit}, ~r/statute is missing "name"/},
@@ -88,6 +90,26 @@ defmodule Tightbeam.RailsTest do
       write_statute(ctx, overrides)
       assert_raise ArgumentError, error, fn -> Rails.load!(ctx.base_dir) end
     end
+  end
+
+  test "an action statute compiles the closed argv classifier", ctx do
+    write_statute(ctx, %{"pattern" => :omit, "action" => ~s("git-stash")})
+    assert [statute] = Rails.load!(ctx.base_dir)
+    assert statute.action == "git-stash"
+    assert statute.pattern == nil
+
+    %{"hooks" => %{"PreToolUse" => [entry, github_auth, observation]}} = Rails.hook_settings()
+    assert github_auth == Rails.github_auth_entry()
+    assert observation == Rails.observation_entry()
+    assert [%{"command" => command}] = entry["hooks"]
+
+    assert command ==
+             "sh -c 'tightbeam rail-action git-stash; status=$?; " <>
+               "if [ \"$status\" -eq 1 ]; then exit 0; fi; " <>
+               "if [ \"$status\" -ne 0 ]; then " <>
+               "echo \"[gate: no-history-rewrites] action classifier failed closed (status $status).\" >&2; exit 2; fi; " <>
+               "echo \"[gate: no-history-rewrites] History-rewriting git commands are forbidden here: " <>
+               "other agents may have uncommitted work in this tree.\" >&2; exit 2'"
   end
 
   test "duplicate names across files fail; files load in filename order", ctx do

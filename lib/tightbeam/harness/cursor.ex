@@ -404,7 +404,7 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def owned_home_entries,
-    do: Support.owned_home_entries(@credential_file, @rails_file)
+    do: Enum.sort([@credential_file | Support.owned_home_entries(@rails_file)])
 
   @impl true
   def reconcile_home(target, home, desired) do
@@ -445,7 +445,6 @@ defmodule Tightbeam.Harness.Cursor do
     Tightbeam.Homes.credential_ready?(target, store, [@api_key_file])
   end
 
-  @impl true
   def harvest_credential(_target, _home), do: nil
 
   @impl true

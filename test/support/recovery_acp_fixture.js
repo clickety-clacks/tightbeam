@@ -15,7 +15,15 @@ if (fs.readFileSync(path.join(arena, ".soak-arena"), "utf8") !==
     "tightbeam recovery acceptance arena v1\n") {
   throw new Error("not a recovery acceptance arena");
 }
-if (fs.readFileSync(path.join(arena, "auth/fixture/fixture.json"), "utf8") !==
+const homeInput = process.env.FIXTURE_HOME;
+if (!homeInput || !path.isAbsolute(homeInput)) {
+  throw new Error("FIXTURE_HOME must name the selected synthetic home");
+}
+const home = fs.realpathSync(homeInput);
+if (!home.startsWith(arena + path.sep)) {
+  throw new Error("fixture home must remain inside the marked arena");
+}
+if (fs.readFileSync(path.join(home, "fixture.json"), "utf8") !==
     "fixture-provider-credential") {
   throw new Error("fixture accepts only its synthetic arena credential");
 }

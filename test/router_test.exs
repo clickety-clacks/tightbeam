@@ -6,9 +6,11 @@ defmodule Tightbeam.Wire.RouterTest do
 
   alias Tightbeam.{
     Assignments,
+    ConditionFacts,
     Credentials,
     DB,
     Devices,
+    Dispatch,
     Gateway,
     Org,
     Placement,
@@ -34,6 +36,24 @@ defmodule Tightbeam.Wire.RouterTest do
     def start_link(name), do: GenServer.start_link(__MODULE__, :ok, name: name)
     def init(:ok), do: {:ok, :ok}
     def handle_call({:fire_matching, _fact_id}, _from, state), do: {:reply, :ok, state}
+  end
+
+  test "changes route refuses missing upgrade or unsupported protocol before authentication" do
+    for {path, upgrade} <- [
+          {"/ws/changes", false},
+          {"/ws/changes?protocolVersion=1", false},
+          {"/ws/changes?protocolVersion=2", true},
+          {"/ws/changes?protocolVersion=0", true}
+        ] do
+      request = conn(:get, path)
+      request = if upgrade, do: put_req_header(request, "upgrade", "websocket"), else: request
+      response = Router.call(request, Router.init([]))
+      assert response.status == 426
+
+      assert JSON.decode!(response.resp_body) == %{
+               "error" => %{"code" => "unsupported_protocol_version"}
+             }
+    end
   end
 
   setup do
@@ -160,6 +180,290 @@ defmodule Tightbeam.Wire.RouterTest do
     }
   end
 
+  test "core device detail preserves authorization order and canonical envelope", ctx do
+    opts = ctx.opts ++ [model_catalog: %{}]
+
+    request = fn path, token, options ->
+      conn(:get, path)
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Router.call(Router.init(options))
+    end
+
+    response = request.("/api/devices/d1", ctx.device.token, opts)
+    assert response.status == 200
+
+    expected =
+      Tightbeam.StateResources.query_device(ctx.db, "d1") |> Tightbeam.StateResources.device()
+
+    assert JSON.decode!(response.resp_body) ==
+             %{"schemaVersion" => 1, "resource" => "devices", "item" => expected}
+
+    assert get_resp_header(response, "cache-control") == ["no-store"]
+    refute response.resp_body =~ ctx.device.token
+
+    probe_opts =
+      opts ++ [core_detail_probe: fn _, _ -> flunk("unauthorized request reached lookup") end]
+
+    denied = request.("/api/devices/d1?bad=%ZZ", "invalid-token", probe_opts)
+    assert denied.status == 401
+    assert JSON.decode!(denied.resp_body)["error"]["code"] == "auth_failed"
+    invalid = request.("/api/devices/d1?asUser=other", ctx.device.token, probe_opts)
+    assert invalid.status == 400
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_as_user"
+    missing = request.("/api/devices/missing", ctx.device.token, opts)
+    assert missing.status == 404
+    assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_found"
+  end
+
+  test "closed wake and artifact projections reject malformed public shapes without altering internal rows",
+       ctx do
+    create_session(ctx.db, "shape-holder", ctx.device.user_id)
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "shape-holder",
+        origin: "user:flynn",
+        prompt: "shape",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    work =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, ctx.device.user_id},
+        params: %{title: "Shape parent"}
+      })
+
+    artifact =
+      Tightbeam.Artifacts.record(ctx.db, %{
+        principal: {:session, "shape-holder"},
+        session_key: "shape-holder",
+        params: %{
+          kind: "report",
+          title: "Shape",
+          origin_path: "reports/shape.md",
+          work_item_id: work.id
+        }
+      })
+
+    wake_row = Tightbeam.StateResources.query_wake(ctx.db, wake.wake_id)
+    artifact_row = Tightbeam.StateResources.query_artifact(ctx.db, artifact.artifact_id)
+
+    for {resource, serializer, row, internal_key, public_key} <- [
+          {"wakes", :wake, wake_row, :owner_user_id, "ownerUserId"},
+          {"artifacts", :artifact, artifact_row, :produced_by_assignment_id,
+           "producedByAssignmentId"}
+        ] do
+      assert Map.has_key?(row, internal_key)
+      public = apply(Tightbeam.StateResources, serializer, [row])
+      refute Map.has_key?(public, public_key)
+      assert apply(Tightbeam.StateResources, serializer, [public]) == public
+
+      for malformed <- [Map.put(public, public_key, "not-wire"), Map.delete(public, "rowVersion")] do
+        assert_raise ArgumentError, fn ->
+          apply(Tightbeam.StateResources, serializer, [malformed])
+        end
+
+        assert_raise ArgumentError, fn ->
+          Tightbeam.StateResources.encode_item(resource, malformed, %{})
+        end
+      end
+    end
+
+    assert Tightbeam.StateResources.query_wake(ctx.db, wake.wake_id) == wake_row
+    assert Tightbeam.StateResources.query_artifact(ctx.db, artifact.artifact_id) == artifact_row
+  end
+
+  test "remaining core resources preserve ordered bytes and projection refusal", ctx do
+    create_session(ctx.db, "core-positive", ctx.device.user_id)
+
+    catalog = %{
+      {"testhost", "claude"} => [
+        %{family: "fable", context: nil, efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    opts = ctx.opts ++ [model_catalog: catalog]
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "core-positive",
+        origin: "user:flynn",
+        prompt: "synthetic",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "core-positive"
+      })
+
+    {:ok, seq} =
+      Tightbeam.Ledger.enqueue(ctx.db, %{
+        session_key: "core-positive",
+        message_id: "core-positive-message",
+        origin: "user:flynn",
+        prompt: "synthetic"
+      })
+
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, ctx.device.user_id},
+        params: %{title: "Artifact parent"}
+      })
+
+    artifact =
+      Tightbeam.Artifacts.record(ctx.db, %{
+        principal: {:session, "core-positive"},
+        session_key: "core-positive",
+        params: %{
+          kind: "report",
+          title: "Synthetic",
+          origin_path: "reports/synthetic.md",
+          work_item_id: item.id
+        }
+      })
+
+    {:ok, true, _} =
+      Tightbeam.ReadMarkers.set(ctx.db, ctx.device.user_id, "core-positive", "cursor")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO decision_requests
+          (id, kind, raiserId, ownerUserId, raisedAt, deadlineAt, statuteName,
+           actionKey, question, context, status)
+        VALUES ('dr_positive', 'statute', 'user:flynn', ?1, ?2, ?3, 'core-positive',
+                'read', 'Synthetic?', '{}', 'open')
+        """,
+        [
+          ctx.device.user_id,
+          System.system_time(:millisecond),
+          System.system_time(:millisecond) + 60_000
+        ]
+      )
+
+    wake_row =
+      Tightbeam.StateResources.query_wake(ctx.db, %{
+        key: wake.wake_id,
+        principal: %{kind: "user", id: ctx.device.user_id, is_admin: true}
+      })
+
+    wake_item = Tightbeam.StateResources.wake(wake_row)
+    assert is_binary(Tightbeam.StateResources.encode_item("wakes", wake_item, catalog))
+
+    for {resource, path, key, value} <- [
+          {"wakes", "/api/wakes/#{wake.wake_id}", "wakeId", wake.wake_id},
+          {"turns", "/api/turns/#{seq}", "seq", seq},
+          {"sessions", "/api/sessions/core-positive", "sessionKey", "core-positive"},
+          {"artifacts", "/api/artifacts/#{artifact.artifact_id}", "artifactId",
+           artifact.artifact_id},
+          {"read markers", "/api/read-markers/core-positive", "scopeKey", "core-positive"},
+          {"decision requests", "/api/decision-requests/dr_positive", "id", "dr_positive"}
+        ] do
+      response =
+        conn(:get, path)
+        |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+        |> Router.call(Router.init(opts))
+
+      assert response.status == 200, "#{path}: #{response.resp_body}"
+
+      assert %{"schemaVersion" => 1, "resource" => ^resource, "item" => public} =
+               JSON.decode!(response.resp_body)
+
+      assert public[key] == value
+      assert is_integer(public["rowVersion"])
+      bytes = Tightbeam.StateResources.encode_item(resource, public, catalog)
+
+      assert response.resp_body ==
+               ~s({"schemaVersion":1,"resource":#{JSON.encode!(resource)},"item":#{bytes}})
+
+      assert get_resp_header(response, "cache-control") == ["no-store"]
+
+      for failure_stage <- [:schema, :serializer, :encoder, :envelope] do
+        failing =
+          opts ++
+            [
+              core_detail_probe: fn actual_resource, stage ->
+                assert actual_resource == resource
+
+                if stage == failure_stage,
+                  do: raise(ArgumentError, "synthetic projection failure")
+
+                :ok
+              end
+            ]
+
+        refused =
+          conn(:get, path)
+          |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+          |> Router.call(Router.init(failing))
+
+        assert refused.status == 500
+
+        assert JSON.decode!(refused.resp_body) == %{
+                 "schemaVersion" => 1,
+                 "resource" => resource,
+                 "error" => %{"code" => "projection_invalid"}
+               }
+
+        assert get_resp_header(refused, "cache-control") == ["no-store"]
+      end
+    end
+  end
+
+  test "core detail inventory rejects malformed requests before lookup and keeps missing envelopes",
+       ctx do
+    inventory = [
+      {"work-items", "work items", "missing"},
+      {"assignments", "assignments", "missing"},
+      {"wakes", "wakes", "missing"},
+      {"turns", "turns", "9223372036854775807"},
+      {"decision-requests", "decision requests", "missing"},
+      {"sessions", "sessions", "missing"},
+      {"devices", "devices", "missing"},
+      {"artifacts", "artifacts", "missing"},
+      {"read-markers", "read markers", "missing"}
+    ]
+
+    opts = ctx.opts ++ [model_catalog: %{}]
+    guarded = opts ++ [core_detail_probe: fn _, _ -> flunk("invalid request reached lookup") end]
+
+    request = fn path, token, options ->
+      conn(:get, path)
+      |> put_req_header("authorization", "Bearer " <> token)
+      |> Router.call(Router.init(options))
+    end
+
+    for {path, resource, key} <- inventory do
+      url = "/api/#{path}/#{key}"
+      missing = request.(url, ctx.device.token, opts)
+      assert missing.status == 404
+
+      assert JSON.decode!(missing.resp_body) ==
+               %{
+                 "schemaVersion" => 1,
+                 "resource" => resource,
+                 "error" => %{"code" => "not_found"}
+               }
+
+      assert get_resp_header(missing, "cache-control") == ["no-store"]
+
+      for {query, token, status, code} <- [
+            {"?bad=%ZZ", "invalid", 401, "auth_failed"},
+            {"?bad=%ZZ", ctx.device.token, 400, "malformed_query"},
+            {"?filter=unknown", ctx.device.token, 400, "invalid_filter"},
+            {"?asUser=flynn&asUser=other", "tbc_test", 400, "invalid_as_user"}
+          ] do
+        refusal = request.(url <> query, token, guarded)
+        assert refusal.status == status
+        assert JSON.decode!(refusal.resp_body)["error"]["code"] == code
+      end
+    end
+
+    for key <- ["0", "-1", "01", "1x", "9223372036854775808"] do
+      refusal = request.("/api/turns/" <> key, ctx.device.token, guarded)
+      assert refusal.status == 404
+      assert JSON.decode!(refusal.resp_body)["error"]["code"] == "not_found"
+    end
+  end
+
   test "agent verb allowlist is covered by the real Gateway handler table", ctx do
     agent_verbs =
       Router.__info__(:attributes)
@@ -179,6 +483,52 @@ defmodule Tightbeam.Wire.RouterTest do
   # drives the whole operator lifecycle THROUGH /agent/dispatch against the REAL
   # Gateway handlers, so the allowlist and the handler table must both carry the
   # verbs for it to pass.
+  test "agent full-ID read and targetless return cross the wire", ctx do
+    owner = ctx.device.user_id
+    asker = create_session(ctx.db, "agent-wire-asker", owner, is_built_in: true)
+    reader = create_session(ctx.db, "agent-wire-reader", owner, is_built_in: true)
+
+    handlers =
+      Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_scheduler: ctx.scheduler})
+
+    ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
+
+    ask =
+      dispatch_cli(ctx, asker.cli_token, %{
+        verb: "ask",
+        sessionKey: reader.session_key,
+        params: %{question: "Need details?"}
+      })
+
+    assert ask.status == 200
+    id = JSON.decode!(ask.resp_body)["result"]["id"]
+    assert is_binary(id)
+
+    detail =
+      dispatch_cli(ctx, reader.cli_token, %{verb: "decision-request", params: %{request: id}})
+
+    assert detail.status == 200
+    assert JSON.decode!(detail.resp_body)["result"]["decisionRequest"]["id"] == id
+
+    refused =
+      dispatch_cli(ctx, reader.cli_token, %{
+        verb: "return",
+        sessionKey: asker.session_key,
+        params: %{request: id, reason: "Missing proof"}
+      })
+
+    assert refused.status == 400
+
+    returned =
+      dispatch_cli(ctx, reader.cli_token, %{
+        verb: "return",
+        params: %{request: id, reason: "Missing proof"}
+      })
+
+    assert returned.status == 200
+    assert JSON.decode!(returned.resp_body)["result"]["status"] == "returned"
+  end
+
   test "operator decision lifecycle crosses the wire router: ask -> list -> rule -> withdraw",
        ctx do
     owner = ctx.device.user_id
@@ -435,7 +785,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     ctx = %{ctx | opts: Keyword.put(ctx.opts, :handlers, handlers)}
 
-    # Two requests spanning two statuses: one left open, one ruled.
+    # Three requests spanning three statuses: one left open, one ruled, one returned.
     open_ask =
       dispatch_cli(ctx, raiser.cli_token, %{
         verb: "operator-ask",
@@ -461,6 +811,28 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert ruled.status == 200
 
+    returned_target = create_session(ctx.db, "dr-filter-return-target", owner)
+
+    returned_request =
+      Tightbeam.Escalation.ask(ctx.db, %{
+        verb: "ask",
+        origin: "session:" <> raiser.session_key,
+        principal: {:session, raiser.session_key},
+        session_key: returned_target.session_key,
+        params: %{question: "q-returned?"}
+      })
+
+    returned =
+      Tightbeam.Escalation.return_request(ctx.db, %{
+        verb: "return",
+        origin: "session:" <> returned_target.session_key,
+        principal: {:session, returned_target.session_key},
+        session_key: nil,
+        params: %{request: returned_request.id, reason: "needs more context"}
+      })
+
+    assert returned.status == "returned"
+
     list_ids = fn params ->
       resp =
         dispatch_cli(ctx, "tbc_test", %{verb: "decision-requests", asUser: owner, params: params})
@@ -469,22 +841,30 @@ defmodule Tightbeam.Wire.RouterTest do
       JSON.decode!(resp.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
     end
 
-    # status=all returns rows in BOTH statuses over the wire — the regression: before the
+    # status=all returns rows in all three statuses over the wire — the regression: before the
     # fix this filtered on literal 'all' and returned [].
     all_ids = list_ids.(%{status: "all"})
     assert open_id in all_ids
     assert ruled_id in all_ids
+    assert returned_request.id in all_ids
 
-    # Absent status defaults to "open" through the router: the open row shows, the ruled
-    # one is filtered out.
+    # Absent status defaults to "open" through the router: the open row shows, while the
+    # ruled and returned rows are filtered out.
     default_ids = list_ids.(%{})
     assert open_id in default_ids
     refute ruled_id in default_ids
+    refute returned_request.id in default_ids
 
     # An explicit legal status filters over the wire to exactly that status.
     open_only = list_ids.(%{status: "open"})
     assert open_id in open_only
     refute ruled_id in open_only
+    refute returned_request.id in open_only
+
+    returned_only = list_ids.(%{status: "returned"})
+    assert returned_request.id in returned_only
+    refute open_id in returned_only
+    refute ruled_id in returned_only
 
     # An illegal status reaches the client as a NAMED refusal (HTTP 400), not a silent
     # empty 200 — the refusal names the legal set.
@@ -498,7 +878,9 @@ defmodule Tightbeam.Wire.RouterTest do
     assert bogus.status == 400
     error = JSON.decode!(bogus.resp_body)["error"]
     assert error["code"] == "invalid"
-    assert error["message"] =~ "open, ruled, consumed, withdrawn, superseded, all"
+
+    assert error["message"] =~
+             "open, ruled, consumed, withdrawn, superseded, returned, all"
   end
 
   test "identity status crosses the closed CLI verb router", ctx do
@@ -681,7 +1063,7 @@ defmodule Tightbeam.Wire.RouterTest do
     assert body["sha"] == Tightbeam.BuildStamp.sha()
   end
 
-  test "CLI exact-version refusal is loud and precedes bearer authentication", ctx do
+  test "CLI exact-version refusal is loud after bearer authentication", ctx do
     body = JSON.encode!(%{verb: "inspect", asUser: "flynn", params: %{}})
 
     incompatible =
@@ -703,7 +1085,7 @@ defmodule Tightbeam.Wire.RouterTest do
     auth_failure =
       conn(:post, "/agent/dispatch", body)
       |> put_req_header("authorization", "Bearer wrong")
-      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> put_req_header("x-tightbeam-cli-version", "0.2.0")
       |> Router.call(Router.init(ctx.opts))
 
     assert auth_failure.status == 401
@@ -715,6 +1097,201 @@ defmodule Tightbeam.Wire.RouterTest do
       |> Router.call(Router.init(ctx.opts))
 
     assert non_cli.status == 200
+  end
+
+  test "terminal v1 permits only an authenticated holder's fixed surrender while ordinary mismatch stays closed",
+       ctx do
+    holder = create_session(ctx.db, "terminal-holder", ctx.device.user_id)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+    opts = Keyword.put(ctx.opts, :handlers, handlers)
+
+    {:ok, assignment} =
+      Dispatch.dispatch(ctx.db, handlers, %{
+        verb: "assign",
+        origin: "user:#{ctx.device.user_id}",
+        principal: {:user, ctx.device.user_id},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "terminal path", idempotency_key: nil, work_item_id: nil}
+      })
+
+    ordinary =
+      conn(
+        :post,
+        "/agent/dispatch",
+        JSON.encode!(%{verb: "attest", params: %{assignmentId: assignment.id, kind: "surrender"}})
+      )
+      |> put_req_header("authorization", "Bearer #{holder.cli_token}")
+      |> put_req_header("x-tightbeam-cli-version", "0.0.0")
+      |> Router.call(Router.init(opts))
+
+    assert ordinary.status == 426
+    assert ConditionFacts.standing?(ctx.db, "cli-incompatible", holder.session_key)
+
+    recovered =
+      conn(
+        :post,
+        "/agent/dispatch",
+        JSON.encode!(%{
+          verb: "attests",
+          asUser: ctx.device.user_id,
+          params: %{assignmentId: assignment.id}
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{holder.cli_token}")
+      |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
+      |> Router.call(Router.init(opts))
+
+    assert recovered.status == 200
+    refute ConditionFacts.standing?(ctx.db, "cli-incompatible", holder.session_key)
+
+    surrendered =
+      terminal_surrender(ctx, opts, holder.cli_token, %{
+        "assignmentId" => assignment.id,
+        "disposition" => "surrender",
+        "note" => "version mismatch"
+      })
+
+    assert surrendered.status == 200
+    body = JSON.decode!(surrendered.resp_body)["result"]
+    assert body["assignment"]["outcome"] == "surrendered"
+    assert body["attest"]["kind"] == "surrender"
+
+    replay =
+      terminal_surrender(ctx, opts, holder.cli_token, %{
+        "assignmentId" => assignment.id,
+        "disposition" => "surrender",
+        "note" => "version mismatch"
+      })
+
+    assert replay.status == 200
+    replay_body = JSON.decode!(replay.resp_body)["result"]
+    assert replay_body["replayed"] == true
+    assert replay_body["attest"]["id"] == body["attest"]["id"]
+    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+
+    rejected =
+      terminal_surrender(ctx, opts, holder.cli_token, %{
+        "assignmentId" => assignment.id,
+        "disposition" => "completion",
+        "note" => "no"
+      })
+
+    assert rejected.status == 400
+    assert JSON.decode!(rejected.resp_body)["error"]["code"] == "invalid_terminal_request"
+
+    forged =
+      terminal_surrender(ctx, opts, holder.cli_token, %{
+        "assignmentId" => assignment.id,
+        "disposition" => "surrender",
+        "note" => "no",
+        "asUser" => ctx.device.user_id
+      })
+
+    assert forged.status == 400
+    assert JSON.decode!(forged.resp_body)["error"]["code"] == "invalid_terminal_request"
+  end
+
+  test "concurrent same-holder terminal surrenders replay the committed winner", ctx do
+    holder = create_session(ctx.db, "terminal-race-holder", ctx.device.user_id)
+    handlers = Gateway.handlers(%{db: ctx.db, base_dir: ctx.base_dir, wake_tick_ms: 1_000})
+
+    {:ok, assignment} =
+      Dispatch.dispatch(ctx.db, handlers, %{
+        verb: "assign",
+        origin: "user:#{ctx.device.user_id}",
+        principal: {:user, ctx.device.user_id},
+        session_key: holder.session_key,
+        target_role: nil,
+        role_fallback: false,
+        params: %{subject: "terminal race", idempotency_key: nil, work_item_id: nil}
+      })
+
+    parent = self()
+    real_attest = Map.fetch!(handlers, "attest")
+
+    barrier_attest = fn call ->
+      send(parent, {:terminal_surrender_ready, self()})
+
+      receive do
+        :terminal_surrender_go -> real_attest.(call)
+      end
+    end
+
+    handlers = Map.put(handlers, "attest", barrier_attest)
+
+    db_pid = GenServer.whereis(ctx.db)
+    :erlang.trace_pattern({Tightbeam.Wakes, :row_commit_in_txn, 2}, true, [:local])
+    :erlang.trace_pattern({Assignments, :notify, 4}, true, [:local])
+    :erlang.trace(db_pid, true, [:call, {:tracer, parent}])
+
+    on_exit(fn ->
+      :erlang.trace_pattern({Tightbeam.Wakes, :row_commit_in_txn, 2}, false, [:local])
+      :erlang.trace_pattern({Assignments, :notify, 4}, false, [:local])
+    end)
+
+    call = %{
+      verb: "attest",
+      origin: "agent:terminal",
+      principal: {:session, holder.session_key},
+      session_key: nil,
+      params: %{assignment_id: assignment.id, kind: "surrender", note: "version mismatch"},
+      terminal_surrender: true
+    }
+
+    tasks = for _ <- 1..2, do: Task.async(fn -> Dispatch.dispatch(ctx.db, handlers, call) end)
+
+    pids =
+      for _ <- 1..2 do
+        receive do
+          {:terminal_surrender_ready, pid} -> pid
+        end
+      end
+
+    Enum.each(pids, &:erlang.trace(&1, true, [:call, {:tracer, parent}]))
+    Enum.each(pids, &send(&1, :terminal_surrender_go))
+    results = Task.await_many(tasks, 5_000)
+
+    assert Enum.all?(results, &match?({:ok, _}, &1))
+    assert Enum.count(results, fn {:ok, result} -> result[:replayed] == true end) == 1
+    assert Assignments.attest_count(ctx.db, assignment.id) == 1
+
+    for {:ok, result} <- results do
+      assert Map.has_key?(result.attest, :artifactId)
+      assert Map.has_key?(result.attest, :contentSha256)
+      assert Map.has_key?(result.attest, :waitId)
+    end
+
+    delivered = :erlang.trace_delivered(db_pid)
+    assert_receive {:trace_delivered, ^db_pid, ^delivered}
+    traces = drain_terminal_traces([])
+
+    transitions =
+      for {:trace, ^db_pid, :call, {Tightbeam.Wakes, :row_commit_in_txn, [_txn, rows]}} <- traces,
+          row <- List.wrap(rows),
+          do: row
+
+    assert Enum.count(transitions, &(&1.domain == "attest")) == 1
+
+    assert Enum.count(transitions, &(&1.domain == "assignment" and &1.row_id == assignment.id)) ==
+             1
+
+    notifications =
+      for {:trace, _pid, :call, {Assignments, :notify, [_call, :on_assignment_change, id, _from]}} <-
+            traces,
+          id == assignment.id,
+          do: id
+
+    assert length(notifications) == 1
+  end
+
+  defp drain_terminal_traces(acc) do
+    receive do
+      {:trace, _, :call, _} = trace -> drain_terminal_traces([trace | acc])
+    after
+      0 -> acc
+    end
   end
 
   test "kungfu scaffold crosses the closed CLI verb router with its attributed name", ctx do
@@ -767,6 +1344,7 @@ defmodule Tightbeam.Wire.RouterTest do
                     }}
   end
 
+  @tag rest_r7_encoder: true
   test "work and work-item device routes expose owner-scoped random-access snapshots", ctx do
     :ok = Tightbeam.Schema.ensure_all(ctx.db)
 
@@ -808,17 +1386,74 @@ defmodule Tightbeam.Wire.RouterTest do
     assert items.status == 200
 
     assert %{
-             "items" => [
-               %{"workItem" => %{"id" => item_id}, "assignments" => [%{"id" => assignment_id}]}
-             ],
-             "cursor" => %{"assignment" => _, "workItem" => _}
+             "items" => [%{"id" => item_id, "priority" => 4}],
+             "resource" => "work items",
+             "schemaVersion" => 1,
+             "page" => %{"hasMoreAfter" => false, "hasMoreBefore" => false}
            } = JSON.decode!(items.resp_body)
 
     assert item_id == item.id
-    assert assignment_id == assignment.id
+    refute Map.has_key?(JSON.decode!(items.resp_body), "cursor")
+    assert JSON.decode!(detail.resp_body)["assignment"]["id"] == assignment.id
 
-    item_detail = get_device(ctx, ctx.device, "/api/work-items/#{item.id}")
+    catalog = %{
+      {"testhost", "claude"} => [
+        %{family: "fable", context: nil, efforts: ["medium"], provider: :anthropic}
+      ]
+    }
+
+    core_ctx = %{ctx | opts: ctx.opts ++ [model_catalog: catalog]}
+    item_detail = get_device(core_ctx, ctx.device, "/api/work-items/#{item.id}")
     assert item_detail.status == 200
+
+    assert %{"schemaVersion" => 1, "resource" => "work items", "item" => public_item} =
+             JSON.decode!(item_detail.resp_body)
+
+    assert public_item["id"] == item.id
+    assert public_item["title"] == "Observed"
+    assert JSON.decode!(items.resp_body)["items"] == [public_item]
+    assert public_item["ownerUserId"] == ctx.device.user_id
+    assert is_integer(public_item["rowVersion"])
+
+    shared_row =
+      Tightbeam.StateResources.query_assignment(ctx.db, assignment.id, %{
+        principal: {:user, ctx.device.user_id},
+        rest_principal: %{kind: "user", id: ctx.device.user_id, is_admin: true}
+      })
+
+    shared_item = Tightbeam.StateResources.assignment(shared_row)
+    assert is_binary(Tightbeam.StateResources.encode_item("assignments", shared_item, catalog))
+    assignment_detail = get_device(core_ctx, ctx.device, "/api/assignments/#{assignment.id}")
+    assert assignment_detail.status == 200
+
+    assert %{"schemaVersion" => 1, "resource" => "assignments", "item" => public_assignment} =
+             JSON.decode!(assignment_detail.resp_body)
+
+    assert public_assignment["id"] == assignment.id
+    assert public_assignment["holderKey"] == "holder"
+    assert public_assignment["workItemId"] == item.id
+    assert public_assignment["closedByProcess"] == nil
+    assert public_assignment["closingAttestId"] == nil
+
+    broken_ctx = %{
+      core_ctx
+      | opts:
+          core_ctx.opts ++
+            [
+              core_detail_probe: fn _resource, stage ->
+                if stage == :serializer,
+                  do: raise(ArgumentError, "synthetic serializer refusal"),
+                  else: :ok
+              end
+            ]
+    }
+
+    for path <- ["/api/work-items/#{item.id}", "/api/assignments/#{assignment.id}"] do
+      refusal = get_device(broken_ctx, ctx.device, path)
+      assert refusal.status == 500
+      assert JSON.decode!(refusal.resp_body)["error"]["code"] == "projection_invalid"
+      refute Map.has_key?(JSON.decode!(refusal.resp_body), "item")
+    end
 
     invalid = get_device(ctx, ctx.device, "/api/work?status=blocked")
     assert invalid.status == 400
@@ -827,6 +1462,28 @@ defmodule Tightbeam.Wire.RouterTest do
     other = approved_device(ctx.db, "other-device", "Other")
     assert get_device(ctx, other, "/api/work/#{assignment.id}").status == 404
     assert get_device(ctx, other, "/api/work-items/#{item.id}").status == 404
+
+    no_projection = %{
+      core_ctx
+      | opts:
+          core_ctx.opts ++
+            [
+              core_detail_probe: fn _resource, stage ->
+                if stage in [:schema, :serializer, :encoder, :envelope],
+                  do: flunk("invisible resource reached projection"),
+                  else: :ok
+              end
+            ]
+    }
+
+    for {resource, id} <- [{"work-items", item.id}, {"assignments", assignment.id}] do
+      invisible = get_device(no_projection, other, "/api/#{resource}/#{id}")
+      absent = get_device(no_projection, other, "/api/#{resource}/missing")
+      assert invisible.status == 404
+      assert absent.status == 404
+      assert invisible.resp_body == absent.resp_body
+      assert get_resp_header(invisible, "cache-control") == ["no-store"]
+    end
   end
 
   test "all work-item verbs route, preserve generic target behavior, and map unknown ids", ctx do
@@ -2149,6 +2806,14 @@ defmodule Tightbeam.Wire.RouterTest do
     |> put_req_header("authorization", "Bearer #{bearer}")
     |> put_req_header("x-tightbeam-cli-version", Tightbeam.CliCompatibility.required_version())
     |> Router.call(Router.init(ctx.opts))
+  end
+
+  defp terminal_surrender(_ctx, opts, bearer, body) do
+    conn(:post, "/agent/terminal", JSON.encode!(body))
+    |> put_req_header("authorization", "Bearer #{bearer}")
+    |> put_req_header("x-tightbeam-cli-version", "0.0.0")
+    |> put_req_header("x-tightbeam-terminal-version", "1")
+    |> Router.call(Router.init(opts))
   end
 
   # INVARIANT: a non-ok session-control response always carries a code.

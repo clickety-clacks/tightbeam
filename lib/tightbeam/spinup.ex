@@ -191,7 +191,7 @@ defmodule Tightbeam.Spinup do
     case reachability do
       {:ok, _} ->
         dirs = [
-          Tightbeam.Credentials.store_dir(host.base_dir, module.credential_provider()),
+          Homes.home_path(host.base_dir, target.host_name, module.id()),
           Path.join(host.base_dir, "work"),
           Path.join(host.base_dir, "homes")
         ]
@@ -241,18 +241,20 @@ defmodule Tightbeam.Spinup do
                 if module.credential_ready?(target, home) do
                   {:ok, "reached; directories ensured; #{adapter_detail}; credentials present"}
                 else
-                  auth_dir =
-                    Tightbeam.Credentials.store_dir(
-                      host.base_dir,
-                      module.credential_provider()
-                    )
+                  credential_location =
+                    if module == Tightbeam.Harness.Cursor do
+                      store = Credentials.store_dir(host.base_dir, :cursor)
+                      "Tightbeam keeps its own credential under #{store}."
+                    else
+                      "The credential belongs only in #{home}."
+                    end
 
                   message =
                     "host #{target.host_name} is not ready for #{module.wire_name()}: " <>
                       "Tightbeam has no credential for #{module.credential_provider()} on " <>
                       "#{target.host_name}. It does not use or import your normal " <>
-                      "#{module.wire_name()} CLI login; Tightbeam keeps its own credential " <>
-                      "under #{Path.dirname(auth_dir)}. Run on #{target.host_name}: " <>
+                      "#{module.wire_name()} CLI login. #{credential_location} " <>
+                      "Run on #{target.host_name}: " <>
                       "#{Credentials.onboard_command(module.credential_provider())} " <>
                       "--as-user <userId>"
 

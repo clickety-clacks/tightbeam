@@ -402,6 +402,7 @@ defmodule Tightbeam.WorkStateTest do
     result =
       handlers["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: "retiring",
         params: %{}
       })
@@ -521,7 +522,7 @@ defmodule Tightbeam.WorkStateTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{assignment_id: assignment_id},
+      params: %{assignment_id: assignment_id, reason: "work-state abandoned fixture"},
       on_assignment_change: ctx.assignment_change
     })
   end

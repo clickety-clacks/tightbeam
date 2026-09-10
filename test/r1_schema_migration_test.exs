@@ -27,14 +27,23 @@ defmodule Tightbeam.R1SchemaMigrationTest do
   } do
     load_o2(db)
     seed(db)
+    assignment_columns = columns(db, "assignments")
     assignments = rows(db, "SELECT * FROM assignments")
     facts = rows(db, "SELECT * FROM condition_facts")
     objects = guards(db)
     assert :ok = Schema.ensure_all(db)
     assert shape(db) == [["cursor-provider-v1-020"]]
-    assert rows(db, "SELECT * FROM assignments") == Enum.map(assignments, &(&1 ++ [nil]))
+    # Preserve every historical value despite Firehose's explicit table rebuild.
+    assert rows(db, "SELECT #{Enum.join(assignment_columns, ",")} FROM assignments") ==
+             assignments
+
+    assert rows(db, "SELECT reminderState,closedByProcess FROM assignments") == [[nil, nil]]
     assert rows(db, "SELECT * FROM condition_facts") == Enum.map(facts, &(&1 ++ [nil]))
-    assert guards(db) == objects
+    object_names = Enum.map(objects, &Enum.at(&1, 1))
+
+    assert Enum.filter(guards(db), &(Enum.at(&1, 1) in object_names)) ==
+             Enum.map(objects, fn [type, name, sql] -> [type, name, firehose_guard(name, sql)] end)
+
     assert_columns(db)
     :ok = DB.execute(db, ~s(UPDATE assignments SET reminderState='{"version":1}'))
     :ok = DB.execute(db, ~s(UPDATE condition_facts SET payload='{"version":1}'))
@@ -110,7 +119,27 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     end
   end
 
+  defp columns(db, table), do: Enum.map(rows(db, "PRAGMA table_info(#{table})"), &Enum.at(&1, 1))
+
   defp shape(db), do: rows(db, "SELECT shape FROM schema_stamp")
+
+  # Only these two historical guards change: Firehose adds rowVersion checks.
+  # Preserve their terminal-principal predicate and every other object's SQL.
+  defp firehose_guard(name, sql)
+       when name in ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard) do
+    assert String.contains?(sql, "\nWHEN ")
+    assert String.contains?(sql, "))\nBEGIN\n")
+
+    sql
+    |> String.replace("BEFORE UPDATE OF status ON", "BEFORE UPDATE ON")
+    |> String.replace(
+      "\nWHEN ",
+      "\nWHEN typeof(NEW.rowVersion) <> 'integer' OR NEW.rowVersion < 1 OR\n  ("
+    )
+    |> String.replace("))\nBEGIN\n", ")))\nBEGIN\n")
+  end
+
+  defp firehose_guard(_name, sql), do: sql
 
   defp guards(db),
     do:

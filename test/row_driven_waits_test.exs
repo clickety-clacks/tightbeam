@@ -147,6 +147,44 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert supervision_counts(ctx.db, "V") == before
   end
 
+  test "Firehose internal consume commits once and rollback preserves pending", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "owner-a", is_admin: false})
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        origin: "process:tightbeam",
+        consumer: "fixture-internal",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert {:error, %RuntimeError{}} =
+             DB.transaction(ctx.db, fn txn ->
+               :ok = Wakes.consume_internal_in_txn(txn, wake.wake_id)
+               raise "rollback internal"
+             end)
+
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, :ok} =
+             DB.transaction(ctx.db, fn txn -> Wakes.consume_internal_in_txn(txn, wake.wake_id) end)
+
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["state"] == "fired"
+    Hub.delivered(hub, self())
+
+    assert {:error, %ArgumentError{}} =
+             DB.transaction(ctx.db, fn txn -> Wakes.consume_internal_in_txn(txn, wake.wake_id) end)
+
+    refute_receive {:firehose_notice, _}
+  end
+
   test "unresolved registration is coherent, terminal recognition latches, and T gates one delivery",
        ctx do
     turn = running_turn(ctx.db, "holder")
@@ -187,13 +225,48 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     assert challenged.attest.waitId == wake.wake_id
     assert Wakes.get(ctx.db, wake.wake_id).recognition_reason == "resolver-terminal"
 
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "owner-a",
+        is_admin: false
+      })
+
+    :ok = Hub.subscribe(hub, self(), "wait-fired", %{"classes" => ["wake.fired"]})
+    exact_wake_id = wake.wake_id
+
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 0
+
+    verifier_wake_id = wake.verification_notice_wake_id
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "wake.fired", "payload" => %{"wakeId" => ^verifier_wake_id}}}
+
+    Hub.delivered(hub, self())
+
+    refute_receive {:firehose_notice,
+                    %{"class" => "wake.fired", "payload" => %{"wakeId" => ^exact_wake_id}}}
 
     assert :ok = Ledger.finish(ctx.db, turn.seq, "failed", "fixture failure")
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert :ok = Wakes.fire_due(ctx.scheduler)
     assert turn_count(ctx.db, wake.wake_id) == 1
+
+    assert_receive {:firehose_notice,
+                    %{
+                      "class" => "wake.fired",
+                      "payload" => %{"wakeId" => ^exact_wake_id, "state" => "fired"}
+                    }}
+
+    Hub.delivered(hub, self())
+
+    refute_receive {:firehose_notice,
+                    %{"class" => "wake.fired", "payload" => %{"wakeId" => ^exact_wake_id}}}
 
     assert {:ok, [[prompt]]} =
              DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [wake.wake_id])
@@ -1122,97 +1195,10 @@ defmodule Tightbeam.RowDrivenWaitsTest do
     end
   end
 
+  @tag tmp_dir: true
   test "C5-C7,V1-V2: overlapping provisional waits pause one generation and challenge resumes its remainder",
-       ctx do
-    qualification_policy(ctx)
-
-    assert {:ok, generation} =
-             DB.transaction(ctx.db, fn txn ->
-               EffortCheckin.arm_in_txn(txn, %{base_dir: ctx.base}, %{
-                 id: "A",
-                 holderKey: "holder"
-               })
-             end)
-
-    before = effort_snapshot(ctx.db)
-    first = register_wait(ctx.db, due_after(), predicate("R"))
-    second = register_wait(ctx.db, due_after(), predicate("R"))
-
-    assert {:ok, [[started, 0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
-             )
-
-    assert started == first.created_at
-    assert effort_snapshot(ctx.db) == before
-
-    assert %{attest: %{verdictKind: "wait-verified"}} =
-             attest(ctx.db, "V", "verifier", "verdict", "wait-verified", first.wake_id)
-
-    assert effort_snapshot(ctx.db) == before
-    # Reopen a real SQLite snapshot under a fresh database owner.
-    path = Path.join(ctx.base, "relief-restart.db")
-    assert :ok = DB.execute(ctx.db, "VACUUM INTO '#{path}'")
-    restarted = :"relief_restart_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: path, name: restarted}, id: restarted)
-    :persistent_term.erase({Tightbeam.RuleRuntime, :wait_relief})
-    assert :ok = Tightbeam.Schema.ensure_all(restarted)
-
-    assert {:ok, :ok} =
-             DB.transaction(restarted, fn txn ->
-               EffortCheckin.reconcile_wait_relief_in_txn(txn, "A", started + 100)
-             end)
-
-    assert {:ok, [[^started, 0]]} =
-             DB.query(
-               restarted,
-               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
-             )
-
-    assert effort_snapshot(restarted) == before
-
-    # Seed elapsed time, not a timeout guess, to prove that overlap is not summed.
-    interval_start = started - 1_000
-
-    assert {:ok, _} =
-             DB.query(
-               ctx.db,
-               "UPDATE effort_checkin_generations SET reliefStartedAt=?1 WHERE assignmentId='A'",
-               [interval_start]
-             )
-
-    assert %{attest: _} =
-             attest(ctx.db, "V", "verifier", "verdict", "wait-challenged", first.wake_id)
-
-    assert covered?(ctx.db, "A")
-
-    assert {:ok, [[^interval_start, 0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
-             )
-
-    assert %{attest: _} =
-             attest(ctx.db, "V", "verifier", "verdict", "wait-challenged", second.wake_id)
-
-    refute covered?(ctx.db, "A")
-
-    assert {:ok, [[nil, excluded]]} =
-             DB.query(
-               ctx.db,
-               "SELECT reliefStartedAt,reliefExcludedMs FROM effort_checkin_generations WHERE assignmentId='A'"
-             )
-
-    assert excluded == Wakes.get(ctx.db, second.wake_id).recognition_at - interval_start
-    assert effort_snapshot(ctx.db) == before
-
-    assert Wakes.get(ctx.db, generation.wake_id).due_at ==
-             generation.armed_at +
-               generation.base_horizon_ms * generation.multiplier + excluded
-
-    assert :ok = Wakes.fire_due(ctx.scheduler)
-    refute covered?(ctx.db, "A")
+       %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(tmp, "row_wait_relief_runtime.exs", "row-wait-relief: ok")
   end
 
   test "C5: ready-now uses normal effort and self-owed relief requires a policy election", ctx do
@@ -1714,7 +1700,7 @@ defmodule Tightbeam.RowDrivenWaitsTest do
       verb: "revoke-assignment",
       principal: {:user, "owner-a"},
       origin: "user:owner-a",
-      params: %{assignment_id: assignment_id}
+      params: %{assignment_id: assignment_id, reason: "fixture resolver disposition"}
     })
   end
 

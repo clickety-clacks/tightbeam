@@ -12,7 +12,17 @@ defmodule Tightbeam.Toplines do
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Toplines.Schema, as: ToplinesSchema
+
+  @firehose_sources %{
+    "topline_created" => "topline.created",
+    "work_linked" => "topline_work_membership.linked",
+    "work_unlinked" => "topline_work_membership.unlinked"
+  }
+
+  @doc false
+  def firehose_sources, do: @firehose_sources
 
   @white_space [
     0x0009,
@@ -253,9 +263,19 @@ defmodule Tightbeam.Toplines do
                 [topline_id, caller.user, title, caller.actor_kind, caller.actor_ref, now]
               )
 
-              append_event(txn, topline_id, "topline_created", nil, nil, nil, caller, nil, now, %{
-                title: title
-              })
+              append_event(
+                txn,
+                topline_id,
+                "topline_created",
+                nil,
+                nil,
+                nil,
+                caller,
+                nil,
+                now,
+                %{title: title},
+                Map.get(call, :firehose_hub, Tightbeam.Firehose.Hub)
+              )
 
               response = %{topline: summary_in_txn(txn, topline_id)}
               remember(txn, caller.user, operation, key, fingerprint, response)
@@ -470,7 +490,8 @@ defmodule Tightbeam.Toplines do
                     caller,
                     reason,
                     now,
-                    %{workItemId: work_item_id, linkReason: reason}
+                    %{workItemId: work_item_id, linkReason: reason},
+                    Map.get(call, :firehose_hub, Tightbeam.Firehose.Hub)
                   )
 
                   response = %{
@@ -544,7 +565,8 @@ defmodule Tightbeam.Toplines do
                   caller,
                   reason,
                   now,
-                  %{workItemId: membership.work_item_id, unlinkReason: reason}
+                  %{workItemId: membership.work_item_id, unlinkReason: reason},
+                  Map.get(call, :firehose_hub, Tightbeam.Firehose.Hub)
                 )
 
                 Txn.q(
@@ -1289,7 +1311,8 @@ defmodule Tightbeam.Toplines do
          caller,
          reason,
          at,
-         detail
+         detail,
+         hub \\ Tightbeam.Firehose.Hub
        ) do
     [[seq]] =
       Txn.q(txn, "SELECT COALESCE(MAX(seq), 0) + 1 FROM topline_events WHERE toplineId = ?1", [
@@ -1317,6 +1340,25 @@ defmodule Tightbeam.Toplines do
         canonical_json(detail)
       ]
     )
+
+    # Maintenance owns additional event kinds. Only these three source kinds
+    # carry the reviewed invalidation contract; all other events stay unchanged.
+    if class = Map.get(@firehose_sources, kind) do
+      refs =
+        case kind do
+          "topline_created" ->
+            %{"toplineId" => topline_id}
+
+          kind when kind in ["work_linked", "work_unlinked"] ->
+            %{
+              "toplineId" => topline_id,
+              "membershipId" => membership_id,
+              "workItemId" => Map.fetch!(detail, :workItemId)
+            }
+        end
+
+      Publisher.source_invalidation_in_txn(txn, hub, class, seq, at, refs)
+    end
   end
 
   defp visible_topline(txn, id, caller) do

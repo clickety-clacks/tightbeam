@@ -680,7 +680,12 @@ defmodule Tightbeam.Wakes do
       [wake_id, now()]
     )
 
-    if Txn.changes(txn) == 1, do: :ok, else: raise(ArgumentError, "internal wake is not pending")
+    if Txn.changes(txn) == 1 do
+      publish_change_in_txn(txn, "wake.fired", wake_id)
+      :ok
+    else
+      raise ArgumentError, "internal wake is not pending"
+    end
   end
 
   @doc "Register one obligation-scoped dependency or after-turn continuation atomically."
@@ -3336,6 +3341,7 @@ defmodule Tightbeam.Wakes do
         )
       end
 
+      publish_change_in_txn(txn, "wake.canceled", wake.wake_id)
       cancellation_result(cancellation)
     else
       false
@@ -4331,6 +4337,7 @@ defmodule Tightbeam.Wakes do
               "path=#{wake.recognition_path} assignment=#{wake.assignment_id}"
             )
 
+            publish_change_in_txn(txn, "wake.fired", wake.wake_id)
             {:delivery, delivery}
           else
             :noop
@@ -4575,8 +4582,10 @@ defmodule Tightbeam.Wakes do
         [wake_id, now()]
       )
 
-      :ok
+      if Txn.changes(txn) == 1, do: publish_change_in_txn(txn, "wake.fired", wake_id)
     end)
+
+    :ok
   end
 
   defp evaluate_conditions(%{db: db, batch: batch}, mode) do
@@ -4775,6 +4784,7 @@ defmodule Tightbeam.Wakes do
           )
 
         lifecycle_for_fire(txn, wake, cause, match, delivery)
+        publish_change_in_txn(txn, "wake.fired", wake.wake_id)
         {:fired, delivery}
       else
         :noop
@@ -4804,10 +4814,21 @@ defmodule Tightbeam.Wakes do
     end
   end
 
-  # The 0.1.9 line has no firehose publisher. The ordinary wake row and its
-  # lifecycle event remain the durable observation seams on this branch.
   @doc false
-  def publish_change_in_txn(%Txn{}, _class, _wake_id), do: :ok
+  def publish_change_in_txn(%Txn{} = txn, class, wake_id) do
+    case get_in_txn(txn, wake_id) do
+      nil ->
+        :ok
+
+      wake ->
+        Tightbeam.Firehose.Publisher.committed_in_txn(
+          txn,
+          class,
+          wake,
+          %{"wakeId" => wake_id, "sessionKey" => wake.session_key}
+        )
+    end
+  end
 
   defp lifecycle_for_fire(txn, wake, cause, match, :skipped) do
     matched =

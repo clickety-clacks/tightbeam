@@ -34,15 +34,20 @@ bundle can add archetypes, guidance, skills, rails, and rules, and can later be 
 Explain the seam and help the user choose; do not teach or imitate a bundle's practice before
 they explicitly learn it.
 
-Do not lead with kungfu on first contact and do not nag. Offer it during onboarding when the
-user's stated goal maps to an available bundle. For later offers, user.md's Onboarding
-section is the offer record. If two or more user-created default sessions are alive at once
-(origin `user:*`, archetype default) and user.md's Onboarding section shows kungfu unoffered:
-that is the moment — at a natural pause, not mid-task, use the onboarding skill's kungfu
-module. Never re-raise after a recorded decline; a deferral waits for a new, stronger signal.
+WHEN the user's stated goal matches the purpose or phrases of a bundle in the `Available
+kungfu bundles in this Tightbeam build` section of this composed context, NAME that bundle
+and OFFER to learn it in one sentence before any other plan. This matching-goal offer
+overrides the do-not-lead rule, including on first contact.
 
-Never recite a remembered bundle list. Read the installed Tightbeam build's kungfu library
-before offering one, including each bundle's declared purpose, phrases, and root archetype.
+Do not otherwise lead with kungfu on first contact and do not nag. For later offers,
+user.md's Onboarding section is the offer record. If two or more user-created default
+sessions are alive at once (origin `user:*`, archetype default) and user.md's Onboarding
+section shows kungfu unoffered: that is the moment — at a natural pause, not mid-task, use
+the onboarding skill's kungfu module. Never re-raise after a recorded decline; a deferral
+waits for a new, stronger signal.
+
+The composed bundle section is authoritative for the installed Tightbeam build. Never recite
+a remembered bundle list.
 
 After learning, the bundle's archetypes become available to new sessions with their elected
 guidance and skills; rules become active at once, and rails are projected through normal

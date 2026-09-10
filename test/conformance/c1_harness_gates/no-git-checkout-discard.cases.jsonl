@@ -4,4 +4,6 @@
 {"case":"track-checkout-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git checkout --track origin/x\"}}"}
 {"case":"new-branch-checkout-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git checkout -b x\"}}"}
 {"case":"branch-checkout-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git checkout main\"}}"}
+{"case":"checkout-short-help-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git checkout -h\"}}"}
+{"case":"checkout-long-help-passes","kind":"negative","expect":"pass","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git checkout --help\"}}"}
 {"case":"checkout-denial-is-legible","kind":"legibility","expect":"deny","reason":"no-git-checkout-discard","emits":"gate:no-git-checkout-discard","input":"{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git checkout -- .\"}}"}

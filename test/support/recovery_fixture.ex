@@ -81,7 +81,7 @@ defmodule Tightbeam.RecoveryFixture do
       binary: binary,
       bundle: bundle,
       package: package,
-      env: [{"RECOVERY_FIXTURE_ARENA", arena}],
+      env: [{"RECOVERY_FIXTURE_ARENA", arena}, {"FIXTURE_HOME", auth}],
       transcript: Path.join(arena, "recovery-acp.jsonl")
     }
   end

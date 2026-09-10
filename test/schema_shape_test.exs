@@ -1,38 +1,3 @@
-defmodule Tightbeam.SchemaShapeTest.FailingDb do
-  @moduledoc """
-  A `Tightbeam.DB` interposer that forwards everything to the real server and
-  fails ONE statement — the first whose SQL contains `fragment`.
-
-  It exists because an interrupted bootstrap cannot be simulated by building
-  its end state: the whole question is WHEN the stamp is written relative to
-  the tables, and that is only observable by stopping a real run in the middle.
-  """
-
-  use GenServer
-
-  def start_link(opts), do: GenServer.start_link(__MODULE__, Map.new(opts))
-
-  @impl true
-  def init(opts), do: {:ok, opts |> Map.put(:armed, true) |> Map.put_new(:skip, 0)}
-
-  @impl true
-  def handle_call(message, _from, state) do
-    if state.armed and holds?(message, state.fragment) do
-      if state.skip > 0 do
-        {:reply, GenServer.call(state.db, message), %{state | skip: state.skip - 1}}
-      else
-        {:reply, {:error, "interrupted"}, %{state | armed: false}}
-      end
-    else
-      {:reply, GenServer.call(state.db, message), state}
-    end
-  end
-
-  defp holds?(message, fragment) do
-    message |> Tuple.to_list() |> Enum.any?(&(is_binary(&1) and String.contains?(&1, fragment)))
-  end
-end
-
 defmodule Tightbeam.SchemaShapeTest.LaneStub do
   use GenServer
 
@@ -49,7 +14,7 @@ defmodule Tightbeam.SchemaShapeTest do
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, Wakes}
 
   @shape "cursor-provider-v1-020"
-  @cursor_provider_previous_shape "row-driven-r1-v1-019"
+  @cursor_provider_previous_shape "firehose-r1-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -206,6 +171,7 @@ defmodule Tightbeam.SchemaShapeTest do
     %{db: name}
   end
 
+  @tag firehose_final_stamp: true
   test "a fresh database is created and stamped", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     assert "executionId" in table_columns(db, "command_executions")
@@ -307,7 +273,7 @@ defmodule Tightbeam.SchemaShapeTest do
              )
 
     for owner <- ["marker-a", "marker-b"] do
-      Tightbeam.Org.create(db, %{
+      historical_session!(db, %{
         session_key: owner,
         display_name: owner,
         owner_user_id: owner,
@@ -426,7 +392,7 @@ defmodule Tightbeam.SchemaShapeTest do
                "INSERT INTO users (userId,isAdmin,createdAt) VALUES ('owner-a',0,1),('owner-b',0,1)"
              )
 
-    Tightbeam.Org.create(db, %{
+    historical_session!(db, %{
       session_key: "owner-a-session",
       display_name: "owner-a-session",
       owner_user_id: "owner-a",
@@ -438,7 +404,7 @@ defmodule Tightbeam.SchemaShapeTest do
       host: "testhost"
     })
 
-    Tightbeam.Org.create(db, %{
+    historical_session!(db, %{
       session_key: "owner-b-session",
       display_name: "owner-b-session",
       owner_user_id: "owner-b",
@@ -595,66 +561,10 @@ defmodule Tightbeam.SchemaShapeTest do
 
   for activated <- [false, true], boundary <- [1, 2, 3] do
     test "activation=#{activated} survives restart after migration boundary #{boundary}" do
-      activated = unquote(activated)
-      boundary = unquote(boundary)
-      unique = System.unique_integer([:positive])
-      path = Path.join(System.tmp_dir!(), "activation-stamp-#{unique}.sqlite3")
-      first = :"activation_before_#{unique}"
-      second = :"activation_after_#{unique}"
-      on_exit(fn -> File.rm(path) end)
-
-      {:ok, first_pid} = DB.start_link(path: path, name: first)
-      assert :ok = load_admission_fixture(first)
-      downgrade_row_driven_rules(first)
-      unless activated, do: drop_liveness_activation(first)
-      assert :ok = DB.execute(first, "ALTER TABLE sessions DROP COLUMN identityGuidanceDigest")
-      assert :ok = DB.execute(first, "ALTER TABLE sessions DROP COLUMN identityRenderContract")
-
-      predecessor =
-        if activated,
-          do: @identity_render_stamp_previous_shape,
-          else: @notice_batching_pre_liveness_shape
-
-      assert {:ok, _} = DB.query(first, "UPDATE schema_stamp SET shape=?1", [predecessor])
-
-      {:ok, interposer} =
-        Tightbeam.SchemaShapeTest.FailingDb.start_link(
-          db: first,
-          fragment: "SELECT shape FROM schema_stamp",
-          skip: boundary
-        )
-
-      assert_raise CaseClauseError, fn -> Schema.ensure_all(interposer) end
-
-      expected =
-        Enum.at(
-          if(activated,
-            do: [
-              "identity-universal-root-render-v1-019",
-              "row-driven-rules-v1-019",
-              "row-driven-waits-v1-019"
-            ],
-            else: [
-              "identity-universal-root-render-pre-liveness-v1-019",
-              "row-driven-rules-pre-liveness-v1-019",
-              "row-driven-waits-pre-liveness-v1-019"
-            ]
-          ),
-          boundary - 1
-        )
-
-      assert {:ok, [[^expected]]} = DB.query(first, "SELECT shape FROM schema_stamp")
-      assert table?(first, "supervision_liveness_sidecar") == activated
-      :ok = GenServer.stop(interposer)
-      :ok = GenServer.stop(first_pid)
-
-      {:ok, second_pid} = DB.start_link(path: path, name: second)
-      assert :ok = Schema.ensure_all(second)
-      assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
-      assert table?(second, "supervision_liveness_sidecar")
-      assert {:ok, []} = DB.query(second, "PRAGMA foreign_key_check")
-      assert :ok = Schema.ensure_all(second)
-      :ok = GenServer.stop(second_pid)
+      Tightbeam.SchemaShapeRuntimeFixture.run!("activation", %{
+        activated: unquote(activated),
+        boundary: unquote(boundary)
+      })
     end
   end
 
@@ -960,43 +870,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   test "operator-decision migration survives a database-owner restart", %{db: _setup_db} do
-    unique = System.unique_integer([:positive])
-    path = Path.join(System.tmp_dir!(), "terminal-parity-restart-#{unique}.sqlite3")
-    first = :"terminal_parity_before_#{unique}"
-    second = :"terminal_parity_after_#{unique}"
-
-    on_exit(fn -> File.rm(path) end)
-
-    {:ok, first_pid} = DB.start_link(path: path, name: first)
-    assert :ok = load_admission_fixture(first)
-    downgrade_row_driven_rules(first)
-
-    :ok =
-      DB.execute(first, """
-      DROP TRIGGER decision_requests_terminal_insert_guard;
-      DROP TRIGGER decision_requests_terminal_update_guard;
-      DROP TABLE decision_request_integrity_evidence;
-      DROP TABLE decision_request_terminal_epoch;
-      ALTER TABLE decision_requests DROP COLUMN ruledViaPrincipal;
-      ALTER TABLE decision_requests DROP COLUMN ruledViaSessionState;
-      ALTER TABLE sessions DROP COLUMN identityGuidanceDigest;
-      ALTER TABLE sessions DROP COLUMN identityRenderContract;
-      UPDATE schema_stamp SET shape = '#{@operator_decision_shape}', stampedAt = 1;
-      """)
-
-    :ok = GenServer.stop(first_pid)
-
-    {:ok, second_pid} = DB.start_link(path: path, name: second)
-    assert :ok = Schema.ensure_all(second)
-    assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
-
-    assert {:ok, [[@terminal_decision_shape, 0]]} =
-             DB.query(
-               second,
-               "SELECT schemaVersion, legacyRulingFactMaxId FROM decision_request_terminal_epoch WHERE id=0"
-             )
-
-    :ok = GenServer.stop(second_pid)
+    Tightbeam.SchemaShapeRuntimeFixture.run!("operator", %{})
   end
 
   test "a failed exact migration rolls back the rename and stamp", %{db: db} do
@@ -1316,70 +1190,7 @@ defmodule Tightbeam.SchemaShapeTest do
   end
 
   test "the exact d483 terminal-liveness database migrates and survives restart", %{db: _db} do
-    unique = System.unique_integer([:positive])
-    path = Path.join(System.tmp_dir!(), "d483-terminal-liveness-restart-#{unique}.sqlite3")
-    first = :"d483_terminal_liveness_before_#{unique}"
-    second = :"d483_terminal_liveness_after_#{unique}"
-
-    fixture =
-      __DIR__
-      |> Path.join("fixtures/d483a9c8_terminal_liveness.sqlite3.gz.b64")
-      |> File.read!()
-      |> String.replace(~r/\s+/u, "")
-      |> Base.decode64!()
-      |> :zlib.gunzip()
-
-    assert Base.encode16(:crypto.hash(:sha256, fixture), case: :lower) ==
-             "593308eb122ea1140a592b667afea41c501f99003949025ad29fea407d74eeb0"
-
-    File.write!(path, fixture)
-
-    on_exit(fn ->
-      File.rm(path)
-      File.rm("#{path}-shm")
-      File.rm("#{path}-wal")
-    end)
-
-    {:ok, first_pid} = DB.start_link(path: path, name: first)
-    assert {:ok, [[@terminal_decision_shape]]} = DB.query(first, "SELECT shape FROM schema_stamp")
-    assert table?(first, "wake_cancellations")
-
-    {:ok, interposer} =
-      Tightbeam.SchemaShapeTest.FailingDb.start_link(
-        db: first,
-        fragment: "SELECT shape FROM schema_stamp",
-        skip: 1
-      )
-
-    assert_raise CaseClauseError, fn -> Schema.ensure_all(interposer) end
-
-    assert {:ok, [[@effort_request_exit_previous_shape]]} =
-             DB.query(first, "SELECT shape FROM schema_stamp")
-
-    refute "waitMode" in table_columns(first, "wakes")
-
-    assert {:ok, []} =
-             DB.query(
-               first,
-               "SELECT name FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
-             )
-
-    :ok = GenServer.stop(interposer)
-    :ok = GenServer.stop(first_pid)
-
-    {:ok, second_pid} = DB.start_link(path: path, name: second)
-    assert :ok = Schema.ensure_all(second)
-    assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
-    assert "identityGuidanceDigest" in table_columns(second, "sessions")
-    assert "waitMode" in table_columns(second, "wakes")
-
-    assert object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent") =~
-             "coherentpendingwake"
-
-    assert object_sql(second, "trigger", "wakes_typed_cancellation_required") =~
-             "pendingwakecancellationrequirestypedprovenance"
-
-    :ok = GenServer.stop(second_pid)
+    Tightbeam.SchemaShapeRuntimeFixture.run!("d483", %{})
   end
 
   test "the exact notice-batching predecessor widens effort cancellation and preserves the stamp",
@@ -1548,51 +1359,32 @@ defmodule Tightbeam.SchemaShapeTest do
 
   for activated <- [false, true] do
     test "coverage admission predecessor survives restart, activated=#{activated}" do
-      activated = unquote(activated)
-      unique = System.unique_integer([:positive])
-      path = Path.join(System.tmp_dir!(), "admission-upgrade-#{unique}.sqlite3")
-      first = :"admission_before_#{unique}"
-      second = :"admission_after_#{unique}"
-      on_exit(fn -> File.rm(path) end)
-      {:ok, first_pid} = DB.start_link(path: path, name: first)
-      assert :ok = load_admission_fixture(first)
-
-      # Exact trigger SQL from accepted G-C 32911d0c; only heredoc indentation removed.
-      prior = File.read!(Path.join(__DIR__, "fixtures/row_wakes/admission-trigger-32911d0c.sql"))
-
-      assert Base.encode16(:crypto.hash(:sha256, prior), case: :lower) ==
-               "1b87873ea6360d8954d27f1b6c7a79815a9e617d80b4e4ed62d4f6dfef68c6a0"
-
-      assert :ok = DB.execute(first, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
-      assert :ok = DB.execute(first, prior)
-
-      assert object_sql(first, "trigger", "supervision_liveness_sidecar_insert_coherent") =~
-               "w.creatorsessionkey=a.holderkey"
-
-      unless activated, do: drop_liveness_activation(first)
-
-      predecessor =
-        if activated,
-          do: "row-driven-coverage-v1-019",
-          else: "row-driven-coverage-pre-liveness-v1-019"
-
-      assert {:ok, _} = DB.query(first, "UPDATE schema_stamp SET shape=?1", [predecessor])
-      :ok = GenServer.stop(first_pid)
-
-      {:ok, second_pid} = DB.start_link(path: path, name: second)
-      assert :ok = Schema.ensure_all(second)
-      assert {:ok, [[@shape]]} = DB.query(second, "SELECT shape FROM schema_stamp")
-      trigger = object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent")
-      assert trigger =~ "withrecursivelineage"
-      refute trigger =~ "w.creatorsessionkey=a.holderkey"
-      assert trigger =~ "t.sessionkey=w.creatorsessionkey"
-      assert :ok = Schema.ensure_all(second)
-
-      assert object_sql(second, "trigger", "supervision_liveness_sidecar_insert_coherent") ==
-               trigger
-
-      :ok = GenServer.stop(second_pid)
+      Tightbeam.SchemaShapeRuntimeFixture.run!("coverage", %{activated: unquote(activated)})
     end
+  end
+
+  defp historical_session!(db, row) do
+    assert {:ok, []} =
+             DB.query(
+               db,
+               """
+               INSERT INTO sessions(sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,createdAt,updatedAt)
+               VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,1,1)
+               """,
+               [
+                 row.session_key,
+                 row.display_name,
+                 row.owner_user_id,
+                 row.origin,
+                 row.archetype,
+                 row.harness,
+                 row.provider,
+                 row.model.family,
+                 row.host
+               ]
+             )
+
+    :ok
   end
 
   defp table?(db, name) do

@@ -150,6 +150,13 @@ defmodule Tightbeam.RetireOwnershipTest do
     assert %{deleted_session_key: "holder"} =
              retire(ctx, "agent:worker", {:session, "agent:worker:app"}, "holder")
 
+    assert {:ok, [["agent:worker:app", nil, "holder session retired"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedBySession,revokedByUser,reason FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
     # A rung whose principal does NOT own the holder gets no retire item, and the
     # handler agrees.
     session!(ctx.db, "kays-holder", "kay")
@@ -181,6 +188,34 @@ defmodule Tightbeam.RetireOwnershipTest do
 
     refute "retire" in foreign_menu
     assert %{code: "not_found"} = retire(ctx, "user:flynn", {:user, "flynn"}, "kays-holder")
+  end
+
+  test "a forged origin cannot change the authenticated retirement actor", ctx do
+    session!(ctx.db, "forged-origin-holder", "flynn", spawned_by: "agent:worker:app")
+
+    assignment =
+      Assignments.__handle__(ctx.db, "assign", %{
+        verb: "assign",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: "forged-origin-holder",
+        target_role: nil,
+        role_fallback: false,
+        supervision_interval_ms: 1_000,
+        params: %{subject: "authenticated actor"}
+      })
+
+    assert is_binary(assignment.id)
+
+    assert %{deleted_session_key: "forged-origin-holder"} =
+             retire(ctx, "user:kay", {:session, "agent:worker:app"}, "forged-origin-holder")
+
+    assert {:ok, [["agent:worker:app", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedBySession,revokedByUser FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
   end
 
   ## Helpers

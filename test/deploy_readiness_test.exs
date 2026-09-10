@@ -159,39 +159,13 @@ defmodule Tightbeam.DeployReadinessTest do
              Ready.observe!(db, "new-session", "new-wake")
   end
 
-  test "observer preserves exact reply binding on the composed R1 schema" do
-    alias Tightbeam.{DB, Schema}
-    dir = Path.join(System.tmp_dir!(), "readiness-o2-#{System.unique_integer([:positive])}")
-    File.mkdir_p!(dir)
-    on_exit(fn -> File.rm_rf!(dir) end)
-    path = Path.join(dir, "state.db")
-    name = String.to_atom("readiness_o2_#{System.unique_integer([:positive])}")
-    db = start_supervised!({DB, name: name, path: path})
-    assert :ok = Schema.ensure_all(db)
-    assert {:ok, [["cursor-provider-v1-020"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
-
-    :ok =
-      DB.execute(db, """
-      INSERT INTO turns(sessionKey,wakeId,messageId,origin,prompt,status,createdAt)
-        VALUES ('new-session','new-wake','prompt','process:fixture','DEPLOY READY test','delivered',1);
-      INSERT INTO messages(id,sessionKey,replyToMessageId,role,content,timestamp,llmVisibleMessageId)
-        VALUES ('wrong','other','prompt','assistant','DEPLOY READY test',1,'wrong');
-      """)
-
-    assert [%{"replyId" => nil}] = Ready.observe!(path, "new-session", "new-wake")
-
-    :ok =
-      DB.execute(db, """
-      INSERT INTO messages(id,sessionKey,replyToMessageId,role,content,timestamp,llmVisibleMessageId)
-        VALUES ('answer','new-session','prompt','assistant','DEPLOY READY test',2,'answer');
-      """)
-
-    assert [%{"replyId" => "answer", "status" => "delivered"}] =
-             Ready.observe!(path, "new-session", "new-wake")
-
-    assert Ready.observe!(path, "new-session", "other-wake") == []
-    assert Ready.observe!(path, "other-session", "new-wake") == []
-    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+  @tag :tmp_dir
+  test "observer preserves exact reply binding on the composed R1 schema", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "guard_readiness_runtime.exs",
+      "guarded-readiness-reply-binding: ok"
+    )
   end
 
   test "mode rejects typos instead of entering full destructive smoke" do

@@ -173,15 +173,110 @@ defmodule Tightbeam.RecoveryScenario do
   end
 end
 
-# Launched only by the marked-arena soak Port launcher with mix run --no-start.
+# The controller launches the same assembled cold payload for both phases.
 # Ordinary Application startup owns recovery, lanes, and the wake scheduler.
+[payload, base, locks] = System.argv()
+true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 arena = System.fetch_env!("RECOVERY_FIXTURE_ARENA") |> Path.expand()
 ^arena = System.fetch_env!("TIGHTBEAM_BASE_DIR") |> Path.expand()
-"tightbeam recovery acceptance arena v1\n" = File.read!(Path.join(arena, ".soak-arena"))
+^arena = Path.expand(base)
+evidence = System.fetch_env!("RECOVERY_EVIDENCE_DIR") |> Path.expand()
+true = Path.dirname(arena) == evidence
+"tightbeam recovery acceptance arena v1\n" = File.read!(Path.join(evidence, ".soak-arena"))
 "test" = System.fetch_env!("MIX_ENV")
 phase = System.fetch_env!("RECOVERY_PHASE")
 true = phase in ["prepare", "restart"]
 
+{:ok, _} = Application.ensure_all_started(:exqlite)
+{:ok, _} = Application.ensure_all_started(:crypto)
+Application.put_env(:tightbeam, :autostart, false)
+Application.put_env(:tightbeam, :base_dir, base)
+Application.put_env(:tightbeam, :fixture_harness, true)
+Application.put_env(:tightbeam, :local_host_name, "testhost")
+alias Tightbeam.{Boot, DB, Harness, LiveBaseLock}
+
+if phase == "prepare" do
+  false = File.exists?(base)
+
+  {:ok, db} =
+    DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [lock_dir: locks])
+
+  :ignore = Boot.start_link(%{base_dir: base})
+  true = File.regular?(Path.join(base, "build-owner.json"))
+  :ok = GenServer.stop(db)
+  key = :crypto.hash(:sha256, base) |> Base.encode16(case: :lower)
+  lock_path = Path.join(locks, key <> ".lock")
+
+  await = fn recur, remaining ->
+    case LiveBaseLock.acquire(lock_path) do
+      {:ok, lock} ->
+        :ok = LiveBaseLock.release(lock)
+
+      {:error, :lock_busy} when remaining > 0 ->
+        Process.sleep(10)
+        recur.(recur, remaining - 1)
+
+      other ->
+        raise "lock did not release: #{inspect(other)}"
+    end
+  end
+
+  await.(await, 100)
+  File.write!(Path.join(base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
+  Tightbeam.RecoveryFixture.place_adapter!(base, seed_credential: false)
+else
+  true = File.regular?(Path.join(base, "build-owner.json"))
+end
+
+tripwire = Path.join(base, "forbidden-execution.log")
+bin = Path.join(base, "fixture-bin")
+File.mkdir_p!(bin)
+# These are synthetic CLI probes, never harness adapters or provider clients.
+for name <- ["claude", "codex", "fixture"] do
+  path = Path.join(bin, name)
+
+  File.write!(path, """
+  #!/bin/sh
+  if [ '#{name}' = codex ] && [ "$#" = 2 ] && [ "$1" = --dangerously-bypass-hook-trust ] && [ "$2" = --version ]; then
+    shift
+  fi
+  if [ "$#" = 1 ] && [ "$1" = --version ]; then
+    echo '#{name} fixture-only 0.0.0'
+    exit 0
+  fi
+  echo '#{name}: forbidden non-probe' >> "$GUARD_TRIPWIRE"
+  exit 64
+  """)
+
+  File.chmod!(path, 0o755)
+end
+
+for name <- ["npm", "ssh"] do
+  path = Path.join(bin, name)
+  File.write!(path, "#!/bin/sh\necho '#{name}: forbidden' >> \"$GUARD_TRIPWIRE\"\nexit 64\n")
+  File.chmod!(path, 0o755)
+end
+
+System.put_env("GUARD_TRIPWIRE", tripwire)
+System.put_env("PATH", bin <> ":" <> System.fetch_env!("PATH"))
+for module <- Harness.all(), key <- module.credential_env_vars(), do: System.delete_env(key)
+
+for name <- ["claude", "codex", "fixture", "npm", "ssh"] do
+  true = System.find_executable(name) == Path.join(bin, name)
+end
+
+for module <- Harness.all() do
+  %{input: %{profile: profile}} =
+    Enum.find(
+      module.conformance_vectors()["ensure_adapter"],
+      &(&1.case == "local_present")
+    )
+
+  true = File.exists?(Path.join(base, "adapters/node_modules/.bin/#{profile.adapter_bin}"))
+end
+
+Application.put_env(:tightbeam, :live_base_guard, lock_dir: locks)
+Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 Application.put_env(:tightbeam, :base_dir, arena)
 Application.put_env(:tightbeam, :cwd, Path.join(arena, "work"))
 Application.put_env(:tightbeam, :port, 0)
@@ -233,7 +328,8 @@ state =
     do: Tightbeam.RecoveryScenario.prepare!(),
     else: Tightbeam.RecoveryScenario.recovered!()
 
-File.write!(Path.join(arena, "#{phase}-state.json"), JSON.encode!(state))
+false = File.exists?(tripwire)
+File.write!(Path.join(evidence, "#{phase}-state.json"), JSON.encode!(state))
 
 # Readiness remains a distinct observation from consumer completion.
 Tightbeam.Readiness.await_settled()
@@ -265,7 +361,7 @@ readiness = %{
 {:ok, {_address, bound_port}} = ThousandIsland.listener_info(bandit)
 # A boot receipt is only a synchronization barrier, never a recovery verdict.
 File.write!(
-  Path.join(arena, "#{phase}-boot.json.pending"),
+  Path.join(evidence, "#{phase}-boot.json.pending"),
   JSON.encode!(%{
     pid: System.pid(),
     port: bound_port,
@@ -278,8 +374,8 @@ File.write!(
 
 # The test controller owns the OS death boundary. No recovery helpers here.
 File.rename!(
-  Path.join(arena, "#{phase}-boot.json.pending"),
-  Path.join(arena, "#{phase}-boot.json")
+  Path.join(evidence, "#{phase}-boot.json.pending"),
+  Path.join(evidence, "#{phase}-boot.json")
 )
 
 receive do

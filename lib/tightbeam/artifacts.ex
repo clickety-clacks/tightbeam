@@ -26,8 +26,15 @@ defmodule Tightbeam.Artifacts do
 
   alias Tightbeam.{DB, TurnObservations}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @outside_workspace "artifact origin is outside its session workspace"
+  @maximum_version 9_223_372_036_854_775_807
+  @floor_definition """
+  artifactId TEXT NOT NULL PRIMARY KEY,
+  rowVersion INTEGER NOT NULL
+    CHECK (typeof(rowVersion) = 'integer' AND rowVersion > 0)
+  """
 
   @table_definition """
     artifactId        TEXT PRIMARY KEY,
@@ -66,9 +73,92 @@ defmodule Tightbeam.Artifacts do
   #{Enum.join(@index_ddl, ";\n")};
   """
 
+  @doc false
+  def ensure_r1_schema(db), do: DB.execute(db, @ddl)
+
   @doc "Create the artifact registry schema."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    :ok = DB.execute(db, @ddl)
+    DB.execute(db, "CREATE TABLE IF NOT EXISTS artifact_version_floors (#{@floor_definition})")
+  end
+
+  @doc false
+  def migrate_version_floors_in_txn(%Txn{} = txn) do
+    # The stamped predecessor owns eligibility; this is not a history detector.
+    invalid =
+      Txn.q(txn, """
+      SELECT artifactId FROM artifacts
+      WHERE typeof(createdAt) <> 'integer' OR createdAt <= 0
+         OR createdAt >= #{@maximum_version}
+      """)
+
+    if invalid != [], do: raise(ArgumentError, "artifact_version_seed_invalid")
+
+    Txn.q(txn, "CREATE TABLE artifact_version_floors (#{@floor_definition})")
+
+    Txn.q(txn, """
+    INSERT INTO artifact_version_floors (artifactId, rowVersion)
+    SELECT artifactId, createdAt + 1 FROM artifacts
+    """)
+
+    :ok
+  end
+
+  @doc false
+  def reserve_version_in_txn(%Txn{} = txn, artifact_id) do
+    case Txn.q(txn, "SELECT rowVersion FROM artifact_version_floors WHERE artifactId=?1", [
+           artifact_id
+         ]) do
+      [] ->
+        if get_in_txn(txn, artifact_id) != nil,
+          do: raise(ArgumentError, "artifact_projection_invalid: missing floor")
+
+        Txn.q(txn, "INSERT INTO artifact_version_floors (artifactId,rowVersion) VALUES (?1,1)", [
+          artifact_id
+        ])
+
+        1
+
+      [[version]] when is_integer(version) and version > 0 and version < @maximum_version ->
+        Txn.q(
+          txn,
+          """
+          UPDATE artifact_version_floors SET rowVersion=rowVersion+1
+          WHERE artifactId=?1 AND rowVersion=?2 AND rowVersion<#{@maximum_version}
+          """,
+          [artifact_id, version]
+        )
+
+        if Txn.changes(txn) != 1, do: raise(ArgumentError, "artifact_version_compare_failed")
+        version + 1
+
+      _ ->
+        raise ArgumentError, "artifact_version_invalid_or_exhausted"
+    end
+  end
+
+  @doc false
+  def canonical_in_txn(%Txn{} = txn, artifact_id) do
+    selected = columns() |> String.split(",") |> Enum.map_join(",", &("a." <> String.trim(&1)))
+
+    case Txn.q(
+           txn,
+           """
+           SELECT #{selected}, f.rowVersion FROM artifacts a
+           LEFT JOIN artifact_version_floors f ON f.artifactId=a.artifactId
+           WHERE a.artifactId=?1
+           """,
+           [artifact_id]
+         ) do
+      [] ->
+        nil
+
+      [row] ->
+        {fields, [version]} = Enum.split(row, -1)
+        Map.put(artifact(fields), :row_version, version)
+    end
+  end
 
   @doc """
   Record a deliberate artifact pointer for the authenticated calling session.
@@ -97,6 +187,8 @@ defmodule Tightbeam.Artifacts do
                fn txn ->
                  case validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
                    :ok ->
+                     reserve_version_in_txn(txn, artifact_id)
+
                      Txn.q(
                        txn,
                        """
@@ -124,6 +216,8 @@ defmodule Tightbeam.Artifacts do
                        ]
                      )
 
+                     Publisher.maybe_observed_accepted_in_txn(txn, call)
+                     publish_in_txn(txn, "artifact.recorded", artifact_id, call)
                      {:created, artifact_in_txn(txn, artifact_id)}
 
                    error ->
@@ -200,6 +294,11 @@ defmodule Tightbeam.Artifacts do
   defp validate_producer_in_txn(_txn, _producer_id, _session_key, _work_item_id),
     do: %{code: "invalid_producer", message: "producedByAssignmentId must be nonblank text"}
 
+  defp publish_in_txn(txn, class, artifact_id, call \\ %{}) do
+    snapshot = canonical_in_txn(txn, artifact_id)
+    Publisher.artifact_in_txn(txn, class, snapshot, call)
+  end
+
   # The best edge the substrate OBSERVED, with the observation method named.
   #
   # `tool-call-observed` is a claim about OBSERVATION QUALITY and nothing more:
@@ -240,6 +339,15 @@ defmodule Tightbeam.Artifacts do
   defp artifact_in_txn(txn, artifact_id) do
     case Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId=?1", [artifact_id]) do
       [row] -> artifact(row)
+    end
+  end
+
+  @doc false
+  @spec get_in_txn(Txn.t(), String.t() | nil) :: map() | nil
+  def get_in_txn(%Txn{} = txn, artifact_id) do
+    case Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [artifact_id]) do
+      [row] -> artifact(row)
+      [] -> nil
     end
   end
 
@@ -307,7 +415,29 @@ defmodule Tightbeam.Artifacts do
   """
   @spec archive_session(DB.server(), String.t(), String.t() | nil, String.t()) :: :ok
   def archive_session(db \\ Tightbeam.DB, session_key, workspace_path, archive_root) do
-    rows = list(db, %{session_key: session_key})
+    # Filesystem custody has no fixed upper duration. Wait for the actual
+    # serialized transaction result; unrelated DB calls retain their budgets.
+    case GenServer.call(
+           db,
+           {:transaction, &archive_session_in_txn(&1, session_key, workspace_path, archive_root)},
+           :infinity
+         ) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp archive_session_in_txn(txn, session_key, workspace_path, archive_root) do
+    # Serialize the eligibility read and filesystem custody operation together.
+    # A contender must see the winner's committed state before inspecting a moved workspace.
+    rows =
+      Txn.q(
+        txn,
+        "SELECT #{columns()} FROM artifacts WHERE createdBySession=?1 ORDER BY createdAt DESC, artifactId DESC",
+        [session_key]
+      )
+      |> Enum.map(&artifact/1)
+
     live = Enum.filter(rows, &(&1.state == "in-workspace"))
 
     if live == [] do
@@ -333,38 +463,16 @@ defmodule Tightbeam.Artifacts do
 
       updated_at = now()
 
-      {:ok, :ok} =
-        DB.transaction(db, fn txn ->
-          Enum.each(relative_paths, fn {artifact_id, relative_path} ->
-            DB.Txn.q(
-              txn,
-              """
-              UPDATE artifacts
-              SET state = 'archived', home = ?2, updatedAt = ?3
-              WHERE artifactId = ?1 AND state = 'in-workspace'
-              """,
-              [
-                artifact_id,
-                Path.join(archived_path, relative_path),
-                updated_at
-              ]
-            )
-          end)
+      transitions =
+        Enum.map(relative_paths, fn {id, relative} ->
+          {id, "archived", Path.join(archived_path, relative)}
+        end) ++ Enum.map(external, &{&1, "released", nil})
 
-          Enum.each(external, fn artifact_id ->
-            DB.Txn.q(
-              txn,
-              """
-              UPDATE artifacts
-              SET state = 'released', home = NULL, updatedAt = ?2
-              WHERE artifactId = ?1 AND state = 'in-workspace'
-              """,
-              [artifact_id, updated_at]
-            )
-          end)
-
-          :ok
-        end)
+      transitions
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.each(fn {id, state, home} ->
+        transition_in_txn(txn, id, "in-workspace", state, home, updated_at)
+      end)
     end
 
     :ok
@@ -407,23 +515,41 @@ defmodule Tightbeam.Artifacts do
   @doc "Mark an archived artifact as released from Tightbeam custody."
   @spec release(DB.server(), String.t()) :: map() | nil
   def release(db \\ Tightbeam.DB, artifact_id) do
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        UPDATE artifacts
-        SET state = 'released', home = NULL, updatedAt = ?2
-        WHERE artifactId = ?1 AND state = 'archived'
-        """,
-        [artifact_id, now()]
-      )
+    case DB.transaction(db, fn txn ->
+           transition_in_txn(txn, artifact_id, "archived", "released", nil, now())
+           get_in_txn(txn, artifact_id)
+         end) do
+      {:ok, row} -> row
+      {:error, error} -> raise error
+    end
+  end
 
-    get(db, artifact_id)
+  defp transition_in_txn(txn, id, prior, state, home, updated_at) do
+    case get_in_txn(txn, id) do
+      %{state: ^prior} ->
+        reserve_version_in_txn(txn, id)
+
+        Txn.q(
+          txn,
+          """
+          UPDATE artifacts SET state=?2, home=?3, updatedAt=?4
+          WHERE artifactId=?1 AND state=?5
+          """,
+          [id, state, home, updated_at, prior]
+        )
+
+        if Txn.changes(txn) != 1, do: raise(ArgumentError, "artifact_transition_race")
+        publish_in_txn(txn, "artifact." <> state, id)
+
+      _ ->
+        :ok
+    end
   end
 
   defp remove_workspace(nil), do: :ok
 
   defp remove_workspace(workspace_path) do
+    custody_test_boundary()
     if File.exists?(workspace_path), do: File.rm_rf!(workspace_path)
     :ok
   end
@@ -586,5 +712,22 @@ defmodule Tightbeam.Artifacts do
     }
   end
 
-  defp now, do: System.system_time(:millisecond)
+  if Mix.env() == :test do
+    defp custody_test_boundary do
+      case Process.get({__MODULE__, :test_custody_boundary}) do
+        nil -> :ok
+        callback when is_function(callback, 0) -> callback.()
+      end
+    end
+
+    defp now do
+      case Process.get({__MODULE__, :test_clock}) do
+        value when is_integer(value) -> value
+        nil -> System.system_time(:millisecond)
+      end
+    end
+  else
+    defp custody_test_boundary, do: :ok
+    defp now, do: System.system_time(:millisecond)
+  end
 end
