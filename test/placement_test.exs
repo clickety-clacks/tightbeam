@@ -872,6 +872,44 @@ defmodule Tightbeam.PlacementTest do
     assert File.read!(Path.join(external, "hooks.json")) == "operator bytes"
   end
 
+  test "Cursor rail refresh does not follow a projection-home parent symlink", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    execution_home = Path.join(base_dir, "cursor-execution-projection-parent")
+    File.mkdir_p!(execution_home)
+
+    cursor_auth = Path.join([base_dir, "auth", "cursor"])
+    File.mkdir_p!(cursor_auth)
+    File.write!(Path.join(cursor_auth, "api-key"), "fixture-cursor-key\n")
+
+    config = cursor_config(base_dir, db, execution_home)
+    home = Placement.deliver_home(config, {:cursor, "shared", "testhost"})
+    initial_execution_hooks = File.read!(Path.join(execution_home, ".cursor/hooks.json"))
+    refute File.exists?(Path.join(home, ".cursor"))
+
+    external = Path.join(base_dir, "operator-projection-parent")
+    target = Path.join(external, "hooks.json")
+    File.mkdir_p!(external)
+    File.write!(target, "operator sentinel")
+    File.chmod!(target, 0o600)
+    File.ln_s!(external, Path.join(home, ".cursor"))
+
+    install_statute(base_dir, "refreshed rail sentinel")
+    Rails.load!(base_dir)
+    opts = Placement.adapter_opts!(config, {:cursor, "shared", "testhost"})
+
+    assert File.read!(target) == "operator sentinel"
+    assert Bitwise.band(File.stat!(target).mode, 0o777) == 0o600
+    assert File.lstat!(Path.join(home, ".cursor")).type == :symlink
+
+    execution_hooks = File.read!(Path.join(execution_home, ".cursor/hooks.json"))
+    refute execution_hooks == initial_execution_hooks
+
+    assert opts[:cursor_rails_sha256] ==
+             Base.encode16(:crypto.hash(:sha256, execution_hooks), case: :lower)
+  end
+
   defp cursor_config(base_dir, db, execution_home) do
     %{
       base_dir: base_dir,
@@ -1032,8 +1070,7 @@ defmodule Tightbeam.PlacementTest do
       assert String.starts_with?(command, "PATH='#{expected_path}':\"$PATH\"; export PATH; ")
     end
 
-    assert File.read!(Path.join(home, ".cursor/hooks.json")) ==
-             File.read!(Path.join(execution_home, ".cursor/hooks.json"))
+    refute File.exists?(Path.join(home, ".cursor/hooks.json"))
   end
 
   test "remote Cursor adapter_opts refuses local-only before credential kind read", %{

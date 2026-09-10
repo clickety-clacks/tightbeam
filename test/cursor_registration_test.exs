@@ -412,10 +412,10 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert_receive {:remote_integrity_command, _, _}
   end
 
-  test "Cursor owns only its non-secret config and compiled hooks" do
+  test "Cursor projection owns its non-secret config but not execution hooks" do
     owned = Cursor.owned_home_entries()
     assert "cli-config.json" in owned
-    assert ".cursor/hooks.json" in owned
+    refute ".cursor/hooks.json" in owned
 
     base =
       Path.join(System.tmp_dir!(), "cursor-registration-#{System.unique_integer([:positive])}")
@@ -451,10 +451,7 @@ defmodule Tightbeam.CursorRegistrationTest do
     assert Bitwise.band(File.stat!(projected_config).mode, 0o777) == 0o640
     assert File.stat!(projected_config).gid == File.stat!(home).gid
 
-    assert JSON.decode!(File.read!(Path.join([home, ".cursor", "hooks.json"]))) == %{
-             "version" => 1,
-             "hooks" => %{}
-           }
+    refute File.exists?(Path.join([home, ".cursor", "hooks.json"]))
 
     refute File.exists?(Path.join(home, "api-key"))
     assert File.read!(Path.join(home, ".tightbeam/execution-owned")) == "preserve"

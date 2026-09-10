@@ -104,7 +104,7 @@ defmodule Tightbeam.Homes do
   defp reconcile_local(home, desired, mechanics) do
     manifest_path = Path.join(home, @manifest_relative)
     manifest = manifest_bytes(desired)
-    rails_filename = Keyword.fetch!(mechanics, :rails_filename)
+    rails_filename = Keyword.get(mechanics, :rails_filename)
 
     File.mkdir_p!(home)
 
@@ -162,13 +162,16 @@ defmodule Tightbeam.Homes do
 
     staged_stamp = File.read!(staged.manifest_path)
 
-    rails_filename = Keyword.fetch!(mechanics, :rails_filename)
-    rails = Path.join(remote_home, rails_filename)
+    rails_filename = Keyword.get(mechanics, :rails_filename)
+    rails = rails_filename && Path.join(remote_home, rails_filename)
 
     if remote_stamp != staged_stamp do
+      rails_removal = if rails, do: "rm -f \"#{rails}\"; ", else: ""
+
       script =
         "mkdir -p \"#{remote_home}\"; " <>
-          "rm -f \"#{rails}\" \"#{remote_manifest}\"; "
+          rails_removal <>
+          "rm -f \"#{remote_manifest}\"; "
 
       Support.run!(
         target,
@@ -209,9 +212,10 @@ defmodule Tightbeam.Homes do
 
   defp remove_owned_projection(home, rails_filename, preserve_manifest_dir?) do
     unless preserve_manifest_dir?, do: File.rm_rf!(Path.join(home, @manifest_relative))
-    File.rm_rf!(Path.join(home, rails_filename))
+    if rails_filename, do: File.rm_rf!(Path.join(home, rails_filename))
   end
 
+  defp write_rails(_home, nil, _content), do: :ok
   defp write_rails(_home, _filename, nil), do: :ok
 
   defp write_rails(home, filename, content) do

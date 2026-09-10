@@ -114,6 +114,7 @@ defmodule Tightbeam.Harness.Support do
       rails_file
       | Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}")
     ]
+    |> Enum.reject(&is_nil/1)
     |> Enum.sort()
   end
 

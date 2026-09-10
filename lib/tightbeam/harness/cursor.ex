@@ -200,9 +200,8 @@ defmodule Tightbeam.Harness.Cursor do
     end
   end
 
-  # Both hooks.json writers (projection home and execution home) MUST compile
-  # with identical options: the launcher verifies the execution-home file against
-  # the digest of the bytes the projection wrote.
+  # The execution home is the sole hooks owner. The launcher verifies that file
+  # against the digest returned by its descriptor-anchored publisher.
   defp rails_opts(opts), do: Keyword.take(opts, [:path])
 
   @doc """
@@ -404,15 +403,10 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def owned_home_entries,
-    do: Enum.sort([@credential_file | Support.owned_home_entries(@rails_file)])
+    do: Enum.sort([@credential_file | Support.owned_home_entries(nil)])
 
   @impl true
   def reconcile_home(target, home, desired) do
-    rails =
-      desired.rails
-      |> CursorRails.compile(rails_opts(path: Map.get(desired, :rails_path)))
-      |> JSON.encode!()
-
     # harvest_auth: false — the projection root is group-writable by the
     # execution identity, so a home-side cli-config.json can be replaced by
     # uid 503; harvesting it back would let execution-controlled content land
@@ -421,10 +415,9 @@ defmodule Tightbeam.Harness.Cursor do
     Tightbeam.Homes.reconcile(
       target,
       home,
-      %{desired | rails: rails} |> Map.put(:harvest_auth, false),
+      %{desired | rails: nil} |> Map.put(:harvest_auth, false),
       credential_names: [@credential_file],
       credential_projection: :copy_readable,
-      rails_filename: @rails_file,
       preserve_manifest_dir: true
     )
   end
