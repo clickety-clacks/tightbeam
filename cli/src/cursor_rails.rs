@@ -414,10 +414,7 @@ fn exchange_at(directory: libc::c_int, left: &CStr, right: &CStr) -> Result<(), 
     {
         Ok(())
     } else {
-        Err(refusal(format!(
-            "cannot atomically exchange hooks.json: {}",
-            io::Error::last_os_error()
-        )))
+        Err(exchange_refusal(io::Error::last_os_error()))
     }
 }
 
@@ -435,10 +432,22 @@ fn exchange_at(directory: libc::c_int, left: &CStr, right: &CStr) -> Result<(), 
     {
         Ok(())
     } else {
-        Err(refusal(format!(
-            "cannot atomically exchange hooks.json: {}",
-            io::Error::last_os_error()
-        )))
+        Err(exchange_refusal(io::Error::last_os_error()))
+    }
+}
+
+fn exchange_refusal(error: io::Error) -> String {
+    let unsupported = error.raw_os_error().is_some_and(|code| {
+        [libc::ENOSYS, libc::EOPNOTSUPP, libc::EINVAL, libc::EXDEV].contains(&code)
+    });
+
+    if unsupported {
+        refusal(format!(
+            "atomic hooks.json exchange is unsupported on this filesystem or platform; no \
+             non-atomic fallback was attempted: {error}"
+        ))
+    } else {
+        refusal(format!("cannot atomically exchange hooks.json: {error}"))
     }
 }
 
@@ -804,5 +813,21 @@ mod tests {
         assert!(publish(&args).unwrap_err().contains("payload digest"));
         assert!(!home.join(CURSOR_DIR).exists());
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn unsupported_atomic_exchange_reports_fail_closed_behavior() {
+        let error = exchange_refusal(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+
+        assert!(error.contains("atomic hooks.json exchange is unsupported"));
+        assert!(error.contains("no non-atomic fallback was attempted"));
+    }
+
+    #[test]
+    fn other_atomic_exchange_errors_keep_the_operating_system_detail() {
+        let error = exchange_refusal(io::Error::from_raw_os_error(libc::EACCES));
+
+        assert!(error.contains("cannot atomically exchange hooks.json"));
+        assert!(error.contains(&io::Error::from_raw_os_error(libc::EACCES).to_string()));
     }
 }
