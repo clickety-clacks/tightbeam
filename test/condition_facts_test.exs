@@ -81,6 +81,186 @@ defmodule Tightbeam.ConditionFactsTest do
     %{db: db, scheduler: scheduler, session: session}
   end
 
+  test "Firehose condition Dispatch files once and replays observation only", ctx do
+    alias Tightbeam.{Dispatch, Firehose.Hub}
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+    handlers = Gateway.handlers(%{db: ctx.db, wake_scheduler: ctx.scheduler})
+
+    call = %{
+      verb: "condition",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: nil,
+      params: %{
+        kind: "fixture-ready",
+        scope: "synthetic",
+        idempotency_key: "condition-publication"
+      }
+    }
+
+    assert {:ok, fact} = Dispatch.dispatch(ctx.db, handlers, call)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "condition_fact.filed", "payload" => payload}}
+    assert payload["factId"] == fact.fact_id
+    assert payload["rowVersion"] == fact.fact_id
+    Hub.delivered(hub, self())
+    assert {:ok, ^fact} = Dispatch.dispatch(ctx.db, handlers, call)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM condition_facts WHERE kind='fixture-ready'")
+
+    assert {:ok, [["flynn"]]} =
+             DB.query(ctx.db, "SELECT ownerUserId FROM condition_facts WHERE id=?1", [
+               fact.fact_id
+             ])
+
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
+  test "Firehose cancellation emits once and preserves rollback and authorization", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: ctx.session.session_key,
+        origin: "user:flynn",
+        prompt: "Cancel fixture",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    command = %{
+      wake_id: wake.wake_id,
+      expected_origin: "user:flynn",
+      requester: %{kind: "user", id: "flynn"},
+      reason_kind: "requester_withdrew",
+      causal_source: %{
+        kind: "verb_call",
+        accepted_event: %{origin: "user:flynn", session_key: nil, principal: {:user, "flynn"}}
+      },
+      outcome: %{kind: "no_replacement"}
+    }
+
+    assert {:ok, false} =
+             DB.transaction(ctx.db, fn txn ->
+               Wakes.cancel_in_txn(txn, %{command | expected_origin: "user:other"})
+             end)
+
+    refute_receive {:firehose_notice, _}
+
+    assert {:error, %RuntimeError{message: "rollback cancel"}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert {:accepted_in_txn, _, %{canceled: true}} = Wakes.cancel_in_txn(txn, command)
+               raise "rollback cancel"
+             end)
+
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, {:accepted_in_txn, event_id, %{canceled: true}}} =
+             DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
+
+    assert event_id > 0
+    assert_receive {:firehose_notice, %{"class" => "wake.canceled", "payload" => payload}}
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["state"] == "canceled"
+    Hub.delivered(hub, self())
+    assert {:ok, false} = DB.transaction(ctx.db, fn txn -> Wakes.cancel_in_txn(txn, command) end)
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wake_cancellations WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
+    assert turn_count(ctx.db, wake.wake_id) == 0
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
+  test "Firehose condition publication keeps tenant matching and one queued delivery", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('other',0,1)")
+
+    wake = condition_wake(ctx, "deployment-ready", "fixture")
+
+    wrong =
+      ConditionFacts.file(ctx.db, ctx.scheduler, %{
+        kind: "deployment-ready",
+        scope: "fixture",
+        origin: "user:other",
+        owner_user_id: "other"
+      })
+
+    assert is_integer(wrong.fact_id)
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+    assert turn_count(ctx.db, wake.wake_id) == 0
+    refute_receive {:firehose_notice, _}
+
+    matched =
+      ConditionFacts.file(ctx.db, ctx.scheduler, %{
+        kind: "deployment-ready",
+        scope: "fixture",
+        origin: "user:flynn",
+        owner_user_id: "flynn"
+      })
+
+    assert is_integer(matched.fact_id)
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "session.updated", "payload" => session_payload}}
+
+    assert session_payload["sessionKey"] == ctx.session.session_key
+    assert session_payload["mechanicalStatus"] == "running"
+    Hub.delivered(hub, self())
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "message.created", "payload" => message_payload}}
+
+    assert message_payload["sessionKey"] == ctx.session.session_key
+    assert message_payload["sender"] == "agent:owner"
+    assert message_payload["content"] =~ "re-adjudicate"
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "wake.fired", "payload" => payload}}
+    assert payload["wakeId"] == wake.wake_id
+    assert payload["state"] == "fired"
+    assert payload["firedBy"] == "condition"
+    Hub.delivered(hub, self())
+    assert_receive {:lane_nudged, key}
+    assert key == ctx.session.session_key
+
+    assert {:ok, [[seq, "queued", ^key]]} =
+             DB.query(ctx.db, "SELECT seq,status,sessionKey FROM turns WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
+    assert :ok = Wakes.fire_matching(ctx.scheduler, matched.fact_id)
+    refute_receive {:firehose_notice, _}
+    refute_receive {:lane_nudged, _}
+
+    assert {:ok, [[^seq, "queued", ^key]]} =
+             DB.query(ctx.db, "SELECT seq,status,sessionKey FROM turns WHERE wakeId=?1", [
+               wake.wake_id
+             ])
+
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
   test "condition wake uses an id cursor, fires once on a literal fact, and stays count-visible",
        ctx do
     preexisting =

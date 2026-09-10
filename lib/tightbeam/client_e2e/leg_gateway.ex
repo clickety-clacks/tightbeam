@@ -22,10 +22,10 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     copy is same-host by construction — the leg gateway runs on the machine
     the template lives on — so native deps and the relative `.bin` symlinks
     are valid as-is.
-  - `auth/` — credentials are STORE ROWS, not loose files: the backing file,
-    the home symlink, and the `.tightbeam/credential.json` metadata row all
-    have to arrive together.
-  - `homes/` — the harness homes themselves. The codex model catalog no
+  - `homes/` — authoritative harness homes and their same-home metadata.
+    Legacy `auth/` is never copied. Provisioning is not permission to run a
+    second Codex refresher; source quiescence remains a caller obligation.
+    The codex model catalog no
     longer lives here: it is one HTTPS call the host makes with its own
     grant, so nothing has to be seeded for a spawn to find a model.
   - `identity/` — archetypes, guidance and rails, WITH its git repo: the
@@ -50,7 +50,7 @@ defmodule Tightbeam.ClientE2E.LegGateway do
 
   defstruct [:base_dir, :port, :os_pid, :os_command, :port_ref, :log_path]
 
-  @copied ~w(adapters auth homes identity)
+  @copied ~w(adapters homes identity)
 
   @doc """
   Copies a provisioned template org into `base_dir` (which must not exist).
@@ -95,6 +95,13 @@ defmodule Tightbeam.ClientE2E.LegGateway do
     env =
       [
         {~c"MIX_ENV", ~c"dev"},
+        # A leg is a real child BEAM, but it does not need the host's full
+        # scheduler count. Two parallel fixtures plus a restart can otherwise
+        # ask a busy test host for hundreds of scheduler and dirty-scheduler
+        # threads, making the replacement BEAM fail before /version binds.
+        # Bound only this test child; its gateway, sockets, persisted database,
+        # process death, and reconnect path remain real.
+        {~c"ERL_FLAGS", ~c"+S 4:4 +SDcpu 2 +SDio 2"},
         {~c"TIGHTBEAM_BASE_DIR", to_charlist(base_dir)},
         {~c"TIGHTBEAM_PORT", to_charlist(Integer.to_string(port))},
         {~c"TIGHTBEAM_EFFORT_CHECKIN_HORIZON_MS", ~c"2500"}

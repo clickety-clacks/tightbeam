@@ -429,13 +429,13 @@ defmodule Tightbeam.EscalationTest do
     assert {:ok, "open"} = Escalation.list_status(nil)
     assert {:ok, "all"} = Escalation.list_status("all")
 
-    for status <- ~w(open ruled consumed withdrawn superseded) do
+    for status <- ~w(open ruled consumed withdrawn superseded returned) do
       assert {:ok, ^status} = Escalation.list_status(status)
     end
 
     assert %{code: "invalid", message: message} = Escalation.list_status("bogus")
     assert message =~ "bogus"
-    assert message =~ "open, ruled, consumed, withdrawn, superseded, all"
+    assert message =~ "open, ruled, consumed, withdrawn, superseded, returned, all"
   end
 
   test "non-session raisers use the origin domain and option labels resolve to effects", ctx do
@@ -2131,160 +2131,28 @@ defmodule Tightbeam.EscalationTest do
     end
   end
 
-  test "row recognition cannot observe the schedule-before-fact transaction until commit", _ctx do
-    path =
-      Path.join(
-        System.tmp_dir!(),
-        "terminal-decision-transaction-#{System.unique_integer([:positive])}.sqlite3"
-      )
-
-    on_exit(fn -> File.rm(path) end)
-
-    writer = :"terminal_writer_#{System.unique_integer([:positive])}"
-    observer = :"terminal_observer_#{System.unique_integer([:positive])}"
-    reader = :"terminal_reader_#{System.unique_integer([:positive])}"
-
-    start_supervised!({DB, path: path, name: writer}, id: writer)
-    assert :ok = ensure_all_schemas(writer)
-    raiser = session(writer, "transaction-raiser", "flynn")
-    start_supervised!({DB, path: path, name: observer}, id: observer)
-    start_supervised!({DB, path: path, name: reader}, id: reader)
-
-    request =
-      Escalation.operator_ask(writer, operator_call(raiser, %{question: "transaction barrier?"}))
-
-    assert {:ok, _} =
-             DB.query(
-               writer,
-               "INSERT INTO condition_facts (ts,kind,scope,origin) VALUES (?1,'unrelated','fixture','process:test')",
-               [System.system_time(:millisecond)]
-             )
-
-    parent = self()
-
-    task =
-      Task.async(fn ->
-        hook = {:block, :after_schedule, parent, :scheduled_uncommitted, :commit_terminal_ruling}
-
-        Escalation.operator_rule(
-          writer,
-          owner_operator_rule(request.id, %{decision: "accept"}),
-          transaction_step_hook: hook
-        )
-      end)
-
-    assert_receive {:scheduled_uncommitted, writer_pid}
-
-    assert {:ok, [[0, 0]]} =
-             DB.query(
-               reader,
-               "SELECT (SELECT COUNT(*) FROM wakes WHERE conditionScope=?1), (SELECT COUNT(*) FROM condition_facts WHERE scope=?1)",
-               [request.id]
-             )
-
-    send(writer_pid, :commit_terminal_ruling)
-    ruled = Task.await(task)
-
-    assert {:ok, [[cursor, "fired", "condition"]]} =
-             DB.query(
-               observer,
-               "SELECT conditionAfterId,state,firedBy FROM wakes WHERE conditionKind='escalation-ruled' AND conditionScope=?1",
-               [request.id]
-             )
-
-    assert cursor < ruled.ruling_fact_id
-
-    rollback =
-      Escalation.operator_ask(writer, operator_call(raiser, %{question: "transaction rollback?"}))
-
-    assert_raise RuntimeError, "fixture after schedule", fn ->
-      Escalation.operator_rule(
-        writer,
-        owner_operator_rule(rollback.id, %{decision: "accept"}),
-        transaction_step_hook: {:raise, :after_schedule, "fixture after schedule"}
-      )
-    end
-
-    assert {:ok, [[0, 0]]} =
-             DB.query(
-               observer,
-               "SELECT (SELECT COUNT(*) FROM wakes WHERE conditionScope=?1), (SELECT COUNT(*) FROM condition_facts WHERE scope=?1)",
-               [rollback.id]
-             )
+  @tag :tmp_dir
+  @tag :guarded_escalation
+  test "row recognition cannot observe the schedule-before-fact transaction until commit", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "escalation_guard_visibility.exs",
+      "guarded-escalation-visibility: ok"
+    )
   end
 
-  test "integrity evidence remains one across list detail consume restart and replay", _ctx do
-    unique = System.unique_integer([:positive])
-    path = Path.join(System.tmp_dir!(), "terminal-evidence-restart-#{unique}.sqlite3")
-    first = :"terminal_evidence_first_#{unique}"
-    second = :"terminal_evidence_second_#{unique}"
-
-    on_exit(fn -> File.rm(path) end)
-
-    {:ok, first_pid} = DB.start_link(path: path, name: first)
-    Process.unlink(first_pid)
-    assert :ok = ensure_all_schemas(first)
-    raiser = session(first, "evidence-restart", "flynn")
-
-    request =
-      Escalation.operator_ask(first, operator_call(raiser, %{question: "evidence restart?"}))
-
-    Escalation.operator_rule(
-      first,
-      owner_operator_rule(request.id, %{decision: "accept"})
+  @tag :tmp_dir
+  @tag :guarded_escalation
+  test "integrity evidence remains one across list detail consume restart and replay", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "escalation_guard_integrity.exs",
+      "guarded-escalation-integrity: ok"
     )
-
-    assert {:ok, _} =
-             DB.query(
-               first,
-               "DELETE FROM lifecycle_events WHERE kind='decision_request_ruled' AND subject=?1",
-               [request.id]
-             )
-
-    owner_call = %{origin: "user:flynn", principal: {:user, "flynn"}, params: %{}}
-
-    assert %{code: "decision_request_integrity_invalid"} =
-             Escalation.list(first, owner_call, "ruled")
-
-    assert %{code: "decision_request_integrity_invalid"} =
-             Escalation.get(first, owner_call, request.id)
-
-    refute Escalation.consume(first, request.id)
-
-    assert %{code: "decision_request_integrity_invalid"} =
-             Escalation.operator_rule(
-               first,
-               owner_operator_rule(request.id, %{decision: "accept"})
-             )
-
-    assert :ok = GenServer.stop(first_pid)
-
-    {:ok, second_pid} = DB.start_link(path: path, name: second)
-    Process.unlink(second_pid)
-    assert :ok = ensure_all_schemas(second)
-
-    assert %{code: "decision_request_integrity_invalid"} =
-             Escalation.get(second, owner_call, request.id)
-
-    assert %{code: "decision_request_integrity_invalid"} =
-             Escalation.list(second, owner_call, "ruled")
-
-    refute Escalation.consume(second, request.id)
-
-    assert %{code: "decision_request_integrity_invalid"} =
-             Escalation.operator_rule(
-               second,
-               owner_operator_rule(request.id, %{decision: "accept"})
-             )
-
-    assert {:ok, [[1, "list", ~s(["rulingLifecycleEvent"])]]} =
-             DB.query(
-               second,
-               "SELECT COUNT(*),MIN(firstSurface),MIN(failingFields) FROM decision_request_integrity_evidence WHERE requestId=?1",
-               [request.id]
-             )
-
-    assert :ok = GenServer.stop(second_pid)
   end
 
   test "joined terminal traces distinguish known legacy condition and fallback paths", ctx do
@@ -2562,13 +2430,24 @@ defmodule Tightbeam.EscalationTest do
   end
 
   defp insert_assignment!(db, id, holder_key, state) do
-    terminal = if state == "closed", do: ",'revoked',2,'flynn'", else: ",NULL,NULL,NULL"
-
     :ok =
       DB.execute(
         db,
-        "INSERT INTO assignments (id,subject,holderKey,holderFallback,openedBySession,openedAt,state,outcome,closedAt,closedByUser) VALUES ('#{id}','linked','#{holder_key}',0,'#{holder_key}',1,'#{state}'#{terminal})"
+        "INSERT INTO assignments (id,subject,holderKey,holderFallback,openedBySession,openedAt,state) VALUES ('#{id}','linked','#{holder_key}',0,'#{holder_key}',1,'open')"
       )
+
+    if state == "closed" do
+      assert %{id: ^id, state: "closed", outcome: "revoked"} =
+               Tightbeam.Assignments.__handle__(db, "revoke-assignment", %{
+                 verb: "revoke-assignment",
+                 origin: "agent:#{holder_key}",
+                 principal: {:session, holder_key},
+                 params: %{
+                   assignment_id: id,
+                   reason: "closed assignment refusal fixture"
+                 }
+               })
+    end
   end
 
   defp request(ctx, id) do

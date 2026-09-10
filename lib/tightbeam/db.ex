@@ -88,19 +88,61 @@ defmodule Tightbeam.DB do
 
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
 
+  require Logger
+
   defmodule Txn do
     @moduledoc """
     Handle passed to `Tightbeam.DB.transaction/2` callbacks. Runs in the owner
     process — never hold one outside the callback. Errors RAISE (rolling the
     transaction back) rather than returning tuples.
     """
-    @type t :: %__MODULE__{conn: reference()}
-    defstruct [:conn]
+    @type t :: %__MODULE__{
+            conn: reference(),
+            outbox: reference() | nil,
+            outbox_owner: pid() | nil,
+            query_trace: term()
+          }
+    defstruct [:conn, :outbox, :outbox_owner, :query_trace]
+
+    @doc false
+    def observe_queries(%__MODULE__{} = txn, trace), do: %{txn | query_trace: trace}
+
+    @doc "Queue a nonblocking handoff for this transaction's successful COMMIT."
+    def handoff(%__MODULE__{outbox: token, outbox_owner: owner}, server, message)
+        when is_reference(token) and owner == self() do
+      key = {__MODULE__, :outbox, token}
+
+      case Process.get(key) do
+        pending when is_list(pending) ->
+          Process.put(key, [{server, message} | pending])
+          :ok
+
+        _ ->
+          raise ArgumentError, "transaction handoff used outside its live phase"
+      end
+    end
+
+    def handoff(%__MODULE__{}, _server, _message),
+      do: raise(ArgumentError, "transaction handoff used outside its owner")
 
     @doc "Run one SQL statement inside the transaction; returns rows (positional lists)."
     @spec q(t(), String.t(), [term()]) :: [Tightbeam.DB.row()]
-    def q(%__MODULE__{conn: conn}, sql, params \\ []),
-      do: Tightbeam.DB.run_query(conn, sql, params)
+    def q(%__MODULE__{conn: conn, query_trace: trace}, sql, params \\ []) do
+      trace_query(trace, sql, params)
+      Tightbeam.DB.run_query(conn, sql, params)
+    end
+
+    defp trace_query(nil, _sql, _params), do: :ok
+
+    defp trace_query(pid, sql, params) when is_pid(pid) do
+      send(pid, {:core_detail_trace, {:sql_query, sql, params}})
+      :ok
+    end
+
+    defp trace_query(trace, sql, params) when is_function(trace, 1) do
+      trace.({:sql_query, sql, params})
+      :ok
+    end
 
     @doc "Execute a statement without results inside the transaction."
     @spec exec(t(), String.t()) :: :ok
@@ -131,26 +173,165 @@ defmodule Tightbeam.DB do
 
   ## Server
 
-  @impl true
-  def init(opts) do
-    path = Keyword.fetch!(opts, :path)
-    {:ok, conn} = Sqlite3.open(path)
+  @doc false
+  def prepare_schema(server), do: GenServer.call(server, :prepare_schema)
 
-    for pragma <- [
-          "PRAGMA journal_mode=WAL",
-          "PRAGMA foreign_keys=ON",
-          "PRAGMA synchronous=NORMAL",
-          "PRAGMA busy_timeout=5000"
-        ] do
-      :ok = Sqlite3.execute(conn, pragma)
+  @doc false
+  def finish_schema(server), do: GenServer.call(server, :finish_schema)
+
+  @doc false
+  def assert_base_admitted!(server, base) do
+    case GenServer.call(server, {:assert_base_admitted, base}) do
+      :ok -> :ok
+      {:error, error} -> raise error
     end
-
-    :ok = load_topline_unicode(conn)
-
-    {:ok, %{conn: conn}}
   end
 
   @impl true
+  def init(opts) do
+    path = Keyword.fetch!(opts, :path)
+    {path, admission} = prepare_persistent_admission!(path, opts)
+
+    try do
+      if admission do
+        _ = Tightbeam.LiveBaseAdmission.revalidate!(admission)
+        File.mkdir_p!(admission.base)
+      end
+
+      {:ok, conn} = Sqlite3.open(path)
+
+      try do
+        if admission, do: :ok = Tightbeam.LiveBaseLock.attach_sqlite!(admission.lock, conn)
+
+        for pragma <- [
+              "PRAGMA journal_mode=WAL",
+              "PRAGMA foreign_keys=ON",
+              "PRAGMA synchronous=NORMAL",
+              "PRAGMA busy_timeout=5000"
+            ] do
+          :ok = Sqlite3.execute(conn, pragma)
+        end
+
+        :ok = load_topline_unicode(conn)
+        {:ok, %{conn: conn, admission: admission}}
+      rescue
+        error ->
+          :ok = Sqlite3.close(conn)
+          reraise error, __STACKTRACE__
+      end
+    rescue
+      error ->
+        if admission, do: :ok = Tightbeam.LiveBaseLock.release(admission.lock)
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  defp prepare_persistent_admission!(":memory:", _opts), do: {":memory:", nil}
+
+  defp prepare_persistent_admission!(path, opts) when is_binary(path) do
+    alias Tightbeam.{LiveBaseAdmission, LiveBaseLock}
+
+    if String.starts_with?(path, "file:") or Path.basename(path) != "state.db",
+      do: raise(ArgumentError, "persistent DB requires a canonical base/state.db path")
+
+    base = LiveBaseAdmission.canonical!(Path.dirname(Path.expand(path)))
+    payload = LiveBaseAdmission.canonical!(Application.app_dir(:tightbeam))
+
+    admission =
+      case Keyword.fetch(opts, :guard_context) do
+        {:ok, context} when is_map(context) ->
+          unless context.base == base and context.payload_root == payload,
+            do: raise(ArgumentError, "guard handoff must bind base and running payload")
+
+          :ok = LiveBaseLock.claim(context.lock)
+
+          try do
+            LiveBaseAdmission.revalidate!(context)
+          rescue
+            error ->
+              :ok = LiveBaseLock.release(context.lock)
+              reraise error, __STACKTRACE__
+          end
+
+        {:ok, _} ->
+          raise ArgumentError, "guard handoff requires an owned native capability"
+
+        :error ->
+          inputs = Keyword.fetch!(opts, :guard_inputs)
+
+          unless Keyword.keyword?(inputs) and
+                   Enum.all?(Keyword.keys(inputs), &(&1 in [:lock_dir, :transition])),
+                 do:
+                   raise(ArgumentError, "guard inputs accept only lock_dir and exact transition")
+
+          LiveBaseAdmission.prepare!(base, Keyword.put(inputs, :payload_root, payload))
+      end
+
+    {Path.join(base, "state.db"), admission}
+  end
+
+  @impl true
+  def terminate(_reason, %{conn: conn}) do
+    # A native guard attachment belongs to SQLite itself. close_v2 may defer
+    # destruction until remaining statements finalize; never unlock separately
+    # here. Abnormal process death uses the same Exqlite resource destructor.
+    Sqlite3.close(conn)
+    :ok
+  end
+
+  @impl true
+  def handle_call({:assert_base_admitted, base}, _from, state) do
+    unless state.admission && Tightbeam.LiveBaseAdmission.canonical!(base) == state.admission.base,
+      do: raise(ArgumentError, "startup requires this base's persistent DB admission")
+
+    :ok = Tightbeam.LiveBaseAdmission.validate_owned_files!(state.admission)
+    {:reply, :ok, state}
+  rescue
+    error -> {:reply, {:error, error}, state}
+  end
+
+  def handle_call(:finish_schema, _from, %{admission: nil} = state),
+    do: {:reply, :ok, state}
+
+  def handle_call(:finish_schema, _from, %{conn: conn, admission: admission} = state) do
+    rows = run_query(conn, "SELECT shape FROM schema_stamp", [])
+    current = Tightbeam.LiveBaseAdmission.publish_marker!(admission, rows)
+    {:reply, :ok, %{state | admission: current}}
+  rescue
+    error -> {:reply, {:error, error}, state}
+  end
+
+  def handle_call(:prepare_schema, _from, %{conn: conn, admission: admission} = state) do
+    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+    try do
+      if admission && admission.stamp != :fresh do
+        rows = run_query(conn, "SELECT shape FROM schema_stamp", [])
+
+        unless rows == admission.stamp,
+          do:
+            raise(Tightbeam.Schema.ShapeError, message: "schema changed after guarded inspection")
+
+        :ok = Tightbeam.Schema.qualify_guard_stamp!(admission.decision, rows)
+      end
+
+      :ok =
+        Sqlite3.execute(conn, """
+        CREATE TABLE IF NOT EXISTS schema_stamp (
+          shape TEXT PRIMARY KEY,
+          stampedAt INTEGER NOT NULL
+        );
+        """)
+
+      :ok = Sqlite3.execute(conn, "COMMIT")
+      {:reply, :ok, state}
+    rescue
+      error ->
+        :ok = Sqlite3.execute(conn, "ROLLBACK")
+        {:reply, {:error, error}, state}
+    end
+  end
+
   def handle_call({:query, sql, params}, _from, %{conn: conn} = state) do
     {:reply, {:ok, run_query(conn, sql, params)}, state}
   rescue
@@ -163,52 +344,75 @@ defmodule Tightbeam.DB do
 
   def handle_call({:transaction, fun}, _from, %{conn: conn} = state) do
     Process.put(row_commit_key(conn), [])
-    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
 
-    reply =
-      try do
-        result = fun.(%Txn{conn: conn})
-        :ok = Sqlite3.execute(conn, "COMMIT")
-        {:reply, {:ok, result}, state}
-      rescue
-        e ->
-          :ok = Sqlite3.execute(conn, "ROLLBACK")
-          {:reply, {:error, e}, state}
-      end
-
-    Process.delete(row_commit_key(conn))
-    reply
+    try do
+      {:reply, commit_phase(conn, fun), state}
+    after
+      Process.delete(row_commit_key(conn))
+    end
   end
 
   def handle_call({:transaction_then, prepare, after_commit}, _from, %{conn: conn} = state) do
     Process.put(row_commit_key(conn), [])
-    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
 
-    prepared =
-      try do
-        result = prepare.(%Txn{conn: conn})
-        :ok = Sqlite3.execute(conn, "COMMIT")
-        {:committed, result}
-      rescue
-        error ->
-          :ok = Sqlite3.execute(conn, "ROLLBACK")
-          {:rolled_back, error}
-      end
+    try do
+      reply =
+        case commit_phase(conn, prepare) do
+          {:ok, result} -> run_after_commit(conn, after_commit, result)
+          {:error, error} -> {:error, error}
+        end
 
-    reply =
-      case prepared do
-        {:committed, result} ->
-          run_after_commit(conn, after_commit, result)
-
-        {:rolled_back, error} ->
-          {:error, error}
-      end
-
-    Process.delete(row_commit_key(conn))
-    {:reply, reply, state}
+      {:reply, reply, state}
+    after
+      Process.delete(row_commit_key(conn))
+    end
   end
 
   defp row_commit_key(conn), do: {__MODULE__, :row_commits, conn}
+
+  # Each real transaction owns a distinct queue. Invalidate it before sending
+  # casts; later recognition failure cannot undo the first committed phase.
+  defp commit_phase(conn, fun) do
+    token = make_ref()
+    key = {Txn, :outbox, token}
+    Process.put(key, [])
+
+    outcome =
+      try do
+        :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+        try do
+          result = fun.(%Txn{conn: conn, outbox: token, outbox_owner: self()})
+          :ok = Sqlite3.execute(conn, "COMMIT")
+          {:committed, result, Enum.reverse(Process.get(key))}
+        rescue
+          error ->
+            :ok = Sqlite3.execute(conn, "ROLLBACK")
+            {:rolled_back, error}
+        end
+      after
+        Process.delete(key)
+      end
+
+    case outcome do
+      {:committed, result, handoffs} ->
+        Enum.each(handoffs, &deliver_handoff/1)
+        {:ok, result}
+
+      {:rolled_back, error} ->
+        {:error, error}
+    end
+  end
+
+  defp deliver_handoff({server, message}) do
+    GenServer.cast(server, message)
+  catch
+    _, _ ->
+      # A transport failure is not a database rollback or a consumer receipt.
+      # Do not log arbitrary message, destination or exception contents.
+      Logger.error("post-commit handoff transport failed")
+      :ok
+  end
 
   defp run_after_commit(_conn, after_commit, result) when is_function(after_commit, 1) do
     try do
@@ -219,17 +423,7 @@ defmodule Tightbeam.DB do
   end
 
   defp run_after_commit(conn, after_commit, result) when is_function(after_commit, 2) do
-    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
-
-    try do
-      published = after_commit.(%Txn{conn: conn}, result)
-      :ok = Sqlite3.execute(conn, "COMMIT")
-      {:ok, published}
-    rescue
-      error ->
-        :ok = Sqlite3.execute(conn, "ROLLBACK")
-        {:error, error}
-    end
+    commit_phase(conn, fn txn -> after_commit.(txn, result) end)
   end
 
   @doc false

@@ -1041,6 +1041,15 @@ defmodule Tightbeam.ExecutionMapTest do
     id
   end
 
+  defp close!(db, id, "revoked", nil) do
+    Tightbeam.RevocationFixture.close!(
+      db,
+      id,
+      @default_created + 1,
+      "execution-map terminal fixture"
+    )
+  end
+
   defp close!(db, id, outcome, closing_attest_id) do
     {:ok, _} =
       DB.query(

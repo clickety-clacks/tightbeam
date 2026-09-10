@@ -13,7 +13,7 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
 
     File.mkdir_p!(arena)
     File.write!(Path.join(arena, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
-    Tightbeam.RecoveryFixture.place_adapter!(arena, seed_credential: false)
+    fixture = Tightbeam.GuardRuntimeFixture.prepare!(arena, "full_gateway_recovery.exs")
     {head, 0} = System.cmd("git", ["rev-parse", "HEAD"])
     {tree, 0} = System.cmd("git", ["rev-parse", "HEAD^{tree}"])
     candidate = candidate_identity!(arena)
@@ -29,14 +29,14 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
       })
     )
 
-    first = launch(arena, "prepare")
+    first = launch(fixture, arena, "prepare")
 
     try do
       old = await_receipt!(first, arena, "prepare")
       assert_serving_ready!(old, arena, "prepare")
       {:os_pid, old_pid} = Port.info(first, :os_pid)
       assert Integer.to_string(old_pid) == old["pid"]
-      assert old["base"] == arena
+      assert old["base"] == fixture.base
       assert {"", 0} = System.cmd("kill", ["-KILL", Integer.to_string(old_pid)])
       exit_status = await_exit!(first, arena, "prepare")
 
@@ -48,14 +48,14 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
       IO.puts("Recovery kill-result.json: #{File.read!(Path.join(arena, "kill-result.json"))}")
       assert exit_status == 137
       started = System.monotonic_time(:millisecond)
-      second = launch(arena, "restart")
+      second = launch(fixture, arena, "restart")
       assert candidate_identity!(arena) == candidate
 
       try do
         new = await_receipt!(second, arena, "restart")
         assert_serving_ready!(new, arena, "restart")
         assert new["pid"] != old["pid"]
-        assert new["base"] == arena
+        assert new["base"] == fixture.base
         before = JSON.decode!(File.read!(Path.join(arena, "prepare-state.json")))
         after_state = JSON.decode!(File.read!(Path.join(arena, "restart-state.json")))
 
@@ -325,17 +325,29 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
     end
   end
 
-  defp launch(arena, phase) do
-    env = [
-      {~c"MIX_ENV", ~c"test"},
-      {~c"RECOVERY_FIXTURE_ARENA", String.to_charlist(arena)},
-      {~c"RECOVERY_PHASE", String.to_charlist(phase)}
-    ]
+  defp launch(fixture, arena, phase) do
+    assert File.read!(Path.join(arena, ".soak-arena")) ==
+             "tightbeam recovery acceptance arena v1\n"
 
-    Tightbeam.Soak.GatewayProcess.open(arena, 0, env, [
-      ~c"run",
-      ~c"--no-start",
-      ~c"test/support/full_gateway_recovery.exs"
+    env =
+      fixture.env ++
+        [
+          {"MIX_ENV", "test"},
+          {"RECOVERY_FIXTURE_ARENA", fixture.base},
+          {"RECOVERY_EVIDENCE_DIR", arena},
+          {"RECOVERY_PHASE", phase}
+        ]
+
+    Port.open({:spawn_executable, String.to_charlist(fixture.executable)}, [
+      :binary,
+      :exit_status,
+      :stderr_to_stdout,
+      args: Enum.map(fixture.args, &String.to_charlist/1),
+      cd: String.to_charlist(File.cwd!()),
+      env:
+        Enum.map(env, fn {key, value} ->
+          {String.to_charlist(key), if(is_nil(value), do: false, else: String.to_charlist(value))}
+        end)
     ])
   end
 

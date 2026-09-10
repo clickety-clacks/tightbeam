@@ -108,10 +108,9 @@ defmodule Tightbeam.Harness.Support do
   end
 
   @doc false
-  def owned_home_entries(credential_file, rails_file) do
+  def owned_home_entries(rails_file) do
     [
       ".tightbeam/manifest",
-      credential_file,
       rails_file
       | Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}")
     ]
@@ -212,7 +211,7 @@ defmodule Tightbeam.Harness.Support do
       "owned_home_entries" => owned_home_entries_vectors(profile),
       "reconcile_home" => reconcile_home_vectors(module, profile),
       "materialize_skills" => materialize_skills_vectors(module, profile),
-      "credential_ready?/harvest_credential" => credential_vectors(module, profile),
+      "credential_ready?" => credential_vectors(module, profile),
       "credential_live?" => credential_live_vectors(module, profile),
       "install_cli_projection" => install_cli_projection_vectors(module),
       "probe_cli" => probe_cli_vectors(module, profile),
@@ -248,7 +247,7 @@ defmodule Tightbeam.Harness.Support do
   def observe_vector(module, "materialize_skills", %{input: input}),
     do: observe_materialize_skills(module, input.profile)
 
-  def observe_vector(module, "credential_ready?/harvest_credential", %{input: input}),
+  def observe_vector(module, "credential_ready?", %{input: input}),
     do: observe_credential(module, input.profile, input.case)
 
   def observe_vector(module, "credential_live?", %{input: input}),
@@ -298,7 +297,7 @@ defmodule Tightbeam.Harness.Support do
       home = Path.join(base, "home")
       local? = locality == :local
       adapter = adapter_path(base, profile.adapter_bin, locality)
-      token_path = Path.join([base, "auth", profile.home_scope, profile.credential_file])
+      token_path = Path.join(home, profile.credential_file)
       File.mkdir_p!(Path.dirname(token_path))
       File.write!(token_path, "vector-token\n")
 
@@ -545,7 +544,6 @@ defmodule Tightbeam.Harness.Support do
   defp observe_reconcile_home(module, profile) do
     with_tmp("home", fn base ->
       home = Path.join(base, "home")
-      auth_dir = Tightbeam.Credentials.store_dir(base, profile.provider)
 
       sentinels = %{
         "history/transcript" => "history-sentinel",
@@ -559,8 +557,6 @@ defmodule Tightbeam.Harness.Support do
         File.write!(path, bytes)
       end)
 
-      File.mkdir_p!(auth_dir)
-      File.write!(Path.join(auth_dir, profile.credential_file), "credential")
       before = leaf_snapshot(home)
 
       target = %{
@@ -573,8 +569,7 @@ defmodule Tightbeam.Harness.Support do
       module.reconcile_home(target, home, %{
         harness: module.id(),
         machine: "vector",
-        rails: profile.rails,
-        auth_dir: auth_dir
+        rails: profile.rails
       })
 
       after_snapshot = leaf_snapshot(home)
@@ -630,9 +625,9 @@ defmodule Tightbeam.Harness.Support do
     for case_name <- ["present", "absent", "rotated"] do
       expected =
         case case_name do
-          "present" -> %{ready?: true, harvested: nil}
-          "absent" -> %{ready?: false, harvested: nil}
-          "rotated" -> %{ready?: true, harvested: "rotated-bytes"}
+          "present" -> %{ready?: true}
+          "absent" -> %{ready?: false}
+          "rotated" -> %{ready?: true}
         end
 
       vector(case_name, expected, %{profile: profile, case: case_name})
@@ -641,25 +636,16 @@ defmodule Tightbeam.Harness.Support do
 
   defp observe_credential(module, profile, case_name) do
     with_tmp("credential", fn base ->
-      store = Tightbeam.Credentials.store_dir(base, profile.provider)
       home = Path.join(base, "home")
       File.mkdir_p!(home)
 
       if case_name in ["present", "rotated"] do
-        File.mkdir_p!(store)
-        File.write!(Path.join(store, profile.credential_file), "stored-bytes")
-      end
-
-      if case_name == "rotated" do
-        File.write!(Path.join(home, profile.credential_file), "rotated-bytes")
+        File.write!(Path.join(home, profile.credential_file), "credential-bytes")
       end
 
       target = %{host_config: %{ssh: nil, base_dir: base}, base_dir: base}
 
-      %{
-        ready?: module.credential_ready?(target, home),
-        harvested: module.harvest_credential(target, home)
-      }
+      %{ready?: module.credential_ready?(target, home)}
     end)
   end
 

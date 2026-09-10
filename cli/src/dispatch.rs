@@ -117,6 +117,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
@@ -420,6 +421,49 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("action", action),
             ],
         )),
+        Command::Ask {
+            identity,
+            target,
+            question,
+            assignment_id,
+        } => {
+            let target = match target {
+                Target::Session(value) => string_field("sessionKey", value),
+                Target::Role(value) => string_field("role", value),
+                Target::User(value) => string_field("userId", value),
+            };
+            let mut params = vec![string_field("question", question)];
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignmentId", value));
+            }
+            Ok(request(identity, "ask", vec![target], params))
+        }
+        Command::Answer {
+            identity,
+            request_id,
+            answer,
+        } => Ok(request(
+            identity,
+            "answer",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("answer", answer),
+            ],
+        )),
+        Command::Return {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "return",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
+            ],
+        )),
         Command::OperatorAsk {
             identity,
             question,
@@ -505,11 +549,28 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::RevokeAssignment {
             identity,
             assignment_id,
+            reason,
         } => Ok(request(
             identity,
             "revoke-assignment",
             vec![],
-            vec![string_field("assignmentId", assignment_id)],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
+        )),
+        Command::ReopenAssignment {
+            identity,
+            assignment_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "reopen-assignment",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
         )),
         Command::RepairAssignment {
             identity,
@@ -1538,6 +1599,7 @@ where
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
         }
+        Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::AddUser {
             identity,
@@ -1690,12 +1752,16 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
+        | Command::Ask { identity, .. }
+        | Command::Answer { identity, .. }
+        | Command::Return { identity, .. }
         | Command::OperatorAsk { identity, .. }
         | Command::OperatorRule { identity, .. }
         | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }
         | Command::DecisionRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
+        | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
@@ -1735,6 +1801,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::ToolCallObserved
         | Command::GithubAuthCheck
@@ -1766,8 +1833,154 @@ fn tune_model_params(
     params
 }
 
+fn print_current_session_identity() -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let session_key = current_session_key_from(&cwd)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"sessionKey": session_key}))
+            .expect("session identity serializes")
+    );
+    Ok(())
+}
+
+fn current_session_key_from(cwd: &Path) -> Result<String, String> {
+    for directory in cwd.ancestors() {
+        let path = directory.join(".tightbeam-session");
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(format!(
+                    "session identity unavailable: cannot inspect marker '{}'",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+        }
+        // An existing but unreadable/broken nearest marker must never fall back
+        // to another session's ancestor. Errors omit both bytes and parser excerpts.
+        let encoded = fs::read_to_string(&path)
+            .map_err(|_| format!("malformed session marker '{}': unreadable", path.display()))?;
+        let config: Value = serde_json::from_str(&encoded).map_err(|_| {
+            format!(
+                "malformed session marker '{}': invalid JSON",
+                path.display()
+            )
+        })?;
+        return config
+            .get("sessionKey")
+            .and_then(Value::as_str)
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "malformed session marker '{}': missing sessionKey",
+                    path.display()
+                )
+            });
+    }
+    Err("session identity unavailable: no .tightbeam-session marker".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn builds_agent_decision_bodies() {
+        assert_eq!(
+            body(&[
+                "ask",
+                "--session",
+                "agent:r",
+                "--question",
+                "Why?",
+                "--about",
+                "asg_1",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"ask","sessionKey":"agent:r","params":{"question":"Why?","assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "answer",
+                "--request",
+                "dr_1",
+                "--answer",
+                "Yes",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"answer","params":{"request":"dr_1","answer":"Yes"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "return",
+                "--request",
+                "dr_1",
+                "--reason",
+                "Need proof",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"return","params":{"request":"dr_1","reason":"Need proof"}}"#
+        );
+    }
+
+    #[test]
+    fn identity_current_projects_nearest_key_and_refuses_wrong_session_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-current-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("nested");
+        let cwd = nested.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = nested.join(".tightbeam-session");
+        std::fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"sessionKey":"ancestor","token":"ancestor-secret"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &marker,
+            r#"{"sessionKey":"nearest","token":"nearest-secret","url":"https://unused.invalid"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::current_session_key_from(&cwd).unwrap(), "nearest");
+        for malformed in [
+            r#"{"token":"private-value"}"#,
+            r#"{"sessionKey":42}"#,
+            r#"{"sessionKey":" "}"#,
+            r#"{"sessionKey":"private-value", broken"#,
+        ] {
+            std::fs::write(&marker, malformed).unwrap();
+            let error = super::current_session_key_from(&cwd).unwrap_err();
+            assert!(error.starts_with("malformed session marker"));
+            assert!(!error.contains("private-value"));
+            assert!(!error.contains("ancestor-secret"));
+        }
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&marker).unwrap();
+            std::os::unix::fs::symlink(nested.join("missing-target"), &marker).unwrap();
+            assert!(super::current_session_key_from(&cwd)
+                .unwrap_err()
+                .contains("unreadable"));
+            std::fs::remove_file(&marker).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::remove_file(root.join(".tightbeam-session")).unwrap();
+        assert!(super::current_session_key_from(&cwd)
+            .unwrap_err()
+            .starts_with("session identity unavailable"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use crate::args;
     use std::collections::HashMap;
@@ -2035,12 +2248,10 @@ mod tests {
         );
         assert_eq!(
             args::parse(
-                [
-                    "wake", "--role", "owner", "--prompt", "go", "--class", "", "--as", "coder",
-                ]
-                .iter()
-                .map(|value| (*value).to_owned())
-                .collect()
+                ["wake", "--role", "owner", "--prompt", "go", "--class", "", "--as", "coder",]
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect()
             )
             .unwrap_err(),
             "--class requires a class name"
@@ -2414,8 +2625,26 @@ mod tests {
             r#"{"as":"parent","verb":"operator-withdraw","params":{"request":"dr_2","reason":"moot after 013"}}"#
         );
         assert_eq!(
-            body(&["revoke-assignment", "asg_1", "--as", "parent",]),
-            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
+            body(&[
+                "revoke-assignment",
+                "asg_1",
+                "--as",
+                "parent",
+                "--reason",
+                "superseded"
+            ]),
+            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1","reason":"superseded"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "reopen-assignment",
+                "asg_1",
+                "--reason",
+                "continue work",
+                "--as",
+                "parent"
+            ]),
+            r#"{"as":"parent","verb":"reopen-assignment","params":{"assignmentId":"asg_1","reason":"continue work"}}"#
         );
         assert_eq!(
             body(&[
@@ -3303,15 +3532,13 @@ mod tests {
         fs::write(ancestor.join("work").join(".tightbeam-session"), "{").unwrap();
         let error = discover_with(|name| env.get(name).cloned(), &cwd, &root).unwrap_err();
         assert!(error.starts_with("malformed session file"));
-        assert!(
-            error.contains(
-                &ancestor
-                    .join("work")
-                    .join(".tightbeam-session")
-                    .display()
-                    .to_string()
-            )
-        );
+        assert!(error.contains(
+            &ancestor
+                .join("work")
+                .join(".tightbeam-session")
+                .display()
+                .to_string()
+        ));
 
         fs::remove_dir_all(root).unwrap();
     }

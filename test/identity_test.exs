@@ -25,6 +25,46 @@ defmodule Tightbeam.IdentityTest do
     %{base: runtime, root: base, source: source}
   end
 
+  test "served bootstrap seeds exact identity and raw kungfu without notices", ctx do
+    alias Tightbeam.{AdminProjection, DB, Schema, StateResources, Firehose.Hub}
+    assert :initialized = Identity.init!(ctx.base)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Schema.ensure_all(db)
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, user_id: "synthetic-admin", is_admin: true})
+    entries = AdminProjection.served_entries(db, ctx.base)
+    assert Enum.count(entries, &(&1.resource == "identity")) == 1
+
+    assert Enum.count(entries, &(&1.resource == "kungfu")) ==
+             length(Identity.public_kungfu_names(ctx.base))
+
+    assert :ok = AdminProjection.bootstrap_served(db, ctx.base)
+
+    for entry <- entries do
+      assert AdminProjection.stamped_item(db, entry.resource, entry.key) ==
+               Map.put(entry.item, "rowVersion", 1)
+
+      if entry.resource == "kungfu" do
+        assert entry.item ==
+                 Identity.public_kungfu(ctx.base, entry.key) |> Map.delete("rowVersion")
+
+        assert StateResources.kungfu(Map.put(entry.item, "rowVersion", 1))["documents"] ==
+                 entry.item["documents"]
+      end
+    end
+
+    {:ok, before} =
+      DB.query(db, "SELECT * FROM admin_projection_versions ORDER BY resource,primaryKey")
+
+    assert :ok = AdminProjection.bootstrap_served(db, ctx.base)
+
+    assert {:ok, ^before} =
+             DB.query(db, "SELECT * FROM admin_projection_versions ORDER BY resource,primaryKey")
+
+    assert AdminProjection.stamped_item(db, "identity", "missing") == nil
+    refute_receive {:firehose_notice, _}
+  end
+
   test "neutral seed creates the exact three refs and only the two seed files", ctx do
     assert :initialized = Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")

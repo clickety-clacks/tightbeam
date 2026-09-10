@@ -67,7 +67,6 @@ defmodule Tightbeam.Harness do
   @callback reconcile_home(target(), String.t(), desired_home()) :: map()
   @callback materialize_skills(target(), String.t(), map()) :: map()
   @callback credential_ready?(target(), String.t()) :: boolean()
-  @callback harvest_credential(target(), String.t()) :: binary() | nil
   @callback credential_live?(target(), String.t(), keyword()) :: credential_liveness()
   @doc """
   Give the harness one real run against a freshly banked credential.

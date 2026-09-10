@@ -156,31 +156,15 @@ defmodule Tightbeam.ToplinesSchemaTest do
     end
   end
 
-  test "an after-commit database crash restarts with the exact stamped shape and rows" do
-    unique = System.unique_integer([:positive])
-    db = :"toplines_schema_restart_#{unique}"
-    path = Path.join(System.tmp_dir!(), "toplines-schema-restart-#{unique}.db")
-
-    on_exit(fn ->
-      if pid = Process.whereis(db), do: GenServer.stop(pid)
-      Enum.each([path, path <> "-shm", path <> "-wal"], &File.rm/1)
-    end)
-
-    {:ok, first} = DB.start_link(path: path, name: db)
-    Process.unlink(first)
-    seed_base_schema!(db)
-    assert :ok = ToplinesSchema.activate(db, 123)
-    insert_topline!(db, "Durable")
-    before = snapshot(db)
-
-    monitor = Process.monitor(first)
-    Process.exit(first, :kill)
-    assert_receive {:DOWN, ^monitor, :process, ^first, :killed}, 1_000
-
-    {:ok, second} = DB.start_link(path: path, name: db)
-    Process.unlink(second)
-    assert :ok = ToplinesSchema.activate(db, 999)
-    assert snapshot(db) == before
+  @tag :tmp_dir
+  test "an after-commit database crash restarts with the exact stamped shape and rows", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "guard_toplines_runtime.exs",
+      "guarded-toplines-crash: ok"
+    )
   end
 
   defp base_db! do

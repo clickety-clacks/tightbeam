@@ -1,0 +1,16 @@
+[payload, base, locks] = System.argv()
+true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
+false = File.exists?(base)
+{:ok, _} = Application.ensure_all_started(:exqlite)
+{:ok, _} = Application.ensure_all_started(:crypto)
+Application.put_env(:ex_unit, :assert_receive_timeout, 1_000)
+Application.put_env(:tightbeam, :autostart, false)
+Application.put_env(:tightbeam, :fixture_harness, true)
+Application.put_env(:tightbeam, :local_host_name, "testhost")
+Application.put_env(:tightbeam, :base_dir, base)
+
+Tightbeam.AttentionTierFixture.run_case!(
+  String.to_integer(System.fetch_env!("DD36_SCENARIO")),
+  base,
+  locks
+)

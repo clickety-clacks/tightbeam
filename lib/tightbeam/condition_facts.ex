@@ -268,6 +268,12 @@ defmodule Tightbeam.ConditionFacts do
 
   @spec file_idempotent(DB.server(), GenServer.server(), map()) :: map() | {:error, map()}
   def file_idempotent(db, scheduler, input) do
+    {result, _filed?} = file_idempotent_with_effect(db, scheduler, input)
+    result
+  end
+
+  @doc false
+  def file_idempotent_with_effect(db, scheduler, input, firehose_call \\ nil) do
     case DB.transaction_then(
            db,
            fn txn ->
@@ -277,43 +283,61 @@ defmodule Tightbeam.ConditionFacts do
              prior =
                if is_binary(key), do: Idempotency.get_in_txn(txn, origin, "condition", key)
 
-             if prior do
-               result =
-                 with :ok <- consequence_admission(txn, input) do
-                   fact = fact_in_txn(txn, prior.session_key)
+             outcome =
+               if prior do
+                 result =
+                   with :ok <- consequence_admission(txn, input) do
+                     fact = fact_in_txn(txn, prior.session_key)
 
-                   if input[:payload] &&
-                        (is_nil(fact) || fact.kind != input.kind || fact.scope != input[:scope] ||
-                           fact.payload != input[:payload]) do
-                     {:error,
-                      %{
-                        code: "conflict",
-                        message: "condition key already has different immutable content"
-                      }}
-                   else
-                     fact
+                     if input[:payload] &&
+                          (is_nil(fact) || fact.kind != input.kind || fact.scope != input[:scope] ||
+                             fact.payload != input[:payload]) do
+                       {:error,
+                        %{
+                          code: "conflict",
+                          message: "condition key already has different immutable content"
+                        }}
+                     else
+                       fact
+                     end
                    end
+
+                 {result, false}
+               else
+                 # Typed semantic replay can return an existing fact without a wire key.
+                 [[before_id]] =
+                   Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM condition_facts")
+
+                 case file_in_txn(txn, input) do
+                   %{fact_id: fact_id} = fact ->
+                     if is_binary(key) do
+                       Idempotency.put_in_txn(txn, %{
+                         owner_user_id: origin,
+                         operation: "condition",
+                         idempotency_key: key,
+                         session_key: to_string(fact_id)
+                       })
+                     end
+
+                     {fact, fact_id > before_id}
+
+                   error ->
+                     {error, false}
                  end
-
-               {result, false}
-             else
-               case file_in_txn(txn, input) do
-                 %{fact_id: fact_id} = fact ->
-                   if is_binary(key) do
-                     Idempotency.put_in_txn(txn, %{
-                       owner_user_id: origin,
-                       operation: "condition",
-                       idempotency_key: key,
-                       session_key: to_string(fact_id)
-                     })
-                   end
-
-                   {fact, true}
-
-                 error ->
-                   {error, false}
                end
+
+             case {outcome, firehose_call} do
+               {{%{fact_id: _} = fact, true}, %{} = call} ->
+                 Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, fact)
+
+               {{%{fact_id: _}, false}, %{} = call} ->
+                 Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+               _ ->
+                 :ok
              end
+
+             outcome
            end,
            fn txn, {result, filed?} ->
              Tightbeam.Wakes.row_commit_in_txn(txn, [])
@@ -329,7 +353,7 @@ defmodule Tightbeam.ConditionFacts do
       {:ok, {result, deliveries, filed?}} ->
         complete_deliveries(db, deliveries)
         if filed?, do: notify_scheduler(scheduler, result)
-        result
+        {result, filed?}
 
       {:error, error} ->
         raise error

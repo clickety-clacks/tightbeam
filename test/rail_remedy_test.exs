@@ -410,12 +410,7 @@ defmodule Tightbeam.RailRemedyTest do
       if cause == "satisfied" do
         insert_clean_review(ctx, assignment)
       else
-        {:ok, _} =
-          DB.query(
-            ctx.db,
-            "UPDATE assignments SET state='closed',outcome='revoked',closedAt=2,closedByUser='flynn' WHERE id=?1",
-            [assignment.id]
-          )
+        :ok = persist_terminal_race!(ctx.db, assignment.id, 2)
       end
 
       first = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
@@ -1040,12 +1035,7 @@ defmodule Tightbeam.RailRemedyTest do
     %{producer_id: root} = fire_review_notice(ctx, assignment)
     mark_notice_turn(ctx.db, assignment.id, root, "failed_unknown")
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE assignments SET state='closed',outcome='revoked',closedAt=2,closedByUser='flynn' WHERE id=?1",
-        [assignment.id]
-      )
+    :ok = persist_terminal_race!(ctx.db, assignment.id, 2)
 
     episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
 
@@ -1115,12 +1105,7 @@ defmodule Tightbeam.RailRemedyTest do
     second = RailRemedy.episode(ctx.db, "completion-requires-review", terminal.id)
     second_reassessment = Wakes.get(ctx.db, second.notice_state["reassessment"]["wakeId"])
 
-    {:ok, _} =
-      DB.query(
-        ctx.db,
-        "UPDATE assignments SET state='closed',outcome='revoked',closedAt=?2,closedByUser='flynn' WHERE id=?1",
-        [terminal.id, System.system_time(:millisecond)]
-      )
+    :ok = persist_terminal_race!(ctx.db, terminal.id, System.system_time(:millisecond))
 
     assert :ok =
              RailRemedy.reconcile_notice(
@@ -2601,7 +2586,7 @@ defmodule Tightbeam.RailRemedyTest do
       origin: "user:flynn",
       principal: {:user, "flynn"},
       session_key: nil,
-      params: %{assignment_id: assignment_id}
+      params: %{assignment_id: assignment_id, reason: "test disposition"}
     })
   end
 
@@ -2622,8 +2607,55 @@ defmodule Tightbeam.RailRemedyTest do
     })
   end
 
+  # Model a committed terminal row before its downstream reconciliation. Keep the
+  # real audit and generation constraints; using the full revoke handler here
+  # would consume the callback race that these three tests exercise.
+  defp persist_terminal_race!(db, assignment_id, at) do
+    revocation_id = "rev_race_#{System.unique_integer([:positive])}"
+
+    assert {:ok, :ok} =
+             DB.transaction(db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id, assignmentId, revokedAt, revokedByUser, reason)
+                 VALUES (?1, ?2, ?3, 'flynn', 'synthetic terminal race')
+                 """,
+                 [revocation_id, assignment_id, at]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO assignment_revocation_generations
+                   (revocationId, assignmentId, reopeningId)
+                 VALUES (?1, ?2, NULL)
+                 """,
+                 [revocation_id, assignment_id]
+               )
+
+               DB.Txn.q(
+                 txn,
+                 """
+                 UPDATE assignments SET state='closed', outcome='revoked',
+                   closedAt=?2, closedByUser='flynn'
+                 WHERE id=?1 AND state='open'
+                 """,
+                 [assignment_id, at]
+               )
+
+               assert DB.Txn.changes(txn) == 1
+               :ok
+             end)
+
+    :ok
+  end
+
   defp spawn_handlers(ctx) do
-    auth_dir = Path.join([ctx.base_dir, "auth", "codex"])
+    auth_dir =
+      Tightbeam.Homes.home_path(ctx.base_dir, Tightbeam.Placement.local_host_name(), :codex)
+
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "auth.json"), "{}")
     Archetypes.load!(ctx.base_dir)

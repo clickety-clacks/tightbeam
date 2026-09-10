@@ -7,6 +7,7 @@ TEMP=${1:?usage: finalize-artifact.sh <temporary.tgz> <final.tgz> <expected-vers
 FINAL=${2:?usage: finalize-artifact.sh <temporary.tgz> <final.tgz> <expected-version>}
 EXPECTED=${3:?usage: finalize-artifact.sh <temporary.tgz> <final.tgz> <expected-version>}
 
+sh "$(dirname "$0")/verify-payload.sh" "$TEMP"
 sh "$(dirname "$0")/version-smoke.sh" "$TEMP" "$EXPECTED"
 sh "$(dirname "$0")/purity-check.sh" "$TEMP"
 mv "$TEMP" "$FINAL"

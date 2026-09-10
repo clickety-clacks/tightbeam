@@ -18,6 +18,75 @@ defmodule Tightbeam.ToplinesTest do
     %{db: db}
   end
 
+  test "Firehose topline create link unlink publish once with tenant visibility", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+    work_item!(ctx.db, "wi_firehose", "flynn")
+
+    create =
+      Map.put(
+        call({:user, "flynn"}, %{title: "Firehose", idempotency_key: "fh-create"}, 100),
+        :firehose_hub,
+        hub
+      )
+
+    created = Toplines.create(ctx.db, create)
+    assert_receive {:firehose_notice, %{"class" => "topline.created", "refs" => refs} = notice}
+    assert refs["toplineId"] == created.topline.id
+    refute Tightbeam.StateVisibility.visible?(ctx.db, notice, "kay", false)
+    Hub.delivered(hub, self())
+    assert Toplines.create(ctx.db, create) == created
+    refute_receive {:firehose_notice, %{"class" => "topline.created"}}
+
+    link =
+      Map.put(
+        call(
+          {:user, "flynn"},
+          %{
+            topline_id: created.topline.id,
+            work_item_id: "wi_firehose",
+            reason: "group",
+            idempotency_key: "fh-link"
+          },
+          110
+        ),
+        :firehose_hub,
+        hub
+      )
+
+    linked = Toplines.link_work(ctx.db, link)
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "topline_work_membership.linked", "refs" => linked_refs}}
+
+    assert linked_refs["membershipId"] == linked.membership.id
+    assert linked_refs["workItemId"] == "wi_firehose"
+    Hub.delivered(hub, self())
+    assert Toplines.link_work(ctx.db, link) == linked
+    refute_receive {:firehose_notice, %{"class" => "topline_work_membership.linked"}}
+
+    unlink =
+      Map.put(
+        call(
+          {:user, "flynn"},
+          %{membership_id: linked.membership.id, reason: "split", idempotency_key: "fh-unlink"},
+          120
+        ),
+        :firehose_hub,
+        hub
+      )
+
+    ended = Toplines.unlink_work(ctx.db, unlink)
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "topline_work_membership.unlinked", "refs" => ^linked_refs}}
+
+    Hub.delivered(hub, self())
+    assert Toplines.unlink_work(ctx.db, unlink) == ended
+    refute_receive {:firehose_notice, %{"class" => "topline_work_membership.unlinked"}}
+  end
+
   test "self-contained schema creation is deterministic", %{db: db} do
     assert :ok = Toplines.ensure_schema(db)
 

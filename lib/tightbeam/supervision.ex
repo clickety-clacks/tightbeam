@@ -2329,27 +2329,61 @@ defmodule Tightbeam.Supervision do
   end
 
   defp success_clear(db, pending) do
-    transaction!(db, fn txn ->
-      if clear_pending_in_txn(txn, pending) do
-        Txn.q(
-          txn,
-          "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
-          [pending.pendingAssignment, now()]
-        )
+    _event_seq =
+      transaction!(db, fn txn ->
+        if clear_pending_in_txn(txn, pending) do
+          Txn.q(
+            txn,
+            "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
+            [pending.pendingAssignment, now()]
+          )
 
-        # prodCount is a mutable aggregate that RESETS on attest, and pendingK is
-        # overwritten every evaluation: the tier that fired has no other home.
-        if pending.pendingBranch == "prod" do
-          CausalEvents.append_in_txn(txn, %{
-            kind: "prod_fired",
-            assignment_id: pending.pendingAssignment,
-            job_ref: job_ref_in_txn(txn, pending.pendingAssignment),
-            session_key: pending.sessionKey,
-            detail: %{tier: pending.pendingK}
-          })
+          # prodCount is a mutable aggregate that RESETS on attest, and pendingK is
+          # overwritten every evaluation: the tier that fired has no other home.
+          if pending.pendingBranch == "prod" do
+            at = now()
+            job_ref = job_ref_in_txn(txn, pending.pendingAssignment)
+
+            CausalEvents.append_in_txn(txn, %{
+              kind: "prod_fired",
+              assignment_id: pending.pendingAssignment,
+              job_ref: job_ref,
+              session_key: pending.sessionKey,
+              at: at,
+              detail: %{tier: pending.pendingK}
+            })
+
+            [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+
+            event = %{
+              seq: seq,
+              at: at,
+              job_ref: job_ref,
+              assignment_id: pending.pendingAssignment,
+              session_key: pending.sessionKey,
+              kind: "prod_fired",
+              detail: %{tier: pending.pendingK}
+            }
+
+            Tightbeam.Firehose.Publisher.observation_in_txn(
+              txn,
+              "prod.fired",
+              event,
+              %{
+                "eventId" => seq,
+                "assignmentId" => pending.pendingAssignment,
+                "workItemId" => job_ref,
+                "sessionKey" => pending.sessionKey
+              },
+              at
+            )
+
+            seq
+          end
         end
-      end
-    end)
+      end)
+
+    :ok
   end
 
   defp denied_clear(db, pending) do
@@ -4182,7 +4216,7 @@ defmodule Tightbeam.Supervision do
       generation = (transfer.generation || 0) + 1
       outcome_id = "#{assignment_id}##{generation}"
 
-      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch)
+      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch, sync_session: false)
 
       Txn.q(
         txn,
@@ -4228,7 +4262,7 @@ defmodule Tightbeam.Supervision do
       outcome_kind = if target == main, do: "main_elevation", else: "parent_elevation"
       action_needed = outcome_kind == "main_elevation"
 
-      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch)
+      invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch, sync_session: false)
 
       wake =
         Wakes.schedule_in_txn(txn, %{
@@ -4302,12 +4336,15 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  defp invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch) do
+  defp invalidate_transfer_turn_in_txn(txn, transfer, retirement_epoch, opts \\ []) do
     Txn.q(
       txn,
       "UPDATE turns SET status='canceled', endedAt=?2 WHERE seq=?1 AND status='queued'",
       [transfer.turn_seq, retirement_epoch]
     )
+
+    if Txn.changes(txn) == 1 and Keyword.get(opts, :sync_session, true),
+      do: Tightbeam.Org.sync_mechanical_status_in_txn(txn, transfer.session_key)
   end
 
   defp store_retirement_outcome_in_txn(

@@ -10,6 +10,7 @@ defmodule Tightbeam.D1ReadTest do
     %{db: db}
   end
 
+  @tag d1_delta: true
   test "the seam serializes config and host environment with values redacted", %{db: db} do
     :ok = Org.put_setting(db, "default-archetype", "default")
     :ok = Org.put_setting(db, "private-priority", "secret")
@@ -31,14 +32,20 @@ defmodule Tightbeam.D1ReadTest do
 
     harness = hd(Harness.all()).wire_name()
 
-    assert {:ok, _overlay} =
-             Placement.set_env_overlay(
+    assert %{changed: true} =
+             Placement.set_env_overlay_with_firehose(
                db,
                "alpha",
                harness,
                "PRIVATE_TOKEN",
                "secret",
-               "user:admin"
+               "user:admin",
+               %{
+                 verb: "host-env-set",
+                 origin: "user:admin",
+                 principal: {:user, "admin"},
+                 params: %{}
+               }
              )
 
     assert [environment] = D1Read.collection(db, "/unused", :host_environment, %{})
@@ -133,14 +140,14 @@ defmodule Tightbeam.D1ReadRouteTest do
     %{db: db, base_dir: base_dir, opts: opts, admin: admin, operator: operator, session: session}
   end
 
-  test "all six D1 routes provide fixed envelopes, ordered bytes, and no-store", ctx do
+  @tag :kungfu_protection
+  test "available D1 routes retain fixed envelopes", ctx do
     for {path, resource, resource_key} <- [
           {"/api/config", "config", :config},
           {"/api/host-env", "host environment", :host_environment},
           {"/api/hosts", "hosts", :hosts},
           {"/api/users", "users", :users},
-          {"/api/identity", "identity", :identity},
-          {"/api/kungfu", "kungfu", :kungfu}
+          {"/api/identity", "identity", :identity}
         ] do
       response = get(ctx.opts, path, ctx.admin.token)
       assert response.status == 200, "#{path}: #{response.resp_body}"
@@ -256,6 +263,37 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert Enum.map(hosts_after["items"], & &1["host"]) == ["zeta"]
   end
 
+  @tag rest_r7_encoder: true
+  test "all shared collections retain exact missing and repeated principal refusals", ctx do
+    for {path, resource} <- [
+          {"/api/config", "config"},
+          {"/api/host-env", "host environment"},
+          {"/api/hosts", "hosts"},
+          {"/api/users", "users"},
+          {"/api/identity", "identity"},
+          {"/api/kungfu", "kungfu"}
+        ] do
+      for {query, code} <- [
+            {"", "invalid_message"},
+            {"?limit=1", "invalid_message"},
+            {"?asUser=", "invalid_message"},
+            {"?asUser=admin&asUser=admin", "invalid_as_user"}
+          ] do
+        response = get(ctx.opts, path <> query, "tbc_d1_route")
+        assert response.status == 400
+
+        assert JSON.decode!(response.resp_body) ==
+                 %{"schemaVersion" => 1, "resource" => resource, "error" => %{"code" => code}}
+
+        assert get_resp_header(response, "cache-control") == ["no-store"]
+      end
+
+      invalid = get(ctx.opts, path <> "?asUser=admin&asUser=admin", "invalid-token")
+      assert invalid.status == 401
+      assert JSON.decode!(invalid.resp_body)["error"]["code"] == "auth_failed"
+    end
+  end
+
   test "D1 preserves auth, visibility, error bytes, and cache", ctx do
     assert get(ctx.opts, "/api/config?asUser=admin", "tbc_d1_route").status == 200
     assert get(ctx.opts, "/api/hosts?host=alpha", ctx.session.cli_token).status == 200
@@ -273,6 +311,141 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert hidden.resp_body == missing.resp_body
     assert get_resp_header(hidden, "cache-control") == ["no-store"]
     assert get_resp_header(missing, "cache-control") == ["no-store"]
+  end
+
+  @tag :kungfu_protection
+  test "kungfu collection and detail serve unchanged listed bytes with exact hashes", ctx do
+    first = get(ctx.opts, "/api/kungfu", ctx.admin.token)
+    assert first.status == 200
+    assert get_resp_header(first, "cache-control") == ["no-store"]
+    items = JSON.decode!(first.resp_body)["items"]
+    assert items != []
+
+    for item <- items do
+      expected = Identity.public_kungfu(ctx.base_dir, item["name"])
+      assert item["documents"] == expected["documents"]
+
+      for doc <- item["documents"] do
+        assert doc["path"] in ~w(README.md capabilities.md preferred-models.md)
+
+        assert doc["sha256"] ==
+                 :crypto.hash(:sha256, doc["content"]) |> Base.encode16(case: :lower)
+      end
+
+      detail = get(ctx.opts, "/api/kungfu/" <> item["name"], ctx.admin.token)
+      assert detail.status == 200
+      assert detail.resp_body =~ D1Read.encode(:kungfu, item)
+    end
+
+    assert get(ctx.opts, "/api/kungfu", ctx.admin.token).resp_body == first.resp_body
+    assert get(ctx.opts, "/api/kungfu/no-such-bundle", ctx.admin.token).status == 404
+  end
+
+  @tag :kungfu_protection
+  test "kungfu serving preserves prior auth principal visibility and query decisions", ctx do
+    assert get(ctx.opts, "/api/kungfu", "invalid").status == 401
+    assert get(ctx.opts, "/api/kungfu", "tbc_d1_route").status == 400
+    invalid = get(ctx.opts, "/api/kungfu?unknown=value", ctx.admin.token)
+    assert invalid.status == 400
+    assert JSON.decode!(invalid.resp_body)["error"]["code"] == "invalid_filter"
+    assert get(ctx.opts, "/api/kungfu?asUser=other", ctx.session.cli_token).status == 403
+    hidden = get(ctx.opts, "/api/kungfu/no-such-bundle", ctx.operator.token)
+    assert hidden.status == 404
+    collection = get(ctx.opts, "/api/kungfu", ctx.operator.token)
+    assert collection.status == 200
+    assert JSON.decode!(collection.resp_body)["items"] == []
+    assert get(ctx.opts, "/api/hosts", ctx.admin.token).status == 200
+  end
+
+  @tag d1_delta: true
+  test "authenticated host REST notice and rebuild agree without widening host environment",
+       ctx do
+    alias Tightbeam.{StateResources, StateVisibility}
+    alias Tightbeam.Firehose.{Hub, Rebuild}
+    start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(Hub, self(), %{mode: :all, db: ctx.db, user_id: "admin", is_admin: true})
+
+    call = %{
+      verb: "register-host",
+      principal: {:user, "admin"},
+      origin: "user:admin",
+      params: %{}
+    }
+
+    assert {:ok, _} =
+             Placement.register_host_with_firehose(
+               ctx.db,
+               "alpha",
+               %{
+                 ssh: "operator@alpha",
+                 base_dir: "/tmp/alpha",
+                 cli_bin: "/tmp/tightbeam",
+                 adapter_bin_dir: "/tmp/adapters"
+               },
+               call
+             )
+
+    _barrier = Hub.sequence(Hub, self())
+    assert_received {:firehose_notice, %{"class" => "host.registered"} = notice}
+    Hub.delivered(Hub, self())
+    assert notice["payload"] == StateResources.host(StateResources.query_host(ctx.db, "alpha"))
+    assert Map.keys(notice["payload"]) |> Enum.sort() == ["host", "rowVersion"]
+
+    for {token, user, admin} <- [
+          {ctx.admin.token, "admin", true},
+          {ctx.operator.token, "operator", false},
+          {ctx.session.cli_token, "admin", false}
+        ] do
+      response = get(ctx.opts, "/api/hosts/alpha", token)
+      assert response.status == 200
+      assert JSON.decode!(response.resp_body)["item"] == notice["payload"]
+      assert StateVisibility.visible?(ctx.db, notice, user, admin)
+
+      assert {:ok, notice["payload"]} ==
+               Rebuild.fetch(ctx.db, "host.registered", notice["refs"], user, admin)
+    end
+
+    assert get(ctx.opts, "/api/hosts/alpha", "bad-token").status == 401
+    assert conn(:get, "/api/hosts/alpha") |> Router.call(ctx.opts) |> Map.fetch!(:status) == 401
+
+    assert JSON.decode!(get(ctx.opts, "/api/host-env", ctx.operator.token).resp_body)["items"] ==
+             []
+
+    harness = hd(Harness.all()).wire_name()
+
+    assert %{changed: true, projection: %{row_version: version}} =
+             Placement.set_env_overlay_with_firehose(
+               ctx.db,
+               "alpha",
+               harness,
+               "D1_TEST_VALUE",
+               "changed-private-value",
+               "user:admin",
+               %{call | verb: "host-env-set"}
+             )
+
+    assert is_integer(version) and version > 0
+    environment = hd(D1Read.collection(ctx.db, ctx.base_dir, :host_environment, %{}))
+    refs = Map.take(environment, ["host", "harness", "name"])
+    assert :forbidden == Rebuild.fetch(ctx.db, "host_env.updated", refs, "operator", false)
+    assert {:ok, rebuilt} = Rebuild.fetch(ctx.db, "host_env.updated", refs, "admin", true)
+    assert rebuilt == environment
+    assert rebuilt["value"] == nil
+    assert rebuilt["valuePresent"] == true
+    refute StateVisibility.config_visible?(false)
+    refute StateVisibility.user_visible?(false)
+    refute StateVisibility.host_environment_visible?(false)
+  end
+
+  @tag :tmp_dir
+  @tag d1_guarded_restart: true
+  test "stamped environment first change noop unset and guarded restart preserve canonical parity",
+       %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "firehose_d1_restart.exs",
+      "guarded-environment-parity: ok"
+    )
   end
 
   defp get(opts, path, bearer) do

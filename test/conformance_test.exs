@@ -611,7 +611,7 @@ defmodule Tightbeam.ConformanceSupport do
         case kase["expect"] do
           "pass" ->
             assert Enum.all?(results, fn {_entry, _output, status} -> status == 0 end),
-                   kase["case"]
+                   "#{kase["case"]}: #{inspect(results, limit: :infinity, printable_limit: :infinity)}"
 
           "deny" ->
             marker = "[gate: #{kase["reason"]}]"
@@ -619,7 +619,7 @@ defmodule Tightbeam.ConformanceSupport do
             assert Enum.any?(results, fn {_entry, output, status} ->
                      status == 2 and output =~ marker
                    end),
-                   kase["case"]
+                   "#{kase["case"]}: #{inspect(results, limit: :infinity, printable_limit: :infinity)}"
         end
       end)
     after
@@ -630,10 +630,15 @@ defmodule Tightbeam.ConformanceSupport do
 
   defp run_hook(entry, input) do
     [%{"command" => command}] = entry["hooks"]
+    ensure_real_rail_exec!()
+    cli_dir = Path.expand("../cli/target/release", __DIR__)
 
     {output, status} =
       System.cmd("sh", ["-c", "printf '%s' \"$TB_CONFORMANCE_INPUT\" | " <> command],
-        env: [{"TB_CONFORMANCE_INPUT", input}],
+        env: [
+          {"TB_CONFORMANCE_INPUT", input},
+          {"PATH", cli_dir <> ":" <> System.get_env("PATH", "")}
+        ],
         stderr_to_stdout: true
       )
 
@@ -2374,7 +2379,7 @@ defmodule Tightbeam.ConformanceSupport do
   end
 
   defp remedy_action_handlers(base, db) do
-    auth_dir = Path.join([base, "auth", "codex"])
+    auth_dir = Tightbeam.Homes.home_path(base, Placement.local_host_name(), :codex)
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "auth.json"), "{}")
     Archetypes.load!(base)
@@ -3183,7 +3188,7 @@ defmodule Tightbeam.ConformanceSupport do
         origin: "user:owner",
         principal: {:user, "owner"},
         session_key: nil,
-        params: %{assignment_id: assignment_id}
+        params: %{assignment_id: assignment_id, reason: "test disposition"}
       })
 
     refute Map.has_key?(result, :code)

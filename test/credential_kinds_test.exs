@@ -22,6 +22,25 @@ defmodule Tightbeam.CredentialKindsTest do
   alias Tightbeam.{Credentials, ModelCatalog}
   alias Tightbeam.Harness.{Claude, Codex}
 
+  defp start_credentials(opts), do: Credentials.start_link(credential_opts(opts))
+
+  defp credential_opts(opts) do
+    home =
+      Tightbeam.Homes.home_path(
+        Keyword.fetch!(opts, :base_dir),
+        Keyword.fetch!(opts, :machine),
+        :claude
+      )
+
+    synthetic_warm = fn argv ->
+      assert ["env", config_home, _binary, "-p", "ok", "--model", "sonnet"] = argv
+      assert config_home == "CLAUDE_CONFIG_DIR=#{home}"
+      {"", 0}
+    end
+
+    Keyword.put_new(opts, :sh, synthetic_warm)
+  end
+
   setup do
     base = Path.join(System.tmp_dir!(), "tb-cred-kinds-#{System.unique_integer([:positive])}")
     db = :"cred_kinds_db_#{System.unique_integer([:positive])}"
@@ -32,7 +51,7 @@ defmodule Tightbeam.CredentialKindsTest do
   end
 
   defp stage!(base, provider, filename, bytes) do
-    path = Path.join([base, "auth", provider, filename])
+    path = Path.join([base, "homes", Tightbeam.Placement.local_host_name(), provider, filename])
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, bytes)
     path
@@ -53,14 +72,26 @@ defmodule Tightbeam.CredentialKindsTest do
 
   describe "the credential store records the kind" do
     test "an API key banks with the kind recorded and no expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} =
+        start_credentials(
+          name: nil,
+          base_dir: ctx.base,
+          machine: Tightbeam.Placement.local_host_name()
+        )
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-staged")
       assert :ok = Credentials.finish_onboard(:anthropic, :api_key, lease_id, server)
 
       metadata =
-        [ctx.base, "auth", "claude", ".tightbeam", "credential.json"]
+        [
+          ctx.base,
+          "homes",
+          Tightbeam.Placement.local_host_name(),
+          "claude",
+          ".tightbeam",
+          "credential.json"
+        ]
         |> Path.join()
         |> File.read!()
         |> JSON.decode!()
@@ -79,7 +110,12 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "a subscription banks with its kind and keeps its expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} =
+        start_credentials(
+          name: nil,
+          base_dir: ctx.base,
+          machine: Tightbeam.Placement.local_host_name()
+        )
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
 
@@ -91,7 +127,14 @@ defmodule Tightbeam.CredentialKindsTest do
       assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata =
-        [ctx.base, "auth", "claude", ".tightbeam", "credential.json"]
+        [
+          ctx.base,
+          "homes",
+          Tightbeam.Placement.local_host_name(),
+          "claude",
+          ".tightbeam",
+          "credential.json"
+        ]
         |> Path.join()
         |> File.read!()
         |> JSON.decode!()
@@ -103,7 +146,12 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "no credential is its own state, not a kind", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} =
+        start_credentials(
+          name: nil,
+          base_dir: ctx.base,
+          machine: Tightbeam.Placement.local_host_name()
+        )
 
       assert Credentials.kind(:anthropic, server) == :none
       assert Credentials.kind(:openai, server) == :none
@@ -111,7 +159,12 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "both providers on one host can hold different kinds", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} =
+        start_credentials(
+          name: nil,
+          base_dir: ctx.base,
+          machine: Tightbeam.Placement.local_host_name()
+        )
 
       {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(claude_staging, ".credentials.json"), "sk-ant-api03-staged")
@@ -147,7 +200,7 @@ defmodule Tightbeam.CredentialKindsTest do
     defp target(base, ssh) do
       %{
         base_dir: base,
-        host_name: "vector",
+        host_name: Tightbeam.Placement.local_host_name(),
         host_config: %{base_dir: base, ssh: ssh},
         adapter_binary: Path.join(base, "adapter"),
         sh: fn _command -> {"", 0} end
@@ -157,7 +210,13 @@ defmodule Tightbeam.CredentialKindsTest do
     test "a local api-key host gets ANTHROPIC_API_KEY and nothing else", ctx do
       stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-local\n")
 
-      plan = Claude.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:api_key))
+      plan =
+        Claude.prepare_launch(
+          target(ctx.base, nil),
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :claude),
+          launch_opts(:api_key)
+        )
+
       env = Keyword.fetch!(plan, :env)
 
       assert {"ANTHROPIC_API_KEY", "sk-ant-api03-local"} in env
@@ -177,11 +236,19 @@ defmodule Tightbeam.CredentialKindsTest do
     test "a local subscription host gets no credential in its environment at all", ctx do
       stage!(ctx.base, "claude", ".credentials.json", ~s({"claudeAiOauth":{"accessToken":"a"}}))
 
-      plan = Claude.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:subscription))
+      plan =
+        Claude.prepare_launch(
+          target(ctx.base, nil),
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :claude),
+          launch_opts(:subscription)
+        )
+
       env = Keyword.fetch!(plan, :env)
 
       assert Enum.filter(env, fn {name, _} -> credential_variable?(name) end) == []
-      assert {"CLAUDE_CONFIG_DIR", "/home"} in env
+
+      assert {"CLAUDE_CONFIG_DIR",
+              Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :claude)} in env
     end
 
     test "a remote host expands its own credential and puts no secret in any argv", ctx do
@@ -190,7 +257,7 @@ defmodule Tightbeam.CredentialKindsTest do
       plan =
         Claude.prepare_launch(
           target(ctx.base, "vector@remote"),
-          "/home",
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :claude),
           launch_opts(:api_key)
         )
 
@@ -210,8 +277,19 @@ defmodule Tightbeam.CredentialKindsTest do
     test "codex's launch plan does not vary by kind", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-x"}))
 
-      keyed = Codex.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:api_key))
-      subbed = Codex.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:subscription))
+      keyed =
+        Codex.prepare_launch(
+          target(ctx.base, nil),
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :codex),
+          launch_opts(:api_key)
+        )
+
+      subbed =
+        Codex.prepare_launch(
+          target(ctx.base, nil),
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :codex),
+          launch_opts(:subscription)
+        )
 
       # Codex reads its credential out of auth.json itself, so the kind cannot
       # reach the launch. Pinned rather than assumed.
@@ -429,7 +507,9 @@ defmodule Tightbeam.CredentialKindsTest do
           ["kind-admin", System.system_time(:second)]
         )
 
-      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+      start_supervised!(
+        {Credentials, credential_opts(name: Credentials, base_dir: ctx.base, machine: "testhost")}
+      )
 
       onboard =
         Tightbeam.Gateway.handlers(%{
@@ -474,7 +554,9 @@ defmodule Tightbeam.CredentialKindsTest do
           ["owner-admin", System.system_time(:second)]
         )
 
-      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+      start_supervised!(
+        {Credentials, credential_opts(name: Credentials, base_dir: ctx.base, machine: "testhost")}
+      )
 
       onboard =
         Tightbeam.Gateway.handlers(%{
@@ -504,7 +586,9 @@ defmodule Tightbeam.CredentialKindsTest do
           ["kind-admin", System.system_time(:second)]
         )
 
-      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+      start_supervised!(
+        {Credentials, credential_opts(name: Credentials, base_dir: ctx.base, machine: "testhost")}
+      )
 
       onboard =
         Tightbeam.Gateway.handlers(%{

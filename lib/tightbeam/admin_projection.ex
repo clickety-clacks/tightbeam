@@ -1,5 +1,6 @@
 defmodule Tightbeam.AdminProjection do
   @moduledoc "Durable row-version floors for branch-local administrative projections."
+  require Logger
 
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
@@ -33,8 +34,38 @@ defmodule Tightbeam.AdminProjection do
   );
   """
 
+  @firehose_storage """
+  CREATE TABLE IF NOT EXISTS host_environment_projection (
+    host         TEXT NOT NULL,
+    harness      TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    valuePresent INTEGER NOT NULL CHECK (valuePresent IN (0, 1)),
+    updatedAt    INTEGER NOT NULL,
+    rowVersion   INTEGER NOT NULL CHECK (rowVersion > 0),
+    PRIMARY KEY (host, harness, name)
+  );
+  CREATE TABLE IF NOT EXISTS admin_projection_faults (
+    resource   TEXT NOT NULL,
+    primaryKey TEXT NOT NULL,
+    code       TEXT NOT NULL,
+    detail     TEXT NOT NULL,
+    occurredAt INTEGER NOT NULL,
+    PRIMARY KEY (resource, primaryKey)
+  );
+  """
+  def ensure_storage(db \\ DB), do: DB.execute(db, @ddl <> @firehose_storage)
+
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ DB) do
+    with :ok <- ensure_storage(db) do
+      now = System.system_time(:millisecond)
+
+      case DB.transaction(db, fn txn -> backfill_in_txn(txn, now) end) do
+        {:ok, :ok} -> :ok
+        {:error, error} -> {:error, error}
+      end
+    end
+  end
 
   @doc "Read one durable identity validation-publication marker."
   def identity_publication_marker(source, invocation_id, expected_prior) do
@@ -277,6 +308,347 @@ defmodule Tightbeam.AdminProjection do
   end
 
   defp query(%Txn{} = txn, sql, params), do: Txn.q(txn, sql, params)
+
+  @doc "Read the exact stamped kungfu bytes with their durable version."
+  def stamped_item(source, "kungfu", primary_key) do
+    case query(
+           source,
+           "SELECT item,rowVersion FROM admin_projection_versions WHERE resource='kungfu' AND primaryKey=?1",
+           [key(primary_key)]
+         ) do
+      [[item, version]] when is_binary(item) ->
+        item
+        |> JSON.decode!()
+        |> Map.put("rowVersion", version)
+        |> Tightbeam.StateResources.kungfu()
+
+      [] ->
+        nil
+    end
+  end
+
+  def stamped_item(source, "identity", primary_key) do
+    case query(
+           source,
+           "SELECT item,rowVersion FROM admin_projection_versions WHERE resource='identity' AND primaryKey=?1",
+           [key(primary_key)]
+         ) do
+      [[item, version]] when is_binary(item) ->
+        item
+        |> JSON.decode!()
+        |> Map.put("rowVersion", version)
+        |> Tightbeam.StateResources.identity()
+
+      [] ->
+        nil
+    end
+  end
+
+  @doc "Stamp and hand off the validated served projection in one transaction."
+  def stamp_publication(db, call, entries, opts \\ []) when is_list(entries) do
+    entries =
+      Enum.map(entries, fn
+        %{resource: "kungfu", key: key, class: "kungfu.updated", refs: refs, item: item}
+        when is_binary(key) and is_map(refs) and is_map(item) ->
+          canonical = item |> Map.put("rowVersion", 1) |> Tightbeam.StateResources.kungfu()
+
+          unless canonical["name"] == key,
+            do: raise(ArgumentError, "invalid served-resource projection entry")
+
+          _ = Tightbeam.Firehose.Publisher.committed_notice("kungfu.updated", canonical, refs)
+          {"kungfu", key, "kungfu.updated", Map.delete(canonical, "rowVersion"), refs}
+
+        %{
+          resource: "identity",
+          key: "served",
+          class: "identity.updated",
+          refs: %{"name" => "served"} = refs,
+          item: item
+        }
+        when map_size(refs) == 1 and is_map(item) ->
+          canonical = item |> Map.put("rowVersion", 1) |> Tightbeam.StateResources.identity()
+
+          unless canonical["name"] == "served",
+            do: raise(ArgumentError, "invalid served-resource projection entry")
+
+          {"identity", "served", "identity.updated", Map.delete(canonical, "rowVersion"), refs}
+
+        _ ->
+          raise ArgumentError, "invalid served-resource projection entry"
+      end)
+
+    result =
+      DB.transaction(db, fn txn ->
+        if before_stamp = Keyword.get(opts, :before_stamp), do: before_stamp.(txn)
+
+        Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+        Enum.flat_map(entries, fn {resource, name, class, item, refs} ->
+          encoded = JSON.encode!(item)
+          fingerprint = :crypto.hash(:sha256, encoded) |> Base.encode16(case: :lower)
+
+          if fingerprint_matches?(txn, resource, name, fingerprint) do
+            []
+          else
+            version =
+              allocate_in_txn(txn, resource, name, System.system_time(:millisecond),
+                fingerprint: fingerprint,
+                item: encoded
+              )
+
+            clear_fault_in_txn(txn, resource, name)
+            payload = Map.put(item, "rowVersion", version)
+            Tightbeam.Firehose.Publisher.committed_in_txn(txn, class, payload, refs)
+            [payload]
+          end
+        end)
+      end)
+
+    case result do
+      {:ok, changed} ->
+        {:ok, changed}
+
+      {:error, error} ->
+        Enum.each(entries, fn {resource, name, _class, _item, _refs} ->
+          record_fault(db, resource, name, error)
+        end)
+
+        {:error,
+         %{
+           code: "projection_stamp_failed",
+           message: "published identity bytes could not be stamped for state projection"
+         }}
+    end
+  end
+
+  @doc "True when a served-resource source fingerprint is already stamped."
+  @spec fingerprint_matches?(Txn.t(), String.t(), String.t(), String.t()) :: boolean()
+  def fingerprint_matches?(%Txn{} = txn, resource, primary_key, fingerprint) do
+    Txn.q(
+      txn,
+      "SELECT 1 FROM admin_projection_versions WHERE resource = ?1 AND primaryKey = ?2 AND fingerprint = ?3",
+      [resource, key(primary_key), fingerprint]
+    ) != []
+  end
+
+  @doc "Seed a served-resource stamp without advancing an existing floor."
+  @spec seed_stamp_in_txn(Txn.t(), String.t(), String.t(), String.t(), map(), integer()) :: :ok
+  def seed_stamp_in_txn(%Txn{} = txn, resource, primary_key, fingerprint, item, updated_at) do
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO admin_projection_versions
+        (resource, primaryKey, rowVersion, updatedAt, fingerprint, item)
+      VALUES (?1, ?2, 1, ?3, ?4, ?5)
+      """,
+      [resource, key(primary_key), updated_at, fingerprint, JSON.encode!(item)]
+    )
+
+    :ok
+  end
+
+  @doc "Persist a loud publication-stamp fault in a separate recovery transaction."
+  @spec record_fault(DB.server(), String.t(), String.t(), term()) :: :ok
+  def record_fault(db, resource, primary_key, detail) do
+    occurred_at = System.system_time(:millisecond)
+    rendered = Exception.format_banner(:error, detail)
+
+    case DB.transaction(db, fn txn ->
+           Txn.q(
+             txn,
+             """
+             INSERT INTO admin_projection_faults
+               (resource, primaryKey, code, detail, occurredAt)
+             VALUES (?1, ?2, 'projection_stamp_failed', ?3, ?4)
+             ON CONFLICT(resource, primaryKey) DO UPDATE SET
+               code = excluded.code, detail = excluded.detail, occurredAt = excluded.occurredAt
+             """,
+             [resource, key(primary_key), rendered, occurred_at]
+           )
+
+           :ok
+         end) do
+      {:ok, :ok} ->
+        Logger.error(
+          "unresolved projection stamp fault resource=#{resource} key=#{key(primary_key)}: #{rendered}"
+        )
+
+        :ok
+
+      {:error, fault_error} ->
+        Logger.error(
+          "UNRECORDED projection stamp fault resource=#{resource} key=#{key(primary_key)} " <>
+            "stamp=#{rendered} fault_store=#{Exception.message(fault_error)}"
+        )
+
+        :ok
+    end
+  end
+
+  @doc "Clear a resolved fault in the successful stamp transaction."
+  @spec clear_fault_in_txn(Txn.t(), String.t(), String.t()) :: :ok
+  def clear_fault_in_txn(%Txn{} = txn, resource, primary_key) do
+    Txn.q(
+      txn,
+      "DELETE FROM admin_projection_faults WHERE resource = ?1 AND primaryKey = ?2",
+      [resource, key(primary_key)]
+    )
+
+    :ok
+  end
+
+  @doc "Stable SHA-256 fingerprint of an already allowlisted item."
+  @spec fingerprint(map()) :: String.t()
+  def fingerprint(item) when is_map(item) do
+    :crypto.hash(:sha256, JSON.encode!(item)) |> Base.encode16(case: :lower)
+  end
+
+  @doc "Seed the committed served-identity and kungfu snapshots without publishing boot notices."
+  @spec bootstrap_served(DB.server(), String.t()) :: :ok
+  def bootstrap_served(db, base_dir) do
+    entries = served_entries(db, base_dir)
+    now = System.system_time(:millisecond)
+
+    case DB.transaction(db, fn txn ->
+           Enum.each(entries, fn entry ->
+             seed_stamp_in_txn(
+               txn,
+               entry.resource,
+               entry.key,
+               fingerprint(entry.item),
+               entry.item,
+               now
+             )
+           end)
+
+           :ok
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc "Build the allowlisted source entries after a successful Git publication."
+  @spec served_entries(DB.server(), String.t()) :: [map()]
+  def served_entries(db, base_dir) do
+    identity =
+      db
+      |> Tightbeam.StateResources.identity_snapshot(base_dir)
+      |> canonical_without_version("identity")
+
+    kungfu =
+      base_dir
+      |> Tightbeam.StateResources.kungfu_names()
+      |> Enum.flat_map(fn name ->
+        case Tightbeam.StateResources.kungfu_snapshot(base_dir, name) do
+          nil ->
+            []
+
+          snapshot ->
+            [
+              %{
+                resource: "kungfu",
+                key: name,
+                class: "kungfu.updated",
+                refs: %{"name" => name},
+                item: canonical_without_version(snapshot, "kungfu")
+              }
+            ]
+        end
+      end)
+
+    [
+      %{
+        resource: "identity",
+        key: "served",
+        class: "identity.updated",
+        refs: %{"name" => "served"},
+        item: identity
+      }
+      | kungfu
+    ]
+  end
+
+  defp canonical_without_version(item, "identity") do
+    item
+    |> Map.put("rowVersion", 1)
+    |> Tightbeam.StateResources.identity()
+    |> Map.delete("rowVersion")
+  end
+
+  defp canonical_without_version(item, "kungfu") do
+    item
+    |> Map.put("rowVersion", 1)
+    |> Tightbeam.StateResources.kungfu()
+    |> Map.delete("rowVersion")
+  end
+
+  defp backfill_in_txn(txn, now) do
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO admin_projection_versions
+        (resource, primaryKey, rowVersion, updatedAt)
+      SELECT 'config', key, 1, updatedAt FROM org_settings
+      """
+    )
+
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO admin_projection_versions
+        (resource, primaryKey, rowVersion, updatedAt)
+      SELECT 'hosts', name, 1, ?1 FROM hosts
+      """,
+      [now]
+    )
+
+    Txn.q(
+      txn,
+      """
+      INSERT OR IGNORE INTO admin_projection_versions
+        (resource, primaryKey, rowVersion, updatedAt)
+      SELECT 'users', userId, 1, createdAt FROM users
+      """
+    )
+
+    for [host, harness, name, set_at] <-
+          Txn.q(
+            txn,
+            "SELECT host, harness, name, setAt FROM harness_env_overlays ORDER BY host, harness, name"
+          ) do
+      encoded_key = key([host, harness, name])
+
+      Txn.q(
+        txn,
+        """
+        INSERT OR IGNORE INTO admin_projection_versions
+          (resource, primaryKey, rowVersion, updatedAt)
+        VALUES ('host environment', ?1, 1, ?2)
+        """,
+        [encoded_key, set_at]
+      )
+
+      [[row_version]] =
+        Txn.q(
+          txn,
+          "SELECT rowVersion FROM admin_projection_versions WHERE resource = 'host environment' AND primaryKey = ?1",
+          [encoded_key]
+        )
+
+      Txn.q(
+        txn,
+        """
+        INSERT OR IGNORE INTO host_environment_projection
+          (host, harness, name, valuePresent, updatedAt, rowVersion)
+        VALUES (?1, ?2, ?3, 1, ?4, ?5)
+        """,
+        [host, harness, name, set_at, row_version]
+      )
+    end
+
+    :ok
+  end
 
   defp query(db, sql, params) do
     {:ok, rows} = DB.query(db, sql, params)

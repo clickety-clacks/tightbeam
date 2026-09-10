@@ -17,8 +17,13 @@ Canonical capability IDs (the full proof references live in
 - CAP-003 slash commands: PARITY passthrough. Claude `/clear /compact /model`
   are verified. Codex vocabulary includes `/status /mcp /skills /review
   /compact /logout /new /clear`, plus configured skills and domain commands.
-- CAP-004 projected identity: PARITY through Claude system-prompt metadata and
-  Codex developer-instruction metadata.
+- CAP-004 projected identity: keep Claude system-prompt append metadata and
+  Codex developer-instruction metadata. Apply changed Claude guidance at the next
+  cold load; do not claim guidance-only warm refresh. Retain the dr4409 Codex
+  new/resume/load transport anchors until an equivalent channel is accepted.
+  Keep session guidance separate from skill materialization and shared homes.
+  A malformed, missing, or wrong-session identity must fail closed; do not use
+  hook source inspection as proof of authenticated first-request delivery.
 - CAP-005 native skills: PARITY progressive disclosure under
   `.claude/skills` / `.codex/skills`; Tightbeam owns `tightbeam__*` only.
 - CAP-006 vendor-native skills/commands: PARITY and preserved additively.
@@ -26,7 +31,10 @@ Canonical capability IDs (the full proof references live in
   PreToolUse hooks after the fail-closed boot wiring-check.
 - CAP-008 future block/check tiers: reserved named divergence on both; do not
   claim allow/ask/rewrite support.
-- CAP-009 credential file lifecycle: PARITY, including stopped-runtime harvest.
+- CAP-009 harness-home credential ownership: use one regular credential
+  file per exact machine/harness home. Reconciliation must not copy, link, or
+  harvest it. Preserve the non-rotating Claude setup-token contract and the
+  single Codex refresher; do not claim rotation or provider-longevity parity.
 - CAP-010 token environment: PARITY mechanisms; no subscription-longevity
   equivalence is claimed.
 - CAP-011 onboarding: PARITY through `tightbeam onboard <provider>`.

@@ -6,6 +6,7 @@ defmodule Tightbeam.Org do
 
   alias Tightbeam.{AdminProjection, DB, EventLog, NoticeBatcher, Supervision, Wakes}
   alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Model
 
   @type db :: GenServer.server()
@@ -40,6 +41,7 @@ defmodule Tightbeam.Org do
           host: String.t(),
           cleared_through_seq: integer(),
           state: String.t(),
+          mechanical_status: String.t(),
           created_at: integer(),
           updated_at: integer()
         }
@@ -88,6 +90,8 @@ defmodule Tightbeam.Org do
     host          TEXT NOT NULL DEFAULT 'local',
     clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
     state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+    mechanicalStatus TEXT NOT NULL DEFAULT 'idle'
+                     CHECK (mechanicalStatus IN ('idle','running')),
     createdAt     INTEGER NOT NULL,
     updatedAt     INTEGER NOT NULL
   );
@@ -111,11 +115,65 @@ defmodule Tightbeam.Org do
   """
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB) do
+  @r1_ddl """
+  CREATE TABLE IF NOT EXISTS sessions (
+    sessionKey    TEXT PRIMARY KEY,
+    displayName   TEXT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('main','dm','custom')),
+    orderIndex    INTEGER NOT NULL DEFAULT 0,
+    isBuiltIn     INTEGER NOT NULL DEFAULT 0,
+    adopted       INTEGER NOT NULL DEFAULT 0,
+    ownerUserId   TEXT NOT NULL,
+    origin        TEXT NOT NULL,
+    spawnedBy     TEXT,
+    handle        TEXT UNIQUE,
+    archetype     TEXT NOT NULL,
+    overrides     TEXT,
+    identityName  TEXT,
+    identityRevision TEXT,
+    identityRenderContract TEXT,
+    identityGuidanceDigest TEXT,
+    cliToken      TEXT,
+    harness       TEXT NOT NULL CHECK (harness IN (__TIGHTBEAM_HARNESSES__)),
+    provider      TEXT NOT NULL CHECK (provider IN (__TIGHTBEAM_PROVIDERS__)),
+    model         TEXT NOT NULL,
+    thinkingLevel TEXT,
+    modelContext  TEXT,
+    host          TEXT NOT NULL DEFAULT 'local',
+    clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+    state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+    createdAt     INTEGER NOT NULL,
+    updatedAt     INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS sessions_owner ON sessions (ownerUserId, state);
+  CREATE TABLE IF NOT EXISTS harness_pointers (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    sessionKey       TEXT NOT NULL REFERENCES sessions(sessionKey),
+    harnessSessionId TEXT NOT NULL,
+    sourceSessionRef TEXT NOT NULL,
+    harness          TEXT NOT NULL,
+    machine          TEXT NOT NULL,
+    reason           TEXT NOT NULL CHECK (reason IN ('created','loaded','fallback')),
+    createdAt        INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS pointers_session ON harness_pointers (sessionKey, id);
+  CREATE TABLE IF NOT EXISTS org_settings (
+    key       TEXT PRIMARY KEY,
+    value     TEXT NOT NULL,
+    updatedAt INTEGER NOT NULL
+  );
+  """
+
+  @doc false
+  def ensure_r1_schema(db), do: ensure_schema_ddl(db, @r1_ddl)
+
+  def ensure_schema(db \\ Tightbeam.DB), do: ensure_schema_ddl(db, @ddl)
+
+  defp ensure_schema_ddl(db, schema_ddl) do
     harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
 
     ddl =
-      @ddl
+      schema_ddl
       |> String.replace("__TIGHTBEAM_HARNESSES__", harnesses)
       |> String.replace("__TIGHTBEAM_PROVIDERS__", @provider_values)
 
@@ -142,7 +200,7 @@ defmodule Tightbeam.Org do
         """
       )
 
-    result
+    with :ok <- result, do: AdminProjection.ensure_storage(db)
   end
 
   @doc "Read an organization setting, or nil when it is unset."
@@ -159,22 +217,40 @@ defmodule Tightbeam.Org do
   @doc "Write an organization setting."
   @spec put_setting(db(), String.t(), String.t()) :: :ok
   def put_setting(db \\ Tightbeam.DB, key, value) do
-    transaction!(db, fn txn -> put_setting_in_txn(txn, key, value) end)
+    transaction!(db, fn txn ->
+      put_setting_projected_in_txn(txn, key, value)
+      :ok
+    end)
   end
 
   @doc false
   @spec put_setting_in_txn(Txn.t(), String.t(), String.t()) :: :ok
   def put_setting_in_txn(%Txn{} = txn, key, value) do
+    put_setting_projected_in_txn(txn, key, value)
+    :ok
+  end
+
+  @doc false
+  def put_setting_projected_in_txn(%Txn{} = txn, key, value) do
+    updated_at = now()
+
     Txn.q(
       txn,
       """
       INSERT INTO org_settings (key, value, updatedAt) VALUES (?1, ?2, ?3)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt
+      WHERE org_settings.value != excluded.value
       """,
-      [key, value, now()]
+      [key, value, updated_at]
     )
 
-    :ok
+    changed = Txn.changes(txn) == 1
+
+    if changed do
+      AdminProjection.allocate_in_txn(txn, "config", key, updated_at)
+    end
+
+    %{changed: changed, projection: Tightbeam.StateResources.query_config(txn, key)}
   end
 
   @doc false
@@ -343,6 +419,24 @@ defmodule Tightbeam.Org do
     end
   end
 
+  @doc false
+  @spec owner_user_id_in_txn(Txn.t(), String.t() | nil) :: String.t() | nil
+  def owner_user_id_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, "SELECT ownerUserId FROM sessions WHERE sessionKey = ?1", [session_key]) do
+      [[owner_user_id]] -> owner_user_id
+      [] -> nil
+    end
+  end
+
+  @doc false
+  @spec get_in_txn(Txn.t(), String.t()) :: session() | nil
+  def get_in_txn(%Txn{} = txn, session_key) do
+    case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
+      [row] -> to_session(row)
+      [] -> nil
+    end
+  end
+
   @doc """
   Sessions for a user. `is_admin: true` returns ALL active sessions — a
   management capability. WIRE CALLERS MUST PASS `false`: chat catalogs,
@@ -491,37 +585,70 @@ defmodule Tightbeam.Org do
         {expected_model, expected_harness},
         {%Model{} = model, harness, provider}
       ) do
-    current = must_get(txn, session_key)
+    swap_model_in_txn(
+      txn,
+      session_key,
+      {expected_model, expected_harness},
+      {model, harness, provider},
+      []
+    )
+  end
 
-    if current.model == model and current.harness == harness do
+  @doc "Serialized model/harness change with optional same-commit session fields."
+  @spec swap_model_in_txn(
+          Txn.t(),
+          String.t(),
+          {Model.t() | nil, String.t()},
+          {Model.t(), String.t(), String.t()},
+          keyword()
+        ) :: {:ok, session()} | {:duplicate, session()} | :stale
+  def swap_model_in_txn(
+        %Txn{} = txn,
+        session_key,
+        {expected_model, expected_harness},
+        {%Model{} = model, harness, provider},
+        opts
+      ) do
+    current = must_get(txn, session_key)
+    cleared_through = Keyword.get(opts, :cleared_through, current.cleared_through_seq)
+
+    if current.model == model and current.harness == harness and
+         current.cleared_through_seq == cleared_through do
       {:duplicate, current}
     else
       expected = expected_model || %Model{family: nil}
 
-      Txn.q(
-        txn,
-        """
-        UPDATE sessions SET model=?4, thinkingLevel=?8, modelContext=?9, harness=?5,
-          provider=?6, updatedAt=?7
-        WHERE sessionKey=?1 AND model IS ?2 AND thinkingLevel IS ?10
-          AND modelContext IS ?11 AND harness=?3
-        """,
-        [
-          session_key,
-          expected.family,
-          expected_harness,
-          model.family,
-          harness,
-          provider,
-          now(),
-          model.effort,
-          model.context,
-          expected.effort,
-          expected.context
-        ]
-      )
+      mutate_session_in_txn(txn, session_key, fn ->
+        Txn.q(
+          txn,
+          """
+          UPDATE sessions SET model=?4, thinkingLevel=?7, modelContext=?8, harness=?5,
+            provider=?6, clearedThroughSeq=?11
+          WHERE sessionKey=?1 AND model IS ?2 AND thinkingLevel IS ?9
+            AND modelContext IS ?10 AND harness=?3
+          """,
+          [
+            session_key,
+            expected.family,
+            expected_harness,
+            model.family,
+            harness,
+            provider,
+            model.effort,
+            model.context,
+            expected.effort,
+            expected.context,
+            cleared_through
+          ]
+        )
 
-      if Txn.changes(txn) == 1, do: {:ok, must_get(txn, session_key)}, else: :stale
+        Txn.changes(txn)
+      end)
+      |> case do
+        {:changed, session, 1} -> {:ok, session}
+        {:unchanged, _session, 0} -> :stale
+        {:unchanged, session, 1} -> {:duplicate, session}
+      end
     end
   end
 
@@ -537,16 +664,31 @@ defmodule Tightbeam.Org do
     update(db, session_key, "host = ?2", [host])
   end
 
+  @doc false
+  @spec sync_mechanical_status_in_txn(Txn.t(), String.t()) :: session() | nil
+  def sync_mechanical_status_in_txn(%Txn{} = txn, session_key) do
+    case get_in_txn(txn, session_key) do
+      nil ->
+        nil
+
+      _session ->
+        [[pending]] =
+          Txn.q(
+            txn,
+            "SELECT COUNT(*) FROM turns WHERE sessionKey = ?1 AND status IN ('queued','running')",
+            [session_key]
+          )
+
+        status = if pending == 0, do: "idle", else: "running"
+
+        update_in_txn(txn, session_key, "mechanicalStatus = ?2", [status])
+    end
+  end
+
   @doc "Transaction-owned host recorder for workspace-motion compositions."
   @spec set_host_in_txn(Txn.t(), String.t(), String.t()) :: session()
   def set_host_in_txn(%Txn{} = txn, session_key, host) do
-    Txn.q(
-      txn,
-      "UPDATE sessions SET host = ?2, updatedAt = ?3 WHERE sessionKey = ?1",
-      [session_key, host, now()]
-    )
-
-    must_get(txn, session_key)
+    update_in_txn(txn, session_key, "host = ?2", [host])
   end
 
   @doc "Replace the normalized overrides and their derived identity name together."
@@ -588,15 +730,7 @@ defmodule Tightbeam.Org do
   @doc false
   @spec set_cleared_through_in_txn(Txn.t(), String.t(), integer()) :: session()
   def set_cleared_through_in_txn(%Txn{} = txn, session_key, seq) do
-    must_get(txn, session_key)
-
-    Txn.q(
-      txn,
-      "UPDATE sessions SET clearedThroughSeq = ?2, updatedAt = ?3 WHERE sessionKey = ?1",
-      [session_key, seq, now()]
-    )
-
-    must_get(txn, session_key)
+    update_in_txn(txn, session_key, "clearedThroughSeq = ?2", [seq])
   end
 
   @doc """
@@ -651,15 +785,26 @@ defmodule Tightbeam.Org do
 
     Txn.q(
       txn,
-      "UPDATE sessions SET state = 'retired', updatedAt = ?2 WHERE sessionKey = ?1 AND state = 'active'",
-      [session_key, retirement_epoch]
+      """
+      UPDATE sessions
+      SET state = 'retired',
+          mechanicalStatus = CASE WHEN EXISTS (
+            SELECT 1 FROM turns
+            WHERE turns.sessionKey = sessions.sessionKey
+              AND turns.status IN ('queued','running')
+          ) THEN 'running' ELSE 'idle' END
+      WHERE sessionKey = ?1 AND state = 'active'
+      """,
+      [session_key]
     )
 
     if Txn.changes(txn) != 1, do: raise("retirement state changed before commit")
 
     cancel_retirement_wakes_in_txn(txn, session_key)
 
-    must_get(txn, session_key)
+    session = stamp_session_change_in_txn(txn, session_key, retirement_epoch)
+    publish_session_in_txn(txn, "session.retired", session)
+    session
   end
 
   defp cancel_retirement_wakes_in_txn(txn, session_key) do
@@ -983,19 +1128,27 @@ defmodule Tightbeam.Org do
 
         if session.state == "retired" or
              (allow_permanent? and (session.kind == "main" or session.is_built_in)) do
-          Txn.q(
-            txn,
-            """
-            UPDATE sessions
-            SET archetype = ?2, overrides = NULL, identityName = ?2,
-                identityRevision = NULL, identityRenderContract = NULL,
-                identityGuidanceDigest = NULL, updatedAt = ?3
-            WHERE sessionKey = ?1
-            """,
-            [session_key, archetype, now()]
-          )
+          result =
+            mutate_session_in_txn(txn, session_key, fn ->
+              Txn.q(
+                txn,
+                """
+                UPDATE sessions
+                SET archetype = ?2, overrides = NULL, identityName = ?2,
+                    identityRevision = NULL, identityRenderContract = NULL,
+                    identityGuidanceDigest = NULL
+                WHERE sessionKey = ?1
+                """,
+                [session_key, archetype]
+              )
 
-          {:ok, must_get(txn, session_key)}
+              Txn.changes(txn)
+            end)
+
+          case result do
+            {:changed, session, _changes} -> {:ok, session}
+            {:unchanged, session, _changes} -> {:ok, session}
+          end
         else
           {:error, :not_repointable}
         end
@@ -1223,20 +1376,57 @@ defmodule Tightbeam.Org do
 
   defp update(db, session_key, sets, values) do
     transaction!(db, fn txn ->
-      must_get(txn, session_key)
-
-      params = [session_key | values] ++ [now()]
-      updated_at_index = length(params)
-
-      Txn.q(
-        txn,
-        "UPDATE sessions SET #{sets}, updatedAt = ?#{updated_at_index} WHERE sessionKey = ?1",
-        params
-      )
-
-      must_get(txn, session_key)
+      update_in_txn(txn, session_key, sets, values)
     end)
   end
+
+  defp update_in_txn(txn, session_key, sets, values) do
+    mutate_session_in_txn(txn, session_key, fn ->
+      Txn.q(txn, "UPDATE sessions SET #{sets} WHERE sessionKey = ?1", [session_key | values])
+      Txn.changes(txn)
+    end)
+    |> then(fn {_outcome, session, _changes} -> session end)
+  end
+
+  # Every public session change passes this seam. It compares the canonical
+  # item without its version, advances the durable per-session version once,
+  # and queues exactly one post-commit state notice. A duplicate write does
+  # none of those things.
+  defp mutate_session_in_txn(txn, session_key, mutation) do
+    before = must_get(txn, session_key)
+    result = mutation.()
+    after_mutation = must_get(txn, session_key)
+
+    if session_projection(before) == session_projection(after_mutation) do
+      {:unchanged, after_mutation, result}
+    else
+      session = stamp_session_change_in_txn(txn, session_key, now())
+      publish_session_in_txn(txn, "session.updated", session)
+      {:changed, session, result}
+    end
+  end
+
+  defp stamp_session_change_in_txn(txn, session_key, occurred_at) do
+    [[current]] =
+      Txn.q(txn, "SELECT updatedAt FROM sessions WHERE sessionKey = ?1", [session_key])
+
+    next_version = max(occurred_at, current + 1)
+
+    Txn.q(txn, "UPDATE sessions SET updatedAt = ?2 WHERE sessionKey = ?1", [
+      session_key,
+      next_version
+    ])
+
+    must_get(txn, session_key)
+  end
+
+  defp publish_session_in_txn(txn, class, session) do
+    Publisher.committed_in_txn(txn, class, session, %{
+      "sessionKey" => session.session_key
+    })
+  end
+
+  defp session_projection(session), do: Map.drop(session, [:updated_at, :cli_token])
 
   defp must_get(txn, session_key) do
     case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
@@ -1250,7 +1440,8 @@ defmodule Tightbeam.Org do
     SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
            ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
            identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
-           model, thinkingLevel, modelContext, host, clearedThroughSeq, state, createdAt, updatedAt
+           model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
+           mechanicalStatus, createdAt, updatedAt
     FROM sessions
     """
   end
@@ -1281,6 +1472,7 @@ defmodule Tightbeam.Org do
          host,
          cleared_through_seq,
          state,
+         mechanical_status,
          created_at,
          updated_at
        ]) do
@@ -1308,6 +1500,7 @@ defmodule Tightbeam.Org do
       host: host,
       cleared_through_seq: cleared_through_seq,
       state: state,
+      mechanical_status: mechanical_status,
       created_at: created_at,
       updated_at: updated_at
     }

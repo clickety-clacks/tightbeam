@@ -15,7 +15,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
 
   test "fresh O2 bootstrap and restart preserve nullable notice state", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "row-driven-r1-v1-019"
+    assert stamp(db) == "firehose-r1-v1-019"
     seed_episode(db)
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert :ok = Schema.ensure_all(db)
@@ -49,14 +49,19 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     before_episode = rows(db, "SELECT * FROM rail_remedy_episodes")
     before_triggers = triggers(db)
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "row-driven-r1-v1-019"
+    assert stamp(db) == "firehose-r1-v1-019"
     assert rows(db, "SELECT * FROM wake_cancellations") == before_rows
     assert rows(db, "SELECT * FROM wakes ORDER BY wakeId") == before_wakes
 
     assert rows(db, "SELECT * FROM rail_remedy_episodes") ==
              Enum.map(before_episode, &(&1 ++ [nil]))
 
-    assert triggers(db) == before_triggers
+    # Firehose adds guards; old triggers stay byte-identical except the two explicit rowVersion upgrades.
+    before_names = Enum.map(before_triggers, &hd/1)
+
+    assert Enum.filter(triggers(db), &(hd(&1) in before_names)) ==
+             Enum.map(before_triggers, fn [name, sql] -> [name, firehose_guard(name, sql)] end)
+
     assert rows(db, "PRAGMA foreign_key_check") == []
     assert rows(db, "PRAGMA foreign_keys") == [[1]]
     assert :ok = Schema.ensure_all(db)
@@ -203,7 +208,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     assert rows(db, "SELECT name FROM sqlite_master WHERE name='wake_cancellations'") == []
     :ok = DB.execute(db, "DROP TRIGGER o2_test_refuse_activation")
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "row-driven-r1-v1-019"
+    assert stamp(db) == "firehose-r1-v1-019"
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert_two_shapes(db)
   end
@@ -266,6 +271,24 @@ defmodule Tightbeam.O2SchemaMigrationTest do
   end
 
   defp stamp(db), do: rows(db, "SELECT shape FROM schema_stamp") |> hd() |> hd()
+
+  # Only these two historical guards change: Firehose adds rowVersion checks.
+  # Preserve their terminal-principal predicate and every other object's SQL.
+  defp firehose_guard(name, sql)
+       when name in ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard) do
+    assert String.contains?(sql, "\nWHEN ")
+    assert String.contains?(sql, "))\nBEGIN\n")
+
+    sql
+    |> String.replace("BEFORE UPDATE OF status ON", "BEFORE UPDATE ON")
+    |> String.replace(
+      "\nWHEN ",
+      "\nWHEN typeof(NEW.rowVersion) <> 'integer' OR NEW.rowVersion < 1 OR\n  ("
+    )
+    |> String.replace("))\nBEGIN\n", ")))\nBEGIN\n")
+  end
+
+  defp firehose_guard(_name, sql), do: sql
 
   defp triggers(db),
     do: rows(db, "SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name")

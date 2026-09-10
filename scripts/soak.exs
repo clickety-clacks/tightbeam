@@ -96,6 +96,10 @@ defmodule Tightbeam.Soak do
   end
 
   defp prepare_arena!(base_dir) do
+    source_base = System.fetch_env!("TIGHTBEAM_SOAK_SOURCE_BASE")
+    machine = Tightbeam.Placement.local_host_name()
+    plan = Tightbeam.Soak.GatewayProcess.home_plan!(base_dir, source_base, machine)
+
     marker = Path.join(base_dir, @marker)
 
     case File.lstat(base_dir) do
@@ -118,55 +122,8 @@ defmodule Tightbeam.Soak do
 
     File.mkdir_p!(base_dir)
     File.write!(marker, "tightbeam soak arena v1\n")
-    File.mkdir_p!(Path.join(base_dir, "auth"))
     File.mkdir_p!(Path.join(base_dir, "work"))
-
-    # WHICH ORG LENDS ITS CREDENTIAL. This was a hardcoded `~/.tightbeam-beam`, which
-    # rotted silently: that org still holds the pre-model-identity `oauth-token` file,
-    # so the arena booted with a credential this build does not read and every spawn
-    # failed as `placement_denied` — "no credential for anthropic" — rather than as a
-    # stale source. A hardcoded path to someone else's org cannot be kept true by the
-    # code that depends on it.
-    auth_source =
-      System.get_env("TIGHTBEAM_SOAK_AUTH_SOURCE") ||
-        Path.join(System.user_home!(), ".tightbeam-beam/auth/claude")
-
-    auth_target = Path.join([base_dir, "auth", "claude"])
-
-    unless File.dir?(auth_source) do
-      raise "Claude auth directory not found: #{auth_source} " <>
-              "(set TIGHTBEAM_SOAK_AUTH_SOURCE to an onboarded org's auth/claude)"
-    end
-
-    # Name the shape, not just the directory: a source that predates model-identity
-    # has the same layout and fails much later, at the first spawn, blaming placement.
-    unless File.exists?(Path.join(auth_source, ".credentials.json")) do
-      raise "#{auth_source} holds no .credentials.json — it predates the current " <>
-              "credential shape. Point TIGHTBEAM_SOAK_AUTH_SOURCE at a currently " <>
-              "onboarded org, or re-onboard this one."
-    end
-
-    # COPY, NOT SYMLINK. A symlinked store is silently ignored — no catalog, no log
-    # line at all — so every spawn failed as `catalog_unavailable: :not_derived` and
-    # blamed the catalog. Verified on one arena, same boot, symlink vs copy the only
-    # difference: copy derives the catalog and reports READY. The arena is disposable
-    # and same-machine, so copying the credential here crosses no boundary.
-    File.cp_r!(auth_source, auth_target)
-
-    # THE HOME AND THE ADAPTERS TRAVEL WITH THE CREDENTIAL. Claude's catalog is derived
-    # from the installed ACP adapter (its version decides which models are selectable at
-    # all) plus `additionalModelOptionsCache` inside the harness home. The home is built
-    # by `Credentials.reconcile_provider_homes/2` on a credential WRITE, which never
-    # happens here — the arena borrows an already-onboarded credential rather than
-    # onboarding one. Without these the catalog never derives and every spawn fails as
-    # `catalog_unavailable: {:unavailable, :not_derived}`, blaming the catalog for a
-    # missing input. These are the same directories client_e2e provisions; the arena was
-    # carrying one of the four.
-    org_root = Path.dirname(Path.dirname(auth_source))
-
-    for dir <- ~w(homes adapters), File.dir?(Path.join(org_root, dir)) do
-      File.cp_r!(Path.join(org_root, dir), Path.join(base_dir, dir))
-    end
+    Tightbeam.Soak.GatewayProcess.seed_home!(base_dir, plan)
   end
 
   # `/version` answering means the wire is up, NOT that a turn can be placed: the model

@@ -418,9 +418,48 @@ defmodule Tightbeam.HarnessHealthTest do
         {key, assignment, seq, queued}
       end
 
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(ctx.db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    before_sessions = Map.new(running, fn {key, _, _, _} -> {key, Org.get(ctx.db, key)} end)
+
+    assert Enum.all?(before_sessions, fn {_, session} ->
+             session.mechanical_status == "running"
+           end)
+
     recovered = Ledger.recover_running(ctx.db)
     assert Enum.sort(recovered) == Enum.sort(Enum.map(running, &elem(&1, 2)))
+
+    notices =
+      for _ <- 1..2 do
+        assert_receive {:firehose_notice, notice}
+        Hub.delivered(hub, self())
+        notice
+      end
+
+    terminal_notices = Enum.filter(notices, &(&1["class"] == "turn.ended"))
+    assert length(terminal_notices) == 2
+    assert Enum.sort(Enum.map(terminal_notices, & &1["refs"]["turnSeq"])) == Enum.sort(recovered)
+
+    for {key, assignment, seq, _queued} <- running do
+      notice = Enum.find(terminal_notices, &(&1["refs"]["turnSeq"] == seq))
+      assert notice["refs"]["sessionKey"] == key
+      assert notice["refs"]["assignmentId"] == assignment
+      assert notice["payload"]["status"] == "failed_unknown"
+      assert Org.get(ctx.db, key).mechanical_status == "running"
+    end
+
+    # Queued successors keep both sessions running: no public state or version changes.
+    assert Enum.all?(notices, &(&1["class"] == "turn.ended"))
+
+    assert Map.new(running, fn {key, _, _, _} -> {key, Org.get(ctx.db, key)} end) ==
+             before_sessions
+
+    refute_receive {:firehose_notice, _}
     assert Ledger.recover_running(ctx.db) == []
+    refute_receive {:firehose_notice, _}
 
     for {key, assignment, seq, queued} <- running do
       assert {:ok, [["failed_unknown", ^assignment, ended_at, error]]} =
