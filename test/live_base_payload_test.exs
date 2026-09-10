@@ -109,6 +109,21 @@ defmodule Tightbeam.LiveBasePayloadTest do
 
     assert String.trim(output) == identity
 
+    scratch = Path.join(tmp, "physical-scratch")
+    alias_scratch = Path.join(tmp, "scratch-alias")
+    File.mkdir_p!(scratch)
+    File.ln_s!(scratch, alias_scratch)
+
+    assert {alias_output, 0} =
+             System.cmd("sh", ["packaging/verify-payload.sh", archive],
+               env: [{"TMPDIR", alias_scratch}],
+               stderr_to_stdout: true
+             )
+
+    assert String.trim(alias_output) == identity
+    assert File.ls!(scratch) == []
+    assert File.lstat!(alias_scratch).type == :symlink
+
     for relative <- ["bin/tightbeam", "bin/tightbeam-gateway", "release/releases/1/sys.config"] do
       path = Path.join(root, relative)
       original = File.read!(path)
