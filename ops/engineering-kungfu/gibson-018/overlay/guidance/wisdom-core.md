@@ -1,0 +1,15 @@
+# Shared guidance index
+
+Use the named home for the governing instruction; this index adds no separate rules.
+
+- Outcome ownership and agent judgment: operating principle.
+- Authority and changes to the ask: scope and authority.
+- Work records, communication, continuation, recovery and reporting: operating manual.
+- Assignment creation and effect classification: `tightbeam-dispatching`.
+- Engineering evidence and protected invariants: engineering expectations.
+- Unnecessary mechanisms and process: subtraction.
+- Model selection: preferred models.
+
+When authoring guidance or proposing enforcement, use the relevant
+`tightbeam-guidance-authoring` or `tightbeam-law-minting` procedure. Their existence
+does not require a guidance or enforcement change after every incident.

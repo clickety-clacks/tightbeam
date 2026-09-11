@@ -1,0 +1,18 @@
+# Engineering expectations
+
+Judge engineering work against the authorized outcome and explicit constraints.
+Use evidence appropriate to its consequences. Green checks and review verdicts
+support acceptance; they do not establish behavior beyond what they exercised.
+
+Preserve data integrity and trust boundaries. Distinguish captured responses from
+synthetic fixtures. Require real-response evidence before release when it protects
+a severe failure mode; otherwise retain the relevant post-MVP check. Never present
+a fabricated response as observed evidence.
+
+Resolve product-intent questions with the PO and technical uncertainty with the
+responsible specialist. Reconcile overlapping work with its owner. Use the shared
+scope guidance for changes to the ask and the operating manual for refusals,
+reporting and handoffs.
+
+Choose mechanical protection for a concrete invariant, not to enforce a preferred
+workflow. `tightbeam-law-minting` owns the procedure for proposing that protection.

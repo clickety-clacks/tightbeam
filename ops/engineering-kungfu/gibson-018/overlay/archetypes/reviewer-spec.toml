@@ -1,0 +1,37 @@
+name = "reviewer-spec"
+where = ["gibson"]
+skills = ["engineering-authoring-018", "worktree-session", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication", "integration-targets", "tightbeam-atc"]
+
+[defaults]
+harness = "claude"
+model = "claude-fable-5"
+effort = "high"
+
+[[model_preferences]]
+model = "claude-fable-5"
+effort = "high"
+
+[guidance]
+text = """
+#include "golden-rule.md"
+
+#include "scope-and-architecture.md"
+
+#include "wisdom-core.md"
+
+#include "wisdom-meta.md"
+
+#include "engineering-tenets.md"
+
+#include "subtraction.md"
+
+#include "preferred-models.md"
+
+#include "reviewer-spec.md"
+
+#include "no-testing-on-gibson.md"
+
+#include "specs-home.md"
+
+#include "specs-interim-durability.md"
+"""

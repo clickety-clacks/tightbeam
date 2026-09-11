@@ -185,6 +185,25 @@ No review here claims live runtime, full-suite or release acceptance. Remaining
 participant reviews and verification results must be recorded against their actual
 revisions before the consolidation is treated as finished.
 
+At source revision 16f51c2, Rowan, the spec-writer author and the orchestrator editor
+accepted the follow-up authoring-skill composition; Morrow carried his bounded
+acceptance. The neutral-identity test then caught engineering vocabulary in shared
+bundle-authoring guidance. Revision 768efb1 replaces that wording with a neutral
+deployment reference, preserving the test and its subject.
+
+The prepared 0.1.8 overlay is under `ops/engineering-kungfu/gibson-018`. Review exposed
+an installed-version include-expansion difference, corrected in the archetype include
+paths. An isolated check against released 0.1.8 composes all nine identities for both
+harnesses, verifies the complete local restriction and preservation text, rejects
+unexpanded includes and duplicate manuals, and exercises the released rule and identity
+validators. These checks passed on eezo without starting a gateway or an inference turn.
+
+The older release rejects a notification-only linked-review remedy. Its overlay uses
+an explicit denial with an owner-directed resolution, preserving the completion
+predicate. It also uses an ordinary local authoring skill because the release reserves
+the baseline skill names. These are compatibility choices, not claims that 0.1.8 has
+the newer runtime behavior.
+
 ## Current-org application
 
 Prepare a compatible 0.1.8 identity overlay separately from the shipped bundle.
@@ -197,6 +216,12 @@ their actual responsibility. A model/effort change and a harness replacement hav
 different context consequences; preserve useful work and report unsupported settings.
 Repair actual operational custody with supported handoffs, not by relabeling roles.
 A role rebind does not rewrite spawning ancestry or transfer open assignments.
+
+Supersession is scoped to the engineering-guidance deliverable. An umbrella work item
+may also contain retained release or upgrade acceptance, including the parked release
+integrator's work. Do not close that umbrella or retire its owners merely because
+this branch replaces the guidance implementation. Record the replaced scope and keep
+every remaining obligation accountable.
 
 Tightbeam can run turns even during this external consolidation. Read agents and
 substrate, but do not initiate operations that need or can trigger Tightbeam turns.
