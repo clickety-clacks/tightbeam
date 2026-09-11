@@ -111,7 +111,7 @@ defmodule Tightbeam.LiveBasePayloadTest do
         else: []
 
     assert {_, 0} =
-             System.cmd("tar", metadata_flags ++ ["czf", archive, "-C", tmp, "tightbeam"])
+             System.cmd("tar", metadata_flags ++ ["-czf", archive, "-C", tmp, "tightbeam"])
 
     assert {output, 0} =
              System.cmd("sh", ["packaging/verify-payload.sh", archive], stderr_to_stdout: true)

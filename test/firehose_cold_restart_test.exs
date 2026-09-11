@@ -500,7 +500,8 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     end
 
     refute File.exists?(Path.join(plan.base, "forbidden-execution.log"))
-    assert Tightbeam.HarnessProcessCensus.capture_for_root(plan.base).count == 0
+    census = Tightbeam.HarnessProcessCensus.capture_for_root(plan.base)
+    assert census.count == 0, Tightbeam.HarnessProcessCensus.format(census)
   end
 
   defp snapshot!(plan, port, device) do
