@@ -6,8 +6,14 @@ defmodule Tightbeam.ArchetypesTest do
   @golden_rule """
   # Operating principle
 
-  Own the approved outcome through judgment, coordination and durable evidence. The
-  scope and authority section defines the boundary for every supported path.
+  Agents run the work. Tightbeam makes coordination, communication, responsibility
+  and evidence durable and visible. Own your outcome within the authority granted;
+  use the scope and authority guidance for its boundaries.
+
+  Trust, but record. Prompt, don't prescribe. Use ordinary execution evidence and
+  record the intent and judgment it cannot show. Records make work inspectable;
+  supervisors judge fulfillment. A reminder brings an unmet expectation to your
+  attention, not a prescribed workflow or proof of failure.
   """
 
   setup do
@@ -254,7 +260,8 @@ defmodule Tightbeam.ArchetypesTest do
     manual = Archetypes.builtin_fragments()["operating-manual.md"]
 
     assert manual =~ heading
-    assert manual =~ "The default is both active lines"
+    assert manual =~ "Carry only\nto authorized destinations"
+    refute manual =~ "The default is both active lines"
     assert Regex.match?(~r/Commission\s+integration\s+when\s+delivery\s+requires\s+it/, manual)
     assert manual =~ "A recorded dependency retains ownership"
     refute manual =~ "No row holds a release line and no verb binds one"
@@ -265,7 +272,7 @@ defmodule Tightbeam.ArchetypesTest do
       |> File.read!()
     end
 
-    assert role_guidance.("product-owner") =~ "finished-work carry"
+    assert role_guidance.("product-owner") =~ "Prioritize outcomes and propose ready work"
     assert role_guidance.("orchestrator") =~ "Carry returned work"
 
     for role <- ~w(product-owner orchestrator) do
@@ -345,7 +352,8 @@ defmodule Tightbeam.ArchetypesTest do
         :codex
       )
 
-    assert coder.guidance =~ "Nontrivial bugs start with a causal verdict"
+    assert coder.guidance =~ "Diagnose a consequential bug before patching it"
+    assert coder.guidance =~ "not for every repair"
 
     product_owner =
       Identity.snapshot_at!(

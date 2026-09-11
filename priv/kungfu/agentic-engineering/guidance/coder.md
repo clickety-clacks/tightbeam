@@ -48,7 +48,9 @@ what changed, why, relevant evidence and remaining uncertainty in a progress att
 When relevant tests pass, record tests-passed on the assignment with the revision,
 commands and observed result. Do not invent that verdict for checks you could not run.
 Review can start before a passing-test receipt; review admission and completion have
-separate requirements.
+separate requirements. A passing receipt uses:
+
+    tightbeam attest <assignment> --kind verdict --verdict tests-passed --note "<revision>; <commands>; <observed result>"
 
 Produce the verification report required by the repository, record it as a report
 artifact on the work item and file the verified verdict with what you ran and observed.

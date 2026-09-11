@@ -253,8 +253,8 @@ defmodule Tightbeam.IdentityTest do
     refute engineering_rule =~ ~s(target_role = "reviewer")
 
     for {role, present_axis, absent_axis} <- [
-          {"reviewer-code", "## Analysis axes: code", "## Analysis axes: spec"},
-          {"reviewer-spec", "## Analysis axes: spec", "## Analysis axes: code"}
+          {"reviewer-code", "## Code judgment", "## Analysis axes: spec"},
+          {"reviewer-spec", "## Analysis axes: spec", "## Code judgment"}
         ] do
       review = Identity.snapshot!(base, role, :codex)
       assert review.guidance =~ "# Review"
@@ -266,7 +266,7 @@ defmodule Tightbeam.IdentityTest do
     end
 
     coder = Identity.snapshot!(base, "coder", :codex)
-    assert coder.guidance =~ "Before the ready-for-review progress attest"
+    assert coder.guidance =~ "Review can start before a passing-test receipt"
     assert coder.guidance =~ "--verdict tests-passed"
   end
 
