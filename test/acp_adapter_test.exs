@@ -1056,8 +1056,16 @@ defmodule Tightbeam.Acp.AdapterTest do
 
   test "a prompt worker that dies before dispatch returns an error without wedging the adapter" do
     {adapter, _capture_path} = start_adapter()
-    dead_conn = spawn(fn -> :ok end)
+
+    dead_conn =
+      spawn(fn ->
+        receive do
+          :finish -> :ok
+        end
+      end)
+
     monitor = Process.monitor(dead_conn)
+    send(dead_conn, :finish)
     assert_receive {:DOWN, ^monitor, :process, ^dead_conn, :normal}
 
     :sys.replace_state(adapter, &%{&1 | conn: dead_conn})
