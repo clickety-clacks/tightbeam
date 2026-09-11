@@ -181,9 +181,8 @@ to implement the new model/harness ringdown and retarget existing agents. The Se
 commission. Concrete model ordering and cross-family preference are the lead's
 accountable decisions under that commission, not quotations of a user-selected table.
 
-No review here claims live runtime, full-suite or release acceptance. Remaining
-participant reviews and verification results must be recorded against their actual
-revisions before the consolidation is treated as finished.
+Reviews cover the stated source and compatibility concerns, not live runtime or
+release acceptance. An unanswered request does not count as agreement.
 
 At source revision 16f51c2, Rowan, the spec-writer author and the orchestrator editor
 accepted the follow-up authoring-skill composition; Morrow carried his bounded
@@ -203,6 +202,44 @@ an explicit denial with an owner-directed resolution, preserving the completion
 predicate. It also uses an ordinary local authoring skill because the release reserves
 the baseline skill names. These are compatibility choices, not claims that 0.1.8 has
 the newer runtime behavior.
+
+### Review and verification record
+
+| Contributor | Reviewed subject | Disposition |
+| --- | --- | --- |
+| Rowan | PO/shared composition through 16f51c2; compatible overlay at 89e3a40 | Accepted after artifact-preservation, spirit-impact and include-expansion corrections. |
+| Fable, spec-writer author | Spec and shared composition through 16f51c2; overlay at 89e3a40 | Accepted. Competing implementation stood down; reviewer remains available. |
+| Orchestrator editor | Orchestration and authoring composition through 16f51c2 | Accepted within that scope. No overlay or runtime acceptance claimed. |
+| Morrow | Recovery guidance through 16f51c2; overlay at 89e3a40 | Accepted after compatibility discussion. Separate recovery and upgrade obligations remain. |
+| Kestrel | Firehose preservation and the two test changes at 0e64de6 | Accepted within those scopes. |
+| Release patrol | Coverage at 89e3a40 and the two test changes at 0e64de6 | Accepted within those scopes; release custody retained. |
+| Stall-watch, Parallax, separate completion-family Fable | Consolidated branch, invitations repeated | No response yet. These requests remain open. |
+
+The canonical Elixir gate at 768efb1 passed formatting and ran 9 doctests and 2,246
+tests, with two failures and 11 skips. One failure came from a positive archive
+fixture that retained Darwin metadata outside the intended package root. The fixture
+now uses the existing assembler's metadata exclusions; strict archive validation and
+negative cases remain intact. The other failure was a nonzero process census after
+Firehose fixture cleanup. Its assertion remains unchanged and now prints the processes
+on failure. It is not claimed fixed or classified as pre-existing.
+
+At 0e64de6, formatting and all ten focused tests passed, with four other tests
+excluded by the targeted invocation. The full canonical Elixir gate then ran 9
+doctests and 2,246 tests in 840.9 seconds, with two failures and 11 skips. Archive
+validation passed. The cleanup failure reproduced, identifying the fixture's
+`codex --version` child after teardown. A rate-limit park/resume test also missed its
+500ms runner notification; that single case passed on a subsequent focused run.
+Neither passing focused run erases the full-suite failures.
+
+Kestrel identified an existing process-lifetime risk in the bounded CLI probe. The
+lead retained it as a hypothesis for this specimen because the log does not prove
+that the probe timed out. The gateway notification failure also needs a causal
+explanation. Both failures remain separate runtime follow-up concerns, with evidence
+sent to the recovery and release owners. This branch does not claim a green full gate.
+
+No production code or Rust source changed. The tests used isolated fixture gateways
+without model inference or live-org access, and no tests ran on Gibson. Verification
+logs and exact review messages remain in the operator's private consolidation evidence.
 
 ## Current-org application
 
