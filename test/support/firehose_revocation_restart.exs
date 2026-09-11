@@ -159,7 +159,7 @@ try do
            ) == generations
 
     assert rows.(reopened, "SELECT priorClosedByProcess FROM assignment_reopenings") == [[nil]]
-    assert rows.(reopened, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
+    assert rows.(reopened, "SELECT shape FROM schema_stamp") == [["cursor-provider-v1-020"]]
     assert rows.(reopened, "PRAGMA foreign_key_check") == []
     assert File.read!(Path.join(base, "build-owner.json")) == marker
 

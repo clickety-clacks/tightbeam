@@ -7,3 +7,4 @@ cli/src/probe.rs
 lib/tightbeam/credentials.ex
 lib/tightbeam/gateway.ex
 lib/tightbeam/org.ex
+lib/tightbeam/schema.ex

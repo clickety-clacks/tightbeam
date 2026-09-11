@@ -6132,6 +6132,19 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
+  @tag :tmp_dir
+  test "a checkout refusal keeps its stable code through the real runner and turn wire", %{
+    tmp_dir: tmp
+  } do
+    File.write!(Path.join(tmp, "checkout-case.txt"), "cursor")
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-cursor-refusal: ok"
+    )
+  end
+
   test "conversational turns stay unattributed and bracket-1 nags reverse-link jobRef only",
        ctx do
     :ok =
@@ -8143,15 +8156,6 @@ defmodule Tightbeam.GatewayTest do
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
     end
-  end
-
-  defp gateway_children_base! do
-    suffix = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
-    base = Path.join(System.tmp_dir!(), "gateway_children_#{suffix}")
-    File.rm_rf!(base)
-    File.mkdir!(base)
-    on_exit(fn -> File.rm_rf!(base) end)
-    base
   end
 
   defp role_test_base(suffix, ready? \\ true) do

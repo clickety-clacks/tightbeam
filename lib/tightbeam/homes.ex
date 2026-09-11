@@ -69,6 +69,17 @@ defmodule Tightbeam.Homes do
     home = home_path(base_dir, spec.machine, spec.harness)
     module = Harness.module!(spec.harness)
 
+    desired = %{
+      harness: spec.harness,
+      machine: spec.machine,
+      rails: Map.get(spec, :rails)
+    }
+
+    desired =
+      if module.id() == :cursor,
+        do: Map.put(desired, :auth_dir, auth_dir(base_dir, module)),
+        else: desired
+
     module.reconcile_home(
       %{
         base_dir: base_dir,
@@ -77,11 +88,7 @@ defmodule Tightbeam.Homes do
         sh: &Support.system_cmd/1
       },
       home,
-      %{
-        harness: spec.harness,
-        machine: spec.machine,
-        rails: Map.get(spec, :rails)
-      }
+      desired
     )
   end
 
@@ -97,12 +104,17 @@ defmodule Tightbeam.Homes do
   defp reconcile_local(home, desired, mechanics) do
     manifest_path = Path.join(home, @manifest_relative)
     manifest = manifest_bytes(desired)
-    rails_filename = Keyword.fetch!(mechanics, :rails_filename)
+    rails_filename = Keyword.get(mechanics, :rails_filename)
 
     File.mkdir_p!(home)
 
     unless File.read(manifest_path) == {:ok, manifest} do
-      remove_owned_projection(home, rails_filename)
+      remove_owned_projection(
+        home,
+        rails_filename,
+        Keyword.get(mechanics, :preserve_manifest_dir, false)
+      )
+
       write_rails(home, rails_filename, Map.get(desired, :rails))
       File.mkdir_p!(Path.dirname(manifest_path))
       File.write!(manifest_path, manifest)
@@ -110,7 +122,23 @@ defmodule Tightbeam.Homes do
 
     project_baseline_skills(home)
 
-    %{home_path: home, manifest_path: manifest_path}
+    case Keyword.fetch(mechanics, :credential_names) do
+      {:ok, credential_names} ->
+        %{
+          home_path: home,
+          manifest_path: manifest_path,
+          linked_auth_files:
+            project_auth(
+              Map.fetch!(desired, :auth_dir),
+              home,
+              credential_names,
+              Keyword.get(mechanics, :credential_projection, :link)
+            )
+        }
+
+      :error ->
+        %{home_path: home, manifest_path: manifest_path}
+    end
   end
 
   defp reconcile_remote(target, remote_home, desired, mechanics) do
@@ -134,13 +162,16 @@ defmodule Tightbeam.Homes do
 
     staged_stamp = File.read!(staged.manifest_path)
 
-    rails_filename = Keyword.fetch!(mechanics, :rails_filename)
-    rails = Path.join(remote_home, rails_filename)
+    rails_filename = Keyword.get(mechanics, :rails_filename)
+    rails = rails_filename && Path.join(remote_home, rails_filename)
 
     if remote_stamp != staged_stamp do
+      rails_removal = if rails, do: "rm -f \"#{rails}\"; ", else: ""
+
       script =
         "mkdir -p \"#{remote_home}\"; " <>
-          "rm -f \"#{rails}\" \"#{remote_manifest}\"; "
+          rails_removal <>
+          "rm -f \"#{remote_manifest}\"; "
 
       Support.run!(
         target,
@@ -176,15 +207,21 @@ defmodule Tightbeam.Homes do
   def home_path(base_dir, machine, harness),
     do: Path.join([base_dir, "homes", machine, Atom.to_string(harness)])
 
-  defp remove_owned_projection(home, rails_filename) do
-    File.rm_rf!(Path.join(home, @manifest_relative))
-    File.rm_rf!(Path.join(home, rails_filename))
+  defp auth_dir(base_dir, module),
+    do: Tightbeam.Credentials.store_dir(base_dir, module.credential_provider())
+
+  defp remove_owned_projection(home, rails_filename, preserve_manifest_dir?) do
+    unless preserve_manifest_dir?, do: File.rm_rf!(Path.join(home, @manifest_relative))
+    if rails_filename, do: File.rm_rf!(Path.join(home, rails_filename))
   end
 
+  defp write_rails(_home, nil, _content), do: :ok
   defp write_rails(_home, _filename, nil), do: :ok
 
   defp write_rails(home, filename, content) do
-    File.write!(Path.join(home, filename), content)
+    path = Path.join(home, filename)
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, content)
   end
 
   defp project_baseline_skills(home) do
@@ -203,6 +240,56 @@ defmodule Tightbeam.Homes do
           File.rm_rf!(target)
           File.ln_s!(source, target)
       end
+    end
+  end
+
+  defp project_auth(auth_dir, home, credential_names, projection) do
+    auth_dir
+    |> credential_store_files(credential_names)
+    |> Enum.map(fn file ->
+      source = Path.join(auth_dir, file)
+      target = Path.join(home, file)
+
+      case projection do
+        :link ->
+          case File.lstat(target) do
+            {:error, :enoent} -> File.ln_s!(source, target)
+            _ -> :ok
+          end
+
+        :copy_readable ->
+          # The target's directory may be writable by the execution identity, so
+          # never follow whatever is at `target`: remove it (a planted symlink
+          # goes with it) and create the copy exclusively, which fails rather
+          # than writes through anything re-planted in between.
+          case File.rm(target) do
+            :ok -> :ok
+            {:error, :enoent} -> :ok
+            {:error, reason} -> raise File.Error, reason: reason, action: "remove", path: target
+          end
+
+          bytes = File.read!(source)
+
+          case :file.open(target, [:write, :exclusive, :binary]) do
+            {:ok, io} ->
+              :ok = :file.write(io, bytes)
+              :ok = :file.close(io)
+
+            {:error, reason} ->
+              raise File.Error, reason: reason, action: "create exclusively", path: target
+          end
+
+          File.chmod!(target, 0o640)
+      end
+
+      file
+    end)
+  end
+
+  defp credential_store_files(auth_dir, credential_names) do
+    case File.ls(auth_dir) do
+      {:ok, files} -> files |> Enum.filter(&(&1 in credential_names)) |> Enum.sort()
+      {:error, :enoent} -> []
     end
   end
 

@@ -57,7 +57,7 @@ defmodule Tightbeam.Org do
           created_at: integer()
         }
 
-  @provider_values "'anthropic','openai'" <>
+  @provider_values "'anthropic','openai','cursor'" <>
                      if(Application.compile_env(:tightbeam, :fixture_harness, false),
                        do: ",'fixture_provider'",
                        else: ""
@@ -170,7 +170,7 @@ defmodule Tightbeam.Org do
   def ensure_schema(db \\ Tightbeam.DB), do: ensure_schema_ddl(db, @ddl)
 
   defp ensure_schema_ddl(db, schema_ddl) do
-    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+    harnesses = Enum.map_join(Tightbeam.Harness.known(), ",", &"'#{&1.wire_name()}'")
 
     ddl =
       schema_ddl

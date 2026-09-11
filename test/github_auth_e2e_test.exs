@@ -420,7 +420,7 @@ defmodule Tightbeam.GithubAuthE2ETest do
       end
     }
 
-    local_opts = Placement.adapter_opts(config, {:codex, "default", "testhost"})
+    local_opts = Placement.adapter_opts!(config, {:codex, "default", "testhost"})
     assert {"GH_CONFIG_DIR", GithubAuth.config_dir(ctx.local)} in local_opts[:env]
     assert {"TIGHTBEAM_MACHINE", "testhost"} in local_opts[:env]
 
@@ -431,7 +431,7 @@ defmodule Tightbeam.GithubAuthE2ETest do
                cli_bin: Path.join(ctx.satellite, "bin")
              })
 
-    remote_opts = Placement.adapter_opts(config, {:codex, "default", "worker"})
+    remote_opts = Placement.adapter_opts!(config, {:codex, "default", "worker"})
 
     assert "TIGHTBEAM_MACHINE=worker" in remote_opts[:cmd]
     assert "GH_CONFIG_DIR='#{GithubAuth.config_dir(ctx.satellite)}'" in remote_opts[:cmd]

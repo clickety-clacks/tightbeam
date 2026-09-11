@@ -206,6 +206,32 @@ defmodule Tightbeam.ReadinessTest do
            ]
   end
 
+  test "a missing Cursor operand names its dedicated pin and onboarding remedy", ctx do
+    module = Tightbeam.Harness.Cursor
+    previous = Application.get_env(:tightbeam, :enabled_dormant_harnesses)
+    Application.put_env(:tightbeam, :enabled_dormant_harnesses, [:cursor])
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :enabled_dormant_harnesses),
+        else: Application.put_env(:tightbeam, :enabled_dormant_harnesses, previous)
+    end)
+
+    catalog = catalog!(%{module.wire_name() => live("m", [])})
+
+    line =
+      ctx.config
+      |> Readiness.summary(catalog)
+      |> Readiness.render(ctx.config)
+      |> Enum.find(&(&1 =~ "Dedicated pinned Cursor operand missing"))
+
+    assert line =~ module.adapter_path()
+    assert line =~ module.adapter_version()
+    assert line =~ "tightbeam onboard cursor --api-key"
+    refute line =~ "npm install"
+    refute line =~ Path.join([ctx.base, "adapters", "node_modules", ".bin"])
+  end
+
   test "a missing credential names the separate login, auth root, and onboard command", ctx do
     [module | _] = Harness.all()
     install_adapter!(ctx.base, module)
@@ -230,6 +256,29 @@ defmodule Tightbeam.ReadinessTest do
     assert line =~ "normal #{module.wire_name()} CLI login"
     assert line =~ Path.join(ctx.base, "auth")
     assert line =~ "on testhost"
+  end
+
+  test "a missing Cursor credential renders the legal API-key command", ctx do
+    module = Tightbeam.Harness.Cursor
+
+    row = %{
+      host: "testhost",
+      base_dir: ctx.base,
+      harness: module.wire_name(),
+      provider: module.credential_provider(),
+      adapter: :present,
+      binary: :runnable,
+      credential: {:absent, :missing},
+      model: :unknown,
+      runnable?: false
+    }
+
+    line =
+      %{runnable?: false, harnesses: [row]}
+      |> Readiness.render(ctx.config)
+      |> Enum.find(&(&1 =~ "Tightbeam has no credential for cursor"))
+
+    assert line =~ "tightbeam onboard cursor --api-key --as-user <userId>"
   end
 
   test "a default model outside the live catalog is named by its fields", ctx do
@@ -632,7 +681,7 @@ defmodule Tightbeam.ReadinessTest do
 
   ## The derivation this module rests on
 
-  test "every registered harness's adapter bin is its package basename", _ctx do
+  test "every registered harness publishes its readiness adapter or dedicated bundle", _ctx do
     # `adapter_state/3` derives the adapter's bin name from `install_package/0`
     # because no callback exposes it. If a harness ever breaks that convention,
     # its adapter would be reported permanently missing and the summary would
@@ -641,16 +690,22 @@ defmodule Tightbeam.ReadinessTest do
     for module <- Harness.all() do
       # The harness behaviour exposes no adapter_bin, so the coupling is pinned
       # against the path Support ACTUALLY builds, as published in the harness's
-      # own conformance vectors.
+      # own conformance vectors. Cursor launches and reports its dedicated
+      # pinned bundle rather than the generic npm adapter path.
       expected = "/adapters/node_modules/.bin/" <> Path.basename(module.install_package())
 
       published =
         inspect(module.conformance_vectors(), limit: :infinity, printable_limit: :infinity)
 
-      assert String.contains?(published, expected),
-             "#{module.wire_name()}: Support builds no adapter path ending #{expected}, " <>
-               "so Readiness.adapter_state/3 — which derives the bin name from " <>
-               "install_package/0 — would report this adapter permanently missing"
+      if module == Tightbeam.Harness.Cursor do
+        assert String.contains?(published, "/2026.08.11-e8db854/cursor-agent"),
+               "cursor: Support does not publish the pinned dedicated bundle path"
+      else
+        assert String.contains?(published, expected),
+               "#{module.wire_name()}: Support builds no adapter path ending #{expected}, " <>
+                 "so Readiness.adapter_state/3 — which derives the bin name from " <>
+                 "install_package/0 — would report this adapter permanently missing"
+      end
     end
   end
 end

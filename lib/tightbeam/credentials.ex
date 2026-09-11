@@ -32,9 +32,16 @@ defmodule Tightbeam.Credentials do
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
   @fixture_provider? Application.compile_env(:tightbeam, :fixture_harness, false)
 
-  @type provider :: :openai | :anthropic | :fixture_provider
+  @type provider :: :openai | :anthropic | :opencode | :cursor | :fixture_provider
   @type kind :: :api_key | :subscription
   @type status :: :onboarded | {:needs_onboarding, term()}
+
+  @doc "The provider-specific onboarding command prefix."
+  @spec onboard_command(provider() | String.t()) :: String.t()
+  def onboard_command(provider) when provider in [:cursor, "cursor"],
+    do: "tightbeam onboard cursor --api-key"
+
+  def onboard_command(provider), do: "tightbeam onboard #{provider}"
 
   @doc "Start one lifecycle owner for this machine."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -139,7 +146,7 @@ defmodule Tightbeam.Credentials do
   @doc "Classify only pinned terminal evidence. Unknown is always non-terminal."
   @spec terminal_evidence?(provider(), term()) :: boolean()
   def terminal_evidence?(provider, evidence) do
-    case Enum.find(Harness.all(), &(&1.credential_provider() == provider)) do
+    case Enum.find(Harness.known(), &(&1.credential_provider() == provider)) do
       nil -> false
       module -> module.classify_auth_event(evidence) == :terminal
     end
@@ -201,7 +208,7 @@ defmodule Tightbeam.Credentials do
             "Nothing was banked — the credential on this host is unchanged. A credential " <>
             "with no usable token cannot authenticate a turn, and writing it would report " <>
             "success now and fail every session later. Delete that file and re-run " <>
-            "`tightbeam onboard #{provider}`."
+            "`#{onboard_command(provider)}`."
 
         {:error, {:hollow_credential, %{source: source, found: found, sentence: sentence}}}
     end
@@ -763,11 +770,55 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  # Cursor holds ONE kind, an API key, and it never lands in a harness home: the
+  # cursor CLI reads no credential file, only the CURSOR_API_KEY env var, so the
+  # banked key is injected at spawn by the cursor harness rather than linked in.
+  # It is banked as a bare string, trimmed, exactly as an anthropic API key is —
+  # the blank check is all refuse_hollow can say about a bare secret, and the deep
+  # anthropic check does not apply.
+  defp write_credential!(state, :cursor, credential) do
+    with :ok <- refuse_hollow(:cursor, credential.bytes, "the onboarding ceremony") do
+      atomic_write!(
+        credential_store_path(state, :cursor),
+        String.trim(credential.bytes) <> "\n",
+        bank_dir_mode(:cursor)
+      )
+
+      seed_cursor_preferences!(state)
+      reconcile_provider_homes(state, :cursor)
+      :ok
+    end
+  end
+
   defp write_credential!(state, :fixture_provider, credential) do
     with :ok <- refuse_hollow(:fixture_provider, credential.bytes, "the onboarding ceremony") do
       atomic_write!(credential_home_path(state, :fixture_provider), credential.bytes)
       reconcile_provider_homes(state, :fixture_provider)
       :ok
+    end
+  end
+
+  # Cursor's pinned loader merges defaults into this version-only seed, validates
+  # the completed document, and replaces the file atomically. Seed the non-secret
+  # canonical document before home reconciliation and the planned stop/start
+  # below. Reconciliation projects a read-only copy; the fresh Cursor process can
+  # then replace it inside the group-writable home with its own writable runtime
+  # copy. An existing canonical preference file is operator state and remains
+  # untouched.
+  defp seed_cursor_preferences!(state) do
+    path = Path.join(Path.dirname(credential_store_path(state, :cursor)), "cli-config.json")
+
+    case :file.open(path, [:write, :exclusive, :binary]) do
+      {:ok, io} ->
+        :ok = :file.write(io, Tightbeam.Harness.Cursor.initial_cli_config())
+        :ok = :file.close(io)
+        File.chmod!(path, 0o600)
+
+      {:error, :eexist} ->
+        :ok
+
+      {:error, reason} ->
+        raise File.Error, reason: reason, action: "seed Cursor preferences", path: path
     end
   end
 
@@ -777,15 +828,22 @@ defmodule Tightbeam.Credentials do
     Enum.each(harnesses_for_provider(provider), fn module ->
       home = Homes.home_path(state.base_dir, state.machine, module.id())
 
+      desired = %{
+        harness: module.id(),
+        machine: state.machine,
+        rails: Rails.hook_settings(),
+        credential_home: home
+      }
+
+      desired =
+        if module.id() == :cursor,
+          do: Map.put(desired, :auth_dir, store_dir(state.base_dir, :cursor)),
+          else: desired
+
       module.reconcile_home(
         target,
         home,
-        %{
-          harness: module.id(),
-          machine: state.machine,
-          rails: Rails.hook_settings(),
-          credential_home: home
-        }
+        desired
       )
 
       warm_home(module, target, home)
@@ -848,7 +906,7 @@ defmodule Tightbeam.Credentials do
   end
 
   defp harnesses_for_provider(provider),
-    do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
+    do: Enum.filter(Harness.known(), &(&1.credential_provider() == provider))
 
   defp default_park_targets(machine) do
     Harness.all()
@@ -1160,10 +1218,18 @@ defmodule Tightbeam.Credentials do
 
   defp harness_id(:openai), do: :codex
   defp harness_id(:anthropic), do: :claude
+  defp harness_id(:cursor), do: :cursor
   defp harness_id(:fixture_provider), do: :fixture
+
+  @doc false
+  def store_dir(base_dir, :cursor), do: Path.join([base_dir, "auth", "cursor"])
+
+  defp credential_store_path(state, :cursor),
+    do: Path.join([state.base_dir, "auth", "cursor", "api-key"])
 
   defp credential_filename(:openai), do: "auth.json"
   defp credential_filename(:anthropic), do: ".credentials.json"
+  defp credential_filename(:cursor), do: "api-key"
   defp credential_filename(:fixture_provider), do: "fixture.json"
 
   defp credential_present_at?(base_dir, machine, provider) do
@@ -1183,8 +1249,29 @@ defmodule Tightbeam.Credentials do
       )
   end
 
-  defp atomic_write!(path, bytes) do
-    File.mkdir_p!(Path.dirname(path))
+  # The mode a provider's bank directory must carry, or nil to leave whatever
+  # `mkdir` created. Cursor is the one owner-only (0700) provider: its key is a
+  # bare secret with no harness home to fall back on, so a world-traversable
+  # directory around a 0600 file is exposure the credential-park store exists to
+  # close. The others keep the default here; tightening every provider to 0700
+  # is a separate cross-provider change, not a rider on the cursor add. This is
+  # the single source of truth for both the local and remote bank writes.
+  defp bank_dir_mode(:cursor), do: 0o700
+  defp bank_dir_mode(_provider), do: nil
+
+  # `dir_mode` is opt-in and defaults to leaving the directory as `mkdir_p`
+  # created it, so every existing caller is byte-for-byte unchanged. Cursor
+  # passes 0o700 because its bank directory holds a bare secret with no harness
+  # home to fall back on: the file is 0600, but a 0755 directory still lets any
+  # same-box process TRAVERSE to it, and the credential-park contract is
+  # owner-only at rest. This is scoped to the cursor write on purpose — widening
+  # 0700 to every provider's bank directory changes openai/anthropic/fixture
+  # behavior and is an adjudication for the dispatcher, not a change to smuggle
+  # in under a cursor provider-add.
+  defp atomic_write!(path, bytes, dir_mode \\ nil) do
+    dir = Path.dirname(path)
+    File.mkdir_p!(dir)
+    if dir_mode, do: File.chmod!(dir, dir_mode)
     temporary = path <> ".tmp-#{System.unique_integer([:positive])}"
     File.write!(temporary, bytes)
     File.chmod!(temporary, 0o600)
@@ -1239,6 +1326,16 @@ defmodule Tightbeam.Credentials do
     end
   end
 
+  # A bare API key staged under the provider's one name. Same basename the store
+  # uses, matching the openai/anthropic staged-then-installed shape; the cursor
+  # harness reads the banked file only to inject CURSOR_API_KEY at spawn.
+  defp staged_credential(:cursor, kind, path) do
+    case File.read(Path.join(path, "api-key")) do
+      {:ok, bytes} -> {:ok, Map.put(installed_metadata(:cursor, kind), :bytes, bytes)}
+      {:error, reason} -> {:error, {:cursor_api_key_failed, reason}}
+    end
+  end
+
   defp staged_credential(:fixture_provider, kind, path) do
     case File.read(Path.join(path, "fixture.json")) do
       {:ok, bytes} -> {:ok, Map.put(installed_metadata(:fixture_provider, kind), :bytes, bytes)}
@@ -1255,11 +1352,28 @@ defmodule Tightbeam.Credentials do
 
   defp install_staged!(state, provider, kind, path) do
     source = staged_path(provider, path)
-    store = credential_home_path(state, provider)
+
+    {store, dir_chmod} =
+      case provider do
+        :cursor ->
+          store = credential_store_path(state, :cursor)
+
+          # Cursor's bank directory is owner-only, remotely as it is locally:
+          # the key is injected at spawn and never belongs in a harness home.
+          {store, "chmod 700 #{shell_quote(Path.dirname(store))} && "}
+
+        _other ->
+          # The live target keeps all file-backed harness credentials in the
+          # harness home. Preserve that layout for every existing provider.
+          {credential_home_path(state, provider), ""}
+      end
+
+    dir = Path.dirname(store)
 
     script =
       "test -f #{shell_quote(source)} && " <>
-        "mkdir -p #{shell_quote(Path.dirname(store))} && " <>
+        "mkdir -p #{shell_quote(dir)} && " <>
+        dir_chmod <>
         "chmod 600 #{shell_quote(source)} && " <>
         "mv #{shell_quote(source)} #{shell_quote(store)} && " <>
         "chmod 600 #{shell_quote(store)}"
@@ -1290,6 +1404,7 @@ defmodule Tightbeam.Credentials do
 
   defp staged_path(:openai, path), do: Path.join(path, "auth.json")
   defp staged_path(:anthropic, path), do: Path.join(path, ".credentials.json")
+  defp staged_path(:cursor, path), do: Path.join(path, "api-key")
   defp staged_path(:fixture_provider, path), do: Path.join(path, "fixture.json")
 
   defp onboarding_staging_path(%{ssh: nil}, provider) do

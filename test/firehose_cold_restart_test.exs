@@ -421,7 +421,7 @@ defmodule Tightbeam.FirehoseColdRestartTest do
 
     try do
       assert exit!(port, plan, "first", System.monotonic_time(:millisecond) + 30_000) == 1
-      assert read_log(plan, "first") =~ "no registered harness CLI is installed"
+      assert read_log(plan, "first") =~ "no usable harness CLI is installed"
       evidence = JSON.decode!(File.read!(Path.join(plan.base, "refusal-input.json")))
       assert evidence["pid"] == Integer.to_string(pid)
       assert File.read!(Path.join(plan.base, "build-owner.json")) == evidence["marker"]

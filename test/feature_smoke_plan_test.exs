@@ -53,6 +53,26 @@ defmodule Tightbeam.FeatureSmokePlanTest do
     end
   end
 
+  test "the documented Cursor model input makes the registered leg plannable" do
+    refute Tightbeam.Harness.Cursor in Harness.all()
+    cursor = Tightbeam.Harness.Cursor
+
+    [leg] =
+      FeatureSmokePlan.legs([cursor], fn
+        "TIGHTBEAM_SMOKE_MODEL_CURSOR" -> "catalog-listed-cursor-model"
+        _ -> nil
+      end)
+
+    assert leg.wire_name == "cursor"
+    assert leg.model == "catalog-listed-cursor-model"
+
+    smoke = File.read!(Path.expand("../docs/SMOKE.md", __DIR__))
+    assert smoke =~ "TIGHTBEAM_SMOKE_MODEL_CURSOR='<catalog-listed-cursor-model>'"
+    assert smoke =~ "not a default"
+    assert smoke =~ "claim of"
+    assert smoke =~ "live support"
+  end
+
   # e2e-tier-map-v1 GAP-3. Written against the REGISTRY rather than against literal harness
   # names, so the seam guard stays satisfied and a third registered harness does not
   # silently invalidate the cases.

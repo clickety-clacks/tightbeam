@@ -74,15 +74,14 @@ defmodule Tightbeam.SpinupTest do
                patch_adapter: no_patch()
              )
 
-    assert [["sh", "-c", script]] = receive_commands(1)
+    assert [["/bin/sh", "-c", script]] = receive_commands(1)
 
     # Local means local: no ssh hop to reach the machine tightbeam is running on.
     refute script =~ "ssh"
     assert script =~ "npm install --prefix"
     assert script =~ Path.join(ctx.base_dir, "adapters")
 
-    # Every harness at its pin, asserted per harness rather than by naming packages —
-    # a partial pin has to fail for the harness that lost it (#47).
+    # Every enabled harness is npm-provisioned. Dormant Cursor does not enter this registry.
     for module <- Tightbeam.Harness.all() do
       assert script =~ "#{module.install_package()}@#{module.adapter_version()}",
              "#{module.wire_name()} is not installed at its pinned version"

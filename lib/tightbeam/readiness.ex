@@ -182,16 +182,22 @@ defmodule Tightbeam.Readiness do
   defp adapter_state(_module, false, _config), do: {:unknown, :not_probed_on_satellite}
 
   defp adapter_state(module, true, config) do
-    path =
-      Path.join([
-        config.base_dir,
-        "adapters",
-        "node_modules",
-        ".bin",
-        Path.basename(module.install_package())
-      ])
+    path = adapter_path(module, config)
 
     if File.exists?(path), do: :present, else: {:missing, path}
+  end
+
+  defp adapter_path(Tightbeam.Harness.Cursor, _config),
+    do: Tightbeam.Harness.Cursor.adapter_path()
+
+  defp adapter_path(module, config) do
+    Path.join([
+      config.base_dir,
+      "adapters",
+      "node_modules",
+      ".bin",
+      Path.basename(module.install_package())
+    ])
   end
 
   # The executability axis (O5/I6): can this harness actually RUN here? The vendor
@@ -448,6 +454,12 @@ defmodule Tightbeam.Readiness do
   defp adapter_line(%{adapter: :present}), do: nil
   defp adapter_line(%{adapter: {:unknown, _reason}}), do: nil
 
+  defp adapter_line(%{harness: "cursor", adapter: {:missing, path}}) do
+    "Dedicated pinned Cursor operand missing at #{path}. Run `tightbeam onboard cursor " <>
+      "--api-key` to print the administrator provisioning block for Cursor " <>
+      "#{Tightbeam.Harness.Cursor.adapter_version()}."
+  end
+
   # The fallback command is PINNED and `--no-save`. An operator who follows a remedy
   # verbatim gets whatever it says, so a bare package name here installs npm's latest
   # and floats the adapter off its pin — the drift the install site was fixed to prevent,
@@ -473,14 +485,15 @@ defmodule Tightbeam.Readiness do
        }) do
     "Tightbeam has no credential for #{provider} on #{host}. It does not use or import " <>
       "your normal #{harness} CLI login; Tightbeam keeps its own credential under " <>
-      "#{Path.join(base_dir, "auth")}. Run on #{host}: tightbeam onboard #{provider} " <>
+      "#{Path.join(base_dir, "auth")}. Run on #{host}: " <>
+      "#{Tightbeam.Credentials.onboard_command(provider)} " <>
       "--as-user <userId>"
   end
 
   defp credential_line(%{provider: provider, host: host, credential: {:absent, reason}}) do
     "no credential on #{host} (#{inspect(reason)}) — this host's model catalog is " <>
       "empty, so no model can be selected here. Onboard it with: " <>
-      "tightbeam onboard #{provider} --as-user <userId> on #{host}"
+      "#{Tightbeam.Credentials.onboard_command(provider)} --as-user <userId> on #{host}"
   end
 
   defp credential_line(%{harness: wire, host: host, credential: {:unknown, reason}}) do
