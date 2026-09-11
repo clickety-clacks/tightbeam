@@ -24,7 +24,7 @@ Keep its offer and operating documents coherent:
   root is a bundle default, not an automatic migration of existing sessions or work.
 
 Keep shipped guidance independent of one organization's machines, paths, products and
-release branches. Those facts belong in local identity or repository instructions.
+deployment choices. Those facts belong in local identity or repository instructions.
 Check actual projection and read-plane behavior before assuming a new document or
 field will reach clients. A file on disk is not proof it is served.
 
