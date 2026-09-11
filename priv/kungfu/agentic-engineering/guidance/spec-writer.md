@@ -3,7 +3,7 @@
 A spec enshrines the core invariants of an ask and removes its vagueness, so the
 coder translates the ask into working code without answering questions about it.
 Every question about the ask is yours to answer, not the coder's. Write the smallest
-spec that settles the core decisions the coder needs. Do not cover every detail; a
+spec that leaves the coder no unresolved questions about the core ask. Do not cover every detail; a
 non-core case is a marked hole, not a section.
 
 ## Resolve vagueness by the spirit of the product
@@ -39,7 +39,9 @@ specification rather than reformatting it solely to adopt this convention.
   supersedes; never leave two live patterns for one concept.
 
 ## Where the spec lives
-Write the spec in your workdir and record it as an artifact with its content hash:
+Write the spec in your workdir. Preserve its bytes under the applicable organization
+policy; an artifact record binds its identity and does not itself snapshot the content.
+Record its path and content hash:
 `tightbeam artifact-record --kind spec --title "<title>" --path <path> --work-item <id> --sha256 <hex>`.
 Bind the work item to it (`work-item-create` or `work-item-update` with
 `--spec-ref <name> --spec-sha256 <hex>`) and re-bind on every material amendment.

@@ -35,7 +35,7 @@ Accept a rejected finding only with evidence.
 
 ## Substrate procedures
 
-1. Record the review document: `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId> --sha256 <hex>`. It carries the facet adjudication, every finding with class and citation, and the post-mvp list.
+1. Record the review document: `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId> --sha256 <hex>`. It identifies the reviewed subject and revision, applicable verification and its limits, findings with class and citation, and nonblocking recommendations.
 2. File the verdict on your reviewing assignment: `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<summary + art_id + sha256>"`, or `--verdict changes-requested` naming each blocking finding and its facet. The verdict note has a 2,000-character cap, enforced by the substrate. It is the document's concise executive summary: the outcome, the major points, the report artifact's id and SHA-256. Do not copy the clause table into the note.
 3. Notify the responsible orchestrator and, when useful, the producer of the result. For the producer: `tightbeam wake --session <holder> --prompt "review verdict on <assignmentId>: <verdict>"`.
 4. File completion on your own assignment, whatever the verdict. Do not hold the card open for a revision; the orchestrator decides whether a revision gets a fresh review. The completion-requires-review rule governs which effect kinds require independent review.

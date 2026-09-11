@@ -156,8 +156,34 @@ Related work is not automatically completed or revoked:
 Reviewers must identify a missing concept or concrete conflicting instruction, its
 consequence and a proposed correction. The lead accepts fixes it agrees with and
 records and discusses disagreements. A review of a prior package does not cover this
-new composition automatically. Review completion and final revision evidence will be
-recorded after independent review.
+new composition automatically.
+
+Input patch hashes: Rowan po-guidance.patch
+45d552eee9a240e7a27618b0fb11566fcedb3b4f852d3dd5e10a000533c35d21;
+Fable spec-writer-019.patch
+00b938a1afa9f257a8c5156e800f1783967c420541e1a05de1063d600c8d22f0;
+previously landed orchestrator-scope-clarifications.patch
+ce4efbfdd9b860856913afe4d7d1bccf65118441beb5a2ebc78f39c80160febd.
+
+The first exact review subject was 3c3878cb05916d2d2e7c1fcce91994444073a33c.
+The spec-writer, orchestration, Firehose, recovery and coverage reviewers accepted
+within their stated scopes. Rowan requested two corrections, both accepted: distinguish
+artifact identity from content preservation in both role kernels, and state the PO's
+proportionate impact judgment when spirit changes. The lead also accepted clearer
+spec-size wording, removal of duplicate orchestration reporting, input hashes and an
+explicit review-subject/evidence statement. The lead retained consequence-based
+BLOCKING because technical feasibility or authority can prevent core implementation,
+while inference from spirit and PO-first intent escalation remain explicit.
+
+The model-policy scope challenge was resolved against the newer explicit commission
+to implement the new model/harness ringdown and retarget existing agents. The September
+8 package had intentionally excluded model changes; it does not prohibit this later
+commission. Concrete model ordering and cross-family preference are the lead's
+accountable decisions under that commission, not quotations of a user-selected table.
+
+No review here claims live runtime, full-suite or release acceptance. Remaining
+participant reviews and verification results must be recorded against their actual
+revisions before the consolidation is treated as finished.
 
 ## Current-org application
 

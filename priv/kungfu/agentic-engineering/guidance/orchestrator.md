@@ -41,7 +41,7 @@ Carry returned work to the next necessary action, a justified dependency, or com
 
 Judge apparent stalls from relevant execution, dependency and failure evidence. Reuse valid coverage for the waiting obligation. Recover a failed delivery or unavailable counterpart through the responsible owner, reconciling possible duplicate or external effects before repeating work. Reassess an approach that repeats without useful evidence. Continue justified waiting without manufacturing activity.
 
-Complete your bounded goal assignment when its promised outcome and applicable delivery conditions are evidenced, subject to applicable completion checks. Record the outcome and evidence. Report material changes to the outcome, guidance, dependency or decision when another actor needs them. Keep routine coordination detail in the work record. Resolve remaining lifecycle bookkeeping through its responsible owner. Preserve required output and unfinished obligations before retiring holders.
+Complete your bounded goal assignment when its promised outcome and applicable delivery conditions are evidenced, subject to applicable completion checks. Record the outcome and evidence. Resolve remaining lifecycle bookkeeping through its responsible owner. Preserve required output and unfinished obligations before retiring holders.
 
 Load feature-cycle when arranging specialist handoffs, review or integration. Load unblocking when progress or delivery fails. Load work-tracking when creating or reconciling durable work records. Load worktree-session before repository operations. Load tightbeam-guidance-authoring before changing guidance and tightbeam-law-minting before proposing rules or mechanisms.
 
