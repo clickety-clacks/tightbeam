@@ -1,31 +1,28 @@
 #include "review-common.md"
 
-## Analysis axes: code
+## Code judgment
 
-Each axis names the measurement, the threshold, and the class of a finding past it.
+Inspect conformance, correctness, trust boundaries, data integrity and changed
+interactions. Use complexity, duplication, coupling, cycles, mutation adequacy and
+coverage to direct attention. A metric or missing test is not by itself a blocker;
+identify the unfulfilled requirement, consequential defect or explicit limit it
+exposes. Treat speculative public contracts and unasked behavior as scope questions.
+Order findings by their effect on the agreed outcome.
 
-Cognitive complexity: over 15 in a touched function is post-mvp; over 25 is blocking.
-Cyclomatic complexity: over 10 in a touched function is post-mvp.
-Clone detection: a duplicated block over 20 lines introduced by the change is post-mvp.
-Change coupling: a file that co-changes with a touched file in over half its commits and was not touched is unproven until the producer answers.
-Mutation adequacy: an obvious mutant (inverted condition, off-by-one, dropped call) surviving on a must-have path is blocking.
-Dependency cycles: any introduced is blocking.
-Dead code: any introduced is post-mvp.
-Failure mode analysis: an external call with no handled failure path is blocking on a must-have path, else post-mvp.
-Boundary value analysis: a must-have input with no boundary test is post-mvp.
-Taint analysis: untrusted input reaching a sink unsanitised is blocking.
-YAGNI: a behavioural addition the ask did not name is beyond the ask.
-Speculative generality: an abstraction with one implementation, a parameter with one call-site value, or an extension point with no caller, introduced by this change and not named by the ask. Blocking if it is public or a contract others must implement, post-mvp otherwise.
-Hotspot weighting: report findings in hotspot files first.
-Line coverage: not a gate; a percentage is not a finding.
+Read the governing ask. When a work item pins a spec, establish that the text you
+review is the identified revision. Reuse an established identity check while the
+bytes and its applicability remain unchanged. Trace each must-have to adequate
+source or execution evidence. Mark uncertainty explicitly; do not round unproven up
+to satisfied. Scale the report to the change instead of requiring a clause inventory
+for every repair.
 
-## Substrate procedures: code
+Review can begin before a tests-passed verdict. Evaluate the actual verification
+coverage and whether it applies to the reviewed result. A weak or false receipt is
+evidence of a verification problem, not a reason to withhold all source judgment.
+Apply required completion checks without making passing tests an admission gate.
 
-The report opens with conformance: every clause of the ask marked satisfied, unsatisfied, unproven, or out of scope, each with its evidence.
-Read the ask at its source. When the work item pins a spec, verify its SHA-256 because conformance is owed to that exact ruling text; otherwise use the work item's authoritative input.
-Unproven is its own class: plausibly met, but no test exercises it, no run demonstrates it, no code path confirms it. Do not round it up to satisfied.
-Before judging code, confirm the producer's `tests-passed` receipt names the reviewed commit, the tests, and a passing result. A weak or false receipt is blocking.
-Blocking: hand-written ideal fixtures; demo, prototype or placeholder framing on a product-trusted path.
-Post-mvp: a missing real-response capture, unless it protects an incredibly detrimental failure mode.
-Cite every finding by file and line, log line, or commit.
-If the reviewed assignment is already closed when you begin, the producer completed before review; raise it with your hirer.
+Distinguish captured responses from synthetic fixtures and identify what each can
+prove. Require realistic evidence for a severe failure mode or explicit delivery
+condition; record nonessential later checks as recommendations. Cite findings by
+source location or precise execution evidence. If a producer closed before required
+review, tell the responsible orchestrator and preserve your attributable conclusion.

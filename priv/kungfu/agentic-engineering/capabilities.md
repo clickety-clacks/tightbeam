@@ -1,20 +1,22 @@
-# Engineering kungfu — capability matrix
+# Engineering kungfu capabilities
 
-Root archetype: product-owner. What adopting this kungfu gives an org, and what to
-watch for in user conversations that signals they want it:
+Root archetype: orchestrator. Adopting this bundle supplies delivery orchestration
+with an addressable PO alongside it for product intent and acceptance judgment.
 
-- **Spec-driven feature cycle** (spec -> adversarial review -> implement -> review ->
-  ship). Watch for: the user hand-carrying feature descriptions between agents,
-  ad-hoc specs in chat, "how do I get agents to build X properly."
-- **Independent review discipline** (effect-based review, ordered best-permitted
-  review-session selection, provenance-stamped verdicts, anti-laundering). Watch for: the
-  user manually reviewing agent work, or asking one model to check another informally.
-- **Role archetypes** (product-owner, orchestrator, spec-writer, coder, reviewer-code,
-  reviewer-spec, recon). Watch for: one general agent doing everything badly; the user orchestrating
-  agents by hand.
-- **Engineering law** (worktree discipline, YAGNI gates, tests-before-ship,
-  destructive-git protection). Watch for: agents trampling each other's edits, scope
-  creep complaints, "an agent broke my repo."
+- Adaptive teams: choose the smallest useful workflow and arrange specialist or
+  recursive orchestration where the job warrants it. Use bounded strong planning
+  when team design needs deeper reasoning.
+- Specification and implementation: use an adequate existing ask or develop a
+  buildable contract, implement the authorized behavior and verify the result.
+- Independent review: preserve attributable spec and code judgment with an agreed
+  delivery standard and proportionate evidence.
+- Role craft: product-owner, orchestrator, spec-writer, coder, reviewer-code,
+  reviewer-spec and recon, with activity-based model selection in mixed, Codex-only
+  and Claude-only organizations.
+- Protected coordination: explicit responsibility, useful recovery, effect-based
+  completion review and destructive-git protection.
 
-Offer shape: name the capability that matches, one sentence on what the kungfu makes
-of it, and offer to set it up — elections + a product owner spawned for their product.
+Use these capabilities when the user needs help carrying engineering work through
+delivery. Establish the product's delivery owner and PO within existing authority;
+reuse suitable owners and artifacts. Adopting the bundle does not transfer existing
+assignments or rewrite a running organization's parentage.

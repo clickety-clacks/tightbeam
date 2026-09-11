@@ -38,3 +38,10 @@ canonical; cite by number there):
 Before committing: reread as the target session would — cold, mid-task, no context
 but the projected home. If any line requires knowledge it does not carry or point to,
 fix that first.
+
+When revising an archetype, read its full composed guidance and elected skill
+frontmatter. Reconcile shared homes and opposing role instructions together. State
+who owns intent, delivery, review and recovery, and distinguish an addressed role from
+actual assignment custody. Let agents adapt team shape and model activity within
+scope. Name a new archetype only for a durable missing responsibility; do not turn an
+incident, topology choice or task title into a permanent role by default.

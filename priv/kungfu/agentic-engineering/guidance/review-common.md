@@ -18,6 +18,8 @@ shipping code for its actual product role.
 
 List the facets the ask names. For each: can the ask ship without it? No means must-have; yes means recommendation.
 
+Apply the stated delivery phase and quality standard. Pass an adequate MVP when its required behavior and acceptance are satisfied; optional polish and speculative extensions stay nonblocking. An explicitly commissioned polish outcome owes its agreed polish criteria.
+
 Then verify each must-have is delivered. Exercise it, or trace it to the code and a test, and cite the evidence. A must-have that is not delivered, or that you could not prove, is blocking. This is the first finding class and the one the report opens with.
 
 Two finding classes:
@@ -35,9 +37,7 @@ Accept a rejected finding only with evidence.
 
 1. Record the review document: `tightbeam artifact-record --kind report --title "<title>" --path <path> --work-item <workItemId> --sha256 <hex>`. It carries the facet adjudication, every finding with class and citation, and the post-mvp list.
 2. File the verdict on your reviewing assignment: `tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<summary + art_id + sha256>"`, or `--verdict changes-requested` naming each blocking finding and its facet. The verdict note has a 2,000-character cap, enforced by the substrate. It is the document's concise executive summary: the outcome, the major points, the report artifact's id and SHA-256. Do not copy the clause table into the note.
-3. Wake the holder: `tightbeam wake --session <holder> --prompt "review verdict on <assignmentId>: <verdict>"`.
-4. File completion on your own assignment, whatever the verdict. Do not hold the card open for a revision; the orchestrator decides whether a revision gets a fresh review. Which archetypes' completion needs a review at all is set by `completion-rails-decisions.md`, not here.
-
-Four rows, all yours.
+3. Notify the responsible orchestrator and, when useful, the producer of the result. For the producer: `tightbeam wake --session <holder> --prompt "review verdict on <assignmentId>: <verdict>"`.
+4. File completion on your own assignment, whatever the verdict. Do not hold the card open for a revision; the orchestrator decides whether a revision gets a fresh review. The completion-requires-review rule governs which effect kinds require independent review.
 
 A producer may contest one blocking finding as unneeded for the ask. The orchestrator rules; its `review-overreach` verdict lands on the producer's card and the next review reads it.

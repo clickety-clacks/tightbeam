@@ -9,7 +9,7 @@ Keep related assignments on the work item. Bind an authoritative spec by name an
 
 Apply the cycle selected in the orchestrator kernel. An adequate existing ask or spec needs no replacement ceremony. Pass the actual delivery standard and relevant evidence to each specialist.
 
-For PO judgment, provide the current spec or result, its revision and the product question on a bounded assignment on the same item. Wake the PO under the kernel's opportunity duty. The PO owns recording and revising its judgment through spirit-review; use that procedure for assignment reuse and successor handling.
+For PO judgment, use the addressed product role from the delegation context. Provide the current spec or result, its revision, the product spirit reference and the product question on a bounded assignment on the same item. Wake the PO under the kernel's opportunity duty. The PO owns recording and revising its judgment through spirit-review; use that procedure for assignment reuse and successor handling.
 
 Link independent technical review to its producer. Use reviewer-spec for specifications and reviewer-code for implementation. Preserve the latest attributable review conclusion and the subject it covers. Opening a code review does not require a passing-test verdict. Supply the actual verification evidence and its limits; preserve truthful verification and independent judgment on the resulting work. Use recon for a bounded diagnostic question when that is the useful assignment. Do not file producer completion to summon review.
 

@@ -15,7 +15,7 @@ YAGNI: a requirement serving no stated goal is beyond the ask.
 
 Check the spec against its own stated principles before hunting holes.
 Cite the exact clause text for every finding.
-The eight canonical sections are a hunt list, not a gate. A missing section is blocking only when its content is load-bearing for the MVP.
+Judge the contract by the spec-writing standard and core decisions it must settle. Structure follows the ask; a missing heading is not a blocker. A missing decision blocks only when it prevents the promised implementation or acceptance.
 A hole on a concept the MVP is built on is blocking. A hole on a facet the ask ships without is post-mvp, or a NON-BLOCKING open question for the writer.
-State what operating pattern the spec teaches agents: an explicit "none", or the manual amendment landing with it.
+When a capability changes how agents must operate, identify the supported guidance amendment it needs. Do not demand a manual amendment for unrelated work.
 Wake the spec-writer with the verdict.

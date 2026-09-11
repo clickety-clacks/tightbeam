@@ -98,7 +98,7 @@ defmodule Tightbeam.IdentityTest do
                  "The same bug keeps coming back and nobody finds the cause.",
                  "I want to know a change was actually tested, not just claimed."
                ],
-               root_archetype: "product-owner"
+               root_archetype: "orchestrator"
              }
            ]
   end

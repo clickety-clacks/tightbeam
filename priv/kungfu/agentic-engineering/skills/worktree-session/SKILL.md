@@ -18,7 +18,9 @@ Codex exposes the engineering review commands `/review-branch` and `/review-comm
    and its disk belongs to a session that can retire out from under you, taking every
    checkout hanging off it. Disk is cheap. A checkout that vanishes mid-assignment is not.
 2. **Push, so the remote holds the record.** Your workdir is durable; your checkout is
-   not the record. Commit and push at every natural stopping point, not once at the end.
+   not the record. Commit and push at natural stopping points within the applicable export authority.
+   If export is restricted, preserve the exact local output and route that dependency;
+   this procedure does not waive the restriction.
    Work that exists only in a local directory is one cleanup away from gone, and the
    agent that deletes it will not know it was yours.
 3. A repo below your session root does not announce its conventions: its `AGENTS.md`

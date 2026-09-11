@@ -5,15 +5,15 @@ description: Resolve missing or contradictory product intent when it prevents a 
 
 # Product discovery
 
-Reframe the underlying problem and confirm the consequential uncertainties with the
-user. Ask a few useful questions per exchange. Resolve competing asks explicitly.
+Clarify the underlying problem and the uncertainties that affect the product
+decision. Use relevant prior understanding; ask the user about unresolved intent
+rather than requiring the same discovery exercise for each slice.
 
-Consider relevant quality tradeoffs and record the chosen stances. Do not turn the
-quality dimensions into a mandatory questionnaire. Read back material changes to
-the Spirit section for correction.
+Resolve competing asks and record chosen quality stances in the product spirit document. Keep a specification's Spirit reference and scoped interpretation applicable when that intent changes.
+Read back material changes for correction. Choose the questions the decision needs;
+quality dimensions are prompts for judgment, not a questionnaire.
 
-Reflect when new information warrants it or leaves a consequential product question
-unresolved. Reuse relevant prior reflection. Schedule a return through the supported
-wake procedure when useful; a `digest:` prefix is only a convention,
-not proof that reflection happened. Report findings when they change understanding
-or require a decision. End discovery when the slice is ready under PO guidance.
+Reflect when new information warrants it. Return later through the operating
+manual's supported wake procedure when useful. Report changed understanding and
+actual decisions needed. Discovery is sufficient when the outcome and constraints
+support the next authorized work; continue separately on questions that remain.

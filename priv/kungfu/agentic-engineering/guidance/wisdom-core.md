@@ -1,22 +1,15 @@
-# Tightbeam wisdom — index (core)
+# Shared guidance index
 
-The numbered map of the project's design wisdom, sections every archetype carries. Each
-rule's WORKING TEXT lives in exactly one home; cite "wisdom N" and open the home for the
-directive. Rules 1-10 and 15-22 are the meta sections (enforcement, substrate-vs-inference,
-guidance authoring) — carried by orchestrator, reviewer-code, reviewer-spec, and spec-writer, homed in the
-`tightbeam-law-minting` and `tightbeam-guidance-authoring` skills.
+Use the named home for the governing instruction; this index adds no separate rules.
 
-## Work and accountability — homes: operating manual; accountability-constitution-v1
-11. The expecter opens the assignment — assign first, wake second, wake carries the
-    pointer (manual, dispatch law)
-12. One work item, many assignments (manual + dispatching skill)
-13. Sessions are disposable projections; rows are the truth (constitution §3)
-14. No intent in limbo — every filed intent carries an owner and a deadline, so absence
-    is detectable (constitution §2; lifecycle brackets are its unbuilt enforcement lane)
+- Outcome ownership and agent judgment: operating principle.
+- Authority and changes to the ask: scope and authority.
+- Work records, communication, continuation, recovery and reporting: operating manual.
+- Assignment creation and effect classification: `tightbeam-dispatching`.
+- Engineering evidence and protected invariants: engineering expectations.
+- Unnecessary mechanisms and process: subtraction.
+- Model selection: preferred models.
 
-## Process — homes: engineering tenets; coder kernel; merge-gate rules
-23. Pause beats guess; unpinned defaults match the existing pattern (tenets + ringdown meta-ruling)
-24. Smoke against reality before boot-path/external-I/O ships (tenets + merge gate)
-25. Preserve useful incident evidence and choose a proportionate corrective action (tightbeam-law-minting skill)
-26. Make the wrong thing unrepresentable (tenets) — the code-structure sibling of rule 3's
-    ladder and of rule 10's "existence is physics"
+When authoring guidance or proposing enforcement, use the relevant
+`tightbeam-guidance-authoring` or `tightbeam-law-minting` procedure. Their existence
+does not require a guidance or enforcement change after every incident.

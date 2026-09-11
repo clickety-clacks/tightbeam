@@ -6798,7 +6798,7 @@ defmodule Tightbeam.GatewayTest do
                  name: "agentic-engineering",
                  purpose: purpose,
                  phrases: phrases,
-                 root_archetype: "product-owner"
+                 root_archetype: "orchestrator"
                }
              ]
            } =

@@ -1,55 +1,32 @@
 ---
 name: committing-and-pushing
-description: Commit and push discipline — build before committing, one concern per commit with behavior and structure never mixed, deliberate staging, semantic reconciliation before main advances. Use when committing, pushing, or merging a branch toward main.
+description: Preserve attributable commits and reconcile reviewed work onto its authorized target. Use when committing, publishing or integrating repository work.
 ---
 
-# Committing and pushing
+# Committing and integration
 
-## Every commit
-1. Build before you commit. Run the build and the tests the change touches; a commit
-   that does not build is never pushed. A broken commit on a shared branch breaks every
-   colleague who pulls it.
-2. `git status` and `git diff` first: know exactly what you are committing, and confirm
-   every staged change is yours. Stage deliberately — do not sweep in files you did not
-   change.
-3. One concern per commit, and never behavior and structure in the same one. A commit
-   that both moves code and changes what it does cannot be reviewed under one lens —
-   the reviewer-code session cannot tell which lines are supposed to change output. Split them:
-   structure commits reviewed for direction, behavior commits reviewed for
-   correctness. A tangled commit is also permanent damage — it poisons blame, bisect,
-   and defect archaeology long after it merges.
-4. Message: concise, descriptive, states what the change does. No co-author lines, no
-   tool or model attributions, no generated-by noise.
-5. Push to your own branch.
+Read repository instructions and the governing target agreement. Inspect status and
+the diff, then stage only work you own. Keep commits coherent and reviewable; separate
+structural preparation when it clarifies a behavior change. Use a concise message
+stating the change, without tool attribution or generated-by text.
 
-## Merging your branch into main
-Merging is a semantic integration problem, not a text-selection problem.
+Run the checks required for the change and record their actual result. Preserve local
+work truthfully when a check is blocked or fails; do not present that revision as
+verified. Publish to your branch at useful boundaries within export authority. A
+publication hold does not authorize another remote or public mirror.
 
-When a lane pins an authorized target commit, hold that exact target until the reviewed
-candidate lands. If the target moves for unrelated work, stop and report the hold
-violation. Do not reconcile or rebuild on the moved target unless the owner explicitly
-changes the pin.
+Reconcile with the authorized target before integrating. An explicit target pin
+remains until its owner changes it. If that pin moves unexpectedly, hold the affected
+integration and report the conflict. An unpinned moving target is ordinary integration
+work within the shared agreement, not an automatic permission request.
 
-1. Merge main into your branch first. Every conflict is resolved on your branch.
-2. Resolve conflicts semantically. Never resolve by wholesale accepting ours, theirs,
-   or the newer block. For each conflict, determine what each side contributes — read
-   the merge base, both sides, callers, and tests — and produce a combination that
-   keeps your intended change and every orthogonal behavior main already carries. When
-   two behaviors are truly incompatible, stop and send the decision up; do not silently
-   choose one.
-3. Prove the reconciled branch: build, tests, and the repository's required gates, on
-   the branch, after reconciliation.
-4. The review that clears the work covers the post-reconciliation result; a review from
-   before reconciliation is stale where reconciliation changed semantics.
-5. Advancing main is the orchestrator's decision: it happens after the
-   orchestrator has cleared the work — the `reviewed-clean` verdict is on
-   record, and the current product-owner judgment required by the governing intent is recorded.
-   An unchanged authorized fix does not need a new intent ceremony. You execute the mechanics: confirm main
-   is an ancestor of the reconciled branch
-   (`git merge-base --is-ancestor main <branch>`), then advance main from the
-   branch — fast-forward, because the reconciliation already happened on the
-   branch.
-6. An explicit target pin remains in force until its owner changes it. If that pinned
-   target moves, report it and hold the affected integration. Otherwise reconcile target
-   movement within existing authority and the agreed integration order. Reassess changed
-   interactions and refresh verification or review where prior evidence no longer applies.
+Resolve conflicts semantically from the base, both contributions, callers and tests.
+Preserve orthogonal behavior and useful evidence. Route incompatible intent to the
+responsible owner. Verify changed interactions on the resulting candidate and ask the
+orchestrator to judge where existing review no longer applies. A different commit hash
+alone does not invalidate an unchanged review conclusion.
+
+Advance only the authorized destination with the responsible orchestrator's applicable
+review, verification and required product judgment. Preserve explicit user acceptance
+conditions. Distinguish delivered source from release publication and installed behavior.
+Use worktree-session for durable output custody and cleanup.
