@@ -1222,7 +1222,7 @@ defmodule Tightbeam.Supervision do
   @spec ladder_target(DB.server() | Txn.t(), String.t(), pos_integer()) :: String.t() | nil
   def ladder_target(db_or_txn, holder_key, rung) do
     [[owner, spawned_by]] =
-      query(db_or_txn, "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey = ?1", [
+      query(db_or_txn, "SELECT ownerUserId, #{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1", [
         holder_key
       ])
 
@@ -3505,7 +3505,7 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db, "SELECT state, spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
+      case query(db, "SELECT state, #{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1", [session_key]) do
         [[state, spawned_by]] ->
           next_acc = if state == "active", do: [session_key | acc], else: acc
           lineage(db, spawned_by, MapSet.put(visited, session_key), next_acc)
@@ -4418,7 +4418,7 @@ defmodule Tightbeam.Supervision do
 
   defp ladder_target_excluding(db_or_txn, holder_key, rung, excluded) do
     [[owner, spawned_by]] =
-      query(db_or_txn, "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey=?1", [
+      query(db_or_txn, "SELECT ownerUserId, #{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey=?1", [
         holder_key
       ])
 
@@ -4440,7 +4440,7 @@ defmodule Tightbeam.Supervision do
     if MapSet.member?(visited, session_key) do
       Enum.reverse(acc)
     else
-      case query(db_or_txn, "SELECT state, spawnedBy FROM sessions WHERE sessionKey=?1", [
+      case query(db_or_txn, "SELECT state, #{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey=?1", [
              session_key
            ]) do
         [[state, spawned_by]] ->

@@ -48,7 +48,7 @@ defmodule Tightbeam.ExecutionMapTest do
   @node_keys Enum.sort(
                ~w(active assignments attests bracket1_armed closing_attests creation_context
                   fail_reason fan_out finished_at id jobs minds open_decision_requests
-                  origin parent since_progress_ms spec_ref_name spec_ref_sha256 started_at
+                  origin parent current_coordination since_progress_ms spec_ref_name spec_ref_sha256 started_at
                   state title turns)a
              )
 

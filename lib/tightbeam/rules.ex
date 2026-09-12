@@ -2173,12 +2173,12 @@ defmodule Tightbeam.Rules do
         db,
         """
         WITH RECURSIVE lineage(sessionKey,spawnedBy,holderKey,ownerUserId) AS (
-          SELECT s.sessionKey,s.spawnedBy,s.sessionKey,s.ownerUserId
+          SELECT s.sessionKey,#{Tightbeam.Org.current_parent_sql("s")},s.sessionKey,s.ownerUserId
           FROM assignments a JOIN sessions s ON s.sessionKey=a.holderKey
           JOIN sessions caller ON caller.sessionKey=?2 AND caller.ownerUserId=s.ownerUserId
           WHERE a.id=?1 AND a.state='open'
           UNION
-          SELECT s.sessionKey,s.spawnedBy,l.holderKey,l.ownerUserId
+          SELECT s.sessionKey,#{Tightbeam.Org.current_parent_sql("s")},l.holderKey,l.ownerUserId
           FROM sessions s JOIN lineage l ON s.sessionKey=l.spawnedBy AND s.ownerUserId=l.ownerUserId
         )
         SELECT sessionKey=holderKey FROM lineage WHERE sessionKey=?2

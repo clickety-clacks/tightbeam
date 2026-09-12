@@ -267,6 +267,7 @@ defmodule Tightbeam.Schema do
   @r1_shape "row-driven-r1-v1-019"
   # Composed 019: R1 storage plus the complete Firehose schema suffix.
   @firehose_shape "firehose-r1-v1-019"
+  @reparent_shape "session-reparent-v1-019"
   @o2_shape "row-driven-o2-v1-019"
   @o2_pre_liveness_shape "row-driven-o2-pre-liveness-v1-019"
   @shape "row-driven-admission-v1-019"
@@ -1242,6 +1243,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @reparent_shape,
       @firehose_shape,
       @r1_shape,
       @o2_shape,
@@ -1290,7 +1292,7 @@ defmodule Tightbeam.Schema do
     {:ok, [[predecessor]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     Enum.each(@schema_modules, fn module ->
-      :ok = bootstrap_module(db, module, predecessor == @firehose_shape)
+      :ok = bootstrap_module(db, module, predecessor in [@firehose_shape, @reparent_shape])
     end)
 
     activated_at = System.system_time(:millisecond)
@@ -1323,6 +1325,7 @@ defmodule Tightbeam.Schema do
 
     :ok = upgrade_r1(db)
     :ok = upgrade_firehose_r1(db)
+    :ok = upgrade_session_reparent(db)
     Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
 
@@ -1899,7 +1902,7 @@ defmodule Tightbeam.Schema do
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[stamp]]}
-      when stamp in [@firehose_shape, @r1_shape, @o2_shape, @o2_pre_liveness_shape] ->
+      when stamp in [@reparent_shape, @firehose_shape, @r1_shape, @o2_shape, @o2_pre_liveness_shape] ->
         :ok
 
       {:ok, [[@shape]]} ->
@@ -2010,7 +2013,7 @@ defmodule Tightbeam.Schema do
   defp upgrade_r1(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[stamp]] when stamp in [@firehose_shape, @r1_shape] ->
+             [[stamp]] when stamp in [@reparent_shape, @firehose_shape, @r1_shape] ->
                :ok
 
              [[@o2_shape]] ->
@@ -2050,7 +2053,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def upgrade_firehose_r1(db, opts \\ []) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[@firehose_shape]]} ->
+      {:ok, [[stamp]]} when stamp in [@reparent_shape, @firehose_shape] ->
         :ok
 
       {:ok, [[@r1_shape]]} ->
@@ -2097,10 +2100,31 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  @doc false
+  def upgrade_session_reparent(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@reparent_shape]] -> :ok
+             [[@firehose_shape]] ->
+               :ok = Tightbeam.SessionReparent.migrate_in_txn(txn)
+               :ok = Tightbeam.Idempotency.migrate_reparent_in_txn(txn)
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3",
+                 [@reparent_shape,System.system_time(:millisecond),@firehose_shape])
+               if Txn.changes(txn) != 1, do: raise(ShapeError, message: "session reparent stamp race")
+               [] = Txn.q(txn, "PRAGMA foreign_key_check")
+               :ok
+             rows -> raise ShapeError, message: "incompatible session reparent predecessor: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
   defp upgrade_o2(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[stamp]]}
-      when stamp in [@firehose_shape, @r1_shape, @o2_shape, @o2_pre_liveness_shape] ->
+      when stamp in [@reparent_shape, @firehose_shape, @r1_shape, @o2_shape, @o2_pre_liveness_shape] ->
         :ok
 
       {:ok, [[predecessor]]} when predecessor in [@shape, @pre_liveness_shape] ->

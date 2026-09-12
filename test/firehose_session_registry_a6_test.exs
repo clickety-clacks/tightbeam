@@ -254,7 +254,7 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
 
     assert idle_version > 10
     assert running_version > 20
-    assert {:ok, [["firehose-r1-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["session-reparent-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, [[~s({"phase":"pending"})]]} =
              DB.query(db, "SELECT reminderState FROM assignments WHERE id='retained'")

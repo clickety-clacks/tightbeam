@@ -129,6 +129,13 @@ pub enum Command {
         session_key: String,
         idempotency_key: Option<String>,
     },
+    SessionReparent {
+        identity: Identity,
+        session_key: String,
+        parent_session_key: String,
+        assignment_id: String,
+        idempotency_key: String,
+    },
     Tune {
         identity: Identity,
         session_key: String,
@@ -562,6 +569,9 @@ COMMANDS:
       org's shape — archetypes (with allowed hosts), known hosts, and the
       valid model catalog per harness — and, for admins, pending devices.
         tightbeam list --as orchestrator:news
+
+  session-reparent --session <key> --parent <key> --assignment <id> --key <key>
+      Owner-as-user correction of one custom session and its sole open assignment.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
@@ -1556,6 +1566,18 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 session_key: session_key.expect("checked above"),
                 idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "session-reparent" => {
+            if parsed.positional.len() != 1 || nonempty(flags, "role").is_some() || nonempty(flags, "user").is_some() {
+                return Err("usage: tightbeam session-reparent --session <key> --parent <key> --assignment <id> --key <key>".to_owned());
+            }
+            Ok(Command::SessionReparent {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or("--session is required")?,
+                parent_session_key: nonempty(flags, "parent").ok_or("--parent is required")?,
+                assignment_id: nonempty(flags, "assignment").ok_or("--assignment is required")?,
+                idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
             })
         }
         "tune" => parse_tune(&parsed, flags),

@@ -653,7 +653,7 @@ defmodule Tightbeam.Productions.Bubble do
     do: :exhausted
 
   defp next_active_ancestor(db, session_key, hops) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
+    case DB.query(db, "SELECT #{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1", [session_key]) do
       {:ok, [[parent]]} when is_binary(parent) ->
         case DB.query(db, "SELECT state FROM sessions WHERE sessionKey = ?1", [parent]) do
           {:ok, [["active"]]} -> {:ok, parent}
@@ -676,7 +676,7 @@ defmodule Tightbeam.Productions.Bubble do
        do: :exhausted
 
   defp next_active_ancestor_in_txn(txn, session_key, excluded, hops) do
-    case DB.Txn.q(txn, "SELECT spawnedBy FROM sessions WHERE sessionKey=?1", [session_key]) do
+    case DB.Txn.q(txn, "SELECT #{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey=?1", [session_key]) do
       [[parent]] when is_binary(parent) ->
         case DB.Txn.q(txn, "SELECT state FROM sessions WHERE sessionKey=?1", [parent]) do
           [["active"]] ->

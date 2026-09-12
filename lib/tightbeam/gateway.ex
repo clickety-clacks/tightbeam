@@ -1222,6 +1222,7 @@ defmodule Tightbeam.Gateway do
       {"tune", ["message.created", "session.updated"]} => fn call ->
         tune_result(config, db, call)
       end,
+      {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
       {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
         retire_result(config, db, call)
       end
@@ -2526,6 +2527,7 @@ defmodule Tightbeam.Gateway do
       :harness,
       :origin,
       :spawned_by,
+      :current_parent,
       :state,
       :created_at
     ])
@@ -4106,7 +4108,9 @@ defmodule Tightbeam.Gateway do
   defp role_list_result(db) do
     roles =
       Enum.map(Roles.list(db), fn role ->
-        Map.put(role, :fallback_target, Org.personal_session_key(role.owner_user_id))
+        role
+        |> Map.put(:fallback_target, Org.personal_session_key(role.owner_user_id))
+        |> Map.put(:bound_session_current_parent, Org.current_parent(db, role.bound_session_key))
       end)
 
     %{roles: roles}
@@ -4195,7 +4199,7 @@ defmodule Tightbeam.Gateway do
   defp caller_in_lineage_above?(_db, _scope, _caller_key, hops) when hops > 32, do: false
 
   defp caller_in_lineage_above?(db, scope, caller_key, hops) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [scope]) do
+    case DB.query(db, "SELECT #{Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1", [scope]) do
       {:ok, [[parent]]} when is_binary(parent) ->
         parent == caller_key or caller_in_lineage_above?(db, parent, caller_key, hops + 1)
 
@@ -7125,7 +7129,7 @@ defmodule Tightbeam.Gateway do
     rows =
       Txn.q(
         txn,
-        "SELECT sessionKey, spawnedBy FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
+        "SELECT sessionKey, #{Org.current_parent_sql("sessions")} FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
       )
 
     children = Enum.group_by(rows, &Enum.at(&1, 1))
@@ -7146,7 +7150,7 @@ defmodule Tightbeam.Gateway do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT sessionKey, spawnedBy, state FROM sessions ORDER BY createdAt, sessionKey"
+        "SELECT sessionKey, #{Org.current_parent_sql("sessions")}, state FROM sessions ORDER BY createdAt, sessionKey"
       )
 
     children = Enum.group_by(rows, &Enum.at(&1, 1))

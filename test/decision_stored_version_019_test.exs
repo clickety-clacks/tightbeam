@@ -279,7 +279,7 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
     assert {:ok, [[~s({"phase":"pending"})]]} =
              DB.query(db, "SELECT reminderState FROM assignments WHERE id='retained'")
 
-    assert {:ok, [["firehose-r1-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+    assert {:ok, [["session-reparent-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     assert {:ok, _} =
              DB.query(db, "UPDATE decision_requests SET question='Versioned?' WHERE id='old-1'")

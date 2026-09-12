@@ -24,7 +24,8 @@ defmodule Tightbeam.JobTrace do
     "causal_event" => 5,
     "effort_generation" => 6,
     "attest" => 7,
-    "turn_end" => 8
+    "turn_end" => 8,
+    "session_reparent" => 9
   }
 
   @spec build(DB.server(), map()) :: map()
@@ -47,7 +48,8 @@ defmodule Tightbeam.JobTrace do
            wake_entries(db, item.id, assignment_ids) ++
            decision_entries(db, assignment_ids) ++
            effort_entries(db, assignment_ids) ++
-           causal_entries(db, item.id, assignment_ids))
+           causal_entries(db, item.id, assignment_ids) ++
+           Tightbeam.SessionReparent.timeline(db, item.id))
         |> Enum.sort_by(fn entry ->
           {entry.at, Map.fetch!(@type_rank, entry.type), entry.id}
         end)
@@ -100,6 +102,7 @@ defmodule Tightbeam.JobTrace do
         id: id,
         holderKey: holder,
         openerRef: opener_ref(opened_user, opened_session),
+        currentCoordinationParentRef: Tightbeam.SessionReparent.current_coordination_ref(db, id),
         state: state,
         files: assignment_files(db, id),
         reviewsAssignmentId: reviews

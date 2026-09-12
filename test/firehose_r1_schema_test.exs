@@ -54,7 +54,7 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
 
   test "fresh bootstrap and restart use one composed shape without duplicate columns", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    assert rows(db, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
+    assert rows(db, "SELECT shape FROM schema_stamp") == [["session-reparent-v1-019"]]
 
     for {table, column} <- [
           {"assignments", "reminderState"},

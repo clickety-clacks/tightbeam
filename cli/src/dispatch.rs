@@ -2,6 +2,23 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+    fn session_reparent_preserves_opaque_keys_and_requires_explicit_retry_key() {
+        assert_eq!(
+            body(&["session-reparent", "--session", "child with space", "--parent", "parent",
+                   "--assignment", "asg_one", "--key", "correction", "--as-user", "owner"]),
+            r#"{"asUser":"owner","verb":"session-reparent","params":{"sessionKey":"child with space","parentSessionKey":"parent","assignmentId":"asg_one","idempotencyKey":"correction"}}"#
+        );
+        for missing in ["--session", "--parent", "--assignment", "--key"] {
+            let mut args = vec!["session-reparent"];
+            for (flag, value) in [("--session", "child"), ("--parent", "parent"),
+                                  ("--assignment", "asg_one"), ("--key", "correction")] {
+                if flag != missing { args.extend([flag, value]); }
+            }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
 use serde_json::Value;
 
 use crate::args::{Command, Identity, Target, ToplineSelection, TuneControl};
@@ -298,6 +315,13 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::SessionReparent { identity, session_key, parent_session_key, assignment_id, idempotency_key } =>
+            Ok(request(identity, "session-reparent", vec![], vec![
+                string_field("sessionKey", session_key),
+                string_field("parentSessionKey", parent_session_key),
+                string_field("assignmentId", assignment_id),
+                string_field("idempotencyKey", idempotency_key),
+            ])),
         Command::Tune {
             identity,
             session_key,
@@ -1749,6 +1773,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::List { identity }
         | Command::Retire { identity, .. }
         | Command::Tune { identity, .. }
+        | Command::SessionReparent { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }

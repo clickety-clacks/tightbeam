@@ -112,7 +112,7 @@ defmodule Tightbeam.RevocationMigrationTest do
 
     assert :ok = Schema.upgrade_firehose_r1(db)
     assert rows(db, "SELECT count(*) FROM assignment_revocations") == [[2]]
-    assert rows(db, "SELECT shape FROM schema_stamp") == [["firehose-r1-v1-019"]]
+    assert rows(db, "SELECT shape FROM schema_stamp") == [["session-reparent-v1-019"]]
     assert rows(db, "PRAGMA foreign_key_check") == []
     assert rows(db, "PRAGMA foreign_keys") == [[1]]
   end

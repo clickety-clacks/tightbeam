@@ -1693,9 +1693,9 @@ defmodule Tightbeam.RailRemedy do
         txn,
         """
         WITH RECURSIVE chain(sessionKey,spawnedBy) AS (
-          SELECT sessionKey,spawnedBy FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2
+          SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2
           UNION
-          SELECT s.sessionKey,s.spawnedBy FROM sessions s JOIN chain c ON s.sessionKey=c.spawnedBy
+          SELECT s.sessionKey,#{Tightbeam.Org.current_parent_sql("s")} FROM sessions s JOIN chain c ON s.sessionKey=c.spawnedBy
           WHERE s.ownerUserId=?2
         ) SELECT c.sessionKey FROM chain c JOIN sessions s ON s.sessionKey=c.sessionKey
         WHERE s.state='active'
