@@ -3,8 +3,9 @@
 Judge engineering work against the authorized outcome and explicit constraints.
 Use evidence appropriate to its consequences. Green checks and review verdicts
 support acceptance; they do not establish behavior beyond what they exercised.
-Review can start before a passing-test receipt. Completion still requires its
-promised outcome, applicable verification, independent review and required delivery.
+Review can start before a passing-test receipt. Complete the promised outcome under
+its applicable verification and delivery conditions. Obtain independent review where
+the applicable completion rule requires it; a shared role instruction adds no new gate.
 A partial review records the questions it can settle and the evidence still needed.
 
 Preserve data integrity and trust boundaries. Distinguish captured responses from

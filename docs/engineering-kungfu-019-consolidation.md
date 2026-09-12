@@ -395,8 +395,16 @@ providing their explicit precedence over the release's older reserved procedures
 
 These changes add no runtime mechanism, rule, model restriction or review-admission
 gate. Existing scoped acceptances above describe earlier revisions; this coherent
-revision is a new source-review subject. The prepared 0.1.8 command sequence now
-removes retired skills only after de-election. No live application is performed.
+revision received renewed source review. Rowan identified an unqualified completion
+review duty in the new shared fragment. The lead accepted that finding and tied
+independent review to the applicable completion rule in both version targets, rather
+than granting an exemption by archetype. No predicate or effect classification changed. Rowan accepted the correction in
+message 924f142f; Fable confirmed both targets in b651066e. Fable, Morrow, Stall watch,
+Kestrel and the orchestrator editor accepted their affected scopes at def5bef.
+
+Existing composition tests now assert the revised recon trigger, integration-custody
+instruction and bounded verdict record instead of the superseded prose. The prepared
+0.1.8 command sequence now removes retired skills only after de-election. No live application is performed.
 
 ## Current-org application
 

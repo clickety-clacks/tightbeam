@@ -66,7 +66,7 @@
     {
       "path": "guidance/engineering-tenets.md",
       "before_sha256": "8436878ba6cbb4bc033c152b4e18795da53c5847c6cfac7823adc27b57a0c612",
-      "after_sha256": "b58217b33fc8dcbcc3317573fbfede650cf40b7d57fc579c26304f70d17d1417"
+      "after_sha256": "72b9e768952b8ea46688b8eb7f3dd6f70adef239dbb834548fe52b5b9f789f0d"
     },
     {
       "path": "guidance/golden-rule.md",

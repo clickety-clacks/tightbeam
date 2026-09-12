@@ -262,7 +262,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert manual =~ heading
     assert manual =~ "Carry only\nto authorized destinations"
     refute manual =~ "The default is both active lines"
-    assert Regex.match?(~r/Commission\s+integration\s+when\s+delivery\s+requires\s+it/, manual)
+    assert manual =~ "Reuse capable integration custody; create it when needed"
     assert manual =~ "A recorded dependency retains ownership"
     refute manual =~ "No row holds a release line and no verb binds one"
     refute manual =~ ~s("done awaiting target" and "candidate remains unintegrated")
@@ -288,7 +288,7 @@ defmodule Tightbeam.ArchetypesTest do
       served = Identity.snapshot_at!(ctx.base_dir, revision, role, harness).guidance
 
       assert length(String.split(served, heading)) == 2
-      assert Regex.match?(~r/Commission\s+integration\s+when\s+delivery\s+requires\s+it/, served)
+      assert served =~ "Reuse capable integration custody; create it when needed"
       refute Regex.match?(~r/^#include/m, served)
     end
   end
@@ -352,8 +352,8 @@ defmodule Tightbeam.ArchetypesTest do
         :codex
       )
 
-    assert coder.guidance =~ "Diagnose a consequential bug before patching it"
-    assert coder.guidance =~ "not for every repair"
+    assert coder.guidance =~ ~r/Request focused recon when\s+you need an independent investigator/
+    assert coder.guidance =~ "for a consequential uncertainty"
 
     product_owner =
       Identity.snapshot_at!(
@@ -440,9 +440,9 @@ defmodule Tightbeam.ArchetypesTest do
     for role <- ~w(reviewer-code reviewer-spec) do
       guidance = Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).guidance
 
-      assert guidance =~ "The verdict note has a 2,000-character cap"
-      assert guidance =~ "report artifact's id and SHA-256"
-      assert guidance =~ ~r/Do not copy the clause table into the\s+note/
+      assert guidance =~ "The note has a 2,000-character cap"
+      assert guidance =~ "report's artifact id and SHA-256"
+      assert guidance =~ "--note \"<summary + art_id + sha256>\""
       assert guidance =~ "tightbeam artifact-record --kind report"
       assert guidance =~ "--work-item <workItemId>"
     end
