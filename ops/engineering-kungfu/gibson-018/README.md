@@ -83,6 +83,11 @@ establish a supported installed CLI edit operation or permission to change live 
 The command plan, exact hashes and execution logs remain private operator evidence.
 No live application was performed.
 
+The 7d19a52 context, frugality and lifetime refinement changed six overlay files.
+Those edits passed the released identity API and all 18 resulting compositions,
+including the three local policy fragments and three-rule validation. This updates
+the content proof without changing the previously verified 49-operation sequence.
+
 Therefore no automatic apply, tune, reparent, wake or stand-down script is supplied.
 Do not bypass the supported interface with direct database writes, path traversal,
 an invented relearn conflict, an unreleased binary or a gateway restart.

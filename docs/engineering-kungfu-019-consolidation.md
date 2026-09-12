@@ -445,6 +445,18 @@ idle timeout, automatic cleanup service or new supervision cadence is introduced
 Both the portable guidance and prepared installed-build overlay receive these rules.
 The 0.1.8 mechanisms remain distinct and no live retirement or tuning is performed.
 
+At 7d19a52, Rowan, Fable, the orchestrator editor, Morrow and Stall watch accepted
+this revision in their stated scopes. Formatting, 134 focused tests and packaging
+passed on eezo. Six changed overlay files passed the released identity-edit API
+against exact installed source fdb3db5, followed by all 18 final compositions and
+three-rule validation in a disposable fixture. The earlier 49-operation ordering
+proof still covers the unchanged operation kinds and de-election sequence.
+
+Stall watch's disk-custody observation adds no general cleanup authority. Existing
+repository guidance already assigns cleanup after required output is preserved and
+no remaining obligation needs the clone. Retirement retains its handoff duty; this
+change neither deletes workspaces nor treats an idle count as proof of abandonment.
+
 ## Current-org application
 
 Prepare a compatible 0.1.8 identity overlay separately from the shipped bundle.
