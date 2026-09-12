@@ -6675,6 +6675,121 @@ defmodule Tightbeam.GatewayTest do
     assert AdminProjection.stamped_item(ctx.db, "identity", "served") == stamp
   end
 
+  test "identity staleness alarm counts only active post-publication turns and dedupes by revision day",
+       ctx do
+    base_dir = role_test_base("identity-staleness-alarm")
+    assert :initialized = Identity.init!(base_dir)
+    :ok = Tightbeam.AdminProjection.bootstrap_served(ctx.db, base_dir)
+    ensure_main_session(ctx.db, "flynn")
+    ensure_global_registry()
+
+    {:ok, [[item, published_at]]} =
+      DB.query(
+        ctx.db,
+        "SELECT item, updatedAt FROM admin_projection_versions " <>
+          "WHERE resource = 'identity' AND primaryKey = 'served'"
+      )
+
+    %{"liveRevision" => revision} = JSON.decode!(item)
+    now = System.system_time(:millisecond)
+
+    assert :current = Gateway.identity_staleness_alarm_for_test(ctx.db, now)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    create = fn key, stamped_revision ->
+      session = create_session(ctx.db, key, "flynn")
+
+      if is_binary(stamped_revision),
+        do: Org.set_identity_revision(ctx.db, key, stamped_revision)
+
+      session
+    end
+
+    terminal_turn = fn session, started_at ->
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: session.session_key,
+          message_id: "identity-staleness-#{session.session_key}-#{started_at}",
+          origin: "user:flynn",
+          prompt: "fixture"
+        })
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE turns SET status = 'delivered', startedAt = ?2, endedAt = ?2 WHERE seq = ?1",
+          [seq, started_at]
+        )
+
+      seq
+    end
+
+    late_one = create.("agent:identity-late-one", "older-revision")
+    late_two = create.("agent:identity-late-two", nil)
+    quiet = create.("agent:identity-quiet", "older-revision")
+    early = create.("agent:identity-early", "older-revision")
+    current = create.("agent:identity-current", revision)
+    retired = create.("agent:identity-retired", "older-revision")
+
+    first_seq = terminal_turn.(late_one, published_at)
+    terminal_turn.(late_two, published_at + 1)
+    terminal_turn.(early, published_at - 1)
+    terminal_turn.(current, published_at + 1)
+    terminal_turn.(retired, published_at + 1)
+    Org.retire(ctx.db, retired.session_key, "test:identity-staleness", now)
+
+    assert Org.get(ctx.db, quiet.session_key).state == "active"
+
+    assert :ok =
+             Gateway.terminal_publisher_for_test(ctx.db).(%{
+               session_key: late_one.session_key,
+               message_id: "identity-staleness-publish",
+               status: "delivered",
+               seq: first_seq
+             })
+
+    assert {:ok, [[target, owner, prompt, "process:tightbeam", 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey, ownerUserId, prompt, origin, targetGate FROM wakes"
+             )
+
+    assert target == Org.personal_session_key("flynn")
+    assert owner == "flynn"
+
+    assert prompt ==
+             "Identity staleness: 2 active sessions are late for published revision #{revision}."
+
+    for session <- [late_one, late_two, quiet, early, current, retired] do
+      refute prompt =~ session.session_key
+    end
+
+    assert :already_notified = Gateway.identity_staleness_alarm_for_test(ctx.db, now)
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    next_revision = "next-published-revision"
+    next_published_at = published_at + 10_000
+    next_item = item |> JSON.decode!() |> Map.put("liveRevision", next_revision) |> JSON.encode!()
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE admin_projection_versions SET item = ?1, updatedAt = ?2 " <>
+          "WHERE resource = 'identity' AND primaryKey = 'served'",
+        [next_item, next_published_at]
+      )
+
+    terminal_turn.(late_one, next_published_at)
+
+    assert {:scheduled, 1, ^next_revision} =
+             Gateway.identity_staleness_alarm_for_test(ctx.db, now)
+
+    assert {:scheduled, 1, ^next_revision} =
+             Gateway.identity_staleness_alarm_for_test(ctx.db, now + 86_400_000)
+
+    assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
   test "learn and unlearn reload all law and unlearn names durable references", ctx do
     case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
       {:ok, _pid} -> :ok

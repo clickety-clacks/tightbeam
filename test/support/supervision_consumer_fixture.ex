@@ -808,7 +808,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
 
     assert main == ctx.main.session_key
     assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", first)
-    assert length(Wakes.list_pending(ctx.db)) == 1
+    assert Enum.count(Wakes.list_pending(ctx.db), &(&1.assignment_id == "asg_1")) == 1
 
     fire_all_pending(ctx.db, consume)
     insert_entitlement!(ctx.db, "asg_1", generation: 2, due_at: 0)
@@ -817,7 +817,7 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     assert {:escalated, 2, ^main} =
              Supervision.evaluate(ctx.db, ctx.handlers, 0, "holder", second)
 
-    assert length(Wakes.list_pending(ctx.db)) == 1
+    assert Enum.count(Wakes.list_pending(ctx.db), &(&1.assignment_id == "asg_1")) == 1
   end
 
   defp real_consumer_fixture!(ctx, opts \\ []) do
