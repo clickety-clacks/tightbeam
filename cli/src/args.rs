@@ -3351,6 +3351,7 @@ mod tests {
                 "operator-rule",
                 "operator-withdraw",
                 "retire",
+                "session-reparent",
                 "repair-assignment",
                 "revoke-assignment",
                 "reopen-assignment",
