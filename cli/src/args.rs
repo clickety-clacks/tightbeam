@@ -1569,7 +1569,10 @@ fn parse_with_optional_catalog(
             })
         }
         "session-reparent" => {
-            if parsed.positional.len() != 1 || nonempty(flags, "role").is_some() || nonempty(flags, "user").is_some() {
+            if parsed.positional.len() != 1
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
                 return Err("usage: tightbeam session-reparent --session <key> --parent <key> --assignment <id> --key <key>".to_owned());
             }
             Ok(Command::SessionReparent {

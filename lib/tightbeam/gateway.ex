@@ -4199,7 +4199,11 @@ defmodule Tightbeam.Gateway do
   defp caller_in_lineage_above?(_db, _scope, _caller_key, hops) when hops > 32, do: false
 
   defp caller_in_lineage_above?(db, scope, caller_key, hops) do
-    case DB.query(db, "SELECT #{Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1", [scope]) do
+    case DB.query(
+           db,
+           "SELECT #{Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1",
+           [scope]
+         ) do
       {:ok, [[parent]]} when is_binary(parent) ->
         parent == caller_key or caller_in_lineage_above?(db, parent, caller_key, hops + 1)
 

@@ -58,7 +58,9 @@ defmodule Tightbeam.SessionReparent do
 
     with true <- valid_key?(key),
          true <- Enum.all?([child, parent, assignment], &(is_binary(&1) and &1 != "")) do
-      fingerprint = :crypto.hash(:sha256, Jason.encode!([child, parent, assignment])) |> Base.encode16(case: :lower)
+      fingerprint =
+        :crypto.hash(:sha256, JSON.encode!([child, parent, assignment]))
+        |> Base.encode16(case: :lower)
 
       case Idempotency.reparent_result_in_txn(txn, owner, key) do
         %{fingerprint: ^fingerprint, response: response} -> response
@@ -83,28 +85,55 @@ defmodule Tightbeam.SessionReparent do
       else
         event = "trp_" <> Tightbeam.Id.uuid4()
         at = System.system_time(:millisecond)
+
         response = %{
           "eventId" => event,
-          "session" => %{"sessionKey" => child, "originParent" => origin_parent,
-            "previousCurrentParent" => previous_parent, "currentParent" => parent},
-          "assignment" => %{"assignmentId" => assignment, "workItemId" => work_item,
+          "session" => %{
+            "sessionKey" => child,
+            "originParent" => origin_parent,
+            "previousCurrentParent" => previous_parent,
+            "currentParent" => parent
+          },
+          "assignment" => %{
+            "assignmentId" => assignment,
+            "workItemId" => work_item,
             "originOpenerRef" => opener,
             "previousCurrentCoordinationParentRef" => session_ref(previous_coordination),
-            "currentCoordinationParentRef" => session_ref(parent)},
+            "currentCoordinationParentRef" => session_ref(parent)
+          },
           "appliedAt" => at
         }
 
-        Txn.q(txn, """
-        INSERT INTO session_reparent_events
-          (eventId,ownerUserId,childSessionKey,assignmentId,workItemId,
-           originParentSessionKey,previousCurrentParentSessionKey,newCurrentParentSessionKey,
-           originAssignmentOpenerKind,originAssignmentOpenerRef,
-           previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey,
-           cause,principalKind,principalRef,idempotencyKey,requestFingerprint,createdAt)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?8,
-          'owner_topology_correction','user',?12,?13,?14,?15)
-        """, [event,owner,child,assignment,work_item,origin_parent,previous_parent,parent,
-          opener_kind,opener,previous_coordination,"user:" <> owner,key,fingerprint,at])
+        Txn.q(
+          txn,
+          """
+          INSERT INTO session_reparent_events
+            (eventId,ownerUserId,childSessionKey,assignmentId,workItemId,
+             originParentSessionKey,previousCurrentParentSessionKey,newCurrentParentSessionKey,
+             originAssignmentOpenerKind,originAssignmentOpenerRef,
+             previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey,
+             cause,principalKind,principalRef,idempotencyKey,requestFingerprint,createdAt)
+          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?8,
+            'owner_topology_correction','user',?12,?13,?14,?15)
+          """,
+          [
+            event,
+            owner,
+            child,
+            assignment,
+            work_item,
+            origin_parent,
+            previous_parent,
+            parent,
+            opener_kind,
+            opener,
+            previous_coordination,
+            "user:" <> owner,
+            key,
+            fingerprint,
+            at
+          ]
+        )
 
         :ok = Idempotency.put_reparent_in_txn(txn, owner, key, fingerprint, event, response)
         response
@@ -115,7 +144,11 @@ defmodule Tightbeam.SessionReparent do
   end
 
   defp child_in_txn(txn, owner, child) do
-    case Txn.q(txn, "SELECT ownerUserId,kind,isBuiltIn,state,spawnedBy FROM sessions WHERE sessionKey=?1", [child]) do
+    case Txn.q(
+           txn,
+           "SELECT ownerUserId,kind,isBuiltIn,state,spawnedBy FROM sessions WHERE sessionKey=?1",
+           [child]
+         ) do
       [[^owner, "custom", 0, "active", origin]] -> {:ok, origin}
       [[^owner, _, _, _, _]] -> {:error, "unsupported_session"}
       _ -> {:error, "not_authorized"}
@@ -131,22 +164,37 @@ defmodule Tightbeam.SessionReparent do
   end
 
   defp assignment_in_txn(txn, owner, child, assignment) do
-    case Txn.q(txn, """
-    SELECT a.holderKey,a.state,a.workItemId,w.ownerUserId,w.state,a.openedByUser,a.openedBySession
-    FROM assignments a LEFT JOIN work_items w ON w.id=a.workItemId WHERE a.id=?1
-    """, [assignment]) do
+    case Txn.q(
+           txn,
+           """
+           SELECT a.holderKey,a.state,a.workItemId,w.ownerUserId,w.state,a.openedByUser,a.openedBySession
+           FROM assignments a LEFT JOIN work_items w ON w.id=a.workItemId WHERE a.id=?1
+           """,
+           [assignment]
+         ) do
       [[^child, "open", item, ^owner, "open", user, session]] ->
-        case Txn.q(txn, "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY id", [child]) do
+        case Txn.q(
+               txn,
+               "SELECT id FROM assignments WHERE holderKey=?1 AND state='open' ORDER BY id",
+               [child]
+             ) do
           [[^assignment]] ->
-            {kind, ref} = if user, do: {"user", "user:" <> user}, else: {"session", "session:" <> session}
+            {kind, ref} =
+              if user, do: {"user", "user:" <> user}, else: {"session", "session:" <> session}
+
             {:ok, item, kind, ref}
-          _ -> {:error, "multiple_open_assignments"}
+
+          _ ->
+            {:error, "multiple_open_assignments"}
         end
-      _ -> {:error, "not_authorized"}
+
+      _ ->
+        {:error, "not_authorized"}
     end
   end
 
   defp acyclic(_txn, nil, _seen), do: :ok
+
   defp acyclic(txn, key, seen) do
     if MapSet.member?(seen, key),
       do: {:error, "cycle_detected"},
@@ -154,10 +202,14 @@ defmodule Tightbeam.SessionReparent do
   end
 
   def current_coordination_parent(db, assignment) do
-    case DB.query(db, """
-    SELECT newCurrentCoordinationParentSessionKey FROM session_reparent_events
-    WHERE assignmentId=?1 ORDER BY eventSeq DESC LIMIT 1
-    """, [assignment]) do
+    case DB.query(
+           db,
+           """
+           SELECT newCurrentCoordinationParentSessionKey FROM session_reparent_events
+           WHERE assignmentId=?1 ORDER BY eventSeq DESC LIMIT 1
+           """,
+           [assignment]
+         ) do
       {:ok, [[parent]]} -> parent
       {:ok, []} -> nil
     end
@@ -167,23 +219,51 @@ defmodule Tightbeam.SessionReparent do
     do: session_ref(current_coordination_parent(db, assignment))
 
   def timeline(db, work_item) do
-    {:ok, rows} = DB.query(db, """
-    SELECT eventSeq,eventId,createdAt,principalRef,cause,childSessionKey,assignmentId,
-      previousCurrentParentSessionKey,newCurrentParentSessionKey,
-      previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey
-    FROM session_reparent_events WHERE workItemId=?1 ORDER BY eventSeq
-    """, [work_item])
+    {:ok, rows} =
+      DB.query(
+        db,
+        """
+        SELECT eventSeq,eventId,createdAt,principalRef,cause,childSessionKey,assignmentId,
+          previousCurrentParentSessionKey,newCurrentParentSessionKey,
+          previousCurrentCoordinationParentSessionKey,newCurrentCoordinationParentSessionKey
+        FROM session_reparent_events WHERE workItemId=?1 ORDER BY eventSeq
+        """,
+        [work_item]
+      )
 
-    Enum.map(rows, fn [seq,id,at,principal,cause,child,assignment,previous,parent,previous_coord,coord] ->
-      %{type: "session_reparent", id: id, at: at, seqTiebreak: seq, principal: principal,
-        cause: cause, sessionKey: child, assignmentId: assignment,
-        previousCurrentParent: previous, currentParent: parent,
+    Enum.map(rows, fn [
+                        seq,
+                        id,
+                        at,
+                        principal,
+                        cause,
+                        child,
+                        assignment,
+                        previous,
+                        parent,
+                        previous_coord,
+                        coord
+                      ] ->
+      %{
+        type: "session_reparent",
+        id: id,
+        at: at,
+        seqTiebreak: seq,
+        principal: principal,
+        cause: cause,
+        sessionKey: child,
+        assignmentId: assignment,
+        previousCurrentParent: previous,
+        currentParent: parent,
         previousCurrentCoordinationParentRef: session_ref(previous_coord),
-        currentCoordinationParentRef: session_ref(coord)}
+        currentCoordinationParentRef: session_ref(coord)
+      }
     end)
   end
 
-  defp valid_key?(key), do: is_binary(key) and String.trim(key) != "" and String.length(key) <= 200
+  defp valid_key?(key),
+    do: is_binary(key) and String.trim(key) != "" and String.length(key) <= 200
+
   defp session_ref(nil), do: nil
   defp session_ref(key), do: "session:" <> key
   defp refusal(code), do: %{ok: false, code: code, message: code}

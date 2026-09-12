@@ -103,21 +103,30 @@ defmodule Tightbeam.Idempotency do
 
   @doc false
   def reparent_result_in_txn(txn, owner, key) do
-    case Txn.q(txn, """
-    SELECT requestFingerprint,canonicalResponse FROM wire_idempotency
-    WHERE ownerUserId=?1 AND operation='session-reparent' AND idempotencyKey=?2
-    """, [owner,key]) do
-      [[fingerprint,response]] -> %{fingerprint: fingerprint, response: Jason.decode!(response)}
+    case Txn.q(
+           txn,
+           """
+           SELECT requestFingerprint,canonicalResponse FROM wire_idempotency
+           WHERE ownerUserId=?1 AND operation='session-reparent' AND idempotencyKey=?2
+           """,
+           [owner, key]
+         ) do
+      [[fingerprint, response]] -> %{fingerprint: fingerprint, response: JSON.decode!(response)}
       [] -> nil
     end
   end
 
   @doc false
   def put_reparent_in_txn(txn, owner, key, fingerprint, event, response) do
-    Txn.q(txn, """
-    INSERT INTO wire_idempotency(ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse)
-    VALUES (?1,'session-reparent',?2,?3,?4,?5)
-    """, [owner,key,event,fingerprint,Jason.encode!(response)])
+    Txn.q(
+      txn,
+      """
+      INSERT INTO wire_idempotency(ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse)
+      VALUES (?1,'session-reparent',?2,?3,?4,?5)
+      """,
+      [owner, key, event, fingerprint, JSON.encode!(response)]
+    )
+
     :ok
   end
 

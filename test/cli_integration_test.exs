@@ -178,6 +178,33 @@ defmodule Tightbeam.CliIntegrationTest do
     }
   end
 
+  test "session reparent crosses the real CLI wire and preserves assignment continuity", ctx do
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+    assert {created, 0} = run.(["work-item-create", "--title", "reparent wire", "--as-user", "flynn"])
+    item = JSON.decode!(created)["id"]
+    assert {assigned, 0} = run.(["assign", "--session", "cli-holder", "--subject", "existing work",
+      "--effect-kind", "coordination", "--work-item", item, "--as-user", "flynn"])
+    assignment = JSON.decode!(assigned)["id"]
+    args = ["session-reparent", "--session", "cli-holder", "--parent", "cli-worker",
+      "--assignment", assignment, "--key", "wire-reparent"]
+    {refused, status} = run.(args)
+    assert status != 0
+    assert refused =~ "user_principal_required"
+    assert {corrected, 0} = run.(args ++ ["--as-user", "flynn"])
+    result = JSON.decode!(corrected)
+    assert result["session"]["currentParent"] == "cli-worker"
+    assert result["session"]["originParent"] == nil
+    assert_receive {:cli_call, %{verb: "session-reparent", principal: {:user, "flynn"}}}
+    assert {retried, 0} = run.(args ++ ["--as-user", "flynn"])
+    assert JSON.decode!(retried) == result
+    assert {:ok, [[nil]]} = DB.query(ctx.db, "SELECT spawnedBy FROM sessions WHERE sessionKey='cli-holder'")
+    assert {:ok, [["flynn", "cli-holder", "open"]]} =
+      DB.query(ctx.db, "SELECT openedByUser,holderKey,state FROM assignments WHERE id=?1", [assignment])
+    assert {finished, 0} = run.(["attest", assignment, "--kind", "completion", "--note", "existing work completed"])
+    assert JSON.decode!(finished)["assignment"]["state"] == "closed"
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='cli-worker'")
+  end
+
   test "typed consequence crosses the real CLI wire with authenticated assignment custody", ctx do
     start_supervised!(
       {Wakes,

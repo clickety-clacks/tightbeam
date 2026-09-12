@@ -1390,7 +1390,14 @@ defmodule Tightbeam.Schema do
 
     validate_activation_epoch!(txn)
 
-    Enum.each(@supervision_liveness_enforcement_objects, fn object ->
+    [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+
+    enforcement_objects =
+      if shape == @reparent_shape,
+        do: reparent_liveness_enforcement_objects(),
+        else: @supervision_liveness_enforcement_objects
+
+    Enum.each(enforcement_objects, fn object ->
       if owned_object_present?(txn, object) do
         validate_owned_object!(txn, object)
       else
@@ -1902,7 +1909,13 @@ defmodule Tightbeam.Schema do
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[stamp]]}
-      when stamp in [@reparent_shape, @firehose_shape, @r1_shape, @o2_shape, @o2_pre_liveness_shape] ->
+      when stamp in [
+             @reparent_shape,
+             @firehose_shape,
+             @r1_shape,
+             @o2_shape,
+             @o2_pre_liveness_shape
+           ] ->
         :ok
 
       {:ok, [[@shape]]} ->
@@ -2101,19 +2114,62 @@ defmodule Tightbeam.Schema do
   end
 
   @doc false
+  # Historical migrations retain their exact DDL. Only the reparent successor
+  # resolves current lineage in the holder-continuation admission trigger.
+  defp reparent_liveness_enforcement_objects do
+    Enum.map(@supervision_liveness_enforcement_objects, fn
+      %{name: "supervision_liveness_sidecar_insert_coherent"} = object ->
+        sql =
+          object.sql
+          |> String.replace(
+            "SELECT sessionKey,spawnedBy FROM sessions",
+            "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions"
+          )
+          |> String.replace(
+            "SELECT ancestor.sessionKey,ancestor.spawnedBy",
+            "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
+          )
+
+        %{object | sql: sql}
+
+      object ->
+        object
+    end)
+  end
+
   def upgrade_session_reparent(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[@reparent_shape]] -> :ok
+             [[@reparent_shape]] ->
+               :ok
+
              [[@firehose_shape]] ->
                :ok = Tightbeam.SessionReparent.migrate_in_txn(txn)
                :ok = Tightbeam.Idempotency.migrate_reparent_in_txn(txn)
-               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3",
-                 [@reparent_shape,System.system_time(:millisecond),@firehose_shape])
-               if Txn.changes(txn) != 1, do: raise(ShapeError, message: "session reparent stamp race")
+
+               trigger =
+                 Enum.find(reparent_liveness_enforcement_objects(), fn object ->
+                   object.name == "supervision_liveness_sidecar_insert_coherent"
+                 end)
+
+               :ok = Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+               :ok = Txn.exec(txn, trigger.sql)
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                 @reparent_shape,
+                 System.system_time(:millisecond),
+                 @firehose_shape
+               ])
+
+               if Txn.changes(txn) != 1,
+                 do: raise(ShapeError, message: "session reparent stamp race")
+
                [] = Txn.q(txn, "PRAGMA foreign_key_check")
                :ok
-             rows -> raise ShapeError, message: "incompatible session reparent predecessor: #{inspect(rows)}"
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible session reparent predecessor: #{inspect(rows)}"
            end
          end) do
       {:ok, :ok} -> :ok
@@ -2124,7 +2180,13 @@ defmodule Tightbeam.Schema do
   defp upgrade_o2(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[stamp]]}
-      when stamp in [@reparent_shape, @firehose_shape, @r1_shape, @o2_shape, @o2_pre_liveness_shape] ->
+      when stamp in [
+             @reparent_shape,
+             @firehose_shape,
+             @r1_shape,
+             @o2_shape,
+             @o2_pre_liveness_shape
+           ] ->
         :ok
 
       {:ok, [[predecessor]]} when predecessor in [@shape, @pre_liveness_shape] ->

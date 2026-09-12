@@ -308,9 +308,18 @@ defmodule Tightbeam.ExecutionMap do
       origin: %{principal: principal(item), created_by: created_by(item)},
       creation_context: %{recorded: item.context_known, turn_seq: item.created_in_turn_seq},
       parent: Map.fetch!(world.parents, item.id),
-      current_coordination: set |> Enum.map(&Map.fetch!(world.assignments_by_id, &1)) |> Enum.filter(&(&1.state == "open")) |> Enum.sort_by(& &1.id) |> Enum.map(fn a ->
-        %{assignment_id: a.id, holder_key: a.holder_key, current_coordination_parent_ref: a.current_coordination_parent_ref}
-      end),
+      current_coordination:
+        set
+        |> Enum.map(&Map.fetch!(world.assignments_by_id, &1))
+        |> Enum.filter(&(&1.state == "open"))
+        |> Enum.sort_by(& &1.id)
+        |> Enum.map(fn a ->
+          %{
+            assignment_id: a.id,
+            holder_key: a.holder_key,
+            current_coordination_parent_ref: a.current_coordination_parent_ref
+          }
+        end),
       finished_at: finished_at(world, item),
       assignments: assignment_counts(world, set),
       jobs: jobs(world, set),
@@ -711,7 +720,8 @@ defmodule Tightbeam.ExecutionMap do
         outcome: outcome,
         opened_at: opened,
         closing_attest_id: closing,
-        current_coordination_parent_ref: Tightbeam.SessionReparent.current_coordination_ref(db, id)
+        current_coordination_parent_ref:
+          Tightbeam.SessionReparent.current_coordination_ref(db, id)
       }
     end)
   end

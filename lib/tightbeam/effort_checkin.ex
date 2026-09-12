@@ -145,13 +145,7 @@ defmodule Tightbeam.EffortCheckin do
   def valid_workdir_root(root) when is_binary(root) do
     segments = Path.split(root)
 
-    coordination_parent = Tightbeam.SessionReparent.current_coordination_parent(txn, assignment.id)
-
     cond do
-      coordination_parent ->
-        holder = session_in_txn(txn, assignment.holder_key)
-        route_session(txn, coordination_parent, holder.owner_user_id, 0, assignment.holder_key)
-
       Path.type(root) == :absolute ->
         invalid_root()
 
@@ -1292,7 +1286,14 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp initial_expecter(txn, assignment) do
+    coordination_parent =
+      Tightbeam.SessionReparent.current_coordination_parent(txn, assignment.id)
+
     cond do
+      coordination_parent ->
+        holder = session_in_txn(txn, assignment.holder_key)
+        route_session(txn, coordination_parent, holder.owner_user_id, 0, assignment.holder_key)
+
       assignment.opened_by_user ->
         %{
           session_key: nil,
@@ -1306,7 +1307,13 @@ defmodule Tightbeam.EffortCheckin do
         holder = session_in_txn(txn, assignment.holder_key)
 
         if holder.current_parent do
-          route_session(txn, holder.current_parent, holder.owner_user_id, 1, assignment.holder_key)
+          route_session(
+            txn,
+            holder.current_parent,
+            holder.owner_user_id,
+            1,
+            assignment.holder_key
+          )
         else
           %{
             session_key: nil,

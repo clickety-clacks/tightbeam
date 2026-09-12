@@ -9,7 +9,9 @@ defmodule Tightbeam.Org do
 
   @doc "Current lineage parent, with immutable spawning provenance as the fallback."
   def current_parent(db, session_key) do
-    case DB.query(db, "SELECT #{current_parent_sql("s")} FROM sessions s WHERE s.sessionKey=?1", [session_key]) do
+    case DB.query(db, "SELECT #{current_parent_sql("s")} FROM sessions s WHERE s.sessionKey=?1", [
+           session_key
+         ]) do
       {:ok, [[parent]]} -> parent
       {:ok, []} -> nil
     end
@@ -23,6 +25,7 @@ defmodule Tightbeam.Org do
       "WHERE rp.childSessionKey=#{session_alias}.sessionKey ORDER BY rp.eventSeq DESC LIMIT 1), " <>
       "#{session_alias}.spawnedBy)"
   end
+
   alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Model
 
