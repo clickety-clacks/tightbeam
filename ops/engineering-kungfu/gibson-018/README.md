@@ -1,16 +1,48 @@
 # Apply the adopted engineering practice to Gibson 0.1.8
 
-Status, 12 September: compatible guidance published; existing-session migration
-pending. The 58 supported CLI edits and removals published identity revision
+Status, 12 September: compatible guidance published and eligible existing sessions
+migrated. The 58 supported CLI edits and removals published identity revision
 `fd24c468022fe09b338744639b12d7e4cfe29f37`. The default archetype changed from
-`default` to `orchestrator`. Existing sessions have not been refreshed, retuned or
-reparented by this consolidation. The old rule file remains active. These files
+`default` to `orchestrator`. The application record below distinguishes session
+refresh, runtime selection and adopted delivery routing. Historical parent edges
+remain unchanged and the old rule file remains active. These files
 are organization operations material, outside the shipped kungfu bundle.
 
 Mike's latest instruction is to adapt the running 0.1.8 org now so it can finish
 0.1.9 work. The development changes target the 0.1.9 branch; no release cut or
-installation is part of this application. His earlier no-turn restriction still
-limits operations that enter session execution lanes.
+installation is part of this application. Mike subsequently answered "do it" to
+the migration and resumed-work sequence, lifting the blanket no-turn restriction
+for that scope. Specific stop orders and publication holds remain.
+
+## Session migration and adopted routing
+
+At the 16:46 UTC application boundary, 50 existing sessions have the published
+identity, including one with a pending duty but no open assignment. 37 existing
+sessions received model, effort or harness changes. Model and reasoning changes follow actual duties and preserve capable
+conversations where suitable. Protected sessions, unavailable hosts and dormant
+sessions without a current assignment are deferred; no wake was sent solely to
+refresh a dormant session. Private readbacks and per-command outcomes are in
+`migration-runtime-actions.jsonl` and `migration-current-summary.json` in the
+consolidation evidence directory.
+
+The .9 owner adopted one new `orchestrator:019-runtime-delivery` on Codex Sol/high,
+opened its assignment on the existing umbrella, and retained eleven historical
+lane assignments with explicit material-event routing. It also retains the interim
+product-intent address while PO: Tightbeam is under C5. The new orchestrator opens
+new worker and review assignments. Receipt `att_f7ac8afa` records that decision;
+`att_e2d7bb52` and `att_cb433c5c` supersede covered guidance authorship while
+preserving runtime, integration and acceptance work. Agents that retain those
+obligations remain staffed.
+
+The dependency patrol's Fable-to-Opus switch returned an unhandled model-readback
+error. A subsequent supported switch to Codex Sol/high succeeded with cleanup
+verified and engine context reset; `att_05ff1a71` confirms recovery from durable
+records. One Agentd PO migration notice received a provider safety refusal; its
+runtime fields changed, but uptake is not established. These outcomes are distinct
+from a successful identity publication. During resumed work, database query timeouts
+at 16:37 and 16:41 UTC interrupted agent turns and restarted internal processes.
+No service restart was issued by this lead. Preserve partial output and reconcile
+failed turns before recovery; publishing guidance does not establish runtime health.
 
 The portable change is on `kungfu/consolidated-019-20260911`. Its design and
 adjudications are in `docs/engineering-kungfu-019-consolidation.md`. This directory
@@ -64,9 +96,10 @@ prepared argv's `--remove` spelling was corrected before executing any removal.
 
 ## No-turn boundary and preparation evidence
 
-Tightbeam can run turns. Mike permits reading agents and durable state but forbids
-operations that need or can trigger turns during this phase. Gateway power remains
-his decision. All database inspection uses a read-only connection.
+During preparation, Mike permitted reading agents and durable state but forbade
+operations that need or can trigger turns. The subsequent migration authorization
+is recorded above. Gateway power remains his decision. All direct database
+inspection uses a read-only connection.
 
 Source inspection establishes the following limits:
 
@@ -111,9 +144,14 @@ an invented relearn conflict, an unreleased binary or a gateway restart.
 
 ## Protected custody and availability
 
-Keep the five sessions identified by `att_f92abeaf-6b45-4ef3-bb49-810e05eca002`
-out of routing, wakes, tuning and refresh until their recovery owner resolves the
-queued-turn replay risk. This includes Main. Do not use Main as a fallback worker.
+Recovery owner `att_85eb7466-1f05-47b8-8124-ef037af77697` clears the five-session
+replay-risk hold after checking the terminalized turns. Mike's separate C5 order,
+message `s_d88e0dab-ebb0-4297-98f1-3c4776d379f2`, remains in force for Main,
+`s_5ae8a4b5`, `s_fde9b2be`, `s_11812a8d`, `s_6e0a78e9`, `s_7169b2a6` and
+`s_7fa87968`. Do not contact that set or use Main as a fallback worker.
+`s_0fa0faea` is outside C5 and was refreshed after the owner's clearance.
+The quiet refresh/tune of `s_7fa87968` preceded recovery of its original C5 citation;
+readback found no new turn and its migration notice remains deferred.
 
 The recovery owner lifted the release integrator's former park in
 `att_1ca8c736-abe0-451a-90cc-645daaf24f8d` and resumed its existing acceptance
@@ -132,11 +170,11 @@ holds or dependencies are resolved. A session left on its old harness is not evi
 that a prior restaffing request was forgotten. Other sessions omitted from that
 incident-specific restaffing are not thereby permanently protected from this migration.
 
-Codex on Gibson has an open rate-limit incident. Racter's two provider routes are
-reported unavailable, and the recovery instruction forbids resident agent staffing
-or probes there. SSH test execution on its isolated test area is a separate activity.
-A Claude candidate is not proven available merely because its catalog entry exists.
-Recheck live disposition through allowed evidence before choosing a route.
+Codex on Gibson is producing useful turns again; the patrol verified restoration
+fact 4138 and closed its old capacity watch in `att_05ff1a71`. The former broad
+Claude fallback inventory is stale. Fable has a recorded exhausted quota. Racter's
+resident agent staffing/probe restriction remains; SSH test execution on its isolated
+test area is separate. A catalog entry alone does not prove provider availability.
 
 ## Execution order after preparation
 
@@ -218,5 +256,5 @@ rule file remained untouched through the supported sequence, then was copied onl
 inside the disposable fixture for validation. The proof used no gateway, live
 identity, CLI operation or inference. Evidence is `proof-1a9ca30-018.log` in the
 consolidation work directory. That rehearsal preceded the live publication recorded
-at the top of this document; existing-session migration and the rule target remain
-unapplied.
+at the top of this document. The rule target and explicitly deferred session
+operations remain unapplied.

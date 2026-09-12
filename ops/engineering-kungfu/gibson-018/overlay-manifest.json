@@ -1,7 +1,7 @@
 {
   "identity_base": "08262823f065561977c5cf196345d59922b760e5",
   "source_revision": "a976fea",
-  "state": "guidance-published-session-migration-pending",
+  "state": "eligible-session-migration-applied-with-explicit-deferrals",
   "files": [
     {
       "path": "archetypes/coder.toml",
@@ -456,11 +456,29 @@
       "before": "default",
       "after": "orchestrator"
     },
-    "existing_session_refresh": "not-applied",
-    "existing_model_harness_changes": "not-applied",
-    "custody_changes": "not-applied",
+    "existing_session_refresh": {
+      "state": "eligible-current-duty-holders-applied",
+      "count": 50,
+      "remaining": "protected, unavailable, or dormant sessions deferred"
+    },
+    "existing_model_harness_changes": {
+      "state": "applied-to-selected-current-duty-holders",
+      "count": 37,
+      "selection": "Current duty and capability, preserve qualified context; Fable-exhausted patrol moved to Codex Sol with fresh context"
+    },
+    "custody_changes": {
+      "state": "new-delivery-orchestrator-and-interim-routing-adopted",
+      "receipt": "att_f7ac8afa-175b-4a8c-8422-0eaa07523517",
+      "historical_reparenting": "none"
+    },
     "rule_application": "deferred-no-supported-cli-authoring-verb",
     "service_change": "none",
-    "database_direct_writes": "none"
+    "database_direct_writes": "none",
+    "migration_turn_authority": "Mike answered do it to migration and resumed eligible work on 2026-09-12; specific holds retained",
+    "uptake_limitations": [
+      "Agentd PO provider refused migration notice; identity/runtime fields are not proof of uptake"
+    ],
+    "runtime_evidence": "Private migration-runtime-actions.jsonl and migration-current-summary.json; README records preserved limits",
+    "runtime_health": "DB query timeouts during resumption interrupted turns; preserve partial effects and verify recovery. Migration is not runtime-health proof."
   }
 }

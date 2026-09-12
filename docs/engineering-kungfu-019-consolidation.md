@@ -15,11 +15,12 @@ compatible application to Gibson's current org, future model/harness ringdown, r
 of existing agents and best-effort repair of parentage and messaging.
 
 That direct instruction is the authority. No Tightbeam ruling or work item was minted
-as a substitute for it during the no-turn phase. The later restriction remains explicit:
+as a substitute for it during the no-turn phase. That phase's restriction was explicit:
 "you can read agents and substrate but nothing that needs turns". Source authoring,
-external review and isolated validation continue within that commission. Live application
-needs the concrete maintenance and resumption conditions described in the local plan;
-it is not authorized to trigger turns during this phase.
+external review and isolated validation continued within that commission. Mike later
+answered "do it" to the migration and resumed-work sequence on 12 September. That
+lifts the blanket no-turn restriction for this scope; specific stop orders,
+publication holds and the no-release/no-install boundary remain.
 
 The spec-writer contribution has one implementation owner, this consolidation lead.
 Fable gave the patch to this branch and explicitly stood down separate implementation
@@ -540,11 +541,23 @@ best available topology to the existing 0.1.8 org now to help finish that work.
 
 The supported guidance publication is complete at live identity revision
 `fd24c468022fe09b338744639b12d7e4cfe29f37`, with the default archetype changed to
-`orchestrator`. Existing-session refresh, model/harness tuning and custody changes
-remain pending under the earlier no-turn restriction. The released CLI cannot author
-the prepared rule file, so the old rules remain active. This is partial application,
-not a claim that the org has already changed topology. The overlay manifest records
-each published file separately from the deferred rule target.
+`orchestrator`. After Mike authorized migration turns, 50 existing sessions were
+refreshed and 37 had their model, effort or harness changed. Supported model changes preserve capable conversations where suitable;
+the dependency patrol switched from quota-exhausted Fable to Sol and verified its
+recovery from durable records. One Agentd PO notice met a provider safety refusal,
+so its uptake is not claimed. Dormant, unavailable and protected sessions remain
+explicitly deferred. The released CLI cannot author the prepared rule file, so the
+old rules remain active.
+
+The .9 owner adopted a Sol/high delivery orchestrator under its existing umbrella,
+with real session ancestry and an assignment opened by that owner. It retains
+historical assignments through an explicit material-event routing agreement and
+holds the interim product-intent address while the existing PO is stopped. New
+workers and reviews belong under the delivery orchestrator. `att_f7ac8afa` records
+the adopted arrangement, not a rewritten historical parent edge. `att_e2d7bb52`
+and `att_cb433c5c` record bounded guidance supersession and preserve runtime work.
+The external consolidation lead retains the separate .9 reparent implementation
+continuation. No duplicate implementation was delegated to the new subtree.
 
 Fable accepted the explicit PO `operator-ask` change at `a976fea`/`a1615c0` in
 message `493a0738-c4e6-49de-8e31-61fcf5a544a7`; Morrow accepted it in
@@ -569,10 +582,10 @@ Do not close that umbrella or retire its owners merely because
 this branch replaces the guidance implementation. Record the replaced scope and keep
 every remaining obligation accountable.
 
-Tightbeam can run turns even during this external consolidation. Read agents and
-substrate, but do not initiate operations that need or can trigger Tightbeam turns.
-Prove a runtime action does not trigger turns before considering it; otherwise defer
-it until the user explicitly resumes that phase. Do not change gateway power state.
+Mike authorized migration and resumed eligible turns on 12 September. Preserve his
+separate C5 no-contact order and applicable product, host and publication holds.
+Recovery owner `att_85eb7466` clears the distinct five-session replay-risk hold;
+four of those sessions remain covered by C5. Do not change gateway power state.
 Never edit the live database directly. No unreleased binary is installed on Gibson.
 
 After the authorized application and resumption, give agents one concise notice naming
