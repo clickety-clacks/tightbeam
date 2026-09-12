@@ -132,8 +132,8 @@
     {
       "path": "guidance/engineering-tenets.md",
       "before_sha256": "8436878ba6cbb4bc033c152b4e18795da53c5847c6cfac7823adc27b57a0c612",
-      "after_sha256": "402a57ff5cc9655067bfd1ed57ee6d60fc7e248b779801c73733f159165e3b39",
-      "application_state": "published",
+      "after_sha256": "5610795b4c8f894f509cd04567b3c326bf3feb8e78e2f72581433bdb8ad877eb",
+      "application_state": "reporting-amendment-prepared",
       "observed_sha256": "402a57ff5cc9655067bfd1ed57ee6d60fc7e248b779801c73733f159165e3b39"
     },
     {
@@ -181,7 +181,7 @@
     {
       "path": "guidance/operating-manual.md",
       "before_sha256": "793b250ea0c7a997cb947efd11f2b571ccb3825cb66f9da51dc43b4e450c8afa",
-      "after_sha256": "679e340784e90bdaa42589a7fcb417f18ee04fe6cb8eb94cbd1a7561d0e4f896",
+      "after_sha256": "ce60694e698bcb14477c084e113051bc176b4ce328aa115ba1104b75b0907405",
       "application_state": "reporting-amendment-prepared",
       "observed_sha256": "af82c39008699b1b08e016ce75e620115e3da1d98bc237fe6b0f2f00f7bef08f"
     },
@@ -487,9 +487,14 @@
     "state": "prepared",
     "files": [
       {
+        "path": "guidance/engineering-tenets.md",
+        "before_sha256": "402a57ff5cc9655067bfd1ed57ee6d60fc7e248b779801c73733f159165e3b39",
+        "after_sha256": "5610795b4c8f894f509cd04567b3c326bf3feb8e78e2f72581433bdb8ad877eb"
+      },
+      {
         "path": "guidance/operating-manual.md",
         "before_sha256": "af82c39008699b1b08e016ce75e620115e3da1d98bc237fe6b0f2f00f7bef08f",
-        "after_sha256": "679e340784e90bdaa42589a7fcb417f18ee04fe6cb8eb94cbd1a7561d0e4f896"
+        "after_sha256": "ce60694e698bcb14477c084e113051bc176b4ce328aa115ba1104b75b0907405"
       },
       {
         "path": "guidance/orchestrator.md",

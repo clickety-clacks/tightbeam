@@ -607,10 +607,12 @@ micromanagement. He then directed: "make changes. merge to 0.1.9, and the runnin
 ask affected agents to re-read their guidance". This external conversation is the
 authority for this amendment; it does not authorize a release or install.
 
-The operating manual owns the reporting boundary and the distinction between
-information and an action request. Orchestrator guidance names executive, product and
-feature scope and delegates team design and staffing with the outcome. Team-planner
-uses those existing homes when designing responsibility and authority. The compatible
+The neutral operating manual owns the distinction between information and an action
+request. Engineering expectations own the product-to-executive reporting boundary;
+neutral guidance does not prescribe the engineering topology. Orchestrator guidance
+names executive, product and feature scope and delegates team design and staffing with
+the outcome. Team-planner uses those existing homes when designing responsibility and
+authority. The compatible
 0.1.8 overlay carries the same amendment without teaching new runtime behavior.
 Existing delegation briefs must agree with it; a product orchestrator still receives
 material product information. The change adds no staffing gate or exception-only

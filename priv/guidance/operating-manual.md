@@ -63,11 +63,8 @@ the affected outcome and changed fact. Distinguish information from a request fo
 decision or action; a useful report need not ask the recipient to intervene.
 
 Carry upward the consequences relevant to the parent's responsibilities. Receiving a
-report does not itself require forwarding it. The product orchestrator maintains the
-product delivery picture; material product information normally stops there. Involve
-the executive root for cross-product consequences, decisions beyond product authority,
-and consolidated outcomes or changed commitments relevant to the user. Keep detailed
-evidence available in the record without copying it into every ancestor's context.
+report does not itself require forwarding it. Keep detailed evidence available in the
+record without copying it into every ancestor's context.
 
 Use direct specialist conversation for questions; notify delivery ownership when an
 answer changes its commitments. Route product-intent questions to the addressed PO.
