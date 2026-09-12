@@ -2018,37 +2018,37 @@ mod tests {
 
     #[test]
     fn session_reparent_preserves_opaque_keys_and_requires_explicit_retry_key() {
-    assert_eq!(
-        body(&[
-            "session-reparent",
-            "--session",
-            "child with space",
-            "--parent",
-            "parent",
-            "--assignment",
-            "asg_one",
-            "--key",
-            "correction",
-            "--as-user",
-            "owner"
-        ]),
-        r#"{"asUser":"owner","verb":"session-reparent","params":{"sessionKey":"child with space","parentSessionKey":"parent","assignmentId":"asg_one","idempotencyKey":"correction"}}"#
-    );
-    for missing in ["--session", "--parent", "--assignment", "--key"] {
-        let mut args = vec!["session-reparent"];
-        for (flag, value) in [
-            ("--session", "child"),
-            ("--parent", "parent"),
-            ("--assignment", "asg_one"),
-            ("--key", "correction"),
-        ] {
-            if flag != missing {
-                args.extend([flag, value]);
+        assert_eq!(
+            body(&[
+                "session-reparent",
+                "--session",
+                "child with space",
+                "--parent",
+                "parent",
+                "--assignment",
+                "asg_one",
+                "--key",
+                "correction",
+                "--as-user",
+                "owner"
+            ]),
+            r#"{"asUser":"owner","verb":"session-reparent","params":{"sessionKey":"child with space","parentSessionKey":"parent","assignmentId":"asg_one","idempotencyKey":"correction"}}"#
+        );
+        for missing in ["--session", "--parent", "--assignment", "--key"] {
+            let mut args = vec!["session-reparent"];
+            for (flag, value) in [
+                ("--session", "child"),
+                ("--parent", "parent"),
+                ("--assignment", "asg_one"),
+                ("--key", "correction"),
+            ] {
+                if flag != missing {
+                    args.extend([flag, value]);
+                }
             }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
         }
-        assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
     }
-}
 
     #[test]
     fn builds_harness_process_list_request() {
