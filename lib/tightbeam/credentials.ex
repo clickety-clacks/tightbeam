@@ -529,6 +529,7 @@ defmodule Tightbeam.Credentials do
       with :ok <- state.gate.(provider),
            :ok <- state.stop.(provider),
            {:ok, credential} <- Map.fetch!(state.onboarders, provider).(state),
+           :ok <- prepare_staged_activation(state, provider, :subscription),
            :ok <- write_credential!(state, provider, credential) do
         case state.start.(provider, :subscription) do
           :ok ->
