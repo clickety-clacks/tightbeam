@@ -189,31 +189,34 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
   end
 
-  test "an absent credential store is missing rather than unreadable", ctx do
-    store = Path.join([ctx.base, "homes", "eezo", "codex"])
+  test "an absent harness-home credential is missing", ctx do
+    credential = Credentials.credential_path(ctx.base, "eezo", :openai)
+    metadata = Path.join([Path.dirname(credential), ".tightbeam", "credential.json"])
     {:ok, server} = start_credentials(name: nil, base_dir: ctx.base, machine: "eezo")
 
-    refute File.exists?(store)
+    refute File.exists?(credential)
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+
+    File.mkdir_p!(Path.dirname(metadata))
+    File.write!(metadata, JSON.encode!(%{"onboarded" => true, "kind" => "api_key"}))
+    assert Credentials.kind_at(ctx.base, "eezo", :openai) == :none
   end
 
-  test "a symlinked credential store refuses with its path and actual shape", ctx do
-    store = Path.join([ctx.base, "homes", "eezo", "codex"])
-    target = Path.join(ctx.base, "symlink-target")
-    metadata = Path.join([target, ".tightbeam", "credential.json"])
-    File.mkdir_p!(Path.dirname(metadata))
-    File.write!(Path.join(target, "auth.json"), ~S({"token":"present"}))
-    File.write!(metadata, ~S({"provider":"openai","onboarded":true}))
-    File.mkdir_p!(Path.dirname(store))
-    File.ln_s!(target, store)
+  test "a stale legacy store and a credential symlink are not authority", ctx do
+    legacy = Path.join([ctx.base, "auth", "codex", "auth.json"])
+    target = Path.join(ctx.base, "legacy-token")
+    credential = Credentials.credential_path(ctx.base, "eezo", :openai)
+    File.mkdir_p!(Path.dirname(legacy))
+    File.write!(legacy, ~S({"token":"stale"}))
+    File.write!(target, ~S({"token":"outside-home"}))
+    File.mkdir_p!(Path.dirname(credential))
+    File.ln_s!(target, credential)
 
     {:ok, server} = start_credentials(name: nil, base_dir: ctx.base, machine: "eezo")
 
-    reason =
-      {:credential_store_unreadable, %{path: store, found: :symlink, expected: :directory}}
-
-    assert Credentials.status(:openai, server) == {:needs_onboarding, reason}
-    assert Credentials.kind(:openai, server) == {:error, reason}
+    assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
+    assert Credentials.kind(:openai, server) == :none
+    assert File.read!(legacy) == ~S({"token":"stale"})
   end
 
   test "corrupt credential metadata refuses with its path and expected shape", ctx do
@@ -271,7 +274,7 @@ defmodule Tightbeam.CredentialsTest do
     assert File.read!(store) == "runtime-owned"
   end
 
-  test "expiry is compared only at read seams and schedules no timer", ctx do
+  test "stored expiry is never treated as credential health", ctx do
     {:ok, server} =
       start_credentials(
         name: nil,
@@ -290,7 +293,7 @@ defmodule Tightbeam.CredentialsTest do
     assert {:messages, []} = Process.info(server, :messages)
 
     :sys.replace_state(server, fn state -> %{state | now: fn -> 101 end} end)
-    assert Credentials.status(:anthropic, server) == {:needs_onboarding, :expired}
+    assert Credentials.status(:anthropic, server) == :onboarded
     assert {:messages, []} = Process.info(server, :messages)
   end
 
@@ -1372,9 +1375,10 @@ defmodule Tightbeam.CredentialsTest do
       assert Credentials.status(:anthropic, server) == :onboarded
       assert Credentials.kind(:anthropic, server) == :api_key
       assert Credentials.kind_at(ctx.base, :anthropic) == :api_key
+      assert Credentials.kind_at(ctx.base, machine, :anthropic) == :api_key
     end
 
-    test "a subscription banks with its kind and keeps its expiry", ctx do
+    test "a subscription banks with its kind and no inferred expiry", ctx do
       {:ok, server} = start_credentials(name: nil, base_dir: ctx.base, machine: "eezo")
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
@@ -1389,7 +1393,7 @@ defmodule Tightbeam.CredentialsTest do
       metadata = credential_metadata(ctx.base, "claude")
 
       assert metadata["kind"] == "subscription"
-      assert is_integer(metadata["expires_at"])
+      refute Map.has_key?(metadata, "expires_at")
       assert metadata["subscription_status"] == "supported"
       assert Credentials.kind(:anthropic, server) == :subscription
     end
@@ -1425,12 +1429,9 @@ defmodule Tightbeam.CredentialsTest do
   # and every session afterwards read "expired", tried to refresh, and died
   # `authentication_failed`. Two coder sessions were killed by it before it was traced.
   #
-  # The writer was never the ceremony. Claude Code OWNS the `.credentials.json` inside a
-  # harness home and rotates it in place; `Homes.sweep_auth/2` harvests that file at every
-  # gateway boot (gateway.ex:193) and `store_harvested/3` wrote the bytes over the SHARED
-  # auth store without ever looking at them. So one agent's hollow home file poisoned the
-  # credential for every agent on the next boot — and the reboot was what re-applied the
-  # poison, which is why restarting never healed it.
+  # The writer is never the ceremony. Claude Code owns the `.credentials.json` inside its
+  # exact harness home and rotates it in place. Tightbeam validates onboarding input before
+  # installing it there, and no later projection copies credential bytes between homes.
   # THE ARTIFACT, NOT AN IDEALISED VERSION OF IT.
   #
   # The key SET is captured from the vendor's own writer, not invented: three independent

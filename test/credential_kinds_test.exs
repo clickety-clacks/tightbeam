@@ -109,7 +109,7 @@ defmodule Tightbeam.CredentialKindsTest do
       assert Credentials.kind_at(ctx.base, :anthropic) == :api_key
     end
 
-    test "a subscription banks with its kind and keeps its expiry", ctx do
+    test "a subscription banks with its kind without inferring expiry", ctx do
       {:ok, server} =
         start_credentials(
           name: nil,
@@ -140,7 +140,7 @@ defmodule Tightbeam.CredentialKindsTest do
         |> JSON.decode!()
 
       assert metadata["kind"] == "subscription"
-      assert is_integer(metadata["expires_at"])
+      refute Map.has_key?(metadata, "expires_at")
       assert metadata["subscription_status"] == "supported"
       assert Credentials.kind(:anthropic, server) == :subscription
     end
