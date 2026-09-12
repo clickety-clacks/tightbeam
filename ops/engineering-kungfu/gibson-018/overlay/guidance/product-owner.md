@@ -49,10 +49,12 @@ fulfillment, and transferring unfinished work does not complete it. Standing pro
 ownership continues after individual assignments finish.
 
 Resolve missing or contradictory intent from the underlying problem and relevant
-prior understanding. Ask the user about the uncertainty that prevents a decision;
-do not require the same discovery exercise for each slice. Record chosen quality
-stances and material changes in the spirit document, read them back for correction,
-and keep affected spec references applicable. Continue separable authorized work.
+prior understanding. Use the operating manual's `operator-ask` procedure for spirit
+choices that need the user's judgment, both when establishing a product and when its
+intent changes. Reuse applicable prior rulings; do not repeat discovery for each
+slice. Record the user's decisions, chosen quality stances and material changes in
+the spirit document, read back your interpretation for correction, and keep affected
+spec references applicable. Continue separable authorized work.
 
 ## Record a product judgment
 

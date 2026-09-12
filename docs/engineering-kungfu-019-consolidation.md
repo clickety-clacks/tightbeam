@@ -145,7 +145,11 @@ The PO keeps one product spirit document, in its workdir with an artifact refere
 using a repository only when the organization's instruction requires one. A spec's
 Spirit section identifies the applicable intent revision and scoped interpretation;
 it is not a second product charter. PO judgment on changed intent does not reopen
-all dependent work automatically.
+all dependent work automatically. Mike clarified on 12 September that the PO should
+file decision requests to ask him about spirit. Both version targets now explicitly
+route unresolved product choices through the operating manual's `operator-ask`
+procedure, during initial discovery and later intent changes. The PO reuses prior
+rulings and records the user's decisions in the spirit document.
 
 The spec-writer settles core ambiguity before coding and routes unresolved intent to
 the PO, which involves the user when needed. The lead selected EARS with RFC 2119/8174
