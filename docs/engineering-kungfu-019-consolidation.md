@@ -5,6 +5,30 @@ engineering guidance work under the user's 11 September commission. The lead own
 adjudication after contributor input and review. Existing landed runtime behavior is
 the baseline. This document is a delivery record, not projected agent guidance.
 
+## Commission and source custody
+
+Mike commissioned this work directly in the external Codex conversation. His instruction
+was: "take their input and rewrite the guidance, rails, archetypes, anything you need to
+in 0.1.9, on a branch". He assigned final adjudication to the lead: "you are the final
+call and i expect you to make adjudications on their comments". He also requested a
+compatible application to Gibson's current org, future model/harness ringdown, retargeting
+of existing agents and best-effort repair of parentage and messaging.
+
+That direct instruction is the authority. No Tightbeam ruling or work item was minted
+as a substitute for it during the no-turn phase. The later restriction remains explicit:
+"you can read agents and substrate but nothing that needs turns". Source authoring,
+external review and isolated validation continue within that commission. Live application
+needs the concrete maintenance and resumption conditions described in the local plan;
+it is not authorized to trigger turns during this phase.
+
+The spec-writer contribution has one implementation owner, this consolidation lead.
+Fable gave the patch to this branch and explicitly stood down separate implementation
+on 11 September at 22:12 UTC, Subetha message
+`7ba979f4-0e1b-4c63-9fd7-ea8eb525059d`. Fable then reviewed the combined text and
+carried acceptance to 0e64de6 in message `3266b2f9-c2c2-4540-a225-3f4429cd18a3`.
+The older September 9 draft is provenance; it is not a competing landing lane.
+Fable retains the review role and source authorship of the absorbed contribution.
+
 ## Tenets
 
 1. Own the promised outcome and work within explicit authority. Records support
@@ -156,6 +180,13 @@ Related work is not automatically completed or revoked:
   0.1.9 pending a line-specific migration contract. This branch preserves the
   guidance duties without claiming those runtime mechanisms ship or their work is
   superseded. Closed work-item states alone do not establish release delivery.
+- R1, wi_d884d359-d1f2-4a1a-94c3-a8dbb90279ce, concerns reminder reassessment
+  and notification recovery. Its carry at 56808621374e99fc1a4e86880a4e238364ae1e7c
+  is present in this branch. Stall-watch withdrew its claim that this fixes the
+  separate finalize crash leaving turns marked running. The later defect record
+  wi_bb2bbdc3-798a-4870-93da-042aada491fc is closed with no assignments; no
+  implementation custody or fix was verified. Preserve that unresolved runtime
+  defect separately. The five affected sessions remain protected from replay.
 - Standing integration accountability is preserved. Local release-line elections
   remain local instructions, with this branch explicitly targeting only 0.1.9.
 
@@ -209,6 +240,38 @@ predicate. It also uses an ordinary local authoring skill because the release re
 the baseline skill names. These are compatibility choices, not claims that 0.1.8 has
 the newer runtime behavior.
 
+### Stall-watch adjudication
+
+The lead received all three review parts, messages `30a53ac0`, `38358f76` and
+`a667470e`. The R1 correction is recorded above. The claimed spec-writer custody
+collision was already resolved by Fable's handoff and subsequent review. The commission
+is now quoted here so a reviewer need not reconstruct it from channel history.
+
+The live-application concern is accepted at its proper scope. Administrative runtime
+changes need the concrete before/after plan and must respect the present no-turn
+restriction and protected custody. That does not create another permission gate for
+this authorized source branch, isolated validation or ordinary coordination records.
+No live modification is claimed or performed by this branch.
+
+| Churn finding | Lead disposition and guidance home |
+| --- | --- |
+| Transport status mistaken for work | Accepted. The shared manual requires the turn content and promised effects; delivered and running labels alone do not prove useful execution. |
+| Connected listener mistaken for receipt | Accepted in unblocking. Verify delivery into the accountable session when establishing or repairing the path; do not generate periodic inference merely to prove presence. |
+| Self-wake mistaken for assignment progress | Accepted with a limit. The 0.1.8 manual distinguishes the two; unblocking records material advancement and rejects dummy progress attests intended only to reset supervision. |
+| Canceled wake reported as successor | Accepted in unblocking. After a ruling or recovery, verify the surviving continuation and current disposition. |
+| Ruling assumed to wake its holder | Accepted for build 1337. Verify delivery and arrange one supported notification when needed and permitted. Keep 0.1.9's row-driven delivery behavior intact. |
+| Provider failure assumed to self-recover | Accepted in unblocking. Name the actor who arranges renewed execution and verify that work resumes. |
+| Shared-holder activity mistaken for obligation progress | Accepted in unblocking. Judge each obligation from its relevant evidence; retain session activity as context. |
+| Dismissal recreates unchanged effort traffic | Accepted as a 0.1.8 compatibility concern. Do not dismiss solely to quiet the request; any containment keeps an owner and bounded reassessment. |
+| Full review after every partial correction | Accept batching and relevant review scope in feature-cycle. Reject a universal readiness package or review admission gate; bounded early review can resolve uncertainty. |
+| An unrequested mechanism becomes the new blocker | Accepted in subtraction. Remove the unnecessary addition within existing authority and preserve required behavior and data. |
+| Checkpoint receipts sent to stopped holders | Accept suppression of repeated receipt-only wakes in unblocking. Reject withholding every message until a final candidate; material handoffs, dependency changes and required decisions still reach delivery ownership. |
+
+These edits preserve attributable independent review and the existing completion
+predicate. They do not add a new archetype, metric gate or runtime detector. Stall-watch
+must review the resulting changes and may challenge these adjudications; its initial
+review is not acceptance of edits it has not read.
+
 ### Review and verification record
 
 | Contributor | Reviewed subject | Disposition |
@@ -219,7 +282,7 @@ the newer runtime behavior.
 | Morrow | Recovery guidance through 16f51c2; overlay at 89e3a40 | Accepted after compatibility discussion. Separate recovery and upgrade obligations remain. |
 | Kestrel | Firehose preservation and the two test changes at 0e64de6 | Accepted within those scopes. |
 | Release patrol | Coverage at 89e3a40 and the two test changes at 0e64de6 | Accepted within those scopes; release custody retained. |
-| Stall-watch | Consolidated branch and churn/recovery coverage | Responding again; concrete branch review requested and pending. |
+| Stall-watch | Consolidated branch and churn/recovery coverage | All three review parts adjudicated. Accepted corrections implemented; custody concern resolved from prior handoff. Follow-up review of the resulting changes pending. |
 | Separate completion-family Fable | Completion, escalation and lifecycle subjects | Invitation undeliverable; no current local Subetha listener. No review acceptance claimed. |
 
 Mike clarified on 12 September that Parallax is uninvolved. Parallax is excluded

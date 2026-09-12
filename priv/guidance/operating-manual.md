@@ -135,6 +135,10 @@ Work is tracked as durable records, not in chat.
 
     tightbeam attest <assignmentId> --kind verdict --verdict confirmed --note "…"
 
+Read a turn's content and the promised effects before crediting work. A delivered
+turn can contain a provider refusal, and a running row alone does not prove that
+execution is still active.
+
 These records expose the state of the work. They do not establish fulfillment by
 themselves; the responsible agents judge the outcome from applicable evidence. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
 with `tightbeam assignments --role <your-role>`.

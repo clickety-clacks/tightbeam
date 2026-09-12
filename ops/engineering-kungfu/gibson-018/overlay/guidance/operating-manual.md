@@ -132,6 +132,10 @@ Work is tracked as durable records, not in chat.
 
     tightbeam attest <assignmentId> --kind verdict --verdict confirmed --note "…"
 
+Read a turn's content and the promised effects before crediting work. A delivered
+turn can contain a provider refusal, and a running row alone does not prove that
+execution is still active.
+
 These records expose the state of the work. They do not establish fulfillment by
 themselves; the responsible agents judge the outcome from applicable evidence. Read the facts with `tightbeam attests <assignmentId>`. List your obligations
 with `tightbeam assignments --role <your-role>`.
@@ -255,13 +259,29 @@ explicit applicable disposition replaces it; existing public refs remain unchang
 Do not spread a product-specific hold to unrelated work or waive a hold by moving its
 content to another public ref.
 
+## Installed continuation and ruling limits
+
+A plain self-wake arranges a future message; it does not establish per-assignment
+progress or automatically satisfy the effort monitor. Record material advancement
+when it happens. Do not create empty progress attests merely to quiet supervision.
+
+On build 1337, `operator-rule` records the decision but does not directly wake its
+holder. When turns are permitted, verify existing delivery before adding a concise
+wake to the responsible recipient with the `dr_id` and the actual ruling. Preserve
+holds and avoid duplicating a healthy notification.
+
+Do not dismiss an unchanged effort request solely to quiet it; dismissal can restart
+the monitoring cycle. If leaving it open contains repeated notifications, keep the
+responsible owner and bounded reassessment explicit. Containment is not recovery.
+
 ## Installed review limitation
 
-On 0.1.8 the completion check uses the newest linked review assignment and that
-holder's latest verdict, which must be reviewed-clean from a different session.
-It does not pool review-conclusion verdicts across cards as 0.1.9 does. Keep the
-current substantive review attributable there; do not treat older favorable evidence
-as an override. Do not invent an empty reviewed-clean receipt just to satisfy the
+On installed 0.1.8 build 1337, the completion check selects the most recent
+holder-filed verdict across linked review cards. That verdict must be reviewed-clean
+from a different session. A newer card without a holder verdict does not displace
+an existing judgment. This build does not pool applicable review conclusions as
+0.1.9 does. Keep the current substantive review attributable; do not treat older
+favorable evidence as an override. Do not invent an empty reviewed-clean receipt just to satisfy the
 check. Resolve a concrete mismatch through the responsible delivery owner.
 
 ## Adopted authoring policy on 0.1.8

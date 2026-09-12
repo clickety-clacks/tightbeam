@@ -6,7 +6,9 @@ operations material. They are not part of the shipped kungfu bundle.
 
 The portable change is on `kungfu/consolidated-019-20260911`. Its design and
 adjudications are in `docs/engineering-kungfu-019-consolidation.md`. This directory
-adapts that policy to released 0.1.8, source tag `becb13072624fce1129cfce377882bc2fb647cb8`.
+adapts that policy to installed 0.1.8 build 1337, release tag `v0.1.8+1337`,
+source `fdb3db53b596d4114d06505b39a4c1836fba7564`. The gateway reports that
+build and revision. The original 0.1.8 tag is an earlier release.
 The original local identity revision is recorded in `overlay-manifest.json`.
 
 ## What the overlay changes
@@ -38,7 +40,7 @@ them immediately before execution; this snapshot is not authority to overwrite d
 | Model selection | The activity table is a guidance fragment. Explicit selection by the caller implements ringdown; preference metadata alone does not perform fallback. |
 | Shared authoring skills | Their names are reserved by the release. Do not put replacement copies under those names in local identity. `engineering-authoring-018` supplies the adopted policy as an ordinary local skill; the manual names the precedence. |
 | Dependency waits | Use actual condition producers or a concrete timed recheck. No `--assignment`, `--after-turn` or qualified-predicate wake claims. A condition subscription cannot observe arbitrary rows by itself. |
-| Review qualification | The installed completion check uses the newest linked review card and that holder's latest verdict. It does not implement 0.1.9 pooled review conclusions. |
+| Review qualification | Build 1337 selects the most recent holder-filed verdict across linked review cards. It must be reviewed-clean from a different session. New cards without holder verdicts do not displace existing judgments. This differs from both the original 0.1.8 tag and 0.1.9 pooled review conclusions. |
 | Rules | The proposed rule file keeps the completion predicate and uses a denial with an explicit owner remedy. The 0.1.8 validator requires assignment creation for a linked-review remedy, so the 0.1.9 notification-only remedy cannot be imported. The released CLI has no rule-file edit command. It is a reviewed target, not an executable CLI application step. |
 | Parentage | No supported command changes existing spawning ancestry or transfers an open assignment's opener. Role bindings and display names cannot do that work. |
 | Active archetypes | Ordinary worker rows must be retired before `identity repoint`. Released source also handles Main and built-in sessions at a turn boundary, closing their resident context. That exception is not safe under the present no-turn restriction, and Main is specifically protected. Do not retire an active worker merely to change its archetype. |
@@ -68,8 +70,10 @@ Source inspection establishes the following limits:
 - Same-harness tuning is designed to preserve the conversation, but still uses the
   execution-lane boundary and must respect held or queued work.
 
-The prepared operator sequence was exercised against released 0.1.8 on an isolated
-copy of the original identity. All 38 supported edits published successfully, and
+The prepared operator sequence was exercised against the original 0.1.8 tag on an
+isolated copy of the original identity. Its identity, archetype and rule-loader source
+is identical to build 1337. The final overlay was also composed and validated on
+build 1337, matching the installed gateway. All 38 supported edits published successfully, and
 every intermediate revision composed for both harnesses. Final file hashes matched
 the overlay. The rule file remained at its original hash throughout. This validates
 the identity edit order, not live rule application or runtime retargeting. No gateway
@@ -91,6 +95,13 @@ parked with its acceptance context and owned checkout. Its separate release and
 upgrade acceptance responsibilities are not superseded by this guidance branch.
 The recorded concern about losing private custody is an operational constraint;
 the tune implementation itself preserves the workdir when switching harnesses.
+
+The recorded disposition in `att_acbbd933-d89a-4cb2-a14a-a20c25722c6c` also
+parks PO: Tightbeam under its C5 stop and preserves the existing restoration-attempt
+dependency under its C5-locked parent. Preserve those decisions until their actual
+holds or dependencies are resolved. A session left on its old harness is not evidence
+that a prior restaffing request was forgotten. Other sessions omitted from that
+incident-specific restaffing are not thereby permanently protected from this migration.
 
 Codex on Gibson has an open rate-limit incident. Racter's two provider routes are
 reported unavailable, and the recovery instruction forbids resident agent staffing

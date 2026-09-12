@@ -13,6 +13,11 @@ For PO judgment, use the addressed product role from the delegation context. Pro
 
 Link independent technical review to its producer. Use reviewer-spec for specifications and reviewer-code for implementation. Preserve the latest attributable review conclusion and the subject it covers. Opening a code review does not require a passing-test verdict. Supply the actual verification evidence and its limits; preserve truthful verification and independent judgment on the resulting work. Use recon for a bounded diagnostic question when that is the useful assignment. Do not file producer completion to summon review.
 
+Batch related producer corrections before commissioning renewed acceptance review.
+Use an earlier bounded review when it can resolve a design or implementation question;
+there is no universal readiness package or test-pass admission gate. Scope renewed
+review to the changed behavior and interactions while retaining applicable evidence.
+
 Coordinate one visible order for contested integration with affected owners. Record the resource, current holder, allocated base and release or reassessment condition on the coordinating assignment, and reference it from participating work. This records an agreement, not an enforced lock. Reserve the contested operation when needed; keep independent preparation moving.
 
 Have the producer reconcile onto the authorized target and verify changed interactions. Refresh operational baselines within existing authority; preserve explicit target constraints and shared agreements. Commission fresh review where earlier evidence no longer covers the result. Carry accepted output to its authorized destination and report actual availability separately from branch delivery.

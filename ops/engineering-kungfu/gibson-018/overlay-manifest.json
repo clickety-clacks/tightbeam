@@ -81,7 +81,7 @@
     {
       "path": "guidance/operating-manual.md",
       "before_sha256": "793b250ea0c7a997cb947efd11f2b571ccb3825cb66f9da51dc43b4e450c8afa",
-      "after_sha256": "4aca884af8760e268cfe72b1322d6352bc8db4fbce518a6b6dff43c42a4b522f"
+      "after_sha256": "341755d206f85fab87ebddad28d3ed4d77ca2d937d92fb0e0bddb0ed875ee94b"
     },
     {
       "path": "guidance/orchestrator.md",
@@ -141,7 +141,7 @@
     {
       "path": "guidance/subtraction.md",
       "before_sha256": "5aaef7e9f1f8623982d045da6641e939136a7a7ecb139f776249923dcc0f8e54",
-      "after_sha256": "a410127093698af81ad1e37aada423c8cb6fb6c625cd4426e6b5f8d6e163a984"
+      "after_sha256": "40a3e9f30665f89f22657fdb54c95bd900369df3215a07df3136358651f9c93e"
     },
     {
       "path": "guidance/wisdom-core.md",
@@ -156,7 +156,7 @@
     {
       "path": "rules/engineering.toml",
       "before_sha256": "9139b364faaff05beac9db1324156d21abe214f65974b3119345a8c8a84075dc",
-      "after_sha256": "cbf0f7c399f00d04cd90289493aa97fe8ea953f244e50bdbda172df9e901ffa2"
+      "after_sha256": "47ae04d311f2afe49146239deeefe2a56d6c7d0d1162a32633e68020ddbff2f0"
     },
     {
       "path": "skills/committing-and-pushing/SKILL.md",
@@ -171,7 +171,7 @@
     {
       "path": "skills/feature-cycle/SKILL.md",
       "before_sha256": "ba1909b77e5f430a52f3009ce271b62e6e1717283402eb1a376fe10f9f771f12",
-      "after_sha256": "e8054180d0d449fd208736f9352c76960e344b34c67e85d99978e6d00f0322af"
+      "after_sha256": "84f0a748192f5f737e8bee132aa3f964643f1ea93f38862fba103fa600f29695"
     },
     {
       "path": "skills/model-release-intake/SKILL.md",
@@ -196,7 +196,7 @@
     {
       "path": "skills/unblocking/SKILL.md",
       "before_sha256": "112f9a6bf8f71581c87ba43e10c77b439db224d1abb1cce9d24e6729b8d36a78",
-      "after_sha256": "dfa53334f0f33dcabf5dcc3278b588581aff9155d42665b39f93bf77d8077052"
+      "after_sha256": "d5b7d69861a6d32979f36c35ea0ff86b0a6c9080f44e07d13fdd8d6c5172b9f4"
     },
     {
       "path": "skills/worktree-session/SKILL.md",
@@ -221,5 +221,11 @@
       "path": "skills/human-communication/SKILL.md",
       "sha256": "9c9419c27eb661680272017e1a41511dc8f39f793bc003af4dac00079da8b53b"
     }
-  ]
+  ],
+  "compatibility_release": {
+    "tag": "v0.1.8+1337",
+    "source_revision": "fdb3db53b596d4114d06505b39a4c1836fba7564",
+    "gateway_reported_version": "0.1.8",
+    "gateway_reported_build": 1337
+  }
 }
