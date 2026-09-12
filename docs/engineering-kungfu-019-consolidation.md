@@ -617,3 +617,18 @@ authority. The compatible
 Existing delegation briefs must agree with it; a product orchestrator still receives
 material product information. The change adds no staffing gate or exception-only
 filter for product delivery.
+
+The neutral default archetype deliberately does not include engineering expectations.
+All eleven engineering archetypes, and the 0.1.8 reviewer alias, include them. An
+existing engineering assignment held by a historical default session receives the
+engineering-tenets reference in its scoped reread notice; this does not impose
+engineering policy on neutral sessions. Dormant neutral sessions are not woken for
+this amendment, and existing no-contact and host holds remain in force. Staffing
+remains discoverable in assignment records without requiring upward staffing reports.
+
+The amended live guidance was published through four supported identity edits as
+`c4ff2288431a93a904dfb7ec4b0140904bb5bc97`. Session refresh and reread delivery are
+tracked separately; an active turn can postpone refresh on 0.1.8. Packaging passed
+on eezo at `9a37851`. Fable accepted the final composition in Subetha `bdba678f`;
+Morrow's neutral-default coverage observation is resolved by the explicit boundary
+above. No runtime code, schema, rail or rule changed in this amendment.
