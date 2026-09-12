@@ -31,7 +31,7 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
     {:ok, _} = DB.query(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('flynn',1,1)")
     register_testhost(db)
     worker = create_session(db, "critical-worker", Org.personal_session_key("flynn"))
-    handlers = Gateway.handlers(%{db: db, critical_lease_hard_cap_ms: 20_000})
+    handlers = Gateway.handlers(%{db: db, critical_lease_hard_cap_ms: 1_500})
 
     call = %{
       verb: "critical",
@@ -43,23 +43,27 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
 
     _ = receive_notices()
     assert {:ok, first} = Dispatch.dispatch(db, handlers, call)
-    notices = receive_notices()
-    assert Enum.map(notices, & &1["class"]) == ["verb.accepted", "critical_lease.updated"]
-
-    assert List.last(notices)["payload"] ==
-             StateResources.critical_state(Tightbeam.CriticalLeases.get(db, worker.session_key))
-
-    assert first.expires_at <= first.hard_deadline
     assert {:ok, renewed} = Dispatch.dispatch(db, handlers, call)
-    assert renewed.hard_deadline == first.hard_deadline
-    assert renewed.expires_at >= first.expires_at
+    stored = Tightbeam.CriticalLeases.get(db, worker.session_key)
 
-    assert Enum.map(receive_notices(), & &1["class"]) == [
+    assert renewed.hard_deadline == first.hard_deadline
+    assert stored.hard_deadline == first.hard_deadline
+    assert renewed.expires_at == first.hard_deadline
+    assert stored.expires_at == first.hard_deadline
+
+    notices = receive_notices()
+
+    assert Enum.map(notices, & &1["class"]) == [
+             "verb.accepted",
+             "critical_lease.updated",
              "verb.accepted",
              "critical_lease.updated"
            ]
 
-    before = Tightbeam.CriticalLeases.get(db, worker.session_key)
+    assert Enum.at(notices, 1)["payload"] == StateResources.critical_state(first)
+    assert List.last(notices)["payload"] == StateResources.critical_state(stored)
+
+    before = stored
 
     assert {:error, _} =
              Dispatch.dispatch(db, handlers, %{
