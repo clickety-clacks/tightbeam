@@ -529,9 +529,26 @@ The earlier full-suite run's two failures remain recorded above; this is not a c
 that full CI is green. Evidence is preserved outside the checkout as
 `proof-1a9ca30.log` and `proof-1a9ca30-018.log` in the consolidation work directory.
 Mike ended the Lavish review; both completed polls were consumed without further
-feedback. This branch remains private, with no release or live application.
+feedback. The branch remained private, with no release or live application at that
+review boundary. The later partial live application is recorded below.
 
 ## Current-org application
+
+On 12 September Mike clarified that 0.1.9 is still unfinished: merge to its development
+branch, without cutting or installing a release. Apply the compatible guidance and
+best available topology to the existing 0.1.8 org now to help finish that work.
+
+The supported guidance publication is complete at live identity revision
+`fd24c468022fe09b338744639b12d7e4cfe29f37`, with the default archetype changed to
+`orchestrator`. Existing-session refresh, model/harness tuning and custody changes
+remain pending under the earlier no-turn restriction. The released CLI cannot author
+the prepared rule file, so the old rules remain active. This is partial application,
+not a claim that the org has already changed topology. The overlay manifest records
+each published file separately from the deferred rule target.
+
+Fable accepted the explicit PO `operator-ask` change at `a976fea`/`a1615c0` in
+message `493a0738-c4e6-49de-8e31-61fcf5a544a7`; Morrow accepted it in
+`42173de5-74ab-44a8-8fc0-eb04c1acbef3`. Packaging passed on eezo at `a1615c0`.
 
 Prepare a compatible 0.1.8 identity overlay separately from the shipped bundle.
 Preserve local product authority, test-host restrictions, release/install law,

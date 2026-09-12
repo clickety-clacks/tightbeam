@@ -1,8 +1,16 @@
 # Apply the adopted engineering practice to Gibson 0.1.8
 
-Status: prepared, not applied. No live identity, session, assignment, service or
-database row has been changed by this consolidation. These files are organization
-operations material. They are not part of the shipped kungfu bundle.
+Status, 12 September: compatible guidance published; existing-session migration
+pending. The 58 supported CLI edits and removals published identity revision
+`fd24c468022fe09b338744639b12d7e4cfe29f37`. The default archetype changed from
+`default` to `orchestrator`. Existing sessions have not been refreshed, retuned or
+reparented by this consolidation. The old rule file remains active. These files
+are organization operations material, outside the shipped kungfu bundle.
+
+Mike's latest instruction is to adapt the running 0.1.8 org now so it can finish
+0.1.9 work. The development changes target the 0.1.9 branch; no release cut or
+installation is part of this application. His earlier no-turn restriction still
+limits operations that enter session execution lanes.
 
 The portable change is on `kungfu/consolidated-019-20260911`. Its design and
 adjudications are in `docs/engineering-kungfu-019-consolidation.md`. This directory
@@ -23,7 +31,7 @@ The original local identity revision is recorded in `overlay-manifest.json`.
 - A compatibility identity serves existing generic `reviewer` sessions. New staffing
   chooses the actual review subject through `reviewer-code` or `reviewer-spec`.
 
-The snapshot has 457 session rows marked active and 149 open assignments. These are
+The original snapshot had 457 session rows marked active and 149 open assignments. These are
 durable states, not a count of running processes. Of those assignments, 94 are held by
 PO archetypes and 85 were opened by them. A PO label often masks delivery work.
 Retarget from the actual responsibility and its consequences, not the label alone.
@@ -32,6 +40,14 @@ The private per-session model plan and assignment-custody plan live with the ope
 consolidation evidence. They include current fields, proposed fields, exclusions and
 application state. Keep production inventories out of the shipped bundle. Refresh
 them immediately before execution; this snapshot is not authority to overwrite drift.
+
+Publication preflight found 457 active session rows and 148 open assignments held by
+60 sessions. Every edited or removed file matched its recorded before hash; final
+readback matched all applicable after hashes, with no identity conflicts. The manifest
+records publication separately from session refresh and rule application. Private
+evidence includes `live-018-guidance-application.jsonl` and the before/after status
+readbacks. The executed removal flag was `--rm`, as released CLI help requires; the
+prepared argv's `--remove` spelling was corrected before executing any removal.
 
 ## Compatibility decisions
 
@@ -46,7 +62,7 @@ them immediately before execution; this snapshot is not authority to overwrite d
 | Active archetypes | Ordinary worker rows must be retired before `identity repoint`. Released source also handles Main and built-in sessions at a turn boundary, closing their resident context. That exception is not safe under the present no-turn restriction, and Main is specifically protected. Do not retire an active worker merely to change its archetype. |
 | Artifact bytes | A path/hash record binds identity; it does not preserve content. Keep the existing organization-local preservation rule until durable content retrieval is delivered. |
 
-## No-turn boundary
+## No-turn boundary and preparation evidence
 
 Tightbeam can run turns. Mike permits reading agents and durable state but forbids
 operations that need or can trigger turns during this phase. Gateway power remains
@@ -81,7 +97,8 @@ The rule file stayed unchanged through the supported edit sequence. Loading the
 prepared replacement in that fixture is a separate compatibility check; it does not
 establish a supported installed CLI edit operation or permission to change live rules.
 The command plan, exact hashes and execution logs remain private operator evidence.
-No live application was performed.
+No live application was performed during that rehearsal. The publication recorded
+above is a later, separate operation.
 
 The 7d19a52 context, frugality and lifetime refinement changed six overlay files.
 Those edits passed the released identity API and all 18 resulting compositions,
@@ -200,4 +217,6 @@ composed for both harnesses, and all three prepared rules validated. The deferre
 rule file remained untouched through the supported sequence, then was copied only
 inside the disposable fixture for validation. The proof used no gateway, live
 identity, CLI operation or inference. Evidence is `proof-1a9ca30-018.log` in the
-consolidation work directory. The package remains prepared and unapplied.
+consolidation work directory. That rehearsal preceded the live publication recorded
+at the top of this document; existing-session migration and the rule target remain
+unapplied.

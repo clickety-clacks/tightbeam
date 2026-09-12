@@ -1,232 +1,324 @@
 {
   "identity_base": "08262823f065561977c5cf196345d59922b760e5",
   "source_revision": "a976fea",
-  "state": "prepared-not-applied",
+  "state": "guidance-published-session-migration-pending",
   "files": [
     {
       "path": "archetypes/coder.toml",
       "before_sha256": "7fc270a61e1793bd51728dab15b6e91053dcec90a4f79ab0ffbad7e80ebc40f2",
-      "after_sha256": "3b16009a7ab22e46d87f3862e6c37f687068d51996d95d7de772094926bafa1f"
+      "after_sha256": "3b16009a7ab22e46d87f3862e6c37f687068d51996d95d7de772094926bafa1f",
+      "application_state": "published",
+      "observed_sha256": "3b16009a7ab22e46d87f3862e6c37f687068d51996d95d7de772094926bafa1f"
     },
     {
       "path": "archetypes/default.toml",
       "before_sha256": "6a51cf19cb778b13fd0782974940de617671a51d971b396c0a2a53debab8509e",
-      "after_sha256": "5d8cc2e241909a43be5f1640fc3013b4619a34b5ef3ee0a3adeb2ad6c151cda2"
+      "after_sha256": "5d8cc2e241909a43be5f1640fc3013b4619a34b5ef3ee0a3adeb2ad6c151cda2",
+      "application_state": "published",
+      "observed_sha256": "5d8cc2e241909a43be5f1640fc3013b4619a34b5ef3ee0a3adeb2ad6c151cda2"
     },
     {
       "path": "archetypes/guidance-reviewer.toml",
       "before_sha256": null,
-      "after_sha256": "fbba65caeafec07cfb3ccf124f321014760fb87bf0948a0ae0aadc01f9619674"
+      "after_sha256": "fbba65caeafec07cfb3ccf124f321014760fb87bf0948a0ae0aadc01f9619674",
+      "application_state": "published",
+      "observed_sha256": "fbba65caeafec07cfb3ccf124f321014760fb87bf0948a0ae0aadc01f9619674"
     },
     {
       "path": "archetypes/guidance-writer.toml",
       "before_sha256": null,
-      "after_sha256": "50b7fed2a15df2fc195fa9be90645369cf84353d2e06ddcdd2cdf7b816f2048c"
+      "after_sha256": "50b7fed2a15df2fc195fa9be90645369cf84353d2e06ddcdd2cdf7b816f2048c",
+      "application_state": "published",
+      "observed_sha256": "50b7fed2a15df2fc195fa9be90645369cf84353d2e06ddcdd2cdf7b816f2048c"
     },
     {
       "path": "archetypes/integrator.toml",
       "before_sha256": null,
-      "after_sha256": "98c1474a7ec261bba6288212e65e7a447f56ad280c472c7eb667c4a378184e8b"
+      "after_sha256": "98c1474a7ec261bba6288212e65e7a447f56ad280c472c7eb667c4a378184e8b",
+      "application_state": "published",
+      "observed_sha256": "98c1474a7ec261bba6288212e65e7a447f56ad280c472c7eb667c4a378184e8b"
     },
     {
       "path": "archetypes/orchestrator.toml",
       "before_sha256": "ef493b1599562caadad8a83d6ea064fc8548d36a6e47f581bb01721542f7f4e7",
-      "after_sha256": "f7f13cfb6e98cea75e0fd9d7cf22c4630c371b0057d8a6467585a6ebaf562335"
+      "after_sha256": "f7f13cfb6e98cea75e0fd9d7cf22c4630c371b0057d8a6467585a6ebaf562335",
+      "application_state": "published",
+      "observed_sha256": "f7f13cfb6e98cea75e0fd9d7cf22c4630c371b0057d8a6467585a6ebaf562335"
     },
     {
       "path": "archetypes/product-owner.toml",
       "before_sha256": "546060e67787fa33a681437b4bdcd383513d477fd96cbfd128fd83a53b6f9d51",
-      "after_sha256": "4777222787a0599de04f62e96bfaf57f3e573bf176fdcd4292337df7f8c13bc0"
+      "after_sha256": "4777222787a0599de04f62e96bfaf57f3e573bf176fdcd4292337df7f8c13bc0",
+      "application_state": "published",
+      "observed_sha256": "4777222787a0599de04f62e96bfaf57f3e573bf176fdcd4292337df7f8c13bc0"
     },
     {
       "path": "archetypes/recon.toml",
       "before_sha256": "08a49c4c0519854a9fd22c12d7201ab1e0c023ebbf39eb19101b141ec9d8aea3",
-      "after_sha256": "152f4e4060326efdc9c131f97cb224150bc3b2d1ef8dbeb6f5c33d29b8026a97"
+      "after_sha256": "152f4e4060326efdc9c131f97cb224150bc3b2d1ef8dbeb6f5c33d29b8026a97",
+      "application_state": "published",
+      "observed_sha256": "152f4e4060326efdc9c131f97cb224150bc3b2d1ef8dbeb6f5c33d29b8026a97"
     },
     {
       "path": "archetypes/reviewer-code.toml",
       "before_sha256": "968a0a35872f1597986d34048cbc2c610eeb19abc6b554db78d2a0f946de2db6",
-      "after_sha256": "d1c36f6b9b720a45f434450e97fbd751d6fa79ab7bbb8537155b0d37784b9884"
+      "after_sha256": "d1c36f6b9b720a45f434450e97fbd751d6fa79ab7bbb8537155b0d37784b9884",
+      "application_state": "published",
+      "observed_sha256": "d1c36f6b9b720a45f434450e97fbd751d6fa79ab7bbb8537155b0d37784b9884"
     },
     {
       "path": "archetypes/reviewer-spec.toml",
       "before_sha256": "3c02b66b9736065619ea1638d7f28fbec79ab2298794a5cd7330459aae8f5f87",
-      "after_sha256": "588145e250f94301afb4cbbfd77c25cd6766e8174f9b63946acc5cceb9f956a8"
+      "after_sha256": "588145e250f94301afb4cbbfd77c25cd6766e8174f9b63946acc5cceb9f956a8",
+      "application_state": "published",
+      "observed_sha256": "588145e250f94301afb4cbbfd77c25cd6766e8174f9b63946acc5cceb9f956a8"
     },
     {
       "path": "archetypes/reviewer.toml",
       "before_sha256": null,
-      "after_sha256": "478c901cfa0596d83f2dbcaeda7ca8692c0223d93d422abb75b1723246879312"
+      "after_sha256": "478c901cfa0596d83f2dbcaeda7ca8692c0223d93d422abb75b1723246879312",
+      "application_state": "published",
+      "observed_sha256": "478c901cfa0596d83f2dbcaeda7ca8692c0223d93d422abb75b1723246879312"
     },
     {
       "path": "archetypes/spec-writer.toml",
       "before_sha256": "6197ae472bf231230ce650e7d717b4b96f5ec28b284f291b14974b13ba60716e",
-      "after_sha256": "4af011fe7cbc83b65f5ea55500c40711953a5dc544842186dd2558308d7ed5d6"
+      "after_sha256": "4af011fe7cbc83b65f5ea55500c40711953a5dc544842186dd2558308d7ed5d6",
+      "application_state": "published",
+      "observed_sha256": "4af011fe7cbc83b65f5ea55500c40711953a5dc544842186dd2558308d7ed5d6"
     },
     {
       "path": "archetypes/team-planner.toml",
       "before_sha256": null,
-      "after_sha256": "2e7ece375e7b1ef59e19a7b5cd1baef0f4d52418bb12cef0aea82adfde91f6ef"
+      "after_sha256": "2e7ece375e7b1ef59e19a7b5cd1baef0f4d52418bb12cef0aea82adfde91f6ef",
+      "application_state": "published",
+      "observed_sha256": "2e7ece375e7b1ef59e19a7b5cd1baef0f4d52418bb12cef0aea82adfde91f6ef"
     },
     {
       "path": "guidance/coder.md",
       "before_sha256": "73fc1943e78e1af3a9f5dd315fc07d2ebddf1ebda8f96a8cced50c8b018bfac6",
-      "after_sha256": "93150a7002572170e1c1f0e5335503a4b7440246a83441539c5d9deff55be907"
+      "after_sha256": "93150a7002572170e1c1f0e5335503a4b7440246a83441539c5d9deff55be907",
+      "application_state": "published",
+      "observed_sha256": "93150a7002572170e1c1f0e5335503a4b7440246a83441539c5d9deff55be907"
     },
     {
       "path": "guidance/default.md",
       "before_sha256": "5b1d5ae5e1d2bc8ce4b5000ca63ff5460ea60d6a59c3a55ac167c10f9564d181",
-      "after_sha256": "2cb668d47dde00ac17d8a64309cf8e3f96a1b14bbabbb81652eb519c8b87d9bf"
+      "after_sha256": "2cb668d47dde00ac17d8a64309cf8e3f96a1b14bbabbb81652eb519c8b87d9bf",
+      "application_state": "published",
+      "observed_sha256": "2cb668d47dde00ac17d8a64309cf8e3f96a1b14bbabbb81652eb519c8b87d9bf"
     },
     {
       "path": "guidance/delivery-records.md",
       "before_sha256": null,
-      "after_sha256": "c6939d3efee6377969d1f589145d7a5be63988f5108cc291c852b6417ac7789f"
+      "after_sha256": "c6939d3efee6377969d1f589145d7a5be63988f5108cc291c852b6417ac7789f",
+      "application_state": "published",
+      "observed_sha256": "c6939d3efee6377969d1f589145d7a5be63988f5108cc291c852b6417ac7789f"
     },
     {
       "path": "guidance/delivery-recovery.md",
       "before_sha256": null,
-      "after_sha256": "39c661fd798300ea747904527cdf806b097cef61b7f8b91fc500218ce8a0bea0"
+      "after_sha256": "39c661fd798300ea747904527cdf806b097cef61b7f8b91fc500218ce8a0bea0",
+      "application_state": "published",
+      "observed_sha256": "39c661fd798300ea747904527cdf806b097cef61b7f8b91fc500218ce8a0bea0"
     },
     {
       "path": "guidance/engineering-model-activities.md",
       "before_sha256": null,
-      "after_sha256": "8afd0e354c25910f9c4612a88a05560cae98ac67621114db99f9776e89726c84"
+      "after_sha256": "8afd0e354c25910f9c4612a88a05560cae98ac67621114db99f9776e89726c84",
+      "application_state": "published",
+      "observed_sha256": "8afd0e354c25910f9c4612a88a05560cae98ac67621114db99f9776e89726c84"
     },
     {
       "path": "guidance/engineering-tenets.md",
       "before_sha256": "8436878ba6cbb4bc033c152b4e18795da53c5847c6cfac7823adc27b57a0c612",
-      "after_sha256": "402a57ff5cc9655067bfd1ed57ee6d60fc7e248b779801c73733f159165e3b39"
+      "after_sha256": "402a57ff5cc9655067bfd1ed57ee6d60fc7e248b779801c73733f159165e3b39",
+      "application_state": "published",
+      "observed_sha256": "402a57ff5cc9655067bfd1ed57ee6d60fc7e248b779801c73733f159165e3b39"
     },
     {
       "path": "guidance/golden-rule.md",
       "before_sha256": "759e76b511ad9bcc71068728c868beb70c6278a0b3cc64f92686eaa8c509fbb2",
-      "after_sha256": "61d6ca9a8dba80edc6275c1ea7a8d59e237d1eec0b8a2943eecaa57fe944a6a0"
+      "after_sha256": "61d6ca9a8dba80edc6275c1ea7a8d59e237d1eec0b8a2943eecaa57fe944a6a0",
+      "application_state": "published",
+      "observed_sha256": "61d6ca9a8dba80edc6275c1ea7a8d59e237d1eec0b8a2943eecaa57fe944a6a0"
     },
     {
       "path": "guidance/guidance-policy-craft.md",
       "before_sha256": null,
-      "after_sha256": "6ced727261e2e7bdd8939100180e0801e8a8c36c28d50cb8ad2467c1612f4b32"
+      "after_sha256": "6ced727261e2e7bdd8939100180e0801e8a8c36c28d50cb8ad2467c1612f4b32",
+      "application_state": "published",
+      "observed_sha256": "6ced727261e2e7bdd8939100180e0801e8a8c36c28d50cb8ad2467c1612f4b32"
     },
     {
       "path": "guidance/guidance-reviewer.md",
       "before_sha256": null,
-      "after_sha256": "66115c7b50b3ea49d94cc0de3c169ae78107ebe2120baafa4fea13d88df88b5f"
+      "after_sha256": "66115c7b50b3ea49d94cc0de3c169ae78107ebe2120baafa4fea13d88df88b5f",
+      "application_state": "published",
+      "observed_sha256": "66115c7b50b3ea49d94cc0de3c169ae78107ebe2120baafa4fea13d88df88b5f"
     },
     {
       "path": "guidance/guidance-writer.md",
       "before_sha256": null,
-      "after_sha256": "63717e402bfd7fab23fe0b38c07d6f3888dd14d7a64504285e76a7bdda4459f9"
+      "after_sha256": "63717e402bfd7fab23fe0b38c07d6f3888dd14d7a64504285e76a7bdda4459f9",
+      "application_state": "published",
+      "observed_sha256": "63717e402bfd7fab23fe0b38c07d6f3888dd14d7a64504285e76a7bdda4459f9"
     },
     {
       "path": "guidance/harness-support.md",
       "before_sha256": "62c677b44999bb4612920173575f12c1ec7d8e3705a58ca7feea132e23b041d9",
-      "after_sha256": "62c677b44999bb4612920173575f12c1ec7d8e3705a58ca7feea132e23b041d9"
+      "after_sha256": "62c677b44999bb4612920173575f12c1ec7d8e3705a58ca7feea132e23b041d9",
+      "application_state": "published",
+      "observed_sha256": "62c677b44999bb4612920173575f12c1ec7d8e3705a58ca7feea132e23b041d9"
     },
     {
       "path": "guidance/integrator.md",
       "before_sha256": null,
-      "after_sha256": "14994523242e563e5573ef9029d29081b6e3b997577bbdddd5764ae5345d1613"
+      "after_sha256": "14994523242e563e5573ef9029d29081b6e3b997577bbdddd5764ae5345d1613",
+      "application_state": "published",
+      "observed_sha256": "14994523242e563e5573ef9029d29081b6e3b997577bbdddd5764ae5345d1613"
     },
     {
       "path": "guidance/operating-manual.md",
       "before_sha256": "793b250ea0c7a997cb947efd11f2b571ccb3825cb66f9da51dc43b4e450c8afa",
-      "after_sha256": "af82c39008699b1b08e016ce75e620115e3da1d98bc237fe6b0f2f00f7bef08f"
+      "after_sha256": "af82c39008699b1b08e016ce75e620115e3da1d98bc237fe6b0f2f00f7bef08f",
+      "application_state": "published",
+      "observed_sha256": "af82c39008699b1b08e016ce75e620115e3da1d98bc237fe6b0f2f00f7bef08f"
     },
     {
       "path": "guidance/orchestrator.md",
       "before_sha256": "a090a8428344d0c98ac06d314f29cb7e1047130da0f0732fe5cf4c29ce27630c",
-      "after_sha256": "b091d89732d886608274ad5f2d4100e160c6878d1e2ce527dd34fa041935399f"
+      "after_sha256": "b091d89732d886608274ad5f2d4100e160c6878d1e2ce527dd34fa041935399f",
+      "application_state": "published",
+      "observed_sha256": "b091d89732d886608274ad5f2d4100e160c6878d1e2ce527dd34fa041935399f"
     },
     {
       "path": "guidance/preferred-models.md",
       "before_sha256": "b2374c1bfdd6b297927a681f0d0ca61ccea6ef9e8c08eaad80f5b42faed8a520",
-      "after_sha256": "ec69ea5b7ee05c30cafcf460f0f47f1f8376e5380088ef54277297d617bbd318"
+      "after_sha256": "ec69ea5b7ee05c30cafcf460f0f47f1f8376e5380088ef54277297d617bbd318",
+      "application_state": "published",
+      "observed_sha256": "ec69ea5b7ee05c30cafcf460f0f47f1f8376e5380088ef54277297d617bbd318"
     },
     {
       "path": "guidance/product-owner.md",
       "before_sha256": "8ae444578bcaf61913b09c9e5df7e6d04690395f9e2a055ecd526d68d3f60bee",
-      "after_sha256": "9e0a0bf825d46d61e49ac79589fb68ffe3357ad137c6bdd80299e5a9499ebe90"
+      "after_sha256": "9e0a0bf825d46d61e49ac79589fb68ffe3357ad137c6bdd80299e5a9499ebe90",
+      "application_state": "published",
+      "observed_sha256": "9e0a0bf825d46d61e49ac79589fb68ffe3357ad137c6bdd80299e5a9499ebe90"
     },
     {
       "path": "guidance/recon.md",
       "before_sha256": "59a94eaedc77f2815476f480ea604c1f67e9ca3a8abc398604fdcb1a307f19bc",
-      "after_sha256": "7b4cf482cc617eb1b024942a4ec25640b5d807cc0cd2158a19506134d084e3b7"
+      "after_sha256": "7b4cf482cc617eb1b024942a4ec25640b5d807cc0cd2158a19506134d084e3b7",
+      "application_state": "published",
+      "observed_sha256": "7b4cf482cc617eb1b024942a4ec25640b5d807cc0cd2158a19506134d084e3b7"
     },
     {
       "path": "guidance/repository-custody.md",
       "before_sha256": null,
-      "after_sha256": "a3a3a81ca9e17bd315fd87bffaa92802b60e855c161d250846c62389dcb7f590"
+      "after_sha256": "a3a3a81ca9e17bd315fd87bffaa92802b60e855c161d250846c62389dcb7f590",
+      "application_state": "published",
+      "observed_sha256": "a3a3a81ca9e17bd315fd87bffaa92802b60e855c161d250846c62389dcb7f590"
     },
     {
       "path": "guidance/review-common.md",
       "before_sha256": "72b595ecd7480d1b1f22a5b985552e80ce20b6fa954261a78c71fc83b06ca5ea",
-      "after_sha256": "dbc2437eaacc23279e805df2d671785b20c530b351d37cb3803a9e0af837cb0d"
+      "after_sha256": "dbc2437eaacc23279e805df2d671785b20c530b351d37cb3803a9e0af837cb0d",
+      "application_state": "published",
+      "observed_sha256": "dbc2437eaacc23279e805df2d671785b20c530b351d37cb3803a9e0af837cb0d"
     },
     {
       "path": "guidance/reviewer-code.md",
       "before_sha256": "93162275f788d11041310b11afd161197715e32cad8b87223f10b018ff80b73f",
-      "after_sha256": "5ce75f3d4030d098cbbd8fe9c67f8eca8c3e871d82128fcdef4ea9779fd23385"
+      "after_sha256": "5ce75f3d4030d098cbbd8fe9c67f8eca8c3e871d82128fcdef4ea9779fd23385",
+      "application_state": "published",
+      "observed_sha256": "5ce75f3d4030d098cbbd8fe9c67f8eca8c3e871d82128fcdef4ea9779fd23385"
     },
     {
       "path": "guidance/reviewer-spec.md",
       "before_sha256": "8479006d38fc699eae9324d66dce4a10eebf8d13c771dd2e04cd4a36799d7b19",
-      "after_sha256": "602c8b605310e6251c28749646d353592b6c94b8af3dd1dadbb05c492cb31ea7"
+      "after_sha256": "602c8b605310e6251c28749646d353592b6c94b8af3dd1dadbb05c492cb31ea7",
+      "application_state": "published",
+      "observed_sha256": "602c8b605310e6251c28749646d353592b6c94b8af3dd1dadbb05c492cb31ea7"
     },
     {
       "path": "guidance/scope-and-architecture.md",
       "before_sha256": "bc8d24d81a7fc915d5d490e0597f2d552c1b738afc384d008a0dcd7b932908a2",
-      "after_sha256": "aaac1d166ad25cb304aee1c80630c50bb1317c14893856768a80dcb7135f6a6c"
+      "after_sha256": "aaac1d166ad25cb304aee1c80630c50bb1317c14893856768a80dcb7135f6a6c",
+      "application_state": "published",
+      "observed_sha256": "aaac1d166ad25cb304aee1c80630c50bb1317c14893856768a80dcb7135f6a6c"
     },
     {
       "path": "guidance/spec-writer.md",
       "before_sha256": "81bc5b50c0278576359c137d9a88fbf60c0699c44c5dd8a8e704d5aa610e58c3",
-      "after_sha256": "c80df58b6176d7309de541e837c9e07348423327077422cf832b7075d9e175ae"
+      "after_sha256": "c80df58b6176d7309de541e837c9e07348423327077422cf832b7075d9e175ae",
+      "application_state": "published",
+      "observed_sha256": "c80df58b6176d7309de541e837c9e07348423327077422cf832b7075d9e175ae"
     },
     {
       "path": "guidance/specs-home.md",
       "before_sha256": "30ec8f48915b71bdb9c1b88bfbe0f12da2274dbe65077808fe3a774508d0e582",
-      "after_sha256": "bbe1a3cdfa2cf83dacd1280d5aedf6e0a38d75b4ba0f70ee1e38875c71933707"
+      "after_sha256": "bbe1a3cdfa2cf83dacd1280d5aedf6e0a38d75b4ba0f70ee1e38875c71933707",
+      "application_state": "published",
+      "observed_sha256": "bbe1a3cdfa2cf83dacd1280d5aedf6e0a38d75b4ba0f70ee1e38875c71933707"
     },
     {
       "path": "guidance/specs-interim-durability.md",
       "before_sha256": null,
-      "after_sha256": "a8fc8461ee1e113ac0fc889556c9dd4acc827d45e494f09e22f37f8f2bc3aecc"
+      "after_sha256": "a8fc8461ee1e113ac0fc889556c9dd4acc827d45e494f09e22f37f8f2bc3aecc",
+      "application_state": "published",
+      "observed_sha256": "a8fc8461ee1e113ac0fc889556c9dd4acc827d45e494f09e22f37f8f2bc3aecc"
     },
     {
       "path": "guidance/subtraction.md",
       "before_sha256": "5aaef7e9f1f8623982d045da6641e939136a7a7ecb139f776249923dcc0f8e54",
-      "after_sha256": "40a3e9f30665f89f22657fdb54c95bd900369df3215a07df3136358651f9c93e"
+      "after_sha256": "40a3e9f30665f89f22657fdb54c95bd900369df3215a07df3136358651f9c93e",
+      "application_state": "published",
+      "observed_sha256": "40a3e9f30665f89f22657fdb54c95bd900369df3215a07df3136358651f9c93e"
     },
     {
       "path": "guidance/team-planner.md",
       "before_sha256": null,
-      "after_sha256": "9bc362fe570105e93e97838b4ae5b6bd8741e02abd9921bfc4f051520af3cfd7"
+      "after_sha256": "9bc362fe570105e93e97838b4ae5b6bd8741e02abd9921bfc4f051520af3cfd7",
+      "application_state": "published",
+      "observed_sha256": "9bc362fe570105e93e97838b4ae5b6bd8741e02abd9921bfc4f051520af3cfd7"
     },
     {
       "path": "guidance/wisdom-core.md",
       "before_sha256": "6e9a468348f467bf49e46fae893c96b45c4c891b9e021ba11fac24b466c71dde",
-      "after_sha256": "12441e6cf578f6d0b7080b6a56e057ce94477df748a2addcf74d7abbbd2485b9"
+      "after_sha256": "12441e6cf578f6d0b7080b6a56e057ce94477df748a2addcf74d7abbbd2485b9",
+      "application_state": "published",
+      "observed_sha256": "12441e6cf578f6d0b7080b6a56e057ce94477df748a2addcf74d7abbbd2485b9"
     },
     {
       "path": "guidance/wisdom-meta.md",
       "before_sha256": "878d85c24de4b785f0c1dd8c04904bbb4e05560d9be8f7df881bdbb12ef7ba71",
-      "after_sha256": "4947fe18a8403e677763b2c9bbe25733c2a789332fb603a7f1a4f647c363bfd9"
+      "after_sha256": "4947fe18a8403e677763b2c9bbe25733c2a789332fb603a7f1a4f647c363bfd9",
+      "application_state": "published",
+      "observed_sha256": "4947fe18a8403e677763b2c9bbe25733c2a789332fb603a7f1a4f647c363bfd9"
     },
     {
       "path": "rules/engineering.toml",
       "before_sha256": "9139b364faaff05beac9db1324156d21abe214f65974b3119345a8c8a84075dc",
-      "after_sha256": "47ae04d311f2afe49146239deeefe2a56d6c7d0d1162a32633e68020ddbff2f0"
+      "after_sha256": "47ae04d311f2afe49146239deeefe2a56d6c7d0d1162a32633e68020ddbff2f0",
+      "application_state": "deferred",
+      "cli_applicable": false,
+      "application_reason": "Released 0.1.8 CLI has no rule-file authoring verb. The old live rule remains active; after_sha256 is a reviewed target only.",
+      "observed_sha256": "9139b364faaff05beac9db1324156d21abe214f65974b3119345a8c8a84075dc"
     },
     {
       "path": "skills/human-communication/SKILL.md",
       "before_sha256": "9c9419c27eb661680272017e1a41511dc8f39f793bc003af4dac00079da8b53b",
-      "after_sha256": "81854161eada1a6aff9261ee81e8678223a67087d26c94f4dc6a79cf3b20098c"
+      "after_sha256": "81854161eada1a6aff9261ee81e8678223a67087d26c94f4dc6a79cf3b20098c",
+      "application_state": "published",
+      "observed_sha256": "81854161eada1a6aff9261ee81e8678223a67087d26c94f4dc6a79cf3b20098c"
     },
     {
       "path": "skills/model-release-intake/SKILL.md",
       "before_sha256": "e603813b19f1f0baf3d3cbdf7f773cd239cf471a2bd4292b730bda36a9d1b542",
-      "after_sha256": "26c845d56c8b1ef56bc621c9f9eee7c3936e4d37360eabce0e01a336f8a8d890"
+      "after_sha256": "26c845d56c8b1ef56bc621c9f9eee7c3936e4d37360eabce0e01a336f8a8d890",
+      "application_state": "published",
+      "observed_sha256": "26c845d56c8b1ef56bc621c9f9eee7c3936e4d37360eabce0e01a336f8a8d890"
     }
   ],
   "retained_dependencies": [
@@ -254,91 +346,121 @@
       "path": "skills/recon-first-investigation/SKILL.md",
       "before_sha256": "1b9a6ec7df38f4d40665d4915c6381c22aa65e9445f3e7db924e7e794387db61",
       "after_sha256": null,
-      "reason": "Role duties now have one home; remove retired instructions after de-election."
+      "reason": "Role duties now have one home; remove retired instructions after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/recon-lifecycle/SKILL.md",
       "before_sha256": "8a26456aab222792b84799816357630d8975282dfff49045a33f1032704cbebf",
       "after_sha256": null,
-      "reason": "Role duties now have one home; remove retired instructions after de-election."
+      "reason": "Role duties now have one home; remove retired instructions after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/review-for-completeness/SKILL.md",
       "before_sha256": "702d99a972f3a88dbdad3a6acbbc59be845390176dd42a049825acc49d0d6335",
       "after_sha256": null,
-      "reason": "Role duties now have one home; remove retired instructions after de-election."
+      "reason": "Role duties now have one home; remove retired instructions after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/review-for-yagni/SKILL.md",
       "before_sha256": "54cf56a8265f6c69b915b70be5ac457b74501e46e3230e72d7e238e1e1b684c5",
       "after_sha256": null,
-      "reason": "Role duties now have one home; remove retired instructions after de-election."
+      "reason": "Role duties now have one home; remove retired instructions after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/spec-conformance/SKILL.md",
       "before_sha256": "c629ef9e7d53f45177127ffd0a5cc869b1ab751ebe597c275e6d8f8bcb6d8e54",
       "after_sha256": null,
-      "reason": "Role duties now have one home; remove retired instructions after de-election."
+      "reason": "Role duties now have one home; remove retired instructions after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/drafting-requirements/SKILL.md",
       "before_sha256": "e173a2594a032c0f9824d5a2eabe726c2dd9f7acc06386e2822ef394dc871d8b",
       "after_sha256": null,
-      "reason": "Role duties now have one home; remove retired instructions after de-election."
+      "reason": "Role duties now have one home; remove retired instructions after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/spec-handoff/SKILL.md",
       "before_sha256": "a592248c26cef5fec60aa1a7fc512f1b9706b1632a8d9dab62d9b869d776b8ba",
       "after_sha256": null,
-      "reason": "Role duties now have one home; remove retired instructions after de-election."
+      "reason": "Role duties now have one home; remove retired instructions after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/spec-homing/SKILL.md",
       "before_sha256": "5669c076798fea24efeaeecadc2d2f4f8a3d342673ca6020b086716f93578b3e",
       "after_sha256": null,
-      "reason": "Role duties now have one home; remove retired instructions after de-election."
+      "reason": "Role duties now have one home; remove retired instructions after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/feature-cycle/SKILL.md",
       "before_sha256": "ba1909b77e5f430a52f3009ce271b62e6e1717283402eb1a376fe10f9f771f12",
       "after_sha256": null,
-      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election."
+      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/work-tracking/SKILL.md",
       "before_sha256": "32dda800cbfc39e69c4dd1dd0d3c667381bf9d7d414df264008390d2df0cfd2c",
       "after_sha256": null,
-      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election."
+      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/unblocking/SKILL.md",
       "before_sha256": "112f9a6bf8f71581c87ba43e10c77b439db224d1abb1cce9d24e6729b8d36a78",
       "after_sha256": null,
-      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election."
+      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/product-discovery/SKILL.md",
       "before_sha256": "90fdf189a96b3d6280d3592c3796a42165d7af235207b39756d809e99a60ea49",
       "after_sha256": null,
-      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election."
+      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/bug-provenance/SKILL.md",
       "before_sha256": "6deaf672374792c66773c802db1038b8a6ee9f239a0aa20fd232d190cfaae2e6",
       "after_sha256": null,
-      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election."
+      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/worktree-session/SKILL.md",
       "before_sha256": "8ba358b074873a94c62596d7881ac7a1ee74e15778ec9de257c927d51b5387eb",
       "after_sha256": null,
-      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election."
+      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election.",
+      "application_state": "removed"
     },
     {
       "path": "skills/committing-and-pushing/SKILL.md",
       "before_sha256": "086c0419d0ad1766f6d8d068c5449943048d2ae8c2b28d86e56ff21d4d8baf1d",
       "after_sha256": null,
-      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election."
+      "reason": "Responsibility moved into focused role guidance; remove the retired skill after de-election.",
+      "application_state": "removed"
     }
-  ]
+  ],
+  "live_publication": {
+    "date": "2026-09-12",
+    "identity_revision": "fd24c468022fe09b338744639b12d7e4cfe29f37",
+    "supported_cli_operations": 58,
+    "default_archetype": {
+      "before": "default",
+      "after": "orchestrator"
+    },
+    "existing_session_refresh": "not-applied",
+    "existing_model_harness_changes": "not-applied",
+    "custody_changes": "not-applied",
+    "rule_application": "deferred-no-supported-cli-authoring-verb",
+    "service_change": "none",
+    "database_direct_writes": "none"
+  }
 }
