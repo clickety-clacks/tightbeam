@@ -2419,7 +2419,7 @@ defmodule Tightbeam.GatewayTest do
 
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), Org.get(ctx.db, "swapme"))
 
-    assert File.read!(Path.join(cwd, ".fixture/skills/tightbeam__worktree-session/SKILL.md"))
+    assert File.read!(Path.join(cwd, ".fixture/skills/tightbeam__model-release-intake/SKILL.md"))
 
     refute guidance =~ "[engine swap]"
 
@@ -6815,7 +6815,7 @@ defmodule Tightbeam.GatewayTest do
   test "every unlearn reference kind supplies supported commands that clear it", ctx do
     ensure_global_registry()
     base_dir = role_test_base("unlearn-reference-property")
-    learn_engineering_identity!(base_dir)
+    learn_engineering_identity_without_apply_fixture_skills!(base_dir)
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
 
     active =
@@ -6949,14 +6949,14 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, session.session_key, "thread-stable", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
     old_body = File.read!(skill)
 
     next =
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "new served skill",
         "test"
       )
@@ -7040,17 +7040,17 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, session.session_key, "thread-running", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-    alpha = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
-    beta = Path.join(cwd, ".codex/skills/tightbeam__committing-and-pushing/SKILL.md")
+    alpha = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+    beta = Path.join(cwd, ".codex/skills/tightbeam__human-communication/SKILL.md")
     old_alpha = File.read!(alpha)
 
-    identity_edit!(base_dir, "coder", {:skill, "worktree-session", false}, "alpha next", "test")
+    identity_edit!(base_dir, "coder", {:skill, "model-release-intake", false}, "alpha next", "test")
 
     next =
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "committing-and-pushing", false},
+        {:skill, "human-communication", false},
         "beta next",
         "test"
       )
@@ -7123,7 +7123,7 @@ defmodule Tightbeam.GatewayTest do
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "unstarted served skill",
         "test"
       )
@@ -7146,7 +7146,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert session_key == session.session_key
 
-    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
+    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")) ==
              "unstarted served skill"
 
     stamped = Org.get(ctx.db, session.session_key)
@@ -7208,7 +7208,7 @@ defmodule Tightbeam.GatewayTest do
     File.write!(vendor, ~s({"vendor":"state"}))
 
     bystander_skill =
-      Path.join(bystander_cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+      Path.join(bystander_cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
 
     bystander_body = File.read!(bystander_skill)
 
@@ -7216,7 +7216,7 @@ defmodule Tightbeam.GatewayTest do
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "only the selected session gets this",
         "test"
       )
@@ -7231,7 +7231,7 @@ defmodule Tightbeam.GatewayTest do
     assert session_key == selected.session_key
 
     assert File.read!(
-             Path.join(selected_cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+             Path.join(selected_cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
            ) ==
              "only the selected session gets this"
 
@@ -7276,7 +7276,7 @@ defmodule Tightbeam.GatewayTest do
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "org-wide guidance",
         "test"
       )
@@ -7334,7 +7334,7 @@ defmodule Tightbeam.GatewayTest do
     identity_edit!(
       base_dir,
       "coder",
-      {:skill, "worktree-session", false},
+      {:skill, "model-release-intake", false},
       "never lands",
       "test"
     )
@@ -7397,7 +7397,7 @@ defmodule Tightbeam.GatewayTest do
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "retried served skill",
         "test"
       )
@@ -7410,7 +7410,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{applied: [_], identity_revision: ^next} = apply.(call)
     assert %{applied: [_], identity_revision: ^next} = apply.(call)
 
-    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
+    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")) ==
              "retried served skill"
 
     assert Org.get(ctx.db, session.session_key).identity_revision == next
@@ -7454,13 +7454,13 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, session.session_key, "thread-retired", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
     old_body = File.read!(skill)
 
     identity_edit!(
       base_dir,
       "coder",
-      {:skill, "worktree-session", false},
+      {:skill, "model-release-intake", false},
       "not for the retired",
       "test"
     )
@@ -7510,7 +7510,7 @@ defmodule Tightbeam.GatewayTest do
       Org.append_pointer(ctx.db, key, "thread-#{order}", "created")
       cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
       Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-      {session, Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")}
+      {session, Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")}
     end
 
     # `--all` orders by orderIndex, so first is updated before second.
@@ -7522,7 +7522,7 @@ defmodule Tightbeam.GatewayTest do
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "mid-pass guidance",
         "test"
       )
@@ -7586,20 +7586,20 @@ defmodule Tightbeam.GatewayTest do
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
 
     skills = Path.join(cwd, ".codex/skills")
-    alpha = Path.join(skills, "tightbeam__committing-and-pushing/SKILL.md")
-    beta_dir = Path.join(skills, "tightbeam__worktree-session")
+    alpha = Path.join(skills, "tightbeam__human-communication/SKILL.md")
+    beta_dir = Path.join(skills, "tightbeam__model-release-intake")
     beta = Path.join(beta_dir, "SKILL.md")
     old_beta = File.read!(beta)
 
     identity_edit!(
       base_dir,
       "coder",
-      {:skill, "committing-and-pushing", false},
+      {:skill, "human-communication", false},
       "alpha next",
       "test"
     )
 
-    identity_edit!(base_dir, "coder", {:skill, "worktree-session", false}, "beta next", "test")
+    identity_edit!(base_dir, "coder", {:skill, "model-release-intake", false}, "beta next", "test")
 
     # The injection: the writer rewrites the elected skills in name order, so a
     # directory it cannot replace stops it PARTWAY — alpha rewritten, beta not.
@@ -7660,13 +7660,13 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, session.session_key, "thread-stamp-fail", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
 
     next =
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "stamp-fail served skill",
         "test"
       )
@@ -7739,13 +7739,13 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, session.session_key, "thread-nudge-fail", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
 
     next =
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "nudge-fail served skill",
         "test"
       )
@@ -7809,13 +7809,13 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, session.session_key, "thread-lost-response", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
 
     next =
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "lost-response served skill",
         "test"
       )
@@ -7877,13 +7877,13 @@ defmodule Tightbeam.GatewayTest do
     Org.append_pointer(ctx.db, session.session_key, "thread-forbidden", "created")
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-    skill = Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
     body = File.read!(skill)
 
     identity_edit!(
       base_dir,
       "coder",
-      {:skill, "worktree-session", false},
+      {:skill, "model-release-intake", false},
       "must not reach an outsider's apply",
       "test"
     )
@@ -8194,6 +8194,26 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp learn_engineering_identity!(base_dir) do
+    learn_engineering_identity_without_apply_fixture_skills!(base_dir)
+
+    manifest_path = Path.join([base_dir, "identity", "archetypes", "coder.toml"])
+    manifest = File.read!(manifest_path)
+
+    assert manifest =~ ~s(skills = [])
+
+    fixture_manifest =
+      String.replace(
+        manifest,
+        ~s(skills = []),
+        ~s(skills = ["human-communication", "model-release-intake"]),
+        global: false
+      )
+
+    identity_edit!(base_dir, "coder", :manifest, fixture_manifest, "test")
+    Archetypes.load!(base_dir)
+  end
+
+  defp learn_engineering_identity_without_apply_fixture_skills!(base_dir) do
     assert :initialized = Identity.init!(base_dir)
     assert {:ok, _revision} = identity_learn!(base_dir, "agentic-engineering", "test")
     Archetypes.load!(base_dir)
