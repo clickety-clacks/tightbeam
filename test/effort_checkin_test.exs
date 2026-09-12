@@ -83,6 +83,44 @@ defmodule Tightbeam.EffortCheckinTest do
     %{db: db, base_dir: base_dir, config: config, parent: parent, holder: holder, root: root}
   end
 
+  test "a new effort request follows corrected coordination while preserving its opener", ctx do
+    session(ctx.db, "corrected-parent", "h2", Placement.local_host_name())
+
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        verb: "work-item-create",
+        origin: "user:h2",
+        principal: {:user, "h2"},
+        session_key: nil,
+        params: %{title: "corrected coordination"}
+      })
+
+    assigned =
+      assignment(ctx, "assign", {:user, "h2"}, "holder", %{
+        subject: "one assignment",
+        work_item_id: item.id
+      })
+
+    result =
+      Tightbeam.SessionReparent.handle(ctx.db, %{
+        principal: {:user, "h2"},
+        params: %{
+          session_key: "holder",
+          parent_session_key: "corrected-parent",
+          assignment_id: assigned.id,
+          idempotency_key: "effort-reparent"
+        }
+      })
+
+    assert is_binary(result["eventId"])
+    request = escalate(ctx, assigned.id)
+    assert request.expecter_session_key == "corrected-parent"
+
+    assert rows(ctx.db, "SELECT openedByUser,openedBySession FROM assignments WHERE id=?1", [
+             assigned.id
+           ]) == [["h2", nil]]
+  end
+
   test "proof 1: assign and dispatch each arm one bracket; roots validate; all closes cancel",
        ctx do
     bare = assignment(ctx, "assign", {:user, "h1"}, "holder", %{subject: "bare"})

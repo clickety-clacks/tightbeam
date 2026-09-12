@@ -6,6 +6,26 @@ defmodule Tightbeam.Org do
 
   alias Tightbeam.{AdminProjection, DB, EventLog, NoticeBatcher, Supervision, Wakes}
   alias Tightbeam.DB.Txn
+
+  @doc "Current lineage parent, with immutable spawning provenance as the fallback."
+  def current_parent(db, session_key) do
+    case DB.query(db, "SELECT #{current_parent_sql("s")} FROM sessions s WHERE s.sessionKey=?1", [
+           session_key
+         ]) do
+      {:ok, [[parent]]} -> parent
+      {:ok, []} -> nil
+    end
+  end
+
+  @doc false
+  # SQL consumers (including recursive authority queries) use the same resolver.
+  # The alias is source-owned SQL, never caller input.
+  def current_parent_sql(session_alias) do
+    "COALESCE((SELECT rp.newCurrentParentSessionKey FROM session_reparent_events rp " <>
+      "WHERE rp.childSessionKey=#{session_alias}.sessionKey ORDER BY rp.eventSeq DESC LIMIT 1), " <>
+      "#{session_alias}.spawnedBy)"
+  end
+
   alias Tightbeam.Firehose.Publisher
   alias Tightbeam.Model
 
@@ -1441,7 +1461,7 @@ defmodule Tightbeam.Org do
            ownerUserId, origin, spawnedBy, handle, archetype, overrides, identityName,
            identityRevision, identityRenderContract, identityGuidanceDigest, cliToken, harness, provider,
            model, thinkingLevel, modelContext, host, clearedThroughSeq, state,
-           mechanicalStatus, createdAt, updatedAt
+           mechanicalStatus, createdAt, updatedAt, #{current_parent_sql("sessions")}
     FROM sessions
     """
   end
@@ -1474,7 +1494,8 @@ defmodule Tightbeam.Org do
          state,
          mechanical_status,
          created_at,
-         updated_at
+         updated_at,
+         current_parent
        ]) do
     %{
       session_key: session_key,
@@ -1486,6 +1507,7 @@ defmodule Tightbeam.Org do
       owner_user_id: owner_user_id,
       origin: origin,
       spawned_by: spawned_by,
+      current_parent: current_parent,
       handle: handle,
       archetype: archetype,
       overrides: decode_overrides(overrides),

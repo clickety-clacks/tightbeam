@@ -12,7 +12,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     db: db
   } do
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["firehose-r1-v1-019"]]
+    assert shape(db) == [["session-reparent-v1-019"]]
     assert_columns(db)
     seed(db)
     assert rows(db, "SELECT reminderState FROM assignments") == [[nil]]
@@ -32,7 +32,7 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     facts = rows(db, "SELECT * FROM condition_facts")
     objects = guards(db)
     assert :ok = Schema.ensure_all(db)
-    assert shape(db) == [["firehose-r1-v1-019"]]
+    assert shape(db) == [["session-reparent-v1-019"]]
     # Preserve every historical value despite Firehose's explicit table rebuild.
     assert rows(db, "SELECT #{Enum.join(assignment_columns, ",")} FROM assignments") ==
              assignments
@@ -42,7 +42,9 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     object_names = Enum.map(objects, &Enum.at(&1, 1))
 
     assert Enum.filter(guards(db), &(Enum.at(&1, 1) in object_names)) ==
-             Enum.map(objects, fn [type, name, sql] -> [type, name, firehose_guard(name, sql)] end)
+             Enum.map(objects, fn [type, name, sql] ->
+               [type, name, successor_guard(name, sql)]
+             end)
 
     assert_columns(db)
     :ok = DB.execute(db, ~s(UPDATE assignments SET reminderState='{"version":1}'))
@@ -123,9 +125,8 @@ defmodule Tightbeam.R1SchemaMigrationTest do
 
   defp shape(db), do: rows(db, "SELECT shape FROM schema_stamp")
 
-  # Only these two historical guards change: Firehose adds rowVersion checks.
-  # Preserve their terminal-principal predicate and every other object's SQL.
-  defp firehose_guard(name, sql)
+  # Preserve terminal-principal predicates while adding the explicit rowVersion checks.
+  defp successor_guard(name, sql)
        when name in ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard) do
     assert String.contains?(sql, "\nWHEN ")
     assert String.contains?(sql, "))\nBEGIN\n")
@@ -139,7 +140,21 @@ defmodule Tightbeam.R1SchemaMigrationTest do
     |> String.replace("))\nBEGIN\n", ")))\nBEGIN\n")
   end
 
-  defp firehose_guard(_name, sql), do: sql
+  defp successor_guard("supervision_liveness_sidecar_insert_coherent", sql) do
+    # Event-derived ancestry is the only change to this historical trigger;
+    # admission behavior is exercised separately in SessionReparentTest.
+    sql
+    |> String.replace(
+      "SELECT sessionKey,spawnedBy FROM sessions",
+      "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions"
+    )
+    |> String.replace(
+      "SELECT ancestor.sessionKey,ancestor.spawnedBy",
+      "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
+    )
+  end
+
+  defp successor_guard(_name, sql), do: sql
 
   defp guards(db),
     do:

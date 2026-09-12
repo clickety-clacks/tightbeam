@@ -658,7 +658,11 @@ defmodule Tightbeam.Artifacts do
   end
 
   defp parent_session(db, session_key) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
+    case DB.query(
+           db,
+           "SELECT #{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1",
+           [session_key]
+         ) do
       {:ok, [[parent]]} -> parent
       {:ok, []} -> nil
     end

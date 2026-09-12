@@ -15,7 +15,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
 
   test "fresh O2 bootstrap and restart preserve nullable notice state", %{db: db} do
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "firehose-r1-v1-019"
+    assert stamp(db) == "session-reparent-v1-019"
     seed_episode(db)
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert :ok = Schema.ensure_all(db)
@@ -49,18 +49,18 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     before_episode = rows(db, "SELECT * FROM rail_remedy_episodes")
     before_triggers = triggers(db)
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "firehose-r1-v1-019"
+    assert stamp(db) == "session-reparent-v1-019"
     assert rows(db, "SELECT * FROM wake_cancellations") == before_rows
     assert rows(db, "SELECT * FROM wakes ORDER BY wakeId") == before_wakes
 
     assert rows(db, "SELECT * FROM rail_remedy_episodes") ==
              Enum.map(before_episode, &(&1 ++ [nil]))
 
-    # Firehose adds guards; old triggers stay byte-identical except the two explicit rowVersion upgrades.
+    # Only the explicit rowVersion and current-lineage trigger upgrades change old SQL.
     before_names = Enum.map(before_triggers, &hd/1)
 
     assert Enum.filter(triggers(db), &(hd(&1) in before_names)) ==
-             Enum.map(before_triggers, fn [name, sql] -> [name, firehose_guard(name, sql)] end)
+             Enum.map(before_triggers, fn [name, sql] -> [name, successor_guard(name, sql)] end)
 
     assert rows(db, "PRAGMA foreign_key_check") == []
     assert rows(db, "PRAGMA foreign_keys") == [[1]]
@@ -208,7 +208,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     assert rows(db, "SELECT name FROM sqlite_master WHERE name='wake_cancellations'") == []
     :ok = DB.execute(db, "DROP TRIGGER o2_test_refuse_activation")
     assert :ok = Schema.ensure_all(db)
-    assert stamp(db) == "firehose-r1-v1-019"
+    assert stamp(db) == "session-reparent-v1-019"
     assert rows(db, "SELECT noticeState FROM rail_remedy_episodes") == [[nil]]
     assert_two_shapes(db)
   end
@@ -272,9 +272,8 @@ defmodule Tightbeam.O2SchemaMigrationTest do
 
   defp stamp(db), do: rows(db, "SELECT shape FROM schema_stamp") |> hd() |> hd()
 
-  # Only these two historical guards change: Firehose adds rowVersion checks.
-  # Preserve their terminal-principal predicate and every other object's SQL.
-  defp firehose_guard(name, sql)
+  # Preserve terminal-principal predicates while adding the explicit rowVersion checks.
+  defp successor_guard(name, sql)
        when name in ~w(decision_requests_terminal_insert_guard decision_requests_terminal_update_guard) do
     assert String.contains?(sql, "\nWHEN ")
     assert String.contains?(sql, "))\nBEGIN\n")
@@ -288,7 +287,21 @@ defmodule Tightbeam.O2SchemaMigrationTest do
     |> String.replace("))\nBEGIN\n", ")))\nBEGIN\n")
   end
 
-  defp firehose_guard(_name, sql), do: sql
+  defp successor_guard("supervision_liveness_sidecar_insert_coherent", sql) do
+    # Event-derived ancestry is the only change to this historical trigger;
+    # admission behavior is exercised separately in SessionReparentTest.
+    sql
+    |> String.replace(
+      "SELECT sessionKey,spawnedBy FROM sessions",
+      "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions"
+    )
+    |> String.replace(
+      "SELECT ancestor.sessionKey,ancestor.spawnedBy",
+      "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
+    )
+  end
+
+  defp successor_guard(_name, sql), do: sql
 
   defp triggers(db),
     do: rows(db, "SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name")

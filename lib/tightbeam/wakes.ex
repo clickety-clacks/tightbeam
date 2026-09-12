@@ -1049,9 +1049,9 @@ defmodule Tightbeam.Wakes do
         txn,
         """
         WITH RECURSIVE lineage(sessionKey,spawnedBy) AS (
-          SELECT sessionKey,spawnedBy FROM sessions WHERE sessionKey=?1 AND ownerUserId=?3
+          SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey=?1 AND ownerUserId=?3
           UNION
-          SELECT s.sessionKey,s.spawnedBy FROM sessions s JOIN lineage l ON s.sessionKey=l.spawnedBy
+          SELECT s.sessionKey,#{Tightbeam.Org.current_parent_sql("s")} FROM sessions s JOIN lineage l ON s.sessionKey=l.spawnedBy
           WHERE s.ownerUserId=?3
         )
         SELECT 1 FROM lineage WHERE sessionKey=?2

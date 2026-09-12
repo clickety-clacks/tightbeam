@@ -80,6 +80,56 @@ defmodule Tightbeam.Idempotency do
     end
   end
 
+  @doc false
+  def migrate_reparent_in_txn(txn) do
+    Txn.exec(txn, """
+    CREATE TABLE wire_idempotency_reparent (
+      ownerUserId TEXT NOT NULL,
+      operation TEXT NOT NULL CHECK (operation IN ('spawn','retire','wake','assign','condition','work-item-create','session-reparent')),
+      idempotencyKey TEXT NOT NULL,
+      sessionKey TEXT NOT NULL,
+      requestFingerprint TEXT,
+      canonicalResponse TEXT,
+      PRIMARY KEY(ownerUserId,operation,idempotencyKey),
+      CHECK (operation != 'session-reparent' OR
+        (requestFingerprint IS NOT NULL AND canonicalResponse IS NOT NULL))
+    );
+    INSERT INTO wire_idempotency_reparent(ownerUserId,operation,idempotencyKey,sessionKey)
+      SELECT ownerUserId,operation,idempotencyKey,sessionKey FROM wire_idempotency;
+    DROP TABLE wire_idempotency;
+    ALTER TABLE wire_idempotency_reparent RENAME TO wire_idempotency;
+    """)
+  end
+
+  @doc false
+  def reparent_result_in_txn(txn, owner, key) do
+    case Txn.q(
+           txn,
+           """
+           SELECT requestFingerprint,canonicalResponse FROM wire_idempotency
+           WHERE ownerUserId=?1 AND operation='session-reparent' AND idempotencyKey=?2
+           """,
+           [owner, key]
+         ) do
+      [[fingerprint, response]] -> %{fingerprint: fingerprint, response: JSON.decode!(response)}
+      [] -> nil
+    end
+  end
+
+  @doc false
+  def put_reparent_in_txn(txn, owner, key, fingerprint, event, response) do
+    Txn.q(
+      txn,
+      """
+      INSERT INTO wire_idempotency(ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse)
+      VALUES (?1,'session-reparent',?2,?3,?4,?5)
+      """,
+      [owner, key, event, fingerprint, JSON.encode!(response)]
+    )
+
+    :ok
+  end
+
   @doc "Record a completed operation's session_key under its key."
   @spec put(db(), row()) :: :ok
   def put(db \\ Tightbeam.DB, row) do
