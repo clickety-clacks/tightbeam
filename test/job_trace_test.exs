@@ -170,7 +170,7 @@ defmodule Tightbeam.JobTraceTest do
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
         assignment,
-        ~w(files holderKey id openerRef reviewsAssignmentId state)a
+        ~w(currentCoordinationParentRef files holderKey id openerRef reviewsAssignmentId state)a
       )
     end)
 
@@ -178,6 +178,7 @@ defmodule Tightbeam.JobTraceTest do
     review = Enum.find(trace.assignments, &(&1.id == "asg_review"))
     assert direct.files == ["a.ex", "z.ex"]
     assert direct.openerRef == "user:owner"
+    assert direct.currentCoordinationParentRef == nil
     assert review.openerRef == "session:reviewer"
     assert review.reviewsAssignmentId == "asg_direct"
 
