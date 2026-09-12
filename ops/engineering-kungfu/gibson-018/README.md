@@ -70,13 +70,18 @@ Source inspection establishes the following limits:
 - Same-harness tuning is designed to preserve the conversation, but still uses the
   execution-lane boundary and must respect held or queued work.
 
-The initial 38-edit sequence passed isolated validation on source whose identity,
-archetype and rule-loader code matches build 1337. The invariant revision adds three
-skill updates and removal of eight retired skill bodies after all manifests have
-stopped electing them. Its 49-edit command plan and before/after hashes are private
-operator evidence. Rehearse this changed sequence against installed source before
-execution; the earlier proof does not cover the new removals. The rule target remains
-a separate compatibility check, with no installed CLI edit operation claimed.
+The revised 49-edit sequence passed isolated validation against the exact installed
+source, build 1337, including all intermediate role/harness compositions and the
+final file hashes. Eight retired skill bodies were removed after every manifest
+stopped electing them. The final overlay passed all 18 role/harness compositions,
+with the three local policy fragments preserved, and all three rule definitions
+loaded successfully in the disposable fixture.
+
+The rule file stayed unchanged through the supported edit sequence. Loading the
+prepared replacement in that fixture is a separate compatibility check; it does not
+establish a supported installed CLI edit operation or permission to change live rules.
+The command plan, exact hashes and execution logs remain private operator evidence.
+No live application was performed.
 
 Therefore no automatic apply, tune, reparent, wake or stand-down script is supplied.
 Do not bypass the supported interface with direct database writes, path traversal,

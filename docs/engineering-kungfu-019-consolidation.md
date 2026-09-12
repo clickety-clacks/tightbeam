@@ -406,6 +406,15 @@ Existing composition tests now assert the revised recon trigger, integration-cus
 instruction and bounded verdict record instead of the superseded prose. The prepared
 0.1.8 command sequence now removes retired skills only after de-election. No live application is performed.
 
+Verification of the revised guidance at 77515cf passed on eezo: formatting, all 134
+focused identity/archetype/skill/rule/rendering tests, and packaging. The corrected
+49-edit compatibility rehearsal passed against installed source fdb3db5, including
+all intermediate compositions, the eight actual skill removals, final file hashes,
+18 final identities and three-rule validation. The rule file remained unchanged
+through the supported edit sequence; the replacement was loaded only in the
+isolated fixture. Earlier full-suite failures remain recorded above and are not
+resolved by these focused results.
+
 ## Current-org application
 
 Prepare a compatible 0.1.8 identity overlay separately from the shipped bundle.
