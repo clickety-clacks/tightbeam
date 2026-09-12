@@ -1,6 +1,6 @@
 {
   "identity_base": "08262823f065561977c5cf196345d59922b760e5",
-  "source_revision": "1a9ca30",
+  "source_revision": "a976fea",
   "state": "prepared-not-applied",
   "files": [
     {
@@ -146,7 +146,7 @@
     {
       "path": "guidance/product-owner.md",
       "before_sha256": "8ae444578bcaf61913b09c9e5df7e6d04690395f9e2a055ecd526d68d3f60bee",
-      "after_sha256": "28b4c90d7bf6a4b5d28b75bd53c3322749981a332772e2984c471b51cfc162df"
+      "after_sha256": "9e0a0bf825d46d61e49ac79589fb68ffe3357ad137c6bdd80299e5a9499ebe90"
     },
     {
       "path": "guidance/recon.md",
