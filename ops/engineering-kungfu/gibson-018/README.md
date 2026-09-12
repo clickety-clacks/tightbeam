@@ -193,5 +193,11 @@ suggested model defaults and the existing no-testing and spec-preservation fragm
 These definitions do not create agents or retarget current ones. Everyday delivery,
 PO and recon procedures move into their role guidance; repository specialists share
 repository-custody. Retired skills must be de-elected before supported removal.
-The previous 49-operation proof predates this revision. Updated isolated verification
-and sequence evidence are pending. The package remains prepared and unapplied.
+The previous 49-operation proof predates this revision. The fresh proof for source
+`1a9ca30` used released 0.1.8 build `fdb3db5` on eezo. All 58 supported identity edits
+and removals passed, with composition after every edit. The final 13 archetypes
+composed for both harnesses, and all three prepared rules validated. The deferred
+rule file remained untouched through the supported sequence, then was copied only
+inside the disposable fixture for validation. The proof used no gateway, live
+identity, CLI operation or inference. Evidence is `proof-1a9ca30-018.log` in the
+consolidation work directory. The package remains prepared and unapplied.

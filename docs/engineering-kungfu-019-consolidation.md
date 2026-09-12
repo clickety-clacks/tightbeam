@@ -466,7 +466,8 @@ On 12 September Mike accepted the interactive topology and then directed: "i clo
 the lavish. no more comments. apply what you need to". This continues the same
 commission on the same private branch. The four archetypes previously marked
 proposed are now authored: team-planner, guidance-writer, guidance-reviewer and
-integrator. Verification and focused review of this revision are pending.
+integrator. Implementation is complete at `1a9ca30`; focused review and isolated
+verification are complete.
 
 Executive and feature delivery remain scopes of orchestrator. The planner carries
 team-design craft without inheriting staffing or delivery recovery. Guidance writer
@@ -496,8 +497,35 @@ No new runtime mechanism, permanent agent, fixed tree or live operation is intro
 
 The prepared 0.1.8 overlay carries these roles and local restrictions using existing
 identity mechanisms. It retains installed review and wake limitations and reserved
-baseline skill names. Its prior composition proof does not establish this revision;
-a fresh isolated edit and composition check is required before calling it ready.
+baseline skill names. A fresh isolated rehearsal on released build `fdb3db5`
+passed all 58 supported identity edits and removals, including composition after
+every edit. All 13 final archetypes composed for both harnesses, and the three
+prepared rules validated. The deferred rule file was copied only into the disposable
+fixture after proving the supported sequence left it untouched. No gateway, live
+identity, CLI operation or inference was involved.
+
+The final review correction keeps repository work with its custodian. The PO owns
+spirit content and the spec writer owns cleared spec bytes; both send required
+repository publication through the delivery owner. They retain content authority
+and receive the durable path and revision. Spec reviewers also avoid repository
+custody instructions. This accepts Fable's context-cost finding and Rowan's and
+Morrow's missing-custody finding without adding unrelated craft to product roles.
+
+| Reviewer | Final scoped disposition |
+| --- | --- |
+| Fable | Accepted `1a9ca30`, message `d8cff1b4`; spec-role context finding closed. |
+| Rowan | Accepted `f608318..1a9ca30`, message `92032b5f`; PO publication custody finding closed. |
+| Morrow | Accepted `1a9ca30`, message `bc0c3977`; no open findings. |
+| Orchestrator editor | Accepted the planner, custody, duty placement and review applicability at `f608318`, message `1bbb4a6a`; those decisions remain in the final revision. |
+| Stall watch | Accepted recon, recovery and the 0.1.8 adaptation at `f608318`, message `79e46a2a`; no findings in that scope. |
+
+On eezo, implementation `1a9ca30` passed format checking, 134 focused identity,
+archetype, skill, rule, projection, rendering and home tests, and packaging assembly.
+The earlier full-suite run's two failures remain recorded above; this is not a claim
+that full CI is green. Evidence is preserved outside the checkout as
+`proof-1a9ca30.log` and `proof-1a9ca30-018.log` in the consolidation work directory.
+Mike ended the Lavish review; both completed polls were consumed without further
+feedback. This branch remains private, with no release or live application.
 
 ## Current-org application
 
