@@ -268,6 +268,8 @@ defmodule Tightbeam.Schema do
   # Composed 019: R1 storage plus the complete Firehose schema suffix.
   @firehose_shape "firehose-r1-v1-019"
   @reparent_shape "session-reparent-v1-019"
+  # Artifact durability successor: captured content storage over the reparent shape.
+  @durability_shape "artifact-content-v1-019"
   @o2_shape "row-driven-o2-v1-019"
   @o2_pre_liveness_shape "row-driven-o2-pre-liveness-v1-019"
   @shape "row-driven-admission-v1-019"
@@ -1243,6 +1245,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @durability_shape,
       @reparent_shape,
       @firehose_shape,
       @r1_shape,
@@ -1292,7 +1295,12 @@ defmodule Tightbeam.Schema do
     {:ok, [[predecessor]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     Enum.each(@schema_modules, fn module ->
-      :ok = bootstrap_module(db, module, predecessor in [@firehose_shape, @reparent_shape])
+      :ok =
+        bootstrap_module(
+          db,
+          module,
+          predecessor in [@firehose_shape, @reparent_shape, @durability_shape]
+        )
     end)
 
     activated_at = System.system_time(:millisecond)
@@ -1326,6 +1334,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_r1(db)
     :ok = upgrade_firehose_r1(db)
     :ok = upgrade_session_reparent(db)
+    :ok = upgrade_artifact_durability(db)
     Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
 
@@ -1393,7 +1402,7 @@ defmodule Tightbeam.Schema do
     [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
     enforcement_objects =
-      if shape == @reparent_shape,
+      if shape in [@reparent_shape, @durability_shape],
         do: reparent_liveness_enforcement_objects(),
         else: @supervision_liveness_enforcement_objects
 
@@ -1910,6 +1919,7 @@ defmodule Tightbeam.Schema do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[stamp]]}
       when stamp in [
+             @durability_shape,
              @reparent_shape,
              @firehose_shape,
              @r1_shape,
@@ -1989,7 +1999,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@reparent_shape}
+          this build: #{@durability_shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
@@ -2011,7 +2021,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@reparent_shape}
+          this build: #{@durability_shape}
 
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
@@ -2026,7 +2036,8 @@ defmodule Tightbeam.Schema do
   defp upgrade_r1(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
-             [[stamp]] when stamp in [@reparent_shape, @firehose_shape, @r1_shape] ->
+             [[stamp]]
+             when stamp in [@durability_shape, @reparent_shape, @firehose_shape, @r1_shape] ->
                :ok
 
              [[@o2_shape]] ->
@@ -2066,7 +2077,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def upgrade_firehose_r1(db, opts \\ []) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[stamp]]} when stamp in [@reparent_shape, @firehose_shape] ->
+      {:ok, [[stamp]]} when stamp in [@durability_shape, @reparent_shape, @firehose_shape] ->
         :ok
 
       {:ok, [[@r1_shape]]} ->
@@ -2140,6 +2151,9 @@ defmodule Tightbeam.Schema do
   def upgrade_session_reparent(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@durability_shape]] ->
+               :ok
+
              [[@reparent_shape]] ->
                :ok
 
@@ -2177,10 +2191,65 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  @doc false
+  # Artifact durability successor over session-reparent-v1-019. Creates the
+  # captured-content store only; every historical module DDL is left alone.
+  def upgrade_artifact_durability(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@durability_shape]] ->
+               :ok
+
+             [[@reparent_shape]] ->
+               existing =
+                 Txn.q(
+                   txn,
+                   "SELECT name FROM sqlite_master WHERE name IN ('artifact_contents', 'artifacts_released_requires_content_insert', 'artifacts_released_requires_content_update', 'artifact_contents_released_immutable', 'artifact_contents_released_retained') ORDER BY name"
+                 )
+
+               if existing != [],
+                 do:
+                   raise(ShapeError,
+                     message: "incompatible artifact durability objects: #{inspect(existing)}"
+                   )
+
+               :ok = Tightbeam.ArtifactContent.schema_in_txn(txn)
+
+               # Existing rows are left exactly as they are. A legacy `released`
+               # row with no stored content is the EXTERNAL case: its bytes were
+               # never taken into custody, so there is nothing for this store to
+               # account for and nothing to revoke. Terminal state stays
+               # `released`, origin stays intact, no custody is implied.
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                 @durability_shape,
+                 System.system_time(:millisecond),
+                 @reparent_shape
+               ])
+
+               if Txn.changes(txn) != 1,
+                 do: raise(ShapeError, message: "artifact durability stamp race")
+
+               # Scoped: the argument-less form walks the WHOLE database, a real stall
+               # inside this transaction on a live 15G state.db for no added coverage.
+               [] = Txn.q(txn, "PRAGMA foreign_key_check(artifacts)")
+               [] = Txn.q(txn, "PRAGMA foreign_key_check(artifact_contents)")
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible artifact durability predecessor: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
   defp upgrade_o2(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[stamp]]}
       when stamp in [
+             @durability_shape,
              @reparent_shape,
              @firehose_shape,
              @r1_shape,
