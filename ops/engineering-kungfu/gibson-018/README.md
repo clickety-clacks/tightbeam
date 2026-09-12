@@ -41,7 +41,7 @@ them immediately before execution; this snapshot is not authority to overwrite d
 | Review qualification | The installed completion check uses the newest linked review card and that holder's latest verdict. It does not implement 0.1.9 pooled review conclusions. |
 | Rules | The proposed rule file keeps the completion predicate and uses a denial with an explicit owner remedy. The 0.1.8 validator requires assignment creation for a linked-review remedy, so the 0.1.9 notification-only remedy cannot be imported. The released CLI has no rule-file edit command. It is a reviewed target, not an executable CLI application step. |
 | Parentage | No supported command changes existing spawning ancestry or transfers an open assignment's opener. Role bindings and display names cannot do that work. |
-| Active archetypes | `identity repoint` supports retired rows. Do not retire an active session merely to change its archetype. |
+| Active archetypes | Ordinary worker rows must be retired before `identity repoint`. Released source also handles Main and built-in sessions at a turn boundary, closing their resident context. That exception is not safe under the present no-turn restriction, and Main is specifically protected. Do not retire an active worker merely to change its archetype. |
 | Artifact bytes | A path/hash record binds identity; it does not preserve content. Keep the existing organization-local preservation rule until durable content retrieval is delivered. |
 
 ## No-turn boundary
@@ -52,8 +52,13 @@ his decision. All database inspection uses a read-only connection.
 
 Source inspection establishes the following limits:
 
-- `identity edit` writes and publishes identity, then reloads archetypes. It does not
-  refresh existing sessions or reload rule files.
+- Each `identity edit` commits and publishes one file, then reloads archetypes. It does
+  not refresh existing sessions or reload rule files. Publish dependencies before
+  references and verify intermediate composed identities as well as the final tree.
+- A successful `identity relearn`, or `learn` of an already learned bundle, reloads
+  archetypes, rails and rules without refreshing sessions or creating execution lanes.
+  This supplies a law reload, not the missing rule-file edit operation. A gateway
+  restart is not inherently required to reload law.
 - `identity apply` and tuning enter a session execution lane. Even
   `ensure_lane_quiet` creates a lane whose initialization nudges pending work.
   They are not general no-turn operations.
@@ -62,6 +67,14 @@ Source inspection establishes the following limits:
   session, workdir and work graph. Private engine reasoning does not carry over.
 - Same-harness tuning is designed to preserve the conversation, but still uses the
   execution-lane boundary and must respect held or queued work.
+
+The prepared operator sequence was exercised against released 0.1.8 on an isolated
+copy of the original identity. All 38 supported edits published successfully, and
+every intermediate revision composed for both harnesses. Final file hashes matched
+the overlay. The rule file remained at its original hash throughout. This validates
+the identity edit order, not live rule application or runtime retargeting. No gateway
+or inference ran in that validation. The exact command plan and log remain private
+operator evidence.
 
 Therefore no automatic apply, tune, reparent, wake or stand-down script is supplied.
 Do not bypass the supported interface with direct database writes, path traversal,
