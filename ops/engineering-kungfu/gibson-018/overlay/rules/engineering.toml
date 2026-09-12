@@ -1,0 +1,20 @@
+# Protect explicit authority and attributable review. Agents judge the workflow.
+# Resolve a defective rule with its responsible owner; preserve the governing
+# restriction and continue separable authorized work while it is corrected.
+
+# Qualifying completion requires an applicable independent reviewed-clean conclusion.
+# On 0.1.8, report the missing review and let the holder coordinate with delivery ownership.
+# A pure notification remedy over linked-review facts requires the later runtime.
+# Completion remains blocked until the required review evidence qualifies.
+[[rule]]
+name = "completion-requires-review"
+verb = "attest"
+text = "code, policy, release, and live-mutation completion needs the most recent holder-filed verdict across --reviews-linked cards to be reviewed-clean on a card held by a different session; a newer card without a holder verdict does not displace an existing judgment; evidence, review, and coordination effects do not require review, and harness, provider, model, and effort guide review-session selection only. Coordinate missing review with the accountable delivery owner."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "completion" },
+  { fact = "assignment.effect_kind", op = "in", value = ["code", "policy", "release", "live_mutation"] },
+  { fact = "assignment.qualifying_review_verdict_kinds", op = "not_in", value = ["reviewed-clean"] },
+]

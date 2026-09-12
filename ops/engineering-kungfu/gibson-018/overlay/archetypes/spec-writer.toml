@@ -1,0 +1,35 @@
+name = "spec-writer"
+where = ["gibson"]
+skills = ["human-communication"]
+
+[defaults]
+harness = "codex"
+model = "gpt-5.6-sol"
+effort = "high"
+
+[[model_preferences]]
+model = "gpt-5.6-sol"
+effort = "high"
+
+[guidance]
+text = """
+#include "golden-rule.md"
+
+#include "scope-and-architecture.md"
+
+#include "wisdom-core.md"
+
+#include "engineering-tenets.md"
+
+#include "subtraction.md"
+
+#include "preferred-models.md"
+
+#include "spec-writer.md"
+
+#include "no-testing-on-gibson.md"
+
+#include "specs-home.md"
+
+#include "specs-interim-durability.md"
+"""

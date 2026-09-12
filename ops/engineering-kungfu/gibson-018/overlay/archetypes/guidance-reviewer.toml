@@ -1,0 +1,39 @@
+name = "guidance-reviewer"
+where = ["gibson"]
+skills = ["human-communication", "integration-targets"]
+
+[defaults]
+harness = "claude"
+model = "claude-opus-5"
+effort = "xhigh"
+
+[[model_preferences]]
+model = "claude-opus-5"
+effort = "xhigh"
+
+[guidance]
+text = """
+#include "golden-rule.md"
+
+#include "scope-and-architecture.md"
+
+#include "wisdom-core.md"
+
+#include "engineering-tenets.md"
+
+#include "subtraction.md"
+
+#include "preferred-models.md"
+
+#include "repository-custody.md"
+
+#include "guidance-policy-craft.md"
+
+#include "guidance-reviewer.md"
+
+#include "no-testing-on-gibson.md"
+
+#include "specs-home.md"
+
+#include "specs-interim-durability.md"
+"""

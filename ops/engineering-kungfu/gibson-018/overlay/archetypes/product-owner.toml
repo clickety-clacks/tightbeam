@@ -1,0 +1,34 @@
+name = "product-owner"
+skills = ["human-communication", "tightbeam-dispatching"]
+
+[defaults]
+harness = "codex"
+model = "gpt-6-astra"
+effort = "high"
+
+[[model_preferences]]
+model = "gpt-6-astra"
+effort = "high"
+
+[guidance]
+text = """
+#include "golden-rule.md"
+
+#include "scope-and-architecture.md"
+
+#include "wisdom-core.md"
+
+#include "engineering-tenets.md"
+
+#include "subtraction.md"
+
+#include "preferred-models.md"
+
+#include "product-owner.md"
+
+#include "no-testing-on-gibson.md"
+
+#include "specs-home.md"
+
+#include "specs-interim-durability.md"
+"""

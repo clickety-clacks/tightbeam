@@ -1,36 +1,37 @@
 ---
 name: tightbeam-archetype-cultivation
-description: The method for maturing an archetype from accreted bullets into a disciplined role — research, restructure, tier, verify, rail. Use when formalizing or overhauling any archetype's guidance and skills.
+description: Revise a role's responsibility, guidance and elected skills when its current composition no longer serves the work.
 ---
 
-Proven on the default archetype and on a domain archetype. Steps, in order; cite wisdom N
-throughout.
+# Archetype cultivation
 
-1. RESEARCH the discipline: the role's professional tenets AND its named anti-patterns
-   (the traps are more actionable than the virtues). Web research; distill only the
-   non-obvious.
-2. REWRITE THE KERNEL by duty and contact-mode, not accreted bullets: identity
-   sentence carrying APPETITE (the role WANTS its outcome), then sections per
-   situation ("on user contact", "when X fails"). No per-wake rituals; scope duties
-   to who triggers them.
-3. GIVE THE ROLE A DURABLE ARTIFACT it maintains (user.md, a role-owned decision record):
-   the written trace that survives context resets, records decisions and DECLINES so
-   nothing is re-asked, and gives rails something to check.
-4. TIER EVERYTHING (wisdom 15-17): reflexes, triggers, and detection in the always-on
-   kernel; ceremony and craft in progressively-disclosed skills; a skill must never
-   be what tells you to load it.
-5. MAKE TRIGGERS CONCRETE: observable in-turn events ("the user corrected your
-   reframe"), never vibes, never thresholds. Include out-of-turn thinking where the
-   role is judgment-heavy: self-scheduled digest wakes with concrete triggers and a
-   law-visible prompt convention.
-6. VERIFY EVERY MECHANISM (wisdom 20-21): read the code for each verb, field, and
-   record the guidance references. No invented capabilities; state interim
-   workarounds honestly; file the missing mechanism as a lane instead of pretending.
-7. RAILS PASS (wisdom 1-4): for each norm — both sides leave rows? file the statute
-   candidate. One side missing a marker? mint a convention. Judgment? it stays
-   guidance, say so explicitly.
-8. AUDIT COMPLETE AND COLD: walk every path as a stranger session would; ground each
-   term at first use (19); then check SPIRIT — does the role read as wanting its
-   work, or merely complying?
-9. LAND per authoring law: one home per concept (18), batch the edits (22), guidance source
-   and identity in sync, with the rendered result ready for the user's review.
+Identify the durable responsibility the role should own, its authority, contacts and
+observable outcome. Reuse established role craft and existing evidence. Research an
+unfamiliar discipline or consequential uncertainty when it would change the design;
+a role rewrite does not automatically require a research project.
+
+Read the current composed role, including shared guidance, kernel and elected skill
+frontmatter. Use tightbeam-guidance-authoring for placement, direct instructions and
+supported mechanisms. Preserve compatible intent, useful expertise and local authority.
+Remove conflicting refractions together rather than appending a newer opposing rule.
+
+Keep everyday role judgment in the kernel and occasional procedures behind discoverable
+skills. Choose the smallest useful durable artifact when the role needs one; a task's
+ordinary work record may suffice. Do not mint a marker, template or digest cadence
+merely to prove that an agent thought about the work.
+
+Distinguish roles from topology. One archetype may serve several scopes or layers,
+and a transient planner assignment need not become another permanent role. State
+intent, delivery and recovery responsibility without prescribing one universal graph.
+Model choices follow the applicable activity policy; do not bury competing model
+orders inside role prose.
+
+Use tightbeam-law-minting when an explicit boundary or concrete invariant may need
+mechanical protection. Observable rows make a check possible; they do not alone
+justify enforcing it. Keep judgment in guidance and preserve supported recovery.
+
+Read the result as a fresh competent session doing the actual job. Check that the
+role can find its procedures, understand its authority, address the right owner and
+produce the promised outcome without this conversation. Review realistic scenarios
+proportionate to the change. Batch coherent edits through the authorized identity
+workflow and distinguish authored source, published identity and refreshed sessions.

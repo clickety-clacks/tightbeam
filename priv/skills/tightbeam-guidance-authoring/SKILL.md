@@ -1,40 +1,39 @@
 ---
 name: tightbeam-guidance-authoring
-description: The rules for writing or editing any tightbeam guidance — manual sections, archetype kernels, skills, kungfu docs. Use before creating or changing guidance text.
+description: Apply the adopted writing invariants when creating or changing manual sections, archetype kernels, skills or kungfu guidance.
 ---
 
-Working projection of wisdom.md rules 15-22 (the doctrine is
-canonical; cite by number there):
+# Guidance authoring
 
-- Write DIRECTIVES in role voice, not reference prose. If it reads like an
-  encyclopedia entry, rewrite it as an order. (15)
-- Assume professional competence. State intent, authority and local facts. Name
-  established practices without teaching them. Explain unfamiliar Tightbeam procedures
-  only as needed. Keep each rule in one home and verify the supported mechanism before
-  teaching it. (15)
-- Choose the home by frequency: everyday operation -> the always-on manual; rare
-  ceremony -> a skill; role craft -> the archetype kernel; depth -> a skill body
-  behind its frontmatter. (16)
-- Detection always lives in the always-on layer; a skill must never be what tells you
-  whether to load it. Triggers in the kernel, ceremony in the body. (17)
-- One concept, one home. Never restate a rule in a second place with different words
-  — co-locate role phrasings with the law or replace it. (18)
-- Explain unfamiliar Tightbeam terms and procedures when needed to act correctly.
-  Assume professional competence and refer to the established home for shared
-  instructions. (19)
-- Teach only what exists. No commands, records, or mechanisms that are not built;
-  state interim workarounds honestly. (20)
-- VERIFY the mechanism in code before writing it into guidance — read the projection,
-  the verb, the table. Cited-but-nonexistent machinery is the recorded failure mode. (21)
-- Batch your edits: every identity change taxes every live session's memory at
-  reprojection. Accumulate, then land together. (22)
-- For every ratified capability record, answer "what pattern does this teach?" The answer
-  is "none" or an operating-manual amendment that lands with the capability. Never add a pattern
-  section before the capability and its commands ship.
-- Role-refracted doctrine (one rule that several roles each see from their own side) is
-  amended in ALL its refractions together, in the canonical guidance source — changing one
-  refraction alone forks the doctrine.
+1. Assume professional competence. State intent, authority, and local facts. Do not teach
+   familiar engineering practice.
+2. Preserve judgment. Give outcomes and constraints without turning every decision into a
+   gate, checklist, or permission request.
+3. One concept, one home. Shared duties belong in shared guidance. Each archetype carries
+   the guidance for its responsibility. Prefer delegation for distinct responsibilities;
+   use skills where there is a concrete reason to keep the procedure with the same agent.
+4. Make skills discoverable. Always-loaded guidance says when to load a skill; a skill cannot
+   be its own discovery mechanism.
+5. Teach only supported behavior. Verify mechanisms before describing them, and separate
+   proposed behavior from what actually exists.
+6. Keep the whole composition consistent. Check kernel, includes, elected skills, and manual
+   together, and remove instructions that oppose each other across those homes.
+7. Write direct, concise instructions. Role voice, concrete verbs, enough context to act
+   without the conversation history.
+8. Revise proportionately. Batch coherent changes, preserve useful content, and do not add a
+   procedural layer for every incident.
 
-Before committing: reread as the target session would — cold, mid-task, no context
-but the projected home. If any line requires knowledge it does not carry or point to,
-fix that first.
+Choose a coherent responsibility with useful shared context. Weigh narrower role
+context against briefing, synchronization and reconstruction costs. Compatible
+functions can remain together when they need the same evolving understanding;
+independent judgment and incompatible authority still require separation.
+
+Use a short role-specific pointer to the governing home when an agent needs to find
+it. Local terms and unfamiliar Tightbeam procedures need enough explanation to act.
+Check the installed projection, command or record before teaching a mechanism.
+
+Apply these invariants to the complete identity the role will receive. Include any
+retained skill whose instructions the change can expose. Preserve explicit authority
+and useful local knowledge while removing conflicting or duplicated instructions.
+Use the supported identity workflow and distinguish authored source, published
+identity and refreshed sessions. A guidance edit does not by itself refresh them.

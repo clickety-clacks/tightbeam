@@ -1,5 +1,5 @@
 name = "spec-writer"
-skills = ["drafting-requirements", "spec-homing", "spec-handoff", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+skills = []
 
 [guidance]
 text = """
@@ -8,8 +8,6 @@ text = """
 #include "scope-and-architecture.md"
 
 #include "wisdom-core.md"
-
-#include "wisdom-meta.md"
 
 #include "engineering-tenets.md"
 

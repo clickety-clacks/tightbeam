@@ -98,7 +98,7 @@ defmodule Tightbeam.IdentityTest do
                  "The same bug keeps coming back and nobody finds the cause.",
                  "I want to know a change was actually tested, not just claimed."
                ],
-               root_archetype: "product-owner"
+               root_archetype: "orchestrator"
              }
            ]
   end
@@ -253,8 +253,8 @@ defmodule Tightbeam.IdentityTest do
     refute engineering_rule =~ ~s(target_role = "reviewer")
 
     for {role, present_axis, absent_axis} <- [
-          {"reviewer-code", "## Analysis axes: code", "## Analysis axes: spec"},
-          {"reviewer-spec", "## Analysis axes: spec", "## Analysis axes: code"}
+          {"reviewer-code", "## Code judgment", "## Spec judgment"},
+          {"reviewer-spec", "## Spec judgment", "## Code judgment"}
         ] do
       review = Identity.snapshot!(base, role, :codex)
       assert review.guidance =~ "# Review"
@@ -262,11 +262,19 @@ defmodule Tightbeam.IdentityTest do
       refute review.guidance =~ absent_axis
       refute Regex.match?(~r/^#include/m, review.guidance)
 
-      assert Map.keys(review.skills) == ~w(worktree-session)
+      assert review.skills == %{}
+
+      if role == "reviewer-code" do
+        assert review.guidance =~ "# Repository custody"
+      else
+        refute review.guidance =~ "# Repository custody"
+      end
+
+      refute review.guidance =~ "# Guidance and policy craft"
     end
 
     coder = Identity.snapshot!(base, "coder", :codex)
-    assert coder.guidance =~ "Before the ready-for-review progress attest"
+    assert coder.guidance =~ "Review can start before a passing-test receipt"
     assert coder.guidance =~ "--verdict tests-passed"
   end
 

@@ -31,3 +31,10 @@ Designing a mechanism:
   judgment. Justify a hard gate by the explicit authority limit or concrete protection
   it preserves. Preserve useful incident evidence and choose a proportionate corrective
   action. Do not add a workflow marker merely to make compliance enforceable. (25)
+
+Keep model cost, process size, topology and product-spirit interpretation in agent
+judgment. Protect attributable independent review without requiring a provider family
+or fixed agent graph. Verify that the remedy reaches an accountable owner through
+supported routes; a notification must not be described as staffing, transfer or
+fulfillment. Reuse existing dependency and completion mechanisms before proposing new
+markers or gates.

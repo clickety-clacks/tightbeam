@@ -1,65 +1,82 @@
-# Preferred models — substrate
+# Preferred models
 
-The org owns this table; retune it through an identity edit, not by deference to
-whoever wrote it. It is the only model-selection guidance: there is no separate
-policy table.
-
-Two parts: CAPSULES (the org's working set — the minds we actually use, characterized
-once each) and the SUBSTRATE'S OWN ACTIVITIES. Kungfu-owned activities live in each
-bundle's `kungfu/<name>/preferred-models.md`. The working set is deliberately small:
-a model not listed here is NOT IN USE — adding one is an intake/release-ceremony act.
+Own model selection through this guidance and the installed kungfu's activity table.
+Keep canonical names, selection mechanics and substrate activities here. Engineering
+activities live in `kungfu/agentic-engineering/preferred-models.md`.
 
 ## Working set (capsules)
 
-- **claude-fable-5** — deepest judgment and breadth; load-bearing rulings, adversarial
-  whole-system review, wisdom-level authoring. Expensive; reserve for what needs it.
-- **claude-opus-4-8** — strong general reasoning and composition; coordination,
-  drafting under rulings, reviewing another model's code.
-- **claude-sonnet-5** — the everyday mind: conversation, general agency, light
-  analysis; the org default. Not for adversarial depth.
-- **claude-haiku-4-5-20251001** (nickname: haiku) — fast and cheap: classification, extraction, mechanical
-  transforms. Never judgment.
-- **gpt-5.6-sol** — the implementer: focused greenfield goals with invariants stated
-  up front; adversarial spec review at high effort. Pauses on underspecification
-  (virtue). Never orchestrates; stalls on rework-in-place.
-- **gpt-5.3-codex-spark** — utility intelligence: summarization and
-  deterministic-but-loose transforms that still need inference. Cheap, fast.
-- **gpt-5.6-luna** (nickname: luna) — straightforward-task workhorse at high/xhigh effort: classification,
-  triage, and other non-load-bearing work that still needs inference. Not for
-  judgment that carries weight.
+- **gpt-6-astra** — (nickname: astra): deep product, architecture, planning and review judgment. Use high or higher reasoning for sustained work.
+- **gpt-5.6-sol** — (nickname: sol): general engineering and delivery orchestration; increase effort for sustained or coupled work. Can commission a stronger planner.
+- **gpt-5.6-terra** — (nickname: terra): bounded engineering implementation and mechanical work with an inspectable contract.
+- **gpt-5.6-luna** — (nickname: luna): default well-scoped engineering coder at xhigh; lower effort for bounded factual or mechanical tasks. Escalate consequential uncertainty.
+- **claude-fable-5** — (nickname: fable): deep product judgment, difficult planning, implementation and whole-system review.
+- **claude-opus-5** — (nickname: opus): sustained engineering, orchestration, specification and independent review. This policy explicitly replaces the previous Opus 4.8 mapping.
+- **claude-sonnet-5** — (nickname: sonnet): bounded orchestration, specification and implementation under an understood contract.
+- **claude-haiku-4-5-20251001** — (nickname: haiku): narrow factual extraction and classification with inspectable evidence. No effort setting is assumed.
 
-Capsule names are the CANONICAL catalog base ids (what `tightbeam list` shows);
-activity tables use the parenthetical nickname + an effort bracket — expand to
-`--model <canonical-base> --effort <effort>` when you spawn (e.g. sonnet[medium] ->
-`--model claude-sonnet-5 --effort medium`).
+## Select and recover
 
-Effort brackets (claude-x[low..max], sol[low..xhigh]) tune depth within a capsule;
-`tightbeam list` shows the live legal forms.
+Choose the best agent for the actual job, but be frugal. Select for the outcome,
+quality, duration, uncertainty and consequences. Prefer the least costly qualified
+choice expected to deliver that result. Count briefing and context reconstruction,
+supervision, synchronization, rework and review along with the agent's own usage.
+A capable agent that already understands the work may cost less overall than a
+fresh cheaper model. Do not over-specify a job merely to fit it to a cheaper coder.
 
-## How to read the activity tables
+The ringdown rows suggest starting choices and fallback order; inference owns the
+selection. Use their default order when the job supplies no reason to choose
+differently. Choose another qualified candidate when its task fit, retained context,
+expected total cost or availability better serves the outcome. A default or model
+preference is not a compulsory first attempt, a price ranking or automatic fallback.
+Use available cost and usage evidence without inventing prices or guaranteed cache
+reuse across sessions, models or harnesses. Routine selection needs no benchmark,
+new scoring ceremony or approval request.
 
-ONE column of minds per activity, IN ORDER: use the first qualified candidate that
-the live catalog permits. A candidate is available only when its model and effort are
-selectable on an allowed host, its credential can run, and it has the capability the
-activity requires. If NONE is available, the work is BLOCKED — the end of the list IS
-the floor; nothing off-list may do the work. `any` = no floor: any available mind may
-do it.
+Determine permitted families from the organization's instructions. Filter candidates
+for mixed, Codex-only or Claude-only operation before choosing. Qualification still
+requires the activity's capability floor, allowed host and harness, supported model
+and effort, and runnable access. Catalog presence alone does not establish access.
+Suggested order can change; explicit family, authority and budget restrictions cannot.
+Use an applicable activity for the actual outcome; the rows are not required stages.
+Commission stronger planning or use a stronger agent throughout when the work needs it.
 
-Decide at spawn AND again whenever a mind fails you mid-work. Try each candidate once:
-a refused spawn or a harness out of tokens advances you one place to the right, never
-back to the same candidate. If qualification is ambiguous, use the recorded model
-policy; do not guess. When no mind on the list is available, the list has produced a
-named capability block: record the attempted rungs and evidence on the affected
-assignment, keep separable work moving, and schedule a re-check. Do not report up
-merely because the list ended; Main is never a model fallback. A responsible owner
-surfaces a real credential need to the user only through the normal exception path.
-Never a silent stall, never a retry loop against a wall.
+Expand nicknames to canonical models above. Pass the chosen model, effort and matching
+permitted harness explicitly when spawning. Verify supported settings rather than
+inventing a similarly named model. Archetype metadata does not make the selection
+or implement fallback on the caller's behalf.
+
+Independent review requires independent session and judgment. In mixed mode, prefer
+the other provider family when candidates are otherwise comparably suitable and
+frugal. That is a default preference, not an acceptance gate. A qualified same-family
+reviewer remains eligible; single-family operation stays within its permitted family.
+Choose the deeper review activity when the subject requires it.
+
+On an unavailable route, reassess the remaining qualified candidates using the same
+selection judgment. The suggested fallback order remains useful when there is no
+reason to depart from it; a fallback may cost more. Do not retry a known unavailable
+route without new evidence. If none qualifies, keep the obligation owned, record the
+capability block and continue separable work. Reframe the work or propose a policy
+change through its owner. Main is not a fallback worker. Report material consequences
+through ordinary ownership, not each attempted or successful staffing choice.
+
+A poor result requires diagnosis of the ask, inputs, context, dependencies and
+approach. Increase effort, use a stronger activity or seek planning according to the
+cause. Do not blindly demote by list position or repeat an uncertain external effect.
+Preserve usable work and custody when replacing a holder or changing its harness.
+
+Scale reasoning to expected task length and complexity. Astra low is not for
+sustained work. Start sustained difficult work at high or xhigh rather than waiting
+for a low-effort failure. More reasoning can produce a shorter plan; max or ultra is
+not a default requirement. Report material product impact, budget issues or access
+decisions through ordinary ownership, not every successful staffing choice.
 
 ## Substrate activities
 
 | Activity | Wants | Minds, in order (blocked if none) |
 |---|---|---|
-| General user conversation (default agent) | breadth, warmth, cheap to idle | sonnet[medium], opus[medium] |
-| Onboarding / discovery conversations | judgment about people, reframing | fable[high], opus[high], sol[low] |
-| Failure classification, log triage | fast pattern matching | luna[high], haiku, sonnet[low], any |
-| Guidance / law authoring | wisdom-grade writing | fable[high], opus[high], sol[xhigh] |
+| General user conversation | breadth and proportionate judgment | sol[medium], sonnet[medium], opus[medium], astra[high], fable[high] |
+| Onboarding or product discovery | intent and constraints | astra[high], fable[high], sol[high], opus[high] |
+| Narrow failure classification or log triage | inspectable factual evidence | luna[low], haiku, terra[low], sol[medium], sonnet[medium] |
+| Guidance or law authoring | coherent authority and composed behavior | astra[high], fable[high], sol[xhigh], opus[xhigh] |
+| Guidance or law review | independent judgment of authority, consistency and supported behavior | astra[high], fable[high], sol[xhigh], opus[xhigh] |

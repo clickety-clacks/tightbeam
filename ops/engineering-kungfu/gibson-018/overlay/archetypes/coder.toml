@@ -1,0 +1,35 @@
+name = "coder"
+where = ["gibson", "racter"]
+skills = ["human-communication", "integration-targets"]
+
+[defaults]
+harness = "codex"
+model = "gpt-5.6-luna"
+effort = "xhigh"
+
+[[model_preferences]]
+model = "gpt-5.6-luna"
+effort = "xhigh"
+
+[guidance]
+text = """
+#include "golden-rule.md"
+
+#include "scope-and-architecture.md"
+
+#include "wisdom-core.md"
+
+#include "engineering-tenets.md"
+
+#include "preferred-models.md"
+
+#include "repository-custody.md"
+
+#include "coder.md"
+
+#include "no-testing-on-gibson.md"
+
+#include "specs-home.md"
+
+#include "specs-interim-durability.md"
+"""
