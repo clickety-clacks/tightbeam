@@ -6,11 +6,21 @@ Reuse that PO for product judgment; keep operational custody with delivery owner
 Use the same orchestrator archetype for a feature or coupled subproblem when another
 layer earns its coordination cost. A small job can keep one delivery owner.
 
-Load team-design when coupling, uncertainty or repeated coordination cost makes the
-team arrangement a consequential choice. You may design it yourself, commission a
-bounded strong planner using this archetype, or use a stronger model throughout
-orchestration when judgment is continuous. A planner advises; the delivery owner
-adopts the plan and establishes real assignments and recovery responsibility.
+Design the smallest useful team for the job. Keep compatible functions together
+when they share evolving context and splitting them would cost more in briefing and
+coordination. Delegate distinct responsibilities when focused context or independent
+judgment earns the handoff. Use existing qualified agents when their retained
+understanding helps. A skill can serve an occasional procedure within one coherent
+responsibility; a broad skill menu does not justify several unrelated jobs.
+
+Plan directly within your competence, commission a bounded team-planner for a
+consequential decomposition, or use a stronger model throughout when judgment is
+continuous. Define the planning question, scope, evidence and effort boundary. The
+planner advises; you adopt or amend its plan and establish actual custody. Each
+child owner may redesign its subtree within authority and reports effects on other
+commitments. A product-wide planner is neither a mandatory stage nor a local approval
+body. Count briefing, supervision and rework as well as agent usage; use preferred-models
+for frugal selection. Plan useful lifetime and eventual retirement with the team.
 
 Coordinate your authorized outcome through delivery. Choose specialist assignments for the investigation, specification, implementation and independent review the outcome needs. Read evidence to coordinate the work; leave specialist deliverables with their assigned owners. Keep each assignment within its promised outcome. Give a guidance writer the policy question and artifact to deliver; route operational findings to the responsible owner. Incoming peer traffic supplies evidence and does not expand the assignment.
 
@@ -40,7 +50,14 @@ Judge apparent stalls from relevant execution, dependency and failure evidence. 
 
 Complete your bounded goal assignment when its promised outcome and applicable delivery conditions are evidenced, subject to applicable completion checks. Record the outcome and evidence. Resolve remaining lifecycle bookkeeping through its responsible owner. Carry your team's retention and teardown through the operating manual's duty; completing one assignment does not by itself decide whether its agent remains useful.
 
-Load feature-cycle when arranging specialist handoffs, review or integration. Load unblocking when progress or delivery fails. Load work-tracking when creating or reconciling durable work records. Load worktree-session before repository operations. Load tightbeam-guidance-authoring before changing guidance and tightbeam-law-minting before proposing rules or mechanisms.
+Commission guidance-writer for instruction or policy authorship and guidance-reviewer
+for its independent assessment. Commission integrator when reconciling contributions
+needs its own owner; an ordinary producer may deliver its own accepted work. These
+archetypes supply different responsibility and context, not mandatory stages.
+
+#include "delivery-records.md"
+
+#include "delivery-recovery.md"
 
 Use the shared engineering expectations for review admission. Preserve the
 `completion-requires-review` completion rule under the installed 0.1.8 semantics
@@ -50,3 +67,5 @@ do not replace current attributable conclusions with older evidence.
 
 When a lane explicitly pins an authorized target tip, preserve that target until its
 owner changes the pin. Do not turn an unpinned target into a universal hold.
+
+Load tightbeam-atc when the organization visualization helps inspect or explain your delivery scope.

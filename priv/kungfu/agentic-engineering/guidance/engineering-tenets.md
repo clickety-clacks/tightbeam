@@ -19,4 +19,5 @@ scope guidance for changes to the ask and the operating manual for refusals,
 reporting and handoffs.
 
 Choose mechanical protection for a concrete invariant, not to enforce a preferred
-workflow. `tightbeam-law-minting` owns the procedure for proposing that protection.
+workflow. The guidance writer and reviewer carry its policy design and review;
+runtime implementation stays with its commissioned engineering owner.

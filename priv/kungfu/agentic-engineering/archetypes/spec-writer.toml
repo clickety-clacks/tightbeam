@@ -15,5 +15,7 @@ text = """
 
 #include "preferred-models.md"
 
+#include "repository-custody.md"
+
 #include "spec-writer.md"
 """

@@ -1,4 +1,4 @@
-name = "spec-writer"
+name = "integrator"
 where = ["gibson"]
 skills = ["human-communication", "integration-targets"]
 
@@ -21,13 +21,11 @@ text = """
 
 #include "engineering-tenets.md"
 
-#include "subtraction.md"
-
 #include "preferred-models.md"
 
 #include "repository-custody.md"
 
-#include "spec-writer.md"
+#include "integrator.md"
 
 #include "no-testing-on-gibson.md"
 

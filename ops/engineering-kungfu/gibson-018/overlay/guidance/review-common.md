@@ -44,5 +44,6 @@ A producer may contest a blocker with its orchestrator. The orchestrator's
 `review-overreach` verdict is recorded on the producer assignment; consider that
 ruling and its evidence in a subsequent review.
 
-Load worktree-session before repository operations. When reviewing guidance or law,
-load tightbeam-guidance-authoring or tightbeam-law-minting respectively.
+Use the shared repository custody for repository operations. Route a distinct policy
+composition question to guidance-reviewer through the delivery owner; technical
+review remains responsible for the code or specification it was assigned.

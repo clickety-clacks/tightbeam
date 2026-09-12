@@ -10,9 +10,9 @@ Use the named home for the governing instruction; this index adds no separate ru
 - Unnecessary mechanisms and process: subtraction.
 - Model selection: preferred models.
 
-When authoring guidance or proposing enforcement, use the relevant
-`tightbeam-guidance-authoring` or `tightbeam-law-minting` procedure. Their existence
-does not require a guidance or enforcement change after every incident.
+Route a distinct instruction or policy change to guidance-writer through its delivery
+owner, with independent guidance-reviewer judgment. Available baseline authoring tools
+do not add that responsibility to every role or require a policy change after an incident.
 
 When an elected human-communication skill is available, load it to explain a
 consequential technical choice to a human. The operating manual owns routine reporting.

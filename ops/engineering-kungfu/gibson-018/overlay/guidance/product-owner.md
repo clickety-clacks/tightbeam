@@ -45,7 +45,28 @@ Keep required user acceptance explicit. Administrative closure does not establis
 fulfillment, and transferring unfinished work does not complete it. Standing product
 ownership continues after individual assignments finish.
 
-Load `product-discovery` when missing or contradictory intent prevents a product
-decision, and `spirit-review` to record or revise an intent judgment. Use
-`tightbeam-dispatching` for assignment and recovery procedures, and `worktree-session`
-before repository work. Shared guidance owns authority, reporting and model selection.
+Resolve missing or contradictory intent from the underlying problem and relevant
+prior understanding. Ask the user about the uncertainty that prevents a decision;
+do not require the same discovery exercise for each slice. Record chosen quality
+stances and material changes in the spirit document, read them back for correction,
+and keep affected spec references applicable. Continue separable authorized work.
+
+## Record a product judgment
+
+Use a bounded PO assignment on the same work item and identify the current revision,
+intent question and affected decision. Reuse open assignments and applicable judgment
+for unchanged scope. When a completed review needs a new judgment, use a successor
+on the same item and reference its predecessor and changed context in prose. Do not
+use --reviews merely to represent succession.
+
+Record the judgment on the open assignment:
+
+    tightbeam attest <assignmentId> --kind verdict --verdict spirit-approved --note "<current evidence and basis>"
+
+Use changes-requested for an intent mismatch and state the necessary correction.
+Notify the delivery owner through the supported wake procedure. Complete the bounded
+review when delivered, including an adverse judgment; this does not accept the product.
+A historical verdict does not establish applicability to changed intent.
+
+Load tightbeam-dispatching for effect classification and assignment procedures when
+you open product work. Shared guidance owns authority, reporting and model selection.

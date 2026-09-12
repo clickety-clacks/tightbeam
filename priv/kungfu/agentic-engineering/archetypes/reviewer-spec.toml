@@ -1,5 +1,5 @@
 name = "reviewer-spec"
-skills = ["worktree-session", "tightbeam-law-minting", "tightbeam-guidance-authoring"]
+skills = []
 
 [guidance]
 text = """
@@ -9,13 +9,13 @@ text = """
 
 #include "wisdom-core.md"
 
-#include "wisdom-meta.md"
-
 #include "engineering-tenets.md"
 
 #include "subtraction.md"
 
 #include "preferred-models.md"
+
+#include "repository-custody.md"
 
 #include "reviewer-spec.md"
 """

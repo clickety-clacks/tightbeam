@@ -1,14 +1,14 @@
-name = "spec-writer"
+name = "guidance-writer"
 where = ["gibson"]
 skills = ["human-communication", "integration-targets"]
 
 [defaults]
 harness = "codex"
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 effort = "high"
 
 [[model_preferences]]
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 effort = "high"
 
 [guidance]
@@ -27,7 +27,9 @@ text = """
 
 #include "repository-custody.md"
 
-#include "spec-writer.md"
+#include "guidance-policy-craft.md"
+
+#include "guidance-writer.md"
 
 #include "no-testing-on-gibson.md"
 

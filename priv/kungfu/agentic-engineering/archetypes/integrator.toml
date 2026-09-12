@@ -1,4 +1,4 @@
-name = "recon"
+name = "integrator"
 skills = []
 
 [guidance]
@@ -15,5 +15,5 @@ text = """
 
 #include "repository-custody.md"
 
-#include "recon.md"
+#include "integrator.md"
 """

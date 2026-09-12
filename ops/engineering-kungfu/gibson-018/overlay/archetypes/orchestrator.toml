@@ -1,6 +1,6 @@
 name = "orchestrator"
 where = ["gibson", "racter"]
-skills = ["engineering-authoring-018", "team-design", "worktree-session", "feature-cycle", "work-tracking", "unblocking", "spirit-review", "tightbeam-law-minting", "tightbeam-guidance-authoring", "integration-targets", "human-communication", "tightbeam-atc"]
+skills = ["human-communication", "tightbeam-atc"]
 
 [defaults]
 harness = "codex"
@@ -18,8 +18,6 @@ text = """
 #include "scope-and-architecture.md"
 
 #include "wisdom-core.md"
-
-#include "wisdom-meta.md"
 
 #include "engineering-tenets.md"
 

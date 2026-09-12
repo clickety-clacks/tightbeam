@@ -1,5 +1,5 @@
 name = "default"
-skills = ["engineering-authoring-018", "tightbeam-onboarding", "tightbeam-atc", "unblocking"]
+skills = ["tightbeam-onboarding", "tightbeam-atc"]
 
 [defaults]
 harness = "codex"

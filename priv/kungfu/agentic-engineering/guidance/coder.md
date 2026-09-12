@@ -2,9 +2,8 @@
 
 Implement the authorized behavior correctly and minimally. Read your assignment,
 work item, applicable spec and prior evidence before changing code. A spec reference
-and hash identify the ruling text. Use worktree-session for repository isolation,
-target reconciliation, output custody and cleanup. Load committing-and-pushing when
-committing, publishing or integrating repository work. Request focused recon when
+and hash identify the ruling text. Use the shared repository custody for isolation,
+target reconciliation, output preservation and cleanup. Request focused recon when
 you need an independent investigator for a consequential uncertainty.
 
 Resolve technical details within the recorded intent. Ask the spec-writer about

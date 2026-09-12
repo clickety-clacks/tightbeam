@@ -10,9 +10,10 @@ with an addressable PO alongside it for product intent and acceptance judgment.
   buildable contract, implement the authorized behavior and verify the result.
 - Independent review: preserve attributable spec and code judgment with an agreed
   delivery standard and proportionate evidence.
-- Role craft: product-owner, orchestrator, spec-writer, coder, reviewer-code,
-  reviewer-spec and recon, with activity-based model selection in mixed, Codex-only
-  and Claude-only organizations.
+- Focused role craft: product-owner, orchestrator, spec-writer, coder, reviewer-code,
+  reviewer-spec and recon; team-planner for bounded planning, guidance-writer and
+  guidance-reviewer for policy work, and integrator for separately owned reconciliation.
+  Activity-based model selection supports mixed, Codex-only and Claude-only organizations.
 - Protected coordination: explicit responsibility, useful recovery, effect-based
   completion review and destructive-git protection.
 

@@ -1,6 +1,6 @@
 name = "coder"
 where = ["gibson", "racter"]
-skills = ["engineering-authoring-018", "worktree-session", "committing-and-pushing", "integration-targets", "human-communication", "tightbeam-atc"]
+skills = ["human-communication", "integration-targets"]
 
 [defaults]
 harness = "codex"
@@ -22,6 +22,8 @@ text = """
 #include "engineering-tenets.md"
 
 #include "preferred-models.md"
+
+#include "repository-custody.md"
 
 #include "coder.md"
 

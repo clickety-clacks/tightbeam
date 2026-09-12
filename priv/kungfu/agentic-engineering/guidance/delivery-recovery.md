@@ -1,9 +1,4 @@
----
-name: unblocking
-description: Recover stalled work or failed delivery from the actual dependency, execution and failure evidence. Load when progress or delivery fails.
----
-
-# Unblocking
+# Delivery recovery
 
 Identify the unresolved outcome and responsible actor. Distinguish useful ongoing
 work, a valid dependency wait, a false assumption, unavailable execution and an

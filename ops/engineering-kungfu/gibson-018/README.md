@@ -38,7 +38,7 @@ them immediately before execution; this snapshot is not authority to overwrite d
 | Concern | Installed 0.1.8 treatment |
 | --- | --- |
 | Model selection | The activity table is a guidance fragment. Explicit selection by the caller implements ringdown; preference metadata alone does not perform fallback. |
-| Shared authoring skills | Their names are reserved by the release. Do not put replacement copies under those names in local identity. `engineering-authoring-018` supplies the adopted policy as an ordinary local skill; the manual names the precedence. |
+| Shared authoring skills | Their names are reserved by the release. Do not put replacement copies under those names in local identity. The focused policy roles include `guidance-policy-craft.md`; the manual names its precedence over older baseline procedures. |
 | Dependency waits | Use actual condition producers or a concrete timed recheck. No `--assignment`, `--after-turn` or qualified-predicate wake claims. A condition subscription cannot observe arbitrary rows by itself. |
 | Review qualification | Build 1337 selects the most recent holder-filed verdict across linked review cards. It must be reviewed-clean from a different session. New cards without holder verdicts do not displace existing judgments. This differs from both the original 0.1.8 tag and 0.1.9 pooled review conclusions. |
 | Rules | The proposed rule file keeps the completion predicate and uses a denial with an explicit owner remedy. The 0.1.8 validator requires assignment creation for a linked-review remedy, so the 0.1.9 notification-only remedy cannot be imported. The released CLI has no rule-file edit command. It is a reviewed target, not an executable CLI application step. |
@@ -183,3 +183,15 @@ to redraw old edges would lose the point of preserving ongoing work.
 
 Fill the template from actual applied state. Do not tell a session it was retargeted,
 refreshed or reparented when the operation is still deferred.
+
+
+## Focused archetype revision
+
+The accepted walkthrough adds team-planner, guidance-writer, guidance-reviewer and
+integrator to this prepared identity. Their manifests carry local host constraints,
+suggested model defaults and the existing no-testing and spec-preservation fragments.
+These definitions do not create agents or retarget current ones. Everyday delivery,
+PO and recon procedures move into their role guidance; repository specialists share
+repository-custody. Retired skills must be de-elected before supported removal.
+The previous 49-operation proof predates this revision. Updated isolated verification
+and sequence evidence are pending. The package remains prepared and unapplied.

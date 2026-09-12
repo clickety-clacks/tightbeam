@@ -1,4 +1,4 @@
-name = "recon"
+name = "team-planner"
 skills = []
 
 [guidance]
@@ -13,7 +13,5 @@ text = """
 
 #include "preferred-models.md"
 
-#include "repository-custody.md"
-
-#include "recon.md"
+#include "team-planner.md"
 """

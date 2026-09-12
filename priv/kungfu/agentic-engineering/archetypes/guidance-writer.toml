@@ -1,4 +1,4 @@
-name = "recon"
+name = "guidance-writer"
 skills = []
 
 [guidance]
@@ -11,9 +11,13 @@ text = """
 
 #include "engineering-tenets.md"
 
+#include "subtraction.md"
+
 #include "preferred-models.md"
 
 #include "repository-custody.md"
 
-#include "recon.md"
+#include "guidance-policy-craft.md"
+
+#include "guidance-writer.md"
 """

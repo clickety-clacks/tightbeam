@@ -79,5 +79,6 @@ decisions through ordinary ownership, not every successful staffing choice.
 | Onboarding or product discovery | intent and constraints | astra[high], fable[high], sol[high], opus[high] |
 | Narrow failure classification or log triage | inspectable factual evidence | luna[low], haiku, terra[low], sol[medium], sonnet[medium] |
 | Guidance or law authoring | coherent authority and composed behavior | astra[high], fable[high], sol[xhigh], opus[xhigh] |
+| Guidance or law review | independent judgment of authority, consistency and supported behavior | astra[high], fable[high], sol[xhigh], opus[xhigh] |
 
 #include "engineering-model-activities.md"

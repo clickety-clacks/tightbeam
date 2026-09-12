@@ -1,6 +1,6 @@
 name = "reviewer-code"
 where = ["gibson"]
-skills = ["engineering-authoring-018", "worktree-session", "tightbeam-law-minting", "tightbeam-guidance-authoring", "human-communication", "integration-targets", "tightbeam-atc"]
+skills = ["human-communication", "integration-targets"]
 
 [defaults]
 harness = "claude"
@@ -19,13 +19,13 @@ text = """
 
 #include "wisdom-core.md"
 
-#include "wisdom-meta.md"
-
 #include "engineering-tenets.md"
 
 #include "subtraction.md"
 
 #include "preferred-models.md"
+
+#include "repository-custody.md"
 
 #include "reviewer-code.md"
 

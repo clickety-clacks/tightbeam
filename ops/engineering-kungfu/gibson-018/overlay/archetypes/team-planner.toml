@@ -1,14 +1,14 @@
-name = "spec-writer"
+name = "team-planner"
 where = ["gibson"]
-skills = ["human-communication", "integration-targets"]
+skills = ["human-communication"]
 
 [defaults]
 harness = "codex"
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 effort = "high"
 
 [[model_preferences]]
-model = "gpt-5.6-sol"
+model = "gpt-6-astra"
 effort = "high"
 
 [guidance]
@@ -21,13 +21,9 @@ text = """
 
 #include "engineering-tenets.md"
 
-#include "subtraction.md"
-
 #include "preferred-models.md"
 
-#include "repository-custody.md"
-
-#include "spec-writer.md"
+#include "team-planner.md"
 
 #include "no-testing-on-gibson.md"
 

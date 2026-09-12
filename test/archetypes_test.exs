@@ -302,20 +302,13 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(coder default orchestrator product-owner recon reviewer-code reviewer-spec spec-writer)
+             ~w(coder default guidance-reviewer guidance-writer integrator orchestrator product-owner recon reviewer-code reviewer-spec spec-writer team-planner)
 
-    assert loaded["product-owner"].skills == [
-             "worktree-session",
-             "tightbeam-dispatching",
-             "product-discovery",
-             "spirit-review"
-           ]
+    assert loaded["product-owner"].skills == ["tightbeam-dispatching"]
 
-    for role <- ~w(coder orchestrator product-owner reviewer-code reviewer-spec) do
-      assert "worktree-session" in loaded[role].skills
+    for role <- ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator) do
+      refute Enum.any?(loaded[role].skills, &(&1 in ~w(worktree-session team-design feature-cycle work-tracking unblocking product-discovery spirit-review bug-provenance committing-and-pushing)))
     end
-
-    assert "spirit-review" in loaded["orchestrator"].skills
 
     assert Enum.all?(loaded, fn {_role, archetype} ->
              "human-communication" not in archetype.skills
@@ -363,26 +356,44 @@ defmodule Tightbeam.ArchetypesTest do
         :codex
       )
 
-    assert Map.keys(product_owner.skills) == [
-             "product-discovery",
-             "spirit-review",
-             "worktree-session"
-           ]
-
-    assert product_owner.skills["spirit-review"] =~
+    assert product_owner.skills == %{}
+    assert product_owner.guidance =~
              "A historical verdict does not establish applicability to changed intent"
 
-    assert product_owner.skills["worktree-session"] =~
-             "Clone your own copy, into your own workdir"
+    assert coder.guidance =~ "Use your own clone in your workdir"
+    assert coder.guidance =~ "commits and pushes"
+    assert coder.guidance =~ "Remove a finished clone only after"
+    refute coder.guidance =~ "hands you a specific checkout"
 
-    assert product_owner.skills["worktree-session"] =~
-             "Push, so the remote holds the record"
+    for role <- ~w(team-planner guidance-writer guidance-reviewer integrator) do
+      snapshot = Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
+      assert snapshot.skills == %{}
+      assert snapshot.guidance =~ "# Operating tightbeam"
+      refute Regex.match?(~r/^#include/m, snapshot.guidance)
+    end
 
-    assert product_owner.skills["worktree-session"] =~
-             "Remove a finished clone after required output"
+    writer = Identity.snapshot!(ctx.base_dir, "guidance-writer", :codex)
+    reviewer = Identity.snapshot!(ctx.base_dir, "guidance-reviewer", :codex)
+    orchestrator = Identity.snapshot!(ctx.base_dir, "orchestrator", :codex)
+    planner = Identity.snapshot!(ctx.base_dir, "team-planner", :codex)
 
-    refute product_owner.skills["worktree-session"] =~
-             "hands you a specific checkout"
+    for snapshot <- [writer, reviewer] do
+      assert snapshot.guidance =~ "# Guidance and policy craft"
+      assert snapshot.guidance =~ "1. Assume professional competence"
+      assert snapshot.guidance =~ "## Enforcement and mechanisms"
+    end
+
+    assert reviewer.guidance =~ "do not edit the work you review"
+    refute writer.guidance =~ "do not edit the work you review"
+    for snapshot <- [coder, product_owner, orchestrator, planner] do
+      refute snapshot.guidance =~ "# Guidance and policy craft"
+    end
+    assert planner.guidance =~ "# Team planner"
+    assert planner.guidance =~ "does not staff a team"
+    refute planner.guidance =~ "# Delivery recovery"
+    assert orchestrator.guidance =~ "# Delivery recovery"
+    refute orchestrator.guidance =~ "# Team planner"
+    assert orchestrator.guidance =~ "Commission a spec and spec review when the work needs a new contract"
 
     refute File.regular?(
              Path.join([

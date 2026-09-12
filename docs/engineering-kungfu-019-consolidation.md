@@ -84,8 +84,9 @@ prepared compatibility overlay.
 
 A short role-specific pointer may refer to a shared duty without restating it.
 Explain unfamiliar Tightbeam behavior where needed; local procedures do not justify
-lessons in familiar engineering practice. The projected home of these authoring
-instructions is `tightbeam-guidance-authoring`, with discovery in shared guidance.
+lessons in familiar engineering practice. The engineering policy roles always include `guidance-policy-craft.md`, which owns
+these authoring instructions in their composition. Neutral baseline authoring tools
+remain available without giving ordinary engineering roles a second responsibility.
 
 ## Resulting organization
 
@@ -95,17 +96,18 @@ relevant work, and opens delegated outcome assignments. A feature orchestrator o
 its specialists' and reviewers' assignments. This makes delivery custody follow the
 coordination structure instead of using the PO as a mailbox for worker traffic.
 
-The existing orchestrator archetype can also serve a bounded planning assignment.
-The new team-design skill covers its trigger, inputs, output and adoption. Sol can
-manage a familiar delivery while Astra or Fable reasons about a difficult decomposition.
-A strong model may own orchestration throughout when the decisions remain difficult.
-The same choice is available within a feature or coupled subproblem. No mandatory
-planner archetype, fixed stage sequence or enforced maximum graph depth is introduced.
+A delivery owner can plan directly or commission team-planner for a bounded
+recommendation. Sol can manage familiar delivery while Astra or Fable reasons about
+a difficult decomposition. A strong model may own orchestration throughout when
+judgment stays difficult. Each owner can adapt its own subtree within authority;
+changes affecting other owners' commitments travel to those owners. A planner can
+recommend the whole initial tree when coupling warrants it, but has no standing
+approval authority over all local team changes.
 
-A planner recommends the smallest useful team and records decisions that affect real
-work. The delivery owner adopts it and creates the actual assignments. New archetypes
-are available through authorized identity authoring when a durable missing responsibility
-justifies one; a transient task name is not sufficient reason to mint another archetype.
+The planner recommends; the delivery owner adopts or amends the plan and establishes
+actual assignments and recovery responsibility. No planner, integrator or stage is
+mandatory. New archetypes require a distinct reusable responsibility, supported
+identity authoring and the applicable review. A task label supplies no new capability.
 
 Workers may exchange technical questions directly or ask the PO about intent. They
 keep the responsible orchestrator informed when the answer changes delivery, scope,
@@ -432,8 +434,8 @@ splitting them would require repeated briefing and synchronization. A focused
 specialist remains useful when its context can travel economically or independent
 judgment requires separation. Reuse retained understanding where useful, while making
 no guarantee about provider cache reuse. Invariant 3 and authoring guidance carry
-this clarification. The proposed separate planner, guidance and integration
-archetypes remain a follow-up design; this change creates none of them.
+this clarification. The later accepted focused-archetype revision below implements the planner,
+guidance and integration roles. The earlier context/cost change alone created none.
 
 Topology choices include useful lifetime and a retirement owner. The operating manual
 owns the retention and teardown duty. Complete the bounded assignment when delivered;
@@ -456,6 +458,46 @@ Stall watch's disk-custody observation adds no general cleanup authority. Existi
 repository guidance already assigns cleanup after required output is preserved and
 no remaining obligation needs the clone. Retirement retains its handoff duty; this
 change neither deletes workspaces nor treats an idle count as proof of abandonment.
+
+
+## Focused archetypes accepted through the walkthrough
+
+On 12 September Mike accepted the interactive topology and then directed: "i closed
+the lavish. no more comments. apply what you need to". This continues the same
+commission on the same private branch. The four archetypes previously marked
+proposed are now authored: team-planner, guidance-writer, guidance-reviewer and
+integrator. Verification and focused review of this revision are pending.
+
+Executive and feature delivery remain scopes of orchestrator. The planner carries
+team-design craft without inheriting staffing or delivery recovery. Guidance writer
+and reviewer share policy craft, with independent reviewer judgment and no producer
+editing authority in the reviewer. The integrator owns separately commissioned target
+reconciliation; ordinary coders may still deliver their own work.
+
+Ordinary delivery records and recovery now live in orchestrator guidance. PO discovery
+and spirit judgment live in PO guidance; diagnosis routing lives in recon. Repository
+ownership, preservation, target reconciliation and cleanup share a fragment included
+by repository specialists. Nine former skills are retired after those duties are
+rehomed. Policy-authoring skill elections and the meta index leave ordinary
+orchestration and technical review. Narrow role context does not require a new
+archetype for every topic, and an occasional procedure may remain a skill when it
+preserves useful context within the same responsibility.
+
+The universal operating manual still supplies the supported coordination mechanics.
+Tightbeam also makes its nine neutral baseline tools available to sessions. This
+revision does not change that runtime library or claim that a manifest removes all
+baseline skill discovery. Engineering roles receive only their own specialist
+instructions and route other responsibilities through the delivery owner.
+
+The rule predicates already protect effect and independent evidence rather than
+archetype names. New policy authorship and integration remain subject to their
+applicable completion review; planning advice and review do not acquire a new gate.
+No new runtime mechanism, permanent agent, fixed tree or live operation is introduced.
+
+The prepared 0.1.8 overlay carries these roles and local restrictions using existing
+identity mechanisms. It retains installed review and wake limitations and reserved
+baseline skill names. Its prior composition proof does not establish this revision;
+a fresh isolated edit and composition check is required before calling it ready.
 
 ## Current-org application
 

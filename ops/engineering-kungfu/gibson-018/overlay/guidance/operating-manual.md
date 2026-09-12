@@ -296,12 +296,13 @@ check. Resolve a concrete mismatch through the responsible delivery owner.
 ## Adopted authoring policy on 0.1.8
 
 The engineering-kungfu consolidation replaces older mandatory research, role-artifact,
-digest, marker and intake procedures with proportionate professional judgment. Use
-engineering-authoring-018 when revising guidance, roles or law. The shipped baseline
-authoring skills retain their reserved names until a release updates them; where their
-procedure conflicts with this adopted policy, follow this policy. Keep supported
-commands, authority checks and actual recovery mechanisms. An observable row alone
-does not justify a new rail. Ordinary work need not load an authoring procedure.
+digest, marker and intake procedures with proportionate professional judgment.
+Commission guidance-writer and guidance-reviewer for policy work; their shared
+policy craft carries the adopted authoring instructions. The released baseline
+skills retain their reserved names. If their older procedure conflicts with this
+adopted role guidance, follow the adopted guidance while preserving supported
+commands, authority checks and recovery. Baseline tool availability does not give
+every role a policy-authoring responsibility.
 
 Existing obligations remain with their incumbent holder until another accountable
 owner accepts the handoff. A new PO kernel does not release old delivery custody.

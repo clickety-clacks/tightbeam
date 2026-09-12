@@ -1,5 +1,5 @@
 name = "product-owner"
-skills = ["engineering-authoring-018", "worktree-session", "tightbeam-dispatching", "product-discovery", "spirit-review", "integration-targets", "human-communication", "tightbeam-atc"]
+skills = ["human-communication", "tightbeam-dispatching"]
 
 [defaults]
 harness = "codex"
