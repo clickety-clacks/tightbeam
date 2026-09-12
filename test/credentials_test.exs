@@ -189,6 +189,33 @@ defmodule Tightbeam.CredentialsTest do
     assert Credentials.status(:openai, server) == {:needs_onboarding, :missing}
   end
 
+  test "a direct onboarding runtime failure keeps the installed credential unverified", ctx do
+    {:ok, server} =
+      start_credentials(
+        name: nil,
+        base_dir: ctx.base,
+        machine: "eezo",
+        onboarders: %{
+          openai: fn _ -> {:ok, %{bytes: "candidate", expires_at: nil}} end
+        },
+        start: fn :openai, :subscription -> {:error, :runtime_start_failed} end
+      )
+
+    assert {:error, :runtime_start_failed} = Credentials.onboard(:openai, server)
+
+    assert {:needs_onboarding, {:present_but_unverified, cause}} =
+             Credentials.status(:openai, server)
+
+    assert cause["finish"] =~ "runtime_start_failed"
+    assert File.read!(Credentials.credential_path(ctx.base, "eezo", :openai)) == "candidate"
+
+    GenServer.stop(server)
+    {:ok, restarted} = start_credentials(name: nil, base_dir: ctx.base, machine: "eezo")
+
+    assert {:needs_onboarding, {:present_but_unverified, ^cause}} =
+             Credentials.status(:openai, restarted)
+  end
+
   test "an absent harness-home credential is missing", ctx do
     credential = Credentials.credential_path(ctx.base, "eezo", :openai)
     metadata = Path.join([Path.dirname(credential), ".tightbeam", "credential.json"])

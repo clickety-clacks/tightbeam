@@ -32,14 +32,15 @@ defmodule Tightbeam.ApplicationDefaultsTest do
   defp restore(key, nil), do: Application.delete_env(:tightbeam, key)
   defp restore(key, value), do: Application.put_env(:tightbeam, key, value)
 
-  # Write the same onboarded-credential metadata that a real onboard leaves, so
-  # Credentials.kind_at reads a non-:none kind for the provider.
+  # Write the same regular credential plus metadata that a real onboard leaves,
+  # so Credentials.kind_at reads a non-:none kind for the provider.
   defp onboard!(base, provider) do
-    harness = if provider == :anthropic, do: :claude, else: :codex
-    home = Tightbeam.Homes.home_path(base, Tightbeam.Placement.local_host_name(), harness)
-    meta = Path.join([home, ".tightbeam", "credential.json"])
+    machine = Tightbeam.Placement.local_host_name()
+    credential = Credentials.credential_path(base, machine, provider)
+    meta = Path.join([Path.dirname(credential), ".tightbeam", "credential.json"])
 
     File.mkdir_p!(Path.dirname(meta))
+    File.write!(credential, "test-credential")
 
     File.write!(
       meta,

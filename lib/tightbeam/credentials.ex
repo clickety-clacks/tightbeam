@@ -525,18 +525,27 @@ defmodule Tightbeam.Credentials do
   end
 
   defp perform_onboard(provider, state) do
-    result =
+    {result, state} =
       with :ok <- state.gate.(provider),
            :ok <- state.stop.(provider),
            {:ok, credential} <- Map.fetch!(state.onboarders, provider).(state),
-           :ok <- write_credential!(state, provider, credential),
-           :ok <- state.start.(provider, :subscription),
-           :ok <- mark_onboarded!(state, provider, :subscription, credential),
-           :ok <- state.on_credential_present.(provider),
-           captured <- capture_sessions(state, provider),
-           :ok <- state.resume.(provider) do
-        publish_sessions(state, captured, :onboarded)
-        :ok
+           :ok <- write_credential!(state, provider, credential) do
+        case state.start.(provider, :subscription) do
+          :ok ->
+            result =
+              with :ok <- mark_onboarded!(state, provider, :subscription, credential),
+                   :ok <- state.on_credential_present.(provider),
+                   captured <- capture_sessions(state, provider),
+                   :ok <- state.resume.(provider) do
+                publish_sessions(state, captured, :onboarded)
+                :ok
+              end
+
+            {result, update_in(state.present_but_unverified, &Map.delete(&1, provider))}
+
+          failure ->
+            failed_finish(state, provider, :subscription, failure)
+        end
       else
         {:error, {:unsupported, :no_subscription}} = error ->
           write_metadata!(state, provider, %{
@@ -547,10 +556,10 @@ defmodule Tightbeam.Credentials do
             "last_health" => "no_subscription"
           })
 
-          error
+          {error, state}
 
         {:error, _reason} = error ->
-          error
+          {error, state}
       end
 
     {:reply, result, state}
@@ -944,7 +953,7 @@ defmodule Tightbeam.Credentials do
     metadata_write_for_finish(fn -> mark_onboarded!(state, provider, kind, credential) end)
   end
 
-  # Fail CLOSED and VISIBLE: the staged credential stays installed, the org
+  # Fail CLOSED and VISIBLE: the installed credential stays present, the org
   # reads as not-onboarded, and the cause carries the failure verbatim so a
   # reader learns what the vendor or the runtime actually said. `status/1`
   # serves `present_but_unverified` from both the in-memory map and the durable
