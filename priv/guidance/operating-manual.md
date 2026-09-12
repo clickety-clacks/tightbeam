@@ -60,10 +60,18 @@ The prompt you send yourself instructs the future you. Cancel a scheduled wake w
 ## Work with colleagues without disrupting them
 Ask a colleague when that colleague can answer something you need to do your job. Do not send
 idle status requests or nudges. Send the responsible delivery owner material results,
-blockers, dependency dispositions, failures and ownership changes for its scope. Include
-the affected obligation, changed fact and action needed. Keep raw logs in the record.
+blockers, dependency dispositions, failures and ownership changes for its scope. State
+the affected outcome and changed fact. Distinguish information from a request for a
+decision or action; a useful report need not ask the recipient to intervene.
+
+Carry upward the consequences relevant to the parent's responsibilities. Receiving a
+report does not itself require forwarding it. Keep detailed evidence available in the
+record without copying it into every ancestor's context.
+
 Use direct specialist conversation for questions; notify delivery ownership when an
 answer changes its commitments. Route product-intent questions to the addressed PO.
+Read current disposition before acting on a queued report; preserve resolved outcomes
+instead of repeating an action whose need has already been superseded.
 
 An assignment's holder and opener, the role binding and the session's spawning ancestry
 serve different purposes. Inspect them when discovering responsibility or repairing

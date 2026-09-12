@@ -132,8 +132,8 @@
     {
       "path": "guidance/engineering-tenets.md",
       "before_sha256": "8436878ba6cbb4bc033c152b4e18795da53c5847c6cfac7823adc27b57a0c612",
-      "after_sha256": "402a57ff5cc9655067bfd1ed57ee6d60fc7e248b779801c73733f159165e3b39",
-      "application_state": "published",
+      "after_sha256": "5610795b4c8f894f509cd04567b3c326bf3feb8e78e2f72581433bdb8ad877eb",
+      "application_state": "reporting-amendment-prepared",
       "observed_sha256": "402a57ff5cc9655067bfd1ed57ee6d60fc7e248b779801c73733f159165e3b39"
     },
     {
@@ -181,15 +181,15 @@
     {
       "path": "guidance/operating-manual.md",
       "before_sha256": "793b250ea0c7a997cb947efd11f2b571ccb3825cb66f9da51dc43b4e450c8afa",
-      "after_sha256": "af82c39008699b1b08e016ce75e620115e3da1d98bc237fe6b0f2f00f7bef08f",
-      "application_state": "published",
+      "after_sha256": "ce60694e698bcb14477c084e113051bc176b4ce328aa115ba1104b75b0907405",
+      "application_state": "reporting-amendment-prepared",
       "observed_sha256": "af82c39008699b1b08e016ce75e620115e3da1d98bc237fe6b0f2f00f7bef08f"
     },
     {
       "path": "guidance/orchestrator.md",
       "before_sha256": "a090a8428344d0c98ac06d314f29cb7e1047130da0f0732fe5cf4c29ce27630c",
-      "after_sha256": "b091d89732d886608274ad5f2d4100e160c6878d1e2ce527dd34fa041935399f",
-      "application_state": "published",
+      "after_sha256": "25c563a4451d43bdc6d1d73c8fb974e732c20cd1d838cfb0d9df3e29a486eb5b",
+      "application_state": "reporting-amendment-prepared",
       "observed_sha256": "b091d89732d886608274ad5f2d4100e160c6878d1e2ce527dd34fa041935399f"
     },
     {
@@ -279,8 +279,8 @@
     {
       "path": "guidance/team-planner.md",
       "before_sha256": null,
-      "after_sha256": "9bc362fe570105e93e97838b4ae5b6bd8741e02abd9921bfc4f051520af3cfd7",
-      "application_state": "published",
+      "after_sha256": "27dda769949b5fb0f40691d36947416c5c42256728ec4c7bf78258ef1636fc60",
+      "application_state": "reporting-amendment-prepared",
       "observed_sha256": "9bc362fe570105e93e97838b4ae5b6bd8741e02abd9921bfc4f051520af3cfd7"
     },
     {
@@ -480,5 +480,32 @@
     ],
     "runtime_evidence": "Private migration-runtime-actions.jsonl and migration-current-summary.json; README records preserved limits",
     "runtime_health": "DB query timeouts during resumption interrupted turns; preserve partial effects and verify recovery. Migration is not runtime-health proof."
+  },
+  "reporting_amendment": {
+    "authority": "Mike, external conversation 2026-09-12: merge to 0.1.9, apply to running org, ask affected agents to reread",
+    "base_source_revision": "a1d7bc6",
+    "state": "prepared",
+    "files": [
+      {
+        "path": "guidance/engineering-tenets.md",
+        "before_sha256": "402a57ff5cc9655067bfd1ed57ee6d60fc7e248b779801c73733f159165e3b39",
+        "after_sha256": "5610795b4c8f894f509cd04567b3c326bf3feb8e78e2f72581433bdb8ad877eb"
+      },
+      {
+        "path": "guidance/operating-manual.md",
+        "before_sha256": "af82c39008699b1b08e016ce75e620115e3da1d98bc237fe6b0f2f00f7bef08f",
+        "after_sha256": "ce60694e698bcb14477c084e113051bc176b4ce328aa115ba1104b75b0907405"
+      },
+      {
+        "path": "guidance/orchestrator.md",
+        "before_sha256": "b091d89732d886608274ad5f2d4100e160c6878d1e2ce527dd34fa041935399f",
+        "after_sha256": "25c563a4451d43bdc6d1d73c8fb974e732c20cd1d838cfb0d9df3e29a486eb5b"
+      },
+      {
+        "path": "guidance/team-planner.md",
+        "before_sha256": "9bc362fe570105e93e97838b4ae5b6bd8741e02abd9921bfc4f051520af3cfd7",
+        "after_sha256": "27dda769949b5fb0f40691d36947416c5c42256728ec4c7bf78258ef1636fc60"
+      }
+    ]
   }
 }

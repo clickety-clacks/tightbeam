@@ -18,6 +18,13 @@ responsible specialist. Reconcile overlapping work with its owner. Use the share
 scope guidance for changes to the ask and the operating manual for refusals,
 reporting and handoffs.
 
+The product orchestrator maintains the product delivery picture. Material product
+information normally stops there. Involve the executive root for cross-product
+consequences, decisions beyond product authority, and consolidated outcomes or changed
+commitments relevant to the user. Use the operating manual for the shared reporting
+contract; keeping the product orchestrator informed does not require its permission
+for delivery choices already delegated to the responsible owner.
+
 Choose mechanical protection for a concrete invariant, not to enforce a preferred
 workflow. The guidance writer and reviewer carry its policy design and review;
 runtime implementation stays with its commissioned engineering owner.

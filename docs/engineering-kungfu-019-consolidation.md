@@ -36,10 +36,13 @@ Fable retains the review role and source authorship of the absorbed contribution
    judgment; notification, administrative closure and reassignment do not prove delivery.
 2. Keep product intent with an active, addressable PO. Maintain current product
    understanding, judge new specs and material changes, and challenge consequential drift.
-3. Put delivery custody with orchestrators. Staffing, sequencing, integration,
-   dependency recovery and acceptance follow-through need an accountable owner.
-4. Give each orchestrator the coordination that matters to its scope. Preserve raw
-   evidence for inspection; do not forward every receipt and local detail to ancestors.
+3. Delegate delivery authority with its outcome. Orchestrators own team design,
+   staffing, sequencing, integration, recovery and acceptance follow-through within
+   their authority and resources; routine staffing needs no parent report or permission.
+4. Give each orchestrator material information for its scope. Product delivery
+   information normally stops at the product orchestrator; the executive receives
+   cross-product consequences, decisions beyond product authority and user-relevant
+   outcomes. Reporting information does not ask the parent to take over the work.
 5. Design the team for the job. Reuse existing archetypes, vary scope and depth,
    commission bounded strong planning when useful, and revise when evidence changes.
 6. Size process to the outcome, uncertainty and consequences. An understood repair
@@ -594,3 +597,23 @@ Never edit the live database directly. No unreleased binary is installed on Gibs
 After the authorized application and resumption, give agents one concise notice naming
 the accepted guidance, material changes and superseded work. Have them reread guidance,
 rediscover addressed roles and actual custody, and continue only retained obligations.
+
+
+## 12 September amendment: reporting and delegated authority
+
+Mike distinguished the executive root from the product orchestrator, affirmed material
+reporting to product delivery ownership, and rejected reporting staffing choices as
+micromanagement. He then directed: "make changes. merge to 0.1.9, and the running org.
+ask affected agents to re-read their guidance". This external conversation is the
+authority for this amendment; it does not authorize a release or install.
+
+The neutral operating manual owns the distinction between information and an action
+request. Engineering expectations own the product-to-executive reporting boundary;
+neutral guidance does not prescribe the engineering topology. Orchestrator guidance
+names executive, product and feature scope and delegates team design and staffing with
+the outcome. Team-planner uses those existing homes when designing responsibility and
+authority. The compatible
+0.1.8 overlay carries the same amendment without teaching new runtime behavior.
+Existing delegation briefs must agree with it; a product orchestrator still receives
+material product information. The change adds no staffing gate or exception-only
+filter for product delivery.
