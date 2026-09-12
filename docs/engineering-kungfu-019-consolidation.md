@@ -68,8 +68,9 @@ prepared compatibility overlay.
    familiar engineering practice.
 2. Preserve judgment. Give outcomes and constraints without turning every decision into a
    gate, checklist, or permission request.
-3. One concept, one home. Shared duties in shared guidance, role craft in the archetype,
-   occasional procedures in skills.
+3. One concept, one home. Shared duties belong in shared guidance. Each archetype carries
+   the guidance for its responsibility. Prefer delegation for distinct responsibilities;
+   use skills where there is a concrete reason to keep the procedure with the same agent.
 4. Make skills discoverable. Always-loaded guidance says when to load a skill; a skill cannot
    be its own discovery mechanism.
 5. Teach only supported behavior. Verify mechanisms before describing them, and separate
@@ -414,6 +415,35 @@ all intermediate compositions, the eight actual skill removals, final file hashe
 through the supported edit sequence; the replacement was loaded only in the
 isolated fixture. Earlier full-suite failures remain recorded above and are not
 resolved by these focused results.
+
+
+## Context continuity, frugal selection and teardown
+
+Mike's subsequent instruction is to choose the best agent for the job, but be
+frugal, and treat ringdown as a suggestion. The shared model policy now gives
+inference the choice among qualified candidates. The tables provide starting
+preferences and capability floors; explicit authority, budget, family and supported
+host/model/effort constraints still govern. No automatic price calculator, model
+probe, new gate or runtime selector is claimed.
+
+Team design now weighs shared working context against the cost of unnecessary role
+instructions. Compatible functions may stay together with an occasional skill when
+splitting them would require repeated briefing and synchronization. A focused
+specialist remains useful when its context can travel economically or independent
+judgment requires separation. Reuse retained understanding where useful, while making
+no guarantee about provider cache reuse. Invariant 3 and authoring guidance carry
+this clarification. The proposed separate planner, guidance and integration
+archetypes remain a follow-up design; this change creates none of them.
+
+Topology choices include useful lifetime and a retirement owner. The operating manual
+owns the retention and teardown duty. Complete the bounded assignment when delivered;
+keep its agent for a concrete continuing role or likely useful follow-up, without
+manufactured check-in turns. Retire it when that purpose ends after preserving output,
+child supervision and unresolved obligations through accepted handoff. No arbitrary
+idle timeout, automatic cleanup service or new supervision cadence is introduced.
+
+Both the portable guidance and prepared installed-build overlay receive these rules.
+The 0.1.8 mechanisms remain distinct and no live retirement or tuning is performed.
 
 ## Current-org application
 

@@ -17,44 +17,48 @@ activities live in `guidance/engineering-model-activities.md`.
 
 ## Select and recover
 
-Choose the activity for the actual outcome, expected duration, uncertainty and
-consequences. These activities are options, not required workflow stages. An
-orchestrator may select a stronger activity, commission planning or keep deep
-judgment in its own session within its authority and budget. Do not over-specify a
-job merely to fit it to a cheaper coder. Judge savings across planning, context,
-supervision, rework and review as well as the worker's tokens.
+Choose the best agent for the actual job, but be frugal. Select for the outcome,
+quality, duration, uncertainty and consequences. Prefer the least costly qualified
+choice expected to deliver that result. Count briefing and context reconstruction,
+supervision, synchronization, rework and review along with the agent's own usage.
+A capable agent that already understands the work may cost less overall than a
+fresh cheaper model. Do not over-specify a job merely to fit it to a cheaper coder.
 
-Determine the permitted model families from the organization's instructions. Support
-mixed, Codex-only and Claude-only operation. Filter a row by that restriction before
-fallback, retaining its order. An outage does not authorize crossing the restriction.
-Every essential responsibility must remain possible within the selected mode.
+The ringdown rows suggest starting choices and fallback order; inference owns the
+selection. Use their default order when the job supplies no reason to choose
+differently. Choose another qualified candidate when its task fit, retained context,
+expected total cost or availability better serves the outcome. A default or model
+preference is not a compulsory first attempt, a price ranking or automatic fallback.
+Use available cost and usage evidence without inventing prices or guaranteed cache
+reuse across sessions, models or harnesses. Routine selection needs no benchmark,
+new scoring ceremony or approval request.
 
-Use the first qualified available candidate in the resulting row. Qualification
-requires the activity's capability floor, an allowed host and harness, a supported
-model and effort, and runnable access. Catalog presence alone does not prove access.
-Expand a nickname to the exact canonical model above. Pass model, effort and the
-matching permitted harness explicitly when spawning; do not rely on an inherited
-model to implement this policy. Verify supported settings rather than inventing a
-similarly named model. Archetype model-preference metadata is not automatic spawn
-fallback or a transfer of selection responsibility from the orchestrator.
+Determine permitted families from the organization's instructions. Filter candidates
+for mixed, Codex-only or Claude-only operation before choosing. Qualification still
+requires the activity's capability floor, allowed host and harness, supported model
+and effort, and runnable access. Catalog presence alone does not establish access.
+Suggested order can change; explicit family, authority and budget restrictions cannot.
+Use an applicable activity for the actual outcome; the rows are not required stages.
+Commission stronger planning or use a stronger agent throughout when the work needs it.
 
-For independent review in mixed mode, prefer the other provider family than the
-producer among the qualified candidates in the applicable review row. Keep each
-family's internal order. Thus ordinary review of Codex-produced code starts with
-Opus; ordinary review of Claude-produced code starts with Sol. Use the deeper review
-row for consequential interactions. When both families materially produced the work,
-retain the row's order and use an independent reviewer. A fresh capable same-family
-reviewer remains eligible when preferred alternatives are unavailable; single-family
-operation uses its permitted row. Provider diversity is a selection preference, never
-an additional acceptance gate. Preserve independent session and judgment.
+Expand nicknames to canonical models above. Pass the chosen model, effort and matching
+permitted harness explicitly when spawning. Verify supported settings rather than
+inventing a similarly named model. Archetype metadata does not make the selection
+or implement fallback on the caller's behalf.
 
-Availability fallback may cost more. A refused model/host/harness route or exhausted
-access advances to the next qualified candidate. Do not retry a known unavailable
-route without new evidence. If none qualifies, keep the affected obligation owned,
-record the capability block and continue separable work. Reframe, select another
-applicable activity or propose a policy change through the responsible owner. Main
-is not a fallback worker. Routine fallback does not require an approval request or
-an upward report of each attempt.
+Independent review requires independent session and judgment. In mixed mode, prefer
+the other provider family when candidates are otherwise comparably suitable and
+frugal. That is a default preference, not an acceptance gate. A qualified same-family
+reviewer remains eligible; single-family operation stays within its permitted family.
+Choose the deeper review activity when the subject requires it.
+
+On an unavailable route, reassess the remaining qualified candidates using the same
+selection judgment. The suggested fallback order remains useful when there is no
+reason to depart from it; a fallback may cost more. Do not retry a known unavailable
+route without new evidence. If none qualifies, keep the obligation owned, record the
+capability block and continue separable work. Reframe the work or propose a policy
+change through its owner. Main is not a fallback worker. Report material consequences
+through ordinary ownership, not each attempted or successful staffing choice.
 
 A poor result requires diagnosis of the ask, inputs, context, dependencies and
 approach. Increase effort, use a stronger activity or seek planning according to the

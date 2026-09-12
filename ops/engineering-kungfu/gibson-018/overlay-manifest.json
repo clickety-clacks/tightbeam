@@ -61,7 +61,7 @@
     {
       "path": "guidance/engineering-model-activities.md",
       "before_sha256": null,
-      "after_sha256": "c53f3840660b46bb755572c0bd5ff1137306b2faaee0096a34c8fc9ac90f2261"
+      "after_sha256": "8afd0e354c25910f9c4612a88a05560cae98ac67621114db99f9776e89726c84"
     },
     {
       "path": "guidance/engineering-tenets.md",
@@ -81,17 +81,17 @@
     {
       "path": "guidance/operating-manual.md",
       "before_sha256": "793b250ea0c7a997cb947efd11f2b571ccb3825cb66f9da51dc43b4e450c8afa",
-      "after_sha256": "ea8a02646ad6ad338b92cf31362d79befa8ac3af55b3456d589e8a6fa222a196"
+      "after_sha256": "f45718d8f1d029e628144890ec1d10186ac5f607eef1ac513a572ea18f33c006"
     },
     {
       "path": "guidance/orchestrator.md",
       "before_sha256": "a090a8428344d0c98ac06d314f29cb7e1047130da0f0732fe5cf4c29ce27630c",
-      "after_sha256": "26e1bac72538c4ef5bc6f3206c076c900b9a059465e60acddb50b578e010ee61"
+      "after_sha256": "7d9fc33e8b525593d95f3c0832d11a587366b36d3831125a6d6e85ff90b31834"
     },
     {
       "path": "guidance/preferred-models.md",
       "before_sha256": "b2374c1bfdd6b297927a681f0d0ca61ccea6ef9e8c08eaad80f5b42faed8a520",
-      "after_sha256": "144f3ee4405809a1b9f33c8db36a7c4c413681afcca1d951d2bf65d7d86e87bb"
+      "after_sha256": "b7b275dbf4444bb193c9cd8d33abea624dace6983412c3086e323c06921056d5"
     },
     {
       "path": "guidance/product-owner.md",
@@ -171,7 +171,7 @@
     {
       "path": "skills/engineering-authoring-018/SKILL.md",
       "before_sha256": null,
-      "after_sha256": "6d79e68642b3d9d9fd51655ce19c66e426398f03c92407b834d7c35536407c61"
+      "after_sha256": "014d566c8f04be8a259390ee2064e78cf792176962ab2dada40c34081afb189d"
     },
     {
       "path": "skills/feature-cycle/SKILL.md",
@@ -201,7 +201,7 @@
     {
       "path": "skills/team-design/SKILL.md",
       "before_sha256": null,
-      "after_sha256": "976c91ed88d4d69c8d45d220d5e77756ef232a6b457164d85a62467e96a885b7"
+      "after_sha256": "452b7d31a6e4b17149ed59d252d3abd32d5696d832c78e77c67df843d41386b3"
     },
     {
       "path": "skills/unblocking/SKILL.md",

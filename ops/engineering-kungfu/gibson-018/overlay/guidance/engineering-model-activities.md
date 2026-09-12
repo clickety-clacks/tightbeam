@@ -1,12 +1,13 @@
 # Preferred models for engineering kungfu
 
-Use the shared preferred-models guidance for canonical names, family restrictions,
+Use the shared `preferred-models.md` for canonical names, family restrictions,
 qualification, producer-dependent review preference, reasoning and fallback mechanics.
-These are the initial engineering activity orders and capability floors. Their
-single-family views retain relative order. In mixed mode, apply the shared
-other-family review preference before availability fallback on either review row.
+These are suggested engineering activity orders and required capability floors.
+The single-family tables preserve the default relative order. Apply the shared
+selection judgment to choose the best agent for the job while being frugal; the
+order and producer-dependent review preference are advice, not compulsory selection.
 
-Use Luna xhigh for well-scoped implementation, including feature work. Retain capable
+Luna xhigh is the starting suggestion for well-scoped implementation, including feature work. Retain capable
 orchestration and stronger independent review. Choose a stronger coder directly for
 unsettled architecture, critical code or difficult bugs; a failed Luna attempt is not
 an admission test. Use the sustained rows when work is expected to be sustained.

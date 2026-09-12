@@ -86,8 +86,19 @@ it is FOR.
 
 When delegating an outcome, the assignment row records its responsibility. Open it first (`tightbeam assign --subject "..." --work-item <id>`), then send a
 concise wake carrying its reference and material new context. Thread every assignment to
-the work item it serves. Preserve required output and unfinished dependent obligations
-before retiring a hire whose work has ended.
+the work item it serves.
+
+The responsible delivery owner carries agent retention and retirement through to
+completion. Complete a delivered assignment under its applicable rule; retain the
+session only for a concrete continuing role or likely follow-up whose retained
+context justifies it. Quiet waiting needs no turns that merely keep the agent visible.
+When that purpose ends, retire the hire through the supported command. Preserve
+required output and unfinished dependent obligations through an accepted handoff
+before retirement, including child supervision and artifact custody. A zero open-
+assignment count alone does not settle those duties. Resolve obsolete continuations
+through their owner while preserving coverage still needed by unfinished work.
+Use purpose and expected reuse to judge retention; no fixed idle timeout or new
+periodic inference check is required. Keeping a session does not promise cache reuse.
 
 ## Carry finished work to a line
 When returned work enables the next step, carry it forward under existing authority.

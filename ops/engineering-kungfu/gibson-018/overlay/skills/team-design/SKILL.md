@@ -10,6 +10,20 @@ available capabilities and cost constraints. Reuse adequate analysis. Choose the
 smallest process that can deliver the agreed result. A familiar bounded repair may
 need only a coder and independent reviewer under its existing orchestrator.
 
+Choose boundaries for useful context as well as focus. Group functions that share
+substantial evolving plans, evidence and decisions when their authority is compatible.
+Use a skill for an occasional procedure within that coherent responsibility. Separate
+responsibilities when focus, different context or independent judgment justifies the
+briefing and coordination cost. An occasional procedure alone does not require a new
+archetype, and a broad skill menu does not justify giving one agent several jobs.
+
+Account for what existing agents already know. Reuse a suitable agent or specialist
+and communicate relevant changes when that avoids repeated catch-up. Delegate a
+bounded question when its needed context can travel economically. Give each child
+its outcome, authority and relevant evidence; avoid copying unrelated parent history.
+Use preferred-models for frugal selection by expected total cost, including context
+reconstruction and possible cache reuse. A suggested row does not settle that judgment.
+
 Use an orchestrator as a bounded planner when topology needs strong reasoning but
 routine delivery does not. Select the planning activity in preferred-models. Give
 the planner the decision to make, relevant evidence, scope and effort boundary.
@@ -21,8 +35,11 @@ As planner, return an actionable recommendation in the ordinary work artifact or
 assignment context. Explain only the choices that matter: independent versus coupled
 work, owners, specialist outcomes, model activities, critical dependencies, review,
 product judgment and what evidence would change the arrangement. Account for the
-cost of supervision, repeated context, corrective work and idle roles. Recommend no
-new agent when the current team is adequate. Do not require a separate design paper.
+cost of supervision, repeated context, corrective work and idle roles. Account for
+useful lifetime: which help ends with its result, which context merits reuse and who
+owns eventual retirement. Apply the operating manual's retention and teardown duty.
+Recommend no new agent when the current team is adequate. Do not require a separate
+design paper or a mandatory lifetime field for every assignment.
 
 As delivery owner, adopt or amend the recommendation within your authority. Create
 the actual assignments and addressed relationships using existing dispatch mechanics.
