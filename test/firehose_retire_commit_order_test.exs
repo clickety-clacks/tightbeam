@@ -46,6 +46,7 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
 
     _ = receive_notices()
     assert {:ok, first} = Dispatch.dispatch(db, handlers, call)
+    first_stored = Tightbeam.CriticalLeases.get(db, worker.session_key)
     assert {:ok, renewed} = Dispatch.dispatch(db, handlers, call)
     stored = Tightbeam.CriticalLeases.get(db, worker.session_key)
 
@@ -64,7 +65,7 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
              "critical_lease.updated"
            ]
 
-    assert Enum.at(notices, 1)["payload"] == StateResources.critical_state(first)
+    assert Enum.at(notices, 1)["payload"] == StateResources.critical_state(first_stored)
     assert List.last(notices)["payload"] == StateResources.critical_state(stored)
 
     before = stored
