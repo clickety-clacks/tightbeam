@@ -182,11 +182,19 @@ Related work is not automatically completed or revoked:
   superseded. Closed work-item states alone do not establish release delivery.
 - R1, wi_d884d359-d1f2-4a1a-94c3-a8dbb90279ce, concerns reminder reassessment
   and notification recovery. Its carry at 56808621374e99fc1a4e86880a4e238364ae1e7c
-  is present in this branch. Stall-watch withdrew its claim that this fixes the
-  separate finalize crash leaving turns marked running. The later defect record
-  wi_bb2bbdc3-798a-4870-93da-042aada491fc is closed with no assignments; no
-  implementation custody or fix was verified. Preserve that unresolved runtime
-  defect separately. The five affected sessions remain protected from replay.
+  is present in this branch. The separate finalize crash caused by a turn carrying
+  another session's assignment is addressed by O2 commit
+  eff3da0a437920fe7293128af8831550304278fe, already in this branch. The lead verified
+  that its two health-attribution lookups accept an assignment only when its holder
+  matches the executing session. Otherwise the health observation records a null
+  assignment, avoiding the ownership constraint while retaining the turn's original
+  assignment reference. The commit also includes terminal and boot-recovery tests.
+  Installed build fdb3db5 predates this guard. Stall-watch corrected its earlier
+  no-fix claim in message 69931710; wi_bb2bbdc3-798a-4870-93da-042aada491fc is closed
+  without a new implementation assignment. Preserve the existing fix and release
+  delivery responsibility; do not commission a duplicate fix. The five affected live
+  sessions remain protected until their recovery owner clears replay risk. Source
+  presence does not establish that their existing queues have recovered.
 - Standing integration accountability is preserved. Local release-line elections
   remain local instructions, with this branch explicitly targeting only 0.1.9.
 
