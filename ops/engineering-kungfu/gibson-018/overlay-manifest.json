@@ -26,7 +26,7 @@
     {
       "path": "archetypes/recon.toml",
       "before_sha256": "08a49c4c0519854a9fd22c12d7201ab1e0c023ebbf39eb19101b141ec9d8aea3",
-      "after_sha256": "6c957620fc88071d5c899d4cd10c55fed39207984c1a376389606351dd28ee66"
+      "after_sha256": "a68f04e95d1f806d4a3e6caafc3d9598205fbe01261df262fed005e6ff6dca57"
     },
     {
       "path": "archetypes/reviewer-code.toml",
@@ -51,7 +51,7 @@
     {
       "path": "guidance/coder.md",
       "before_sha256": "73fc1943e78e1af3a9f5dd315fc07d2ebddf1ebda8f96a8cced50c8b018bfac6",
-      "after_sha256": "62fdda3898f78ea0a02ea022e64bc2f987e4c76c333fd01d74550fdb4a464e7c"
+      "after_sha256": "af01d76a556a7ac5a010aed4b95c13f02493cc80fdcba3427bfb14caaad373d3"
     },
     {
       "path": "guidance/default.md",
@@ -66,7 +66,7 @@
     {
       "path": "guidance/engineering-tenets.md",
       "before_sha256": "8436878ba6cbb4bc033c152b4e18795da53c5847c6cfac7823adc27b57a0c612",
-      "after_sha256": "75cbecf4621c579c22961cc11b774887b7db9beab432e8a278ac764dd5242323"
+      "after_sha256": "b58217b33fc8dcbcc3317573fbfede650cf40b7d57fc579c26304f70d17d1417"
     },
     {
       "path": "guidance/golden-rule.md",
@@ -81,12 +81,12 @@
     {
       "path": "guidance/operating-manual.md",
       "before_sha256": "793b250ea0c7a997cb947efd11f2b571ccb3825cb66f9da51dc43b4e450c8afa",
-      "after_sha256": "341755d206f85fab87ebddad28d3ed4d77ca2d937d92fb0e0bddb0ed875ee94b"
+      "after_sha256": "ea8a02646ad6ad338b92cf31362d79befa8ac3af55b3456d589e8a6fa222a196"
     },
     {
       "path": "guidance/orchestrator.md",
       "before_sha256": "a090a8428344d0c98ac06d314f29cb7e1047130da0f0732fe5cf4c29ce27630c",
-      "after_sha256": "68d27f77c937bc85f1f967de7ab31f451f8631bc5e08f1548c1bb3c7ab6dacdc"
+      "after_sha256": "26e1bac72538c4ef5bc6f3206c076c900b9a059465e60acddb50b578e010ee61"
     },
     {
       "path": "guidance/preferred-models.md",
@@ -101,22 +101,22 @@
     {
       "path": "guidance/recon.md",
       "before_sha256": "59a94eaedc77f2815476f480ea604c1f67e9ca3a8abc398604fdcb1a307f19bc",
-      "after_sha256": "a5532b9ed14b57db303c65cb1b0474938c46b01c6f95b15683915a1ce39e1b24"
+      "after_sha256": "fdcad6f02dc0c1c8e4dfdb501397c33382ee9aa2e887d7ed804b7488be379e1d"
     },
     {
       "path": "guidance/review-common.md",
       "before_sha256": "72b595ecd7480d1b1f22a5b985552e80ce20b6fa954261a78c71fc83b06ca5ea",
-      "after_sha256": "23c6c8c742f30696f12f466cf441f114619ba1e764e394010269a25c5c82da4d"
+      "after_sha256": "a6fd158579ffe5a9bf415d0037e73b1b3a05cb9f6f412db6135aa55e38a536bb"
     },
     {
       "path": "guidance/reviewer-code.md",
       "before_sha256": "93162275f788d11041310b11afd161197715e32cad8b87223f10b018ff80b73f",
-      "after_sha256": "1817194eed693a7a32d737e4bdf3646936ec004ae1144950d342f858a880c874"
+      "after_sha256": "5ce75f3d4030d098cbbd8fe9c67f8eca8c3e871d82128fcdef4ea9779fd23385"
     },
     {
       "path": "guidance/reviewer-spec.md",
       "before_sha256": "8479006d38fc699eae9324d66dce4a10eebf8d13c771dd2e04cd4a36799d7b19",
-      "after_sha256": "0219c7fe9d1b144f51538a4580276a6d98b9e26fa1424426017a21010730dcff"
+      "after_sha256": "602c8b605310e6251c28749646d353592b6c94b8af3dd1dadbb05c492cb31ea7"
     },
     {
       "path": "guidance/scope-and-architecture.md",
@@ -126,7 +126,7 @@
     {
       "path": "guidance/spec-writer.md",
       "before_sha256": "81bc5b50c0278576359c137d9a88fbf60c0699c44c5dd8a8e704d5aa610e58c3",
-      "after_sha256": "e9a91273b17599b9fa42dceb0a37833a94f4856a2f8dba52fb2ce3107865ede9"
+      "after_sha256": "5274c0a314efbe98402ac145ac5001a9a68446a597388dc57879edc8eb42af03"
     },
     {
       "path": "guidance/specs-home.md",
@@ -146,12 +146,12 @@
     {
       "path": "guidance/wisdom-core.md",
       "before_sha256": "6e9a468348f467bf49e46fae893c96b45c4c891b9e021ba11fac24b466c71dde",
-      "after_sha256": "256911538b5a339b92415981e296ce02c2209f83014ee011f7fdc9aa8dbd6865"
+      "after_sha256": "4465d71e1745da98a7a0380eaf8a0f116873dcfeb325cd619b287d40bc455203"
     },
     {
       "path": "guidance/wisdom-meta.md",
       "before_sha256": "878d85c24de4b785f0c1dd8c04904bbb4e05560d9be8f7df881bdbb12ef7ba71",
-      "after_sha256": "d003ef7071cf237a39a2768bf593fa36added28d1a639954d194d1141c61f0ac"
+      "after_sha256": "8e7507a39eaf24200e3e1af082782a8aaf4d66a7ec8ec4751c40cb6dcb56db02"
     },
     {
       "path": "rules/engineering.toml",
@@ -159,19 +159,29 @@
       "after_sha256": "47ae04d311f2afe49146239deeefe2a56d6c7d0d1162a32633e68020ddbff2f0"
     },
     {
+      "path": "skills/bug-provenance/SKILL.md",
+      "before_sha256": "6deaf672374792c66773c802db1038b8a6ee9f239a0aa20fd232d190cfaae2e6",
+      "after_sha256": "f0e8f583e53da27ae9b13782a0747693385598648197c7e815c02238286cf380"
+    },
+    {
       "path": "skills/committing-and-pushing/SKILL.md",
       "before_sha256": "086c0419d0ad1766f6d8d068c5449943048d2ae8c2b28d86e56ff21d4d8baf1d",
-      "after_sha256": "5c279e07a6454da80c0516524c7f04f0aeb075efdbf2f65e21a175f00d62dd69"
+      "after_sha256": "1fba7ddc3588644100736da59e2cae9c3577a855a222d491b4d3b600b03ca3da"
     },
     {
       "path": "skills/engineering-authoring-018/SKILL.md",
       "before_sha256": null,
-      "after_sha256": "1d054f024fe59fd308befa5f7b86bbb6ecba71fd0552f20f1f8507e8dcd80471"
+      "after_sha256": "6d79e68642b3d9d9fd51655ce19c66e426398f03c92407b834d7c35536407c61"
     },
     {
       "path": "skills/feature-cycle/SKILL.md",
       "before_sha256": "ba1909b77e5f430a52f3009ce271b62e6e1717283402eb1a376fe10f9f771f12",
-      "after_sha256": "84f0a748192f5f737e8bee132aa3f964643f1ea93f38862fba103fa600f29695"
+      "after_sha256": "44527ffc76374d0e1dc5a6e77f5a91a8bdca5beff13c0cf14c91cd631a28d7a8"
+    },
+    {
+      "path": "skills/human-communication/SKILL.md",
+      "before_sha256": "9c9419c27eb661680272017e1a41511dc8f39f793bc003af4dac00079da8b53b",
+      "after_sha256": "81854161eada1a6aff9261ee81e8678223a67087d26c94f4dc6a79cf3b20098c"
     },
     {
       "path": "skills/model-release-intake/SKILL.md",
@@ -197,6 +207,11 @@
       "path": "skills/unblocking/SKILL.md",
       "before_sha256": "112f9a6bf8f71581c87ba43e10c77b439db224d1abb1cce9d24e6729b8d36a78",
       "after_sha256": "d5b7d69861a6d32979f36c35ea0ff86b0a6c9080f44e07d13fdd8d6c5172b9f4"
+    },
+    {
+      "path": "skills/work-tracking/SKILL.md",
+      "before_sha256": "32dda800cbfc39e69c4dd1dd0d3c667381bf9d7d414df264008390d2df0cfd2c",
+      "after_sha256": "db681b09a0e2a3737e93b2ad41ec5644b7f6da1ca20f3d34dda874b9598e2bd8"
     },
     {
       "path": "skills/worktree-session/SKILL.md",
@@ -227,5 +242,55 @@
     "source_revision": "fdb3db53b596d4114d06505b39a4c1836fba7564",
     "gateway_reported_version": "0.1.8",
     "gateway_reported_build": 1337
-  }
+  },
+  "removed_files": [
+    {
+      "path": "skills/recon-first-investigation/SKILL.md",
+      "before_sha256": "1b9a6ec7df38f4d40665d4915c6381c22aa65e9445f3e7db924e7e794387db61",
+      "after_sha256": null,
+      "reason": "Role duties now have one home; remove retired instructions after de-election."
+    },
+    {
+      "path": "skills/recon-lifecycle/SKILL.md",
+      "before_sha256": "8a26456aab222792b84799816357630d8975282dfff49045a33f1032704cbebf",
+      "after_sha256": null,
+      "reason": "Role duties now have one home; remove retired instructions after de-election."
+    },
+    {
+      "path": "skills/review-for-completeness/SKILL.md",
+      "before_sha256": "702d99a972f3a88dbdad3a6acbbc59be845390176dd42a049825acc49d0d6335",
+      "after_sha256": null,
+      "reason": "Role duties now have one home; remove retired instructions after de-election."
+    },
+    {
+      "path": "skills/review-for-yagni/SKILL.md",
+      "before_sha256": "54cf56a8265f6c69b915b70be5ac457b74501e46e3230e72d7e238e1e1b684c5",
+      "after_sha256": null,
+      "reason": "Role duties now have one home; remove retired instructions after de-election."
+    },
+    {
+      "path": "skills/spec-conformance/SKILL.md",
+      "before_sha256": "c629ef9e7d53f45177127ffd0a5cc869b1ab751ebe597c275e6d8f8bcb6d8e54",
+      "after_sha256": null,
+      "reason": "Role duties now have one home; remove retired instructions after de-election."
+    },
+    {
+      "path": "skills/drafting-requirements/SKILL.md",
+      "before_sha256": "e173a2594a032c0f9824d5a2eabe726c2dd9f7acc06386e2822ef394dc871d8b",
+      "after_sha256": null,
+      "reason": "Role duties now have one home; remove retired instructions after de-election."
+    },
+    {
+      "path": "skills/spec-handoff/SKILL.md",
+      "before_sha256": "a592248c26cef5fec60aa1a7fc512f1b9706b1632a8d9dab62d9b869d776b8ba",
+      "after_sha256": null,
+      "reason": "Role duties now have one home; remove retired instructions after de-election."
+    },
+    {
+      "path": "skills/spec-homing/SKILL.md",
+      "before_sha256": "5669c076798fea24efeaeecadc2d2f4f8a3d342673ca6020b086716f93578b3e",
+      "after_sha256": null,
+      "reason": "Role duties now have one home; remove retired instructions after de-election."
+    }
+  ]
 }

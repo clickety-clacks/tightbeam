@@ -1,6 +1,6 @@
 name = "recon"
 where = ["gibson"]
-skills = ["engineering-authoring-018", "recon-first-investigation", "recon-lifecycle", "bug-provenance", "human-communication", "tightbeam-atc"]
+skills = ["engineering-authoring-018", "worktree-session", "bug-provenance", "human-communication", "tightbeam-atc"]
 
 [defaults]
 harness = "codex"

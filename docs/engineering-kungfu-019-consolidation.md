@@ -57,6 +57,35 @@ Fable retains the review role and source authorship of the absorbed contribution
     size, model selection and product interpretation in judgment. A refusal does not
     authorize bypass, and a reminder is not evidence of failure.
 
+## Guidance-writing invariants
+
+Mike explicitly adopted these eight invariants in the external conversation on
+12 September and asked the lead to apply them to the complete guidance composition.
+They are acceptance criteria for this revision, including retained skills and the
+prepared compatibility overlay.
+
+1. Assume professional competence. State intent, authority, and local facts. Do not teach
+   familiar engineering practice.
+2. Preserve judgment. Give outcomes and constraints without turning every decision into a
+   gate, checklist, or permission request.
+3. One concept, one home. Shared duties in shared guidance, role craft in the archetype,
+   occasional procedures in skills.
+4. Make skills discoverable. Always-loaded guidance says when to load a skill; a skill cannot
+   be its own discovery mechanism.
+5. Teach only supported behavior. Verify mechanisms before describing them, and separate
+   proposed behavior from what actually exists.
+6. Keep the whole composition consistent. Check kernel, includes, elected skills, and manual
+   together, and remove instructions that oppose each other across those homes.
+7. Write direct, concise instructions. Role voice, concrete verbs, enough context to act
+   without the conversation history.
+8. Revise proportionately. Batch coherent changes, preserve useful content, and do not add a
+   procedural layer for every incident.
+
+A short role-specific pointer may refer to a shared duty without restating it.
+Explain unfamiliar Tightbeam behavior where needed; local procedures do not justify
+lessons in familiar engineering practice. The projected home of these authoring
+instructions is `tightbeam-guidance-authoring`, with discovery in shared guidance.
+
 ## Resulting organization
 
 The bundle's default root is an orchestrator. It establishes a standing product-owner
@@ -339,6 +368,35 @@ sent to the recovery and release owners. This branch does not claim a green full
 No production code or Rust source changed. The tests used isolated fixture gateways
 without model inference or live-org access, and no tests ran on Gibson. Verification
 logs and exact review messages remain in the operator's private consolidation evidence.
+
+## Revision under the eight writing invariants
+
+The 12 September follow-up applies the eight invariants to retained content as well
+as the new topology guidance. Recon now owns one bounded finding, its evidence,
+uncertainty and handoff. Its kernel carries the role's local lifecycle; bug-provenance
+covers occasional routing across responsible owners. The duplicate recon-first-
+investigation and recon-lifecycle skills are retired. The unelected review-for-
+completeness, review-for-yagni and spec-conformance tutorials are also retired so
+later skill loads cannot restore automatic checklists, clause tables or test gates.
+
+Shared engineering expectations own evidence quality and review admission. Review
+craft applies that contract to code or specifications. A spec reviewer identifies
+the core decision or applicable explicit constraint behind a blocker, while the
+spec-writer retains the agreed EARS/RFC standard, new-requirement examples, spirit
+ownership and preservation of adequate existing specifications. Implementation
+choices that preserve the core invariants remain with the coder.
+
+Coder and recon guidance now name the triggers for their elected procedures. Local
+integration and visualization procedures have triggers in the compatibility manual.
+Routine reporting stays in the manual; human-communication covers explaining a
+consequential technical choice without grammar lessons or numeric style gates.
+Guidance-authoring owns the eight invariants, with the local 0.1.8 authoring skill
+providing their explicit precedence over the release's older reserved procedures.
+
+These changes add no runtime mechanism, rule, model restriction or review-admission
+gate. Existing scoped acceptances above describe earlier revisions; this coherent
+revision is a new source-review subject. The prepared 0.1.8 command sequence now
+removes retired skills only after de-election. No live application is performed.
 
 ## Current-org application
 

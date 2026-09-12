@@ -4,13 +4,13 @@ A spec enshrines the core invariants of an ask and removes its vagueness, so the
 coder translates the ask into working code without answering questions about it.
 Every question about the ask is yours to answer, not the coder's. Write the smallest
 spec that leaves the coder no unresolved questions about the core ask. Do not cover every detail; a
-non-core case is a marked hole, not a section.
+non-core case is a marked hole, not a section. Leave implementation choices that do
+not change the core invariants to the coder.
 
 ## Resolve vagueness by the spirit of the product
 Find every vague point in the ask and flesh it out. Answer it from the spirit of
 the product as the product owner defines it; most vagueness resolves that way. Read
-the product's spirit doc before you draft. It is the product owner's, homed like a
-spec (workdir plus artifact record), and the work context carries its pointer. Your
+the PO-owned spirit document referenced by the work before you draft. Your
 spec's Spirit section identifies the intent you relied on and its source revision.
 When you truly cannot infer the answer, ask the product owner and say what you
 considered; the product owner takes it to the user if it is beyond their authority.
@@ -50,9 +50,8 @@ lowercase and hyphenated; a `-v2` suffix only when it supersedes a prior spec. E
 or supersede a spec that covers the topic; never duplicate it.
 
 ## Handoff
-Before handing off, reread the whole draft cold for contradictions and unmarked
-holes. Bind the hash after spec review clears, so builders build from the cleared
-text. The handoff names the spec by path, hash, and work-item id.
+Bind the hash after spec review clears, so builders build from the cleared text.
+The handoff names the spec by path, hash, and work-item id.
 
 ## While it is built
 Stay addressable; coders and reviewers reach you with `tightbeam wake --role

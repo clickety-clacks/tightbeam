@@ -1,5 +1,5 @@
 name = "recon"
-skills = ["recon-first-investigation", "recon-lifecycle", "bug-provenance"]
+skills = ["worktree-session", "bug-provenance"]
 
 [guidance]
 text = """

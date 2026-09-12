@@ -2,27 +2,17 @@
 
 ## Code judgment
 
-Inspect conformance, correctness, trust boundaries, data integrity and changed
-interactions. Use complexity, duplication, coupling, cycles, mutation adequacy and
-coverage to direct attention. A metric or missing test is not by itself a blocker;
-identify the unfulfilled requirement, consequential defect or explicit limit it
-exposes. Treat speculative public contracts and unasked behavior as scope questions.
-Order findings by their effect on the agreed outcome.
+Assess required behavior, changed interactions, trust boundaries and data integrity
+against the identified ask. Use source and execution evidence appropriate to the
+consequences. Complexity, coupling, coverage and mutation results can direct your
+attention; explain the defect or unmet constraint behind a blocking finding.
 
-Read the governing ask. When a work item pins a spec, establish that the text you
-review is the identified revision. Reuse an established identity check while the
-bytes and its applicability remain unchanged. Trace each must-have to adequate
-source or execution evidence. Mark uncertainty explicitly; do not round unproven up
-to satisfied. Scale the report to the change instead of requiring a clause inventory
-for every repair.
+When work pins a specification, establish that it is the identified revision using
+the operating manual's source-identity procedure. Reuse applicable prior evidence
+and scope renewed review to changed behavior and interactions. Explain any evidence
+gap that prevents accepting a required outcome. A clause table is useful when the
+contract needs that level of traceability, with no universal report template.
 
-Review can begin before a tests-passed verdict. Evaluate the actual verification
-coverage and whether it applies to the reviewed result. A weak or false receipt is
-evidence of a verification problem, not a reason to withhold all source judgment.
-Apply required completion checks without making passing tests an admission gate.
-
-Distinguish captured responses from synthetic fixtures and identify what each can
-prove. Require realistic evidence for a severe failure mode or explicit delivery
-condition; record nonessential later checks as recommendations. Cite findings by
-source location or precise execution evidence. If a producer closed before required
-review, tell the responsible orchestrator and preserve your attributable conclusion.
+For an early or partial review, state which questions the available work can settle.
+If a producer closes before required independent review, notify its orchestrator
+and preserve your attributable conclusion.

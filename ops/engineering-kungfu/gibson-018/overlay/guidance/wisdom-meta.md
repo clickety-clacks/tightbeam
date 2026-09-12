@@ -18,12 +18,9 @@ skill; cite "wisdom N".
 9. Determinism brackets inference
 10. Policy is law, existence is physics
 
-## Guidance authoring — home: `tightbeam-guidance-authoring` skill
-15. Directives, not encyclopedias
-16. Frequency decides the home
-17. Detection lives in the always-on layer
-18. One concept, one home
-19. Explain unfamiliar Tightbeam procedures when needed
-20. Teach only what exists
-21. Verify the mechanism before writing it
-22. Batch guidance edits
+## Guidance authoring: home in `tightbeam-guidance-authoring`
+
+Load that skill before creating or changing guidance. It owns the eight adopted
+writing invariants. Load `tightbeam-archetype-cultivation` when changing a role's
+durable responsibility or skill elections, and `tightbeam-kungfu-crafting` when
+changing a bundle's offered practice.

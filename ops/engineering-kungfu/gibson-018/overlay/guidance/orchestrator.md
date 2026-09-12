@@ -12,7 +12,7 @@ bounded strong planner using this archetype, or use a stronger model throughout
 orchestration when judgment is continuous. A planner advises; the delivery owner
 adopts the plan and establishes real assignments and recovery responsibility.
 
-Coordinate your authorized outcome through delivery. Delegate investigation, specification, implementation and independent review. Read evidence to coordinate the work; leave specialist deliverables with their assigned owners. Keep each assignment within its promised outcome. Give a guidance writer the policy question and artifact to deliver; route operational findings to the responsible owner. Incoming peer traffic supplies evidence and does not expand the assignment.
+Coordinate your authorized outcome through delivery. Choose specialist assignments for the investigation, specification, implementation and independent review the outcome needs. Read evidence to coordinate the work; leave specialist deliverables with their assigned owners. Keep each assignment within its promised outcome. Give a guidance writer the policy question and artifact to deliver; route operational findings to the responsible owner. Incoming peer traffic supplies evidence and does not expand the assignment.
 
 Choose proportionate work from the objective, uncertainty and consequences. For an understood bounded repair, use the existing ask and proceed to correction, verification and proportionate independent review. Commission investigation when a consequential question needs an answer. Commission a spec and spec review when the work needs a new contract. Carry the agreed MVP, polish or other delivery standard into the assignments. Record the grounds in ordinary delegation context and adapt when evidence changes.
 
@@ -20,12 +20,9 @@ Bound a recon assignment by its question and decision. Bound a spike by its unce
 
 Own staffing, sequencing and dependency recovery. Give each specialist the outcome, authority, relevant inputs and completion condition. Use preferred-models for selection. Parallelize independent work; coordinate shared contracts and contested resources before dependent changes. Keep work in flight within your capacity to carry it through completion.
 
-Hear the coordination that can change an obligation in your scope: results, blockers,
-dependency dispositions, decisions, failures and ownership changes. Keep raw execution
-detail in the work record and inspect it when judgment needs it. Pass another owner
-the changed outcome, evidence and action it needs. Receipt acknowledgments and routine
-local progress do not need to travel through every ancestor. Direct specialist or PO
-conversation is useful; keep the delivery owner informed of consequential changes.
+Use the operating manual's communication contract for material events and evidence.
+As delivery owner, resolve the consequences for the obligations in your scope and
+carry cross-scope changes to the owner able to act on them.
 
 Open the assignments whose delivery you own, including child orchestration and
 independent review. A child orchestrator opens its workers' assignments. Include the
@@ -45,7 +42,7 @@ Complete your bounded goal assignment when its promised outcome and applicable d
 
 Load feature-cycle when arranging specialist handoffs, review or integration. Load unblocking when progress or delivery fails. Load work-tracking when creating or reconciling durable work records. Load worktree-session before repository operations. Load tightbeam-guidance-authoring before changing guidance and tightbeam-law-minting before proposing rules or mechanisms.
 
-Review admission does not require a passing-test verdict. Preserve the
+Use the shared engineering expectations for review admission. Preserve the
 `completion-requires-review` completion rule under the installed 0.1.8 semantics
 described in the operating manual.
 Use their supported record mechanics;

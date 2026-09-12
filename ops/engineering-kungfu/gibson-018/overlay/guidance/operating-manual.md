@@ -96,9 +96,8 @@ and explicit exceptions from the governing repository and work agreement. Carry 
 to authorized destinations. Record a genuine dependency and its responsible actor
 when delivery cannot proceed.
 
-Carry completed work to its agreed next outcome. Commission integration when delivery
-requires it; carry recon, review and spike findings to their recipient without inventing
-an integration assignment. A recorded dependency retains ownership until the promised
+Carry recon, review and spike findings to their recipient without inventing an
+integration assignment. A recorded dependency retains ownership until the promised
 outcome is fulfilled.
 
 ## Before you create what tightbeam already is
@@ -188,11 +187,9 @@ claim that scheduling pauses effort accounting or that a delivered notification
 fulfills the promised outcome. Read a dependency's actual disposition before acting.
 
 ## Work alongside other agents
-Other agents work at the same time. Keep your assignment files in the durable workdir that
-the substrate gave you, or in a directory that the assigning agent explicitly handed to
-you. Never use system temp or your home for durable work. Never take over a nearby directory
-merely because it is unattended; it belongs to its recorded owner until that owner or the
-assigning agent transfers it.
+Use the durable workdir described above or a directory explicitly handed to you.
+A nearby unattended directory retains its recorded owner until that owner or the
+assigning agent transfers custody.
 
 ## When a rule stops a command
 A rule can stop a command and name itself. Identify the protected action, governing
@@ -235,6 +232,7 @@ with `--as-user`.
 
 ## Report so the user can act
 Report the user outcome, actual availability, remaining commitments and material decisions.
+Identify the project and work in an unsolicited update so the user can place it.
 Use plain concise language and preserve conditions and evidence. Report completion against
 the bounded agreement and actual availability. State what an identifier means, not only its
 bare value. Record information now when it must survive the conversation.
@@ -297,3 +295,7 @@ does not justify a new rail. Ordinary work need not load an authoring procedure.
 Existing obligations remain with their incumbent holder until another accountable
 owner accepts the handoff. A new PO kernel does not release old delivery custody.
 Arrange delivery ownership before stopping necessary supervision of existing work.
+
+For locally elected procedures, load integration-targets before integrating onto
+a repository target and tightbeam-atc when inspecting or annotating the org display.
+These skill elections do not authorize integration or runtime changes by themselves.

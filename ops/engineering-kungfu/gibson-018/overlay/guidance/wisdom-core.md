@@ -13,3 +13,6 @@ Use the named home for the governing instruction; this index adds no separate ru
 When authoring guidance or proposing enforcement, use the relevant
 `tightbeam-guidance-authoring` or `tightbeam-law-minting` procedure. Their existence
 does not require a guidance or enforcement change after every incident.
+
+When an elected human-communication skill is available, load it to explain a
+consequential technical choice to a human. The operating manual owns routine reporting.

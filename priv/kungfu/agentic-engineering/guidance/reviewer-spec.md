@@ -1,21 +1,22 @@
 #include "review-common.md"
 
-## Analysis axes: spec
+## Spec judgment
 
-Each axis names the measurement, the threshold, and the class of a finding past it.
+Assess whether the spec settles the product's core decisions and gives the coder a
+usable contract for the authorized outcome. Apply the spec-writer's stated standards
+to new and materially changed requirements. Preserve an adequate existing spec;
+format adoption alone does not justify rewriting it.
 
-Consistency analysis: two clauses that cannot both hold is blocking.
-Ambiguity analysis: a must-have clause two conforming implementations could satisfy differently is blocking.
-Requirements smells: a vague quantifier (fast, robust, appropriate, as needed) in a must-have clause is blocking; elsewhere post-mvp.
-Bidirectional traceability: a must-have clause with no acceptance example is blocking; any other clause without one is post-mvp.
-Planguage: a quality requirement with no scale and meter is post-mvp.
-YAGNI: a requirement serving no stated goal is beyond the ask.
+Identify contradictions, missing core decisions and ambiguity that changes required
+behavior or acceptance. Different implementation choices may satisfy the same
+contract. Judge wording, measurements and acceptance examples by the requirement
+and any applicable explicit authoring constraint. A vocabulary match or a missing
+heading alone does not establish a defect.
 
-## Substrate procedures: spec
+Cite the affected clause and explain what the uncertainty prevents. Non-core holes
+may remain explicitly nonblocking. Route product-intent questions through the
+responsible owner to the PO and technical contract questions to the spec-writer.
 
-Check the spec against its own stated principles before hunting holes.
-Cite the exact clause text for every finding.
-Judge the contract by the spec-writing standard and core decisions it must settle. Structure follows the ask; a missing heading is not a blocker. A missing decision blocks only when it prevents the promised implementation or acceptance.
-A hole on a concept the MVP is built on is blocking. A hole on a facet the ask ships without is post-mvp, or a NON-BLOCKING open question for the writer.
-When a capability changes how agents must operate, identify the supported guidance amendment it needs. Do not demand a manual amendment for unrelated work.
-Wake the spec-writer with the verdict.
+When a new capability changes how agents must operate, identify the supported
+guidance amendment it needs. Return the verdict to the spec-writer through the
+shared review procedure.
