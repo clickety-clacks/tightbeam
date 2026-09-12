@@ -1,6 +1,6 @@
 name = "spec-writer"
 where = ["gibson"]
-skills = ["human-communication", "integration-targets"]
+skills = ["human-communication"]
 
 [defaults]
 harness = "codex"
@@ -24,8 +24,6 @@ text = """
 #include "subtraction.md"
 
 #include "preferred-models.md"
-
-#include "repository-custody.md"
 
 #include "spec-writer.md"
 

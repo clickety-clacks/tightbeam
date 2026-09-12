@@ -306,8 +306,12 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert loaded["product-owner"].skills == ["tightbeam-dispatching"]
 
-    for role <- ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator) do
-      refute Enum.any?(loaded[role].skills, &(&1 in ~w(worktree-session team-design feature-cycle work-tracking unblocking product-discovery spirit-review bug-provenance committing-and-pushing)))
+    for role <-
+          ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator) do
+      refute Enum.any?(
+               loaded[role].skills,
+               &(&1 in ~w(worktree-session team-design feature-cycle work-tracking unblocking product-discovery spirit-review bug-provenance committing-and-pushing))
+             )
     end
 
     assert Enum.all?(loaded, fn {_role, archetype} ->
@@ -357,6 +361,10 @@ defmodule Tightbeam.ArchetypesTest do
       )
 
     assert product_owner.skills == %{}
+    refute product_owner.guidance =~ "# Repository custody"
+    assert product_owner.guidance =~ "You retain\ncontent ownership"
+    assert product_owner.guidance =~ "publication through its repository custodian"
+
     assert product_owner.guidance =~
              "A historical verdict does not establish applicability to changed intent"
 
@@ -366,7 +374,9 @@ defmodule Tightbeam.ArchetypesTest do
     refute coder.guidance =~ "hands you a specific checkout"
 
     for role <- ~w(team-planner guidance-writer guidance-reviewer integrator) do
-      snapshot = Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
+      snapshot =
+        Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
+
       assert snapshot.skills == %{}
       assert snapshot.guidance =~ "# Operating tightbeam"
       refute Regex.match?(~r/^#include/m, snapshot.guidance)
@@ -385,15 +395,19 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert reviewer.guidance =~ "do not edit the work you review"
     refute writer.guidance =~ "do not edit the work you review"
+
     for snapshot <- [coder, product_owner, orchestrator, planner] do
       refute snapshot.guidance =~ "# Guidance and policy craft"
     end
+
     assert planner.guidance =~ "# Team planner"
     assert planner.guidance =~ "does not staff a team"
     refute planner.guidance =~ "# Delivery recovery"
     assert orchestrator.guidance =~ "# Delivery recovery"
     refute orchestrator.guidance =~ "# Team planner"
-    assert orchestrator.guidance =~ "Commission a spec and spec review when the work needs a new contract"
+
+    assert orchestrator.guidance =~
+             "Commission a spec and spec review when the work needs a new contract"
 
     refute File.regular?(
              Path.join([

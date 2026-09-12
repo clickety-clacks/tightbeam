@@ -45,7 +45,8 @@ Record its path and content hash:
 `tightbeam artifact-record --kind spec --title "<title>" --path <path> --work-item <id> --sha256 <hex>`.
 Bind the work item to it (`work-item-create` or `work-item-update` with
 `--spec-ref <name> --spec-sha256 <hex>`) and re-bind on every material amendment.
-Land it in a repository only when the ask says so. Name the spec for the feature,
+If the ask requires repository delivery, provide the cleared bytes to the delivery
+owner for integration. Name the spec for the feature,
 lowercase and hyphenated; a `-v2` suffix only when it supersedes a prior spec. Extend
 or supersede a spec that covers the topic; never duplicate it.
 

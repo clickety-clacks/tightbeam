@@ -263,7 +263,13 @@ defmodule Tightbeam.IdentityTest do
       refute Regex.match?(~r/^#include/m, review.guidance)
 
       assert review.skills == %{}
-      assert review.guidance =~ "# Repository custody"
+
+      if role == "reviewer-code" do
+        assert review.guidance =~ "# Repository custody"
+      else
+        refute review.guidance =~ "# Repository custody"
+      end
+
       refute review.guidance =~ "# Guidance and policy craft"
     end
 

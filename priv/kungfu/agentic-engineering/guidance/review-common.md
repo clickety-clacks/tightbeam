@@ -44,6 +44,5 @@ A producer may contest a blocker with its orchestrator. The orchestrator's
 `review-overreach` verdict is recorded on the producer assignment; consider that
 ruling and its evidence in a subsequent review.
 
-Use the shared repository custody for repository operations. Route a distinct policy
-composition question to guidance-reviewer through the delivery owner; technical
+Route a distinct policy composition question to guidance-reviewer through the delivery owner; technical
 review remains responsible for the code or specification it was assigned.

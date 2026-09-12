@@ -51,7 +51,7 @@
     {
       "path": "archetypes/reviewer-spec.toml",
       "before_sha256": "3c02b66b9736065619ea1638d7f28fbec79ab2298794a5cd7330459aae8f5f87",
-      "after_sha256": "0dee8e10dbed6095be58b8cae24eb9887606b39a2d46a2e9ad17cb7460957d31"
+      "after_sha256": "588145e250f94301afb4cbbfd77c25cd6766e8174f9b63946acc5cceb9f956a8"
     },
     {
       "path": "archetypes/reviewer.toml",
@@ -61,7 +61,7 @@
     {
       "path": "archetypes/spec-writer.toml",
       "before_sha256": "6197ae472bf231230ce650e7d717b4b96f5ec28b284f291b14974b13ba60716e",
-      "after_sha256": "a397bd08c492964ef571d69306a4ef440db4d906bc99d9496f19cf42eb24ffd5"
+      "after_sha256": "4af011fe7cbc83b65f5ea55500c40711953a5dc544842186dd2558308d7ed5d6"
     },
     {
       "path": "archetypes/team-planner.toml",
@@ -146,7 +146,7 @@
     {
       "path": "guidance/product-owner.md",
       "before_sha256": "8ae444578bcaf61913b09c9e5df7e6d04690395f9e2a055ecd526d68d3f60bee",
-      "after_sha256": "064728087f2aa143866251a144a3f177df2d407fefc1240c285fffe85c172336"
+      "after_sha256": "28b4c90d7bf6a4b5d28b75bd53c3322749981a332772e2984c471b51cfc162df"
     },
     {
       "path": "guidance/recon.md",
@@ -161,7 +161,7 @@
     {
       "path": "guidance/review-common.md",
       "before_sha256": "72b595ecd7480d1b1f22a5b985552e80ce20b6fa954261a78c71fc83b06ca5ea",
-      "after_sha256": "957569823e72ad403157ee932117926f5acf3c166f3b8d8d71a6428ae4d4e966"
+      "after_sha256": "dbc2437eaacc23279e805df2d671785b20c530b351d37cb3803a9e0af837cb0d"
     },
     {
       "path": "guidance/reviewer-code.md",
@@ -181,7 +181,7 @@
     {
       "path": "guidance/spec-writer.md",
       "before_sha256": "81bc5b50c0278576359c137d9a88fbf60c0699c44c5dd8a8e704d5aa610e58c3",
-      "after_sha256": "5274c0a314efbe98402ac145ac5001a9a68446a597388dc57879edc8eb42af03"
+      "after_sha256": "c80df58b6176d7309de541e837c9e07348423327077422cf832b7075d9e175ae"
     },
     {
       "path": "guidance/specs-home.md",
@@ -241,10 +241,6 @@
     {
       "path": "skills/integration-targets/SKILL.md",
       "sha256": "eeedd1a4148c9b855c6a56d3de73647a7438122b783828e80f168493b64c1d0a"
-    },
-    {
-      "path": "skills/human-communication/SKILL.md",
-      "sha256": "9c9419c27eb661680272017e1a41511dc8f39f793bc003af4dac00079da8b53b"
     }
   ],
   "compatibility_release": {

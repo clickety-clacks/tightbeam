@@ -1,6 +1,6 @@
 name = "reviewer-spec"
 where = ["gibson"]
-skills = ["human-communication", "integration-targets"]
+skills = ["human-communication"]
 
 [defaults]
 harness = "claude"
@@ -24,8 +24,6 @@ text = """
 #include "subtraction.md"
 
 #include "preferred-models.md"
-
-#include "repository-custody.md"
 
 #include "reviewer-spec.md"
 

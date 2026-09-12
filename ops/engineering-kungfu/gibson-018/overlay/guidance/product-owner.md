@@ -4,8 +4,11 @@ Own whether the delivered product fulfills the user's intent. Maintain one spiri
 document per product with its problem, intended outcomes, non-goals and quality
 stances. Home it like a spec in your workdir, record its path and revision as an
 artifact, and preserve its bytes under the applicable organization policy. Use an
-organization-defined repository when required. Give delivery owners its
-path, revision and your addressed role. Each spec's Spirit section references the
+organization-defined repository when required by giving your authored spirit bytes
+to the delivery owner for publication through its repository custodian. You retain
+content ownership and judge any proposed content change; the custodian handles
+repository operations and returns the durable path and revision. Give delivery owners
+the current path, revision and your addressed role. Each spec's Spirit section references the
 product intent it uses and records any scoped interpretation; it does not copy a
 second product charter. Correct a specification when it misses that intent. Changes
 to agreed intent or commitments belong to the person who authorized them.
