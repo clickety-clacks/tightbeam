@@ -2689,6 +2689,8 @@ defmodule Tightbeam.Gateway do
             session_key: turn.session_key
           })
         )
+
+        emit_identity_staleness_alarm(db)
       end
 
       outcome =
@@ -2783,6 +2785,8 @@ defmodule Tightbeam.Gateway do
                   session_key: turn.session_key
                 })
               )
+
+              emit_identity_staleness_alarm(db)
             end
 
             # The RECORD half of the substrate's obligation. `Ledger.finish_in_txn`
@@ -2921,8 +2925,112 @@ defmodule Tightbeam.Gateway do
         )
       end
 
+      emit_identity_staleness_alarm(db)
+
       :ok
     end
+  end
+
+  @doc false
+  def identity_staleness_alarm_for_test(db, now),
+    do: identity_staleness_alarm(db, now)
+
+  defp emit_identity_staleness_alarm(db) do
+    best_effort(fn -> identity_staleness_alarm(db, System.system_time(:millisecond)) end)
+  end
+
+  defp identity_staleness_alarm(db, now) do
+    case DB.transaction(db, fn txn -> identity_staleness_alarm_in_txn(txn, now) end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp identity_staleness_alarm_in_txn(txn, now) do
+    case Txn.q(
+           txn,
+           "SELECT item, updatedAt FROM admin_projection_versions " <>
+             "WHERE resource = 'identity' AND primaryKey = 'served'",
+           []
+         ) do
+      [[item, published_at]] ->
+        %{"liveRevision" => revision} = JSON.decode!(item)
+
+        [[late_count]] =
+          Txn.q(
+            txn,
+            """
+            SELECT COUNT(*)
+            FROM sessions AS session
+            WHERE session.state = 'active'
+              AND session.identityRevision IS NOT ?1
+              AND EXISTS (
+                SELECT 1 FROM turns AS turn
+                WHERE turn.sessionKey = session.sessionKey
+                  AND turn.startedAt >= ?2
+              )
+            """,
+            [revision, published_at]
+          )
+
+        maybe_schedule_identity_staleness_notice(txn, revision, late_count, now)
+
+      [] ->
+        :no_published_identity
+    end
+  end
+
+  defp maybe_schedule_identity_staleness_notice(_txn, _revision, 0, _now), do: :current
+
+  defp maybe_schedule_identity_staleness_notice(txn, revision, late_count, now) do
+    case identity_staleness_owner(txn) do
+      nil ->
+        :no_owner_surface
+
+      {owner, target} ->
+        epoch_day = div(now, 86_400_000)
+        digest = :crypto.hash(:sha256, "identity-staleness:#{revision}:#{epoch_day}")
+        wake_id = "w_" <> Base.encode16(digest, case: :lower)
+
+        case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId = ?1", [wake_id]) do
+          [] ->
+            Wakes.schedule_in_txn(txn, %{
+              wake_id: wake_id,
+              session_key: target,
+              owner_user_id: owner,
+              origin: "process:tightbeam",
+              prompt:
+                "Identity staleness: #{late_count} active " <>
+                  "#{if late_count == 1, do: "session is", else: "sessions are"} late for " <>
+                  "published revision #{revision}.",
+              due_at: now,
+              target_gate: 0
+            })
+
+            {:scheduled, late_count, revision}
+
+          [[1]] ->
+            :already_notified
+        end
+    end
+  end
+
+  defp identity_staleness_owner(txn) do
+    txn
+    |> Txn.q("SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId", [])
+    |> Enum.find_value(fn [owner] ->
+      target = Org.personal_session_key(owner)
+
+      case Txn.q(
+             txn,
+             "SELECT 1 FROM sessions WHERE sessionKey = ?1 AND ownerUserId = ?2 " <>
+               "AND state = 'active'",
+             [target, owner]
+           ) do
+        [[1]] -> {owner, target}
+        [] -> nil
+      end
+    end)
   end
 
   # Live progress for the typing indicator: relayed from ACP updates
