@@ -150,6 +150,12 @@ Related work is not automatically completed or revoked:
 - Harness-failure classification, computed liveness, environment probes, unrelated
   main-line work and release acceptance retain their existing ownership. Guidance
   references are reconciled here; that is not proof their runtime features are done.
+- The separate completion-family subjects retain their implementation history:
+  wi_809821f8 completion escalation, wi_c49c1e4a idle-worker disposition and
+  wi_f46d2e83 named deliverables. The recorded completion-escalation carry excluded
+  0.1.9 pending a line-specific migration contract. This branch preserves the
+  guidance duties without claiming those runtime mechanisms ship or their work is
+  superseded. Closed work-item states alone do not establish release delivery.
 - Standing integration accountability is preserved. Local release-line elections
   remain local instructions, with this branch explicitly targeting only 0.1.9.
 
@@ -213,7 +219,8 @@ the newer runtime behavior.
 | Morrow | Recovery guidance through 16f51c2; overlay at 89e3a40 | Accepted after compatibility discussion. Separate recovery and upgrade obligations remain. |
 | Kestrel | Firehose preservation and the two test changes at 0e64de6 | Accepted within those scopes. |
 | Release patrol | Coverage at 89e3a40 and the two test changes at 0e64de6 | Accepted within those scopes; release custody retained. |
-| Stall-watch, separate completion-family Fable | Consolidated branch, invitations repeated | No response yet. These requests remain open. |
+| Stall-watch | Consolidated branch and churn/recovery coverage | Responding again; concrete branch review requested and pending. |
+| Separate completion-family Fable | Completion, escalation and lifecycle subjects | Invitation undeliverable; no current local Subetha listener. No review acceptance claimed. |
 
 Mike clarified on 12 September that Parallax is uninvolved. Parallax is excluded
 from this review roster; no response or acceptance is required from that session.
