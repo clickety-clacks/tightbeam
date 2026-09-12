@@ -213,7 +213,10 @@ the newer runtime behavior.
 | Morrow | Recovery guidance through 16f51c2; overlay at 89e3a40 | Accepted after compatibility discussion. Separate recovery and upgrade obligations remain. |
 | Kestrel | Firehose preservation and the two test changes at 0e64de6 | Accepted within those scopes. |
 | Release patrol | Coverage at 89e3a40 and the two test changes at 0e64de6 | Accepted within those scopes; release custody retained. |
-| Stall-watch, Parallax, separate completion-family Fable | Consolidated branch, invitations repeated | No response yet. These requests remain open. |
+| Stall-watch, separate completion-family Fable | Consolidated branch, invitations repeated | No response yet. These requests remain open. |
+
+Mike clarified on 12 September that Parallax is uninvolved. Parallax is excluded
+from this review roster; no response or acceptance is required from that session.
 
 The canonical Elixir gate at 768efb1 passed formatting and ran 9 doctests and 2,246
 tests, with two failures and 11 skips. One failure came from a positive archive
