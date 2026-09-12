@@ -503,6 +503,58 @@ defmodule Tightbeam.FirehoseColdRestartTest do
     assert Tightbeam.HarnessProcessCensus.capture_for_root(plan.base).count == 0
   end
 
+  @tag :tmp_dir
+  test "cleanup rejects a surviving root process even after the gateway Port is gone", %{
+    tmp_dir: tmp
+  } do
+    root = Path.expand(tmp)
+    script = Path.join(root, "held-probe.sh")
+    File.write!(script, "printf 'ready\\n'\nIFS= read -r release\nexit 0\n")
+
+    probe =
+      Port.open({:spawn_executable, ~c"/bin/sh"}, [
+        :binary,
+        :exit_status,
+        args: [String.to_charlist(script)]
+      ])
+
+    try do
+      assert_receive {^probe, {:data, "ready\n"}}, 2_000
+      {:os_pid, probe_pid} = Port.info(probe, :os_pid)
+
+      finished =
+        Port.open({:spawn_executable, ~c"/bin/sh"}, [
+          :exit_status,
+          args: [~c"-c", ~c"exit 0"]
+        ])
+
+      assert_receive {^finished, {:exit_status, 0}}, 2_000
+      assert Port.info(finished) == nil
+
+      error =
+        assert_raise ExUnit.AssertionError, fn ->
+          cleanup!(finished, %{base: root}, "census-proof")
+        end
+
+      assert error.message =~ "census cleanup deadline"
+      assert error.message =~ "harness fixture processes: 1"
+      assert error.message =~ "pid=#{probe_pid} "
+      assert error.message =~ script
+
+      # The deadline must neither signal the survivor nor report it as gone.
+      assert Port.info(probe, :os_pid) == {:os_pid, probe_pid}
+      assert Port.command(probe, "release\n")
+      assert_receive {^probe, {:exit_status, 0}}, 2_000
+      assert cleanup!(finished, %{base: root}, "census-proof") == :ok
+      assert Tightbeam.HarnessProcessCensus.capture_for_root(root).count == 0
+    after
+      if Port.info(probe) do
+        Port.command(probe, "release\n")
+        assert_receive {^probe, {:exit_status, 0}}, 2_000
+      end
+    end
+  end
+
   defp snapshot!(plan, port, device) do
     %{"result" => %{"workItems" => items}} = dispatch!(plan, port, device, "work-item-list", %{})
     assert length(items) == length(Enum.uniq_by(items, & &1["id"]))
@@ -590,6 +642,28 @@ defmodule Tightbeam.FirehoseColdRestartTest do
         status ->
           assert is_integer(status)
       end
+    end
+
+    # Port exit need not coincide with the end of a fixture version probe.
+    # Wait on the actual census even when the gateway Port is already gone;
+    # a persistent survivor still fails, with its identity, at the deadline.
+    await_census_zero!(plan.base, System.monotonic_time(:millisecond) + 2_000)
+  end
+
+  defp await_census_zero!(root, deadline) do
+    census = Tightbeam.HarnessProcessCensus.capture_for_root(root)
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    cond do
+      census.count == 0 ->
+        :ok
+
+      remaining <= 0 ->
+        flunk("census cleanup deadline: " <> Tightbeam.HarnessProcessCensus.format(census))
+
+      true ->
+        Process.sleep(min(25, remaining))
+        await_census_zero!(root, deadline)
     end
   end
 
