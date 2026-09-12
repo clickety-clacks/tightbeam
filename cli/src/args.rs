@@ -238,6 +238,14 @@ pub enum Command {
         turn_seq: Option<String>,
         idempotency_key: String,
     },
+    AssignmentCommitRefCorrect {
+        identity: Identity,
+        assignment_id: String,
+        commit_refs: Vec<serde_json::Value>,
+        reason: String,
+        evidence_artifact_id: String,
+        idempotency_key: String,
+    },
     WorkItemCreate {
         identity: Identity,
         title: String,
@@ -700,6 +708,13 @@ COMMANDS:
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
+  assignment-commitref-correct <assignmentId>
+      --commit-refs '[{"repo":"host:/repo","remote":"<origin>",
+                       "ref":"refs/heads/main","commit":"<sha>"}]'
+      --evidence <artifactId> --reason "..." --key <idempotencyKey>
+      Append one canonical commitRef correction to a CLOSED historical
+      assignment. This does not create an attest, change the assignment outcome,
+      or rewrite lifecycle history.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
       [--artifact <artifactId> --sha256 <hash>]
@@ -1860,6 +1875,28 @@ fn parse_with_optional_catalog(
                 idempotency_key: key.expect("checked above"),
             })
         }
+        "assignment-commitref-correct" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam assignment-commitref-correct <assignmentId> --commit-refs <json> --evidence <artifactId> --reason <text> --key <idempotencyKey>".to_owned());
+            }
+            let commit_refs = nonempty(flags, "commit-refs")
+                .ok_or_else(|| "--commit-refs is required".to_owned())
+                .and_then(|encoded| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
+                        .map_err(|_| "--commit-refs must be a JSON array".to_owned())
+                })?;
+            Ok(Command::AssignmentCommitRefCorrect {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                commit_refs,
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+                evidence_artifact_id: nonempty(flags, "evidence")
+                    .ok_or_else(|| "--evidence is required".to_owned())?,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+            })
+        }
         "work-item-create" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam work-item-create --title <title> [--spec-ref <name> --spec-sha256 <hex>]".to_owned());
@@ -2331,7 +2368,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -3375,6 +3412,7 @@ mod tests {
                 "retire",
                 "session-reparent",
                 "repair-assignment",
+                "assignment-commitref-correct",
                 "revoke-assignment",
                 "reopen-assignment",
                 "spawn",
@@ -4035,10 +4073,78 @@ mod tests {
     }
 
     #[test]
+    fn commitref_correction_requires_every_audit_and_proof_field() {
+        let usage = "usage: tightbeam assignment-commitref-correct <assignmentId> --commit-refs <json> --evidence <artifactId> --reason <text> --key <idempotencyKey>";
+
+        assert_eq!(
+            parse(strings(&[
+                "assignment-commitref-correct",
+                "--as-user",
+                "flynn"
+            ])),
+            Err(usage.to_owned())
+        );
+
+        for missing in ["commit-refs", "evidence", "reason", "key"] {
+            let mut args = vec![
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "historical backfill",
+                "--key",
+                "backfill-1",
+                "--as-user",
+                "flynn",
+            ];
+            let flag = format!("--{missing}");
+            let index = args.iter().position(|value| *value == flag).unwrap();
+            args.drain(index..=index + 1);
+            assert!(
+                parse(strings(&args)).is_err(),
+                "missing {missing} must refuse"
+            );
+        }
+
+        assert!(matches!(
+            parse(strings(&[
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "historical backfill",
+                "--key",
+                "backfill-1",
+                "--as-user",
+                "flynn",
+            ]))
+            .unwrap(),
+            Command::AssignmentCommitRefCorrect {
+                assignment_id,
+                evidence_artifact_id,
+                reason,
+                idempotency_key,
+                commit_refs,
+                ..
+            } if assignment_id == "asg_1"
+                && evidence_artifact_id == "art_1"
+                && reason == "historical backfill"
+                && idempotency_key == "backfill-1"
+                && commit_refs.len() == 1
+        ));
+    }
+
+    #[test]
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned()),
         );
     }
 

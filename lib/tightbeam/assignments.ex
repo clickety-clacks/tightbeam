@@ -629,7 +629,13 @@ defmodule Tightbeam.Assignments do
 
     Enum.map(rows, fn row ->
       assignment = assignment(row)
-      Map.put(assignment, :files, declared_files(db, assignment.id))
+
+      assignment
+      |> Map.put(:files, declared_files(db, assignment.id))
+      |> Map.put(
+        :commitRefCorrections,
+        Tightbeam.AssignmentCommitRefCorrections.list(db, assignment.id)
+      )
     end)
   end
 
@@ -1584,8 +1590,16 @@ defmodule Tightbeam.Assignments do
 
     with :ok <- principal_allowed(call.principal, "assignment-get") do
       case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
-        {:ok, [row]} -> Map.put(assignment(row), :reopenings, list_reopenings(db, assignment_id))
-        {:ok, []} -> error("not_found", "unknown assignment: #{assignment_id}")
+        {:ok, [row]} ->
+          assignment(row)
+          |> Map.put(:reopenings, list_reopenings(db, assignment_id))
+          |> Map.put(
+            :commitRefCorrections,
+            Tightbeam.AssignmentCommitRefCorrections.list(db, assignment_id)
+          )
+
+        {:ok, []} ->
+          error("not_found", "unknown assignment: #{assignment_id}")
       end
     end
   end

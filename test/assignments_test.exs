@@ -1667,12 +1667,16 @@ defmodule Tightbeam.AssignmentsTest do
        ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "fetch me"))
 
+    # `assignment-get` carries every field `assign` returned, plus an empty
+    # `reopenings` and canonical correction lists for a card with no repair history.
     assert handle(
              ctx,
              "assignment-get",
              assignment_get_call({:session, "other-session"}, assignment.id)
            ) ==
-             Map.put(assignment, :reopenings, [])
+             assignment
+             |> Map.put(:reopenings, [])
+             |> Map.put(:commitRefCorrections, [])
 
     assert handle(
              ctx,

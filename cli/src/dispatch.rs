@@ -629,6 +629,28 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "repair-assignment", vec![], params))
         }
+        Command::AssignmentCommitRefCorrect {
+            identity,
+            assignment_id,
+            commit_refs,
+            reason,
+            evidence_artifact_id,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "assignment-commitref-correct",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                format!(
+                    "\"commitRefs\":{}",
+                    serde_json::to_string(commit_refs).expect("commit refs are JSON serializable")
+                ),
+                string_field("reason", reason),
+                string_field("evidenceArtifactId", evidence_artifact_id),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
         Command::WorkItemCreate {
             identity,
             title,
@@ -1791,6 +1813,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
+        | Command::AssignmentCommitRefCorrect { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
@@ -2733,6 +2756,23 @@ mod tests {
                 "parent"
             ]),
             r#"{"as":"parent","verb":"reopen-assignment","params":{"assignmentId":"asg_1","reason":"continue work"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "canonical historical backfill",
+                "--key",
+                "backfill-1",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"assignment-commitref-correct","params":{"assignmentId":"asg_1","commitRefs":[{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","remote":"git@example/repo","repo":"gibson:/repo"}],"reason":"canonical historical backfill","evidenceArtifactId":"art_1","idempotencyKey":"backfill-1"}}"#
         );
         assert_eq!(
             body(&[

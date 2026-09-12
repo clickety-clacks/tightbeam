@@ -25,6 +25,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
     Tightbeam.CommandExecutions,
+    Tightbeam.AssignmentCommitRefCorrections,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
     Tightbeam.RecurrenceSuppression,
@@ -2068,6 +2069,11 @@ defmodule Tightbeam.Schema do
   defp bootstrap_module(db, module, false)
        when module in [Tightbeam.Org, Tightbeam.Escalation, Tightbeam.Artifacts],
        do: module.ensure_r1_schema(db)
+
+  # The correction table is additive current-build storage. Keep its DDL out
+  # of the pre-R1 bootstrap so a refused R1 migration preserves the exact O2
+  # snapshot; the final schema pass installs it after the migration succeeds.
+  defp bootstrap_module(_db, Tightbeam.AssignmentCommitRefCorrections, false), do: :ok
 
   defp bootstrap_module(db, Tightbeam.AdminProjection, _current?),
     do: Tightbeam.AdminProjection.ensure_storage(db)
