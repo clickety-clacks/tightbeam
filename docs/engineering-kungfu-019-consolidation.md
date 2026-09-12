@@ -556,8 +556,11 @@ holds the interim product-intent address while the existing PO is stopped. New
 workers and reviews belong under the delivery orchestrator. `att_f7ac8afa` records
 the adopted arrangement, not a rewritten historical parent edge. `att_e2d7bb52`
 and `att_cb433c5c` record bounded guidance supersession and preserve runtime work.
-The external consolidation lead retains the separate .9 reparent implementation
-continuation. No duplicate implementation was delegated to the new subtree.
+The delivery orchestrator accepted the separate reparent implementation continuation
+in `att_0ca30d31`. Its single implementation item `wi_38204834` preserves the closed
+specification `wi_a78f6a03` and reviewed foundation; `att_c174a5eb` records an
+Astra/high integrator on `asg_f99b5d5d`. The external lead retains the consolidation
+checkout. Reparenting remains implementation work, not an installed capability.
 
 Fable accepted the explicit PO `operator-ask` change at `a976fea`/`a1615c0` in
 message `493a0738-c4e6-49de-8e31-61fcf5a544a7`; Morrow accepted it in
