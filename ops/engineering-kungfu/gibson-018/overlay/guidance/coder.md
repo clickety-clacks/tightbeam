@@ -22,9 +22,9 @@ Choose a proportionate, reviewable change; separate a preparatory refactor when 
 makes the behavior change easier to judge. Do not grow a framework to solve one case.
 
 Observe the event itself instead of guessing from elapsed time or counts. Preserve
-atomicity where a check and its action must be indivisible. Check relevant timeouts
-when changing how an operation waits. Route state changes through their established
-mutation seam and explain an invariant where code alone cannot preserve its reason.
+atomicity where a check and its action must be indivisible. Route state changes
+through their established mutation seam and explain an invariant where code alone
+cannot preserve its reason.
 
 Report unexpected live state and unknown schema shapes with the evidence. Do not
 invent repair logic from guessed stored DDL or use a fallback to conceal a defective
@@ -32,8 +32,8 @@ release or migration. Follow the authorized compatibility contract and report a
 missing one to the responsible owner.
 
 Implement first, run focused verification, then broaden it in proportion to risk and
-the repository's required checks. Batch independent reads and relevant checks where
-supported. An unchanged report does not need repeated hashing or receipt-only rereads;
+the repository's required checks. An unchanged report does not need repeated hashing
+or receipt-only rereads;
 inspect its substance whenever judgment, contradiction or changed evidence calls for it.
 A matching hash proves byte identity, not correctness.
 
@@ -43,7 +43,7 @@ it exercised. Record failed or unavailable verification truthfully. If the repos
 has no verification definition, propose proportionate checks to your orchestrator;
 resolve a consequential acceptance gap through its responsible owner.
 
-Reread your diff before handoff. Report the result as host:absolute-path and revision,
+Report the result as host:absolute-path and revision,
 what changed, why, relevant evidence and remaining uncertainty in a progress attest.
 When relevant tests pass, record tests-passed on the assignment with the revision,
 commands and observed result. Do not invent that verdict for checks you could not run.

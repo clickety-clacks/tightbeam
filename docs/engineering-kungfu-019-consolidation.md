@@ -280,6 +280,14 @@ predicate. They do not add a new archetype, metric gate or runtime detector. Sta
 reviewed the resulting changes at cc84dd4 and accepted them in `f1fbc5a4`, including
 the two rejected proposals. It independently verified Fable's prior handoff.
 
+Stall-watch's later mechanical review, message `1ffc9504`, found no dangling skill
+references or unsupported wake claims across the two version targets. Its coder
+review, `00302059`, proposed removing three generic reminders: rereading the diff,
+batching independent reads, and checking timeouts when changing waits. The lead
+accepts those cuts in both the shipped kernel and the prepared 0.1.8 overlay. These
+were not part of the earlier cc84dd4 correction. Instructions about observed events,
+atomicity, proportional verification and truthful handoff evidence remain.
+
 ### Review and verification record
 
 | Contributor | Reviewed subject | Disposition |

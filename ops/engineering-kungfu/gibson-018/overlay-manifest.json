@@ -51,7 +51,7 @@
     {
       "path": "guidance/coder.md",
       "before_sha256": "73fc1943e78e1af3a9f5dd315fc07d2ebddf1ebda8f96a8cced50c8b018bfac6",
-      "after_sha256": "f1596857417a289d602f18865f5759efd21db2557729fc45090a04cfb02b1026"
+      "after_sha256": "62fdda3898f78ea0a02ea022e64bc2f987e4c76c333fd01d74550fdb4a464e7c"
     },
     {
       "path": "guidance/default.md",
