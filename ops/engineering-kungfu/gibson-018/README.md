@@ -90,11 +90,15 @@ Keep the five sessions identified by `att_f92abeaf-6b45-4ef3-bb49-810e05eca002`
 out of routing, wakes, tuning and refresh until their recovery owner resolves the
 queued-turn replay risk. This includes Main. Do not use Main as a fallback worker.
 
-Keep the release integrator under `att_5f95e542-e34a-46bf-98a6-5195f2a0b4be`
-parked with its acceptance context and owned checkout. Its separate release and
-upgrade acceptance responsibilities are not superseded by this guidance branch.
-The recorded concern about losing private custody is an operational constraint;
-the tune implementation itself preserves the workdir when switching harnesses.
+The recovery owner lifted the release integrator's former park in
+`att_1ca8c736-abe0-451a-90cc-645daaf24f8d` and resumed its existing acceptance
+assignment. Readback on 12 September at 02:42 UTC shows Claude Opus 4.8, high effort,
+on the Claude harness. Another owner made that change. Preserve the active release
+and upgrade acceptance responsibilities, workdir and source custody; route this
+branch's coverage through the release owner and defer further retargeting until an
+appropriate acceptance boundary. The earlier custody-loss premise was withdrawn:
+a harness switch preserves the workdir and work graph while replacing engine context.
+The Firehose publication hold remains in force.
 
 The recorded disposition in `att_acbbd933-d89a-4cb2-a14a-a20c25722c6c` also
 parks PO: Tightbeam under its C5 stop and preserves the existing restoration-attempt

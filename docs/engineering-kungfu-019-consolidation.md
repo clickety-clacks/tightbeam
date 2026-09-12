@@ -269,24 +269,28 @@ No live modification is claimed or performed by this branch.
 
 These edits preserve attributable independent review and the existing completion
 predicate. They do not add a new archetype, metric gate or runtime detector. Stall-watch
-must review the resulting changes and may challenge these adjudications; its initial
-review is not acceptance of edits it has not read.
+reviewed the resulting changes at cc84dd4 and accepted them in `f1fbc5a4`, including
+the two rejected proposals. It independently verified Fable's prior handoff.
 
 ### Review and verification record
 
 | Contributor | Reviewed subject | Disposition |
 | --- | --- | --- |
-| Rowan | PO/shared composition through 16f51c2; compatible overlay at 89e3a40 | Accepted after artifact-preservation, spirit-impact and include-expansion corrections. |
-| Fable, spec-writer author | Spec and shared composition through 16f51c2; overlay at 89e3a40 | Accepted. Competing implementation stood down; reviewer remains available. |
-| Orchestrator editor | Orchestration and authoring composition through 16f51c2 | Accepted within that scope. No overlay or runtime acceptance claimed. |
-| Morrow | Recovery guidance through 16f51c2; overlay at 89e3a40 | Accepted after compatibility discussion. Separate recovery and upgrade obligations remain. |
+| Rowan | PO/shared composition through cc84dd4; compatible overlay at 89e3a40 | Accepted, latest message c8a071d8. No independent build-1337 runtime verification claimed. |
+| Fable, spec-writer author | Spec and shared composition through cc84dd4; overlay at 89e3a40 | Accepted, latest message 82824c0f. Competing implementation stood down. |
+| Orchestrator editor | Orchestration and authoring composition through cc84dd4 | Accepted in b5181570. No overlay or runtime acceptance claimed. |
+| Morrow | Recovery guidance through cc84dd4; overlay at 89e3a40 | Accepted in ba422b4b, nothing further in 7eef68db. Separate recovery and upgrade obligations remain. |
 | Kestrel | Firehose preservation and the two test changes at 0e64de6 | Accepted within those scopes. |
 | Release patrol | Coverage at 89e3a40 and the two test changes at 0e64de6 | Accepted within those scopes; release custody retained. |
-| Stall-watch | Consolidated branch and churn/recovery coverage | All three review parts adjudicated. Accepted corrections implemented; custody concern resolved from prior handoff. Follow-up review of the resulting changes pending. |
+| Stall-watch | Consolidated branch and churn/recovery coverage through cc84dd4 | Accepted in f1fbc5a4 after reviewing the fixes and adjudications. Review complete. |
 | Separate completion-family Fable | Completion, escalation and lifecycle subjects | Invitation undeliverable; no current local Subetha listener. No review acceptance claimed. |
 
 Mike clarified on 12 September that Parallax is uninvolved. Parallax is excluded
 from this review roster; no response or acceptance is required from that session.
+
+Kestrel's and patrol's runtime and test subjects are byte-identical between 0e64de6
+and cc84dd4. Their prior bounded acceptance still applies to those files. It is not
+fresh acceptance of the later guidance text, which its affected reviewers examined.
 
 The canonical Elixir gate at 768efb1 passed formatting and ran 9 doctests and 2,246
 tests, with two failures and 11 skips. One failure came from a positive archive
@@ -303,6 +307,12 @@ validation passed. The cleanup failure reproduced, identifying the fixture's
 `codex --version` child after teardown. A rate-limit park/resume test also missed its
 500ms runner notification; that single case passed on a subsequent focused run.
 Neither passing focused run erases the full-suite failures.
+
+At cc84dd4, formatting and 134 focused identity, archetype, skill, rule and rendering
+tests passed. Packaging passed its version and archive-purity checks. The final local
+overlay passed all 18 role/harness compositions and validation of three rules against
+installed source v0.1.8+1337. These checks cover the changed guidance and compatibility
+target. They do not replace or reverse the recorded full-suite result.
 
 Kestrel identified an existing process-lifetime risk in the bounded CLI probe. The
 lead retained it as a hypothesis for this specimen because the log does not prove
@@ -328,8 +338,10 @@ Repair actual operational custody with supported handoffs, not by relabeling rol
 A role rebind does not rewrite spawning ancestry or transfer open assignments.
 
 Supersession is scoped to the engineering-guidance deliverable. An umbrella work item
-may also contain retained release or upgrade acceptance, including the parked release
-integrator's work. Do not close that umbrella or retire its owners merely because
+may also contain retained release or upgrade acceptance, including the release
+integrator's work. Its owner has since lifted the old park and resumed acceptance
+under `att_1ca8c736`; that change belongs to the recovery owner, not this consolidation.
+Do not close that umbrella or retire its owners merely because
 this branch replaces the guidance implementation. Record the replaced scope and keep
 every remaining obligation accountable.
 
