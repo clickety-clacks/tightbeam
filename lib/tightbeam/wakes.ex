@@ -4448,6 +4448,13 @@ defmodule Tightbeam.Wakes do
 
   defp dispose_closed_remedy(_db, _wake), do: false
 
+  defp closed_remedy_assignment(
+         _db,
+         %{assignment_id: assignment_id, origin: "remedy:completion-requires-review"}
+       )
+       when is_binary(assignment_id),
+       do: :not_closed
+
   defp closed_remedy_assignment(db, %{assignment_id: assignment_id})
        when is_binary(assignment_id) do
     case DB.query(db, "SELECT state FROM assignments WHERE id = ?1", [assignment_id]) do
@@ -4478,6 +4485,7 @@ defmodule Tightbeam.Wakes do
                 'rail-rewake:' || episode.statute || ':' || episode.subject || ':'
             )
            WHERE ?2 = 'remedy:' || episode.statute
+             AND episode.statute != 'completion-requires-review'
              AND assignment.state = 'closed'
            ORDER BY episode.openedAt DESC, episode.subject
            LIMIT 1

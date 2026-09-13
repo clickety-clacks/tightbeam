@@ -524,6 +524,7 @@ defmodule Tightbeam.RailRemedy do
         SELECT wakeId
         FROM wakes
         WHERE state = 'pending' AND origin LIKE 'remedy:%'
+          AND origin != 'remedy:completion-requires-review'
           AND (assignmentId = ?1 OR (?2 IS NOT NULL AND wakeId = ?2))
         ORDER BY wakeId
         """,
@@ -543,7 +544,7 @@ defmodule Tightbeam.RailRemedy do
       """
       UPDATE rail_remedy_episodes
       SET status = 'closed', closedAt = ?2
-      WHERE subject = ?1 AND status != 'closed'
+      WHERE subject = ?1 AND statute != 'completion-requires-review' AND status != 'closed'
       """,
       [assignment_id, now()]
     )

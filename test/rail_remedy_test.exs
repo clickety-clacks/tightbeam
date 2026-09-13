@@ -1030,6 +1030,103 @@ defmodule Tightbeam.RailRemedyTest do
              DB.query(ctx.db, "SELECT count(*) FROM wakes WHERE assignmentId=?1", [assignment.id])
   end
 
+  test "assignment terminal handlers retain protocol review custody", ctx do
+    for terminal <- [:completion, :revocation] do
+      assignment = notice_assignment(ctx, "terminal protocol #{terminal}", "policy")
+      %{producer_id: root} = fire_review_notice(ctx, assignment)
+      mark_notice_turn(ctx.db, assignment.id, root, "failed_unknown")
+
+      episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+      reassessment_id = episode.notice_state["reassessment"]["wakeId"]
+
+      case terminal do
+        :completion ->
+          assert %{assignment: %{state: "closed"}} =
+                   Assignments.__handle__(ctx.db, "attest", completion_call(assignment.id))
+
+        :revocation ->
+          assert %{state: "closed"} =
+                   Assignments.__handle__(ctx.db, "revoke-assignment", %{
+                     verb: "revoke-assignment",
+                     origin: "agent:#{ctx.holder.session_key}",
+                     principal: {:session, ctx.holder.session_key},
+                     session_key: nil,
+                     params: %{assignment_id: assignment.id, reason: "test disposition"}
+                   })
+      end
+
+      assert %{status: "live", notice_state: state} =
+               RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+
+      assert state["reassessment"]["wakeId"] == reassessment_id
+
+      assert %{state: "pending", consumer: "review_remedy_reconcile"} =
+               Wakes.get(ctx.db, reassessment_id)
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1",
+                 [reassessment_id]
+               )
+    end
+  end
+
+  test "scheduler precheck delivers protocol reconciliation after terminal row", ctx do
+    assignment = notice_assignment(ctx, "scheduler protocol custody")
+    %{producer_id: root} = fire_review_notice(ctx, assignment)
+    mark_notice_turn(ctx.db, assignment.id, root, "failed_unknown")
+
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    reassessment_id = episode.notice_state["reassessment"]["wakeId"]
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [reassessment_id])
+
+    :ok = persist_terminal_race!(ctx.db, assignment.id, System.system_time(:millisecond))
+
+    test_pid = self()
+    scheduler = :"protocol_precheck_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Wakes,
+         name: scheduler,
+         db: ctx.db,
+         tick_ms: 60_000,
+         deliver: fn _wake -> flunk("protocol wake was diverted to prompt delivery") end,
+         internal_consumers: %{
+           "review_remedy_reconcile" => fn wake ->
+             send(test_pid, {:review_reconcile_delivered, wake.wake_id})
+             RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, wake)
+           end
+         }},
+        id: scheduler
+      )
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_received {:review_reconcile_delivered, ^reassessment_id}
+
+    assert %{state: "fired", consumer: "review_remedy_reconcile"} =
+             Wakes.get(ctx.db, reassessment_id)
+
+    tracking = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    assert tracking.status == "live"
+    assert tracking.notice_state["need"]["state"] == "terminal"
+
+    assert [%{"wakeId" => recovery, "purpose" => "effects-reconcile"}] =
+             tracking.notice_state["recoveries"]
+
+    next_reassessment = tracking.notice_state["reassessment"]["wakeId"]
+
+    assert %{state: "pending", consumer: "review_remedy_reconcile", assignment_id: id} =
+             Wakes.get(ctx.db, next_reassessment)
+
+    assert is_nil(id)
+    assert Wakes.get(ctx.db, recovery).state == "pending"
+  end
+
   test "terminal producer tracks failed effects recovery to visible exhaustion", ctx do
     assignment = notice_assignment(ctx, "terminal unknown recovery")
     %{producer_id: root} = fire_review_notice(ctx, assignment)
