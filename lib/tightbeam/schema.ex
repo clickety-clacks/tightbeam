@@ -2071,9 +2071,9 @@ defmodule Tightbeam.Schema do
        do: module.ensure_r1_schema(db)
 
   # The correction table is additive current-build storage. Keep its DDL out
-  # of the pre-R1 bootstrap so a refused R1 migration preserves the exact O2
-  # snapshot; the final schema pass installs it after the migration succeeds.
-  defp bootstrap_module(_db, Tightbeam.AssignmentCommitRefCorrections, false), do: :ok
+  # of the bootstrap pass so a refused migration preserves the exact
+  # predecessor snapshot; the final schema pass installs it after migrations.
+  defp bootstrap_module(_db, Tightbeam.AssignmentCommitRefCorrections, _current?), do: :ok
 
   defp bootstrap_module(db, Tightbeam.AdminProjection, _current?),
     do: Tightbeam.AdminProjection.ensure_storage(db)
