@@ -15,6 +15,7 @@ defmodule Tightbeam.Assignments do
     Org,
     Placement,
     Projection,
+    RailRemedy,
     Supervision,
     Wakes
   }
@@ -536,14 +537,18 @@ defmodule Tightbeam.Assignments do
         requester_id: "tightbeam:retirement"
       })
 
-      EffortCheckin.cancel_in_txn(
-        txn,
-        assignment_id,
+      disposition =
         assignment_disposition_command(
           assignment_id,
           "tightbeam:retirement",
           liveness_trigger
-        ),
+        )
+
+      RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+      EffortCheckin.cancel_in_txn(
+        txn,
+        assignment_id,
+        disposition,
         %{verb: "retire", principal: principal}
       )
 
@@ -2140,14 +2145,18 @@ defmodule Tightbeam.Assignments do
                   requester_id: "tightbeam:assignments"
                 })
 
-                EffortCheckin.cancel_in_txn(
-                  txn,
-                  assignment_id,
+                disposition =
                   assignment_disposition_command(
                     assignment_id,
                     "tightbeam:assignments",
                     liveness_trigger
-                  ),
+                  )
+
+                RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+                EffortCheckin.cancel_in_txn(
+                  txn,
+                  assignment_id,
+                  disposition,
                   %{verb: "attest", principal: principal_id(call.principal)}
                 )
 
@@ -2416,14 +2425,18 @@ defmodule Tightbeam.Assignments do
                 requester_id: "tightbeam:assignments"
               })
 
-              EffortCheckin.cancel_in_txn(
-                txn,
-                assignment_id,
+              disposition =
                 assignment_disposition_command(
                   assignment_id,
                   "tightbeam:assignments",
                   liveness_trigger
-                ),
+                )
+
+              RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+              EffortCheckin.cancel_in_txn(
+                txn,
+                assignment_id,
+                disposition,
                 %{verb: "revoke-assignment", principal: principal_id(call.principal)}
               )
 
