@@ -10,6 +10,22 @@ import sys
 import time
 
 
+WATCH_SECONDS = 900
+LIFECYCLE_MARKERS = {
+    "native-lock-ready": re.compile(r"^native-lock-ready$", re.MULTILINE),
+    "native-lock-kill-result": re.compile(r"^native-lock-kill-result: \{", re.MULTILINE),
+    "native-lock-sigkill": re.compile(r"^native-lock-sigkill: ok$", re.MULTILINE),
+    "native-lock-cleanup-exit": re.compile(
+        r"^native-lock-cleanup-exit: [0-9]+$", re.MULTILINE
+    ),
+}
+THREAD_RE = re.compile(r"^\s*(?:\* )?thread #([0-9]+)\b")
+FRAME_RE = re.compile(
+    r"^\s*(?:\* )?frame #([0-9]+):\s+0x[0-9A-Fa-f]+\s+([^`\r\n]+)`([^\s\r\n]+)"
+    r"(?:\s+\+\s+(0x[0-9A-Fa-f]+|[0-9]+))?"
+)
+
+
 def publish(directory, name, value):
     pending = directory / (name + ".pending")
     with pending.open("x", encoding="utf-8") as stream:
@@ -29,6 +45,147 @@ def command(argv):
     if result.returncode:
         raise RuntimeError("diagnostic facility unavailable: " + argv[0])
     return result.stdout.strip()
+
+
+def scan_lifecycle(log, seen):
+    if log.is_symlink() or not log.is_file() or log.stat().st_size > 8_000_000:
+        return
+    try:
+        text = log.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    observed = int(time.time() * 1000)
+    for name, marker in LIFECYCLE_MARKERS.items():
+        if name not in seen and marker.search(text):
+            seen[name] = observed
+
+
+def parse_backtrace(text):
+    thread = None
+    frames = []
+    for line in text.splitlines():
+        if thread is None:
+            match = THREAD_RE.match(line)
+            if match:
+                thread = int(match.group(1))
+        match = FRAME_RE.match(line)
+        if not match or match.group(4) is None:
+            continue
+        module = Path(match.group(2).strip()).name
+        symbol = match.group(3)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", module):
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_.$?~:+<>,()\[\]-]+", symbol):
+            continue
+        frames.append(
+            {
+                "frame": int(match.group(1)),
+                "module": module,
+                "symbol": symbol,
+                "offset": int(match.group(4), 0),
+            }
+        )
+        if len(frames) == 32:
+            break
+    return thread, frames
+
+
+def watch(directory, candidate):
+    """Attach once to the owned test VM and publish only a sanitized backtrace."""
+    result = {
+        "schema": "tightbeam-darwin-backtrace/v1",
+        "candidate": candidate,
+        "status": "watcher-started",
+        "watcherStartedAtMs": int(time.time() * 1000),
+        "lifecycleObservedAtMs": {},
+    }
+    raw_path = directory / "backtrace.raw"
+    log = directory / "full.log"
+    seen = result["lifecycleObservedAtMs"]
+
+    try:
+        runtime = read_json(directory / "runtime.json")
+        if runtime.get("candidate") != candidate:
+            raise ValueError("candidate mismatch")
+        debugger = runtime.get("debuggerPath")
+        if (
+            not isinstance(debugger, str)
+            or Path(debugger).name != "lldb"
+            or not Path(debugger).is_file()
+        ):
+            result["status"] = "debugger-unavailable"
+            return publish(directory, "backtrace.json", result)
+
+        deadline = time.monotonic() + WATCH_SECONDS
+        receipt = None
+        while time.monotonic() < deadline:
+            scan_lifecycle(log, seen)
+            try:
+                receipt = read_json(directory / "vm.json")
+                if receipt.get("candidate") != candidate:
+                    raise ValueError("candidate mismatch")
+                if type(receipt.get("pid")) is not int or receipt["pid"] <= 0:
+                    raise ValueError("invalid PID")
+                break
+            except (FileNotFoundError, OSError, ValueError, KeyError, TypeError):
+                time.sleep(0.1)
+        if receipt is None:
+            result["status"] = "vm-receipt-unavailable"
+            return publish(directory, "backtrace.json", result)
+
+        pid = receipt["pid"]
+        result["pid"] = pid
+        result["vmStartedAtMs"] = receipt.get("startedAtMs")
+        result["attachStartedAtMs"] = int(time.time() * 1000)
+        args = [
+            debugger,
+            "--batch",
+            "--no-lldbinit",
+            "-p",
+            str(pid),
+            "-o",
+            "breakpoint set --name abort",
+            "-o",
+            "continue",
+            "-o",
+            "thread backtrace",
+            "-o",
+            "detach",
+            "-o",
+            "quit",
+        ]
+        with raw_path.open("wb") as raw:
+            process = subprocess.Popen(args, stdout=raw, stderr=subprocess.STDOUT)
+            while process.poll() is None:
+                scan_lifecycle(log, seen)
+                if time.monotonic() >= deadline:
+                    process.kill()
+                    result["status"] = "debugger-timeout"
+                    break
+                time.sleep(0.1)
+            process.wait()
+        result["attachFinishedAtMs"] = int(time.time() * 1000)
+        scan_lifecycle(log, seen)
+        text = raw_path.read_text(encoding="utf-8", errors="replace")
+        thread, frames = parse_backtrace(text)
+        if frames:
+            result["status"] = "captured"
+            result["thread"] = thread
+            result["frames"] = frames
+            result["capturedAtMs"] = int(time.time() * 1000)
+        elif result["status"] == "watcher-started":
+            result["status"] = "no-symbolized-abort-backtrace"
+    except (OSError, ValueError, KeyError, TypeError, UnicodeError):
+        if result["status"] == "watcher-started":
+            result["status"] = "debugger-attach-failed"
+    finally:
+        try:
+            raw_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            result["rawCleanup"] = "failed"
+    publish(directory, "backtrace.json", result)
 
 
 def prepare(directory, candidate):
@@ -113,6 +270,10 @@ def collect(directory, candidate):
             raise ValueError("candidate mismatch")
         if type(receipt["pid"]) is not int or receipt["pid"] <= 0:
             raise ValueError("invalid PID")
+        backtrace = directory / "backtrace.json"
+        deadline = time.monotonic() + 15
+        while not backtrace.is_file() and time.monotonic() < deadline:
+            time.sleep(0.1)
         begin = max(runtime["startedAtMs"], receipt["startedAtMs"])
         end = time.time() * 1000 + 10_000
         reports = Path.home() / "Library/Logs/DiagnosticReports"
@@ -144,8 +305,8 @@ def collect(directory, candidate):
 
 
 def main():
-    if len(sys.argv) != 4 or sys.argv[1] not in {"prepare", "collect"}:
-        raise ValueError("expected prepare|collect directory candidate")
+    if len(sys.argv) != 4 or sys.argv[1] not in {"prepare", "watch", "collect"}:
+        raise ValueError("expected prepare|watch|collect directory candidate")
     operation, raw, candidate = sys.argv[1:]
     directory, root = Path(raw), Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
     if not re.fullmatch(r"[0-9a-f]{40}", candidate):
@@ -154,7 +315,12 @@ def main():
         raise ValueError("diagnostic directory outside canonical runner temp")
     if not directory.is_dir():
         raise ValueError("diagnostic directory missing")
-    (prepare if operation == "prepare" else collect)(directory, candidate)
+    if operation == "prepare":
+        prepare(directory, candidate)
+    elif operation == "watch":
+        watch(directory, candidate)
+    else:
+        collect(directory, candidate)
 
 
 if __name__ == "__main__":

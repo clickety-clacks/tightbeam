@@ -250,6 +250,19 @@ jobs:
           pending.replace(directory / "provenance.json")
           PY
 
+      # Arm one bounded debugger observer before the gate starts. It attaches to
+      # the owned VM named by vm.json, stops only at abort, records the selected
+      # thread's module/symbol/offset frames, and emits no debugger text. The raw
+      # debugger stream is discarded; backtrace.json contains the allowlisted
+      # receipt, lifecycle marker timestamps, and sanitized frames only.
+      - name: Arm bounded Darwin abort backtrace watcher
+        if: matrix.name == 'macos'
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          python3 scripts/collect_darwin_diagnostic.py watch \
+            "$DD36_DARWIN_DIAGNOSTIC_DIR" "$CANDIDATE_SHA" >/dev/null 2>&1 &
+
       - name: mix format --check-formatted
         run: mix format --check-formatted
 
@@ -289,6 +302,7 @@ jobs:
             ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/provenance.json
             ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/exit.txt
             ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/crash.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/backtrace.json
             ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/full.log
 
       - name: cargo fmt --check
