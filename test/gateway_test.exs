@@ -7162,7 +7162,13 @@ defmodule Tightbeam.GatewayTest do
     beta = Path.join(cwd, ".codex/skills/tightbeam__human-communication/SKILL.md")
     old_alpha = File.read!(alpha)
 
-    identity_edit!(base_dir, "coder", {:skill, "model-release-intake", false}, "alpha next", "test")
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "model-release-intake", false},
+      "alpha next",
+      "test"
+    )
 
     next =
       identity_edit!(
@@ -7717,7 +7723,13 @@ defmodule Tightbeam.GatewayTest do
       "test"
     )
 
-    identity_edit!(base_dir, "coder", {:skill, "model-release-intake", false}, "beta next", "test")
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "model-release-intake", false},
+      "beta next",
+      "test"
+    )
 
     # The injection: the writer rewrites the elected skills in name order, so a
     # directory it cannot replace stops it PARTWAY — alpha rewritten, beta not.
