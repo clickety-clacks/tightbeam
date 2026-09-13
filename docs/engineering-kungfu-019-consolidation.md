@@ -632,3 +632,19 @@ tracked separately; an active turn can postpone refresh on 0.1.8. Packaging pass
 on eezo at `9a37851`. Fable accepted the final composition in Subetha `bdba678f`;
 Morrow's neutral-default coverage observation is resolved by the explicit boundary
 above. No runtime code, schema, rail or rule changed in this amendment.
+
+## Frugality clarification, 13 September
+
+Mike asked in the consolidation conversation: "should we patch .9 guidance to be
+more clear about this and apply to the org, and then re-consider existing coding
+agents and switch their models". This follows his objection that frugality is a
+requirement of choosing the best agent.
+
+The model policy now selects for the actual remaining work. Critical-system work
+with an understood design stays eligible for Luna; unresolved architectural or
+causal judgment warrants a stronger coder. The shared selection home accounts for
+retained context and total completion cost. The engineering tables no longer use
+"critical code" as a blanket stronger-model category. Ringdown remains advice,
+without a compulsory cheaper-model trial or reassessment cadence. The installed
+0.1.8 overlay carries the same policy. Runtime model changes use supported tuning
+and preserve existing authority, work holds and custody.

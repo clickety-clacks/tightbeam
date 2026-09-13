@@ -125,7 +125,7 @@
     {
       "path": "guidance/engineering-model-activities.md",
       "before_sha256": null,
-      "after_sha256": "8afd0e354c25910f9c4612a88a05560cae98ac67621114db99f9776e89726c84",
+      "after_sha256": "3ecda86f8f7e2c2170bad7dbce2e550806541feb31c1780bca216810b25b16da",
       "application_state": "published",
       "observed_sha256": "8afd0e354c25910f9c4612a88a05560cae98ac67621114db99f9776e89726c84"
     },
@@ -195,7 +195,7 @@
     {
       "path": "guidance/preferred-models.md",
       "before_sha256": "b2374c1bfdd6b297927a681f0d0ca61ccea6ef9e8c08eaad80f5b42faed8a520",
-      "after_sha256": "ec69ea5b7ee05c30cafcf460f0f47f1f8376e5380088ef54277297d617bbd318",
+      "after_sha256": "9d27d0f9367e92ae46ee9c5c945a896e154f8c7fe552bdc58eb320dbade3c199",
       "application_state": "published",
       "observed_sha256": "ec69ea5b7ee05c30cafcf460f0f47f1f8376e5380088ef54277297d617bbd318"
     },

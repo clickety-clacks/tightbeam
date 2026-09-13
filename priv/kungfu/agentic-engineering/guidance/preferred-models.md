@@ -17,12 +17,17 @@ activities live in `kungfu/agentic-engineering/preferred-models.md`.
 
 ## Select and recover
 
-Choose the best agent for the actual job, but be frugal. Select for the outcome,
-quality, duration, uncertainty and consequences. Prefer the least costly qualified
-choice expected to deliver that result. Count briefing and context reconstruction,
-supervision, synchronization, rework and review along with the agent's own usage.
-A capable agent that already understands the work may cost less overall than a
-fresh cheaper model. Do not over-specify a job merely to fit it to a cheaper coder.
+Frugality is part of choosing the best agent. Choose the least costly qualified
+model and effort expected to complete the actual remaining work to the required
+quality. Spend more where the task's unresolved judgment, likely rework or useful
+retained context warrants it. Project importance, a broad domain label or the
+holder's previous model does not establish that need.
+
+Count briefing and context reconstruction, supervision, synchronization, rework and
+review along with the agent's own usage. Preserve useful context when it reduces
+the cost of finishing; do not assume a model change requires a new session or
+harness. Reconsider the choice when the remaining work changes, without creating
+turns just to reassess it. Do not over-specify a job to fit it to a cheaper coder.
 
 The ringdown rows suggest starting choices and fallback order; inference owns the
 selection. Use their default order when the job supplies no reason to choose
