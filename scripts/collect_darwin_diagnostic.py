@@ -24,6 +24,15 @@ FRAME_RE = re.compile(
     r"^\s*(?:\* )?frame #([0-9]+):\s+0x[0-9A-Fa-f]+\s+([^`\r\n]+)`([^\s\r\n]+)"
     r"(?:\s+\+\s+(0x[0-9A-Fa-f]+|[0-9]+))?"
 )
+LLDB_PROMPT_RE = re.compile(r"^\(lldb\)\s*(.*)$")
+BREAKPOINT_RE = re.compile(
+    r"^\s*Breakpoint ([0-9]+):.*(?:`| )abort(?:\b|[+ ])"
+)
+PROCESS_STOPPED_RE = re.compile(r"^\s*Process ([0-9]+) stopped\b")
+STOP_REASON_RE = re.compile(
+    r"^\s*(?:\* )?thread #([0-9]+).*stop reason = breakpoint ([0-9]+)\.([0-9]+)\b"
+)
+LLDB_ERROR_RE = re.compile(r"^\s*error:")
 
 
 def publish(directory, name, value):
@@ -74,10 +83,16 @@ def parse_backtrace(text):
     thread = None
     frames = []
     for line in text.splitlines():
+        match = THREAD_RE.match(line)
+        if match:
+            current = int(match.group(1))
+            if thread is None:
+                thread = current
+            elif current != thread:
+                return None, []
+            continue
         if thread is None:
-            match = THREAD_RE.match(line)
-            if match:
-                thread = int(match.group(1))
+            continue
         match = FRAME_RE.match(line)
         if not match or match.group(4) is None:
             continue
@@ -87,18 +102,148 @@ def parse_backtrace(text):
             continue
         if not re.fullmatch(r"[A-Za-z0-9_.$?~:+<>,()\[\]-]+", symbol):
             continue
-        frames.append(
-            {
-                "frame": int(match.group(1)),
-                "module": module,
-                "symbol": symbol,
-                "offset": int(match.group(4), 0),
-            }
-        )
+        try:
+            offset = int(match.group(4), 0)
+        except ValueError:
+            continue
+        frames.append({
+            "frame": int(match.group(1)),
+            "module": module,
+            "symbol": symbol,
+            "offset": offset,
+        })
         if len(frames) == 32:
             break
     return thread, frames
 
+
+def parse_lldb_capture(text, pid):
+    """Parse only the selected-thread backtrace command after an abort stop."""
+    abort_breakpoints = set()
+    stopped_pid = None
+    abort_stop = None
+    backtrace_segment = None
+    backtrace_error = False
+
+    for line in text.splitlines():
+        prompt = LLDB_PROMPT_RE.match(line)
+        if prompt:
+            command = prompt.group(1).strip()
+            if command == "thread backtrace -c 32":
+                backtrace_segment = []
+                backtrace_error = False
+                continue
+            if backtrace_segment is not None:
+                break
+            continue
+
+        match = BREAKPOINT_RE.match(line)
+        if match:
+            abort_breakpoints.add(int(match.group(1)))
+
+        match = PROCESS_STOPPED_RE.match(line)
+        if match:
+            stopped_pid = int(match.group(1))
+
+        match = STOP_REASON_RE.match(line)
+        if (
+            match
+            and stopped_pid == pid
+            and int(match.group(2)) in abort_breakpoints
+        ):
+            abort_stop = {
+                "thread": int(match.group(1)),
+                "breakpoint": int(match.group(2)),
+                "location": int(match.group(3)),
+            }
+
+        if backtrace_segment is not None:
+            if LLDB_ERROR_RE.match(line):
+                backtrace_error = True
+            backtrace_segment.append(line)
+
+    if not abort_breakpoints:
+        return "abort-breakpoint-not-verified", None
+    if abort_stop is None:
+        return "abort-stop-not-observed", None
+    if backtrace_segment is None:
+        return "backtrace-command-not-observed", None
+    if backtrace_error:
+        return "backtrace-failed", None
+
+    thread, frames = parse_backtrace("\n".join(backtrace_segment))
+    if thread != abort_stop["thread"]:
+        return "selected-thread-mismatch", None
+    if not frames:
+        return "backtrace-empty", None
+    return "captured", {
+        "thread": thread,
+        "breakpoint": abort_stop["breakpoint"],
+        "stopReason": "breakpoint {}.{}".format(
+            abort_stop["breakpoint"], abort_stop["location"]
+        ),
+        "frames": frames,
+    }
+
+
+
+def apply_lldb_capture(result, text, pid, exit_code):
+    """Apply capture only while the observer still has a nonterminal status."""
+    if result.get("status") != "watcher-started":
+        return
+    if exit_code != 0:
+        result["status"] = "debugger-attach-failed"
+        return
+    status, capture = parse_lldb_capture(text, pid)
+    result["status"] = status
+    if capture is not None:
+        result.update(capture)
+        result["capturedAtMs"] = int(time.time() * 1000)
+
+
+def parser_controls():
+    """Keep synthetic parser controls beside the sanitized parser contract."""
+    pid = 4242
+    positive = """Breakpoint 1: where = libsystem_c.dylib`abort + 4
+(lldb) continue
+Process 4242 stopped
+* thread #7, stop reason = breakpoint 1.1
+(lldb) thread backtrace -c 32
+* thread #7, stop reason = breakpoint 1.1
+  frame #0: 0x0000000180000000 libsystem_c.dylib`abort + 4
+  frame #1: 0x0000000180000010 beam.smp`raise_abort + 16
+(lldb) detach
+"""
+
+    status, capture = parse_lldb_capture(positive, pid)
+    if status != "captured" or capture["thread"] != 7 or len(capture["frames"]) != 2:
+        raise RuntimeError("positive parser control failed")
+
+    attach_failed = {"status": "watcher-started"}
+    apply_lldb_capture(attach_failed, positive, pid, 1)
+    if attach_failed["status"] != "debugger-attach-failed":
+        raise RuntimeError("attach-failure parser control failed")
+
+    unrelated = positive.replace(
+        "stop reason = breakpoint 1.1", "stop reason = signal = SIGSTOP"
+    )
+    status, capture = parse_lldb_capture(unrelated, pid)
+    if status != "abort-stop-not-observed" or capture is not None:
+        raise RuntimeError("unrelated-stop parser control failed")
+
+    failed_backtrace = positive.replace(
+        "* thread #7, stop reason = breakpoint 1.1\n  frame #0: 0x0000000180000000 libsystem_c.dylib`abort + 4\n  frame #1: 0x0000000180000010 beam.smp`raise_abort + 16",
+        "error: thread backtrace failed",
+    )
+    status, capture = parse_lldb_capture(failed_backtrace, pid)
+    if status != "backtrace-failed" or capture is not None:
+        raise RuntimeError("failed-backtrace parser control failed")
+
+    for terminal in ("debugger-timeout", "gate-succeeded"):
+        result = {"status": terminal}
+        apply_lldb_capture(result, positive, pid, 0)
+        if result["status"] != terminal:
+            raise RuntimeError("terminal-status parser control failed")
 
 def watch(directory, candidate):
     """Attach once to the owned test VM and publish only a sanitized backtrace."""
@@ -115,6 +260,7 @@ def watch(directory, candidate):
     seen = result["lifecycleObservedAtMs"]
 
     try:
+        parser_controls()
         runtime = read_json(directory / "runtime.json")
         if runtime.get("candidate") != candidate:
             raise ValueError("candidate mismatch")
@@ -190,15 +336,15 @@ def watch(directory, candidate):
             result["debuggerExitCode"] = process.returncode
         result["attachFinishedAtMs"] = int(time.time() * 1000)
         scan_lifecycle(log, seen)
+        if result["status"] == "watcher-started" and gate_status(exit_path) == 0:
+            result["status"] = "gate-succeeded"
         text = raw_path.read_text(encoding="utf-8", errors="replace")
-        thread, frames = parse_backtrace(text)
-        if thread is not None and frames:
-            result["status"] = "captured"
-            result["thread"] = thread
-            result["frames"] = frames
-            result["capturedAtMs"] = int(time.time() * 1000)
-        elif result["status"] == "watcher-started":
+        apply_lldb_capture(result, text, pid, result["debuggerExitCode"])
+        if result["status"] == "backtrace-command-not-observed":
             result["status"] = "no-symbolized-abort-backtrace"
+    except RuntimeError:
+        if result["status"] == "watcher-started":
+            result["status"] = "parser-controls-failed"
     except (OSError, ValueError, KeyError, TypeError, UnicodeError):
         if result["status"] == "watcher-started":
             result["status"] = "debugger-attach-failed"
