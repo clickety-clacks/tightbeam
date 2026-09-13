@@ -1,5 +1,5 @@
 name = "recon"
-skills = ["recon-first-investigation", "recon-lifecycle", "bug-provenance"]
+skills = []
 
 [guidance]
 text = """
@@ -12,6 +12,8 @@ text = """
 #include "engineering-tenets.md"
 
 #include "preferred-models.md"
+
+#include "repository-custody.md"
 
 #include "recon.md"
 """

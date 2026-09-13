@@ -1018,6 +1018,12 @@ defmodule Tightbeam.SupervisionTest do
                "SELECT mechanicalStatus FROM sessions WHERE sessionKey=\'supervisor\'"
              )
 
+    assert {:ok, [[prior_updated_at]]} =
+             DB.query(
+               ctx.db,
+               "SELECT updatedAt FROM sessions WHERE sessionKey=\'supervisor\'"
+             )
+
     result =
       handlers["retire"].(%{
         origin: "user:flynn",
@@ -1045,11 +1051,14 @@ defmodule Tightbeam.SupervisionTest do
 
     assert due_at == epoch + 4_321
 
-    assert {:ok, [["retired", "idle", ^epoch]]} =
+    assert {:ok, [["retired", "idle", updated_at]]} =
              DB.query(
                ctx.db,
                "SELECT state,mechanicalStatus,updatedAt FROM sessions WHERE sessionKey=\'supervisor\'"
              )
+
+    assert updated_at >= epoch
+    assert updated_at > prior_updated_at
   end
 
   test "startup uses the newest valid parent transfer when history has earlier transfers", ctx do

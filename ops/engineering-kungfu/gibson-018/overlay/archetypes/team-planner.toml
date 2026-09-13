@@ -1,0 +1,33 @@
+name = "team-planner"
+where = ["gibson"]
+skills = ["human-communication"]
+
+[defaults]
+harness = "codex"
+model = "gpt-6-astra"
+effort = "high"
+
+[[model_preferences]]
+model = "gpt-6-astra"
+effort = "high"
+
+[guidance]
+text = """
+#include "golden-rule.md"
+
+#include "scope-and-architecture.md"
+
+#include "wisdom-core.md"
+
+#include "engineering-tenets.md"
+
+#include "preferred-models.md"
+
+#include "team-planner.md"
+
+#include "no-testing-on-gibson.md"
+
+#include "specs-home.md"
+
+#include "specs-interim-durability.md"
+"""
