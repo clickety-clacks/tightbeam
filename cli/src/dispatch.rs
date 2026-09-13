@@ -197,6 +197,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "condition", vec![], params))
         }
+        Command::ArtifactContentFetch {
+            identity,
+            artifact_id,
+        } => Ok(request(
+            identity,
+            "artifact-content-fetch",
+            vec![],
+            vec![string_field("artifactId", artifact_id)],
+        )),
         Command::ArtifactRecord {
             identity,
             kind,
@@ -1761,6 +1770,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
         | Command::ArtifactRecord { identity, .. }
+        | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
@@ -2014,6 +2024,26 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn artifact_content_fetch_sends_only_id_and_authenticated_identity() {
+        let request = build_request(&parse(&[
+            "artifact-content-fetch",
+            "art_fixture",
+            "--as-user",
+            "flynn",
+        ]))
+        .unwrap();
+        assert_eq!(request.path, "/agent/dispatch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.body_json).unwrap(),
+            serde_json::json!({
+                "verb": "artifact-content-fetch",
+                "asUser": "flynn",
+                "params": {"artifactId": "art_fixture"}
+            })
+        );
     }
 
     #[test]

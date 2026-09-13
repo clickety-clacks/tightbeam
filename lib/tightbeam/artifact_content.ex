@@ -103,6 +103,64 @@ defmodule Tightbeam.ArtifactContent do
   def ensure_schema(db), do: DB.execute(db, @ddl)
   def schema_in_txn(%Txn{} = txn), do: Txn.exec(txn, @ddl)
 
+  @doc "Read captured content for an authenticated artifact reader, without an origin path."
+  def fetch_call(db, %{principal: {kind, id}, params: %{artifact_id: artifact_id} = params})
+      when kind in [:user, :session] and is_binary(id) and is_binary(artifact_id) and
+             artifact_id != "" and map_size(params) == 1 do
+    principal = %{kind: Atom.to_string(kind), id: id, is_admin: false}
+
+    case DB.transaction(db, fn txn ->
+           row = Tightbeam.Artifacts.get_in_txn(txn, artifact_id)
+
+           if row != nil and
+                Tightbeam.StateVisibility.core_detail_visible?(txn, "artifacts", row, principal) do
+             case fetch(txn, artifact_id) do
+               nil ->
+                 %{code: "content_not_captured", message: "artifact has no stored content"}
+
+               captured ->
+                 captured
+                 |> Map.delete(:content)
+                 |> Map.put(:content_base64, Base.encode64(captured.content))
+             end
+           else
+             %{code: "not_found"}
+           end
+         end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  def fetch_call(_db, %{principal: {kind, _}}) when kind in [:user, :session],
+    do: %{code: "invalid", message: "artifact-content-fetch requires only artifactId"}
+
+  def fetch_call(_db, _call), do: %{code: "forbidden"}
+
+  @doc """
+  Read captured bytes by artifact ID, or nil when no content was captured.
+
+  This storage read never opens originPath or home. Callers exposing it outside
+  the storage layer must authorize the artifact before returning its content.
+  """
+  @spec fetch(DB.server(), String.t()) :: map() | nil
+  def fetch(db \\ Tightbeam.DB, artifact_id) do
+    case DB.query(
+           db,
+           "SELECT contentSha256, contentSize, content FROM artifact_contents WHERE artifactId=?1",
+           [artifact_id]
+         ) do
+      {:ok, [[digest, size, bytes]]} ->
+        %{artifact_id: artifact_id, content_sha256: digest, content_size: size, content: bytes}
+
+      {:ok, []} ->
+        nil
+
+      {:error, error} ->
+        raise error
+    end
+  end
+
   @doc """
   Store the exact bytes Tightbeam is taking into custody, in the caller's
   transaction, before the row reaches a terminal state.

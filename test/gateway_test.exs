@@ -10,11 +10,14 @@ defmodule Tightbeam.GatewayTest do
     expected =
       ~w(post wake condition facts-read artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent retire)
 
-    expected = expected ++ ~w(ask answer return read-marker-set read-marker-clear)
+    expected =
+      expected ++ ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch)
+
     assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
     assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
     assert effects["reopen-assignment"] == ["assignment.reopened"]
+    assert effects["artifact-content-fetch"] == []
     assert effects["repair-assignment"] == ["message.created", "session.updated"]
 
     assert effects["wake"] == [

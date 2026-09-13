@@ -137,6 +137,9 @@ defmodule Tightbeam.Wire.RouterTest do
           do: %{code: call.params.return_code},
           else: %{artifact_id: call.params.artifact_id}
       end,
+      "artifact-content-fetch" => fn call ->
+        Tightbeam.ArtifactContent.fetch_call(db, call)
+      end,
       "artifacts" => fn call ->
         send(parent, {:call, call})
         %{artifacts: []}
@@ -2471,6 +2474,81 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert missing.status == 404
     assert JSON.decode!(missing.resp_body)["error"]["code"] == "not_found"
+  end
+
+  test "artifact content fetch authenticates and applies existing artifact visibility without origin paths",
+       ctx do
+    writer = create_session(ctx.db, "fetch-writer", "flynn")
+    stranger = create_session(ctx.db, "fetch-stranger", "mike")
+    Roles.create!(ctx.db, "fetch-writer-role", "flynn", writer.session_key)
+    Roles.create!(ctx.db, "fetch-stranger-role", "mike", stranger.session_key)
+
+    :ok =
+      DB.execute(
+        ctx.db,
+        "INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt) VALUES('wi_fetch','Fetch','flynn','flynn',1)"
+      )
+
+    workspace = Path.join(ctx.base_dir, "fetch-workspace")
+    File.mkdir_p!(workspace)
+    bytes = <<0, 255, 128, 10>>
+    File.write!(Path.join(workspace, "bytes.dat"), bytes)
+
+    artifact =
+      Tightbeam.Artifacts.record(ctx.db, %{
+        principal: {:session, writer.session_key},
+        session_key: writer.session_key,
+        params: %{
+          kind: "data",
+          title: "Bytes",
+          origin_path: "bytes.dat",
+          work_item_id: "wi_fetch"
+        }
+      })
+
+    assert :ok =
+             Tightbeam.Artifacts.archive_session(
+               ctx.db,
+               writer.session_key,
+               workspace,
+               Path.join(ctx.base_dir, "fetch-archive")
+             )
+
+    archived = Tightbeam.Artifacts.get(ctx.db, artifact.artifact_id)
+    File.rm!(archived.home)
+    assert Tightbeam.Artifacts.release(ctx.db, artifact.artifact_id).state == "released"
+    body = %{verb: "artifact-content-fetch", params: %{artifactId: artifact.artifact_id}}
+
+    expected = %{
+      "artifactId" => artifact.artifact_id,
+      "contentSha256" => Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
+      "contentSize" => byte_size(bytes),
+      "contentBase64" => Base.encode64(bytes)
+    }
+
+    for {token, request} <- [
+          {writer.cli_token, body},
+          {"tbc_test", Map.put(body, :asUser, "flynn")}
+        ] do
+      response = dispatch_cli(ctx, token, request)
+      assert response.status == 200
+      assert JSON.decode!(response.resp_body) == %{"result" => expected}
+    end
+
+    hidden = dispatch_cli(ctx, stranger.cli_token, body)
+
+    missing =
+      dispatch_cli(ctx, stranger.cli_token, put_in(body, [:params, :artifactId], "art_missing"))
+
+    assert hidden.status == 404
+    assert missing.status == 404
+    assert hidden.resp_body == missing.resp_body
+    assert dispatch_cli(ctx, "invalid-bearer", body).status == 401
+    assert dispatch_cli(ctx, "tbc_test", Map.put(body, :asProcess, "fixture")).status == 403
+    assert dispatch_cli(ctx, writer.cli_token, Map.put(body, :sessionKey, nil)).status == 400
+
+    assert dispatch_cli(ctx, writer.cli_token, put_in(body, [:params, :originPath], "/not/read")).status ==
+             400
   end
 
   test "session bearer enforces the identity ladder and threads the normative principal seam",
