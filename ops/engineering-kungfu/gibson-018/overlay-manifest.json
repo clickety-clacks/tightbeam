@@ -127,7 +127,7 @@
       "before_sha256": null,
       "after_sha256": "3ecda86f8f7e2c2170bad7dbce2e550806541feb31c1780bca216810b25b16da",
       "application_state": "published",
-      "observed_sha256": "8afd0e354c25910f9c4612a88a05560cae98ac67621114db99f9776e89726c84"
+      "observed_sha256": "3ecda86f8f7e2c2170bad7dbce2e550806541feb31c1780bca216810b25b16da"
     },
     {
       "path": "guidance/engineering-tenets.md",
@@ -197,7 +197,7 @@
       "before_sha256": "b2374c1bfdd6b297927a681f0d0ca61ccea6ef9e8c08eaad80f5b42faed8a520",
       "after_sha256": "9d27d0f9367e92ae46ee9c5c945a896e154f8c7fe552bdc58eb320dbade3c199",
       "application_state": "published",
-      "observed_sha256": "ec69ea5b7ee05c30cafcf460f0f47f1f8376e5380088ef54277297d617bbd318"
+      "observed_sha256": "9d27d0f9367e92ae46ee9c5c945a896e154f8c7fe552bdc58eb320dbade3c199"
     },
     {
       "path": "guidance/product-owner.md",
@@ -510,5 +510,23 @@
     "source_revision": "9a37851baae6fcfd5c7903f96cdb1825fa0cda96",
     "live_revision": "c4ff2288431a93a904dfb7ec4b0140904bb5bc97",
     "neutral_default": "Deliberately outside engineering policy. Existing engineering work on a historical default session receives an explicit engineering-tenets reference in its scoped reread notice; dormant neutral sessions are not woken."
+  },
+  "frugality_amendment": {
+    "authority": "Mike, external conversation 2026-09-13: clarify .9 guidance, apply to org, reassess current coders and switch models",
+    "source_revision": "d00b8b61a3eaf2344095b172594087b969fc6bd4",
+    "state": "published",
+    "review": "att_6a451f9c accepts policy bodies and requests publication-record correction; lead agrees",
+    "date": "2026-09-13",
+    "live_revision": "1462ee17354bdca7370ad08f8328c5d9afb94cae",
+    "supported_cli_operations": 2,
+    "publication_readback": "Both changed file hashes match their after_sha256 and observed_sha256. Published identity is distinct from session refresh.",
+    "session_refresh": "Tracked separately in the private frugality-20260913 guidance-refresh-results.jsonl; this publication receipt does not claim session uptake.",
+    "model_tuning": {
+      "state": "verified",
+      "count": 16,
+      "harness_changes": 0,
+      "engine_context": "preserved",
+      "selection": "Actual remaining work; 17 of 26 coder holders with open work now use Luna. Specific holds retained."
+    }
   }
 }
