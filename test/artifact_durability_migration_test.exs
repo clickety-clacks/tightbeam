@@ -101,6 +101,47 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     assert rows(db, "PRAGMA foreign_key_check") == []
   end
 
+  for object <- @content_objects, mutation <- [:missing, :mismatched] do
+    @object object
+    @mutation mutation
+    test "current stamp refuses #{@mutation} #{@object} without repair or row mutation", %{db: db} do
+      assert :ok = Schema.ensure_all(db)
+      seed_artifact(db, "art_validation", "in-workspace")
+      bytes = <<0, 255, 1>>
+      digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower)
+
+      assert {:ok, :ok} =
+               DB.transaction(db, fn txn ->
+                 Tightbeam.ArtifactContent.store_in_txn(txn, "art_validation", digest, bytes, 42)
+                 :ok
+               end)
+
+      [[type, sql]] = rows(db, "SELECT type,sql FROM sqlite_master WHERE name='#{@object}'")
+
+      case {@mutation, type} do
+        {:missing, _} ->
+          assert :ok = DB.execute(db, "DROP #{type} #{@object}")
+
+        {:mismatched, "table"} ->
+          assert :ok = DB.execute(db, "ALTER TABLE artifact_contents ADD COLUMN unexpected TEXT")
+
+        {:mismatched, "trigger"} ->
+          assert :ok = DB.execute(db, "DROP TRIGGER #{@object}")
+          changed = String.replace(sql, "released artifact", "changed artifact")
+          refute changed == sql
+          assert :ok = DB.execute(db, changed)
+      end
+
+      before = validation_snapshot(db)
+
+      assert_raise Schema.ShapeError, "incompatible artifact durability object: #{@object}", fn ->
+        Schema.ensure_all(db)
+      end
+
+      assert validation_snapshot(db) == before
+    end
+  end
+
   test "AD3 ensure_all is idempotent across repeated boots", %{db: db} do
     assert :ok = Schema.ensure_all(db)
     first = objects(db)
@@ -358,6 +399,16 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
       "SELECT name FROM sqlite_master WHERE name IN ('artifact_contents','artifacts_released_requires_content_insert','artifacts_released_requires_content_update','artifact_contents_released_immutable','artifact_contents_released_retained') ORDER BY name"
     )
     |> List.flatten()
+  end
+
+  defp validation_snapshot(db) do
+    contents =
+      if "artifact_contents" in content_objects(db),
+        do: rows(db, "SELECT * FROM artifact_contents ORDER BY artifactId"),
+        else: :missing
+
+    {snapshot(db), rows(db, "SELECT * FROM artifact_version_floors ORDER BY artifactId"),
+     contents}
   end
 
   defp snapshot(db),

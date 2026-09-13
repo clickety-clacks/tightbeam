@@ -206,6 +206,15 @@ defmodule Tightbeam.Wire.Router do
         params: atomize_params(verb, body["params"] || %{})
       }
 
+      call =
+        case {verb, principal} do
+          {"artifact-content-fetch", {kind, _}} when kind in [:user, :session] ->
+            Map.put(call, :rest_principal, state_principal_view(principal, conn))
+
+          _ ->
+            call
+        end
+
       dispatch_response(conn, call, 200, &%{"result" => &1})
     else
       {:error, status, code, message} -> error(conn, status, code, message)

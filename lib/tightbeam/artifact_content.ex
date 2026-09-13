@@ -40,7 +40,7 @@ defmodule Tightbeam.ArtifactContent do
   alias Tightbeam.DB
   alias Tightbeam.DB.Txn
 
-  @ddl """
+  @table_ddl """
   CREATE TABLE IF NOT EXISTS artifact_contents (
     artifactId TEXT PRIMARY KEY REFERENCES artifacts(artifactId),
     contentSha256 TEXT NOT NULL,
@@ -50,7 +50,9 @@ defmodule Tightbeam.ArtifactContent do
     CHECK (length(content) = contentSize),
     CHECK (length(contentSha256) = 64 AND contentSha256 = lower(contentSha256))
   );
+  """
 
+  @insert_ddl """
   CREATE TRIGGER IF NOT EXISTS artifacts_released_requires_content_insert
   BEFORE INSERT ON artifacts
   WHEN NEW.state = 'released'
@@ -64,7 +66,9 @@ defmodule Tightbeam.ArtifactContent do
   BEGIN
     SELECT RAISE(ABORT, 'released artifact requires durable content');
   END;
+  """
 
+  @update_ddl """
   CREATE TRIGGER IF NOT EXISTS artifacts_released_requires_content_update
   BEFORE UPDATE OF state, contentSha256 ON artifacts
   WHEN NEW.state = 'released'
@@ -78,7 +82,9 @@ defmodule Tightbeam.ArtifactContent do
   BEGIN
     SELECT RAISE(ABORT, 'released artifact requires durable content');
   END;
+  """
 
+  @immutable_ddl """
   CREATE TRIGGER IF NOT EXISTS artifact_contents_released_immutable
   BEFORE UPDATE ON artifact_contents
   WHEN EXISTS (
@@ -88,7 +94,9 @@ defmodule Tightbeam.ArtifactContent do
   BEGIN
     SELECT RAISE(ABORT, 'released artifact content is immutable');
   END;
+  """
 
+  @retained_ddl """
   CREATE TRIGGER IF NOT EXISTS artifact_contents_released_retained
   BEFORE DELETE ON artifact_contents
   WHEN EXISTS (
@@ -100,15 +108,31 @@ defmodule Tightbeam.ArtifactContent do
   END;
   """
 
+  @schema_objects [
+    {"table", "artifact_contents", @table_ddl},
+    {"trigger", "artifacts_released_requires_content_insert", @insert_ddl},
+    {"trigger", "artifacts_released_requires_content_update", @update_ddl},
+    {"trigger", "artifact_contents_released_immutable", @immutable_ddl},
+    {"trigger", "artifact_contents_released_retained", @retained_ddl}
+  ]
+  @ddl Enum.map_join(@schema_objects, "\n", fn {_, _, sql} -> sql end)
+
+  @doc false
+  def schema_objects, do: @schema_objects
+
   def ensure_schema(db), do: DB.execute(db, @ddl)
   def schema_in_txn(%Txn{} = txn), do: Txn.exec(txn, @ddl)
 
   @doc "Read captured content for an authenticated artifact reader, without an origin path."
-  def fetch_call(db, %{principal: {kind, id}, params: %{artifact_id: artifact_id} = params})
-      when kind in [:user, :session] and is_binary(id) and is_binary(artifact_id) and
+  def fetch_call(db, %{
+        principal: {kind, id},
+        rest_principal: %{kind: visibility_kind, id: id, is_admin: is_admin} = principal,
+        params: %{artifact_id: artifact_id} = params
+      })
+      when ((kind == :user and visibility_kind == "user") or
+              (kind == :session and visibility_kind == "session")) and
+             is_binary(id) and is_boolean(is_admin) and is_binary(artifact_id) and
              artifact_id != "" and map_size(params) == 1 do
-    principal = %{kind: Atom.to_string(kind), id: id, is_admin: false}
-
     case DB.transaction(db, fn txn ->
            row = Tightbeam.Artifacts.get_in_txn(txn, artifact_id)
 

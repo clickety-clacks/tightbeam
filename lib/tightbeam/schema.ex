@@ -2198,7 +2198,7 @@ defmodule Tightbeam.Schema do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[@durability_shape]] ->
-               :ok
+               validate_artifact_content_schema!(txn)
 
              [[@reparent_shape]] ->
                existing =
@@ -2243,6 +2243,30 @@ defmodule Tightbeam.Schema do
       {:ok, :ok} -> :ok
       {:error, error} -> raise error
     end
+  end
+
+  defp validate_artifact_content_schema!(txn) do
+    Enum.each(Tightbeam.ArtifactContent.schema_objects(), fn {type, name, expected} ->
+      # SQLite removes IF NOT EXISTS and the statement terminator when storing
+      # DDL. Preserve every other byte, including quoted trigger predicates and
+      # error text: a stamped store must not silently repair a changed contract.
+      expected =
+        expected
+        |> String.replace(
+          "CREATE #{String.upcase(type)} IF NOT EXISTS ",
+          "CREATE #{String.upcase(type)} ",
+          global: false
+        )
+        |> String.trim()
+        |> String.trim_trailing(";")
+
+      case Txn.q(txn, "SELECT type, sql FROM sqlite_master WHERE name=?1", [name]) do
+        [[^type, ^expected]] -> :ok
+        _ -> raise ShapeError, message: "incompatible artifact durability object: #{name}"
+      end
+    end)
+
+    :ok
   end
 
   defp upgrade_o2(db) do

@@ -2543,6 +2543,29 @@ defmodule Tightbeam.Wire.RouterTest do
     assert hidden.status == 404
     assert missing.status == 404
     assert hidden.resp_body == missing.resp_body
+    assert dispatch_cli(ctx, "tbc_test", Map.put(body, :asUser, "mike")).status == 404
+
+    # Resolve admin standing from the same stored user used by artifact detail,
+    # not from command params. The artifact remains owned by flynn throughout.
+    Tightbeam.Devices.add_user(ctx.db, "mike", true)
+    assert %{is_admin: true} = Tightbeam.Devices.user(ctx.db, "mike")
+
+    assert %{artifact_id: id} =
+             Tightbeam.StateResources.query_artifact(ctx.db, %{
+               key: artifact.artifact_id,
+               principal: %{kind: "user", id: "mike", is_admin: true}
+             })
+
+    assert id == artifact.artifact_id
+    admin = dispatch_cli(ctx, "tbc_test", Map.put(body, :asUser, "mike"))
+    assert admin.status == 200
+    assert JSON.decode!(admin.resp_body) == %{"result" => expected}
+    # A session does not inherit its owner's admin privilege.
+    assert dispatch_cli(ctx, stranger.cli_token, body).resp_body == hidden.resp_body
+
+    assert dispatch_cli(ctx, stranger.cli_token, put_in(body, [:params, :isAdmin], true)).status ==
+             400
+
     assert dispatch_cli(ctx, "invalid-bearer", body).status == 401
     assert dispatch_cli(ctx, "tbc_test", Map.put(body, :asProcess, "fixture")).status == 403
     assert dispatch_cli(ctx, writer.cli_token, Map.put(body, :sessionKey, nil)).status == 400
