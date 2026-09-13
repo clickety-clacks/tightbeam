@@ -60,6 +60,16 @@ def scan_lifecycle(log, seen):
             seen[name] = observed
 
 
+def gate_status(path):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 32:
+        return None
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return int(value) if re.fullmatch(r"-?[0-9]+", value) else None
+
+
 def parse_backtrace(text):
     thread = None
     frames = []
@@ -101,6 +111,7 @@ def watch(directory, candidate):
     }
     raw_path = directory / "backtrace.raw"
     log = directory / "full.log"
+    exit_path = directory / "exit.txt"
     seen = result["lifecycleObservedAtMs"]
 
     try:
@@ -120,6 +131,9 @@ def watch(directory, candidate):
         receipt = None
         while time.monotonic() < deadline:
             scan_lifecycle(log, seen)
+            if gate_status(exit_path) is not None:
+                result["status"] = "gate-finished-before-vm-receipt"
+                return publish(directory, "backtrace.json", result)
             try:
                 receipt = read_json(directory / "vm.json")
                 if receipt.get("candidate") != candidate:
@@ -148,7 +162,7 @@ def watch(directory, candidate):
             "-o",
             "continue",
             "-o",
-            "thread backtrace",
+            "thread backtrace -c 32",
             "-o",
             "detach",
             "-o",
@@ -158,17 +172,27 @@ def watch(directory, candidate):
             process = subprocess.Popen(args, stdout=raw, stderr=subprocess.STDOUT)
             while process.poll() is None:
                 scan_lifecycle(log, seen)
+                if gate_status(exit_path) == 0:
+                    process.terminate()
+                    result["status"] = "gate-succeeded"
+                    break
                 if time.monotonic() >= deadline:
                     process.kill()
                     result["status"] = "debugger-timeout"
                     break
                 time.sleep(0.1)
-            process.wait()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+                result["status"] = "debugger-timeout"
+            result["debuggerExitCode"] = process.returncode
         result["attachFinishedAtMs"] = int(time.time() * 1000)
         scan_lifecycle(log, seen)
         text = raw_path.read_text(encoding="utf-8", errors="replace")
         thread, frames = parse_backtrace(text)
-        if frames:
+        if thread is not None and frames:
             result["status"] = "captured"
             result["thread"] = thread
             result["frames"] = frames

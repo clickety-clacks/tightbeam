@@ -250,19 +250,6 @@ jobs:
           pending.replace(directory / "provenance.json")
           PY
 
-      # Arm one bounded debugger observer before the gate starts. It attaches to
-      # the owned VM named by vm.json, stops only at abort, records the selected
-      # thread's module/symbol/offset frames, and emits no debugger text. The raw
-      # debugger stream is discarded; backtrace.json contains the allowlisted
-      # receipt, lifecycle marker timestamps, and sanitized frames only.
-      - name: Arm bounded Darwin abort backtrace watcher
-        if: matrix.name == 'macos'
-        env:
-          CANDIDATE_SHA: ${{ github.sha }}
-        run: |
-          python3 scripts/collect_darwin_diagnostic.py watch \
-            "$DD36_DARWIN_DIAGNOSTIC_DIR" "$CANDIDATE_SHA" >/dev/null 2>&1 &
-
       - name: mix format --check-formatted
         run: mix format --check-formatted
 
@@ -272,10 +259,17 @@ jobs:
           CANDIDATE_SHA: ${{ github.sha }}
         run: |
           if [ "$RUNNER_OS" = macOS ]; then
+            # Keep the observer in this step so the runner cannot reap it before
+            # failure-only collection. It attaches once to vm.json's owned PID,
+            # discards debugger text, and publishes only backtrace.json.
+            python3 scripts/collect_darwin_diagnostic.py watch \
+              "$DD36_DARWIN_DIAGNOSTIC_DIR" "$CANDIDATE_SHA" >/dev/null 2>&1 &
+            watcher_pid=$!
             set +e
             scripts/verify_mix.sh > "$DD36_DARWIN_DIAGNOSTIC_DIR/full.log" 2>&1
             status=$?
             printf '%s\n' "$status" > "$DD36_DARWIN_DIAGNOSTIC_DIR/exit.txt"
+            wait "$watcher_pid" 2>/dev/null || :
             cat "$DD36_DARWIN_DIAGNOSTIC_DIR/full.log"
             [ "$status" -eq 0 ] || exit "$status"
             set -e
