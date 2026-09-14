@@ -5,7 +5,7 @@ defmodule Tightbeam.DBTransactionThenTest do
   alias Tightbeam.DB.Txn
 
   @tag :tmp_dir
-  test "transaction_then commits durable evidence while retaining the writer fence", %{
+  test "transaction_then commits durable evidence without retaining the owner fence", %{
     tmp_dir: tmp
   } do
     Tightbeam.GuardRuntimeFixture.run!(
@@ -204,6 +204,42 @@ defmodule Tightbeam.DBTransactionThenTest do
     assert_receive {:handoff, :two}
     refute_receive {:handoff, :invalid}
     assert {:ok, [[1]]} = DB.query(db, "SELECT id FROM outbox_rows")
+  end
+
+  @tag :outbox
+  test "arity one publication does not hold the database owner", %{db: db} do
+    parent = self()
+
+    publication =
+      Task.async(fn ->
+        DB.transaction_then(
+          db,
+          fn _txn -> :prepared end,
+          fn :prepared ->
+            send(parent, :publication_started)
+
+            receive do
+              :release_publication -> :published
+            end
+          end
+        )
+      end)
+
+    assert_receive :publication_started
+
+    writer =
+      Task.async(fn ->
+        DB.transaction(db, fn txn ->
+          Txn.q(txn, "INSERT INTO outbox_rows VALUES(1)")
+          :written
+        end)
+      end)
+
+    writer_before_release = Task.yield(writer, 1_000)
+    send(publication.pid, :release_publication)
+
+    assert {:ok, :published} = Task.await(publication)
+    assert {:ok, {:ok, :written}} = writer_before_release
   end
 
   @tag :outbox

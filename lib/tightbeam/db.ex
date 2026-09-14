@@ -73,16 +73,27 @@ defmodule Tightbeam.DB do
   end
 
   @doc """
-  Commit one transaction, then run a bounded publication callback before releasing the owner.
+  Commit one transaction, then run a publication callback after the owner has replied.
 
-  An arity-one callback receives the prepared result and retains the original publication
-  semantics. An arity-two callback receives the owner's transaction handle followed by the
-  prepared result; it runs in a second transaction after the first commit. This is the
-  row-commit recognition seam: the callback cannot recursively enter the DB owner.
+  An arity-one callback receives the prepared result in the caller process. Keeping arbitrary
+  publication work out of the DB owner means a slow filesystem or Git operation cannot stop
+  unrelated callers from being served. An arity-two callback receives the owner's transaction
+  handle followed by the prepared result; it runs in a second transaction after the first
+  commit. This is the row-commit recognition seam: the callback cannot recursively enter the
+  DB owner.
   """
   def transaction_then(server \\ __MODULE__, prepare, after_commit)
-      when is_function(prepare, 1) and
-             (is_function(after_commit, 1) or is_function(after_commit, 2)) do
+
+  def transaction_then(server, prepare, after_commit)
+      when is_function(prepare, 1) and is_function(after_commit, 1) do
+    case GenServer.call(server, {:transaction, prepare}) do
+      {:ok, result} -> run_after_commit(after_commit, result)
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  def transaction_then(server, prepare, after_commit)
+      when is_function(prepare, 1) and is_function(after_commit, 2) do
     GenServer.call(server, {:transaction_then, prepare, after_commit})
   end
 
@@ -352,7 +363,12 @@ defmodule Tightbeam.DB do
     end
   end
 
-  def handle_call({:transaction_then, prepare, after_commit}, _from, %{conn: conn} = state) do
+  def handle_call(
+        {:transaction_then, prepare, after_commit},
+        _from,
+        %{conn: conn} = state
+      )
+      when is_function(after_commit, 2) do
     Process.put(row_commit_key(conn), [])
 
     try do
@@ -414,7 +430,7 @@ defmodule Tightbeam.DB do
       :ok
   end
 
-  defp run_after_commit(_conn, after_commit, result) when is_function(after_commit, 1) do
+  defp run_after_commit(after_commit, result) when is_function(after_commit, 1) do
     try do
       {:ok, after_commit.(result)}
     rescue
