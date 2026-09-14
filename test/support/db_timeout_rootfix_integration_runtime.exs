@@ -7,6 +7,7 @@ false = File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:crypto)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
+Application.put_env(:ex_unit, :assert_receive_timeout, 1_000)
 
 alias Tightbeam.{Boot, DB, Ledger, Model, ModelCatalog, Org, SessionLane, Wakes}
 import ExUnit.Assertions
