@@ -143,7 +143,7 @@ boot_before_release = Task.await(boot_task, 1_000)
 assert {:ok, :ok} = wake_before_release
 assert {:ok, inventories} = catalog_before_release
 assert is_map(inventories)
-assert {:ok, :ignore} = boot_before_release
+assert :ignore = boot_before_release
 
 assert_receive {:wake_delivered, ^wake_id}
 
