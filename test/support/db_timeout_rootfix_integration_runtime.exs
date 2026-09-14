@@ -128,12 +128,17 @@ publication_pid =
 
 wake_task = Task.async(fn -> Wakes.fire_due(scheduler) end)
 catalog_task = Task.async(fn -> ModelCatalog.get(catalog) end)
-boot_task = Task.async(fn -> Boot.start_link(%{base_dir: base}) end)
 send(runner_pid, :release_runner)
+
+# Finalization owns its own control scenario. Waiting for the lane's terminal
+# receipt before boot prevents Boot.recover_running/1 from racing this fixture's
+# deliberately running turn and changing the expected delivery outcome.
+assert_receive {:lane_terminal, "lane-rootfix", ^lane_seq}
 
 wake_before_release = Task.yield(wake_task, 1_000)
 catalog_before_release = Task.yield(catalog_task, 1_000)
-boot_before_release = Task.yield(boot_task, 1_000)
+boot_task = Task.async(fn -> Boot.start_link(%{base_dir: base}) end)
+boot_before_release = Task.await(boot_task, 1_000)
 
 assert {:ok, :ok} = wake_before_release
 assert {:ok, inventories} = catalog_before_release
@@ -141,7 +146,6 @@ assert is_map(inventories)
 assert {:ok, :ignore} = boot_before_release
 
 assert_receive {:wake_delivered, ^wake_id}
-assert_receive {:lane_terminal, "lane-rootfix", ^lane_seq}
 
 send(publication_pid, :release_publication)
 assert {:ok, :published} = Task.await(publication)

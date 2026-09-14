@@ -252,6 +252,8 @@ defmodule Tightbeam.Org do
 
   @doc false
   def put_setting_projected_in_txn(%Txn{} = txn, key, value) do
+    if key == "default-archetype", do: Txn.assert_archetype_available!(txn, value)
+
     updated_at = now()
 
     Txn.q(
@@ -370,6 +372,8 @@ defmodule Tightbeam.Org do
   @doc false
   @spec create_in_txn(Txn.t(), map()) :: session()
   def create_in_txn(%Txn{} = txn, input) do
+    Txn.assert_archetype_available!(txn, Map.fetch!(input, :archetype))
+
     session_key =
       Map.get(input, :session_key) || custom_session_key(Map.fetch!(input, :owner_user_id))
 
@@ -1139,6 +1143,8 @@ defmodule Tightbeam.Org do
   end
 
   defp repoint_archetype_in_txn(txn, session_key, archetype, allow_permanent?) do
+    Txn.assert_archetype_available!(txn, archetype)
+
     case Txn.q(txn, select_session_sql() <> " WHERE sessionKey = ?1", [session_key]) do
       [] ->
         {:error, :not_found}
@@ -1180,29 +1186,32 @@ defmodule Tightbeam.Org do
 
   Each enumerated reference carries the supported command sequence that clears
   it. The enumeration and its remedies therefore cannot acquire separate case
-  lists. `release` runs inside the DB owner's transaction when no references
-  remain, fencing every session and setting writer behind the publication.
+  lists. The reference check and fence are committed atomically; the callbacks
+  then run in the caller so filesystem and Git work cannot occupy the DB owner.
   """
-  @spec release_archetypes(db(), [String.t()], (Txn.t() -> prepared), (prepared -> result)) ::
+  @spec release_archetypes(db(), [String.t()], (() -> prepared), (prepared -> result)) ::
           {:referenced, [map()]} | {:released, result}
         when prepared: term(), result: term()
   def release_archetypes(db \\ Tightbeam.DB, archetypes, prepare, release)
-      when is_function(prepare, 1) and is_function(release, 1) do
-    case DB.transaction_then(
-           db,
-           fn txn ->
-             case archetype_references_in_txn(txn, archetypes) do
-               [] -> {:prepared, prepare.(txn)}
-               references -> {:referenced, references}
-             end
-           end,
-           fn
-             {:prepared, prepared} -> {:released, release.(prepared)}
-             {:referenced, references} -> {:referenced, references}
+      when is_function(prepare, 0) and is_function(release, 1) do
+    case DB.begin_reference_fence(db, archetypes, fn txn ->
+           case archetype_references_in_txn(txn, archetypes) do
+             [] -> {:ok, :clear}
+             references -> {:error, {:referenced, references}}
            end
-         ) do
-      {:ok, result} -> result
-      {:error, error} -> raise error
+         end) do
+      {:ok, token, :clear} ->
+        try do
+          {:released, release.(prepare.())}
+        after
+          :ok = DB.end_reference_fence(db, token)
+        end
+
+      {:error, {:referenced, references}} ->
+        {:referenced, references}
+
+      {:error, error} ->
+        raise error
     end
   end
 

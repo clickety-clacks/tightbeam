@@ -243,6 +243,45 @@ defmodule Tightbeam.DBTransactionThenTest do
   end
 
   @tag :outbox
+  test "archetype release fences refuse conflicting references but serve unrelated work", %{
+    db: db
+  } do
+    parent = self()
+
+    release =
+      Task.async(fn ->
+        assert {:ok, token, :clear} =
+                 DB.begin_reference_fence(db, ["coder"], fn _txn ->
+                   {:ok, :clear}
+                 end)
+
+        send(parent, {:reference_fence_started, token})
+
+        receive do
+          :release_reference_fence -> DB.end_reference_fence(db, token)
+        end
+      end)
+
+    assert_receive {:reference_fence_started, _token}
+
+    assert {:ok, :unrelated} =
+             DB.transaction(db, fn txn ->
+               Txn.q(txn, "INSERT INTO outbox_rows VALUES(1)")
+               :unrelated
+             end)
+
+    assert {:error, %DB.ReferenceFenceError{archetypes: ["coder"]}} =
+             DB.transaction(db, fn txn ->
+               Txn.assert_archetype_available!(txn, "coder")
+               :never
+             end)
+
+    assert {:ok, [[1]]} = DB.query(db, "SELECT id FROM outbox_rows")
+    send(release.pid, :release_reference_fence)
+    assert :ok = Task.await(release)
+  end
+
+  @tag :outbox
   test "cross-process and escaped handles cannot queue in another live transaction", %{
     db: db,
     sink: sink

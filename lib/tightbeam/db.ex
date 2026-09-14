@@ -31,6 +31,16 @@ defmodule Tightbeam.DB do
     defexception [:message]
   end
 
+  defmodule ReferenceFenceError do
+    @moduledoc "A reference write was refused while an archetype is being released."
+    defexception [:archetypes]
+
+    @impl true
+    def message(%__MODULE__{archetypes: archetypes}) do
+      "archetype release in progress: #{Enum.join(archetypes, ", ")}"
+    end
+  end
+
   ## Client
 
   @doc "Start the owner. Required: `:path` (SQLite file or `\":memory:\"`). Optional `:name`."
@@ -87,7 +97,7 @@ defmodule Tightbeam.DB do
   def transaction_then(server, prepare, after_commit)
       when is_function(prepare, 1) and is_function(after_commit, 1) do
     case GenServer.call(server, {:transaction, prepare}) do
-      {:ok, result} -> run_after_commit(after_commit, result)
+      {:ok, result} -> run_after_commit(after_commit, result, MapSet.new())
       {:error, error} -> {:error, error}
     end
   end
@@ -95,6 +105,23 @@ defmodule Tightbeam.DB do
   def transaction_then(server, prepare, after_commit)
       when is_function(prepare, 1) and is_function(after_commit, 2) do
     GenServer.call(server, {:transaction_then, prepare, after_commit})
+  end
+
+  @doc "Atomically check references and hold a monitored archetype-release fence."
+  @spec begin_reference_fence(
+          server(),
+          [String.t()],
+          (Tightbeam.DB.Txn.t() -> {:ok, term()} | {:error, term()})
+        ) :: {:ok, reference(), term()} | {:error, term()}
+  def begin_reference_fence(server \\ __MODULE__, archetypes, check)
+      when is_list(archetypes) and is_function(check, 1) do
+    GenServer.call(server, {:begin_reference_fence, Enum.uniq(archetypes), check, self()})
+  end
+
+  @doc "Release a fence previously returned by begin_reference_fence/3."
+  @spec end_reference_fence(server(), reference()) :: :ok
+  def end_reference_fence(server \\ __MODULE__, token) when is_reference(token) do
+    GenServer.call(server, {:end_reference_fence, token})
   end
 
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
@@ -111,9 +138,21 @@ defmodule Tightbeam.DB do
             conn: reference(),
             outbox: reference() | nil,
             outbox_owner: pid() | nil,
-            query_trace: term()
+            query_trace: term(),
+            fenced_archetypes: MapSet.t()
           }
-    defstruct [:conn, :outbox, :outbox_owner, :query_trace]
+    defstruct [:conn, :outbox, :outbox_owner, :query_trace, fenced_archetypes: MapSet.new()]
+
+    @doc false
+    @spec assert_archetype_available!(t(), String.t()) :: :ok
+    def assert_archetype_available!(%__MODULE__{fenced_archetypes: fenced}, archetype)
+        when is_binary(archetype) do
+      if MapSet.member?(fenced, archetype) do
+        raise Tightbeam.DB.ReferenceFenceError, archetypes: [archetype]
+      end
+
+      :ok
+    end
 
     @doc false
     def observe_queries(%__MODULE__{} = txn, trace), do: %{txn | query_trace: trace}
@@ -224,7 +263,7 @@ defmodule Tightbeam.DB do
         end
 
         :ok = load_topline_unicode(conn)
-        {:ok, %{conn: conn, admission: admission}}
+        {:ok, %{conn: conn, admission: admission, reference_fences: %{}}}
       rescue
         error ->
           :ok = Sqlite3.close(conn)
@@ -357,7 +396,7 @@ defmodule Tightbeam.DB do
     Process.put(row_commit_key(conn), [])
 
     try do
-      {:reply, commit_phase(conn, fun), state}
+      {:reply, commit_phase(conn, fun, fenced_archetypes(state)), state}
     after
       Process.delete(row_commit_key(conn))
     end
@@ -373,8 +412,8 @@ defmodule Tightbeam.DB do
 
     try do
       reply =
-        case commit_phase(conn, prepare) do
-          {:ok, result} -> run_after_commit(conn, after_commit, result)
+        case commit_phase(conn, prepare, fenced_archetypes(state)) do
+          {:ok, result} -> run_after_commit(conn, after_commit, result, fenced_archetypes(state))
           {:error, error} -> {:error, error}
         end
 
@@ -384,11 +423,67 @@ defmodule Tightbeam.DB do
     end
   end
 
+  def handle_call(
+        {:begin_reference_fence, archetypes, check, owner},
+        _from,
+        %{conn: conn, reference_fences: fences} = state
+      ) do
+    case overlapping_fences(fences, archetypes) do
+      [] ->
+        case fence_check_phase(conn, check, fenced_archetypes(state)) do
+          {:ok, result} ->
+            token = make_ref()
+            monitor = Process.monitor(owner)
+
+            fence = %{archetypes: MapSet.new(archetypes), owner: owner, monitor: monitor}
+
+            {:reply, {:ok, token, result},
+             %{state | reference_fences: Map.put(fences, token, fence)}}
+
+          {:error, error} ->
+            {:reply, {:error, error}, state}
+        end
+
+      overlapping ->
+        {:reply, {:error, %ReferenceFenceError{archetypes: overlapping}}, state}
+    end
+  end
+
+  def handle_call(
+        {:end_reference_fence, token},
+        {owner, _tag},
+        %{reference_fences: fences} = state
+      ) do
+    case Map.get(fences, token) do
+      %{owner: ^owner, monitor: monitor} ->
+        Process.demonitor(monitor, [:flush])
+        {:reply, :ok, %{state | reference_fences: Map.delete(fences, token)}}
+
+      nil ->
+        {:reply, :ok, state}
+
+      _fence ->
+        {:reply, {:error, :not_fence_owner}, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:DOWN, monitor, :process, owner, _reason}, %{reference_fences: fences} = state) do
+    fences =
+      Enum.reduce(fences, fences, fn {token, fence}, acc ->
+        if fence.monitor == monitor and fence.owner == owner,
+          do: Map.delete(acc, token),
+          else: acc
+      end)
+
+    {:noreply, %{state | reference_fences: fences}}
+  end
+
   defp row_commit_key(conn), do: {__MODULE__, :row_commits, conn}
 
   # Each real transaction owns a distinct queue. Invalidate it before sending
   # casts; later recognition failure cannot undo the first committed phase.
-  defp commit_phase(conn, fun) do
+  defp commit_phase(conn, fun, fenced_archetypes) do
     token = make_ref()
     key = {Txn, :outbox, token}
     Process.put(key, [])
@@ -398,7 +493,13 @@ defmodule Tightbeam.DB do
         :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
 
         try do
-          result = fun.(%Txn{conn: conn, outbox: token, outbox_owner: self()})
+          result =
+            fun.(%Txn{
+              conn: conn,
+              outbox: token,
+              outbox_owner: self(),
+              fenced_archetypes: fenced_archetypes
+            })
           :ok = Sqlite3.execute(conn, "COMMIT")
           {:committed, result, Enum.reverse(Process.get(key))}
         rescue
@@ -430,7 +531,8 @@ defmodule Tightbeam.DB do
       :ok
   end
 
-  defp run_after_commit(after_commit, result) when is_function(after_commit, 1) do
+  defp run_after_commit(after_commit, result, _fenced_archetypes)
+       when is_function(after_commit, 1) do
     try do
       {:ok, after_commit.(result)}
     rescue
@@ -438,8 +540,53 @@ defmodule Tightbeam.DB do
     end
   end
 
-  defp run_after_commit(conn, after_commit, result) when is_function(after_commit, 2) do
-    commit_phase(conn, fn txn -> after_commit.(txn, result) end)
+  defp run_after_commit(conn, after_commit, result, fenced_archetypes)
+       when is_function(after_commit, 2) do
+    commit_phase(conn, fn txn -> after_commit.(txn, result) end, fenced_archetypes)
+  end
+
+  defp fenced_archetypes(%{reference_fences: fences}) do
+    Enum.reduce(fences, MapSet.new(), fn {_token, fence}, acc ->
+      MapSet.union(acc, fence.archetypes)
+    end)
+  end
+
+  defp overlapping_fences(fences, archetypes) do
+    wanted = MapSet.new(archetypes)
+
+    fences
+    |> Enum.flat_map(fn {_token, fence} ->
+      MapSet.to_list(MapSet.intersection(wanted, fence.archetypes))
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp fence_check_phase(conn, check, fenced_archetypes) do
+    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+    try do
+      result =
+        check.(%Txn{conn: conn, fenced_archetypes: fenced_archetypes})
+
+      case result do
+        {:ok, value} ->
+          :ok = Sqlite3.execute(conn, "COMMIT")
+          {:ok, value}
+
+        {:error, reason} ->
+          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          {:error, reason}
+
+        other ->
+          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          {:error, {:invalid_reference_fence_check, other}}
+      end
+    rescue
+      error ->
+        :ok = Sqlite3.execute(conn, "ROLLBACK")
+        {:error, error}
+    end
   end
 
   @doc false

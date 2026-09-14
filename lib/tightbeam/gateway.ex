@@ -3598,32 +3598,31 @@ defmodule Tightbeam.Gateway do
   defp identity_unlearn_result(config, db, call) do
     name = call.params.name
     archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
-    invocation_id = Map.fetch!(call, :invocation_id)
-
-    release_identity_unlearn(config, db, call, name, archetypes, fn txn ->
-      candidate = Identity.unlearn!(config.base_dir, name, call.origin)
-
-      marker =
-        AdminProjection.begin_identity_publication_in_txn(
-          txn,
-          invocation_id,
-          candidate,
-          call.origin
-        )
-
-      {candidate, marker}
+    release_identity_unlearn(config, db, call, name, archetypes, fn ->
+      Identity.unlearn!(config.base_dir, name, call.origin)
     end)
   end
 
   defp release_identity_unlearn(config, db, call, name, archetypes, prepare) do
-    case Org.release_archetypes(db, archetypes, prepare, fn {candidate, marker} ->
-           case Identity.publish_live!(config.base_dir, candidate) do
-             {:ok, revision} ->
-               load_law!(config)
-               {:published, marker, revision}
+    case Org.release_archetypes(db, archetypes, prepare, fn candidate ->
+           case AdminProjection.begin_identity_publication(
+                  db,
+                  Map.fetch!(call, :invocation_id),
+                  candidate,
+                  call.origin
+                ) do
+             {:ok, marker} ->
+               case Identity.publish_live!(config.base_dir, candidate) do
+                 {:ok, revision} ->
+                   load_law!(config)
+                   {:published, marker, revision}
+
+                 {:error, error} ->
+                   {:denied, marker, error}
+               end
 
              {:error, error} ->
-               {:denied, marker, error}
+               {:marker_failed, error}
            end
          end) do
       {:referenced, references} ->
@@ -3653,6 +3652,14 @@ defmodule Tightbeam.Gateway do
           end)
 
         error
+
+      {:released, {:marker_failed, error}} ->
+        %{
+          state: "unlearn-failed",
+          code: "identity_marker_failed",
+          message: Exception.message(error),
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
     end
   end
 
@@ -3804,6 +3811,12 @@ defmodule Tightbeam.Gateway do
       {:error, :turn_in_progress} ->
         turn_in_progress([call.session_key])
 
+      {:error, :archetype_release_in_progress} ->
+        %{
+          code: "archetype_release_in_progress",
+          message: "cannot repoint to #{archetype} while it is being released"
+        }
+
       {:error, reason} ->
         %{
           code: "identity_repoint_failed",
@@ -3864,6 +3877,7 @@ defmodule Tightbeam.Gateway do
            end
          end) do
       {:ok, result} -> result
+      {:error, %DB.ReferenceFenceError{}} -> {:error, :archetype_release_in_progress}
       {:error, error} -> raise error
     end
   end
@@ -4571,6 +4585,12 @@ defmodule Tightbeam.Gateway do
       {:ok, {:error, :unknown_archetype}} ->
         %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
 
+      {:error, %DB.ReferenceFenceError{archetypes: names}} ->
+        %{
+          code: "archetype_release_in_progress",
+          message: "cannot set default-archetype while releasing #{Enum.join(names, ", ")}"
+        }
+
       {:error, error} ->
         raise error
     end
@@ -4712,7 +4732,7 @@ defmodule Tightbeam.Gateway do
 
     candidate = identity_candidate_from_marker(marker)
 
-    release_identity_unlearn(config, db, call, name, archetypes, fn _txn ->
+    release_identity_unlearn(config, db, call, name, archetypes, fn ->
       {candidate, marker}
     end)
   end
@@ -5709,6 +5729,13 @@ defmodule Tightbeam.Gateway do
 
         {:error, %Roles.TransactionError{error: error}} ->
           classified_denial("config_denied", error)
+
+        {:error, %DB.ReferenceFenceError{archetypes: names}} ->
+          %{
+            code: "archetype_release_in_progress",
+            message:
+              "cannot spawn #{archetype.name} while it is being released: #{Enum.join(names, ", ")}"
+          }
 
         {:error, error} ->
           raise error
