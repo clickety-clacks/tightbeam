@@ -1189,7 +1189,7 @@ defmodule Tightbeam.Org do
   lists. The reference check and fence are committed atomically; the callbacks
   then run in the caller so filesystem and Git work cannot occupy the DB owner.
   """
-  @spec release_archetypes(db(), [String.t()], (() -> prepared), (prepared -> result)) ::
+  @spec release_archetypes(db(), [String.t()], (-> prepared), (prepared -> result)) ::
           {:referenced, [map()]} | {:released, result}
         when prepared: term(), result: term()
   def release_archetypes(db \\ Tightbeam.DB, archetypes, prepare, release)

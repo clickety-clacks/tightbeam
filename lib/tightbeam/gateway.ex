@@ -3598,6 +3598,7 @@ defmodule Tightbeam.Gateway do
   defp identity_unlearn_result(config, db, call) do
     name = call.params.name
     archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
+
     release_identity_unlearn(config, db, call, name, archetypes, fn ->
       Identity.unlearn!(config.base_dir, name, call.origin)
     end)

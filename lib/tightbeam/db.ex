@@ -500,6 +500,7 @@ defmodule Tightbeam.DB do
               outbox_owner: self(),
               fenced_archetypes: fenced_archetypes
             })
+
           :ok = Sqlite3.execute(conn, "COMMIT")
           {:committed, result, Enum.reverse(Process.get(key))}
         rescue
