@@ -94,6 +94,7 @@ end
 # The initial nudge can run before enqueue; the explicit nudge plus this barrier
 # makes the runner's execution the fact that opens the trigger window.
 :ok = SessionLane.nudge("lane-rootfix")
+
 {_, runner_pid} =
   receive do
     {:runner_started, ^lane_seq, pid} -> {lane_seq, pid}
