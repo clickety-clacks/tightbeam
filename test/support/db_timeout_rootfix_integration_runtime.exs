@@ -143,7 +143,7 @@ assert_receive {:wake_delivered, ^wake_id}
 assert_receive {:lane_terminal, "lane-rootfix", ^lane_seq}
 
 send(publication_pid, :release_publication)
-assert {:ok, {:ok, :published}} = Task.await(publication)
+assert {:ok, :published} = Task.await(publication)
 
 assert Wakes.get(db, wake.wake_id).state == "fired"
 assert {:ok, [["delivered"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [lane_seq])
