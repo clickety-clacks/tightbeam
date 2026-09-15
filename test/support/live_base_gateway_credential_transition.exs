@@ -33,7 +33,13 @@ defmodule GuardCredentialTransition do
       config =
         Map.merge(config, %{
           port: 0,
-          sh: fn _ -> flunk("unexpected credential shell or warm") end,
+          sh: fn argv ->
+            if Enum.join(argv, " ") =~ "/models" do
+              {~S({"data":[{"id":"qwen3.5-35b"}]}) <> "\n200\n", 0}
+            else
+              flunk("unexpected credential shell or warm")
+            end
+          end,
           sh_out: fn _ -> flunk("unexpected credential byte probe") end
         })
 
@@ -84,6 +90,32 @@ defmodule GuardCredentialTransition do
         harness: "fixture",
         provider: "fixture_provider",
         model: Model.new("fixture-model")
+      })
+
+    pi_local =
+      Org.create(db, %{
+        session_key: "agent:credential-pi-local",
+        display_name: "Pi Spark",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "pi",
+        provider: "local_openai",
+        model: Model.new("qwen3.5-35b")
+      })
+
+    pi_opencode =
+      Org.create(db, %{
+        session_key: "agent:credential-pi-opencode",
+        display_name: "Pi OpenCodeGo",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "default",
+        host: "testhost",
+        harness: "pi",
+        provider: "opencode_go",
+        model: Model.new("gpt-5.6-luna")
       })
 
     Org.create(db, %{
@@ -138,7 +170,21 @@ defmodule GuardCredentialTransition do
       |> Keyword.put(:start, fn _provider, _kind -> :ok end)
       |> Keyword.put(:resume, fn _provider -> :ok end)
       |> Keyword.put(:onboarders, %{
-        openai: fn _state -> {:ok, %{bytes: ~S({"token":"replacement"}), expires_at: nil}} end
+        openai: fn _state -> {:ok, %{bytes: ~S({"token":"replacement"}), expires_at: nil}} end,
+        local_openai: fn _state ->
+          {:ok,
+           %{
+             bytes: ~S({"name":"spark","type":"local-openai","endpoint":"http://spark.test"}),
+             expires_at: nil
+           }}
+        end,
+        opencode_go: fn _state ->
+          {:ok,
+           %{
+             bytes: ~S({"opencode-go":{"type":"api_key","key":"replacement"}}),
+             expires_at: nil
+           }}
+        end
       })
 
     {:ok, hub} = Hub.start_link(name: Hub)
@@ -227,6 +273,14 @@ defmodule GuardCredentialTransition do
                  second.session_key,
                  "agent:credential-late"
                ])
+
+      assert :ok = Credentials.onboard(:local_openai, server)
+      _local_frames = collect_pushes(2, [])
+      assert_message_notices(hub, [pi_local.session_key])
+
+      assert :ok = Credentials.onboard(:opencode_go, server)
+      _opencode_frames = collect_pushes(2, [])
+      assert_message_notices(hub, [pi_opencode.session_key])
 
       assert Org.get(db, fixture_session.session_key).provider == "fixture_provider"
     after

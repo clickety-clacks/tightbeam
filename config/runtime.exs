@@ -13,6 +13,12 @@ if config_env() != :test do
     config :tightbeam, :cwd, value
   end
 
+  if value =
+       System.get_env("TIGHTBEAM_CREDENTIALS_DIRECTORY") ||
+         System.get_env("CREDENTIALS_DIRECTORY") do
+    config :tightbeam, :credentials_directory, value
+  end
+
   if value = System.get_env("TIGHTBEAM_DEFAULT_HARNESS") do
     config :tightbeam, :default_harness, Tightbeam.Harness.parse!(value).id()
   end

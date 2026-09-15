@@ -16,7 +16,9 @@ try do
   :ok = DB.assert_base_admitted!(db, base)
   marker = File.read!(Path.join(base, "build-owner.json"))
   alias Tightbeam.DeployReadiness, as: Ready
-  assert {:ok, [["artifact-content-v1-019"]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+  assert {:ok, [["pi-providers-artifact-content-v1-019"]]} =
+           DB.query(db, "SELECT shape FROM schema_stamp")
 
   :ok =
     DB.execute(db, """

@@ -124,6 +124,9 @@ pub fn onboard<S, H>(
     identity: &Identity,
     provider: &str,
     api_key: bool,
+    daemon_credential: bool,
+    local_endpoint: Option<&str>,
+    provider_name: Option<&str>,
     endpoint: &Endpoint,
     send_request: S,
     load_harnesses: H,
@@ -132,21 +135,57 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
 {
-    let kind = if api_key { "apiKey" } else { "subscription" };
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
             .ok()
             .filter(|name| !name.is_empty()),
         dispatch::provisioned(),
     )?;
+    onboard_for_machine(
+        identity,
+        provider,
+        api_key,
+        daemon_credential,
+        local_endpoint,
+        provider_name,
+        endpoint,
+        machine.as_deref(),
+        send_request,
+        load_harnesses,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn onboard_for_machine<S, H>(
+    identity: &Identity,
+    provider: &str,
+    api_key: bool,
+    daemon_credential: bool,
+    local_endpoint: Option<&str>,
+    provider_name: Option<&str>,
+    endpoint: &Endpoint,
+    machine: Option<&str>,
+    send_request: S,
+    load_harnesses: H,
+) -> Result<(), String>
+where
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+    H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
+{
+    let kind = if provider == "local-openai" || api_key || daemon_credential {
+        "apiKey"
+    } else {
+        "subscription"
+    };
     let begin = dispatch::build_onboard_phase_request(
         identity,
         provider,
         "begin",
         kind,
-        machine.as_deref(),
+        machine,
         None,
         None,
+        daemon_credential.then_some("daemonCredential"),
     );
     let ready = send_request(endpoint, &begin, None)?;
     let deadline = ready.as_ref().map_or_else(
@@ -160,7 +199,7 @@ where
         identity,
         send: &send_request,
         provider,
-        machine: machine.as_deref(),
+        machine,
         owner_user_id: ready.as_ref().and_then(owner_user_id),
     };
     let ready = match ready {
@@ -171,7 +210,7 @@ where
                 identity,
                 provider,
                 kind,
-                machine.as_deref(),
+                machine,
                 None,
                 None,
                 reason,
@@ -187,7 +226,7 @@ where
                 identity,
                 provider,
                 kind,
-                machine.as_deref(),
+                machine,
                 None,
                 None,
                 &reason,
@@ -196,6 +235,44 @@ where
             ));
         }
     };
+
+    if daemon_credential {
+        let finish = dispatch::build_onboard_phase_request(
+            identity,
+            provider,
+            "finish",
+            kind,
+            machine,
+            Some(lease_id),
+            None,
+            None,
+        );
+        let outcome = match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
+            Ok(reply) => onboarded_outcome(reply),
+            Err(reason) => Err(reason),
+        };
+        return match outcome {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("JSON value serializes")
+                );
+                Ok(())
+            }
+            Err(reason) => Err(cancel_after_begin(
+                identity,
+                provider,
+                kind,
+                machine,
+                Some(lease_id),
+                None,
+                &reason,
+                &ceremony,
+                &send_request,
+            )),
+        };
+    }
+
     let staging = match staging_path(&ready) {
         Ok(staging) => staging,
         Err(reason) => {
@@ -213,11 +290,23 @@ where
         }
     };
 
-    let staged: Result<(), StageFailure> = if api_key {
-        run_api_key_onboarding(provider, staging, machine.as_deref(), &ceremony)
-            .map_err(StageFailure::from)
+    let staged: Result<(), StageFailure> = if provider == "local-openai" {
+        run_local_openai_onboarding(
+            staging,
+            provider_name
+                .ok_or_else(|| "tightbeam onboard local-openai requires --name NAME".to_owned())?,
+            local_endpoint.ok_or_else(|| {
+                "tightbeam onboard local-openai requires --endpoint URL".to_owned()
+            })?,
+            api_key,
+            machine,
+            &ceremony,
+        )
+        .map_err(StageFailure::from)
+    } else if api_key {
+        run_api_key_onboarding(provider, staging, machine, &ceremony).map_err(StageFailure::from)
     } else {
-        run_provider_onboarding(provider, staging, machine.as_deref(), &ceremony)
+        run_provider_onboarding(provider, staging, machine, &ceremony)
     };
 
     if let Err(failure) = staged {
@@ -228,7 +317,7 @@ where
                 identity,
                 provider,
                 kind,
-                machine.as_deref(),
+                machine,
                 Some(lease_id),
                 None,
                 &reason,
@@ -247,7 +336,7 @@ where
             identity,
             provider,
             kind,
-            machine.as_deref(),
+            machine,
             Some(lease_id),
             classified,
             &reason,
@@ -261,8 +350,9 @@ where
         provider,
         "finish",
         kind,
-        machine.as_deref(),
+        machine,
         Some(lease_id),
+        None,
         None,
     );
     let outcome = match send_request(ceremony.endpoint, &finish, Some(ceremony.deadline)) {
@@ -282,7 +372,7 @@ where
                 identity,
                 provider,
                 kind,
-                machine.as_deref(),
+                machine,
                 Some(lease_id),
                 None,
                 &reason,
@@ -345,7 +435,7 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
 {
     let cancel = dispatch::build_onboard_phase_request(
-        identity, provider, "cancel", kind, machine, lease_id, classified,
+        identity, provider, "cancel", kind, machine, lease_id, classified, None,
     );
     match send_request(ceremony.endpoint, &cancel, Some(ceremony.deadline)) {
         // Matching on a SENTENCE, which makes `dispatch::ceremony_expired`'s wording part
@@ -580,6 +670,201 @@ fn deliver(supervised: &mut Supervised, bytes: &[u8]) -> Result<(), RunError> {
     supervised.write_all(pipe.as_raw_fd(), bytes)
 }
 
+fn run_local_openai_onboarding(
+    staging: &str,
+    provider_name: &str,
+    endpoint: &str,
+    api_key: bool,
+    machine: Option<&str>,
+    ceremony: &Ceremony<'_>,
+) -> Result<(), String> {
+    let provider_name = normalize_local_openai_name(provider_name)?;
+    let endpoint = normalize_local_openai_endpoint(endpoint)?;
+    let optional_key = if api_key {
+        Some(read_api_key("local-openai")?)
+    } else {
+        None
+    };
+    validate_local_openai_endpoint(
+        &endpoint,
+        optional_key.as_deref(),
+        machine,
+        ceremony.deadline,
+    )?;
+    bank_local_openai_credential(staging, &provider_name, &endpoint, optional_key.as_deref())
+}
+
+fn normalize_local_openai_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("tightbeam onboard local-openai requires --name NAME".to_owned());
+    }
+    if trimmed == "opencode-go" {
+        return Err("local-openai provider name opencode-go is reserved".to_owned());
+    }
+    if !trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase())
+    {
+        return Err(format!(
+            "local-openai provider name must start with a lowercase letter, got: {trimmed}"
+        ));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err(format!(
+            "local-openai provider name must contain only lowercase letters, digits, and hyphens, got: {trimmed}"
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn normalize_local_openai_endpoint(endpoint: &str) -> Result<String, String> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Err("tightbeam onboard local-openai requires --endpoint URL".to_owned());
+    }
+    if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        return Err(format!(
+            "local-openai endpoint must be an http(s) URL, got: {trimmed}"
+        ));
+    }
+    Ok(trimmed.trim_end_matches('/').to_owned())
+}
+
+fn validate_local_openai_endpoint(
+    endpoint: &str,
+    api_key: Option<&str>,
+    machine: Option<&str>,
+    deadline: Instant,
+) -> Result<(), String> {
+    let host = machine.map(str::to_owned).unwrap_or_else(this_host);
+    let endpoint = endpoint.to_owned();
+    let api_key = api_key.map(str::to_owned);
+    validation_before_deadline(
+        deadline,
+        "local-openai endpoint validation",
+        move |remaining| {
+            validate_local_openai_endpoint_with_timeout(
+                &endpoint,
+                api_key.as_deref(),
+                &host,
+                remaining,
+            )
+        },
+    )
+}
+
+fn validate_local_openai_endpoint_with_timeout(
+    endpoint: &str,
+    api_key: Option<&str>,
+    host: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let agent = validation_agent(timeout);
+    let url = format!("{endpoint}/models");
+    let mut request = agent.get(&url);
+    if let Some(key) = api_key {
+        request = request.set("authorization", &format!("Bearer {key}"));
+    }
+    match request.call() {
+        Ok(response) => {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            parse_local_openai_models_body(&body)
+        }
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response
+                .into_string()
+                .unwrap_or_else(|_| "<unreadable response body>".to_owned());
+            Err(format!(
+                "the local-openai endpoint was rejected on {host}: HTTP {status} {}. Nothing was \
+                 banked -- the local-openai credential on {host} is unchanged.",
+                body.trim()
+            ))
+        }
+        Err(ureq::Error::Transport(error)) => Err(unvalidated_api_key(
+            "local-openai",
+            &error.to_string(),
+            host,
+        )),
+    }
+}
+
+/// Fail closed unless the captured OpenAI `/models` shape carries at least one
+/// non-empty model id. Pure so malformed, empty, and positive bodies pin without
+/// a live HTTP server.
+fn parse_local_openai_models_body(body: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(body).map_err(|_| {
+        "the local-openai endpoint returned a /models response that is not valid JSON".to_owned()
+    })?;
+    if local_openai_model_ids(&value).is_empty() {
+        Err(
+            "the local-openai endpoint returned a /models response with no usable model id"
+                .to_owned(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
+fn local_openai_model_ids(value: &serde_json::Value) -> Vec<String> {
+    let Some(items) = value.get("data").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+fn bank_local_openai_credential(
+    staging: &str,
+    provider_name: &str,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let mut record = serde_json::json!({
+        "name": provider_name,
+        "type": "local-openai",
+        "endpoint": endpoint
+    });
+    if let Some(key) = api_key {
+        record["apiKey"] = serde_json::json!(key);
+    }
+    let path = std::path::Path::new(staging).join(format!("{provider_name}.json"));
+    let bytes = serde_json::to_vec_pretty(&record)
+        .map_err(|error| format!("could not encode the local-openai credential: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| {
+            format!(
+                "could not stage the local-openai credential at {}: {error}",
+                path.display()
+            )
+        })?;
+    file.write_all(&bytes).map_err(|error| {
+        format!(
+            "could not stage the local-openai credential at {}: {error}",
+            path.display()
+        )
+    })
+}
+
 fn run_provider_onboarding(
     provider: &str,
     staging: &str,
@@ -612,11 +897,12 @@ fn run_api_key_onboarding(
     machine: Option<&str>,
     ceremony: &Ceremony<'_>,
 ) -> Result<(), String> {
-    let key = read_api_key()?;
+    let key = read_api_key(provider)?;
     validate_api_key(provider, &key, machine, ceremony.deadline)?;
     match provider {
         "openai" => bank_openai_api_key(staging, &key, ceremony),
         "anthropic" => bank_anthropic_api_key(staging, &key),
+        "opencode-go" => bank_opencode_go_api_key(staging, &key),
         #[cfg(test)]
         "fixture-provider" => fs::write(std::path::Path::new(staging).join("fixture.json"), &key)
             .map_err(|error| error.to_string()),
@@ -633,9 +919,9 @@ fn run_api_key_onboarding(
 /// path is non-interactive by design anyway. So the terminal case is refused
 /// with the exact command that works, which is also the form codex's own
 /// `login --with-api-key` documents.
-fn read_api_key() -> Result<String, String> {
+fn read_api_key(provider: &str) -> Result<String, String> {
     if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
-        return Err(api_key_needs_a_pipe());
+        return Err(api_key_needs_a_pipe(provider));
     }
     read_api_key_from(&mut io::stdin())
 }
@@ -655,11 +941,51 @@ fn read_api_key_from(reader: &mut impl io::Read) -> Result<String, String> {
 /// `isatty` directly and a unit test cannot stub that, but the remedy it prints
 /// is the whole value of the refusal. Same shape, and same reason, as
 /// `unnamed_machine`.
-fn api_key_needs_a_pipe() -> String {
-    "--api-key reads the key from stdin and will not read from a terminal, because a key \
-     typed at a prompt ends up in your shell scrollback. Pipe it in instead, e.g.\n  \
-     printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key"
-        .to_owned()
+fn api_key_needs_a_pipe(provider: &str) -> String {
+    let (variable, command) = match provider {
+        "openai" => (
+            "OPENAI_API_KEY",
+            format!("tightbeam onboard {provider} --api-key"),
+        ),
+        "opencode-go" => (
+            "OPENCODE_API_KEY",
+            format!("tightbeam onboard {provider} --api-key"),
+        ),
+        "local-openai" => (
+            "LOCAL_OPENAI_API_KEY",
+            format!("tightbeam onboard {provider} --name NAME --endpoint URL --api-key"),
+        ),
+        _ => (
+            "ANTHROPIC_API_KEY",
+            format!("tightbeam onboard {provider} --api-key"),
+        ),
+    };
+    format!(
+        "--api-key reads the key from stdin and will not read from a terminal, because a key \
+         typed at a prompt ends up in your shell scrollback. Pipe it in instead, e.g.\n  \
+         printenv {variable} | {command}"
+    )
+}
+
+fn opencode_go_validation_request_id() -> String {
+    let minted = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("tightbeam-onboard-{}-{minted}", std::process::id())
+}
+
+fn opencode_go_validation_body() -> serde_json::Value {
+    serde_json::json!({
+        "model": "gpt-5.6-luna",
+        "input": [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Reply with OK."}]
+        }],
+        "max_output_tokens": 16,
+        "stream": false,
+        "store": false
+    })
 }
 
 /// One authenticated models call, made from THIS host, before anything is banked.
@@ -668,13 +994,15 @@ fn api_key_needs_a_pipe() -> String {
 /// reaches a command line -- not even a `curl` invocation this process would
 /// spawn, which would put a billing credential in the process table.
 ///
-/// Recorded 2026-07-28 against both routes with deliberately invalid keys:
+/// Recorded 2026-07-28 against both original routes with deliberately invalid keys:
 /// anthropic answers `x-api-key` with 401 "API key is invalid.", and openai
 /// answers a bearer key with 401 `invalid_api_key`. The openai result is the
 /// load-bearing one: a ChatGPT subscription token is refused from that same route
 /// with 403 naming the missing scope `api.model.read`, so the route does
-/// distinguish the two kinds. A VALID key has not been exercised against either
-/// route from this fleet -- see credential-kinds-v1.
+/// distinguish the two kinds. Recorded 2026-08-23 against OpenCode Go with a
+/// valid key: a Pi-shaped Responses request for `gpt-5.6-luna` returned 200 and
+/// Pi reported `stop_reason=stop`. The request floor of 16 output tokens is the
+/// provider minimum that Pi applies itself.
 fn validate_api_key(
     provider: &str,
     key: &str,
@@ -696,20 +1024,33 @@ fn validate_api_key_with_timeout(
     timeout: Duration,
 ) -> Result<(), String> {
     let agent = validation_agent(timeout);
-    let request = match provider {
+    let response = match provider {
         "anthropic" => agent
             .get("https://api.anthropic.com/v1/models?limit=1")
             .set("x-api-key", key)
-            .set("anthropic-version", "2023-06-01"),
+            .set("anthropic-version", "2023-06-01")
+            .call(),
         "openai" => agent
             .get("https://api.openai.com/v1/models")
-            .set("authorization", &format!("Bearer {key}")),
+            .set("authorization", &format!("Bearer {key}"))
+            .call(),
+        "opencode-go" => {
+            let request_id = opencode_go_validation_request_id();
+            agent
+                .post("https://opencode.ai/zen/go/v1/responses")
+                .set("authorization", &format!("Bearer {key}"))
+                .set("x-opencode-client", "pi")
+                .set("x-opencode-session", &request_id)
+                .set("x-client-request-id", &request_id)
+                .set("content-type", "application/json")
+                .send_string(&opencode_go_validation_body().to_string())
+        }
         #[cfg(test)]
         "fixture-provider" => return Ok(()),
         _ => return Err(format!("unsupported provider: {provider}")),
     };
 
-    match request.call() {
+    match response {
         Ok(_response) => Ok(()),
         Err(ureq::Error::Status(status, response)) => {
             let body = match response.into_string() {
@@ -826,6 +1167,26 @@ fn bank_anthropic_api_key(staging: &str, key: &str) -> Result<(), String> {
         .open(&path)
         .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))?;
     file.write_all(key.as_bytes())
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))
+}
+
+/// Pi reads OpenCode Go credentials from its native `auth.json` provider map.
+/// The key is serialized directly into the file; it never reaches a child
+/// process, an argument, or an environment variable.
+fn bank_opencode_go_api_key(staging: &str, key: &str) -> Result<(), String> {
+    let path = std::path::Path::new(staging).join("auth.json");
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "opencode-go": {"type": "api_key", "key": key}
+    }))
+    .map_err(|error| format!("could not encode the Pi credential: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))?;
+    file.write_all(&bytes)
         .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))
 }
 
@@ -2183,6 +2544,60 @@ mod tests {
     /// in the next.
     static DELIVERY_CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn daemon_credential_onboarding_never_requests_or_receives_staging_path() {
+        let endpoint = Endpoint {
+            base: "http://daemon-credential-fixture.invalid".to_owned(),
+            token: "fixture-token".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let sent = std::sync::Mutex::new(Vec::new());
+
+        onboard_for_machine(
+            &Identity::User("fixture-user".to_owned()),
+            "opencode-go",
+            false,
+            true,
+            None,
+            None,
+            &endpoint,
+            Some("fixture-machine"),
+            |_, request, _| {
+                let body: serde_json::Value = serde_json::from_str(&request.body_json).unwrap();
+                sent.lock().unwrap().push(body.clone());
+                match body
+                    .pointer("/params/phase")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("begin") => Ok(Some(serde_json::json!({
+                        "status": "ready",
+                        "leaseId": "fixture-lease",
+                        "leaseTtlMs": 300_000
+                    }))),
+                    Some("finish") => Ok(Some(serde_json::json!({
+                        "status": "onboarded",
+                        "credentialKind": "apiKey"
+                    }))),
+                    phase => panic!("unexpected daemon onboarding phase: {phase:?}"),
+                }
+            },
+            |_, _| Ok(None),
+        )
+        .expect("daemon credential ceremony completes without local staging");
+
+        let sent = sent.into_inner().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["params"]["source"], "daemonCredential");
+        assert!(
+            sent.iter()
+                .all(|body| body.pointer("/params/stagingPath").is_none())
+        );
+        assert!(
+            sent.iter()
+                .all(|body| !body.to_string().contains("fake-daemon-key"))
+        );
+    }
+
     /// The refusal is the whole value of not reading a key from a terminal, so
     /// the sentence is pinned rather than the `isatty` branch that produces it
     /// (which a unit test cannot stub). It must name the pipe form, because that
@@ -2190,11 +2605,90 @@ mod tests {
     /// guessing at an invocation that does not exist anywhere else.
     #[test]
     fn refusing_a_terminal_names_the_pipe_form() {
-        let message = api_key_needs_a_pipe();
+        let message = api_key_needs_a_pipe("anthropic");
 
         assert!(message.contains("printenv"));
         assert!(message.contains("--api-key"));
         assert!(message.contains("scrollback"));
+    }
+
+    #[test]
+    fn opencode_go_terminal_remedy_names_only_the_environment_variable() {
+        let message = api_key_needs_a_pipe("opencode-go");
+
+        assert!(message.contains("printenv OPENCODE_API_KEY"));
+        assert!(message.contains("onboard opencode-go --api-key"));
+    }
+
+    #[test]
+    fn local_openai_terminal_remedy_names_endpoint_and_local_key_variable() {
+        let message = api_key_needs_a_pipe("local-openai");
+
+        assert!(message.contains("printenv LOCAL_OPENAI_API_KEY"));
+        assert!(message.contains("onboard local-openai --name NAME --endpoint URL --api-key"));
+        assert!(!message.contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn local_openai_models_body_requires_a_non_empty_model_id() {
+        assert!(parse_local_openai_models_body(r#"{"data":[{"id":"spark-qwen"}]}"#).is_ok());
+
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"data":[{"id":""}]}"#),
+            Err(
+                "the local-openai endpoint returned a /models response with no usable model id"
+                    .to_owned()
+            )
+        );
+
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"data":[]}"#),
+            Err(
+                "the local-openai endpoint returned a /models response with no usable model id"
+                    .to_owned()
+            )
+        );
+
+        assert_eq!(
+            parse_local_openai_models_body("not json"),
+            Err(
+                "the local-openai endpoint returned a /models response that is not valid JSON"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn local_openai_models_body_rejects_fallback_shapes_and_whitespace_ids() {
+        let no_id = Err(
+            "the local-openai endpoint returned a /models response with no usable model id"
+                .to_owned(),
+        );
+
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"models":[{"id":"spark-qwen"}]}"#),
+            no_id
+        );
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"data":[{"name":"spark-qwen"}]}"#),
+            no_id
+        );
+        assert_eq!(
+            parse_local_openai_models_body(r#"{"data":[{"id":"   "}]}"#),
+            no_id
+        );
+    }
+
+    #[test]
+    fn opencode_go_validation_uses_the_live_pi_request_shape() {
+        let body = opencode_go_validation_body();
+
+        assert_eq!(body["model"], "gpt-5.6-luna");
+        assert_eq!(body["max_output_tokens"], 16);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["store"], false);
+        assert!(body.get("session_id").is_none());
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
     }
 
     /// A subscription credential is a BEARER token, and sending it as `x-api-key` would
@@ -2324,6 +2818,39 @@ mod tests {
     }
 
     #[test]
+    fn an_opencode_go_key_stages_native_pi_auth_without_an_argv_secret() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-opencode-go-stage-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).unwrap();
+
+        bank_opencode_go_api_key(staging.to_str().unwrap(), "fixture-go-key").unwrap();
+
+        let staged = staging.join("auth.json");
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&staged).unwrap()).unwrap();
+        assert_eq!(
+            decoded,
+            serde_json::json!({
+                "opencode-go": {"type": "api_key", "key": "fixture-go-key"}
+            })
+        );
+        let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let gateway = include_str!("../../lib/tightbeam/credentials.ex");
+        assert!(gateway.contains("staged_credential(:opencode_go"));
+        assert!(gateway.contains("Path.join(path, \"auth.json\")"));
+
+        let _ = fs::remove_dir_all(&staging);
+    }
+
+    #[test]
     fn fixture_provider_materializes_its_staged_credential() {
         let staging =
             std::env::temp_dir().join(format!("tightbeam-fixture-provider-{}", std::process::id()));
@@ -2447,6 +2974,9 @@ mod tests {
                 &Identity::User("signal-fixture".to_owned()),
                 "openai",
                 false,
+                false,
+                None,
+                None,
                 &endpoint,
                 |_, request, _| {
                     let request: serde_json::Value =
