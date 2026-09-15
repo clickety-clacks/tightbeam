@@ -1673,9 +1673,13 @@ defmodule Tightbeam.Credentials do
     try {
       const source = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
       if (!source || typeof source !== "object" || Array.isArray(source)) process.exit(65);
-      if (source.name !== process.argv[2] || typeof source.name !== "string") process.exit(65);
-      if (source.type !== "local-openai" || typeof source.type !== "string") process.exit(65);
-      if (typeof source.endpoint !== "string" || source.endpoint.trim() === "") process.exit(65);
+      if (typeof source.name !== "string") process.exit(65);
+      const name = source.name.trim();
+      if (!/^[a-z][a-z0-9-]*$/.test(name) || name.toLowerCase() === "opencode-go" ||
+          name !== process.argv[2]) process.exit(65);
+      if (source.type !== "local-openai") process.exit(65);
+      const endpoint = typeof source.endpoint === "string" ? source.endpoint.trim() : "";
+      if (endpoint === "" || (!endpoint.startsWith("http://") && !endpoint.startsWith("https://"))) process.exit(65);
       if (Object.prototype.hasOwnProperty.call(source, "apiKey") &&
           (typeof source.apiKey !== "string" || source.apiKey.trim() === "")) process.exit(65);
       process.stdout.write("__TIGHTBEAM_LOCAL_OPENAI_VALID__\\n");

@@ -311,6 +311,70 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
       refute Enum.any?(commands, &(Enum.join(&1, " ") =~ secret))
       assert old_descriptor =~ "old.example"
     end
+
+    test "remote finish rejects an ftp endpoint and leaves the old descriptor", ctx do
+      owner = self()
+
+      staged_descriptor =
+        ~s({"name":"spark","type":"local-openai","endpoint":"ftp://spark.example/v1"})
+
+      old_descriptor =
+        ~s({"name":"spark","type":"local-openai","endpoint":"https://old.example/v1"})
+
+      {:ok, store} = Agent.start_link(fn -> old_descriptor end)
+
+      sh = fn command ->
+        send(owner, {:remote_ftp_command, command})
+        joined = Enum.join(command, " ")
+
+        cond do
+          String.contains?(joined, "/bin/ls -1") ->
+            {"spark.json\n", 0}
+
+          String.contains?(joined, "__TIGHTBEAM_LOCAL_OPENAI_VALID__") ->
+            {"endpoint must be an http(s) URL\n", 65}
+
+          String.contains?(joined, "/bin/mv") ->
+            Agent.update(store, fn _ -> staged_descriptor end)
+            {"", 0}
+
+          true ->
+            {"", 0}
+        end
+      end
+
+      server =
+        start_supervised!(
+          {Credentials,
+           name: nil,
+           base_dir: ctx.base,
+           machine: "worker",
+           ssh: "fixture@worker",
+           ssh_bin: "/usr/bin/ssh",
+           sh: sh}
+        )
+
+      assert {:ok, staging, lease_id} = Credentials.begin_onboard(:local_openai, server)
+      refute File.exists?(staging)
+
+      assert {:error,
+              {:local_openai_failed, {:staged_local_openai_validation_failed, {:exit, 65}}}} =
+               Credentials.finish_onboard(:local_openai, :api_key, lease_id, server)
+
+      commands = collect_remote_ftp_commands([])
+
+      validation_command =
+        Enum.find(commands, &(Enum.join(&1, " ") =~ "__TIGHTBEAM_LOCAL_OPENAI_VALID__"))
+
+      assert validation_command
+      assert Enum.join(validation_command, " ") =~ "http://"
+      assert Enum.join(validation_command, " ") =~ "https://"
+      assert Agent.get(store, & &1) == old_descriptor
+      refute Enum.any?(commands, &(Enum.join(&1, " ") =~ "/bin/mv"))
+      assert staged_descriptor =~ "ftp://"
+
+      Agent.stop(store)
+    end
   end
 
   @tag :spark_live
@@ -466,6 +530,14 @@ defmodule Tightbeam.LocalOpenAiOnboardingTest do
   defp collect_remote_malformed_commands(acc) do
     receive do
       {:remote_malformed_command, command} -> collect_remote_malformed_commands([command | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp collect_remote_ftp_commands(acc) do
+    receive do
+      {:remote_ftp_command, command} -> collect_remote_ftp_commands([command | acc])
     after
       0 -> Enum.reverse(acc)
     end
