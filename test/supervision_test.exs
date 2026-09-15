@@ -1708,13 +1708,14 @@ defmodule Tightbeam.SupervisionTest do
     {:ok, _} =
       DB.query(ctx.db, "UPDATE decision_requests SET parkWakeId = NULL WHERE id = ?1", [stale_id])
 
-    # Finish the old park before the timer starts. The retry terminal is created only after
-    # initial recovery has settled, so its notification owns the first race and the real
-    # scheduled sweep is required to re-drive the permanent skip.
+    # Finish the old park before starting supervision. Keep the production timer long enough
+    # to prove the terminal notification owns the permanent skip; the test timer below then
+    # delivers the real scheduled-sweep handler that must re-drive it.
     name = :"park_sweep_supervision_#{System.unique_integer([:positive])}"
 
     start_supervised!(
-      {Supervision, db: proxy, handlers: ctx.handlers, prod_limit: 3, sweep_ms: 10, name: name}
+      {Supervision,
+       db: proxy, handlers: ctx.handlers, prod_limit: 3, sweep_ms: 120_000, name: name}
     )
 
     :sys.get_state(name)
@@ -1722,6 +1723,10 @@ defmodule Tightbeam.SupervisionTest do
     Supervision.notify_terminal(name, "holder", retry_seq)
 
     assert_receive {:request_changed_before_park, :withdraw, ^stale_id}
+    :sys.get_state(name)
+    :sys.get_state(name)
+    refute_receive {:request_rechecked, :withdraw, _}
+    Process.send_after(name, :scheduled_sweep, 0)
 
     try do
       assert_receive {:request_rechecked, :withdraw, 2}
