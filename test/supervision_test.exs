@@ -1703,22 +1703,30 @@ defmodule Tightbeam.SupervisionTest do
 
     proxy = :"park_withdraw_race_db_#{System.unique_integer([:positive])}"
     start_supervised!({ParkRaceDB, {proxy, ctx.db, self(), :withdraw}})
-    name = :"park_sweep_supervision_#{System.unique_integer([:positive])}"
-
-    start_supervised!(
-      {Supervision, db: proxy, handlers: ctx.handlers, prod_limit: 3, sweep_ms: 10, name: name}
-    )
-
-    :sys.get_state(name)
     cancel_wake!(ctx.db, Wakes.get(ctx.db, park_wake_id))
 
     {:ok, _} =
       DB.query(ctx.db, "UPDATE decision_requests SET parkWakeId = NULL WHERE id = ?1", [stale_id])
 
+    # Finish the old park before starting supervision. Keep the production timer long enough
+    # to prove the terminal notification owns the permanent skip; the test timer below then
+    # delivers the real scheduled-sweep handler that must re-drive it.
+    name = :"park_sweep_supervision_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      {Supervision,
+       db: proxy, handlers: ctx.handlers, prod_limit: 3, sweep_ms: 120_000, name: name}
+    )
+
+    :sys.get_state(name)
     retry_seq = terminal!(ctx.db, "holder")
     Supervision.notify_terminal(name, "holder", retry_seq)
 
     assert_receive {:request_changed_before_park, :withdraw, ^stale_id}
+    :sys.get_state(name)
+    :sys.get_state(name)
+    refute_receive {:request_rechecked, :withdraw, _}
+    Process.send_after(name, :scheduled_sweep, 0)
 
     try do
       assert_receive {:request_rechecked, :withdraw, 2}

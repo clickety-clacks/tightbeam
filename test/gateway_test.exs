@@ -114,6 +114,7 @@ defmodule Tightbeam.GatewayTest do
     Idempotency,
     LaneManager,
     Ledger,
+    LocalOpenAi.Providers,
     ModelCatalog,
     NoticeBatcher,
     Org,
@@ -2703,6 +2704,41 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
   end
 
+  test "Pi spawn validates the selected catalog provider independently", ctx do
+    base_dir = role_test_base("spawn-pi-selected-provider", false)
+    Archetypes.load!(base_dir)
+
+    put_host_catalog("testhost", "pi", [
+      {"spark/qwen3.5-35b", [], :local_openai}
+    ])
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :pi)
+      |> Map.put(:default_model, Model.new("spark/qwen3.5-35b"))
+      |> Map.put(:credential_status, fn
+        :local_openai, "testhost" -> {:needs_onboarding, :missing}
+        :opencode_go, "testhost" -> raise "unrelated OpenCode credential was consulted"
+      end)
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "needs_onboarding"},
+             message: message
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Spark selected provider",
+                 idempotency_key: "spawn-pi-selected-provider"
+               }
+             })
+
+    assert message =~ "local_openai"
+    refute message =~ "opencode_go"
+  end
+
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
     base_dir = placement_test_base("later-eligible", ["eurisko", "racter"])
     ensure_global_registry()
@@ -4509,6 +4545,61 @@ defmodule Tightbeam.GatewayTest do
       # The session row was never touched between the two reads.
       assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
     end
+
+    test "a Pi session reports the persisted local provider's credential kind", ctx do
+      store = Providers.provider_path(ctx.cred_base, "spark")
+      File.mkdir_p!(Path.dirname(store))
+
+      File.write!(
+        store,
+        JSON.encode!(%{
+          "name" => "spark",
+          "type" => "local-openai",
+          "endpoint" => "https://spark.example/v1"
+        })
+      )
+
+      metadata =
+        Path.join([
+          ctx.cred_base,
+          "homes",
+          "kindhost",
+          "pi",
+          ".tightbeam",
+          "local-openai-credential.json"
+        ])
+
+      File.mkdir_p!(Path.dirname(metadata))
+      File.write!(metadata, JSON.encode!(%{"provider" => "local_openai", "kind" => "api_key"}))
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE sessions SET harness = 'pi', provider = 'local_openai' WHERE sessionKey = 'k-kind'"
+        )
+
+      owner!(ctx.cred_base)
+
+      assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
+    end
+
+    test "an unknown persisted Pi provider fails closed instead of selecting OpenCode", ctx do
+      :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints = ON")
+
+      try do
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "UPDATE sessions SET harness = 'pi', provider = 'provider-from-nowhere' WHERE sessionKey = 'k-kind'"
+          )
+
+        assert_raise ArgumentError, ~r/unsupported persisted Pi credential provider/, fn ->
+          Gateway.session_status("k-kind", ctx.db)
+        end
+      after
+        :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints = OFF")
+      end
+    end
   end
 
   # A named field that is accepted and then dropped is the silent-no-op class
@@ -6249,7 +6340,12 @@ defmodule Tightbeam.GatewayTest do
   defp put_host_catalog(host, harness, models) do
     entries =
       Enum.map(models, fn spec ->
-        {family, efforts} = if is_tuple(spec), do: spec, else: {spec, []}
+        {family, efforts, provider} =
+          case spec do
+            {family, efforts, provider} -> {family, efforts, provider}
+            {family, efforts} -> {family, efforts, :anthropic}
+            family -> {family, [], :anthropic}
+          end
 
         %{
           family: family,
@@ -6259,7 +6355,7 @@ defmodule Tightbeam.GatewayTest do
           efforts: efforts,
           max_input_tokens: 200_000,
           capabilities: %{},
-          provider: :anthropic
+          provider: provider
         }
       end)
 
@@ -6507,6 +6603,19 @@ defmodule Tightbeam.GatewayTest do
   @tag :tmp_dir
   test "a turn onto a needs_onboarding host is refused by name and fails-tells-records", ctx do
     File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "missing")
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-checkout-refusal: ok"
+    )
+  end
+
+  @tag :cold_gateway
+  @tag :gateway_checkout_refusal
+  @tag :tmp_dir
+  test "a Pi turn uses its persisted local-openai provider in the onboarding remedy", ctx do
+    File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "pi-local")
 
     Tightbeam.GuardRuntimeFixture.run!(
       ctx.tmp_dir,

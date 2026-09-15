@@ -17,11 +17,16 @@ defmodule Tightbeam.RecoveryFixture do
         %{input: %{profile: profile}} =
           Enum.find(module.conformance_vectors()["ensure_adapter"], &(&1.case == "local_present"))
 
-        package =
-          Path.join(
-            arena,
-            "adapters/node_modules/@agentclientprotocol/#{profile.adapter_package}"
-          )
+        package_root =
+          case Map.get(profile, :adapter_scope, :agentclientprotocol) do
+            :unscoped ->
+              "adapters/node_modules/#{profile.adapter_package}"
+
+            :agentclientprotocol ->
+              "adapters/node_modules/@agentclientprotocol/#{profile.adapter_package}"
+          end
+
+        package = Path.join(arena, package_root)
 
         bundle = Path.join([package, "dist", profile.adapter_bundle])
         binary = Path.join(arena, "adapters/node_modules/.bin/#{profile.adapter_bin}")

@@ -22,7 +22,7 @@ defmodule Tightbeam.ModelCatalog do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Model, Placement, Unroutable}
+  alias Tightbeam.{Harness, Model, PiProvider, Placement, Unroutable}
 
   @default_ttl_ms :timer.minutes(15)
 
@@ -338,18 +338,20 @@ defmodule Tightbeam.ModelCatalog do
 
   # The RHS of the credential-present recognition (O4/I5): re-derive the catalog
   # for every harness that spends `provider` on `host`, NOW, reading current
-  # world-state. Provider-scoped by the same rule the runtime uses — a harness
-  # spends exactly one provider's credential — so a claude re-derivation is never
-  # gated on codex, and vice-versa.
+  # world-state. Pi also consumes named local providers; the other harnesses
+  # retain their single-provider association.
   @impl true
   def handle_cast({:credential_present, host, provider}, state) do
     keys =
       for harness <- harness_names(),
-          Harness.parse!(harness).credential_provider() == provider,
+          catalog_uses_provider?(Harness.parse!(harness), provider),
           do: {host, harness}
 
     {:noreply, Enum.reduce(keys, state, &force_rederive(&2, &1))}
   end
+
+  defp catalog_uses_provider?(Tightbeam.Harness.Pi, :local_openai), do: true
+  defp catalog_uses_provider?(module, provider), do: module.credential_provider() == provider
 
   @impl true
   def handle_info(:refresh_due, state), do: {:noreply, refresh_due(state)}
@@ -499,11 +501,18 @@ defmodule Tightbeam.ModelCatalog do
   defp safely_derive({host, harness}, probe, state) do
     try do
       module = Harness.parse!(harness)
-      provider = module.credential_provider()
 
-      with :onboarded <- credential_status(state, provider, host),
+      catalog_state =
+        probe
+        |> Map.put(:host_name, host)
+        |> Map.put(:options, state.options)
+        |> Map.put(:credential_status, fn provider, machine ->
+          credential_status(state, provider, machine)
+        end)
+
+      with :onboarded <- catalog_onboarding_status(module, catalog_state, state, host),
            kind when kind in [:api_key, :subscription] <-
-             credential_kind(state, provider, host) do
+             catalog_credential_kind(module, catalog_state, state, host) do
         probe = Map.put(probe, :credential_kind, kind)
 
         module.fetch_catalog(probe)
@@ -528,6 +537,45 @@ defmodule Tightbeam.ModelCatalog do
     catch
       kind, reason -> {:error, {kind, reason}}
     end
+  end
+
+  defp catalog_onboarding_status(Tightbeam.Harness.Pi, catalog_state, state, host) do
+    cond do
+      credential_status(state, :opencode_go, host) ==
+          {:needs_onboarding, :credential_server_unavailable} ->
+        {:needs_onboarding, :credential_server_unavailable}
+
+      credential_status(state, :local_openai, host) ==
+          {:needs_onboarding, :credential_server_unavailable} ->
+        {:needs_onboarding, :credential_server_unavailable}
+
+      PiProvider.pi_catalog_ready?(catalog_state) ->
+        :onboarded
+
+      true ->
+        {:needs_onboarding, :missing}
+    end
+  end
+
+  defp catalog_onboarding_status(module, _catalog_state, state, host) do
+    credential_status(state, module.credential_provider(), host)
+  end
+
+  defp catalog_credential_kind(Tightbeam.Harness.Pi, _catalog_state, state, host) do
+    cond do
+      credential_status(state, :opencode_go, host) == :onboarded ->
+        credential_kind(state, :opencode_go, host)
+
+      credential_status(state, :local_openai, host) == :onboarded ->
+        :api_key
+
+      true ->
+        :api_key
+    end
+  end
+
+  defp catalog_credential_kind(module, _catalog_state, state, host) do
+    credential_kind(state, module.credential_provider(), host)
   end
 
   defp credential_status(%{credential_status: status}, provider, _host)

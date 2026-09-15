@@ -2,9 +2,10 @@
 
 Stop it, back it up, swap the code, start it, and verify the durable rows.
 Most upgrades are ordinary restarts because the ledger is durable. Tightbeam
-0.1.8 also carries one exact migration: `model-identity-v1` (0.1.7) to
-`operator-decision-requests-v1` (0.1.8). The gateway refuses every other old
-stamp. It never infers a schema from stored DDL.
+0.1.8 also carries one exact migration chain: `model-identity-v1` (0.1.7) to
+`operator-decision-requests-v1`, then to `pi-harness-v1`. A database already at
+the intermediate stamp runs only the second step. The gateway refuses every
+other old stamp. It never infers a schema from stored DDL.
 
 If the gateway is service-managed, installing a new package only swaps the
 executable on disk; it does not restart the running process. After the package
@@ -31,25 +32,28 @@ The primary database does not migrate a satellite database for it. A macOS host
 whose registry entry says `baseDir=/Users/mike/.tightbeam`, for example, must be
 stopped, backed up, upgraded, and started on that host.
 
-## The supported 0.1.7 to 0.1.8 migration
+## The supported 0.1.7 to 0.1.8 migration chain
 
 Let the 0.1.8 gateway perform this migration at first boot. Do not edit the
 stamp or issue manual `ALTER TABLE` statements.
 
-The migration accepts exactly one source stamp:
+The migration accepts exactly these source transitions:
 
 ```text
-model-identity-v1 -> operator-decision-requests-v1
+model-identity-v1 -> operator-decision-requests-v1 -> pi-harness-v1
 ```
 
-It runs in one SQLite transaction. It rebuilds `decision_requests` with the
+The first step runs in one SQLite transaction. It rebuilds `decision_requests` with the
 0.1.8 operator-request constraint and `ruledViaSessionKey` column. It also
 rebuilds `messages` with the 0.1.8 marker-envelope columns and constraint. It
 copies every 0.1.7 row, sets the new fields to `NULL`, and creates the exact
 0.1.8 indexes. The 0.1.7 and 0.1.8 `wakes` table definitions are identical, so
 the migration does not rewrite wakes; it checks that their row count is
-unchanged in the same transaction. The stamp changes last. Any failure rolls
-back both table rebuilds, copied rows, indexes, and the stamp together.
+unchanged in the same transaction. The second transaction rebuilds `sessions`
+with the same columns and rows but adds `pi` and `opencode_go` to the closed
+harness/provider constraints. The stamp changes last in each transaction. Any
+failure rolls back that transaction's table rebuilds, copied rows, indexes, and
+stamp together.
 The serialized database owner suspends foreign-key enforcement only around the
 transaction because SQLite otherwise checks child rows during `DROP TABLE`.
 The transaction runs `foreign_key_check` before it stamps or commits, and the
@@ -96,7 +100,7 @@ upgrade_port=12384
 3. Install an unmodified 0.1.8 package in a second isolated prefix and start it
    against a fresh copy of the fixture. Require a named `ShapeError` that shows
    `model-identity-v1` as the stored stamp and
-   `operator-decision-requests-v1` as the build stamp. It must not serve. Keep
+   `pi-harness-v1` as the build stamp. It must not serve. Keep
    the migrated-run copy separate from this refusal control.
 4. Before installing the migration candidate, require this exact stamp and
    record the populations:
@@ -149,13 +153,16 @@ upgrade_port=12384
    sqlite3 -readonly "$upgrade_db" \
      "SELECT count(*) FROM sqlite_master
       WHERE type='table' AND name IN
-        ('decision_requests_model_identity_v1','messages_new');"
+        ('decision_requests_model_identity_v1','messages_new','sessions_new');"
+   sqlite3 -readonly "$upgrade_db" \
+     "SELECT instr(sql, \"'pi'\"), instr(sql, \"'opencode_go'\")
+      FROM sqlite_master WHERE type='table' AND name='sessions';"
    ```
 
-   PASS means the stamp is `operator-decision-requests-v1`, `quick_check` is
+   PASS means the stamp is `pi-harness-v1`, `quick_check` is
    `ok`, `foreign_key_check` prints nothing, the new request-column and index
    counts are `1`, the new message-column count is `4`, and the temporary-table
-   count is `0`.
+   count is `0`. Both session-constraint positions must be greater than zero.
 8. Repeat all population counts and deterministic hashes. Require exact
    equality with steps 4 and 5. Start the 0.1.8 gateway a second time and
    require the same stamp timestamp, counts, and hashes again; this proves an

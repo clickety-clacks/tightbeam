@@ -2830,7 +2830,9 @@ defmodule Tightbeam.RailRemedyTest do
   defp assignment(ctx, subject, effect_kind_or_work_item_id \\ nil) do
     {effect_kind, work_item_id} =
       case effect_kind_or_work_item_id do
-        nil -> {"code", nil}
+        nil ->
+          {"code", nil}
+
         kind when kind in ~w(code policy release live_mutation evidence review coordination) ->
           {kind, nil}
 

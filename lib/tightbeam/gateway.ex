@@ -122,7 +122,8 @@ defmodule Tightbeam.Gateway do
           escalation_decision_deadline_ms: pos_integer(),
           effort_checkin_horizon_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
-          onboarding_lease_ms: pos_integer()
+          onboarding_lease_ms: pos_integer(),
+          credentials_directory: String.t() | nil
         }
 
   @doc """
@@ -387,6 +388,7 @@ defmodule Tightbeam.Gateway do
       [
         name: Tightbeam.Credentials.server(machine),
         base_dir: host.base_dir,
+        credentials_directory: Map.get(config, :credentials_directory),
         staging_base_dir: config.base_dir,
         machine: machine,
         ssh: host.ssh,
@@ -2618,7 +2620,7 @@ defmodule Tightbeam.Gateway do
   # "there is one and it stopped working" — and a client watching the field
   # simply vanish could not tell either from a decoder change.
   defp credential_kind(session) do
-    provider = Harness.parse!(session.harness).credential_provider()
+    provider = session_credential_provider(session)
     server = Tightbeam.Credentials.server(session.host)
 
     case GenServer.whereis(server) do
@@ -2641,6 +2643,33 @@ defmodule Tightbeam.Gateway do
   defp wire_credential_kind(:api_key), do: "apiKey"
   defp wire_credential_kind(:subscription), do: "subscription"
   defp wire_credential_kind(:none), do: "none"
+
+  # Pi has one harness and more than one credential owner. The provider stored
+  # on a session is therefore authoritative for Pi rows. Parse that field as a
+  # closed vocabulary so a damaged row cannot silently fall back to OpenCode.
+  defp session_credential_provider(%{harness: harness, provider: provider})
+       when harness in ["pi", :pi] do
+    case provider do
+      "opencode_go" ->
+        :opencode_go
+
+      "local_openai" ->
+        :local_openai
+
+      :opencode_go ->
+        :opencode_go
+
+      :local_openai ->
+        :local_openai
+
+      other ->
+        raise ArgumentError,
+              "unsupported persisted Pi credential provider #{inspect(other)}"
+    end
+  end
+
+  defp session_credential_provider(session),
+    do: Harness.parse!(session.harness).credential_provider()
 
   defp defaults(config, db) do
     module = Harness.module!(config.default_harness)
@@ -4075,7 +4104,7 @@ defmodule Tightbeam.Gateway do
   defp apply_failure(%{"message" => message}) when is_binary(message), do: message
   defp apply_failure(reason), do: inspect(reason)
 
-  @onboarding_providers ["openai", "anthropic"] ++
+  @onboarding_providers ["openai", "anthropic", "opencode-go", "local-openai"] ++
                           if(Application.compile_env(:tightbeam, :fixture_harness, false),
                             do: ["fixture-provider"],
                             else: []
@@ -4086,7 +4115,8 @@ defmodule Tightbeam.Gateway do
     machine = params[:machine] || Placement.local_host_name()
 
     with true <- Map.has_key?(Placement.hosts(config.base_dir, gateway_db(config)), machine),
-         {:ok, kind} <- onboarding_kind(params[:kind]) do
+         {:ok, kind} <- provider_onboarding_kind(provider, params[:kind]),
+         {:ok, source} <- onboarding_source(provider, phase, params[:source]) do
       config
       |> onboard_phase(
         provider_atom(provider),
@@ -4094,18 +4124,37 @@ defmodule Tightbeam.Gateway do
         machine,
         kind,
         params[:lease_id],
-        params[:reason]
+        params[:reason],
+        source
       )
       |> with_owner_user_id(phase, gateway_db(config), call.origin)
     else
       false ->
         %{code: "unknown_host", message: "unknown onboarding machine #{machine}"}
 
+      {:error, :api_key_only} ->
+        %{
+          code: "invalid_message",
+          message: "#{provider} requires credential kind apiKey; subscription is unsupported"
+        }
+
       :error ->
         %{
           code: "invalid_message",
           message:
             "unknown credential kind #{inspect(params[:kind])}; expected apiKey or subscription"
+        }
+
+      {:error, :daemon_credential_source_unsupported} ->
+        %{
+          code: "invalid_message",
+          message: "daemon credential delivery is supported only for opencode-go begin"
+        }
+
+      {:error, :unknown_credential_source} ->
+        %{
+          code: "invalid_message",
+          message: "unknown credential source #{inspect(params[:source])}"
         }
     end
   end
@@ -4117,7 +4166,16 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp onboard_phase(config, provider, "begin", machine, kind, _lease_id, _reason) do
+  defp onboard_phase(
+         config,
+         provider,
+         "begin",
+         machine,
+         kind,
+         _lease_id,
+         _reason,
+         :interactive
+       ) do
     case Tightbeam.Credentials.begin_onboard(provider, Tightbeam.Credentials.server(machine)) do
       {:ok, path, lease_id} ->
         # The lease TTL rides the reply so the CLI's ceremony watchdog and the
@@ -4145,7 +4203,44 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "finish", machine, kind, lease_id, _reason) do
+  defp onboard_phase(
+         config,
+         provider,
+         "begin",
+         machine,
+         kind,
+         _lease_id,
+         _reason,
+         :daemon_credential
+       ) do
+    case Tightbeam.Credentials.begin_daemon_onboard(
+           provider,
+           Tightbeam.Credentials.server(machine)
+         ) do
+      {:ok, lease_id} ->
+        %{
+          provider: provider,
+          kind: wire_credential_kind(kind),
+          status: "ready",
+          lease_id: lease_id,
+          lease_ttl_ms: config.onboarding_lease_ms
+        }
+
+      {:error, reason} ->
+        %{code: "needs_onboarding", message: inspect(reason)}
+    end
+  end
+
+  defp onboard_phase(
+         _config,
+         provider,
+         "finish",
+         machine,
+         kind,
+         lease_id,
+         _reason,
+         _source
+       ) do
     case Tightbeam.Credentials.finish_onboard(
            provider,
            kind,
@@ -4169,7 +4264,16 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "cancel", machine, _kind, lease_id, reason) do
+  defp onboard_phase(
+         _config,
+         provider,
+         "cancel",
+         machine,
+         _kind,
+         lease_id,
+         reason,
+         _source
+       ) do
     case Tightbeam.Credentials.cancel_onboard(
            provider,
            lease_id,
@@ -4217,8 +4321,27 @@ defmodule Tightbeam.Gateway do
   defp onboarding_kind("apiKey"), do: {:ok, :api_key}
   defp onboarding_kind(_unknown), do: :error
 
+  defp provider_onboarding_kind("opencode-go", "apiKey"), do: {:ok, :api_key}
+  defp provider_onboarding_kind("opencode-go", _kind), do: {:error, :api_key_only}
+  defp provider_onboarding_kind("local-openai", "subscription"), do: {:error, :api_key_only}
+  defp provider_onboarding_kind("local-openai", _kind), do: {:ok, :api_key}
+  defp provider_onboarding_kind(_provider, kind), do: onboarding_kind(kind)
+
+  defp onboarding_source(_provider, _phase, nil), do: {:ok, :interactive}
+
+  defp onboarding_source("opencode-go", "begin", "daemonCredential"),
+    do: {:ok, :daemon_credential}
+
+  defp onboarding_source(_provider, _phase, "daemonCredential"),
+    do: {:error, :daemon_credential_source_unsupported}
+
+  defp onboarding_source(_provider, _phase, _source),
+    do: {:error, :unknown_credential_source}
+
   defp provider_atom("openai"), do: :openai
   defp provider_atom("anthropic"), do: :anthropic
+  defp provider_atom("opencode-go"), do: :opencode_go
+  defp provider_atom("local-openai"), do: :local_openai
   defp provider_atom("fixture-provider"), do: :fixture_provider
 
   defp role_bind_result(db, call) do
@@ -5421,10 +5544,16 @@ defmodule Tightbeam.Gateway do
       Enum.reduce_while(archetype.where, [], fn host, failures ->
         candidate =
           with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
-               :ok <- validate_credential(config, harness, host),
                model = spawn_model_selection(host, harness, p, default_model),
+               :ok <- validate_credential(config, harness, host, model),
                {:ok, routed} <- route_spawn_candidate(host, harness, model),
-               :ok <- Spinup.ensure_ready(config, module.id(), host, spinup_opts(config, db)) do
+               :ok <-
+                 Spinup.ensure_ready(
+                   config,
+                   module.id(),
+                   host,
+                   spinup_opts(config, db, harness, host, model)
+                 ) do
             {:ok, %{host: host, model: model, routed: routed}}
           end
 
@@ -5492,10 +5621,16 @@ defmodule Tightbeam.Gateway do
         %{host: ^host} ->
           model = spawn_model_selection(host, harness_string, p, default_model)
 
-          with :ok <- validate_credential(config, harness_string, host),
+          with :ok <- validate_credential(config, harness_string, host, model),
                {:ok, routed} <-
                  validate_catalog_model(host, harness_string, model, from_default?(p)),
-               :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)),
+               :ok <-
+                 Spinup.ensure_ready(
+                   config,
+                   harness_atom,
+                   host,
+                   spinup_opts(config, db, harness_string, host, model)
+                 ),
                do: {:ok, {model, routed}}
       end
 
@@ -5706,7 +5841,7 @@ defmodule Tightbeam.Gateway do
                     resolve_selection(session.host, harness, p, selection_base)
                   )
 
-                with :ok <- validate_credential(config, harness, session.host),
+                with :ok <- validate_credential(config, harness, session.host, model),
                      {:ok, routed} <-
                        validate_catalog_model(
                          session.host,
@@ -5719,7 +5854,7 @@ defmodule Tightbeam.Gateway do
                          config,
                          harness_atom,
                          session.host,
-                         spinup_opts(config, db)
+                         spinup_opts(config, db, harness, session.host, model)
                        ) do
                   case at_tune_boundary(config, db, session.session_key, fn ->
                          run_session_mutation(session.session_key, fn ->
@@ -5759,7 +5894,12 @@ defmodule Tightbeam.Gateway do
               {:ok, host} ->
                 harness = Harness.parse!(session.harness).id()
 
-                case Spinup.ensure_ready(config, harness, host, spinup_opts(config, db)) do
+                case Spinup.ensure_ready(
+                       config,
+                       harness,
+                       host,
+                       spinup_opts(config, db, session.harness, host, session.model)
+                     ) do
                   {:error, denial} ->
                     denial
 
@@ -6781,8 +6921,8 @@ defmodule Tightbeam.Gateway do
     %{code: Unroutable.code(unroutable), message: Unroutable.message(unroutable)}
   end
 
-  defp validate_credential(config, harness, machine) do
-    provider = Harness.parse!(harness).credential_provider()
+  defp validate_credential(config, harness, machine, model) do
+    provider = selected_credential_provider(harness, machine, model)
     status = credential_status(config, provider, machine)
 
     case status do
@@ -6797,6 +6937,21 @@ defmodule Tightbeam.Gateway do
          }}
     end
   end
+
+  # Pi is one harness with independently banked providers. The selected live
+  # catalog row, not the harness's historical default, owns the credential
+  # preflight. When there is no selected row, preserve the established harness
+  # fallback so an unavailable catalog still names the credential that can make
+  # that harness bootable.
+  defp selected_credential_provider(harness, machine, %Model{} = model) do
+    case ModelCatalog.entry(machine, harness, model, ModelCatalog) do
+      {%{provider: provider}, _health} when is_atom(provider) -> provider
+      _ -> Harness.parse!(harness).credential_provider()
+    end
+  end
+
+  defp selected_credential_provider(harness, _machine, _model),
+    do: Harness.parse!(harness).credential_provider()
 
   # Single source of truth: a credential-failure `reason` -> the actionable remedy
   # sentence. Every credential-refusal seam (spawn `validate_credential`, the turn
@@ -6816,7 +6971,7 @@ defmodule Tightbeam.Gateway do
   # interim flatten still removes the old false "run onboard" (the r4.2 fix). This mirrors the
   # :prompt-401 deferral to Card 2 — defer the precise naming to the card that owns the signal.
   defp credential_remedy(reason, provider, host) do
-    onboard = "Run on #{host}: tightbeam onboard #{provider} --as-user <userId>"
+    onboard = "Run on #{host}: " <> Tightbeam.Credentials.onboard_command(provider)
 
     case reason do
       :missing ->
@@ -6891,7 +7046,7 @@ defmodule Tightbeam.Gateway do
     case health do
       {:unavailable, {:needs_onboarding, reason}} ->
         if affirmative_credential_reason?(reason) do
-          provider = Harness.parse!(session.harness).credential_provider()
+          provider = session_credential_provider(session)
           {:refused, credential_remedy(reason, provider, session.host)}
         else
           :not_applicable
@@ -6986,7 +7141,11 @@ defmodule Tightbeam.Gateway do
       sessions:
         db
         |> Org.list_for_user("", true)
-        |> Enum.filter(&(MapSet.member?(harnesses, &1.harness) and &1.host == machine))
+        |> Enum.filter(fn session ->
+          MapSet.member?(harnesses, session.harness) and
+            session.host == machine and
+            session.provider == Atom.to_string(provider)
+        end)
     }
   end
 
@@ -7071,6 +7230,8 @@ defmodule Tightbeam.Gateway do
          {:provider_runtime_start_failed, %{started: Enum.reverse(started), failed: failed}}}
     end
   end
+
+  defp harnesses_for_provider(:local_openai), do: [Tightbeam.Harness.Pi]
 
   defp harnesses_for_provider(provider),
     do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
@@ -7171,11 +7332,23 @@ defmodule Tightbeam.Gateway do
   defp empty_override_to_nil(map) when map_size(map) == 0, do: nil
   defp empty_override_to_nil(map), do: map
 
-  defp spinup_opts(config, db) do
-    [db: db]
+  defp spinup_opts(config, db, harness, host, model) do
+    provider = selected_credential_provider(harness, host, model)
+
+    [db: db, credential_provider: provider]
     |> maybe_put_opt(:sh, config[:sh])
     |> maybe_put_opt(:patch_adapter, config[:patch_adapter])
+    |> maybe_put_opt(:credential_names, selected_credential_names(provider, model))
   end
+
+  defp selected_credential_names(:local_openai, %Model{family: family}) do
+    case String.split(family, "/", parts: 2) do
+      [name, _model] -> ["#{name}.json"]
+      _ -> nil
+    end
+  end
+
+  defp selected_credential_names(_provider, _model), do: nil
 
   defp maybe_put_opt(opts, _key, nil), do: opts
   defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
