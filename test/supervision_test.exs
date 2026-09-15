@@ -1703,6 +1703,14 @@ defmodule Tightbeam.SupervisionTest do
 
     proxy = :"park_withdraw_race_db_#{System.unique_integer([:positive])}"
     start_supervised!({ParkRaceDB, {proxy, ctx.db, self(), :withdraw}})
+    cancel_wake!(ctx.db, Wakes.get(ctx.db, park_wake_id))
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE decision_requests SET parkWakeId = NULL WHERE id = ?1", [stale_id])
+
+    # Finish the old park before the timer starts. The retry terminal is created only after
+    # initial recovery has settled, so its notification owns the first race and the real
+    # scheduled sweep is required to re-drive the permanent skip.
     name = :"park_sweep_supervision_#{System.unique_integer([:positive])}"
 
     start_supervised!(
@@ -1710,11 +1718,6 @@ defmodule Tightbeam.SupervisionTest do
     )
 
     :sys.get_state(name)
-    cancel_wake!(ctx.db, Wakes.get(ctx.db, park_wake_id))
-
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE decision_requests SET parkWakeId = NULL WHERE id = ?1", [stale_id])
-
     retry_seq = terminal!(ctx.db, "holder")
     Supervision.notify_terminal(name, "holder", retry_seq)
 

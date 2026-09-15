@@ -1605,8 +1605,7 @@ defmodule Tightbeam.CredentialsTest do
     File.mkdir_p!(home)
     entry = Path.join(home, ".credentials.json")
     File.write!(entry, @healthy_vendor_record)
-    {:ok, server} = start_credentials(name: nil, base_dir: base, machine: "eezo")
-    on_exit(fn -> if Process.alive?(server), do: GenServer.stop(server) end)
+    server = start_supervised_credentials(name: nil, base_dir: base, machine: "eezo")
     assert {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
     File.write!(Path.join(staging, ".credentials.json"), bytes)
 
@@ -1621,6 +1620,14 @@ defmodule Tightbeam.CredentialsTest do
     assert File.lstat!(entry).type == :regular
     refute File.exists?(Path.join(base, "auth"))
     refute_receive {:synthetic_credential_warm, _}
+  end
+
+  defp start_supervised_credentials(opts) do
+    start_supervised!(
+      {Credentials, Keyword.put(opts, :sh, credential_runner(opts))},
+      id: {:credentials, System.unique_integer([:positive])},
+      restart: :temporary
+    )
   end
 
   defp assert_valid_admission(base, kind, bytes) do
