@@ -6,7 +6,7 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
   @fixture Path.expand("fixtures/artifact_durability_reparent_9082cb14.sql", __DIR__)
   @fixture_sha "d8039e7a3584ab26a77aae6214c8927dfc077ab1234ba452ae61ba5731597508"
   @predecessor "session-reparent-v1-019"
-  @successor "artifact-content-v1-019"
+  @successor "pi-providers-artifact-content-v1-019"
 
   @content_objects [
     "artifact_contents",

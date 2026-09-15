@@ -1,6 +1,6 @@
 ---
 name: tightbeam-harnesses
-description: Per-harness feature support matrix (Claude, Codex, and Pi) — what works where and by what mechanism. Consult before promising or relying on a harness-specific feature.
+description: Per-harness capability support matrix (Claude, Codex, and Pi) — what works where and by what mechanism. Consult before promising or relying on a harness-specific capability.
 ---
 
 Per-harness capability support: FACTS, not guesses. Consult this before

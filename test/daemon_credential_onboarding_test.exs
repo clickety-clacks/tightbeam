@@ -84,9 +84,10 @@ defmodule Tightbeam.DaemonCredentialOnboardingTest do
                }
              })
 
-    assert JSON.decode!(File.read!(Path.join([ctx.base, "auth", "pi", "auth.json"]))) == %{
-             "opencode-go" => %{"type" => "api_key", "key" => "fake-daemon-key"}
-           }
+    assert JSON.decode!(File.read!(Credentials.credential_path(ctx.base, ctx.host, :opencode_go))) ==
+             %{
+               "opencode-go" => %{"type" => "api_key", "key" => "fake-daemon-key"}
+             }
   end
 
   test "release CLI delivers a fake daemon credential without leaking it", ctx do
@@ -151,8 +152,9 @@ defmodule Tightbeam.DaemonCredentialOnboardingTest do
     {:ok, rows} = DB.query(ctx.db, "SELECT payload FROM events")
     refute inspect(rows) =~ "fake-daemon-key"
 
-    assert JSON.decode!(File.read!(Path.join([ctx.base, "auth", "pi", "auth.json"]))) == %{
-             "opencode-go" => %{"type" => "api_key", "key" => "fake-daemon-key"}
-           }
+    assert JSON.decode!(File.read!(Credentials.credential_path(ctx.base, ctx.host, :opencode_go))) ==
+             %{
+               "opencode-go" => %{"type" => "api_key", "key" => "fake-daemon-key"}
+             }
   end
 end

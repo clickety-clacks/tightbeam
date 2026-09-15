@@ -195,7 +195,7 @@ defmodule Tightbeam.PiProvider do
 
             home = Tightbeam.Homes.home_path(state.base_dir, machine, :pi)
 
-            if Tightbeam.Homes.credential_ready?(target, home, ["auth.json"]),
+            if Tightbeam.Harness.Pi.credential_ready?(target, home),
               do: :onboarded,
               else: {:needs_onboarding, :missing}
 

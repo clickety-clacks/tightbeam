@@ -355,8 +355,15 @@ defmodule Tightbeam.Harness.Support do
         host_name: "vector",
         host_config: %{base_dir: base, ssh: if(local?, do: nil, else: "vector@remote")},
         adapter_binary: adapter,
-        sh: fn _command -> {"", 0} end
+        sh: launch_probe_shell(profile)
       }
+
+      target =
+        if Map.has_key?(profile, :launch_catalog) do
+          Map.put(target, :credential_status, fn :opencode_go, _host -> :onboarded end)
+        else
+          target
+        end
 
       opts = [
         common_env: [{"COMMON", "1"}],
@@ -377,6 +384,14 @@ defmodule Tightbeam.Harness.Support do
       |> normalize_paths(base, home)
     end)
   end
+
+  defp launch_probe_shell(%{launch_catalog: %{url: url, body: body}}) do
+    fn command ->
+      if String.contains?(Enum.join(command, " "), url), do: {body <> "\n200", 0}, else: {"", 0}
+    end
+  end
+
+  defp launch_probe_shell(_profile), do: fn _command -> {"", 0} end
 
   defp expected_launch(profile, locality, rails, kind) do
     base = "<BASE>"

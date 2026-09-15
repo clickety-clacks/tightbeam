@@ -471,7 +471,24 @@ defmodule Tightbeam.Harness.Pi do
       remote_prefix: fn _base, home, _kind -> ["PI_CODING_AGENT_DIR=#{home}"] end,
       remote_rails_env: nil,
       railed_probe: true,
-      probe_model: @probe_model,
+      # The permission gate receives a discovered catalog entry and returns
+      # its family without inventing an effort. Keep the vector oracle aligned
+      # with that recorded Pi boundary; the harness default remains @probe_model.
+      probe_model: Model.new(@probe_model.family),
+      launch_catalog: %{
+        url: OpenCodeGo.models_url(),
+        body:
+          JSON.encode!(%{
+            "gpt-5.6-luna" => %{
+              "id" => "gpt-5.6-luna",
+              "name" => "Luna",
+              "provider" => "opencode-go",
+              "contextWindow" => 131_072,
+              "maxTokens" => 32_768,
+              "thinkingLevelMap" => %{"medium" => "medium"}
+            }
+          })
+      },
       adapter_bin: "pi-acp",
       adapter_package: @adapter_package,
       adapter_scope: :unscoped,
