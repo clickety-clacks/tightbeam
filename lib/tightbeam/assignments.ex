@@ -545,6 +545,7 @@ defmodule Tightbeam.Assignments do
         )
 
       RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+
       EffortCheckin.cancel_in_txn(
         txn,
         assignment_id,
@@ -2153,6 +2154,7 @@ defmodule Tightbeam.Assignments do
                   )
 
                 RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+
                 EffortCheckin.cancel_in_txn(
                   txn,
                   assignment_id,
@@ -2433,6 +2435,7 @@ defmodule Tightbeam.Assignments do
                 )
 
               RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+
               EffortCheckin.cancel_in_txn(
                 txn,
                 assignment_id,

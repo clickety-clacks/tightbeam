@@ -36,6 +36,7 @@ defmodule Tightbeam.Wakes do
     RuleRuntime,
     Supervision
   }
+
   alias Tightbeam.DB.Txn
 
   @type db :: GenServer.server()
