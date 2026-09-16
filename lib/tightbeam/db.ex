@@ -593,7 +593,16 @@ defmodule Tightbeam.DB do
             # Not `:ok =`: under a deadline the busy_timeout is the remaining
             # time, so ROLLBACK can itself fail, and asserting on it would
             # replace the real error with a MatchError.
-            _ = Sqlite3.execute(conn, "ROLLBACK")
+            #
+            # But the result may not be DISCARDED either. This is the only place
+            # that learns the connection was not restored, and the tuple below
+            # asserts a rollback that may not have happened. Say so, and still
+            # return the real error.
+            case Sqlite3.execute(conn, "ROLLBACK") do
+              :ok -> :ok
+              other -> Logger.error("transaction rollback failed: #{inspect(other)}")
+            end
+
             {:rolled_back, error}
         end
       rescue
