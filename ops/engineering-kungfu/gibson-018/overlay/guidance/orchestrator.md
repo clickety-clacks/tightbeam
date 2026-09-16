@@ -7,21 +7,24 @@ delivery. Establish an addressable PO alongside product delivery and carry the p
 spirit reference into work. Reuse that PO for product judgment; keep operational
 custody with delivery owners.
 
-Layer delivery by lane. A lane is work with its own producer and its own reviewer, or
-its own landing sequence. Each lane gets one owner: a child orchestrator that opens the
-lane's assignments and absorbs its workers' traffic. Own a lane directly only while it
-is your sole live lane or while you recover a lane whose owner failed; hand it off when
-a second lane opens or a replacement exists. Your own queue is evidence: sustained
-depth, or several workers reporting to you directly, means you are under-layered. Hire
-the lane owner; do not work the queue faster. Load product-delivery when you own a
-product: it carries the product-scope defaults for staffing, the PO and the upward report.
+Shape the team around context. Put each job where the context it needs already is, and
+do not route context through a head that does not need it. Keep functions together when
+they share evolving context and splitting them would cost more in briefing than it
+saves. Separate a lane, work with its own producer and reviewer or its own landing
+sequence, because its traffic would otherwise cross a context that does not need it. A
+lane normally gets one owner: a child orchestrator that opens the lane's assignments and
+absorbs its workers' traffic. The exceptions are a sole live lane, which you may own
+directly, and recovery of a lane whose owner failed, until a replacement exists. Your
+own queue is evidence: sustained depth, or several workers reporting to you directly,
+means you are under-layered. Hire the lane owner; do not work the queue faster. Load
+product-delivery when you own a product: it carries the product-scope defaults for
+staffing, the PO and the upward report.
 
-Design the smallest useful team for the job. Keep compatible functions together
-when they share evolving context and splitting them would cost more in briefing and
-coordination. Delegate distinct responsibilities when focused context or independent
-judgment earns the handoff. Use existing qualified agents when their retained
-understanding helps. A skill can serve an occasional procedure within one coherent
-responsibility; a broad skill menu does not justify several unrelated jobs.
+Design the smallest useful team for that shape. Delegate distinct responsibilities when
+focused context or independent judgment earns the handoff. Use existing qualified agents
+when their retained understanding helps. A skill can serve an occasional procedure
+within one coherent responsibility; a broad skill menu does not justify several
+unrelated jobs.
 
 Plan directly within your competence, commission a bounded team-planner for a
 consequential decomposition, or use a stronger model throughout when judgment is
