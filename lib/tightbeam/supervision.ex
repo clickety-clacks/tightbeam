@@ -1571,7 +1571,11 @@ defmodule Tightbeam.Supervision do
       terminal_seq: terminal_seq,
       assignment: assignment,
       verdict: verdict,
-      supervision_interval_ms: interval
+      supervision_interval_ms: interval,
+      # Whether the rail reached a decision and that decision was :allow, as
+      # opposed to falling through un-adjudicated or on a deny. Only the prod
+      # ladder reads it (GH #23).
+      rail_allowed?: false
     }
 
     run_schedule(@turn_end_schedule, ctx)
@@ -1581,6 +1585,7 @@ defmodule Tightbeam.Supervision do
   defp run_schedule([step | rest], ctx) do
     case turn_end_step(step, ctx) do
       :cont -> run_schedule(rest, ctx)
+      {:cont, ctx} -> run_schedule(rest, ctx)
       {:halt, result} -> result
     end
   end
@@ -1589,6 +1594,7 @@ defmodule Tightbeam.Supervision do
     case rail_step(ctx.db, ctx.handlers, ctx.session_key, ctx.assignment, ctx.terminal_seq) do
       {:acted, _tag} = acted -> {:halt, acted}
       {:retry, _tag} = retry -> {:halt, retry}
+      {:fallthrough, :allow} -> {:cont, %{ctx | rail_allowed?: true}}
       :fallthrough -> :cont
     end
   end
@@ -1614,7 +1620,8 @@ defmodule Tightbeam.Supervision do
             ctx.session_key,
             ctx.terminal_seq,
             assignment,
-            ctx.supervision_interval_ms
+            ctx.supervision_interval_ms,
+            ctx.rail_allowed?
           )
 
         {:halt, result}
@@ -1693,9 +1700,12 @@ defmodule Tightbeam.Supervision do
           rail_sweep_lifecycle(db, session_key, assignment.id, error.rule, "re-obligate")
           :fallthrough
 
+        # The tag rides out to the prod ladder, which needs to tell an
+        # adjudicated "nothing is owed" apart from the fallthroughs above and
+        # the un-adjudicated one at the top of this function (GH #23).
         :allow ->
           rail_sweep_lifecycle(db, session_key, assignment.id, nil, "none")
-          :fallthrough
+          {:fallthrough, :allow}
       end
     end
   end
@@ -1794,7 +1804,8 @@ defmodule Tightbeam.Supervision do
          session_key,
          terminal_seq,
          assignment,
-         replacement_interval
+         replacement_interval,
+         rail_allowed?
        ) do
     evaluation_clock = now()
 
@@ -1811,6 +1822,30 @@ defmodule Tightbeam.Supervision do
                [assignment.id]
              ) do
           [] ->
+            # An open obligation with no entitlement row: the ladder has nothing
+            # to claim, and only a new basis can change that. This was the one
+            # branch that returned without a watermark, so the assignment stayed
+            # eligible and every tick re-ran the whole shift, re-adjudicated the
+            # rail to the same :allow, and appended another identical
+            # rail_sweep(decision=none) row — 1,059,688 of them on one host,
+            # 100% decision none (GH #23). Marking it evaluated ends the
+            # repetition, not the record: the first pass still writes the row,
+            # and a later terminal is evaluated normally.
+            #
+            # Only when the rail actually adjudicated and allowed. Every other
+            # way into this branch is suppression by RETRACTABLE state, and its
+            # terminal has to stay re-matchable once that state clears: a
+            # pending self-created continuation short-circuits rail_step before
+            # it decides anything, and a deny falls through on a condition that
+            # can lift. Same reason the write is here and not in rail_step — the
+            # ladder runs only for {:match, assignment}, so the retractable
+            # no-matches (work_blocked, no_terminal) never reach it. And it is
+            # deliberately not extended to the :controlled branch below, which
+            # is gated on a pending scheduled controller, retractable in turn.
+            if rail_allowed? do
+              write_terminal_watermark_in_txn(txn, session_key, terminal_seq, assignment.id)
+            end
+
             :unarmed
 
           [[generation, due_at, state, last_attempt, stored_interval, basis_kind, basis_id]] ->

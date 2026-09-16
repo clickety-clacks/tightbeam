@@ -257,6 +257,109 @@ defmodule Tightbeam.SupervisionTest do
              rail_sweep_details(ctx.db, "holder")
   end
 
+  # GH #23. asg_1 is open with no entitlement, which is the storm population: the
+  # prod ladder answers :unarmed, the one branch that returned without a
+  # watermark, so before the fix every tick re-ran the shift, re-adjudicated the
+  # rail to the same :allow, and appended another identical
+  # rail_sweep(decision=none). One host held 1,059,688 of them, 100% decision none.
+  test "an unarmed assignment records its no-op once per terminal, not once per tick", ctx do
+    seq = terminal!(ctx.db, "holder")
+
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert [%{"decision" => "none", "ref" => "asg_1"}] = rail_sweep_details(ctx.db, "holder")
+
+    # The audit evidence is written; what must stop is the repetition.
+    for _ <- 1..25 do
+      assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    end
+
+    assert [%{"decision" => "none", "ref" => "asg_1"}] = rail_sweep_details(ctx.db, "holder")
+    assert %{lastEvaluatedTerminal: ^seq} = Supervision.watermark(ctx.db, "holder")
+  end
+
+  test "a later meaningful change is still evaluated after an allowed no-op", ctx do
+    first = terminal!(ctx.db, "holder")
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", first)
+    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", first)
+    assert length(rail_sweep_details(ctx.db, "holder")) == 1
+
+    # A new terminal is new evidence: suppression is per-terminal, never permanent.
+    second = terminal!(ctx.db, "holder")
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", second)
+    assert length(rail_sweep_details(ctx.db, "holder")) == 2
+
+    # And the assignment stays eligible to be acted on once it is armed, which is
+    # what recover_liveness does for exactly this population on a later tick.
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    third = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", third)
+    assert %{attemptCount: 1, prodCount: 1} = Supervision.prod_state(ctx.db, "asg_1")
+  end
+
+  # The unarmed branch marks the terminal evaluated; it does not act, so it must
+  # not disturb the pending columns. write_terminal_watermark_in_txn updates
+  # lastEvaluatedTerminal only, unlike write_watermark/4, whose ON CONFLICT nulls
+  # all four — correct for the acting arms that just resolved what they clear.
+  test "the unarmed no-op advances only lastEvaluatedTerminal", ctx do
+    seq = terminal!(ctx.db, "holder")
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert {:ok, [[^seq, nil, nil, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN
+               FROM supervision_watermarks WHERE sessionKey='holder' AND assignmentId='asg_1'
+               """
+             )
+  end
+
+  # The suppression is keyed on the assignment and lives in the branch that runs
+  # only for a matched production, so a retractable no-match is untouched: a
+  # work-blocked holder must still re-match this very terminal when the block is
+  # lifted. That contract is asserted in full at "a standing work-blocked fact
+  # unmatches the prod production until it is retracted"; this pins the watermark
+  # specifically, since that is what the fix adds.
+  test "a work-blocked holder is left re-matchable at the same terminal", ctx do
+    file_fact(ctx.db, "work-blocked", "holder")
+    seq = terminal!(ctx.db, "holder")
+
+    assert :blocked = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert Supervision.watermark(ctx.db, "holder") == nil
+
+    file_fact(ctx.db, "work-unblocked", "holder")
+    assert {:match, %{id: "asg_1"}} = Supervision.prod_production_matches?(ctx.db, "holder", seq)
+  end
+
+  # The suppression is keyed on the rail having adjudicated and allowed. A
+  # pending self-created continuation short-circuits rail_step before it decides
+  # anything, so that pass says nothing about whether the obligation is
+  # satisfied, and cancelling the continuation must leave this same terminal
+  # re-matchable. The remedy that then fires is asserted at "only a durable
+  # self-created continuation suppresses the turn-end remedy"; this pins the
+  # watermark, which is what the fix adds.
+  test "a continuation-suppressed pass leaves the terminal re-matchable", ctx do
+    self_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "user:flynn",
+        prompt: "self continuation",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder"
+      })
+
+    seq = terminal!(ctx.db, "holder")
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert rail_sweep_details(ctx.db, "holder") == []
+    assert Supervision.watermark(ctx.db, "holder") == nil
+
+    cancel_wake!(ctx.db, self_wake)
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert [%{"decision" => "none", "ref" => "asg_1"}] = rail_sweep_details(ctx.db, "holder")
+    assert %{lastEvaluatedTerminal: ^seq} = Supervision.watermark(ctx.db, "holder")
+  end
+
   test "an internal effort wake does not suppress the no-filing prod", ctx do
     insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
 
