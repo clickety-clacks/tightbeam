@@ -24,18 +24,9 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
     assert Codex.patch_adapter_source(patched) == patched
   end
 
-  test "claude patch emits at both liveBackgroundTasks settlement bookends idempotently" do
-    source =
-      [
-        "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
-        "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }"
-      ]
-      |> Enum.join("\n")
-
-    patched = Claude.patch_adapter_source(source)
-    assert patched =~ "const record = session.liveBackgroundTasks.get(message.task_id)"
-    assert patched =~ "subagentTerminated"
-    assert patched =~ "toolCallId: record.parentToolUseId"
-    assert Claude.patch_adapter_source(patched) == patched
+  test "claude preserves native adapter source without injecting legacy settlement events" do
+    source = "nativeSubagents.taskStarted(message); nativeSubagents.finishTask(message);"
+    assert Claude.patch_adapter_source(source) == source
+    assert Claude.patch_adapter_source(Claude.patch_adapter_source(source)) == source
   end
 end

@@ -122,16 +122,9 @@ defmodule Tightbeam.Harness.Claude do
   """
   def adapter_selectable_models, do: @adapter_selectable_models
 
-  @adapter_replacements [
-    {
-      "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
-      "                            case \"task_notification\": {\n                                // The task settled — emit the correlated child-termination\n                                // carrier before dropping its parent tool-use bookkeeping.\n                                const record = session.liveBackgroundTasks.get(message.task_id);\n                                if (record?.isSubagent) {\n                                    await sendUpdate({\n                                        sessionId: message.session_id,\n                                        update: {\n                                            sessionUpdate: \"tool_call_update\",\n                                            toolCallId: record.parentToolUseId,\n                                            status: \"completed\",\n                                            _meta: { claudeCode: { subagentTerminated: { taskId: message.task_id, status: \"completed\" } } },\n                                        },\n                                    });\n                                }\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;\n                            }"
-    },
-    {
-      "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }",
-      "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    const record = session.liveBackgroundTasks.get(message.task_id);\n                                    if (record?.isSubagent) {\n                                        await sendUpdate({\n                                            sessionId: message.session_id,\n                                            update: {\n                                                sessionUpdate: \"tool_call_update\",\n                                                toolCallId: record.parentToolUseId,\n                                                status: message.patch.status === \"completed\" ? \"completed\" : \"failed\",\n                                                _meta: { claudeCode: { subagentTerminated: { taskId: message.task_id, status: message.patch.status } } },\n                                            },\n                                        });\n                                    }\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }"
-    }
-  ]
+  # 0.73.0 emits its native subagent lifecycle extension. Preserve package/version
+  # verification, but do not apply the obsolete legacy source rewrite.
+  @adapter_replacements []
 
   @doc false
   def adapter_version, do: @adapter_version
@@ -261,6 +254,7 @@ defmodule Tightbeam.Harness.Claude do
 
     %{
       guidance: guidance,
+      client_capabilities: %{subagents: %{}},
       meta: %{systemPrompt: %{type: "preset", preset: "claude_code", append: guidance}},
       permission_mode: "bypassPermissions",
       effort_config: "effort",
@@ -473,19 +467,19 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def classify_subagent_event(%{
-        "toolCallId" => tool_call_id,
-        "_meta" => %{"claudeCode" => %{"subagentTerminated" => _}}
+        "sessionUpdate" => "subagent_spawned",
+        "subagentSessionId" => subagent
       }) do
-    {:subagent_stop, %{source_event_ref: tool_call_id, subagent_ref: tool_call_id}}
+    {:subagent_start, %{source_event_ref: subagent, subagent_ref: subagent}}
   end
 
   def classify_subagent_event(%{
-        "sessionUpdate" => "tool_call",
-        "toolCallId" => tool_call_id,
-        "_meta" => %{"claudeCode" => %{"toolName" => tool_name}}
+        "sessionUpdate" => "subagent_state_update",
+        "subagentSessionId" => subagent,
+        "state" => state
       })
-      when tool_name in ["Agent", "Task"] do
-    {:subagent_start, %{source_event_ref: tool_call_id, subagent_ref: tool_call_id}}
+      when state in ["completed", "failed", "cancelled", "disconnected"] do
+    {:subagent_stop, %{source_event_ref: subagent, subagent_ref: subagent}}
   end
 
   def classify_subagent_event(_update), do: :skip
@@ -698,7 +692,7 @@ defmodule Tightbeam.Harness.Claude do
 
   @impl true
   def conformance_vectors do
-    source = Enum.map_join(@adapter_replacements, "\n", &elem(&1, 0))
+    source = "unmodified claude adapter bundle"
 
     valid_entry = %{
       family: "claude-vector",
@@ -775,23 +769,30 @@ defmodule Tightbeam.Harness.Claude do
         %{
           case: "positive_start",
           envelope: %{
-            "sessionUpdate" => "tool_call",
-            "toolCallId" => "claude-call",
-            "_meta" => %{"claudeCode" => %{"toolName" => "Agent"}}
+            "sessionUpdate" => "subagent_spawned",
+            "subagentSessionId" => "claude-task",
+            "name" => "Reviewer",
+            "task" => "Review the implementation",
+            "capabilities" => %{}
           },
           expected:
-            {:subagent_start, %{source_event_ref: "claude-call", subagent_ref: "claude-call"}}
+            {:subagent_start, %{source_event_ref: "claude-task", subagent_ref: "claude-task"}}
         },
         %{
           case: "positive_stop",
           envelope: %{
-            "toolCallId" => "claude-call",
-            "_meta" => %{"claudeCode" => %{"subagentTerminated" => %{}}}
+            "sessionUpdate" => "subagent_state_update",
+            "subagentSessionId" => "claude-task",
+            "state" => "completed"
           },
           expected:
-            {:subagent_stop, %{source_event_ref: "claude-call", subagent_ref: "claude-call"}}
+            {:subagent_stop, %{source_event_ref: "claude-task", subagent_ref: "claude-task"}}
         },
-        %{case: "negative", envelope: %{"sessionUpdate" => "tool_call"}, expected: :skip}
+        %{
+          case: "negative",
+          envelope: %{"sessionUpdate" => "tool_call", "toolCallId" => "claude-call"},
+          expected: :skip
+        }
       ],
       catalog_expected: %{
         "valid" => {:ok, [valid_entry]},
@@ -1070,7 +1071,8 @@ defmodule Tightbeam.Harness.Claude do
       @adapter_package,
       @adapter_bundle,
       @adapter_replacements,
-      wire_name()
+      wire_name(),
+      version: @adapter_version
     )
   end
 end

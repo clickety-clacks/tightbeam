@@ -1,0 +1,33 @@
+// Native lifecycle excerpts from claude-native-0.73.0-capture.json.
+// Legacy tool completion is an explicit negative input, not a captured native event.
+{
+  "adapter": "@agentclientprotocol/claude-agent-acp",
+  "version": "0.73.0",
+  "provenance": "Captured from execution of actual installed package NativeSubagentRuntime; SDK task facts supplied synthetically; no authentication/model request. Not a live harness smoke.",
+  "semantic": {
+    "spawn_operation_terminal": "Tool completion alone: child session remains active",
+    "child_termination_terminal": "Native terminal state settles the child"
+  },
+  "live_agent_started": {
+    "sessionUpdate": "subagent_spawned",
+    "subagentSessionId": "child-1",
+    "name": "Agent call-1",
+    "task": "Task call-1",
+    "capabilities": {}
+  },
+  "spawn_operation_terminal": {
+    "sessionUpdate": "tool_call_update",
+    "toolCallId": "call-claude-1",
+    "status": "completed",
+    "_meta": {
+      "claudeCode": {
+        "toolName": "Agent"
+      }
+    }
+  },
+  "native_termination": {
+    "sessionUpdate": "subagent_state_update",
+    "subagentSessionId": "child-1",
+    "state": "completed"
+  }
+}
