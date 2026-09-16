@@ -51,10 +51,14 @@ to keep the current team. The owner arranges retention or retirement.
 Compose the elected archetypes first: orchestrator, product-owner, spec-writer,
 coder, reviewer-code, reviewer-spec, recon, team-planner, guidance-writer,
 guidance-reviewer and integrator. Vary their number, scope, model,
-effort and lifetime. Recommend another orchestrator for a coupled subproblem when
-that reduces total coordination cost; its owner may redesign that subtree. Avoid another
-layer whose only job is forwarding messages. Keep cross-subtree contracts with an
-identified delivery owner and arrange direct specialist exchange where useful.
+effort and lifetime. Apply the orchestrator's context rule: put each job where the
+context it needs already is, and do not route context through a head that does not
+need it. A lane, work with its own producer and reviewer or its own landing sequence,
+normally gets its own orchestrator, which opens the lane's assignments and settles its
+workers' traffic; its owner may redesign that subtree. That owner is not a forwarding
+layer, because it decides on what it receives. Avoid a layer that only relays. Keep
+cross-subtree contracts with an identified delivery owner and arrange direct specialist
+exchange where useful.
 
 Carry an addressed product role and spirit reference into each relevant brief.
 Keep the PO available for proactive product judgment, new specifications and material
