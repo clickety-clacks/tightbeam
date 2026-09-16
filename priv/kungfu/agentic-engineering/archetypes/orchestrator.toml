@@ -1,5 +1,5 @@
 name = "orchestrator"
-skills = ["product-delivery"]
+skills = ["product-delivery", "team-design"]
 
 [guidance]
 text = """

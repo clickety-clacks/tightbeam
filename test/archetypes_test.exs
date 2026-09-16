@@ -302,15 +302,15 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(coder default guidance-reviewer guidance-writer integrator orchestrator product-owner recon reviewer-code reviewer-spec spec-writer team-planner)
+             ~w(coder default guidance-reviewer guidance-writer integrator orchestrator product-owner recon reviewer-code reviewer-spec spec-writer)
 
     assert loaded["product-owner"].skills == ["tightbeam-dispatching"]
 
     for role <-
-          ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator) do
+          ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer guidance-writer guidance-reviewer integrator) do
       refute Enum.any?(
                loaded[role].skills,
-               &(&1 in ~w(worktree-session team-design feature-cycle work-tracking unblocking product-discovery spirit-review bug-provenance committing-and-pushing))
+               &(&1 in ~w(worktree-session feature-cycle work-tracking unblocking product-discovery spirit-review bug-provenance committing-and-pushing))
              )
     end
 
@@ -373,7 +373,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert coder.guidance =~ "Remove a finished clone only after"
     refute coder.guidance =~ "hands you a specific checkout"
 
-    for role <- ~w(team-planner guidance-writer guidance-reviewer integrator) do
+    for role <- ~w(guidance-writer guidance-reviewer integrator) do
       snapshot =
         Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
 
@@ -385,7 +385,6 @@ defmodule Tightbeam.ArchetypesTest do
     writer = Identity.snapshot!(ctx.base_dir, "guidance-writer", :codex)
     reviewer = Identity.snapshot!(ctx.base_dir, "guidance-reviewer", :codex)
     orchestrator = Identity.snapshot!(ctx.base_dir, "orchestrator", :codex)
-    planner = Identity.snapshot!(ctx.base_dir, "team-planner", :codex)
 
     for snapshot <- [writer, reviewer] do
       assert snapshot.guidance =~ "# Guidance and policy craft"
@@ -396,15 +395,14 @@ defmodule Tightbeam.ArchetypesTest do
     assert reviewer.guidance =~ "do not edit the work you review"
     refute writer.guidance =~ "do not edit the work you review"
 
-    for snapshot <- [coder, product_owner, orchestrator, planner] do
+    for snapshot <- [coder, product_owner, orchestrator] do
       refute snapshot.guidance =~ "# Guidance and policy craft"
     end
 
-    assert planner.guidance =~ "# Team planner"
-    assert planner.guidance =~ "does not staff a team"
-    refute planner.guidance =~ "# Delivery recovery"
     assert orchestrator.guidance =~ "# Delivery recovery"
     refute orchestrator.guidance =~ "# Team planner"
+    assert orchestrator.skills["team-design"] =~ "# Design the team"
+    assert orchestrator.skills["product-delivery"] =~ "# Own a product's delivery"
 
     assert orchestrator.guidance =~
              "Commission a spec and spec review when the work needs a new contract"

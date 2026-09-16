@@ -1,6 +1,6 @@
 name = "orchestrator"
 where = ["gibson", "racter"]
-skills = ["human-communication", "tightbeam-atc", "product-delivery"]
+skills = ["human-communication", "tightbeam-atc", "product-delivery", "team-design"]
 
 [defaults]
 harness = "codex"
