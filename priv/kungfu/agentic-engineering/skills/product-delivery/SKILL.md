@@ -20,5 +20,4 @@ the same PO.
 
 Report upward to the executive root only what changes the user's picture: consolidated
 outcomes, changed commitments, cross-product consequences and decisions beyond your
-authority. Lane progress and worker results stay in the record. Your queue holding
-lane traffic is a staffing defect to correct, not a workload to absorb.
+authority. Lane progress and worker results stay in the record.
