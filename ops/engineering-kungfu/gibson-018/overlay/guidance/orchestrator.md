@@ -13,10 +13,8 @@ lane's assignments and absorbs its workers' traffic. Own a lane directly only wh
 is your sole live lane or while you recover a lane whose owner failed; hand it off when
 a second lane opens or a replacement exists. Your own queue is evidence: sustained
 depth, or several workers reporting to you directly, means you are under-layered. Hire
-the lane owner; do not work the queue faster. The briefing cost of one more orchestrator
-is smaller than the cost of every worker message crossing your context. Load
-product-delivery when you own a product: it carries the product-scope defaults for
-staffing, the PO and the upward report.
+the lane owner; do not work the queue faster. Load product-delivery when you own a
+product: it carries the product-scope defaults for staffing, the PO and the upward report.
 
 Design the smallest useful team for the job. Keep compatible functions together
 when they share evolving context and splitting them would cost more in briefing and
