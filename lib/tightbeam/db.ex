@@ -41,6 +41,11 @@ defmodule Tightbeam.DB do
     end
   end
 
+  defmodule DeadlineExceeded do
+    @moduledoc false
+    defexception message: "database transaction deadline exceeded"
+  end
+
   ## Client
 
   @doc "Start the owner. Required: `:path` (SQLite file or `\":memory:\"`). Optional `:name`."
@@ -80,6 +85,32 @@ defmodule Tightbeam.DB do
         when result: term()
   def transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
     GenServer.call(server, {:transaction, fun})
+  end
+
+  @doc """
+  Run a transaction only while the monotonic deadline remains available.
+
+  The deadline is enforced by the DB owner, not only by the caller's wait:
+  queued work is rejected before it starts, SQLite lock waits use the remaining
+  time, and a callback that overruns is rolled back before commit.
+  """
+  @spec transaction_until(server(), (Tightbeam.DB.Txn.t() -> result), integer()) ::
+          {:ok, result} | {:error, Exception.t() | term()}
+        when result: term()
+  def transaction_until(server \\ __MODULE__, fun, deadline)
+      when is_function(fun, 1) and is_integer(deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, %DeadlineExceeded{}}
+    else
+      try do
+        GenServer.call(server, {:transaction_until, fun, deadline}, remaining + 50)
+      catch
+        :exit, {:timeout, _} -> {:error, %DeadlineExceeded{}}
+        :exit, reason -> {:error, reason}
+      end
+    end
   end
 
   @doc """
@@ -139,10 +170,22 @@ defmodule Tightbeam.DB do
             outbox: reference() | nil,
             outbox_owner: pid() | nil,
             query_trace: term(),
-            fenced_archetypes: MapSet.t()
+            fenced_archetypes: MapSet.t(),
+            deadline: integer() | :infinity
           }
-    defstruct [:conn, :outbox, :outbox_owner, :query_trace, fenced_archetypes: MapSet.new()]
+    defstruct [
+      :conn,
+      :outbox,
+      :outbox_owner,
+      :query_trace,
+      fenced_archetypes: MapSet.new(),
+      deadline: :infinity
+    ]
 
+    # Two independent guards on one transaction handle. `fenced_archetypes` is
+    # reference safety and `deadline` is time; neither reads the other's field
+    # and neither changes when the other fires. They are carried together only
+    # because a transaction has exactly one handle.
     @doc false
     @spec assert_archetype_available!(t(), String.t()) :: :ok
     def assert_archetype_available!(%__MODULE__{fenced_archetypes: fenced}, archetype)
@@ -152,6 +195,18 @@ defmodule Tightbeam.DB do
       end
 
       :ok
+    end
+
+    @doc false
+    def ensure_before_deadline(%__MODULE__{deadline: :infinity}), do: :ok
+
+    def ensure_before_deadline(%__MODULE__{deadline: deadline})
+        when is_integer(deadline) do
+      if System.monotonic_time(:millisecond) < deadline do
+        :ok
+      else
+        raise Tightbeam.DB.DeadlineExceeded
+      end
     end
 
     @doc false
@@ -402,6 +457,24 @@ defmodule Tightbeam.DB do
     end
   end
 
+  def handle_call({:transaction_until, fun, deadline}, _from, %{conn: conn} = state) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:reply, {:error, %DeadlineExceeded{}}, state}
+    else
+      :ok = Sqlite3.execute(conn, "PRAGMA busy_timeout=#{max(remaining, 1)}")
+      Process.put(row_commit_key(conn), [])
+
+      try do
+        {:reply, commit_phase(conn, fun, fenced_archetypes(state), deadline), state}
+      after
+        Process.delete(row_commit_key(conn))
+        _ = Sqlite3.execute(conn, "PRAGMA busy_timeout=5000")
+      end
+    end
+  end
+
   def handle_call(
         {:transaction_then, prepare, after_commit},
         _from,
@@ -483,31 +556,48 @@ defmodule Tightbeam.DB do
 
   # Each real transaction owns a distinct queue. Invalidate it before sending
   # casts; later recognition failure cannot undo the first committed phase.
-  defp commit_phase(conn, fun, fenced_archetypes) do
+  # `deadline` is a fourth parameter with a default rather than a generalised
+  # one, so every caller that has no deadline keeps its existing three-argument
+  # call unchanged and :infinity makes the two deadline checks no-ops. The two
+  # guards stay independent: the fence is enforced inside `fun` via
+  # `assert_archetype_available!`, the deadline around it via
+  # `ensure_before_deadline`, and neither consults the other.
+  defp commit_phase(conn, fun, fenced_archetypes, deadline \\ :infinity) do
     token = make_ref()
     key = {Txn, :outbox, token}
     Process.put(key, [])
 
+    txn = %Txn{
+      conn: conn,
+      outbox: token,
+      outbox_owner: self(),
+      fenced_archetypes: fenced_archetypes,
+      deadline: deadline
+    }
+
     outcome =
       try do
+        # Before BEGIN, so an already-spent deadline never opens a transaction.
+        # This raise is why the outer rescue below exists: there is nothing to
+        # roll back yet.
+        Txn.ensure_before_deadline(txn)
         :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
 
         try do
-          result =
-            fun.(%Txn{
-              conn: conn,
-              outbox: token,
-              outbox_owner: self(),
-              fenced_archetypes: fenced_archetypes
-            })
-
+          result = fun.(txn)
+          Txn.ensure_before_deadline(txn)
           :ok = Sqlite3.execute(conn, "COMMIT")
           {:committed, result, Enum.reverse(Process.get(key))}
         rescue
           error ->
-            :ok = Sqlite3.execute(conn, "ROLLBACK")
+            # Not `:ok =`: under a deadline the busy_timeout is the remaining
+            # time, so ROLLBACK can itself fail, and asserting on it would
+            # replace the real error with a MatchError.
+            _ = Sqlite3.execute(conn, "ROLLBACK")
             {:rolled_back, error}
         end
+      rescue
+        error -> {:rolled_back, error}
       after
         Process.delete(key)
       end
