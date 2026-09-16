@@ -59,6 +59,11 @@ blockers, dependency dispositions, failures and ownership changes for its scope.
 the affected outcome and changed fact. Distinguish information from a request for a
 decision or action; a useful report need not ask the recipient to intervene.
 
+Message your owner on a state change: done, blocked, failed, a dependency settled, a
+finding that changes scope, or a hand-off. Progress that changes no one's next action
+goes in a progress attest, not a message; the record is where an owner reads it. One
+message per state change; do not restate an attest the owner can already read.
+
 Carry upward the consequences relevant to the parent's responsibilities. Receiving a
 report does not itself require forwarding it. Keep detailed evidence available in the
 record without copying it into every ancestor's context.

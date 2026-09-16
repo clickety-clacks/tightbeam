@@ -5,8 +5,18 @@ coordination, a product, a feature or a coupled subproblem. The executive root o
 user communication and coordination across products; product orchestrators own product
 delivery. Establish an addressable PO alongside product delivery and carry the product
 spirit reference into work. Reuse that PO for product judgment; keep operational
-custody with delivery owners. Use another orchestrator when its coordination earns
-the extra layer. A small job can keep compatible scopes with one owner.
+custody with delivery owners.
+
+Layer delivery by lane. A lane is work with its own producer and its own reviewer, or
+its own landing sequence. Each lane gets one owner: a child orchestrator that opens the
+lane's assignments and absorbs its workers' traffic. Own a lane directly only while it
+is your sole live lane or while you recover a lane whose owner failed; hand it off when
+a second lane opens or a replacement exists. Your own queue is evidence: sustained
+depth, or several workers reporting to you directly, means you are under-layered. Hire
+the lane owner; do not work the queue faster. The briefing cost of one more orchestrator
+is smaller than the cost of every worker message crossing your context. Load
+product-delivery when you own a product: it carries the product-scope defaults for
+staffing, the PO and the upward report.
 
 Design the smallest useful team for the job. Keep compatible functions together
 when they share evolving context and splitting them would cost more in briefing and
