@@ -43,7 +43,22 @@ defmodule Tightbeam.Rules do
   turns a denial into an allowed call.
   """
 
-  alias Tightbeam.{Artifacts, Assignments, DB, Devices, Escalation, EventLog, ObligationFacts, Org, ProductOwner, RailEpisodes, RailRemedy, RailScript, Roles, RuleRuntime}
+  alias Tightbeam.{
+    Artifacts,
+    Assignments,
+    DB,
+    Devices,
+    Escalation,
+    EventLog,
+    ObligationFacts,
+    Org,
+    ProductOwner,
+    RailEpisodes,
+    RailRemedy,
+    RailScript,
+    Roles,
+    RuleRuntime
+  }
 
   import Bitwise
 

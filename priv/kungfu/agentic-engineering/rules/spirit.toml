@@ -1,0 +1,63 @@
+# Spirit rumination, as a prod and never a gate (Mike, 2026-09-17).
+#
+# The product owner judges every spec against the product's intent, and a
+# disagreement reaches whoever owns the work. Neither stops anything. The
+# previous form, spec-dispatch-requires-spirit (removed 2026-09-08), refused
+# coder dispatch until a `spirit-approved` verdict existed: measured over its
+# life it fired on non-implementation dispatches, refused the PO's own review
+# card, string-matched a free-text verdict kind, could not summon the PO, and
+# when it did work it produced an approval in a median 30 seconds with 20
+# objections in 166. A record is not a review. So: ask at the moment the spec
+# exists, ask again when it changes, route the objection, block nothing.
+#
+# `transition.fields` names the row fields a row-commit changed; these two rules
+# fire only on the spec pin, not on every write to the item. `{product_owner_key}`
+# is resolved from the caller's lineage (see Tightbeam.ProductOwner). When no
+# single PO resolves the notice is recorded as rule_notice_failed and the verb
+# proceeds.
+[[rule]]
+name = "spec-pinned-summons-spirit"
+verb = "work-item-create"
+edges = ["row-commit"]
+effect = "notice"
+text = "a work item was created with a spec; the product owner is asked to judge it against the product's intent"
+deny_when = [
+  { fact = "work_item.state", op = "eq", value = "open" },
+  { fact = "transition.fields", op = "in", value = ["spec_ref_sha256"] },
+]
+[rule.notice]
+target_session = "{product_owner_key}"
+prompt = "Spirit rumination requested. Work item {work_item_id} now carries a spec, pinned by {caller_key}. Nothing is waiting on you and nothing is blocked. Read the spec against the product's intent and record your judgment on a bounded product-owner assignment on this work item: spirit-approved, or changes-requested naming what must change. A changes-requested verdict reaches the current owner of the work by itself."
+
+[[rule]]
+name = "spec-repinned-summons-spirit"
+verb = "work-item-update"
+edges = ["row-commit"]
+effect = "notice"
+text = "a work item's spec changed; the product owner is asked to judge the new spec against the product's intent"
+deny_when = [
+  { fact = "work_item.state", op = "eq", value = "open" },
+  { fact = "transition.fields", op = "in", value = ["spec_ref_sha256"] },
+]
+[rule.notice]
+target_session = "{product_owner_key}"
+prompt = "Spirit rumination requested. The spec on work item {work_item_id} changed, re-pinned by {caller_key}. Any earlier judgment was of the old spec. Nothing is waiting on you and nothing is blocked. Read the new spec against the product's intent and record your judgment on a bounded product-owner assignment on this work item: spirit-approved, or changes-requested naming what must change."
+
+# The objection travels on its own. When a product owner records
+# changes-requested on a card on a spec-backed item, the session that opened the
+# open implementation card on that item is woken, or the item's creator when no
+# implementation exists yet. The verdict itself is never refused.
+[[rule]]
+name = "spirit-objection-reaches-owner"
+verb = "attest"
+effect = "notice"
+text = "a product-owner changes-requested on spec-backed work is delivered to the session that owns the work"
+deny_when = [
+  { fact = "attest.kind", op = "eq", value = "verdict" },
+  { fact = "attest.verdict_kind", op = "eq", value = "changes-requested" },
+  { fact = "assignment.holder_archetype", op = "eq", value = "product-owner" },
+  { fact = "work_item.has_spec_ref", op = "eq", value = true },
+]
+[rule.notice]
+target_session = "{work_owner_key}"
+prompt = "Spirit objection on work you own. The product owner {caller_key} recorded changes-requested on {assignment_id} for work item {work_item_id}. Read its note, retarget or hold the affected work, and answer the product owner. Nothing was stopped for you."

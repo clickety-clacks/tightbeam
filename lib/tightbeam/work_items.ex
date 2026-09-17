@@ -102,58 +102,58 @@ defmodule Tightbeam.WorkItems do
         transaction_with_row_commits(
           db,
           fn txn ->
-          case key && idempotency_item(txn, owner, key) do
-            nil ->
-              id = "wi_" <> Tightbeam.Id.uuid4()
-              created_in_turn_seq = running_turn_seq(txn, created_by_session)
-              priority = call.params[:priority] || default_priority_in_txn(txn)
-              created_at = now()
+            case key && idempotency_item(txn, owner, key) do
+              nil ->
+                id = "wi_" <> Tightbeam.Id.uuid4()
+                created_in_turn_seq = running_turn_seq(txn, created_by_session)
+                priority = call.params[:priority] || default_priority_in_txn(txn)
+                created_at = now()
 
-              Txn.q(
-                txn,
-                """
-                INSERT INTO work_items
-                  (id, title, specRefName, specRefSha256, isBug, ownerUserId,
-                   state, createdByUser, createdBySession, createdInTurnSeq,
-                   createdContextKnown, createdAt)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
-                """,
-                [
-                  id,
-                  call.params.title,
-                  call.params[:spec_ref_name],
-                  call.params[:spec_ref_sha256],
-                  bool_to_int(is_bug),
-                  owner,
-                  created_by_user,
-                  created_by_session,
-                  created_in_turn_seq,
-                  created_at
-                ]
-              )
-
-              put_priority_in_txn(txn, id, priority)
-              stamp_version_in_txn(txn, id, created_at)
-              routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
-
-              if key do
                 Txn.q(
                   txn,
-                  "INSERT INTO wire_idempotency (ownerUserId, operation, idempotencyKey, sessionKey) VALUES (?1, 'work-item-create', ?2, ?3)",
-                  [owner, key, id]
+                  """
+                  INSERT INTO work_items
+                    (id, title, specRefName, specRefSha256, isBug, ownerUserId,
+                     state, createdByUser, createdBySession, createdInTurnSeq,
+                     createdContextKnown, createdAt)
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9, 1, ?10)
+                  """,
+                  [
+                    id,
+                    call.params.title,
+                    call.params[:spec_ref_name],
+                    call.params[:spec_ref_sha256],
+                    bool_to_int(is_bug),
+                    owner,
+                    created_by_user,
+                    created_by_session,
+                    created_in_turn_seq,
+                    created_at
+                  ]
                 )
-              end
 
-              item = fetch_in_txn(txn, id)
-              on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
-              Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
-              {:created, item, routing_wake}
+                put_priority_in_txn(txn, id, priority)
+                stamp_version_in_txn(txn, id, created_at)
+                routing_wake = arm_routing_in_txn(txn, id, owner, call.params.title)
 
-            item_id ->
-              item = fetch_in_txn(txn, item_id)
-              Publisher.maybe_observed_accepted_in_txn(txn, call)
-              {:replayed, item}
-          end
+                if key do
+                  Txn.q(
+                    txn,
+                    "INSERT INTO wire_idempotency (ownerUserId, operation, idempotencyKey, sessionKey) VALUES (?1, 'work-item-create', ?2, ?3)",
+                    [owner, key, id]
+                  )
+                end
+
+                item = fetch_in_txn(txn, id)
+                on_routing_wake_scheduled_in_txn(call).(txn, routing_wake)
+                Publisher.maybe_accepted_in_txn(txn, call, public_work_item(item))
+                {:created, item, routing_wake}
+
+              item_id ->
+                item = fetch_in_txn(txn, item_id)
+                Publisher.maybe_observed_accepted_in_txn(txn, call)
+                {:replayed, item}
+            end
           end,
           fn _txn, result ->
             case result do

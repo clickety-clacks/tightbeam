@@ -11,7 +11,6 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
 
   alias Tightbeam.{
     Archetypes,
-    Assignments,
     DB,
     Dispatch,
     EventLog,
@@ -200,7 +199,10 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
                Dispatch.dispatch(
                  ctx.db,
                  ctx.handlers,
-                 assign_call({:session, ctx.lane.session_key}, ctx.coder.session_key, item.id,
+                 assign_call(
+                   {:session, ctx.lane.session_key},
+                   ctx.coder.session_key,
+                   item.id,
                    "implement the slice"
                  )
                )
@@ -216,7 +218,9 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
                  verdict_call(ctx.po.session_key, review.id, "changes-requested")
                )
 
-      assert [wake] = wakes_for(ctx, ctx.lane.session_key, "remedy:spirit-objection-reaches-owner")
+      assert [wake] =
+               wakes_for(ctx, ctx.lane.session_key, "remedy:spirit-objection-reaches-owner")
+
       assert wake.prompt =~ ctx.po.session_key
       assert wake.prompt =~ review.id
       assert wake.prompt =~ item.id
@@ -243,7 +247,10 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
                Dispatch.dispatch(
                  ctx.db,
                  ctx.handlers,
-                 assign_call({:session, ctx.lane.session_key}, ctx.coder.session_key, item.id,
+                 assign_call(
+                   {:session, ctx.lane.session_key},
+                   ctx.coder.session_key,
+                   item.id,
                    "implement the slice"
                  )
                )
@@ -293,22 +300,18 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
   end
 
   defp po_card(ctx, item_id) do
-    Assignments.__handle__(ctx.db, "assign", %{
-      verb: "assign",
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      session_key: ctx.po.session_key,
-      target_role: nil,
-      role_fallback: false,
-      params: %{
-        subject: "spirit judgment",
-        work_item_id: item_id,
-        idempotency_key: nil,
-        reviews_assignment_id: nil,
-        effect_kind: nil,
-        files: nil
-      }
-    })
+    assert {:ok, review} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, %{
+               verb: "assign",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               session_key: ctx.po.session_key,
+               target_role: nil,
+               role_fallback: false,
+               params: %{subject: "spirit judgment", work_item_id: item_id}
+             })
+
+    review
   end
 
   defp approve(ctx, item_id) do
