@@ -172,7 +172,12 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
       # The create-rule request is a different rule's notice and stays; a second
       # update supersedes the first update's request.
       assert %{} =
-               update_item(ctx, {:session, ctx.lane.session_key}, item.id, String.duplicate("c", 64))
+               update_item(
+                 ctx,
+                 {:session, ctx.lane.session_key},
+                 item.id,
+                 String.duplicate("c", 64)
+               )
 
       assert [third] = po_wakes(ctx, "remedy:spec-repinned-summons-spirit")
       refute third.wake_id == second.wake_id

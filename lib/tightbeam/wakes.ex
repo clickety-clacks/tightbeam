@@ -2392,6 +2392,9 @@ defmodule Tightbeam.Wakes do
     "tightbeam:effort-checkin" => ~w(superseded obligation_disposed),
     "tightbeam:supervision" => ~w(superseded),
     "tightbeam:rail-remedy" => ~w(superseded target_unresolvable),
+    # A rule notice supersedes only its own earlier notice about the same work
+    # item to the same target, naming the newer notice as the replacement.
+    "tightbeam:rule-notice" => ~w(superseded),
     "tightbeam:retirement" => ~w(target_retired obligation_disposed),
     # The batcher consumes a digest MEMBER exactly one way: superseded by the
     # digest that carries it, named as the replacement. It has no other verb —
