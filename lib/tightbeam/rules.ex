@@ -416,15 +416,21 @@ defmodule Tightbeam.Rules do
         Lineage.nearest(db, Lineage.creator_session(db, bindings.work_item_id), archetype)
 
     case key do
-      nil -> {:error, {:unbound_lineage, archetype}}
-      key -> {:ok, notice |> Map.delete(:target_lineage_archetype) |> Map.put(:target_session, key)}
+      nil ->
+        {:error, {:unbound_lineage, archetype}}
+
+      key ->
+        {:ok, notice |> Map.delete(:target_lineage_archetype) |> Map.put(:target_session, key)}
     end
   end
 
   defp address_notice(db, %{target_item_card_opener: archetype} = notice, bindings) do
     case Lineage.open_card_opener(db, bindings.work_item_id, archetype) do
-      nil -> {:error, {:unbound_card_opener, archetype}}
-      key -> {:ok, notice |> Map.delete(:target_item_card_opener) |> Map.put(:target_session, key)}
+      nil ->
+        {:error, {:unbound_card_opener, archetype}}
+
+      key ->
+        {:ok, notice |> Map.delete(:target_item_card_opener) |> Map.put(:target_session, key)}
     end
   end
 
