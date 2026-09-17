@@ -161,6 +161,39 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
       assert second.prompt =~ "Any earlier judgment was of the old spec"
     end
 
+    test "a newer pin supersedes an unhandled request so the PO holds one, for the latest",
+         ctx do
+      item = create_item(ctx, {:session, ctx.lane.session_key}, @spec_a)
+      assert [first] = po_wakes(ctx, "remedy:spec-pinned-summons-spirit")
+
+      assert %{} = update_item(ctx, {:session, ctx.lane.session_key}, item.id, @spec_b)
+      assert [second] = po_wakes(ctx, "remedy:spec-repinned-summons-spirit")
+
+      # The create-rule request is a different rule's notice and stays; a second
+      # update supersedes the first update's request.
+      assert %{} =
+               update_item(ctx, {:session, ctx.lane.session_key}, item.id, String.duplicate("c", 64))
+
+      assert [third] = po_wakes(ctx, "remedy:spec-repinned-summons-spirit")
+      refute third.wake_id == second.wake_id
+      assert [_] = po_wakes(ctx, "remedy:spec-pinned-summons-spirit")
+      assert first.wake_id == hd(po_wakes(ctx, "remedy:spec-pinned-summons-spirit")).wake_id
+
+      assert {:ok, [[state, reason, replacement]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT w.state, c.reasonKind, c.replacementWakeId FROM wakes w JOIN wake_cancellations c ON c.wakeId = w.wakeId WHERE w.wakeId = ?1",
+                 [second.wake_id]
+               )
+
+      assert {state, reason, replacement} == {"canceled", "superseded", third.wake_id}
+
+      assert Enum.any?(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "rule_notice_superseded" and &1.subject == second.wake_id)
+             )
+    end
+
     test "closing a spec-backed item does not summon anyone", ctx do
       item = create_item(ctx, {:session, ctx.lane.session_key}, @spec_a)
       assert [_] = po_wakes(ctx, "remedy:spec-pinned-summons-spirit")

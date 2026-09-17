@@ -1786,16 +1786,23 @@ defmodule Tightbeam.Wakes do
   defp deliver_rule_notice_in_txn(txn, rule, call, evidence) do
     case RuleRuntime.resolve_notice_in_txn(txn, rule, call) do
       {:ok, resolved} ->
+        origin = "remedy:#{rule.name}"
+        work_item_id = Map.get(resolved, :work_item_id)
+        stale = pending_rule_notices_in_txn(txn, origin, resolved.bound_session, work_item_id)
+
         wake =
           schedule_in_txn(txn, %{
             session_key: resolved.bound_session,
             target_role: resolved.target[:target_role],
-            origin: "remedy:#{rule.name}",
+            origin: origin,
             prompt: resolved.params.prompt,
             due_at: System.system_time(:millisecond),
             creator_session_key: principal_session(call.principal),
+            work_item_id: work_item_id,
             summon: true
           })
+
+        supersede_rule_notices_in_txn(txn, rule, stale, wake, work_item_id)
 
         EventLog.lifecycle_in_txn(
           txn,
@@ -1819,6 +1826,52 @@ defmodule Tightbeam.Wakes do
 
   defp principal_session({:session, session_key}), do: session_key
   defp principal_session(_principal), do: nil
+
+  # A notice from one rule about one work item to one target is a request about
+  # the item's current state. A newer one makes an unhandled older one stale: the
+  # target should hold one request, for the latest state, not one per write. The
+  # old wake is canceled with the new one recorded as its replacement.
+  defp pending_rule_notices_in_txn(_txn, _origin, _target, nil), do: []
+
+  defp pending_rule_notices_in_txn(txn, origin, target, work_item_id) do
+    txn
+    |> Txn.q(
+      """
+      SELECT wakeId FROM wakes
+       WHERE state = 'pending' AND consumer = 'prompt'
+         AND origin = ?1 AND sessionKey = ?2 AND work_item_id = ?3
+      """,
+      [origin, target, work_item_id]
+    )
+    |> Enum.map(fn [wake_id] -> wake_id end)
+  end
+
+  defp supersede_rule_notices_in_txn(_txn, _rule, [], _wake, _work_item_id), do: :ok
+
+  defp supersede_rule_notices_in_txn(txn, rule, stale, wake, work_item_id) do
+    Enum.each(stale, fn old_wake_id ->
+      canceled =
+        cancel_in_txn(txn, %{
+          wake_id: old_wake_id,
+          requester: %{kind: "process", id: "tightbeam:rule-notice"},
+          reason_kind: "superseded",
+          causal_source: %{kind: "wake", id: wake.wake_id},
+          outcome: %{kind: "replacement", replacement_wake_id: wake.wake_id}
+        })
+
+      EventLog.lifecycle_in_txn(
+        txn,
+        "rule_notice_superseded",
+        old_wake_id,
+        JSON.encode!(%{
+          rule: rule.name,
+          work_item_id: work_item_id,
+          replacement: wake.wake_id,
+          canceled: canceled == true
+        })
+      )
+    end)
+  end
 
   defp rule_edge(call) do
     case Map.get(call, :edge, :verb) do

@@ -386,7 +386,11 @@ defmodule Tightbeam.Rules do
   @doc "Resolve a validated notice against the same transaction snapshot as its rule."
   @spec resolve_notice_in_txn(DB.Txn.t(), map(), map()) :: {:ok, map()} | {:error, term()}
   def resolve_notice_in_txn(%DB.Txn{} = txn, rule, call) do
-    RailRemedy.resolve_notice(txn, rule.notice, notice_bindings(txn, call))
+    bindings = notice_bindings(txn, call)
+
+    with {:ok, resolved} <- RailRemedy.resolve_notice(txn, rule.notice, bindings) do
+      {:ok, Map.put(resolved, :work_item_id, bindings.work_item_id)}
+    end
   end
 
   defp normalize_predicate_conditions(conditions) when is_list(conditions) do

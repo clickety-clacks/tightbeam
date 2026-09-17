@@ -27,7 +27,7 @@ deny_when = [
 ]
 [rule.notice]
 target_session = "{product_owner_key}"
-prompt = "Spirit rumination requested. Work item {work_item_id} now carries a spec, pinned by {caller_key}. Nothing is waiting on you and nothing is blocked. Read the spec against the product's intent and record your judgment on a bounded product-owner assignment on this work item: spirit-approved, or changes-requested naming what must change. A changes-requested verdict reaches the current owner of the work by itself."
+prompt = "Spirit rumination requested. Work item {work_item_id} now carries a spec, pinned by {caller_key}. Nothing is waiting on you and nothing is blocked. Read the spec as pinned when you read this, judge it against the product's intent, and record your judgment with the spec hash on a bounded product-owner assignment on this work item: spirit-approved, or changes-requested naming what must change. A changes-requested verdict reaches the current owner of the work by itself."
 
 [[rule]]
 name = "spec-repinned-summons-spirit"
@@ -41,7 +41,7 @@ deny_when = [
 ]
 [rule.notice]
 target_session = "{product_owner_key}"
-prompt = "Spirit rumination requested. The spec on work item {work_item_id} changed, re-pinned by {caller_key}. Any earlier judgment was of the old spec. Nothing is waiting on you and nothing is blocked. Read the new spec against the product's intent and record your judgment on a bounded product-owner assignment on this work item: spirit-approved, or changes-requested naming what must change."
+prompt = "Spirit rumination requested. The spec on work item {work_item_id} changed, re-pinned by {caller_key}. Any earlier judgment was of the old spec. Nothing is waiting on you and nothing is blocked. Read the spec as pinned when you read this, judge it against the product's intent, and record your judgment with the spec hash on a bounded product-owner assignment on this work item: spirit-approved, or changes-requested naming what must change."
 
 # The objection travels on its own. The product owner's changes-requested is a
 # row write; this production recognizes the committed verdict row and wakes the
