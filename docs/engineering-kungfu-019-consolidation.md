@@ -102,7 +102,15 @@ coordination structure instead of using the PO as a mailbox for worker traffic.
 
 A delivery owner plans its own team and asks the PO, which carries the team-design
 skill, for a consequential decomposition (team-planner folded into that skill on the
-PO, 2026-09-17). Sol can manage familiar delivery while Astra or Fable reasons about
+PO, 2026-09-17).
+
+Spirit rumination returned on 2026-09-17 as a prod, never a gate: a work item gaining
+or changing its spec summons the product's PO to judge it, and a PO changes-requested
+on spec-backed work is delivered to the session that owns the work. Nothing blocks.
+The rules are `spec-pinned-summons-spirit`, `spec-repinned-summons-spirit` and
+`spirit-objection-reaches-owner`; the PO is found from lineage by
+`Tightbeam.ProductOwner`. The measured failure of the old deny is recorded in the
+rule file's comment. Sol can manage familiar delivery while Astra or Fable reasons about
 a difficult decomposition. A strong model may own orchestration throughout when
 judgment stays difficult. Each owner can adapt its own subtree within authority;
 changes affecting other owners' commitments travel to those owners. A planner can

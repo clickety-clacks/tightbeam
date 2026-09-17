@@ -99,7 +99,9 @@ defmodule Tightbeam.WorkItems do
       {created_by_user, created_by_session} = creator(call.principal)
 
       result =
-        transaction(db, fn txn ->
+        transaction_with_row_commits(
+          db,
+          fn txn ->
           case key && idempotency_item(txn, owner, key) do
             nil ->
               id = "wi_" <> Tightbeam.Id.uuid4()
@@ -152,7 +154,21 @@ defmodule Tightbeam.WorkItems do
               Publisher.maybe_observed_accepted_in_txn(txn, call)
               {:replayed, item}
           end
-        end)
+          end,
+          fn _txn, result ->
+            case result do
+              {:created, %{specRefSha256: sha} = item, _wake} when is_binary(sha) ->
+                [
+                  work_item_transition(item, call, "work-item-create", %{
+                    spec_ref_sha256: %{old: nil, new: sha}
+                  })
+                ]
+
+              _ ->
+                []
+            end
+          end
+        )
 
       case result do
         # An actual create makes an owner-visible item — one owner-routed
@@ -198,26 +214,44 @@ defmodule Tightbeam.WorkItems do
   defp update_result(db, call) do
     with :ok <- principal_allowed(call.principal) do
       result =
-        transaction(db, fn txn ->
-          result =
-            update_in_txn(
-              txn,
-              Map.put(call.params, :effort_config, Map.get(call, :effort_config, %{}))
-            )
+        transaction_with_row_commits(
+          db,
+          fn txn ->
+            before = fetch_in_txn(txn, call.params[:work_item_id])
 
-          case result do
-            {:updated, item, changed?} ->
-              publish_item_result_in_txn(txn, call, item, changed?)
+            result =
+              update_in_txn(
+                txn,
+                Map.put(call.params, :effort_config, Map.get(call, :effort_config, %{}))
+              )
 
-            _ ->
-              :ok
+            case result do
+              {:updated, item, changed?} ->
+                publish_item_result_in_txn(txn, call, item, changed?)
+                {:updated, item, changed?, before}
+
+              other ->
+                other
+            end
+          end,
+          fn _txn, result ->
+            case result do
+              {:updated, %{specRefSha256: new_sha} = item, true, %{specRefSha256: old_sha}}
+              when is_binary(new_sha) and new_sha != old_sha ->
+                [
+                  work_item_transition(item, call, "work-item-update", %{
+                    spec_ref_sha256: %{old: old_sha, new: new_sha}
+                  })
+                ]
+
+              _ ->
+                []
+            end
           end
-
-          result
-        end)
+        )
 
       case result do
-        {:updated, item, changed?} ->
+        {:updated, item, changed?, _before} ->
           if changed?, do: best_effort(fn -> on_change(call).(item.id, "metadata") end)
           public_work_item(item)
 

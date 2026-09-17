@@ -43,21 +43,7 @@ defmodule Tightbeam.Rules do
   turns a denial into an allowed call.
   """
 
-  alias Tightbeam.{
-    Artifacts,
-    Assignments,
-    DB,
-    Devices,
-    Escalation,
-    EventLog,
-    ObligationFacts,
-    Org,
-    RailEpisodes,
-    RailRemedy,
-    RailScript,
-    RuleRuntime,
-    Roles
-  }
+  alias Tightbeam.{Artifacts, Assignments, DB, Devices, Escalation, EventLog, ObligationFacts, Org, ProductOwner, RailEpisodes, RailRemedy, RailScript, Roles, RuleRuntime}
 
   import Bitwise
 
@@ -106,7 +92,7 @@ defmodule Tightbeam.Rules do
                  "on_rule_denied",
                  "params"
                ])
-  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin)
+  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin caller_key target_key product_owner_key work_owner_key)
   @embedded_fields ~w(subject prompt display)
   @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
@@ -134,6 +120,8 @@ defmodule Tightbeam.Rules do
     "org.live_sessions_owned_by_caller" => :int,
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
+    "attest.verdict_kind" => :string,
+    "transition.fields" => {:list, :string},
     "assignment.verdicts" => {:list, :string},
     "assignment.is_producing_card" => :bool,
     "assignment.effect_kind" => :string,
@@ -711,16 +699,38 @@ defmodule Tightbeam.Rules do
         _ -> nil
       end
 
+    work_item_id =
+      (assignment && assignment.work_item_id) || Map.get(call.params, :work_item_id)
+
+    caller_key = notice_caller_key(call)
+    target_key = Map.get(call, :session_key)
+
     %{
       assignment_id: assignment && assignment.id,
-      work_item_id:
-        (assignment && assignment.work_item_id) || Map.get(call.params, :work_item_id),
+      work_item_id: work_item_id,
       holder_key: assignment && assignment.holder_key,
       holder_role: assignment && assignment[:holder_role],
       holder_archetype: assignment && assignment.holder_archetype,
-      caller_origin: call.origin
+      caller_origin: call.origin,
+      caller_key: caller_key,
+      target_key: target_key,
+      product_owner_key:
+        ProductOwner.resolve(db, caller_key) || ProductOwner.resolve(db, target_key) ||
+          ProductOwner.resolve(db, ProductOwner.creator_session(db, work_item_id)),
+      work_owner_key: ProductOwner.work_owner(db, work_item_id)
     }
   end
+
+  defp notice_caller_key(%{principal: {:session, key}}) when is_binary(key), do: key
+
+  defp notice_caller_key(%{origin: origin}) when is_binary(origin) do
+    case Tightbeam.Origin.parse(origin) do
+      {:agent, key} -> key
+      _ -> nil
+    end
+  end
+
+  defp notice_caller_key(_call), do: nil
 
   defp row_commit_principal("session:" <> session_key, _owner) do
     origin =
@@ -1876,6 +1886,29 @@ defmodule Tightbeam.Rules do
       case {call.verb, Map.get(call.params, :kind)} do
         {"attest", kind} when is_binary(kind) -> kind
         _ -> nil
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("attest.verdict_kind", _db, call, cache) do
+    value =
+      case {call.verb, Map.get(call.params, :verdict_kind)} do
+        {"attest", kind} when is_binary(kind) -> kind
+        _ -> nil
+      end
+
+    {value, cache}
+  end
+
+  # The business-row fields a row-commit transition changed, as strings; empty on a
+  # verb edge. Lets a row-commit rule fire on one field's change instead of every
+  # write to the row.
+  defp compute_fact("transition.fields", _db, call, cache) do
+    value =
+      case Map.get(call, :transition) do
+        %{fields: fields} when is_map(fields) -> fields |> Map.keys() |> Enum.map(&to_string/1)
+        _ -> []
       end
 
     {value, cache}
