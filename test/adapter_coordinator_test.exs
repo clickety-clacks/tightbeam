@@ -1000,8 +1000,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # than abort a durable outcome (observed +8..22ms), and the measurement
     # starts before GenServer.stop dispatches, ahead of the callback's own clock
     # (observed +12..26ms under 4x CPU oversubscription). 100ms is ~3x the worst
-    # observed sum of the two and still fails the 114-214ms overruns measured at
-    # the pre-fix base, so the regression this bound guards stays caught. With 24
+    # observed sum of the two. This bound is a sanity check on the deadline
+    # contract, not the regression detector: at the pre-fix base its catch rate
+    # is platform-dependent — 0 of 8 loaded runs on eezo (macOS, elapsed
+    # 853-1284ms, review control art_88fb2ef4) versus 3 of 6 on racter (Linux,
+    # 1320-1338ms). What caught the base defect on both hosts is the row-state,
+    # log-content and census oracles below, which this allowance leaves
+    # untouched. With 24
     # retained adapters this also proves the bound does not degrade with
     # cardinality: the late entries' outcomes are decided before settlement, and
     # their cleanup is owned by someone else afterwards.
