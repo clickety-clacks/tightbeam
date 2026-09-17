@@ -100,8 +100,9 @@ relevant work, and opens delegated outcome assignments. A feature orchestrator o
 its specialists' and reviewers' assignments. This makes delivery custody follow the
 coordination structure instead of using the PO as a mailbox for worker traffic.
 
-A delivery owner plans its own team and loads team-design for a consequential
-decomposition (team-planner folded into that skill, 2026-09-16). Sol can manage familiar delivery while Astra or Fable reasons about
+A delivery owner plans its own team and asks the PO, which carries the team-design
+skill, for a consequential decomposition (team-planner folded into that skill on the
+PO, 2026-09-17). Sol can manage familiar delivery while Astra or Fable reasons about
 a difficult decomposition. A strong model may own orchestration throughout when
 judgment stays difficult. Each owner can adapt its own subtree within authority;
 changes affecting other owners' commitments travel to those owners. A planner can

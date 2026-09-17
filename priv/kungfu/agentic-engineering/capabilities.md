@@ -11,7 +11,7 @@ with an addressable PO alongside it for product intent and acceptance judgment.
 - Independent review: preserve attributable spec and code judgment with an agreed
   delivery standard and proportionate evidence.
 - Focused role craft: product-owner, orchestrator, spec-writer, coder, reviewer-code,
-  reviewer-spec and recon; team-design for consequential decomposition, guidance-writer and
+  reviewer-spec and recon; team-design on the PO for consequential decomposition, guidance-writer and
   guidance-reviewer for policy work, and integrator for separately owned reconciliation.
   Activity-based model selection supports mixed, Codex-only and Claude-only organizations.
 - Protected coordination: explicit responsibility, useful recovery, effect-based

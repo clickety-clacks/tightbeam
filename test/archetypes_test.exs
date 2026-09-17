@@ -304,7 +304,7 @@ defmodule Tightbeam.ArchetypesTest do
     assert Map.keys(loaded) |> Enum.sort() ==
              ~w(coder default guidance-reviewer guidance-writer integrator orchestrator product-owner recon reviewer-code reviewer-spec spec-writer)
 
-    assert loaded["product-owner"].skills == ["tightbeam-dispatching"]
+    assert loaded["product-owner"].skills == ["tightbeam-dispatching", "team-design"]
 
     for role <-
           ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer guidance-writer guidance-reviewer integrator) do
@@ -360,7 +360,8 @@ defmodule Tightbeam.ArchetypesTest do
         :codex
       )
 
-    assert product_owner.skills == %{}
+    assert Map.keys(product_owner.skills) == ["team-design"]
+    assert product_owner.skills["team-design"] =~ "# Design the team for a delivery owner"
     refute product_owner.guidance =~ "# Repository custody"
     assert product_owner.guidance =~ "You retain\ncontent ownership"
     assert product_owner.guidance =~ "publication through its repository custodian"
@@ -401,7 +402,6 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert orchestrator.guidance =~ "# Delivery recovery"
     refute orchestrator.guidance =~ "# Team planner"
-    assert orchestrator.skills["team-design"] =~ "# Design the team"
     assert orchestrator.skills["product-delivery"] =~ "# Own a product's delivery"
 
     assert orchestrator.guidance =~

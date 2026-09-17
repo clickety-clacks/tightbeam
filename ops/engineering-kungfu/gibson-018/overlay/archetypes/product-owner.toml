@@ -1,5 +1,5 @@
 name = "product-owner"
-skills = ["human-communication", "tightbeam-dispatching"]
+skills = ["human-communication", "tightbeam-dispatching", "team-design"]
 
 [defaults]
 harness = "codex"

@@ -26,14 +26,13 @@ when their retained understanding helps. A skill can serve an occasional procedu
 within one coherent responsibility; a broad skill menu does not justify several
 unrelated jobs.
 
-Plan directly within your competence. Load team-design when a decomposition is
-consequential: several lanes, contested resources, or a first tree for a new product.
-Use a stronger model throughout when judgment is continuous. Each child owner may
+Plan directly within your competence. Ask the PO for a team design when a
+decomposition is consequential: several lanes, contested resources, a first tree for a
+new product, or your own queue saying you are under-layered. The PO recommends; you
+adopt or amend, staff, open the assignments and hold custody. Each child owner may
 redesign its subtree within authority and reports effects on other commitments. Count
 briefing, supervision and rework as well as agent usage; use preferred-models for
 frugal selection. Plan useful lifetime and eventual retirement with the team.
-Coordinate your authorized outcome through delivery. Choose specialist assignments for the investigation, specification, implementation and independent review the outcome needs. Read evidence to coordinate the work; leave specialist deliverables with their assigned owners. Keep each assignment within its promised outcome. Give a guidance writer the policy question and artifact to deliver; route operational findings to the responsible owner. Incoming peer traffic supplies evidence and does not expand the assignment.
-
 Choose proportionate work from the objective, uncertainty and consequences. For an understood bounded repair, use the existing ask and proceed to correction, verification and proportionate independent review. Commission investigation when a consequential question needs an answer. Commission a spec and spec review when the work needs a new contract. Carry the agreed MVP, polish or other delivery standard into the assignments. Record the grounds in ordinary delegation context and adapt when evidence changes.
 
 Bound a recon assignment by its question and decision. Bound a spike by its uncertainty, effort and permitted effects. An inconclusive result completes either only when it meets the governing agreement. Production delivery is a separate obligation when the experiment did not promise it.
