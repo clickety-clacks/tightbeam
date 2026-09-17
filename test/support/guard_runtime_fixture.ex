@@ -5,7 +5,11 @@ defmodule Tightbeam.GuardRuntimeFixture do
   def run!(tmp, script, expected, opts \\ []) do
     %{executable: executable, args: args, env: env} = prepare!(tmp, script)
 
-    {output, status} = System.cmd(executable, args, env: env, stderr_to_stdout: true)
+    {output, status} =
+      System.cmd(executable, args ++ Keyword.get(opts, :args, []),
+        env: env,
+        stderr_to_stdout: true
+      )
 
     File.write!(Path.join(tmp, "runtime.log"), output)
     assert status == Keyword.get(opts, :exit, 0), output

@@ -1733,6 +1733,17 @@ defmodule Tightbeam.Acp.Adapter do
        when kind in ["tool_call", "tool_call_update"],
        do: [JSON.encode!(content)]
 
+  # pi-acp reports a completed bash tool call with no top-level "content" key;
+  # its output (and the gate marker) live in _meta.terminal_output.data. Placed
+  # after the "content" clause above so that clause's matched set is unchanged:
+  # this only rescues content-less updates the fallback would otherwise drop.
+  defp gate_update_output(%{
+         "sessionUpdate" => kind,
+         "_meta" => %{"terminal_output" => %{"data" => data}}
+       })
+       when kind in ["tool_call", "tool_call_update"] and is_binary(data),
+       do: [data]
+
   defp gate_update_output(_update), do: []
 
   defp gate_raw_updates(raw_updates) do

@@ -119,6 +119,60 @@ defmodule Tightbeam.Wire.ChangeSocketTest do
 
     assert {:push, {:text, bytes}, _state} = ChangeSocket.handle_info(:firehose_heartbeat, state)
     assert JSON.decode!(bytes) == %{"type" => "heartbeat", "seq" => 1}
+    assert bytes == JSON.encode!(%{"type" => "heartbeat", "seq" => 1})
+    assert state.credential_digest == :crypto.hash(:sha256, ctx.device.token)
+    refute ctx.device.token in Map.values(Map.from_struct(state))
+  end
+
+  test "heartbeat closes a revoked credential without a revocation notice", ctx do
+    {:push, {:text, _auth}, state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    :ok = Devices.revoke(ctx.db, ctx.device.device_id)
+
+    assert {:stop, :normal, 1008, ^state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+  end
+
+  test "heartbeat closes a rotated credential without a revocation notice", ctx do
+    {:push, {:text, _auth}, state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    replacement = Devices.approve(ctx.db, ctx.device.device_id)
+    assert replacement.status == "allowlisted"
+    refute replacement.token == ctx.device.token
+
+    assert {:stop, :normal, 1008, ^state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+  end
+
+  test "heartbeat closes a missing device without a revocation notice", ctx do
+    {:push, {:text, _auth}, state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    {:ok, _} =
+      DB.query(ctx.db, "DELETE FROM device_versions WHERE deviceId = ?1", [ctx.device.device_id])
+
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM devices WHERE deviceId = ?1", [ctx.device.device_id])
+    assert Devices.by_id(ctx.db, ctx.device.device_id) == nil
+
+    assert {:stop, :normal, 1008, ^state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
+  end
+
+  test "heartbeat closes a disallowed device even if its credential is unchanged", ctx do
+    {:push, {:text, _auth}, state} =
+      inbound(%{"type" => "auth", "token" => ctx.device.token}, ctx.state)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE devices SET status = 'denied' WHERE deviceId = ?1", [
+        ctx.device.device_id
+      ])
+
+    assert Devices.by_id(ctx.db, ctx.device.device_id).token == ctx.device.token
+
+    assert {:stop, :normal, 1008, ^state} =
+             ChangeSocket.handle_info(:firehose_heartbeat, state)
   end
 
   test "a retirement affecting the authenticated owner closes with policy code", ctx do

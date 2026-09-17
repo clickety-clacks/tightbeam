@@ -15,6 +15,7 @@ defmodule Tightbeam.Assignments do
     Org,
     Placement,
     Projection,
+    RailRemedy,
     Supervision,
     Wakes
   }
@@ -536,14 +537,19 @@ defmodule Tightbeam.Assignments do
         requester_id: "tightbeam:retirement"
       })
 
-      EffortCheckin.cancel_in_txn(
-        txn,
-        assignment_id,
+      disposition =
         assignment_disposition_command(
           assignment_id,
           "tightbeam:retirement",
           liveness_trigger
-        ),
+        )
+
+      RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+
+      EffortCheckin.cancel_in_txn(
+        txn,
+        assignment_id,
+        disposition,
         %{verb: "retire", principal: principal}
       )
 
@@ -629,7 +635,13 @@ defmodule Tightbeam.Assignments do
 
     Enum.map(rows, fn row ->
       assignment = assignment(row)
-      Map.put(assignment, :files, declared_files(db, assignment.id))
+
+      assignment
+      |> Map.put(:files, declared_files(db, assignment.id))
+      |> Map.put(
+        :commitRefCorrections,
+        Tightbeam.AssignmentCommitRefCorrections.list(db, assignment.id)
+      )
     end)
   end
 
@@ -1584,8 +1596,16 @@ defmodule Tightbeam.Assignments do
 
     with :ok <- principal_allowed(call.principal, "assignment-get") do
       case DB.query(db, "SELECT #{columns()} FROM assignments WHERE id = ?1", [assignment_id]) do
-        {:ok, [row]} -> Map.put(assignment(row), :reopenings, list_reopenings(db, assignment_id))
-        {:ok, []} -> error("not_found", "unknown assignment: #{assignment_id}")
+        {:ok, [row]} ->
+          assignment(row)
+          |> Map.put(:reopenings, list_reopenings(db, assignment_id))
+          |> Map.put(
+            :commitRefCorrections,
+            Tightbeam.AssignmentCommitRefCorrections.list(db, assignment_id)
+          )
+
+        {:ok, []} ->
+          error("not_found", "unknown assignment: #{assignment_id}")
       end
     end
   end
@@ -2126,14 +2146,19 @@ defmodule Tightbeam.Assignments do
                   requester_id: "tightbeam:assignments"
                 })
 
-                EffortCheckin.cancel_in_txn(
-                  txn,
-                  assignment_id,
+                disposition =
                   assignment_disposition_command(
                     assignment_id,
                     "tightbeam:assignments",
                     liveness_trigger
-                  ),
+                  )
+
+                RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+
+                EffortCheckin.cancel_in_txn(
+                  txn,
+                  assignment_id,
+                  disposition,
                   %{verb: "attest", principal: principal_id(call.principal)}
                 )
 
@@ -2402,14 +2427,19 @@ defmodule Tightbeam.Assignments do
                 requester_id: "tightbeam:assignments"
               })
 
-              EffortCheckin.cancel_in_txn(
-                txn,
-                assignment_id,
+              disposition =
                 assignment_disposition_command(
                   assignment_id,
                   "tightbeam:assignments",
                   liveness_trigger
-                ),
+                )
+
+              RailRemedy.dispose_assignment_in_txn(txn, assignment_id, disposition)
+
+              EffortCheckin.cancel_in_txn(
+                txn,
+                assignment_id,
+                disposition,
                 %{verb: "revoke-assignment", principal: principal_id(call.principal)}
               )
 

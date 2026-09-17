@@ -1064,8 +1064,15 @@ mod instance_authority_tests {
     #[test]
     fn signal_time_pgid_reuse_never_reaches_numeric_killpg() {
         PROCESS_SIGNAL_CALLS.with(|calls| calls.set(0));
-        let pgid = unsafe { libc::getpgrp() };
-        let current = read_process_start_time(pgid).expect("live group leader start time readable");
+        // Our own pid, not getpgrp(). A process group OUTLIVES its leader, so
+        // the runner's group leader may already have exited — reading its start
+        // time is then ESRCH, and the refusal under test never runs because the
+        // product routes a gone leader to `leader_disappeared_authority`
+        // instead. What this test means is "a leader whose start time no longer
+        // matches is refused as reuse", and that needs a leader guaranteed
+        // alive. We are one. The other tests here already do this.
+        let pgid = unsafe { libc::getpid() };
+        let current = read_process_start_time(pgid).expect("own start time readable");
         let captured = stale(current);
         let boot = boot_identity().expect("boot identity readable");
         let launch = "signal-time-pgid-reuse";
@@ -1450,7 +1457,12 @@ mod tests {
     #[test]
     fn historical_six_field_identity_still_authorizes() {
         let path = test_path("historical-six-field");
-        let pgid = unsafe { libc::getpgrp() };
+        // Our own pid, for the same reason as the pgid-reuse test above: the
+        // runner's group leader can already be gone. `authorize_group_signal`
+        // parses the recorded start time out of the identity FILE and never
+        // reads a live process, so any readable start time serves — it only has
+        // to round-trip.
+        let pgid = unsafe { libc::getpid() };
         let start = read_process_start_time(pgid).unwrap();
         let boot = boot_identity().unwrap();
         let launch = "historical-six-field";

@@ -276,7 +276,8 @@ defmodule Tightbeam.Application do
         Application.get_env(:tightbeam, :effort_checkin_horizon_ms, 14_400_000),
       critical_lease_hard_cap_ms:
         Application.get_env(:tightbeam, :critical_lease_hard_cap_ms, 14_400_000),
-      onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000)
+      onboarding_lease_ms: Application.get_env(:tightbeam, :onboarding_lease_ms, 1_800_000),
+      credentials_directory: Application.get_env(:tightbeam, :credentials_directory)
     }
   end
 
@@ -306,7 +307,7 @@ defmodule Tightbeam.Application do
     # silently fail and every shutdown would be inferred dirty at next boot.
     with epoch when is_integer(epoch) <- Application.get_env(:tightbeam, :boot_epoch) do
       try do
-        Tightbeam.EventLog.clean_shutdown(Tightbeam.DB, epoch)
+        Tightbeam.EventLog.clean_shutdown(Tightbeam.DB, epoch, stamp_deadline(deadline))
       catch
         _, _ -> :ok
       end
@@ -315,11 +316,35 @@ defmodule Tightbeam.Application do
     state
   end
 
+  # What the drain left over, and never the global default — but never nothing
+  # either. The stamp is one short UPDATE that HAS to happen: without it the next
+  # boot infers a dirty exit, so a drain that spent its whole budget (turns still
+  # running, DB healthy) must not report every busy restart as a crash. The floor
+  # is the 5s this call inherited from `GenServer` before there was a knob, which
+  # makes the worst case here no longer than it is today; a call timeout
+  # configured below the floor is the smaller bound and wins.
+  @stamp_floor_ms 5_000
+
+  defp stamp_deadline(drain_deadline) do
+    now = System.monotonic_time(:millisecond)
+    allowance = max(drain_deadline - now, @stamp_floor_ms)
+
+    now + min(Tightbeam.DB.call_timeout(), allowance)
+  end
+
   defp drain_until(deadline) do
     running =
       try do
+        # Deadline-bounded: a poll that outlived the drain must not extend it.
+        # A timeout or error fails this match and is caught below as "nothing
+        # running", which ends the drain — the same reading as before.
         {:ok, [[n]]} =
-          Tightbeam.DB.query(Tightbeam.DB, "SELECT COUNT(*) FROM turns WHERE status = 'running'")
+          Tightbeam.DB.query_until(
+            Tightbeam.DB,
+            "SELECT COUNT(*) FROM turns WHERE status = 'running'",
+            [],
+            deadline
+          )
 
         n
       catch

@@ -1,5 +1,5 @@
 name = "product-owner"
-skills = ["worktree-session", "tightbeam-dispatching", "product-discovery", "spirit-review"]
+skills = ["tightbeam-dispatching"]
 
 [guidance]
 text = """

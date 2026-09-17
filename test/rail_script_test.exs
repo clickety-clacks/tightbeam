@@ -45,6 +45,12 @@ defmodule Tightbeam.RailScriptTest do
       :ok = Escalation.ensure_schema(db)
       :ok = Wakes.ensure_schema(db)
       :ok = Placement.ensure_schema(db)
+      # Current session reads require the event relation even in this deliberately
+      # incomplete fixture. Keep assignments absent: that is the tested fault.
+      assert {:ok, :ok} =
+               DB.transaction(db, &Tightbeam.SessionReparent.migrate_in_txn/1)
+
+      assert {:ok, []} = DB.query(db, "SELECT name FROM sqlite_master WHERE name='assignments'")
     else
       :ok = Tightbeam.Schema.ensure_all(db)
     end

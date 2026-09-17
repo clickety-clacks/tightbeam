@@ -122,7 +122,8 @@ defmodule Tightbeam.Gateway do
           escalation_decision_deadline_ms: pos_integer(),
           effort_checkin_horizon_ms: pos_integer(),
           critical_lease_hard_cap_ms: pos_integer(),
-          onboarding_lease_ms: pos_integer()
+          onboarding_lease_ms: pos_integer(),
+          credentials_directory: String.t() | nil
         }
 
   @doc """
@@ -387,6 +388,7 @@ defmodule Tightbeam.Gateway do
       [
         name: Tightbeam.Credentials.server(machine),
         base_dir: host.base_dir,
+        credentials_directory: Map.get(config, :credentials_directory),
         staging_base_dir: config.base_dir,
         machine: machine,
         ssh: host.ssh,
@@ -763,6 +765,9 @@ defmodule Tightbeam.Gateway do
         end,
       {"facts-read", []} => fn call -> facts_read_result(db, call) end,
       {"artifact-record", ["artifact.recorded"]} => fn call -> Artifacts.record(db, call) end,
+      {"artifact-content-fetch", []} => fn call ->
+        Tightbeam.ArtifactContent.fetch_call(db, call)
+      end,
       {"artifact-get", []} => fn call ->
         Artifacts.get(db, call.params[:artifact_id]) || %{code: "not_found"}
       end,
@@ -1194,6 +1199,13 @@ defmodule Tightbeam.Gateway do
       end,
       {"attests", []} => fn call -> Assignments.__handle__(db, "attests", call) end,
       {"assignment-get", []} => fn call -> Assignments.__handle__(db, "assignment-get", call) end,
+      {"assignment-commitref-correct", []} => fn call ->
+        Tightbeam.AssignmentCommitRefCorrections.__handle__(
+          db,
+          "assignment-commitref-correct",
+          call
+        )
+      end,
       {"revoke-assignment", ["assignment.closed"]} => fn call ->
         Assignments.__handle__(
           db,
@@ -1222,6 +1234,7 @@ defmodule Tightbeam.Gateway do
       {"tune", ["message.created", "session.updated"]} => fn call ->
         tune_result(config, db, call)
       end,
+      {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
       {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
         retire_result(config, db, call)
       end
@@ -1705,9 +1718,68 @@ defmodule Tightbeam.Gateway do
           | {:conflict, map()}
           | :skipped
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
-    case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-      nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
-      duplicate -> duplicate
+    case remedy_wake_delivery_admission_in_txn(txn, opts[:wake_id]) do
+      :skip ->
+        :skipped
+
+      :continue ->
+        case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
+          nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+          duplicate -> duplicate
+        end
+    end
+  end
+
+  defp remedy_wake_delivery_admission_in_txn(_txn, wake_id) when not is_binary(wake_id),
+    do: :continue
+
+  defp remedy_wake_delivery_admission_in_txn(txn, wake_id) do
+    case DB.Txn.q(txn, "SELECT origin, assignmentId FROM wakes WHERE wakeId = ?1", [wake_id]) do
+      [["remedy:" <> _ = origin, assignment_id]] ->
+        case assignment_id || legacy_remedy_assignment_id_in_txn(txn, wake_id, origin) do
+          nil ->
+            :continue
+
+          assignment_id ->
+            case DB.Txn.q(txn, "SELECT state FROM assignments WHERE id = ?1", [assignment_id]) do
+              [["open"]] -> :continue
+              _ -> :skip
+            end
+        end
+
+      _ ->
+        :continue
+    end
+  end
+
+  defp legacy_remedy_assignment_id_in_txn(txn, wake_id, origin) do
+    case DB.Txn.q(
+           txn,
+           """
+           SELECT episode.subject
+           FROM rail_remedy_episodes episode
+           JOIN assignments assignment ON assignment.id = episode.subject
+           JOIN wire_idempotency idem
+             ON idem.ownerUserId = ?2
+            AND idem.operation = 'wake'
+            AND idem.sessionKey = ?1
+            AND (
+              substr(idem.idempotencyKey, 1,
+                length('rail-dispatch:' || episode.statute || ':' || episode.subject || ':')) =
+                'rail-dispatch:' || episode.statute || ':' || episode.subject || ':'
+              OR
+              substr(idem.idempotencyKey, 1,
+                length('rail-rewake:' || episode.statute || ':' || episode.subject || ':')) =
+                'rail-rewake:' || episode.statute || ':' || episode.subject || ':'
+            )
+           WHERE ?2 = 'remedy:' || episode.statute
+           ORDER BY episode.openedAt DESC, episode.subject
+           LIMIT 1
+           """,
+           [wake_id, origin]
+         ) do
+      [[assignment_id]] -> assignment_id
+      [] -> nil
     end
   end
 
@@ -2526,6 +2598,7 @@ defmodule Tightbeam.Gateway do
       :harness,
       :origin,
       :spawned_by,
+      :current_parent,
       :state,
       :created_at
     ])
@@ -2547,7 +2620,7 @@ defmodule Tightbeam.Gateway do
   # "there is one and it stopped working" — and a client watching the field
   # simply vanish could not tell either from a decoder change.
   defp credential_kind(session) do
-    provider = Harness.parse!(session.harness).credential_provider()
+    provider = session_credential_provider(session)
     server = Tightbeam.Credentials.server(session.host)
 
     case GenServer.whereis(server) do
@@ -2570,6 +2643,33 @@ defmodule Tightbeam.Gateway do
   defp wire_credential_kind(:api_key), do: "apiKey"
   defp wire_credential_kind(:subscription), do: "subscription"
   defp wire_credential_kind(:none), do: "none"
+
+  # Pi has one harness and more than one credential owner. The provider stored
+  # on a session is therefore authoritative for Pi rows. Parse that field as a
+  # closed vocabulary so a damaged row cannot silently fall back to OpenCode.
+  defp session_credential_provider(%{harness: harness, provider: provider})
+       when harness in ["pi", :pi] do
+    case provider do
+      "opencode_go" ->
+        :opencode_go
+
+      "local_openai" ->
+        :local_openai
+
+      :opencode_go ->
+        :opencode_go
+
+      :local_openai ->
+        :local_openai
+
+      other ->
+        raise ArgumentError,
+              "unsupported persisted Pi credential provider #{inspect(other)}"
+    end
+  end
+
+  defp session_credential_provider(session),
+    do: Harness.parse!(session.harness).credential_provider()
 
   defp defaults(config, db) do
     module = Harness.module!(config.default_harness)
@@ -2687,6 +2787,8 @@ defmodule Tightbeam.Gateway do
             session_key: turn.session_key
           })
         )
+
+        emit_identity_staleness_alarm(db)
       end
 
       outcome =
@@ -2781,6 +2883,8 @@ defmodule Tightbeam.Gateway do
                   session_key: turn.session_key
                 })
               )
+
+              emit_identity_staleness_alarm(db)
             end
 
             # The RECORD half of the substrate's obligation. `Ledger.finish_in_txn`
@@ -2919,8 +3023,112 @@ defmodule Tightbeam.Gateway do
         )
       end
 
+      emit_identity_staleness_alarm(db)
+
       :ok
     end
+  end
+
+  @doc false
+  def identity_staleness_alarm_for_test(db, now),
+    do: identity_staleness_alarm(db, now)
+
+  defp emit_identity_staleness_alarm(db) do
+    best_effort(fn -> identity_staleness_alarm(db, System.system_time(:millisecond)) end)
+  end
+
+  defp identity_staleness_alarm(db, now) do
+    case DB.transaction(db, fn txn -> identity_staleness_alarm_in_txn(txn, now) end) do
+      {:ok, result} -> result
+      {:error, error} -> raise error
+    end
+  end
+
+  defp identity_staleness_alarm_in_txn(txn, now) do
+    case Txn.q(
+           txn,
+           "SELECT item, updatedAt FROM admin_projection_versions " <>
+             "WHERE resource = 'identity' AND primaryKey = 'served'",
+           []
+         ) do
+      [[item, published_at]] ->
+        %{"liveRevision" => revision} = JSON.decode!(item)
+
+        [[late_count]] =
+          Txn.q(
+            txn,
+            """
+            SELECT COUNT(*)
+            FROM sessions AS session
+            WHERE session.state = 'active'
+              AND session.identityRevision IS NOT ?1
+              AND EXISTS (
+                SELECT 1 FROM turns AS turn
+                WHERE turn.sessionKey = session.sessionKey
+                  AND turn.startedAt >= ?2
+              )
+            """,
+            [revision, published_at]
+          )
+
+        maybe_schedule_identity_staleness_notice(txn, revision, late_count, now)
+
+      [] ->
+        :no_published_identity
+    end
+  end
+
+  defp maybe_schedule_identity_staleness_notice(_txn, _revision, 0, _now), do: :current
+
+  defp maybe_schedule_identity_staleness_notice(txn, revision, late_count, now) do
+    case identity_staleness_owner(txn) do
+      nil ->
+        :no_owner_surface
+
+      {owner, target} ->
+        epoch_day = div(now, 86_400_000)
+        digest = :crypto.hash(:sha256, "identity-staleness:#{revision}:#{epoch_day}")
+        wake_id = "w_" <> Base.encode16(digest, case: :lower)
+
+        case Txn.q(txn, "SELECT 1 FROM wakes WHERE wakeId = ?1", [wake_id]) do
+          [] ->
+            Wakes.schedule_in_txn(txn, %{
+              wake_id: wake_id,
+              session_key: target,
+              owner_user_id: owner,
+              origin: "process:tightbeam",
+              prompt:
+                "Identity staleness: #{late_count} active " <>
+                  "#{if late_count == 1, do: "session is", else: "sessions are"} late for " <>
+                  "published revision #{revision}.",
+              due_at: now,
+              target_gate: 0
+            })
+
+            {:scheduled, late_count, revision}
+
+          [[1]] ->
+            :already_notified
+        end
+    end
+  end
+
+  defp identity_staleness_owner(txn) do
+    txn
+    |> Txn.q("SELECT userId FROM users WHERE isAdmin = 1 ORDER BY createdAt, userId", [])
+    |> Enum.find_value(fn [owner] ->
+      target = Org.personal_session_key(owner)
+
+      case Txn.q(
+             txn,
+             "SELECT 1 FROM sessions WHERE sessionKey = ?1 AND ownerUserId = ?2 " <>
+               "AND state = 'active'",
+             [target, owner]
+           ) do
+        [[1]] -> {owner, target}
+        [] -> nil
+      end
+    end)
   end
 
   # Live progress for the typing indicator: relayed from ACP updates
@@ -3390,32 +3598,32 @@ defmodule Tightbeam.Gateway do
   defp identity_unlearn_result(config, db, call) do
     name = call.params.name
     archetypes = Identity.bundle_archetype_names!(config.base_dir, name)
-    invocation_id = Map.fetch!(call, :invocation_id)
 
-    release_identity_unlearn(config, db, call, name, archetypes, fn txn ->
-      candidate = Identity.unlearn!(config.base_dir, name, call.origin)
-
-      marker =
-        AdminProjection.begin_identity_publication_in_txn(
-          txn,
-          invocation_id,
-          candidate,
-          call.origin
-        )
-
-      {candidate, marker}
+    release_identity_unlearn(config, db, call, name, archetypes, fn ->
+      Identity.unlearn!(config.base_dir, name, call.origin)
     end)
   end
 
   defp release_identity_unlearn(config, db, call, name, archetypes, prepare) do
-    case Org.release_archetypes(db, archetypes, prepare, fn {candidate, marker} ->
-           case Identity.publish_live!(config.base_dir, candidate) do
-             {:ok, revision} ->
-               load_law!(config)
-               {:published, marker, revision}
+    case Org.release_archetypes(db, archetypes, prepare, fn candidate ->
+           case AdminProjection.begin_identity_publication(
+                  db,
+                  Map.fetch!(call, :invocation_id),
+                  candidate,
+                  call.origin
+                ) do
+             {:ok, marker} ->
+               case Identity.publish_live!(config.base_dir, candidate) do
+                 {:ok, revision} ->
+                   load_law!(config)
+                   {:published, marker, revision}
+
+                 {:error, error} ->
+                   {:denied, marker, error}
+               end
 
              {:error, error} ->
-               {:denied, marker, error}
+               {:marker_failed, error}
            end
          end) do
       {:referenced, references} ->
@@ -3445,6 +3653,14 @@ defmodule Tightbeam.Gateway do
           end)
 
         error
+
+      {:released, {:marker_failed, error}} ->
+        %{
+          state: "unlearn-failed",
+          code: "identity_marker_failed",
+          message: Exception.message(error),
+          live_revision: Identity.live_revision!(config.base_dir)
+        }
     end
   end
 
@@ -3596,6 +3812,12 @@ defmodule Tightbeam.Gateway do
       {:error, :turn_in_progress} ->
         turn_in_progress([call.session_key])
 
+      {:error, :archetype_release_in_progress} ->
+        %{
+          code: "archetype_release_in_progress",
+          message: "cannot repoint to #{archetype} while it is being released"
+        }
+
       {:error, reason} ->
         %{
           code: "identity_repoint_failed",
@@ -3656,6 +3878,7 @@ defmodule Tightbeam.Gateway do
            end
          end) do
       {:ok, result} -> result
+      {:error, %DB.ReferenceFenceError{}} -> {:error, :archetype_release_in_progress}
       {:error, error} -> raise error
     end
   end
@@ -3896,7 +4119,7 @@ defmodule Tightbeam.Gateway do
   defp apply_failure(%{"message" => message}) when is_binary(message), do: message
   defp apply_failure(reason), do: inspect(reason)
 
-  @onboarding_providers ["openai", "anthropic"] ++
+  @onboarding_providers ["openai", "anthropic", "opencode-go", "local-openai"] ++
                           if(Application.compile_env(:tightbeam, :fixture_harness, false),
                             do: ["fixture-provider"],
                             else: []
@@ -3907,7 +4130,8 @@ defmodule Tightbeam.Gateway do
     machine = params[:machine] || Placement.local_host_name()
 
     with true <- Map.has_key?(Placement.hosts(config.base_dir, gateway_db(config)), machine),
-         {:ok, kind} <- onboarding_kind(params[:kind]) do
+         {:ok, kind} <- provider_onboarding_kind(provider, params[:kind]),
+         {:ok, source} <- onboarding_source(provider, phase, params[:source]) do
       config
       |> onboard_phase(
         provider_atom(provider),
@@ -3915,18 +4139,37 @@ defmodule Tightbeam.Gateway do
         machine,
         kind,
         params[:lease_id],
-        params[:reason]
+        params[:reason],
+        source
       )
       |> with_owner_user_id(phase, gateway_db(config), call.origin)
     else
       false ->
         %{code: "unknown_host", message: "unknown onboarding machine #{machine}"}
 
+      {:error, :api_key_only} ->
+        %{
+          code: "invalid_message",
+          message: "#{provider} requires credential kind apiKey; subscription is unsupported"
+        }
+
       :error ->
         %{
           code: "invalid_message",
           message:
             "unknown credential kind #{inspect(params[:kind])}; expected apiKey or subscription"
+        }
+
+      {:error, :daemon_credential_source_unsupported} ->
+        %{
+          code: "invalid_message",
+          message: "daemon credential delivery is supported only for opencode-go begin"
+        }
+
+      {:error, :unknown_credential_source} ->
+        %{
+          code: "invalid_message",
+          message: "unknown credential source #{inspect(params[:source])}"
         }
     end
   end
@@ -3938,7 +4181,16 @@ defmodule Tightbeam.Gateway do
     }
   end
 
-  defp onboard_phase(config, provider, "begin", machine, kind, _lease_id, _reason) do
+  defp onboard_phase(
+         config,
+         provider,
+         "begin",
+         machine,
+         kind,
+         _lease_id,
+         _reason,
+         :interactive
+       ) do
     case Tightbeam.Credentials.begin_onboard(provider, Tightbeam.Credentials.server(machine)) do
       {:ok, path, lease_id} ->
         # The lease TTL rides the reply so the CLI's ceremony watchdog and the
@@ -3966,7 +4218,44 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "finish", machine, kind, lease_id, _reason) do
+  defp onboard_phase(
+         config,
+         provider,
+         "begin",
+         machine,
+         kind,
+         _lease_id,
+         _reason,
+         :daemon_credential
+       ) do
+    case Tightbeam.Credentials.begin_daemon_onboard(
+           provider,
+           Tightbeam.Credentials.server(machine)
+         ) do
+      {:ok, lease_id} ->
+        %{
+          provider: provider,
+          kind: wire_credential_kind(kind),
+          status: "ready",
+          lease_id: lease_id,
+          lease_ttl_ms: config.onboarding_lease_ms
+        }
+
+      {:error, reason} ->
+        %{code: "needs_onboarding", message: inspect(reason)}
+    end
+  end
+
+  defp onboard_phase(
+         _config,
+         provider,
+         "finish",
+         machine,
+         kind,
+         lease_id,
+         _reason,
+         _source
+       ) do
     case Tightbeam.Credentials.finish_onboard(
            provider,
            kind,
@@ -3990,7 +4279,16 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  defp onboard_phase(_config, provider, "cancel", machine, _kind, lease_id, reason) do
+  defp onboard_phase(
+         _config,
+         provider,
+         "cancel",
+         machine,
+         _kind,
+         lease_id,
+         reason,
+         _source
+       ) do
     case Tightbeam.Credentials.cancel_onboard(
            provider,
            lease_id,
@@ -4038,8 +4336,27 @@ defmodule Tightbeam.Gateway do
   defp onboarding_kind("apiKey"), do: {:ok, :api_key}
   defp onboarding_kind(_unknown), do: :error
 
+  defp provider_onboarding_kind("opencode-go", "apiKey"), do: {:ok, :api_key}
+  defp provider_onboarding_kind("opencode-go", _kind), do: {:error, :api_key_only}
+  defp provider_onboarding_kind("local-openai", "subscription"), do: {:error, :api_key_only}
+  defp provider_onboarding_kind("local-openai", _kind), do: {:ok, :api_key}
+  defp provider_onboarding_kind(_provider, kind), do: onboarding_kind(kind)
+
+  defp onboarding_source(_provider, _phase, nil), do: {:ok, :interactive}
+
+  defp onboarding_source("opencode-go", "begin", "daemonCredential"),
+    do: {:ok, :daemon_credential}
+
+  defp onboarding_source(_provider, _phase, "daemonCredential"),
+    do: {:error, :daemon_credential_source_unsupported}
+
+  defp onboarding_source(_provider, _phase, _source),
+    do: {:error, :unknown_credential_source}
+
   defp provider_atom("openai"), do: :openai
   defp provider_atom("anthropic"), do: :anthropic
+  defp provider_atom("opencode-go"), do: :opencode_go
+  defp provider_atom("local-openai"), do: :local_openai
   defp provider_atom("fixture-provider"), do: :fixture_provider
 
   defp role_bind_result(db, call) do
@@ -4106,7 +4423,9 @@ defmodule Tightbeam.Gateway do
   defp role_list_result(db) do
     roles =
       Enum.map(Roles.list(db), fn role ->
-        Map.put(role, :fallback_target, Org.personal_session_key(role.owner_user_id))
+        role
+        |> Map.put(:fallback_target, Org.personal_session_key(role.owner_user_id))
+        |> Map.put(:bound_session_current_parent, Org.current_parent(db, role.bound_session_key))
       end)
 
     %{roles: roles}
@@ -4195,7 +4514,11 @@ defmodule Tightbeam.Gateway do
   defp caller_in_lineage_above?(_db, _scope, _caller_key, hops) when hops > 32, do: false
 
   defp caller_in_lineage_above?(db, scope, caller_key, hops) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [scope]) do
+    case DB.query(
+           db,
+           "SELECT #{Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1",
+           [scope]
+         ) do
       {:ok, [[parent]]} when is_binary(parent) ->
         parent == caller_key or caller_in_lineage_above?(db, parent, caller_key, hops + 1)
 
@@ -4262,6 +4585,12 @@ defmodule Tightbeam.Gateway do
 
       {:ok, {:error, :unknown_archetype}} ->
         %{code: "unknown_archetype", message: "no such archetype: #{archetype_name}"}
+
+      {:error, %DB.ReferenceFenceError{archetypes: names}} ->
+        %{
+          code: "archetype_release_in_progress",
+          message: "cannot set default-archetype while releasing #{Enum.join(names, ", ")}"
+        }
 
       {:error, error} ->
         raise error
@@ -4404,7 +4733,7 @@ defmodule Tightbeam.Gateway do
 
     candidate = identity_candidate_from_marker(marker)
 
-    release_identity_unlearn(config, db, call, name, archetypes, fn _txn ->
+    release_identity_unlearn(config, db, call, name, archetypes, fn ->
       {candidate, marker}
     end)
   end
@@ -4917,6 +5246,50 @@ defmodule Tightbeam.Gateway do
          condition_kind,
          condition_scope
        ) do
+    case revalidate_remedy_assignment_in_txn(txn, call) do
+      :ready ->
+        schedule_validated_wake_row_in_txn(
+          txn,
+          call,
+          session_key,
+          due_at,
+          condition_kind,
+          condition_scope
+        )
+
+      :assignment_not_open ->
+        %{
+          suppressed: true,
+          reason: :assignment_not_open,
+          assignment_id: wake_assignment_id_in_txn(txn, call)
+        }
+    end
+  end
+
+  defp revalidate_remedy_assignment_in_txn(
+         txn,
+         %{
+           principal: {:remedy, %{action: "wake"}},
+           bound_assignment_id: assignment_id
+         }
+       )
+       when is_binary(assignment_id) do
+    case DB.Txn.q(txn, "SELECT state FROM assignments WHERE id = ?1", [assignment_id]) do
+      [["open"]] -> :ready
+      _ -> :assignment_not_open
+    end
+  end
+
+  defp revalidate_remedy_assignment_in_txn(_txn, _call), do: :ready
+
+  defp schedule_validated_wake_row_in_txn(
+         txn,
+         call,
+         session_key,
+         due_at,
+         condition_kind,
+         condition_scope
+       ) do
     p = call.params
 
     wake =
@@ -4939,11 +5312,11 @@ defmodule Tightbeam.Gateway do
         # SUBSTRATE-ONLY carrier. `wake` is an agent-callable verb, so an arbitrary
         # params value here would let an agent stamp a conversational wake with any
         # assignment and have delivery promote that forged carrier into the turn and
-        # the trace — agent-authored attribution, which Law 0 forbids (F6). Only the
-        # substrate's own principal may set it; the router reserves
-        # process:tightbeam, so it cannot be claimed over the wire. Conversational
-        # and owner wakes stay NULL, as the spec requires.
-        assignment_id: substrate_assignment_id(call)
+        # the trace — agent-authored attribution, which Law 0 forbids (F6). Only
+        # Tightbeam's reserved process principal and a bound internal remedy principal
+        # may set it. Neither can be claimed over the wire. Conversational and owner
+        # wakes stay NULL, as the spec requires.
+        assignment_id: wake_assignment_id_in_txn(txn, call)
       })
 
     bind_liveness_checkpoint_in_txn(txn, call, wake)
@@ -5004,10 +5377,20 @@ defmodule Tightbeam.Gateway do
 
   defp schedule_supervision_controller_in_txn(_txn, _call, _wake), do: :ok
 
-  defp substrate_assignment_id(%{principal: {:process, "tightbeam"}} = call),
+  defp wake_assignment_id_in_txn(_txn, %{principal: {:process, "tightbeam"}} = call),
     do: call.params[:assignment_id]
 
-  defp substrate_assignment_id(_call), do: nil
+  defp wake_assignment_id_in_txn(
+         _txn,
+         %{
+           principal: {:remedy, %{action: "wake"}},
+           bound_assignment_id: assignment_id
+         }
+       )
+       when is_binary(assignment_id),
+       do: assignment_id
+
+  defp wake_assignment_id_in_txn(_txn, _call), do: nil
 
   defp creator_session_key({:session, key}), do: key
   defp creator_session_key(_principal), do: nil
@@ -5182,10 +5565,16 @@ defmodule Tightbeam.Gateway do
       Enum.reduce_while(archetype.where, [], fn host, failures ->
         candidate =
           with {:ok, ^host} <- Placement.resolve(archetype, host, hosts),
-               :ok <- validate_credential(config, harness, host),
                model = spawn_model_selection(host, harness, p, default_model),
+               :ok <- validate_credential(config, harness, host, model),
                {:ok, routed} <- route_spawn_candidate(host, harness, model),
-               :ok <- Spinup.ensure_ready(config, module.id(), host, spinup_opts(config, db)) do
+               :ok <-
+                 Spinup.ensure_ready(
+                   config,
+                   module.id(),
+                   host,
+                   spinup_opts(config, db, harness, host, model)
+                 ) do
             {:ok, %{host: host, model: model, routed: routed}}
           end
 
@@ -5253,10 +5642,16 @@ defmodule Tightbeam.Gateway do
         %{host: ^host} ->
           model = spawn_model_selection(host, harness_string, p, default_model)
 
-          with :ok <- validate_credential(config, harness_string, host),
+          with :ok <- validate_credential(config, harness_string, host, model),
                {:ok, routed} <-
                  validate_catalog_model(host, harness_string, model, from_default?(p)),
-               :ok <- Spinup.ensure_ready(config, harness_atom, host, spinup_opts(config, db)),
+               :ok <-
+                 Spinup.ensure_ready(
+                   config,
+                   harness_atom,
+                   host,
+                   spinup_opts(config, db, harness_string, host, model)
+                 ),
                do: {:ok, {model, routed}}
       end
 
@@ -5335,6 +5730,13 @@ defmodule Tightbeam.Gateway do
 
         {:error, %Roles.TransactionError{error: error}} ->
           classified_denial("config_denied", error)
+
+        {:error, %DB.ReferenceFenceError{archetypes: names}} ->
+          %{
+            code: "archetype_release_in_progress",
+            message:
+              "cannot spawn #{archetype.name} while it is being released: #{Enum.join(names, ", ")}"
+          }
 
         {:error, error} ->
           raise error
@@ -5467,7 +5869,7 @@ defmodule Tightbeam.Gateway do
                     resolve_selection(session.host, harness, p, selection_base)
                   )
 
-                with :ok <- validate_credential(config, harness, session.host),
+                with :ok <- validate_credential(config, harness, session.host, model),
                      {:ok, routed} <-
                        validate_catalog_model(
                          session.host,
@@ -5480,7 +5882,7 @@ defmodule Tightbeam.Gateway do
                          config,
                          harness_atom,
                          session.host,
-                         spinup_opts(config, db)
+                         spinup_opts(config, db, harness, session.host, model)
                        ) do
                   case at_tune_boundary(config, db, session.session_key, fn ->
                          run_session_mutation(session.session_key, fn ->
@@ -5520,7 +5922,12 @@ defmodule Tightbeam.Gateway do
               {:ok, host} ->
                 harness = Harness.parse!(session.harness).id()
 
-                case Spinup.ensure_ready(config, harness, host, spinup_opts(config, db)) do
+                case Spinup.ensure_ready(
+                       config,
+                       harness,
+                       host,
+                       spinup_opts(config, db, session.harness, host, session.model)
+                     ) do
                   {:error, denial} ->
                     denial
 
@@ -6542,8 +6949,8 @@ defmodule Tightbeam.Gateway do
     %{code: Unroutable.code(unroutable), message: Unroutable.message(unroutable)}
   end
 
-  defp validate_credential(config, harness, machine) do
-    provider = Harness.parse!(harness).credential_provider()
+  defp validate_credential(config, harness, machine, model) do
+    provider = selected_credential_provider(harness, machine, model)
     status = credential_status(config, provider, machine)
 
     case status do
@@ -6558,6 +6965,21 @@ defmodule Tightbeam.Gateway do
          }}
     end
   end
+
+  # Pi is one harness with independently banked providers. The selected live
+  # catalog row, not the harness's historical default, owns the credential
+  # preflight. When there is no selected row, preserve the established harness
+  # fallback so an unavailable catalog still names the credential that can make
+  # that harness bootable.
+  defp selected_credential_provider(harness, machine, %Model{} = model) do
+    case ModelCatalog.entry(machine, harness, model, ModelCatalog) do
+      {%{provider: provider}, _health} when is_atom(provider) -> provider
+      _ -> Harness.parse!(harness).credential_provider()
+    end
+  end
+
+  defp selected_credential_provider(harness, _machine, _model),
+    do: Harness.parse!(harness).credential_provider()
 
   # Single source of truth: a credential-failure `reason` -> the actionable remedy
   # sentence. Every credential-refusal seam (spawn `validate_credential`, the turn
@@ -6577,7 +6999,7 @@ defmodule Tightbeam.Gateway do
   # interim flatten still removes the old false "run onboard" (the r4.2 fix). This mirrors the
   # :prompt-401 deferral to Card 2 — defer the precise naming to the card that owns the signal.
   defp credential_remedy(reason, provider, host) do
-    onboard = "Run on #{host}: tightbeam onboard #{provider} --as-user <userId>"
+    onboard = "Run on #{host}: " <> Tightbeam.Credentials.onboard_command(provider)
 
     case reason do
       :missing ->
@@ -6652,7 +7074,7 @@ defmodule Tightbeam.Gateway do
     case health do
       {:unavailable, {:needs_onboarding, reason}} ->
         if affirmative_credential_reason?(reason) do
-          provider = Harness.parse!(session.harness).credential_provider()
+          provider = session_credential_provider(session)
           {:refused, credential_remedy(reason, provider, session.host)}
         else
           :not_applicable
@@ -6747,7 +7169,11 @@ defmodule Tightbeam.Gateway do
       sessions:
         db
         |> Org.list_for_user("", true)
-        |> Enum.filter(&(MapSet.member?(harnesses, &1.harness) and &1.host == machine))
+        |> Enum.filter(fn session ->
+          MapSet.member?(harnesses, session.harness) and
+            session.host == machine and
+            session.provider == Atom.to_string(provider)
+        end)
     }
   end
 
@@ -6832,6 +7258,8 @@ defmodule Tightbeam.Gateway do
          {:provider_runtime_start_failed, %{started: Enum.reverse(started), failed: failed}}}
     end
   end
+
+  defp harnesses_for_provider(:local_openai), do: [Tightbeam.Harness.Pi]
 
   defp harnesses_for_provider(provider),
     do: Enum.filter(Harness.all(), &(&1.credential_provider() == provider))
@@ -6932,11 +7360,23 @@ defmodule Tightbeam.Gateway do
   defp empty_override_to_nil(map) when map_size(map) == 0, do: nil
   defp empty_override_to_nil(map), do: map
 
-  defp spinup_opts(config, db) do
-    [db: db]
+  defp spinup_opts(config, db, harness, host, model) do
+    provider = selected_credential_provider(harness, host, model)
+
+    [db: db, credential_provider: provider]
     |> maybe_put_opt(:sh, config[:sh])
     |> maybe_put_opt(:patch_adapter, config[:patch_adapter])
+    |> maybe_put_opt(:credential_names, selected_credential_names(provider, model))
   end
+
+  defp selected_credential_names(:local_openai, %Model{family: family}) do
+    case String.split(family, "/", parts: 2) do
+      [name, _model] -> ["#{name}.json"]
+      _ -> nil
+    end
+  end
+
+  defp selected_credential_names(_provider, _model), do: nil
 
   defp maybe_put_opt(opts, _key, nil), do: opts
   defp maybe_put_opt(opts, key, value), do: Keyword.put(opts, key, value)
@@ -7125,7 +7565,7 @@ defmodule Tightbeam.Gateway do
     rows =
       Txn.q(
         txn,
-        "SELECT sessionKey, spawnedBy FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
+        "SELECT sessionKey, #{Org.current_parent_sql("sessions")} FROM sessions WHERE state='active' ORDER BY createdAt, sessionKey"
       )
 
     children = Enum.group_by(rows, &Enum.at(&1, 1))
@@ -7146,7 +7586,7 @@ defmodule Tightbeam.Gateway do
     {:ok, rows} =
       DB.query(
         db,
-        "SELECT sessionKey, spawnedBy, state FROM sessions ORDER BY createdAt, sessionKey"
+        "SELECT sessionKey, #{Org.current_parent_sql("sessions")}, state FROM sessions ORDER BY createdAt, sessionKey"
       )
 
     children = Enum.group_by(rows, &Enum.at(&1, 1))

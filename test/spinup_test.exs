@@ -45,6 +45,34 @@ defmodule Tightbeam.SpinupTest do
     assert detail =~ "credentials present"
   end
 
+  test "Pi spinup accepts its selected named provider without OpenCode credentials", ctx do
+    provider =
+      Tightbeam.LocalOpenAi.Providers.provider_path(ctx.base_dir, "spark")
+
+    File.mkdir_p!(Path.dirname(provider))
+
+    File.write!(
+      provider,
+      JSON.encode!(%{
+        "name" => "spark",
+        "type" => "local-openai",
+        "endpoint" => "https://spark.example/v1"
+      })
+    )
+
+    stage_pi!(ctx.base_dir)
+
+    assert :ok =
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :pi, "testhost",
+               db: ctx.db,
+               patch_adapter: no_patch(),
+               credential_provider: :local_openai,
+               credential_names: ["spark.json"]
+             )
+
+    refute File.exists?(Path.join([ctx.base_dir, "auth", "pi", "auth.json"]))
+  end
+
   # The gateway host used to be the only machine that could not supply its own adapters:
   # it refused and told the operator to go install them by hand, on the host tightbeam
   # was standing on. It provisions now, through the same mechanism the remote path uses
@@ -396,6 +424,14 @@ defmodule Tightbeam.SpinupTest do
   # no-op here so these stay about presence and credentials.
   defp stage_claude!(base_dir) do
     path = Path.join([base_dir, "adapters", "node_modules", ".bin", "claude-agent-acp"])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "#!/bin/sh\nexit 0\n")
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  defp stage_pi!(base_dir) do
+    path = Path.join([base_dir, "adapters", "node_modules", ".bin", "pi-acp"])
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "#!/bin/sh\nexit 0\n")
     File.chmod!(path, 0o755)

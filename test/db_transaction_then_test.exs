@@ -5,7 +5,7 @@ defmodule Tightbeam.DBTransactionThenTest do
   alias Tightbeam.DB.Txn
 
   @tag :tmp_dir
-  test "transaction_then commits durable evidence while retaining the writer fence", %{
+  test "transaction_then commits durable evidence without retaining the owner fence", %{
     tmp_dir: tmp
   } do
     Tightbeam.GuardRuntimeFixture.run!(
@@ -204,6 +204,81 @@ defmodule Tightbeam.DBTransactionThenTest do
     assert_receive {:handoff, :two}
     refute_receive {:handoff, :invalid}
     assert {:ok, [[1]]} = DB.query(db, "SELECT id FROM outbox_rows")
+  end
+
+  @tag :outbox
+  test "arity one publication does not hold the database owner", %{db: db} do
+    parent = self()
+
+    publication =
+      Task.async(fn ->
+        DB.transaction_then(
+          db,
+          fn _txn -> :prepared end,
+          fn :prepared ->
+            send(parent, :publication_started)
+
+            receive do
+              :release_publication -> :published
+            end
+          end
+        )
+      end)
+
+    assert_receive :publication_started
+
+    writer =
+      Task.async(fn ->
+        DB.transaction(db, fn txn ->
+          Txn.q(txn, "INSERT INTO outbox_rows VALUES(1)")
+          :written
+        end)
+      end)
+
+    writer_before_release = Task.yield(writer, 1_000)
+    send(publication.pid, :release_publication)
+
+    assert {:ok, :published} = Task.await(publication)
+    assert {:ok, {:ok, :written}} = writer_before_release
+  end
+
+  @tag :outbox
+  test "archetype release fences refuse conflicting references but serve unrelated work", %{
+    db: db
+  } do
+    parent = self()
+
+    release =
+      Task.async(fn ->
+        assert {:ok, token, :clear} =
+                 DB.begin_reference_fence(db, ["coder"], fn _txn ->
+                   {:ok, :clear}
+                 end)
+
+        send(parent, {:reference_fence_started, token})
+
+        receive do
+          :release_reference_fence -> DB.end_reference_fence(db, token)
+        end
+      end)
+
+    assert_receive {:reference_fence_started, _token}
+
+    assert {:ok, :unrelated} =
+             DB.transaction(db, fn txn ->
+               Txn.q(txn, "INSERT INTO outbox_rows VALUES(1)")
+               :unrelated
+             end)
+
+    assert {:error, %DB.ReferenceFenceError{archetypes: ["coder"]}} =
+             DB.transaction(db, fn txn ->
+               Txn.assert_archetype_available!(txn, "coder")
+               :never
+             end)
+
+    assert {:ok, [[1]]} = DB.query(db, "SELECT id FROM outbox_rows")
+    send(release.pid, :release_reference_fence)
+    assert :ok = Task.await(release)
   end
 
   @tag :outbox

@@ -76,16 +76,7 @@ defmodule Tightbeam.HarnessProcess do
 
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
-    case DB.transaction(db, fn txn ->
-           DB.Txn.exec(txn, @ddl)
-
-           DB.Txn.exec(
-             txn,
-             "CREATE INDEX IF NOT EXISTS harness_processes_adapter_launch_sequence ON harness_processes (adapterKey, state, launchSequence)"
-           )
-
-           :ok
-         end) do
+    case DB.transaction(db, &ensure_schema_in_txn/1) do
       {:ok, :ok} ->
         :ok
 
@@ -95,6 +86,17 @@ defmodule Tightbeam.HarnessProcess do
       {:error, error} ->
         {:error, error}
     end
+  end
+
+  defp ensure_schema_in_txn(txn) do
+    DB.Txn.exec(txn, @ddl)
+
+    DB.Txn.exec(
+      txn,
+      "CREATE INDEX IF NOT EXISTS harness_processes_adapter_launch_sequence ON harness_processes (adapterKey, state, launchSequence)"
+    )
+
+    :ok
   end
 
   @doc "Insert the durable launch event and wrap the target command to record its identity."
@@ -207,6 +209,35 @@ defmodule Tightbeam.HarnessProcess do
     DB.transaction(db, &begin_park_in_txn(&1, key))
   end
 
+  @doc false
+  @spec begin_park_many(DB.server(), [tuple()]) ::
+          {:ok, [{tuple(), row() | :no_launch}]} | {:error, term()}
+  def begin_park_many(db, keys) do
+    :ok = ensure_schema(db)
+
+    DB.transaction(db, fn txn ->
+      Enum.map(keys, fn key -> {key, begin_park_in_txn(txn, key)} end)
+    end)
+  end
+
+  @doc false
+  @spec begin_park_many_until(DB.server(), [tuple()], integer()) ::
+          {:ok, [{tuple(), row() | :no_launch}]} | {:error, term()}
+  def begin_park_many_until(db, keys, deadline) do
+    DB.transaction_until(
+      db,
+      fn txn ->
+        ensure_schema_in_txn(txn)
+
+        Enum.map(keys, fn key ->
+          DB.Txn.ensure_before_deadline(txn)
+          {key, begin_park_in_txn(txn, key)}
+        end)
+      end,
+      deadline
+    )
+  end
+
   @doc "Establish the park fence as part of a caller-owned incident transaction."
   @spec begin_park_in_txn(DB.Txn.t(), tuple()) :: row() | :no_launch
   def begin_park_in_txn(%DB.Txn{} = txn, key) do
@@ -308,6 +339,72 @@ defmodule Tightbeam.HarnessProcess do
     else
       {:error, reason} -> unidentified(db, row, reason)
     end
+  end
+
+  @doc false
+  @spec record_park_failure(DB.server(), row(), term()) :: :already_resolved | {:error, term()}
+  def record_park_failure(db, row, reason), do: kill_failed(db, row, reason)
+
+  @doc false
+  @spec settle_park_results(DB.server(), [{tuple(), row() | :no_launch, term()}]) :: :ok
+  def settle_park_results(db, results) do
+    {:ok, :ok} =
+      DB.transaction(db, fn txn ->
+        Enum.each(results, fn {key, process_row, result} ->
+          settle_park_result_in_txn(txn, key, process_row, result)
+        end)
+
+        :ok
+      end)
+
+    :ok
+  end
+
+  @doc false
+  @spec settle_park_results_until(
+          DB.server(),
+          [{tuple(), row() | :no_launch, term()}],
+          integer()
+        ) :: :ok | {:error, term()}
+  def settle_park_results_until(db, results, deadline) do
+    case DB.transaction_until(
+           db,
+           fn txn ->
+             Enum.each(results, fn {key, process_row, result} ->
+               DB.Txn.ensure_before_deadline(txn)
+               settle_park_result_in_txn(txn, key, process_row, result)
+             end)
+
+             :ok
+           end,
+           deadline
+         ) do
+      {:ok, :ok} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp settle_park_result_in_txn(txn, key, _process_row, result)
+       when result in [:ok, :already_resolved], do: complete_park_in_txn(txn, key)
+
+  defp settle_park_result_in_txn(txn, key, process_row, failure) do
+    if is_map(process_row) do
+      DB.Txn.q(
+        txn,
+        "UPDATE harness_processes SET state = 'kill_failed', lastError = ?2 WHERE launchId = ?1 AND resolvedAt IS NULL",
+        [process_row.launch_id, inspect(failure)]
+      )
+    end
+
+    :ok =
+      EventLog.lifecycle_in_txn(
+        txn,
+        "adapter_shutdown_cleanup_failed",
+        key_name(key),
+        inspect(%{result: failure})
+      )
+
+    :ok
   end
 
   @doc "Reconcile every unresolved launch left by an earlier coordinator."
@@ -796,7 +893,7 @@ defmodule Tightbeam.HarnessProcess do
     remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
 
     if remaining_ms == 0 do
-      Port.close(port)
+      terminate_command_port(port)
       {:error, :timeout}
     else
       receive do
@@ -805,12 +902,95 @@ defmodule Tightbeam.HarnessProcess do
 
         {^port, {:exit_status, status}} ->
           {output |> Enum.reverse() |> IO.iodata_to_binary(), status}
+
+        {:tightbeam_shutdown_cancel, _coordinator} ->
+          terminate_command_port(port)
+          # The caller's outer deadline, rather than this command's normal
+          # five-second command deadline, caused the cancellation. The park
+          # path already treats a command timeout as an unconfirmed signal;
+          # the coordinator records the more specific durable budget result.
+          {:error, :timeout}
       after
         remaining_ms ->
-          Port.close(port)
+          terminate_command_port(port)
           {:error, :timeout}
       end
     end
+  end
+
+  # A coordinator may need to cancel a park task while this process is waiting
+  # on a helper port. Closing the port alone does not reliably reap a shebang
+  # wrapper on every supported host, so capture and kill the port child before
+  # closing it. The pid is owned by this command and is never a harness identity
+  # pid; the durable harness group remains governed by park/3's identity checks.
+  defp terminate_command_port(port) do
+    os_pid =
+      case Port.info(port, :os_pid) do
+        {:os_pid, pid} when is_integer(pid) and pid > 1 -> pid
+        _ -> nil
+      end
+
+    if is_integer(os_pid) do
+      [os_pid | command_descendants(os_pid)]
+      |> Enum.uniq()
+      |> Enum.reverse()
+      |> Enum.each(&kill_command_pid/1)
+    end
+
+    _ = Port.close(port)
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  # command descendants are reaped before a cancelled command port closes.
+  defp command_descendants(root_pid) do
+    with ps when is_binary(ps) <- System.find_executable("ps"),
+         {output, 0} <- System.cmd(ps, ["-axo", "pid=,ppid="], stderr_to_stdout: true) do
+      children_by_parent =
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.reduce(%{}, fn line, children ->
+          case Regex.run(~r/^\s*(\d+)\s+(\d+)\s*$/, line, capture: :all_but_first) do
+            [pid, ppid] ->
+              pid = String.to_integer(pid)
+              ppid = String.to_integer(ppid)
+              Map.update(children, ppid, [pid], &[pid | &1])
+
+            _ ->
+              children
+          end
+        end)
+
+      descendants_from(root_pid, children_by_parent, MapSet.new())
+    else
+      _ -> []
+    end
+  rescue
+    _ -> []
+  end
+
+  defp descendants_from(pid, children_by_parent, seen) do
+    Enum.reduce(Map.get(children_by_parent, pid, []), seen, fn child, seen ->
+      if MapSet.member?(seen, child) do
+        seen
+      else
+        descendants_from(child, children_by_parent, MapSet.put(seen, child))
+      end
+    end)
+    |> MapSet.to_list()
+  end
+
+  defp kill_command_pid(pid) do
+    case System.find_executable("kill") do
+      nil ->
+        :ok
+
+      kill ->
+        _ = System.cmd(kill, ["-KILL", Integer.to_string(pid)], stderr_to_stdout: true)
+    end
+  rescue
+    _ -> :ok
   end
 
   defp latest_unresolved(db, key) do

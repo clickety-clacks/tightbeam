@@ -2269,7 +2269,7 @@ defmodule Tightbeam.Escalation do
 
       case Txn.q(
              txn,
-             "SELECT ownerUserId, spawnedBy FROM sessions WHERE sessionKey = ?1",
+             "SELECT ownerUserId, #{Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1",
              [session_key]
            ) do
         [[owner_user_id, operational_parent]] ->

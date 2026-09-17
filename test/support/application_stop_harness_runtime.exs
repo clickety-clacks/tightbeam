@@ -1,4 +1,5 @@
-[payload, base, locks] = System.argv()
+[payload, base, locks | args] = System.argv()
+scenario = List.first(args) || "clean"
 payload = Path.expand(payload)
 ^payload = Application.app_dir(:tightbeam) |> Path.expand()
 false = File.exists?(base)
@@ -159,6 +160,10 @@ true = row.state == "running"
 true = row.process_group_id != escape_pgid
 launch_id = row.launch_id
 
+if scenario == "failure" do
+  File.write!(row.identity_path, "identity was corrupted before application stop\n")
+end
+
 :ok = Application.stop(:tightbeam)
 await_lock.(await_lock, 100)
 
@@ -177,27 +182,64 @@ alive? = fn ->
 end
 
 try do
-  {:ok, [["killed", park_requested_at, kill_attempted_at, kill_sent_at, resolved_at, nil]]} =
-    DB.query(
-      evidence_db,
-      """
-      SELECT state, parkRequestedAt, killAttemptedAt, killSentAt, resolvedAt, lastError
-        FROM harness_processes
-       WHERE launchId = ?1
-      """,
-      [launch_id]
-    )
+  case scenario do
+    "failure" ->
+      {:ok,
+       [["kill_failed", _park_requested_at, _kill_attempted_at, _kill_sent_at, nil, last_error]]} =
+        DB.query(
+          evidence_db,
+          """
+          SELECT state, parkRequestedAt, killAttemptedAt, killSentAt, resolvedAt, lastError
+            FROM harness_processes
+           WHERE launchId = ?1
+          """,
+          [launch_id]
+        )
 
-  true =
-    Enum.all?([park_requested_at, kill_attempted_at, kill_sent_at, resolved_at], &is_integer/1)
+      true = is_binary(last_error)
 
-  {:ok, [[0]]} = DB.query(evidence_db, "SELECT COUNT(*) FROM harness_park_fences", [])
+      {:ok, [[1]]} =
+        DB.query(
+          evidence_db,
+          "SELECT COUNT(*) FROM lifecycle_events WHERE kind = 'adapter_shutdown_cleanup_failed' AND subject = ?1",
+          [row.adapter_key]
+        )
 
-  :ok =
-    await.(await, fn -> not alive?.() end, 750, "detached descendant survived Application.stop")
+      {:ok, [[1]]} = DB.query(evidence_db, "SELECT COUNT(*) FROM harness_park_fences", [])
+      false = File.exists?(tripwire)
+      IO.puts("application-stop-harness-failure: ok")
 
-  false = File.exists?(tripwire)
-  IO.puts("application-stop-harness-cleanup: ok")
+    _ ->
+      {:ok, [["killed", park_requested_at, kill_attempted_at, kill_sent_at, resolved_at, nil]]} =
+        DB.query(
+          evidence_db,
+          """
+          SELECT state, parkRequestedAt, killAttemptedAt, killSentAt, resolvedAt, lastError
+            FROM harness_processes
+           WHERE launchId = ?1
+          """,
+          [launch_id]
+        )
+
+      true =
+        Enum.all?(
+          [park_requested_at, kill_attempted_at, kill_sent_at, resolved_at],
+          &is_integer/1
+        )
+
+      {:ok, [[0]]} = DB.query(evidence_db, "SELECT COUNT(*) FROM harness_park_fences", [])
+
+      :ok =
+        await.(
+          await,
+          fn -> not alive?.() end,
+          750,
+          "detached descendant survived Application.stop"
+        )
+
+      false = File.exists?(tripwire)
+      IO.puts("application-stop-harness-cleanup: ok")
+  end
 after
   if alive?.(), do: System.cmd("/bin/kill", ["-KILL", Integer.to_string(escape_pid)])
   GenServer.stop(evidence_db)

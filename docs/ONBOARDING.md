@@ -27,15 +27,38 @@ subscription. Each session reports its own as `display.credentialKind`
     # API key (non-interactive; the key is read from stdin and never leaves the host)
     printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
     printenv OPENAI_API_KEY    | tightbeam onboard openai    --api-key
+    printenv OPENCODE_API_KEY  | tightbeam onboard opencode-go --api-key
 
 `--api-key` will not read from a terminal — a key typed at a prompt lands in
 shell scrollback.
+
+For a daemon that cannot read a login keychain, a human can seed OpenCode Go
+once without passing the key through an agent or CLI request:
+
+1. Create an owner-private directory with mode `0700`.
+2. Use a human-controlled credential tool to write the key to
+   `opencode-go-api-key` in that directory.
+3. Set the file mode to `0600` or `0400`.
+4. Set `TIGHTBEAM_CREDENTIALS_DIRECTORY` on the gateway service to the absolute
+   directory path. On a systemd unit, set
+   `LoadCredential=opencode-go-api-key:<abs-source>` instead — systemd populates
+   `$CREDENTIALS_DIRECTORY/opencode-go-api-key`, the fixed name the daemon reads.
+5. Run `tightbeam onboard opencode-go --daemon-credential --as-user <userId>`.
+
+The daemon refuses relative directories, symlinks, non-regular files,
+group/world permissions, remote-host delivery, and providers other than
+OpenCode Go. The source file remains in place for later daemon restarts. The
+request and response carry only the source name and an onboarding lease. Run a
+real Pi turn after onboarding to prove provider liveness.
 
 Both paths validate against the provider BEFORE banking. A rejection names the
 provider, the host and the kind, and leaves the existing credential untouched.
 An `onboarded` result from the CLI is therefore a claim about the ceremony, not
 proof the credential works; prove liveness separately (below) before trusting
 it.
+
+OpenCode Go is API-key-only in Tightbeam. A subscription begin is refused
+before a lease opens.
 
 ## The definition of interactive onboarding
 
@@ -121,6 +144,10 @@ different endpoints, so a guess produces a confident answer about the wrong one.
   refuses this grant (403, missing scope `api.model.read`).
 - **codex, api key**: `GET https://api.openai.com/v1/models` with the key from
   `auth.json`'s own `OPENAI_API_KEY` field.
+- **pi, OpenCode Go API key**: a minimum-size Responses request for
+  `gpt-5.6-luna`, using Pi's request headers and the key from Pi-native
+  `auth.json`. Catalog membership is not liveness; the provider may refuse an
+  individual listed model.
 
 Result map, pinned: `:live` → PASS; `{:dead, reason}` → FAIL;
 `{:unknown, reason}` → INCOMPLETE, never PASS. A host whose store records NO
@@ -169,6 +196,7 @@ Each credential exists only as a regular file in its exact harness home:
 
 - Codex: `homes/<machine>/codex/auth.json`;
 - Claude: `homes/<machine>/claude/.credentials.json`;
+- Pi: `homes/<machine>/pi/auth.json`;
 - kind metadata: `homes/<machine>/<harness>/.tightbeam/credential.json` with
   `"onboarded": true` AND `"kind": "subscription" | "api_key"`.
 
@@ -187,6 +215,10 @@ refusal. Current status also rejects recorded expiry, terminal revocation,
 unsupported subscriptions, and present-but-unverified activation. Preserve those
 checks. A provider 401 is an observed authentication failure; file presence and
 metadata alone do not prove liveness.
+
+Pi's backing file is its native provider map:
+`{"opencode-go":{"type":"api_key","key":"…"}}`. Tightbeam refuses any
+other shape before banking it and keeps the file at mode 0600.
 
 `tightbeam onboard <provider>` on the host is the only sanctioned path. There is
 no credential-import verb, and copying a credential between machines is never
@@ -231,7 +263,9 @@ green scorecard imply more than it proved:
 | openai platform route accepts api keys | recorded live — 401 `invalid_api_key`, where a subscription token gets 403 naming the missing scope `api.model.read` |
 | a valid key returns 200 on either route | one-shot capture; see `priv/credential_live/CAPTURE-LEDGER.md` |
 | openai `/v1/models` response SHAPE | same capture — it drives `derive_platform_entries/1` in `harness/codex.ex` |
+| OpenCode Go `gpt-5.6-luna` Pi-shaped request | recorded live — HTTP 200 and Pi `stop_reason=stop`; see `docs/smoke-runs/2026-08-23-pi-opencode-go-precode.md` |
 | codex-acp / claude-agent-acp run a turn on api-key auth | **NOT VERIFIED, not budgeted.** Expected, not observed. |
+| pi-acp runs a turn through Tightbeam with OpenCode Go | recorded live — isolated spawn, Luna response, and pre-exec Bash denial; see `docs/smoke-runs/2026-08-23-pi-core-product.md` |
 
 The last row is the one to say out loud. Everything above it is about reaching
 the vendor; that row is about the harness actually working.

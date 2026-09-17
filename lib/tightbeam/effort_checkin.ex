@@ -1286,7 +1286,14 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp initial_expecter(txn, assignment) do
+    coordination_parent =
+      Tightbeam.SessionReparent.current_coordination_parent(txn, assignment.id)
+
     cond do
+      coordination_parent ->
+        holder = session_in_txn(txn, assignment.holder_key)
+        route_session(txn, coordination_parent, holder.owner_user_id, 0, assignment.holder_key)
+
       assignment.opened_by_user ->
         %{
           session_key: nil,
@@ -1299,8 +1306,14 @@ defmodule Tightbeam.EffortCheckin do
       assignment.opened_by_session == assignment.holder_key ->
         holder = session_in_txn(txn, assignment.holder_key)
 
-        if holder.spawned_by do
-          route_session(txn, holder.spawned_by, holder.owner_user_id, 1, assignment.holder_key)
+        if holder.current_parent do
+          route_session(
+            txn,
+            holder.current_parent,
+            holder.owner_user_id,
+            1,
+            assignment.holder_key
+          )
         else
           %{
             session_key: nil,
@@ -1332,10 +1345,10 @@ defmodule Tightbeam.EffortCheckin do
     current = session_in_txn(txn, request.expecter_session_key)
     assignment = assignment_in_txn(txn, request.assignment_id)
 
-    if current.spawned_by do
+    if current.current_parent do
       route_session(
         txn,
-        current.spawned_by,
+        current.current_parent,
         request.owner_user_id,
         request.lineage_rung + 1,
         assignment.holder_key
@@ -1355,8 +1368,8 @@ defmodule Tightbeam.EffortCheckin do
     session = session_in_txn(txn, key)
 
     cond do
-      key == holder_key and session.spawned_by ->
-        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
+      key == holder_key and session.current_parent ->
+        route_session(txn, session.current_parent, owner_user_id, rung + 1, holder_key)
 
       key == holder_key ->
         %{
@@ -1376,8 +1389,8 @@ defmodule Tightbeam.EffortCheckin do
           rung: rung
         }
 
-      session.spawned_by ->
-        route_session(txn, session.spawned_by, owner_user_id, rung + 1, holder_key)
+      session.current_parent ->
+        route_session(txn, session.current_parent, owner_user_id, rung + 1, holder_key)
 
       true ->
         %{
@@ -1708,17 +1721,17 @@ defmodule Tightbeam.EffortCheckin do
   end
 
   defp session_in_txn(txn, key) do
-    [[key, owner, spawned_by, host, state, built_in]] =
+    [[key, owner, current_parent, host, state, built_in]] =
       Txn.q(
         txn,
-        "SELECT sessionKey, ownerUserId, spawnedBy, host, state, isBuiltIn FROM sessions WHERE sessionKey = ?1",
+        "SELECT sessionKey, ownerUserId, #{Org.current_parent_sql("sessions")}, host, state, isBuiltIn FROM sessions WHERE sessionKey = ?1",
         [key]
       )
 
     %{
       session_key: key,
       owner_user_id: owner,
-      spawned_by: spawned_by,
+      current_parent: current_parent,
       host: host,
       state: state,
       is_built_in: built_in == 1
