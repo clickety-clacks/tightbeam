@@ -154,11 +154,20 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
       assert %{} = update_item(ctx, {:session, ctx.lane.session_key}, item.id, @spec_a)
       assert [_] = po_wakes(ctx, "remedy:spec-repinned-summons-spirit")
 
-      # A new spec is a new question, whatever was judged before.
+      # A new spec is a new question, whatever was judged before. The first
+      # request is still unread, so the new question coalesces into it rather
+      # than queueing a second.
       approve(ctx, item.id)
       assert %{} = update_item(ctx, {:session, ctx.lane.session_key}, item.id, @spec_b)
-      assert [_, second] = po_wakes(ctx, "remedy:spec-repinned-summons-spirit")
-      assert second.prompt =~ "Any earlier judgment was of the old spec"
+      assert [only] = po_wakes(ctx, "remedy:spec-repinned-summons-spirit")
+      assert only.wake_id == first.wake_id
+      assert only.prompt =~ "Any earlier judgment was of the old spec"
+
+      assert Enum.any?(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "rule_notice_coalesced" and &1.subject == first.wake_id and
+                   &1.detail =~ @spec_b)
+             )
     end
 
     test "a newer pin coalesces into an unhandled request so the PO holds one", ctx do
@@ -185,7 +194,9 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
       assert %{detail: detail} =
                ctx.db
                |> EventLog.lifecycle_events()
-               |> Enum.find(&(&1.kind == "rule_notice_coalesced" and &1.subject == second.wake_id))
+               |> Enum.find(
+                 &(&1.kind == "rule_notice_coalesced" and &1.subject == second.wake_id)
+               )
 
       assert detail =~ item.id
       assert detail =~ String.duplicate("c", 64)
