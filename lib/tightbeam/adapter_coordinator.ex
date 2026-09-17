@@ -602,18 +602,24 @@ defmodule Tightbeam.AdapterCoordinator do
     cancel_deadline =
       min(System.monotonic_time(:millisecond) + @shutdown_cancel_grace_ms, settle_start)
 
-    Enum.map(tasks, fn {key, process_row, task} ->
-      remaining = max(cancel_deadline - System.monotonic_time(:millisecond), 0)
+    yielded =
+      Enum.map(tasks, fn {key, process_row, task} ->
+        remaining = max(cancel_deadline - System.monotonic_time(:millisecond), 0)
+        {key, process_row, task, Task.yield(task, remaining)}
+      end)
 
-      case Task.yield(task, remaining) do
-        {:ok, _result} ->
-          :ok
+    # Kill every task that outlived its grace before awaiting any of them, so
+    # the DOWN waits overlap. Awaiting each kill inside the yield loop let the
+    # waits accumulate serially, and on a starved scheduler their sum spent the
+    # settlement reserve just like the unbudgeted grace did.
+    Enum.each(yielded, fn
+      {_key, _process_row, task, nil} -> Process.exit(task.pid, :kill)
+      _ -> :ok
+    end)
 
-        {:exit, _reason} ->
-          :ok
-
-        nil ->
-          _ = Task.shutdown(task, :brutal_kill)
+    Enum.map(yielded, fn {key, process_row, task, outcome} ->
+      if outcome == nil do
+        _ = Task.shutdown(task, :brutal_kill)
       end
 
       {key, process_row, {:error, :shutdown_budget_exhausted}}
