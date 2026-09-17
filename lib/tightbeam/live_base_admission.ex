@@ -176,7 +176,7 @@ defmodule Tightbeam.LiveBaseAdmission do
 
       admission = checked!(LiveBaseGuard.admit_build(base, identity, marker, state, transition))
       database = Path.join(base, "state.db")
-      stamp = qualify_readonly!(database, state, admission, lock)
+      stamp = qualify_readonly!(database, state, admission)
 
       %{
         base: base,
@@ -197,18 +197,43 @@ defmodule Tightbeam.LiveBaseAdmission do
     end
   end
 
-  defp qualify_readonly!(path, state, admission, lock) do
+  defp qualify_readonly!(path, state, admission) do
     case File.lstat(path) do
       {:error, :enoent} when state == :new_empty ->
         :fresh
 
       {:ok, %{type: :regular}} ->
-        rows = LiveBaseLock.inspect_schema!(lock, path)
+        rows = read_schema_stamp!(path)
         :ok = Schema.qualify_guard_stamp!(admission, rows)
         rows
 
       other ->
         refuse!("invalid persistent database: #{inspect(other)}")
+    end
+  end
+
+  # A plain read-only observation of the stamp, nothing more. Every sidecar the
+  # connection may touch must already be an ordinary file: a symlink here would
+  # let an unadmitted base redirect the read at a target outside it, so refuse
+  # rather than open. A read-only connection cannot checkpoint or write the main
+  # database or committed WAL frames; it may create only the SHM.
+  defp read_schema_stamp!(path) do
+    alias Exqlite.Sqlite3
+
+    for file <- [path, path <> "-wal", path <> "-shm", path <> "-journal"] do
+      case File.lstat(file) do
+        {:ok, %{type: :regular}} -> :ok
+        {:error, :enoent} -> :ok
+        other -> raise "schema inspection file refused: #{inspect(other)}"
+      end
+    end
+
+    {:ok, conn} = Sqlite3.open(path, mode: :readonly)
+
+    try do
+      Tightbeam.DB.run_query(conn, "SELECT shape FROM schema_stamp", [])
+    after
+      :ok = Sqlite3.close(conn)
     end
   end
 
