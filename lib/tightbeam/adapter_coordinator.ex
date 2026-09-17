@@ -53,6 +53,16 @@ defmodule Tightbeam.AdapterCoordinator do
   # cancel that starts on time never spends the reserve — and never extends the
   # supervisor's shutdown budget.
   @shutdown_cancel_grace_ms 100
+  # The supervisor's shutdown timer starts at the exit signal; terminate/2's
+  # deadline starts at callback entry, strictly later, and DB.transaction_until
+  # grants a final commit already in flight remaining + 50ms past that deadline.
+  # A supervisor allowance equal to the budget therefore brutal-kills the
+  # coordinator mid-settlement — inside its own contract — destroying the
+  # durable record the budget exists to protect. One second covers the 50ms
+  # grant plus the worst observed signal-to-entry scheduling gap (261ms under
+  # 4x CPU oversubscription) with ~3x headroom, and costs at most one extra
+  # second when terminate/2 is genuinely wedged.
+  @shutdown_supervisor_margin_ms 1_000
 
   @type adapter_key :: Tightbeam.Placement.adapter_key()
 
@@ -82,8 +92,14 @@ defmodule Tightbeam.AdapterCoordinator do
       type: :worker,
       restart: :permanent,
       # The normal worker default (5s) is shorter than identity recovery plus
-      # signal delivery. Let terminate/2 settle the durable process group.
-      shutdown: @shutdown_budget_ms
+      # signal delivery. Let terminate/2 settle the durable process group:
+      # derived from the configured budget, not the attribute, so a caller
+      # raising shutdown_budget_ms is not killed before its own deadline, and
+      # widened by the margin (see @shutdown_supervisor_margin_ms) so the
+      # supervisor never reclaims time the callback's contract still owns.
+      shutdown:
+        Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms) +
+          @shutdown_supervisor_margin_ms
     }
   end
 

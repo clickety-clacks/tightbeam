@@ -468,6 +468,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert [] = ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "adapter_down"))
   end
 
+  test "supervisor allowance exceeds the configured shutdown budget" do
+    # The child_spec must read the configured option, not the module attribute:
+    # a caller raising shutdown_budget_ms above the default would otherwise be
+    # brutal-killed before its own internal deadline.
+    assert AdapterCoordinator.child_spec([]).shutdown > 30_000
+    assert AdapterCoordinator.child_spec(shutdown_budget_ms: 45_000).shutdown > 45_000
+  end
+
   test "shutdown parks every adapter group under one supervisor budget", ctx do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
@@ -983,12 +991,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # terminate/2 promises to complete within shutdown_budget_ms, and the V7
     # concern — a callback overrunning its own budget passing unnoticed — still
     # governs: the allowance below is measurement-scale, not phase-scale, so a
-    # real overrun of the 500ms reserve still fails. Two measured costs land in
-    # elapsed_ms without being terminate's to spend: DB.transaction_until lets a
-    # commit already in flight at the deadline finish rather than abort a durable
-    # outcome (observed +8..22ms), and the measurement starts before
-    # GenServer.stop dispatches (observed +12..26ms under 4x CPU
-    # oversubscription). 100ms is ~3x the worst observed sum of the two. With 24
+    # real overrun of the 500ms reserve still fails. Two costs land in
+    # elapsed_ms without being terminate's to spend: DB.transaction_until grants
+    # a final commit already in flight remaining + 50ms past the deadline rather
+    # than abort a durable outcome (observed +8..22ms), and the measurement
+    # starts before GenServer.stop dispatches, ahead of the callback's own clock
+    # (observed +12..26ms under 4x CPU oversubscription). 100ms is ~3x the worst
+    # observed sum of the two and still fails the 114-214ms overruns measured at
+    # the pre-fix base, so the regression this bound guards stays caught. With 24
     # retained adapters this also proves the bound does not degrade with
     # cardinality: the late entries' outcomes are decided before settlement, and
     # their cleanup is owned by someone else afterwards.
