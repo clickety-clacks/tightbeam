@@ -63,6 +63,9 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
     assert names == [
              "completion-requires-review",
+             "spec-pinned-summons-spirit",
+             "spec-repinned-summons-spirit",
+             "spirit-objection-reaches-owner",
              "completion-requires-verification",
              "completion-requires-results-artifact",
              "wake-obligation-registration-authority"
