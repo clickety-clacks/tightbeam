@@ -51,7 +51,12 @@ defmodule Tightbeam.AdapterCoordinator do
   # has to force-kill the task. Budgeted ahead of the settlement reserve inside
   # the park phase (terminate/2 subtracts it from the park deadline), so a
   # cancel that starts on time never spends the reserve — and never extends the
-  # supervisor's shutdown budget.
+  # supervisor's shutdown budget. At zero the cooperative window is gone:
+  # every outstanding park is brutal-killed, and the descendant reaping a
+  # cancelled park performs before closing its port (HarnessProcess's
+  # terminate_command_port/1) never runs — closing the port alone does not
+  # reliably reap a shebang wrapper on every supported host, so a zero grace
+  # trades orphaned helper descendants for the hundred milliseconds.
   @shutdown_cancel_grace_ms 100
   # The supervisor's shutdown timer starts at the exit signal; terminate/2's
   # deadline starts at callback entry, strictly later, and DB.transaction_until
