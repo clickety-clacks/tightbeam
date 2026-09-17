@@ -365,36 +365,28 @@ defmodule Tightbeam.DB do
     path = Keyword.fetch!(opts, :path)
     {path, admission} = prepare_persistent_admission!(path, opts)
 
+    if admission do
+      _ = Tightbeam.LiveBaseAdmission.revalidate!(admission)
+      File.mkdir_p!(admission.base)
+    end
+
+    {:ok, conn} = Sqlite3.open(path)
+
     try do
-      if admission do
-        _ = Tightbeam.LiveBaseAdmission.revalidate!(admission)
-        File.mkdir_p!(admission.base)
+      for pragma <- [
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA foreign_keys=ON",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA busy_timeout=5000"
+          ] do
+        :ok = Sqlite3.execute(conn, pragma)
       end
 
-      {:ok, conn} = Sqlite3.open(path)
-
-      try do
-        if admission, do: :ok = Tightbeam.LiveBaseLock.attach_sqlite!(admission.lock, conn)
-
-        for pragma <- [
-              "PRAGMA journal_mode=WAL",
-              "PRAGMA foreign_keys=ON",
-              "PRAGMA synchronous=NORMAL",
-              "PRAGMA busy_timeout=5000"
-            ] do
-          :ok = Sqlite3.execute(conn, pragma)
-        end
-
-        :ok = load_topline_unicode(conn)
-        {:ok, %{conn: conn, admission: admission, reference_fences: %{}}}
-      rescue
-        error ->
-          :ok = Sqlite3.close(conn)
-          reraise error, __STACKTRACE__
-      end
+      :ok = load_topline_unicode(conn)
+      {:ok, %{conn: conn, admission: admission, reference_fences: %{}}}
     rescue
       error ->
-        if admission, do: :ok = Tightbeam.LiveBaseLock.release(admission.lock)
+        :ok = Sqlite3.close(conn)
         reraise error, __STACKTRACE__
     end
   end
@@ -402,52 +394,26 @@ defmodule Tightbeam.DB do
   defp prepare_persistent_admission!(":memory:", _opts), do: {":memory:", nil}
 
   defp prepare_persistent_admission!(path, opts) when is_binary(path) do
-    alias Tightbeam.{LiveBaseAdmission, LiveBaseLock}
+    alias Tightbeam.LiveBaseAdmission
 
     if String.starts_with?(path, "file:") or Path.basename(path) != "state.db",
       do: raise(ArgumentError, "persistent DB requires a canonical base/state.db path")
 
     base = LiveBaseAdmission.canonical!(Path.dirname(Path.expand(path)))
     payload = LiveBaseAdmission.canonical!(Application.app_dir(:tightbeam))
+    inputs = Keyword.fetch!(opts, :guard_inputs)
 
-    admission =
-      case Keyword.fetch(opts, :guard_context) do
-        {:ok, context} when is_map(context) ->
-          unless context.base == base and context.payload_root == payload,
-            do: raise(ArgumentError, "guard handoff must bind base and running payload")
+    unless Keyword.keyword?(inputs) and Enum.all?(Keyword.keys(inputs), &(&1 == :transition)),
+      do: raise(ArgumentError, "guard inputs accept only an exact transition")
 
-          :ok = LiveBaseLock.claim(context.lock)
-
-          try do
-            LiveBaseAdmission.revalidate!(context)
-          rescue
-            error ->
-              :ok = LiveBaseLock.release(context.lock)
-              reraise error, __STACKTRACE__
-          end
-
-        {:ok, _} ->
-          raise ArgumentError, "guard handoff requires an owned native capability"
-
-        :error ->
-          inputs = Keyword.fetch!(opts, :guard_inputs)
-
-          unless Keyword.keyword?(inputs) and
-                   Enum.all?(Keyword.keys(inputs), &(&1 in [:lock_dir, :transition])),
-                 do:
-                   raise(ArgumentError, "guard inputs accept only lock_dir and exact transition")
-
-          LiveBaseAdmission.prepare!(base, Keyword.put(inputs, :payload_root, payload))
-      end
-
+    admission = LiveBaseAdmission.prepare!(base, Keyword.put(inputs, :payload_root, payload))
     {Path.join(base, "state.db"), admission}
   end
 
   @impl true
   def terminate(_reason, %{conn: conn}) do
-    # A native guard attachment belongs to SQLite itself. close_v2 may defer
-    # destruction until remaining statements finalize; never unlock separately
-    # here. Abnormal process death uses the same Exqlite resource destructor.
+    # close_v2 may defer destruction until remaining statements finalize.
+    # Abnormal process death uses the same Exqlite resource destructor.
     Sqlite3.close(conn)
     :ok
   end

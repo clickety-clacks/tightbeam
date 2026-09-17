@@ -113,15 +113,12 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     assert output =~ "supervision-cold: ok", output
   end
 
-  def run_case!(id, authority, base, locks) do
+  def run_case!(id, authority, base) do
     {:ok, sup} = Supervisor.start_link([], strategy: :one_for_one)
     Process.put({__MODULE__, :supervisor}, sup)
-    Process.put(:fixture_locks, locks)
     db = DB
 
-    start_supervised!(
-      {DB, path: Path.join(base, "state.db"), name: db, guard_inputs: [lock_dir: locks]}
-    )
+    start_supervised!({DB, path: Path.join(base, "state.db"), name: db, guard_inputs: []})
 
     :ok = Schema.ensure_all(db)
     :ok = DB.assert_base_admitted!(db, base)
@@ -174,7 +171,6 @@ defmodule Tightbeam.SupervisionConsumerFixture do
       refute File.exists?(System.fetch_env!("GUARD_TRIPWIRE"))
     after
       Supervisor.stop(sup)
-      await_lock!(base, locks)
     end
   end
 
@@ -579,11 +575,10 @@ defmodule Tightbeam.SupervisionConsumerFixture do
 
     path = Path.join(ctx.base, "state.db")
     :ok = stop_supervised!(DB)
-    await_lock!(ctx.base, Process.get(:fixture_locks))
     reopened = :"r1_reopened_#{System.unique_integer([:positive])}"
 
     start_supervised!(
-      {DB, name: reopened, path: path, guard_inputs: [lock_dir: Process.get(:fixture_locks)]},
+      {DB, name: reopened, path: path, guard_inputs: []},
       id: reopened
     )
 
@@ -1572,22 +1567,6 @@ defmodule Tightbeam.SupervisionConsumerFixture do
     sup = Process.get({__MODULE__, :supervisor})
     :ok = Supervisor.terminate_child(sup, id)
     :ok = Supervisor.delete_child(sup, id)
-  end
-
-  defp await_lock!(base, locks, remaining \\ 100) do
-    path = Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    case Tightbeam.LiveBaseLock.acquire(path) do
-      {:ok, lock} ->
-        :ok = Tightbeam.LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when remaining > 0 ->
-        Process.sleep(10)
-        await_lock!(base, locks, remaining - 1)
-
-      other ->
-        raise "fixture lock did not release: #{inspect(other)}"
-    end
   end
 
   defp stop_supervised(id) do

@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(Application.app_dir(:tightbeam)) == Path.expand(payload)
 {:ok, _} = Application.ensure_all_started(:exqlite)
 {:ok, _} = Application.ensure_all_started(:crypto)
@@ -10,7 +10,7 @@ import ExUnit.Assertions
 
 {:ok, sup} =
   Supervisor.start_link(
-    Tightbeam.Application.children(%{base_dir: base, guard_inputs: [lock_dir: locks]}),
+    Tightbeam.Application.children(%{base_dir: base, guard_inputs: []}),
     strategy: :rest_for_one
   )
 

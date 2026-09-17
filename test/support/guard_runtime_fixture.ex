@@ -40,9 +40,6 @@ defmodule Tightbeam.GuardRuntimeFixture do
 
     {:ok, manifest} = Tightbeam.LiveBaseGuard.generate_manifest(files)
     File.write!(Path.join(payload, "build-manifest.json"), JSON.encode!(manifest))
-    locks = Path.join(tmp, "locks")
-    File.mkdir_p!(locks)
-    File.chmod!(locks, 0o700)
     base = Path.join(tmp, "base")
 
     paths =
@@ -58,8 +55,7 @@ defmodule Tightbeam.GuardRuntimeFixture do
           Path.join(payload, "ebin"),
           Path.join("test/support", script),
           payload,
-          base,
-          locks
+          base
         ]
 
     env =
@@ -77,8 +73,7 @@ defmodule Tightbeam.GuardRuntimeFixture do
       args: args,
       env: env,
       payload: payload,
-      base: base,
-      locks: locks
+      base: base
     }
   end
 end

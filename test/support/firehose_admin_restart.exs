@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:exqlite)
@@ -6,12 +6,12 @@ false = File.exists?(base)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 import ExUnit.Assertions
-alias Tightbeam.{AdminProjection, DB, LiveBaseLock, Schema}
+alias Tightbeam.{AdminProjection, DB, Schema}
 alias Tightbeam.Firehose.{Hub, Publisher}
 {:ok, hub} = Hub.start_link(name: Hub)
 
 {:ok, db} =
-  DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks])
+  DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
 try do
   :ok = Schema.ensure_all(db)
@@ -72,27 +72,9 @@ try do
     DB.query(db, "SELECT * FROM admin_projection_versions ORDER BY resource,primaryKey")
 
   :ok = GenServer.stop(db)
-  key = :crypto.hash(:sha256, base) |> Base.encode16(case: :lower)
-  lock_path = Path.join(locks, key <> ".lock")
-
-  await = fn recur, remaining ->
-    case LiveBaseLock.acquire(lock_path) do
-      {:ok, lock} ->
-        :ok = LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when remaining > 0 ->
-        Process.sleep(10)
-        recur.(recur, remaining - 1)
-
-      other ->
-        raise "lock did not release: #{inspect(other)}"
-    end
-  end
-
-  await.(await, 100)
 
   {:ok, reopened} =
-    DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks])
+    DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
   try do
     :ok = Schema.ensure_all(reopened)
@@ -112,7 +94,6 @@ try do
     GenServer.stop(reopened)
   end
 
-  await.(await, 100)
   IO.puts("guarded-admin-floor-restart: ok")
 after
   if Process.alive?(db), do: GenServer.stop(db)

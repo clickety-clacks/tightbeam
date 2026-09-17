@@ -50,12 +50,12 @@ defmodule Tightbeam.EffortNotificationFixture do
     assert output =~ "effort-notification: #{scenario}: ok"
   end
 
-  def run_case!(scenario, base, locks) do
+  def run_case!(scenario, base) do
     {:ok, fixtures} = Supervisor.start_link([], strategy: :one_for_one)
     Process.put({__MODULE__, :supervisor}, fixtures)
 
     try do
-      ctx = setup!(base, locks)
+      ctx = setup!(base)
       :ok = DB.assert_base_admitted!(ctx.db, base)
       marker = File.read!(Path.join(base, "build-owner.json"))
       scenario(scenario, ctx)
@@ -64,17 +64,14 @@ defmodule Tightbeam.EffortNotificationFixture do
       if Process.alive?(fixtures), do: Supervisor.stop(fixtures)
     end
 
-    await_lock!(base, locks)
     IO.puts("effort-notification: #{scenario}: ok")
   end
 
-  defp setup!(base_dir, locks) do
+  defp setup!(base_dir) do
     db = :"effort_#{System.unique_integer([:positive])}"
     start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
 
-    start_supervised!(
-      {DB, path: Path.join(base_dir, "state.db"), name: db, guard_inputs: [lock_dir: locks]}
-    )
+    start_supervised!({DB, path: Path.join(base_dir, "state.db"), name: db, guard_inputs: []})
 
     start_supervised!({ConnRegistry, name: Tightbeam.ConnRegistry})
     start_supervised!({LaneDoorbell, self()})
@@ -454,21 +451,5 @@ defmodule Tightbeam.EffortNotificationFixture do
     sup = Process.get({__MODULE__, :supervisor})
     :ok = Supervisor.terminate_child(sup, id)
     :ok = Supervisor.delete_child(sup, id)
-  end
-
-  defp await_lock!(base, locks, remaining \\ 100) do
-    path = Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    case Tightbeam.LiveBaseLock.acquire(path) do
-      {:ok, lock} ->
-        :ok = Tightbeam.LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when remaining > 0 ->
-        Process.sleep(10)
-        await_lock!(base, locks, remaining - 1)
-
-      other ->
-        raise "fixture lock did not release: #{inspect(other)}"
-    end
   end
 end

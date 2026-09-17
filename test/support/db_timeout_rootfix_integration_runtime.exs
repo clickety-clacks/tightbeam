@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 payload = Path.expand(payload)
 ^payload = Application.app_dir(:tightbeam) |> Path.expand()
 false = File.exists?(base)
@@ -13,7 +13,7 @@ alias Tightbeam.{Boot, DB, Ledger, Model, ModelCatalog, Org, SessionLane, Wakes}
 import ExUnit.Assertions
 
 {:ok, db} =
-  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [lock_dir: locks])
+  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
 
 :ignore = Boot.start_link(%{base_dir: base})
 

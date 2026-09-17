@@ -1,4 +1,4 @@
-[payload, base, locks, id, authority] = System.argv()
+[payload, base, id, authority] = System.argv()
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:exqlite)
@@ -16,5 +16,5 @@ authority =
     "" -> nil
   end
 
-Tightbeam.SupervisionConsumerFixture.run_case!(String.to_integer(id), authority, base, locks)
+Tightbeam.SupervisionConsumerFixture.run_case!(String.to_integer(id), authority, base)
 IO.puts("supervision-cold: ok")

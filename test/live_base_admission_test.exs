@@ -4,127 +4,78 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
   @tag :marker_publication
   test "publication requires target schema and refreshes the retained owner", ctx do
     admission = Tightbeam.LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    File.mkdir_p!(ctx.base)
+    marker_path = Path.join(ctx.base, "build-owner.json")
 
-    try do
-      File.mkdir_p!(ctx.base)
-      marker_path = Path.join(ctx.base, "build-owner.json")
-
-      assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/current target stamp/, fn ->
-        Tightbeam.LiveBaseAdmission.publish_marker!(admission, [["unknown"]])
-      end
-
-      refute File.exists?(marker_path)
-      rows = [[hd(Tightbeam.Schema.guard_compatible_stamps())]]
-      {:ok, conn} = Exqlite.Sqlite3.open(Path.join(ctx.base, "state.db"))
-
-      :ok =
-        Exqlite.Sqlite3.execute(
-          conn,
-          "CREATE TABLE schema_stamp(shape TEXT); INSERT INTO schema_stamp VALUES ('#{hd(hd(rows))}');"
-        )
-
-      :ok = Exqlite.Sqlite3.close(conn)
-      current = Tightbeam.LiveBaseAdmission.publish_marker!(admission, rows)
-      assert current.stamp == rows
-      assert current.transition == nil
-      assert current.decision.source == ctx.identity
-      assert current.lock == admission.lock
-      assert JSON.decode!(File.read!(marker_path)) == current.marker
-      assert Tightbeam.LiveBaseAdmission.revalidate!(current) == current
-      before = inventory(ctx.base)
-      assert Tightbeam.LiveBaseAdmission.publish_marker!(current, rows) == current
-      assert inventory(ctx.base) == before
-      refute Enum.any?(File.ls!(ctx.base), &String.contains?(&1, ".tmp-"))
-    after
-      assert :ok = Tightbeam.LiveBaseLock.release(admission.lock)
+    assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/current target stamp/, fn ->
+      Tightbeam.LiveBaseAdmission.publish_marker!(admission, [["unknown"]])
     end
+
+    refute File.exists?(marker_path)
+    rows = [[hd(Tightbeam.Schema.guard_compatible_stamps())]]
+    {:ok, conn} = Exqlite.Sqlite3.open(Path.join(ctx.base, "state.db"))
+
+    :ok =
+      Exqlite.Sqlite3.execute(
+        conn,
+        "CREATE TABLE schema_stamp(shape TEXT); INSERT INTO schema_stamp VALUES ('#{hd(hd(rows))}');"
+      )
+
+    :ok = Exqlite.Sqlite3.close(conn)
+    current = Tightbeam.LiveBaseAdmission.publish_marker!(admission, rows)
+    assert current.stamp == rows
+    assert current.transition == nil
+    assert current.decision.source == ctx.identity
+    assert JSON.decode!(File.read!(marker_path)) == current.marker
+    assert Tightbeam.LiveBaseAdmission.revalidate!(current) == current
+    before = inventory(ctx.base)
+    assert Tightbeam.LiveBaseAdmission.publish_marker!(current, rows) == current
+    assert inventory(ctx.base) == before
+    refute Enum.any?(File.ls!(ctx.base), &String.contains?(&1, ".tmp-"))
   end
 
   @tag :marker_publication
   test "publication refuses an intervening marker without replacing it", ctx do
     admission = Tightbeam.LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    File.mkdir_p!(ctx.base)
+    write_owner(ctx.base, String.duplicate("f", 64))
+    before = inventory(ctx.base)
 
-    try do
-      File.mkdir_p!(ctx.base)
-      write_owner(ctx.base, String.duplicate("f", 64))
-      before = inventory(ctx.base)
-
-      assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/marker changed/, fn ->
-        Tightbeam.LiveBaseAdmission.publish_marker!(
-          admission,
-          [[hd(Tightbeam.Schema.guard_compatible_stamps())]]
-        )
-      end
-
-      assert inventory(ctx.base) == before
-    after
-      assert :ok = Tightbeam.LiveBaseLock.release(admission.lock)
+    assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/marker changed/, fn ->
+      Tightbeam.LiveBaseAdmission.publish_marker!(
+        admission,
+        [[hd(Tightbeam.Schema.guard_compatible_stamps())]]
+      )
     end
+
+    assert inventory(ctx.base) == before
   end
 
   @tag :prewrite_revalidation
-  test "prewrite revalidation retains one capability and rejects a different base", ctx do
+  test "prewrite changed payload refuses without creating the base", ctx do
     admission = Tightbeam.LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    File.write!(Path.join(ctx.payload, "priv/rule"), "changed-before-write")
 
-    try do
-      assert Tightbeam.LiveBaseAdmission.revalidate!(admission) == admission
-
-      assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/lock_busy/, fn ->
-        Tightbeam.LiveBaseAdmission.prepare!(ctx.base, ctx.options)
-      end
-
-      other = ctx.base <> "-other"
-
-      assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/lock_path_mismatch/, fn ->
-        Tightbeam.LiveBaseAdmission.revalidate!(%{admission | base: other})
-      end
-
-      refute File.exists?(other)
-      refute File.exists?(ctx.base)
-    after
-      assert :ok = Tightbeam.LiveBaseLock.release(admission.lock)
+    assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/payload_manifest_mismatch/, fn ->
+      Tightbeam.LiveBaseAdmission.revalidate!(admission)
     end
-  end
 
-  @tag :prewrite_revalidation
-  test "prewrite changed payload refuses without dropping owner exclusion", ctx do
-    admission = Tightbeam.LiveBaseAdmission.prepare!(ctx.base, ctx.options)
-
-    try do
-      File.write!(Path.join(ctx.payload, "priv/rule"), "changed-before-write")
-
-      assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/payload_manifest_mismatch/, fn ->
-        Tightbeam.LiveBaseAdmission.revalidate!(admission)
-      end
-
-      key = :crypto.hash(:sha256, admission.base) |> Base.encode16(case: :lower)
-      path = Path.join(admission.lock_dir, key <> ".lock")
-      assert :ok = Tightbeam.LiveBaseLock.assert_path(admission.lock, path)
-      assert {:error, :lock_busy} = Tightbeam.LiveBaseLock.acquire(path)
-      refute File.exists?(ctx.base)
-    after
-      assert :ok = Tightbeam.LiveBaseLock.release(admission.lock)
-    end
+    refute File.exists?(ctx.base)
   end
 
   @tag :prewrite_revalidation
   test "prewrite changed marker refuses before any SQLite access", ctx do
     admission = Tightbeam.LiveBaseAdmission.prepare!(ctx.base, ctx.options)
+    File.mkdir_p!(ctx.base)
+    File.write!(Path.join(ctx.base, "state.db"), "must-not-open")
+    write_owner(ctx.base, String.duplicate("f", 64))
+    before = inventory(ctx.base)
 
-    try do
-      File.mkdir_p!(ctx.base)
-      File.write!(Path.join(ctx.base, "state.db"), "must-not-open")
-      write_owner(ctx.base, String.duplicate("f", 64))
-      before = inventory(ctx.base)
-
-      assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
-        Tightbeam.LiveBaseAdmission.revalidate!(admission)
-      end
-
-      assert inventory(ctx.base) == before
-    after
-      assert :ok = Tightbeam.LiveBaseLock.release(admission.lock)
+    assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
+      Tightbeam.LiveBaseAdmission.revalidate!(admission)
     end
+
+    assert inventory(ctx.base) == before
   end
 
   @tag :prewrite_revalidation
@@ -144,21 +95,17 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     write_owner(ctx.base, ctx.identity)
     admission = Tightbeam.LiveBaseAdmission.prepare!(ctx.base, ctx.options)
 
-    try do
-      # Deliberate synthetic interposition, not a production migration.
-      {:ok, changed} = Exqlite.Sqlite3.open(path)
-      :ok = Exqlite.Sqlite3.execute(changed, "UPDATE schema_stamp SET shape='#{second}'")
-      :ok = Exqlite.Sqlite3.close(changed)
-      before = inventory(ctx.base)
+    # Deliberate synthetic interposition, not a production migration.
+    {:ok, changed} = Exqlite.Sqlite3.open(path)
+    :ok = Exqlite.Sqlite3.execute(changed, "UPDATE schema_stamp SET shape='#{second}'")
+    :ok = Exqlite.Sqlite3.close(changed)
+    before = inventory(ctx.base)
 
-      assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/admission inputs changed/, fn ->
-        Tightbeam.LiveBaseAdmission.revalidate!(admission)
-      end
-
-      assert inventory(ctx.base) == before
-    after
-      assert :ok = Tightbeam.LiveBaseLock.release(admission.lock)
+    assert_raise Tightbeam.LiveBaseAdmission.Refusal, ~r/admission inputs changed/, fn ->
+      Tightbeam.LiveBaseAdmission.revalidate!(admission)
     end
+
+    assert inventory(ctx.base) == before
   end
 
   @tag :ordinary_inspection
@@ -240,14 +187,7 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
         write_owner(base, ctx.identity)
         before = inventory(base)
         admission = Tightbeam.LiveBaseAdmission.prepare!(base, ctx.options)
-
-        try do
-          assert admission.stamp == [[stamp]]
-          assert_inspection_preserved(base, before)
-        after
-          assert :ok = Tightbeam.LiveBaseLock.release(admission.lock)
-        end
-
+        assert admission.stamp == [[stamp]]
         assert_inspection_preserved(base, before)
       end
     after
@@ -256,8 +196,7 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
   end
 
   @tag :ordinary_inspection
-  test "ordinary inspection after clean checkpoint preserves content and capability checks",
-       ctx do
+  test "ordinary inspection after clean checkpoint preserves content", ctx do
     File.mkdir_p!(ctx.base)
     path = Path.join(ctx.base, "state.db")
     stamp = hd(Tightbeam.Schema.guard_compatible_stamps())
@@ -274,27 +213,7 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     write_owner(ctx.base, ctx.identity)
     before = inventory(ctx.base)
     admission = Tightbeam.LiveBaseAdmission.prepare!(ctx.base, ctx.options)
-
-    try do
-      assert admission.stamp == [[stamp]]
-      assert_inspection_preserved(ctx.base, before)
-
-      task =
-        Task.async(fn ->
-          assert_raise RuntimeError, ~r/not_lock_owner/, fn ->
-            Tightbeam.LiveBaseLock.inspect_schema!(admission.lock, path)
-          end
-        end)
-
-      Task.await(task)
-    after
-      assert :ok = Tightbeam.LiveBaseLock.release(admission.lock)
-    end
-
-    assert_raise RuntimeError, ~r/lock_closed/, fn ->
-      Tightbeam.LiveBaseLock.inspect_schema!(admission.lock, path)
-    end
-
+    assert admission.stamp == [[stamp]]
     assert_inspection_preserved(ctx.base, before)
   end
 
@@ -368,17 +287,14 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     )
   end
 
-  alias Tightbeam.{LiveBaseAdmission, LiveBaseGuard, LiveBaseLock}
+  alias Tightbeam.{LiveBaseAdmission, LiveBaseGuard}
   @moduletag :tmp_dir
 
   setup %{tmp_dir: tmp} do
     payload = Path.join(tmp, "payload")
-    locks = Path.join(tmp, "locks")
     base = Path.join(tmp, "base")
     File.mkdir_p!(Path.join(payload, "ebin"))
     File.mkdir_p!(Path.join(payload, "priv"))
-    File.mkdir_p!(locks)
-    File.chmod!(locks, 0o700)
     files = [{"ebin/fixture.beam", "synthetic code"}, {"priv/rule", "synthetic rule"}]
     Enum.each(files, fn {path, bytes} -> File.write!(Path.join(payload, path), bytes) end)
     {:ok, manifest} = LiveBaseGuard.generate_manifest(files)
@@ -387,12 +303,12 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     %{
       base: base,
       payload: payload,
-      options: [payload_root: payload, lock_dir: locks],
+      options: [payload_root: payload],
       identity: manifest["buildIdentity"]
     }
   end
 
-  test "wrong marker refuses before SQLite can open and releases lock", ctx do
+  test "wrong marker refuses before SQLite can open", ctx do
     File.mkdir_p!(ctx.base)
     File.write!(Path.join(ctx.base, "state.db"), "not SQLite: must never be opened")
 
@@ -411,7 +327,7 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     end
 
     assert inventory(ctx.base) == before
-    # Repeat must reach marker refusal, not lock_busy from leaked ownership.
+    # Repeat must reach the same marker refusal, leaving the base untouched.
     assert_raise LiveBaseAdmission.Refusal, ~r/build_transition_required/, fn ->
       LiveBaseAdmission.prepare!(ctx.base, ctx.options)
     end
@@ -419,18 +335,16 @@ defmodule Tightbeam.LiveBaseAdmissionTest do
     assert inventory(ctx.base) == before
   end
 
-  test "base aliases contend without creating the protected base", ctx do
+  test "base aliases canonicalize to one base without creating it", ctx do
     alias_parent = Path.join(Path.dirname(ctx.base), "alias")
     File.ln_s!(Path.dirname(ctx.base), alias_parent)
     admission = LiveBaseAdmission.prepare!(ctx.base, ctx.options)
     assert admission.stamp == :fresh
     refute File.exists?(ctx.base)
 
-    assert_raise LiveBaseAdmission.Refusal, ~r/lock_busy/, fn ->
-      LiveBaseAdmission.prepare!(Path.join(alias_parent, "base"), ctx.options)
-    end
-
-    assert :ok = LiveBaseLock.release(admission.lock)
+    aliased = LiveBaseAdmission.prepare!(Path.join(alias_parent, "base"), ctx.options)
+    assert aliased.base == admission.base
+    refute File.exists?(ctx.base)
   end
 
   test "changed and extra payload bytes refuse before base creation", ctx do

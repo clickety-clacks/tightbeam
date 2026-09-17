@@ -1,4 +1,4 @@
-[payload, base, _locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(Application.app_dir(:tightbeam)) == Path.expand(payload)
 {:ok, _} = Application.ensure_all_started(:logger)
 bin = Path.join(Path.dirname(base), "broken-cli")

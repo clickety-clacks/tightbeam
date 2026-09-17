@@ -1,6 +1,6 @@
 import ExUnit.Assertions
 alias Tightbeam.{Gateway, Model}
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 assert Path.expand(Application.app_dir(:tightbeam)) == Path.expand(payload)
 {:ok, _} = Application.ensure_all_started(:logger)
 bin = Path.join(Path.dirname(base), "broken-gateway-cli")
@@ -25,7 +25,7 @@ exception =
       max_live_sessions_per_user: 50,
       wake_tick_ms: 1_000,
       onboarding_lease_ms: 1_800_000,
-      guard_inputs: [lock_dir: locks]
+      guard_inputs: []
     })
   end
 

@@ -14,9 +14,9 @@ defmodule Tightbeam.IdentityPublicationFixture do
     Schema
   }
 
-  def run_case!(scenario, base, locks) do
+  def run_case!(scenario, base) do
     {:ok, db} =
-      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks])
+      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
     try do
       assert :ok = Schema.ensure_all(db)
@@ -31,7 +31,6 @@ defmodule Tightbeam.IdentityPublicationFixture do
       if Process.alive?(db), do: GenServer.stop(db)
     end
 
-    await_lock!(base, locks)
     IO.puts("identity_publication-case: #{scenario}: ok")
   end
 
@@ -281,21 +280,5 @@ defmodule Tightbeam.IdentityPublicationFixture do
     sup = Process.get({__MODULE__, :supervisor})
     :ok = Supervisor.terminate_child(sup, id)
     :ok = Supervisor.delete_child(sup, id)
-  end
-
-  defp await_lock!(base, locks, remaining \\ 100) do
-    path = Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    case Tightbeam.LiveBaseLock.acquire(path) do
-      {:ok, lock} ->
-        :ok = Tightbeam.LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when remaining > 0 ->
-        Process.sleep(10)
-        await_lock!(base, locks, remaining - 1)
-
-      other ->
-        raise "fixture lock did not release: #{inspect(other)}"
-    end
   end
 end

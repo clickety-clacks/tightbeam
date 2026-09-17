@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 payload = Path.expand(payload)
 ^payload = Application.app_dir(:tightbeam) |> Path.expand()
 false = File.exists?(base)
@@ -8,32 +8,15 @@ Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
-alias Tightbeam.{Boot, DB, Harness, LiveBaseLock, Model}
+alias Tightbeam.{Boot, DB, Harness, Model}
 
 {:ok, db} =
-  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [lock_dir: locks])
+  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
 
 :ignore = Boot.start_link(%{base_dir: base})
 marker = File.read!(Path.join(base, "build-owner.json"))
 :ok = GenServer.stop(db)
-key = :crypto.hash(:sha256, base) |> Base.encode16(case: :lower)
-lock_path = Path.join(locks, key <> ".lock")
 
-await = fn recur, remaining ->
-  case LiveBaseLock.acquire(lock_path) do
-    {:ok, lock} ->
-      :ok = LiveBaseLock.release(lock)
-
-    {:error, :lock_busy} when remaining > 0 ->
-      Process.sleep(10)
-      recur.(recur, remaining - 1)
-
-    other ->
-      raise "lock did not release: #{inspect(other)}"
-  end
-end
-
-await.(await, 100)
 File.write!(Path.join(base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
 Tightbeam.RecoveryFixture.place_adapter!(base, seed_credential: false)
 tripwire = Path.join(base, "forbidden-execution.log")
@@ -88,7 +71,6 @@ Application.put_env(:tightbeam, :cwd, Path.join(base, "work"))
 Application.put_env(:tightbeam, :port, 0)
 Application.put_env(:tightbeam, :default_harness, :fixture)
 Application.put_env(:tightbeam, :default_model, Model.new("fixture-model"))
-Application.put_env(:tightbeam, :live_base_guard, lock_dir: locks)
 Application.put_env(:tightbeam, :autostart, true)
 Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 {:ok, _apps} = Application.ensure_all_started(:tightbeam)
@@ -165,6 +147,5 @@ after
   5_000 -> raise "Hub observer did not terminate normally"
 end
 
-await.(await, 100)
 false = File.exists?(tripwire)
 IO.puts("guarded-application-startup: ok")

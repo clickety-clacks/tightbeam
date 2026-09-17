@@ -57,11 +57,11 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     def handle_call(_other, _from, state), do: {:reply, :ok, state}
   end
 
-  def run_case!(scenario, base, locks) do
+  def run_case!(scenario, base) do
     {:ok, fixtures} = Supervisor.start_link([], strategy: :one_for_one)
     Process.put({__MODULE__, :supervisor}, fixtures)
     Process.put({__MODULE__, :dbs}, [])
-    db = open_db!(base, locks)
+    db = open_db!(base)
 
     try do
       seed_world!(db)
@@ -75,20 +75,19 @@ defmodule Tightbeam.EscalationDeliveryFixture do
         start_supervised!(%{id: name, start: {Doorbell, :start_link, [{self(), tag, name}]}})
       end
 
-      scenario(scenario, %{db: db, base_dir: base, locks: locks, config: config(base, db)})
+      scenario(scenario, %{db: db, base_dir: base, config: config(base, db)})
       assert File.read!(Path.join(base, "build-owner.json")) == marker
     after
       if Process.alive?(fixtures), do: Supervisor.stop(fixtures)
       for db <- Process.get({__MODULE__, :dbs}), Process.alive?(db), do: GenServer.stop(db)
     end
 
-    await_lock!(base, locks)
     IO.puts("escalation_delivery-case: #{scenario}: ok")
   end
 
-  defp open_db!(base, locks) do
+  defp open_db!(base) do
     {:ok, db} =
-      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks])
+      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
     Process.put({__MODULE__, :dbs}, [db | Process.get({__MODULE__, :dbs}, [])])
     db
@@ -265,7 +264,6 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     assert [%{state: "pending"} = wake] = notification_wakes(db)
     assert count(db, "SELECT COUNT(*) FROM turns") == 0
     GenServer.stop(db)
-    await_lock!(ctx.base_dir, ctx.locks)
 
     # FAIL-BEFORE: without the Wakes child nothing recovers. The window has to be
     # long enough that a recovery which DID happen would have been seen, so it is
@@ -275,7 +273,7 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     # ticks. The 20 periods below are 500ms, ~4x the slowest recovery yet
     # observed, so a producer on anything like that cadence lands inside the
     # window rather than after it.
-    restarted = open_db!(ctx.base_dir, ctx.locks)
+    restarted = open_db!(ctx.base_dir)
     :ok = DB.assert_base_admitted!(restarted, ctx.base_dir)
 
     assert consistently(fn -> Wakes.get(restarted, wake.wake_id).state == "pending" end)
@@ -1155,21 +1153,5 @@ defmodule Tightbeam.EscalationDeliveryFixture do
     sup = Process.get({__MODULE__, :supervisor})
     :ok = Supervisor.terminate_child(sup, id)
     :ok = Supervisor.delete_child(sup, id)
-  end
-
-  defp await_lock!(base, locks, remaining \\ 100) do
-    path = Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    case Tightbeam.LiveBaseLock.acquire(path) do
-      {:ok, lock} ->
-        :ok = Tightbeam.LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when remaining > 0 ->
-        Process.sleep(10)
-        await_lock!(base, locks, remaining - 1)
-
-      other ->
-        raise "fixture lock did not release: #{inspect(other)}"
-    end
   end
 end

@@ -28,12 +28,12 @@ defmodule Tightbeam.HarnessProcessFixture do
     assert output =~ "harness-process-case: #{scenario}: ok"
   end
 
-  def run_case!(scenario, base, locks) do
+  def run_case!(scenario, base) do
     test_dir = Path.join(base, "harness-process-#{System.pid()}-1")
     assert File.exists?(@helper)
 
     {:ok, db} =
-      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks])
+      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
     File.mkdir_p!(test_dir)
 
@@ -60,27 +60,8 @@ defmodule Tightbeam.HarnessProcessFixture do
       end
     end
 
-    lock_path =
-      Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    await = fn recur, remaining ->
-      case Tightbeam.LiveBaseLock.acquire(lock_path) do
-        {:ok, lock} ->
-          :ok = Tightbeam.LiveBaseLock.release(lock)
-
-        {:error, :lock_busy} when remaining > 0 ->
-          Process.sleep(10)
-          recur.(recur, remaining - 1)
-
-        other ->
-          raise "harness fixture lock did not release: #{inspect(other)}"
-      end
-    end
-
-    await.(await, 100)
-
     {:ok, cleanup_db} =
-      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks])
+      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
     try do
       :ok = DB.assert_base_admitted!(cleanup_db, base)
@@ -94,7 +75,6 @@ defmodule Tightbeam.HarnessProcessFixture do
       GenServer.stop(cleanup_db)
     end
 
-    await.(await, 100)
     IO.puts("harness-process-case: #{scenario}: ok")
   end
 

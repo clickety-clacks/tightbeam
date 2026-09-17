@@ -1,13 +1,13 @@
 defmodule Tightbeam.EscalationGuardFixture do
   @moduledoc false
   import ExUnit.Assertions
-  alias Tightbeam.{DB, Devices, Escalation, LiveBaseLock, Model, Org, Schema}
+  alias Tightbeam.{DB, Devices, Escalation, Model, Org, Schema}
   alias Exqlite.Sqlite3
 
-  def run(mode, base, locks) do
+  def run(mode, base) do
     Tightbeam.Rules.load!(Path.join(System.tmp_dir!(), "guarded-escalation-empty-rules"), [])
     path = Path.join(base, "state.db")
-    {:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [lock_dir: locks])
+    {:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [])
 
     try do
       :ok = Schema.ensure_all(db)
@@ -17,15 +17,13 @@ defmodule Tightbeam.EscalationGuardFixture do
 
       case mode do
         :visibility -> visibility(db, path)
-        :integrity -> integrity(db, path, base, locks)
+        :integrity -> integrity(db, path)
       end
 
       assert File.read!(Path.join(base, "build-owner.json")) == marker
     after
       if Process.alive?(db), do: GenServer.stop(db)
     end
-
-    await_release(base, locks)
   end
 
   defp visibility(db, path) do
@@ -103,7 +101,7 @@ defmodule Tightbeam.EscalationGuardFixture do
     end
   end
 
-  defp integrity(first, path, base, locks) do
+  defp integrity(first, path) do
     first_pid = first
     raiser = session(first, "evidence-restart", "flynn")
 
@@ -140,8 +138,7 @@ defmodule Tightbeam.EscalationGuardFixture do
 
     assert :ok = GenServer.stop(first_pid)
 
-    await_release(base, locks)
-    {:ok, second_pid} = DB.start_link(path: path, name: nil, guard_inputs: [lock_dir: locks])
+    {:ok, second_pid} = DB.start_link(path: path, name: nil, guard_inputs: [])
     second = second_pid
 
     try do
@@ -170,8 +167,6 @@ defmodule Tightbeam.EscalationGuardFixture do
     after
       if Process.alive?(second_pid), do: GenServer.stop(second_pid)
     end
-
-    await_release(base, locks)
   end
 
   defp readonly_query(reader, sql, params) do
@@ -183,26 +178,6 @@ defmodule Tightbeam.EscalationGuardFixture do
     after
       :ok = Sqlite3.release(reader, stmt)
     end
-  end
-
-  defp await_release(base, locks) do
-    path = Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    await = fn recur, left ->
-      case LiveBaseLock.acquire(path) do
-        {:ok, lock} ->
-          :ok = LiveBaseLock.release(lock)
-
-        {:error, :lock_busy} when left > 0 ->
-          Process.sleep(10)
-          recur.(recur, left - 1)
-
-        other ->
-          raise "guard lock did not release: #{inspect(other)}"
-      end
-    end
-
-    await.(await, 100)
   end
 
   defp session(db, name, owner) do

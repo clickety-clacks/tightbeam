@@ -30,7 +30,7 @@ defmodule ToplinesCrashSnapshot do
   end
 end
 
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:exqlite)
@@ -44,7 +44,7 @@ path = Path.join(base, "state.db")
 
 alias Tightbeam.Toplines.Schema, as: ToplinesSchema
 db = :guard_toplines_crash
-{:ok, first} = DB.start_link(path: path, name: db, guard_inputs: [lock_dir: locks])
+{:ok, first} = DB.start_link(path: path, name: db, guard_inputs: [])
 Process.unlink(first)
 
 try do
@@ -65,25 +65,7 @@ try do
   Process.exit(first, :kill)
   assert_receive {:DOWN, ^monitor, :process, ^first, :killed}, 1_000
 
-  lock_path =
-    Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-  await = fn recur, remaining ->
-    case Tightbeam.LiveBaseLock.acquire(lock_path) do
-      {:ok, lock} ->
-        :ok = Tightbeam.LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when remaining > 0 ->
-        Process.sleep(10)
-        recur.(recur, remaining - 1)
-
-      other ->
-        raise "lock release failed: #{inspect(other)}"
-    end
-  end
-
-  await.(await, 100)
-  {:ok, second} = DB.start_link(path: path, name: db, guard_inputs: [lock_dir: locks])
+  {:ok, second} = DB.start_link(path: path, name: db, guard_inputs: [])
   Process.unlink(second)
   :ok = Schema.ensure_all(db)
   assert :ok = ToplinesSchema.activate(db, 999)

@@ -4,12 +4,12 @@ defmodule GuardClientWire do
   alias Tightbeam.ClientE2E.{Journeys, SimClient}
   alias Tightbeam.Wire.Router
 
-  def run(base, locks, selected) do
+  def run(base, selected) do
     {:ok, supervisor} = Supervisor.start_link([], strategy: :one_for_one)
     Process.put(:wire_supervisor, supervisor)
 
     try do
-      ctx = real_gateway(base, locks)
+      ctx = real_gateway(base)
       :ok = DB.assert_base_admitted!(ctx.db, base)
       marker = File.read!(Path.join(base, "build-owner.json"))
       run_case(selected, ctx)
@@ -85,12 +85,10 @@ defmodule GuardClientWire do
     }
   end
 
-  defp real_gateway(base_dir, locks) do
+  defp real_gateway(base_dir) do
     db = :"client_e2e_db_#{System.unique_integer([:positive])}"
 
-    start_supervised!(
-      {DB, path: Path.join(base_dir, "state.db"), name: db, guard_inputs: [lock_dir: locks]}
-    )
+    start_supervised!({DB, path: Path.join(base_dir, "state.db"), name: db, guard_inputs: []})
 
     :ok = Tightbeam.Schema.ensure_all(db)
 
@@ -130,12 +128,12 @@ defmodule GuardClientWire do
   end
 end
 
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 for app <- [:exqlite, :crypto, :bandit], do: {:ok, _} = Application.ensure_all_started(app)
 selected = File.read!(Path.join(Path.dirname(base), "wire-case")) |> String.to_integer()
-GuardClientWire.run(base, locks, selected)
+GuardClientWire.run(base, selected)
 IO.puts("guarded-client-wire-#{selected}: ok")
