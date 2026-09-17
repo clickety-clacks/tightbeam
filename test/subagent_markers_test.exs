@@ -49,7 +49,7 @@ defmodule Tightbeam.SubagentMarkersTest do
       codex: codex,
       claude: claude,
       codex_fixture: fixture("codex-acp-1.1.4.jsonc"),
-      claude_fixture: fixture("claude-agent-acp-0.59.0.jsonc")
+      claude_fixture: fixture("claude-agent-acp-0.73.0.jsonc")
     }
   end
 
@@ -84,18 +84,18 @@ defmodule Tightbeam.SubagentMarkersTest do
            ]
   end
 
-  test "proof 4: claude fixture ignores spawn completion and stops at live task settlement",
+  test "proof 4: claude fixture ignores spawn completion and stops at native task settlement",
        ctx do
     fixture = ctx.claude_fixture
-    assert fixture["version"] == "0.59.0"
-    assert fixture["semantic"]["spawn_operation_terminal"] =~ "liveBackgroundTasks"
-    assert fixture["semantic"]["child_termination_terminal"] =~ "settlement"
+    assert fixture["version"] == Tightbeam.Harness.Claude.adapter_version()
+    assert fixture["semantic"]["spawn_operation_terminal"] =~ "child session remains"
+    assert fixture["semantic"]["child_termination_terminal"] =~ "terminal state"
 
     start = consume(ctx, :claude, "sid-claude", fixture["live_agent_started"])
     assert start.appended
     assert :skip = consume(ctx, :claude, "sid-claude", fixture["spawn_operation_terminal"])
 
-    stop = consume(ctx, :claude, "sid-claude", fixture["patched_termination"])
+    stop = consume(ctx, :claude, "sid-claude", fixture["native_termination"])
     assert stop.appended
     assert stop.principal == ctx.claude.session_key
     assert stop.subagent_ref == start.subagent_ref
@@ -104,6 +104,33 @@ defmodule Tightbeam.SubagentMarkersTest do
              "subagent_start",
              "subagent_stop"
            ]
+  end
+
+  test "every recorded native terminal state stops the child; active states do not" do
+    capture =
+      Path.join(__DIR__, "fixtures/subagent_markers/claude-native-0.73.0-capture.json")
+      |> File.read!()
+      |> JSON.decode!()
+
+    for state <- capture["terminals"] |> Map.values() |> Enum.uniq() do
+      update = %{
+        "sessionUpdate" => "subagent_state_update",
+        "subagentSessionId" => "child",
+        "state" => state
+      }
+
+      assert {:subagent_stop, %{source_event_ref: "child", subagent_ref: "child"}} =
+               Tightbeam.Harness.Claude.classify_subagent_event(update)
+    end
+
+    for state <- ["running", "pending", "unknown"] do
+      assert :skip =
+               Tightbeam.Harness.Claude.classify_subagent_event(%{
+                 "sessionUpdate" => "subagent_state_update",
+                 "subagentSessionId" => "child",
+                 "state" => state
+               })
+    end
   end
 
   test "proof 2: parent handle resolves to canonical scope and fires by condition or fallback",
@@ -133,7 +160,7 @@ defmodule Tightbeam.SubagentMarkersTest do
       )
 
     fallback_wake =
-      register_wake(ctx, ctx.claude, "call-claude-1",
+      register_wake(ctx, ctx.claude, "child-1",
         after_ms: 0,
         idempotency_key: "fallback",
         nudge: false
@@ -146,6 +173,36 @@ defmodule Tightbeam.SubagentMarkersTest do
 
     assert %{state: "fired", fired_by: "fallback"} =
              Wakes.get(ctx.db, fallback_wake.wake_id)
+  end
+
+  test "Claude native child handle fires its canonical wake and does not alias a tool call",
+       ctx do
+    start = consume(ctx, :claude, "sid-claude", ctx.claude_fixture["live_agent_started"])
+
+    assert %{code: "subagent_not_found"} =
+             register_wake(ctx, ctx.claude, "call-claude-1",
+               after_ms: 60_000,
+               idempotency_key: "legacy-claude-handle"
+             )
+
+    wake =
+      register_wake(ctx, ctx.claude, "child-1",
+        after_ms: 60_000,
+        idempotency_key: "native-claude-condition"
+      )
+
+    assert %{state: "pending", condition_scope: scope} = Wakes.get(ctx.db, wake.wake_id)
+    assert scope == start.subagent_ref
+
+    stop = consume(ctx, :claude, "sid-claude", ctx.claude_fixture["native_termination"])
+    assert stop.subagent_ref == scope
+    assert %{state: "fired", fired_by: "condition"} = Wakes.get(ctx.db, wake.wake_id)
+
+    assert %{code: "subagent_already_stopped", subagent_ref: ^scope} =
+             register_wake(ctx, ctx.claude, "child-1",
+               after_ms: 60_000,
+               idempotency_key: "native-claude-already-stopped"
+             )
   end
 
   test "proof 2 stop-wins order returns subagent_already_stopped and inserts no wake", ctx do

@@ -230,6 +230,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     }
     switch (m.method) {
       case "initialize":
+        fs.writeFileSync(capturePath + ".initialize", JSON.stringify(m.params));
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 75);
         return send({ id: m.id, result: { protocolVersion: 1 } });
       case "session/new": {
@@ -1838,6 +1839,71 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     assert_receive {:subagent, "sess-1", ^update}
+  end
+
+  test "only Claude negotiates the pinned adapter native subagent capability" do
+    for harness <- [:claude, :codex, :pi] do
+      {adapter, capture_path} = start_adapter(harness: harness)
+      refute Adapter.knows_session?(adapter, "not-created")
+
+      capabilities =
+        (capture_path <> ".initialize")
+        |> File.read!()
+        |> JSON.decode!()
+        |> Map.fetch!("clientCapabilities")
+
+      assert capabilities["fs"] == %{"readTextFile" => false, "writeTextFile" => false}
+
+      if harness == :claude do
+        assert capabilities["subagents"] == %{}
+      else
+        refute Map.has_key?(capabilities, "subagents")
+      end
+    end
+  end
+
+  test "captured Claude child lifecycle routes to its root without mixing child text" do
+    owner = self()
+
+    {adapter, _capture_path} =
+      start_adapter(on_subagent_event: &send(owner, {:native_subagent, &1, &2}))
+
+    assert {:ok, "sess-1"} = Adapter.new_session(adapter, nil, "/tmp", [], "guidance")
+
+    capture =
+      Path.join(__DIR__, "fixtures/subagent_markers/claude-native-0.73.0-capture.json")
+      |> File.read!()
+      |> JSON.decode!()
+
+    assert capture["version"] == Tightbeam.Harness.Claude.adapter_version()
+    assert [root_spawn, child_text, nested_spawn, nested_stop, root_stop] = capture["frames"]
+
+    assert root_spawn["update"]["sessionUpdate"] == "subagent_spawned"
+    assert child_text["sessionId"] == "child-1"
+    assert nested_spawn["sessionId"] == "child-1"
+    assert nested_stop["update"]["state"] == "completed"
+    assert root_stop["update"]["state"] == "completed"
+
+    for frame <- capture["frames"] do
+      frame =
+        if frame["sessionId"] == "root-1",
+          do: Map.put(frame, "sessionId", "sess-1"),
+          else: frame
+
+      update = frame["update"]
+      send(adapter, {:acp_notification, "session/update", frame})
+      assert_receive {:native_subagent, "sess-1", ^update}
+    end
+
+    state = :sys.get_state(adapter)
+    assert state.subagent_session_roots == %{"child-1" => "sess-1", "child-2" => "sess-1"}
+    assert state.chunks["sess-1"] == []
+    refute Map.has_key?(state.chunks, "child-1")
+
+    assert :ok = Adapter.close_session(adapter, "sess-1")
+    state = :sys.get_state(adapter)
+    assert state.subagent_session_roots == %{}
+    refute Map.has_key?(state.chunks, "sess-1")
   end
 
   test "placement subagent callback does not block the adapter on matching wake delivery" do

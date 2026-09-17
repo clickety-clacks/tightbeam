@@ -1,0 +1,66 @@
+{
+  "adapter": "@agentclientprotocol/claude-agent-acp",
+  "version": "0.73.0",
+  "provenance": "Captured from execution of actual installed package NativeSubagentRuntime; SDK task facts supplied synthetically; no authentication/model request. Not a live harness smoke.",
+  "frames": [
+    {
+      "sessionId": "root-1",
+      "update": {
+        "sessionUpdate": "subagent_spawned",
+        "subagentSessionId": "child-1",
+        "name": "Agent call-1",
+        "task": "Task call-1",
+        "capabilities": {}
+      }
+    },
+    {
+      "sessionId": "child-1",
+      "update": {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {
+          "type": "text",
+          "text": "child text"
+        },
+        "_meta": {
+          "claudeCode": {
+            "parentToolUseId": "call-1"
+          }
+        }
+      }
+    },
+    {
+      "sessionId": "child-1",
+      "update": {
+        "sessionUpdate": "subagent_spawned",
+        "subagentSessionId": "child-2",
+        "name": "Agent call-2",
+        "task": "Task call-2",
+        "capabilities": {}
+      }
+    },
+    {
+      "sessionId": "child-1",
+      "update": {
+        "sessionUpdate": "subagent_state_update",
+        "subagentSessionId": "child-2",
+        "state": "completed"
+      }
+    },
+    {
+      "sessionId": "root-1",
+      "update": {
+        "sessionUpdate": "subagent_state_update",
+        "subagentSessionId": "child-1",
+        "state": "completed"
+      }
+    }
+  ],
+  "terminals": {
+    "completed": "completed",
+    "failed": "failed",
+    "cancelled": "cancelled",
+    "disconnected": "disconnected",
+    "killed": "cancelled",
+    "stopped": "cancelled"
+  }
+}
