@@ -1898,22 +1898,33 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("attest.kind", _db, call, cache) do
     value =
-      case {call.verb, Map.get(call.params, :kind)} do
-        {"attest", kind} when is_binary(kind) -> kind
+      case {call.verb, Map.get(call.params, :kind), transition_new(call, :kind)} do
+        {"attest", kind, _} when is_binary(kind) -> kind
+        {_, _, kind} when is_binary(kind) -> kind
         _ -> nil
       end
 
     {value, cache}
   end
 
+  # On a verb edge the attest is the call; on a row-commit edge it is the committed
+  # row, read from the transition so the rule sees what was written, not what was asked.
   defp compute_fact("attest.verdict_kind", _db, call, cache) do
     value =
-      case {call.verb, Map.get(call.params, :verdict_kind)} do
-        {"attest", kind} when is_binary(kind) -> kind
+      case {call.verb, Map.get(call.params, :verdict_kind), transition_new(call, :verdictKind)} do
+        {"attest", kind, _} when is_binary(kind) -> kind
+        {_, _, kind} when is_binary(kind) -> kind
         _ -> nil
       end
 
     {value, cache}
+  end
+
+  defp transition_new(call, field) do
+    case Map.get(call, :transition) do
+      %{fields: %{^field => %{new: value}}} -> value
+      _ -> nil
+    end
   end
 
   # The business-row fields a row-commit transition changed, as strings; empty on a

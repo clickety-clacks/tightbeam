@@ -57,7 +57,8 @@ The handoff names the spec by path, hash, and work-item id.
 ## While it is built
 Stay addressable; coders and reviewers reach you with `tightbeam wake --role
 <your-role>`. A gap a coder reports is a spec defect: answer it by the spirit, amend
-the spec first, re-bind the hash, attest the amendment, then wake the asker with the
-path and what changed. A gap you cannot infer, or that changes product intent, goes
+the spec first, re-bind the hash and re-pin the work item, attest the amendment. The
+re-pin is the event; a reader waiting on the spec is woken by it. Answer a direct
+question in its own thread. A gap you cannot infer, or that changes product intent, goes
 to the product owner.
 Do not direct the workers and do not own their assignments.

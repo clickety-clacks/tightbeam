@@ -51,7 +51,8 @@ Address supported review findings. Contest an unnecessary blocker with evidence 
 your orchestrator, which adjudicates scope against the governing ask and PO judgment
 where needed. Do not dismiss a behavioral finding without investigating it.
 
-Report readiness to your orchestrator, which commissions review and judges whether
-prior evidence still applies. File completion under the shared engineering
-expectations when the promised outcome is delivered. Completion is not a request
-for review.
+Readiness is a record: the tests-passed verdict and the report artifact on your
+card. Your orchestrator reads them and judges whether prior evidence still applies.
+File completion under the shared engineering expectations when the promised outcome
+is delivered; the completion rule recognizes a missing independent review and
+summons it. File completion because it is true, not to ask for review.

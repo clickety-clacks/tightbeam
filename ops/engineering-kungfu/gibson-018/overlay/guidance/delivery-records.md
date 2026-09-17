@@ -6,7 +6,7 @@ Apply the cycle selected in the orchestrator kernel. An adequate existing ask or
 
 For PO judgment, use the addressed product role from the delegation context. Provide the current spec or result, its revision, the product spirit reference and the product question on a bounded assignment on the same item. Wake the PO under the kernel's opportunity duty. Reuse an open PO judgment assignment for unchanged scope. If a completed judgment needs a successor, keep it on the same item and reference the earlier assignment and changed context. Do not use --reviews merely to mark succession. The PO records and completes its own intent judgment.
 
-Link independent technical review to its producer. Use reviewer-spec for specifications and reviewer-code for implementation. Preserve the latest attributable review conclusion and the subject it covers. Use the shared engineering expectations for review admission and proof. Use recon for a bounded diagnostic question when that is the useful assignment. Do not file producer completion to summon review.
+Link independent technical review to its producer. Use reviewer-spec for specifications and reviewer-code for implementation. Preserve the latest attributable review conclusion and the subject it covers. Use the shared engineering expectations for review admission and proof. Use recon for a bounded diagnostic question when that is the useful assignment. A completion attempt without the required review is what summons review; a producer files completion when the outcome is delivered, not to request it.
 
 Batch related producer corrections before commissioning renewed acceptance review.
 Use an earlier bounded review when it can resolve a design or implementation question;

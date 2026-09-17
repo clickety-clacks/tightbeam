@@ -17,6 +17,13 @@ Designing a rail:
 - Red-tape test before shipping: silent when satisfied, evidence as byproduct, remedy
   named before deny, outcome verbs only. One false positive = defective rail. (4)
 - Every marker your mechanism writes carries cause and principal. (5)
+- Know the grammar. Effects: `deny` refuses the verb; `remedy` refuses and enacts a
+  named producer (assign or wake) that releases it; `escalate` raises a decision;
+  `notice` records and wakes a target while the verb proceeds. Edges: `verb`, before
+  the command runs; `row-commit`, after a business row is written (assignment, attest,
+  work item, decision request, artifact) with `transition.fields` naming what changed.
+  Recognizing a transition is a row-commit notice; a deny is for an explicit boundary
+  only. (6)
 
 Designing a mechanism:
 - The substrate routes, classifies, holds, verifies; minds decide. If your mechanism

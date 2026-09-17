@@ -43,13 +43,15 @@ deny_when = [
 target_session = "{product_owner_key}"
 prompt = "Spirit rumination requested. The spec on work item {work_item_id} changed, re-pinned by {caller_key}. Any earlier judgment was of the old spec. Nothing is waiting on you and nothing is blocked. Read the new spec against the product's intent and record your judgment on a bounded product-owner assignment on this work item: spirit-approved, or changes-requested naming what must change."
 
-# The objection travels on its own. When a product owner records
-# changes-requested on a card on a spec-backed item, the session that opened the
-# open implementation card on that item is woken, or the item's creator when no
-# implementation exists yet. The verdict itself is never refused.
+# The objection travels on its own. The product owner's changes-requested is a
+# row write; this production recognizes the committed verdict row and wakes the
+# session that opened the open implementation card on that item, or the item's
+# creator when no implementation exists yet. Row-commit, so it fires on what was
+# written, once per verdict, and never refuses the verdict.
 [[rule]]
 name = "spirit-objection-reaches-owner"
 verb = "attest"
+edges = ["row-commit"]
 effect = "notice"
 text = "a product-owner changes-requested on spec-backed work is delivered to the session that owns the work"
 deny_when = [
@@ -60,4 +62,4 @@ deny_when = [
 ]
 [rule.notice]
 target_session = "{work_owner_key}"
-prompt = "Spirit objection on work you own. The product owner {caller_key} recorded changes-requested on {assignment_id} for work item {work_item_id}. Read its note, retarget or hold the affected work, and answer the product owner. Nothing was stopped for you."
+prompt = "Spirit objection on work you own. The product owner {caller_key} recorded changes-requested on {assignment_id} for work item {work_item_id}. Read its note and record your disposition on the affected card: retarget, hold, or contest with evidence. The record is the answer; nothing was stopped for you."

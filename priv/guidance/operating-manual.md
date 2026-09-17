@@ -59,15 +59,16 @@ The prompt you send yourself instructs the future you. Cancel a scheduled wake w
 
 ## Work with colleagues without disrupting them
 Ask a colleague when that colleague can answer something you need to do your job. Do not send
-idle status requests or nudges. Send the responsible delivery owner material results,
-blockers, dependency dispositions, failures and ownership changes for its scope. State
-the affected outcome and changed fact. Distinguish information from a request for a
-decision or action; a useful report need not ask the recipient to intervene.
-
-Message your owner on a state change: done, blocked, failed, a dependency settled, a
-finding that changes scope, or a hand-off. Progress that changes no one's next action
-goes in a progress attest, not a message; the record is where an owner reads it. One
-message per state change; do not restate an attest the owner can already read.
+idle status requests or nudges. What happened is a record, not a message: file
+completion, surrender, a verdict, a progress attest, an artifact, a decision request,
+or the dependency wait you now hold. The record is the event. The substrate wakes
+whoever registered a wait on it and prods what is left unfiled; do not message your
+owner to report a transition the ledger already shows. Message a colleague for a
+question it can answer, a judgment a record cannot carry, or a request it must decide.
+Distinguish information from a request; a useful report need not ask the recipient to
+intervene. Wait on recorded conditions, not on the clock: register an after-turn
+continuation or a dependency wait on your card, and keep timers for external systems
+with no rows.
 
 Carry upward the consequences relevant to the parent's responsibilities. Receiving a
 report does not itself require forwarding it. Keep detailed evidence available in the

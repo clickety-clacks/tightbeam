@@ -14,5 +14,6 @@ gap that prevents accepting a required outcome. A clause table is useful when th
 contract needs that level of traceability, with no universal report template.
 
 For an early or partial review, state which questions the available work can settle.
-If a producer closes before required independent review, notify its orchestrator
-and preserve your attributable conclusion.
+If a producer closes before required independent review, record that on your review
+card as the verdict note and preserve your attributable conclusion; the owner reads it
+there.

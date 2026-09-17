@@ -13,8 +13,8 @@ answer within a stated limit; it does not fulfill a promise to establish the cau
 
 Use the shared engineering expectations for proof and the operating manual for
 records and communication. Record the finding as a verdict on your assignment and
-provide a report artifact when the result needs a durable document. Notify the
-requester through the assignment's addressed delivery owner. Complete the assignment
+provide a report artifact when the result needs a durable document. The verdict and
+the artifact are the notice to the requester and its delivery owner. Complete the assignment
 when its promised finding and handoff are delivered; a verdict alone does not close
 it. The delivery owner handles retirement after preserving any remaining obligation.
 

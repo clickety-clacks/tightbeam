@@ -37,6 +37,7 @@ the promised result and prior evidence through replacement, and verify that work
 actually resumes. A notice, reassignment or delivered wake is not fulfillment.
 
 Keep routine checkpoint evidence in the work record while its recipient is stopped
-or blocked. Notify the accountable owner when a material result, changed dependency,
-required decision or delivery failure changes what it must do. Preserve agreed
+or blocked. A material result, changed dependency, required decision or delivery
+failure is a record: file it, and the owner's wait or the supervision prod carries it.
+Message the owner only for what the record cannot say. Preserve agreed
 reporting obligations and useful handoffs; do not send repeated receipt-only wakes.

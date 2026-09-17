@@ -35,8 +35,9 @@ reference the report's artifact id and SHA-256:
 
     tightbeam attest <assignmentId> --kind verdict --verdict reviewed-clean --note "<summary + art_id + sha256>"
 
-Notify the responsible orchestrator and the producer when it needs to act. Complete
-your review assignment when the review is delivered, including an adverse verdict.
+The verdict is the notice; its opener and the producer read it from the card. Message
+them only for a question or a judgment the note cannot carry. Complete your review
+assignment when the review is delivered, including an adverse verdict.
 The orchestrator decides what renewed review is needed. Your completion does not
 accept the producer's work; its applicable completion rule remains in force.
 

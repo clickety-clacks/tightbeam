@@ -62,6 +62,8 @@ defmodule Tightbeam.RuleRuntime do
       domains: ["artifact", "attest"],
       binding: "artifact"
     },
+    "attest.kind" => %{kind: :row, domains: ["attest"], binding: "assignmentId"},
+    "attest.verdict_kind" => %{kind: :row, domains: ["attest"], binding: "assignmentId"},
     "condition_fact.matches" => %{kind: :condition_fact, domains: ["condition_fact"]}
   }
 
