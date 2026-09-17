@@ -245,6 +245,8 @@ defmodule Tightbeam.AdapterCoordinator do
        shutdown_budget_ms: Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms),
        shutdown_settlement_budget_ms:
          Keyword.get(opts, :shutdown_settlement_budget_ms, @shutdown_settlement_budget_ms),
+       shutdown_cancel_grace_ms:
+         Keyword.get(opts, :shutdown_cancel_grace_ms, @shutdown_cancel_grace_ms),
        # Owner for cleanup that outlives terminate/2; see dispatch_late_cleanup/2.
        # Overridable so a standalone coordinator can be given its own owner.
        shutdown_cleanup_supervisor:
@@ -265,7 +267,7 @@ defmodule Tightbeam.AdapterCoordinator do
     # begins. Charging the grace to the reserve instead is what left settlement
     # with an already-spent slice under load: transaction_until refused, the
     # park rows kept their fence but lost their durable outcome.
-    park_deadline = settle_start - @shutdown_cancel_grace_ms
+    park_deadline = settle_start - state.shutdown_cancel_grace_ms
 
     {pending, state, preparation} = prepare_shutdown(state, park_deadline)
 
@@ -277,7 +279,11 @@ defmodule Tightbeam.AdapterCoordinator do
           else
             pending
             |> start_shutdown_tasks(state.db)
-            |> collect_shutdown_results(park_deadline, settle_start)
+            |> collect_shutdown_results(
+              park_deadline,
+              settle_start,
+              state.shutdown_cancel_grace_ms
+            )
           end
 
         {:error, reason} ->
@@ -568,27 +574,28 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  defp collect_shutdown_results(tasks, deadline, settle_start) do
-    collect_shutdown_results(tasks, deadline, settle_start, [])
+  defp collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms) do
+    collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms, [])
   end
 
-  defp collect_shutdown_results([], _deadline, _settle_start, results),
+  defp collect_shutdown_results([], _deadline, _settle_start, _cancel_grace_ms, results),
     do: Enum.reverse(results)
 
   defp collect_shutdown_results(
          [{key, process_row, task} = current | rest],
          deadline,
          settle_start,
+         cancel_grace_ms,
          results
        ) do
     case Task.yield(task, max(deadline - System.monotonic_time(:millisecond), 0)) do
       {:ok, result} ->
-        collect_shutdown_results(rest, deadline, settle_start, [
+        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, [
           {key, process_row, result} | results
         ])
 
       {:exit, reason} ->
-        collect_shutdown_results(rest, deadline, settle_start, [
+        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, [
           {key, process_row, {:error, {:shutdown_task_exit, reason}}} | results
         ])
 
@@ -597,7 +604,10 @@ defmodule Tightbeam.AdapterCoordinator do
         # notifying the others would spend the reserved settlement slice on
         # serial cancellation and recreate the original adapter-count hazard.
         cancel_shutdown_tasks([current | rest])
-        timed_out = collect_cancelled_shutdown_results([current | rest], settle_start)
+
+        timed_out =
+          collect_cancelled_shutdown_results([current | rest], settle_start, cancel_grace_ms)
+
         Enum.reverse(results) ++ timed_out
     end
   end
@@ -608,7 +618,7 @@ defmodule Tightbeam.AdapterCoordinator do
     end)
   end
 
-  defp collect_cancelled_shutdown_results(tasks, settle_start) do
+  defp collect_cancelled_shutdown_results(tasks, settle_start, cancel_grace_ms) do
     # The park deadline already budgets one full grace ahead of the reserve, so
     # a cancel that starts on time gets all of it. When park collection overran
     # its own deadline, the grace is truncated at the reserve boundary rather
@@ -616,7 +626,7 @@ defmodule Tightbeam.AdapterCoordinator do
     # unrecorded outcome beats a recorded outcome settlement can no longer
     # write.
     cancel_deadline =
-      min(System.monotonic_time(:millisecond) + @shutdown_cancel_grace_ms, settle_start)
+      min(System.monotonic_time(:millisecond) + cancel_grace_ms, settle_start)
 
     yielded =
       Enum.map(tasks, fn {key, process_row, task} ->
