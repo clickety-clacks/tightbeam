@@ -1069,6 +1069,14 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     assert [] = ctx.db |> EventLog.lifecycle_events() |> Enum.filter(&(&1.kind == "adapter_down"))
   end
 
+  test "supervisor allowance exceeds the configured shutdown budget" do
+    # The child_spec must read the configured option, not the module attribute:
+    # a caller raising shutdown_budget_ms above the default would otherwise be
+    # brutal-killed before its own internal deadline.
+    assert AdapterCoordinator.child_spec([]).shutdown > 30_000
+    assert AdapterCoordinator.child_spec(shutdown_budget_ms: 45_000).shutdown > 45_000
+  end
+
   test "shutdown parks every adapter group under one supervisor budget", ctx do
     path = Path.join(ctx.test_dir, "fake_harness.js")
     File.write!(path, @fake)
@@ -1529,6 +1537,15 @@ defmodule Tightbeam.AdapterCoordinatorTest do
         db: ctx.db,
         shutdown_budget_ms: budget_ms,
         shutdown_settlement_budget_ms: 500,
+        # Zero grace pins this test to the late path by construction: the
+        # cancel deadline collapses to the reserve boundary, every hung park is
+        # force-killed with no cooperative wait, and retirement always enters
+        # past settle_start. At the default grace the premise is a race against
+        # the host's process-enumeration cost — deterministically lost on Linux,
+        # where 24 parks answer the cooperative cancel well inside 100ms and
+        # retirement runs early (0/24 late over 5 runs), and only incidentally
+        # won on macOS (24/24 late; art_171f5abc).
+        shutdown_cancel_grace_ms: 0,
         shutdown_cleanup_supervisor: cleanup_owner,
         name:
           String.to_atom(
@@ -1581,14 +1598,33 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     assert_received {:shutdown_elapsed_ms, elapsed_ms}
 
-    # THE configured deadline, not a looser number. terminate/2 promises to
-    # complete within shutdown_budget_ms; asserting anything above it would let a
-    # callback that overran its own budget pass, which is what the V7 review
-    # caught. With 24 retained adapters this also proves the bound does not
-    # degrade with cardinality: the late entries' outcomes are decided before
-    # settlement, and their cleanup is owned by someone else afterwards.
-    assert elapsed_ms <= budget_ms,
-           "shutdown took #{elapsed_ms}ms against a configured #{budget_ms}ms budget with " <>
+    # terminate/2 promises to complete within shutdown_budget_ms, and the V7
+    # concern — a callback overrunning its own budget passing unnoticed — still
+    # governs: the allowance below is measurement-scale, not phase-scale, so a
+    # real overrun of the 500ms reserve still fails. Without the allowance the
+    # bound's margin is negative by construction — it forbids what the code's
+    # own contract permits and can fail on a quiet host on a scheduling hiccup.
+    # Two costs land in elapsed_ms without being terminate's to spend:
+    # DB.transaction_until grants
+    # a final commit already in flight remaining + 50ms past the deadline rather
+    # than abort a durable outcome (observed +8..22ms), and the measurement
+    # starts before GenServer.stop dispatches, ahead of the callback's own clock
+    # (observed +12..26ms under 4x CPU oversubscription). 100ms is ~3x the worst
+    # observed sum of the two. This bound is a sanity check on the deadline
+    # contract, not the regression detector: at the pre-fix base its catch rate
+    # is platform-dependent — 0 of 8 loaded runs on eezo (macOS, elapsed
+    # 853-1284ms, review control art_88fb2ef4) versus 3 of 6 on racter (Linux,
+    # 1320-1338ms). What caught the base defect on both hosts is the row-state,
+    # log-content and census oracles below, which this allowance leaves
+    # untouched. With 24
+    # retained adapters this also proves the bound does not degrade with
+    # cardinality: the late entries' outcomes are decided before settlement, and
+    # their cleanup is owned by someone else afterwards.
+    observation_allowance_ms = 100
+
+    assert elapsed_ms <= budget_ms + observation_allowance_ms,
+           "shutdown took #{elapsed_ms}ms against a configured #{budget_ms}ms budget " <>
+             "(+#{observation_allowance_ms}ms observation allowance) with " <>
              "#{length(keys)} retained adapters; the deadline guarantee did not hold"
 
     assert log =~ "retirement late entry unresolved"
@@ -1618,6 +1654,120 @@ defmodule Tightbeam.AdapterCoordinatorTest do
 
     # No surviving live descendant — asserted inside the capture above, and again
     # here so the guarantee is stated where it is read.
+    assert HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0
+  end
+
+  # The companion to the retirement-cutoff test above: the same 24 hung parks,
+  # but with a grace the cooperative cancel can answer within on every
+  # platform. It pins the non-late half of the contract, which no other test
+  # distinguishes: the forced-exhaustion test earlier in this file matches
+  # "shutdown_budget_exhausted" as a substring, and the late path's
+  # {:shutdown_retirement_unresolved, :shutdown_budget_exhausted} satisfies
+  # that too, so only the refutations here tell the two paths apart.
+  test "cancel grace answered in time settles hung parks as plain budget exhaustion", ctx do
+    path = Path.join(ctx.test_dir, "fake_harness.js")
+    File.write!(path, @fake)
+
+    helper = Path.expand("../cli/target/release/tightbeam", __DIR__)
+    slow_helper = Path.join(ctx.test_dir, "slow_harness_helper")
+
+    File.write!(
+      slow_helper,
+      "#!/bin/sh\n" <>
+        "if [ \"$1\" = \"harness-group\" ]; then sleep 2; fi\n" <>
+        "exec #{helper} \"$@\"\n"
+    )
+
+    File.chmod!(slow_helper, 0o755)
+
+    cleanup_owner =
+      start_supervised!(
+        {Task.Supervisor, name: :"shutdown_grace_cleanup_#{System.unique_integer([:positive])}"}
+      )
+
+    # The grace must exceed what consumes it: 24 concurrent process-group
+    # enumerations cost ~31ms on Linux and ~197ms on macOS (art_171f5abc), so
+    # one second holds a >5x margin on the slower platform. The budget grows by
+    # the same second so the park phase keeps the cutoff test's shape: parks
+    # get ~900ms against a 2s hang and always time out into the cancel path.
+    {:ok, coordinator} =
+      AdapterCoordinator.start_link(
+        adapter_sup: ctx.sup,
+        adapter_context: fn _ -> [] end,
+        adapter_opts: fn _, _ ->
+          [
+            harness: :claude,
+            cmd: [System.find_executable("node"), path],
+            home: ctx.test_dir,
+            cwd: ctx.test_dir,
+            process_helper: slow_helper,
+            process_identity_dir: ctx.test_dir
+          ]
+        end,
+        db: ctx.db,
+        shutdown_budget_ms: 2_400,
+        shutdown_settlement_budget_ms: 500,
+        shutdown_cancel_grace_ms: 1_000,
+        shutdown_cleanup_supervisor: cleanup_owner,
+        name:
+          String.to_atom(
+            "shutdown_grace_settled_coordinator_#{System.unique_integer([:positive])}"
+          )
+      )
+
+    Process.unlink(coordinator)
+    on_exit(fn -> if Process.alive?(coordinator), do: GenServer.stop(coordinator, :shutdown) end)
+
+    keys =
+      for index <- 1..24 do
+        {:claude, "shared", "shutdown-grace-settled-host-#{index}"}
+      end
+
+    for key <- keys do
+      assert {:ok, _adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+    end
+
+    assert eventually(
+             fn ->
+               rows = HarnessProcess.list(ctx.db)
+               length(rows) == length(keys) and Enum.all?(rows, &(&1.state == "running"))
+             end,
+             300
+           )
+
+    log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert :ok = GenServer.stop(coordinator, :shutdown, 5_000)
+
+        assert eventually(
+                 fn -> HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0 end,
+                 1_000
+               )
+      end)
+
+    # The discriminator: retirement ran before the reserve boundary, so the
+    # late-entry machinery never engaged.
+    refute log =~ "retirement late entry unresolved"
+
+    # Every hung park settled durably as plain budget exhaustion — truthful
+    # rows, fenced, no unresolved marker anywhere.
+    rows = HarnessProcess.list(ctx.db)
+    assert length(rows) == length(keys)
+    assert Enum.all?(rows, &(&1.state == "kill_failed"))
+    assert Enum.all?(rows, &(&1.last_error =~ "shutdown_budget_exhausted"))
+    refute Enum.any?(rows, &(&1.last_error =~ "shutdown_retirement_unresolved"))
+    assert Enum.all?(keys, &HarnessProcess.fenced?(ctx.db, &1))
+
+    failures =
+      Enum.filter(
+        EventLog.lifecycle_events(ctx.db),
+        &(&1.kind == "adapter_shutdown_cleanup_failed")
+      )
+
+    assert length(failures) == length(keys)
+    assert Enum.all?(failures, &String.contains?(&1.detail, "shutdown_budget_exhausted"))
+    refute Enum.any?(failures, &String.contains?(&1.detail, "shutdown_retirement_unresolved"))
+
     assert HarnessProcessCensus.capture_for_root(ctx.test_dir).count == 0
   end
 

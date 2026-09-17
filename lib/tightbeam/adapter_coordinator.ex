@@ -50,9 +50,26 @@ defmodule Tightbeam.AdapterCoordinator do
   # room to finish before the supervisor's outer shutdown deadline.
   @shutdown_settlement_budget_ms 5_000
   # Give a park task a chance to close the port it owns before the coordinator
-  # has to force-kill the task. This is part of the settlement reservation, not
-  # an extension of the supervisor's shutdown budget.
+  # has to force-kill the task. Budgeted ahead of the settlement reserve inside
+  # the park phase (terminate/2 subtracts it from the park deadline), so a
+  # cancel that starts on time never spends the reserve — and never extends the
+  # supervisor's shutdown budget. At zero the cooperative window is gone:
+  # every outstanding park is brutal-killed, and the descendant reaping a
+  # cancelled park performs before closing its port (HarnessProcess's
+  # terminate_command_port/1) never runs — closing the port alone does not
+  # reliably reap a shebang wrapper on every supported host, so a zero grace
+  # trades orphaned helper descendants for the hundred milliseconds.
   @shutdown_cancel_grace_ms 100
+  # The supervisor's shutdown timer starts at the exit signal; terminate/2's
+  # deadline starts at callback entry, strictly later, and DB.transaction_until
+  # grants a final commit already in flight remaining + 50ms past that deadline.
+  # A supervisor allowance equal to the budget therefore brutal-kills the
+  # coordinator mid-settlement — inside its own contract — destroying the
+  # durable record the budget exists to protect. One second covers the 50ms
+  # grant plus the worst observed signal-to-entry scheduling gap (261ms under
+  # 4x CPU oversubscription) with ~3x headroom, and costs at most one extra
+  # second when terminate/2 is genuinely wedged.
+  @shutdown_supervisor_margin_ms 1_000
 
   @type adapter_key :: Tightbeam.Placement.adapter_key()
 
@@ -82,8 +99,14 @@ defmodule Tightbeam.AdapterCoordinator do
       type: :worker,
       restart: :permanent,
       # The normal worker default (5s) is shorter than identity recovery plus
-      # signal delivery. Let terminate/2 settle the durable process group.
-      shutdown: @shutdown_budget_ms
+      # signal delivery. Let terminate/2 settle the durable process group:
+      # derived from the configured budget, not the attribute, so a caller
+      # raising shutdown_budget_ms is not killed before its own deadline, and
+      # widened by the margin (see @shutdown_supervisor_margin_ms) so the
+      # supervisor never reclaims time the callback's contract still owns.
+      shutdown:
+        Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms) +
+          @shutdown_supervisor_margin_ms
     }
   end
 
@@ -229,6 +252,8 @@ defmodule Tightbeam.AdapterCoordinator do
        shutdown_budget_ms: Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms),
        shutdown_settlement_budget_ms:
          Keyword.get(opts, :shutdown_settlement_budget_ms, @shutdown_settlement_budget_ms),
+       shutdown_cancel_grace_ms:
+         Keyword.get(opts, :shutdown_cancel_grace_ms, @shutdown_cancel_grace_ms),
        # Owner for cleanup that outlives terminate/2; see dispatch_late_cleanup/2.
        # Overridable so a standalone coordinator can be given its own owner.
        shutdown_cleanup_supervisor:
@@ -242,7 +267,14 @@ defmodule Tightbeam.AdapterCoordinator do
     # and nonblocking retirement. Reserve the final slice for settlement; if
     # either DB phase cannot finish, keep the outcome explicitly unresolved.
     deadline = System.monotonic_time(:millisecond) + state.shutdown_budget_ms
-    park_deadline = deadline - state.shutdown_settlement_budget_ms
+    settle_start = deadline - state.shutdown_settlement_budget_ms
+
+    # A park phase that times out still owes every cancelled task the cancel
+    # grace, so parking must surrender the clock one grace before the reserve
+    # begins. Charging the grace to the reserve instead is what left settlement
+    # with an already-spent slice under load: transaction_until refused, the
+    # park rows kept their fence but lost their durable outcome.
+    park_deadline = settle_start - state.shutdown_cancel_grace_ms
 
     {pending, state, preparation} = prepare_shutdown(state, park_deadline)
 
@@ -254,14 +286,21 @@ defmodule Tightbeam.AdapterCoordinator do
           else
             pending
             |> start_shutdown_tasks(state.db)
-            |> collect_shutdown_results(park_deadline)
+            |> collect_shutdown_results(
+              park_deadline,
+              settle_start,
+              state.shutdown_cancel_grace_ms
+            )
           end
 
         {:error, reason} ->
           preparation_unresolved_results(pending, reason)
       end
 
-    {results, state, late_targets} = retire_shutdown_results(results, state, park_deadline)
+    # Retirement's cutoff is the reserve boundary, not the park deadline: on
+    # the happy path the grace window goes unused, and retirement may keep
+    # using it right up to where the settlement reserve begins.
+    {results, state, late_targets} = retire_shutdown_results(results, state, settle_start)
 
     # Durable settlement runs before any late cleanup, so it is reachable inside
     # the configured deadline no matter how many adapters were retained; the
@@ -550,34 +589,40 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  defp collect_shutdown_results(tasks, deadline) do
-    collect_shutdown_results(tasks, deadline, [])
+  defp collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms) do
+    collect_shutdown_results(tasks, deadline, settle_start, cancel_grace_ms, [])
   end
 
-  defp collect_shutdown_results([], _deadline, results), do: Enum.reverse(results)
+  defp collect_shutdown_results([], _deadline, _settle_start, _cancel_grace_ms, results),
+    do: Enum.reverse(results)
 
   defp collect_shutdown_results(
          [{key, process_row, task} = current | rest],
          deadline,
+         settle_start,
+         cancel_grace_ms,
          results
        ) do
     case Task.yield(task, max(deadline - System.monotonic_time(:millisecond), 0)) do
       {:ok, result} ->
-        collect_shutdown_results(rest, deadline, [{key, process_row, result} | results])
+        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, [
+          {key, process_row, result} | results
+        ])
 
       {:exit, reason} ->
-        collect_shutdown_results(
-          rest,
-          deadline,
-          [{key, process_row, {:error, {:shutdown_task_exit, reason}}} | results]
-        )
+        collect_shutdown_results(rest, deadline, settle_start, cancel_grace_ms, [
+          {key, process_row, {:error, {:shutdown_task_exit, reason}}} | results
+        ])
 
       nil ->
         # Cancel every outstanding task together. Waiting for one task before
         # notifying the others would spend the reserved settlement slice on
         # serial cancellation and recreate the original adapter-count hazard.
         cancel_shutdown_tasks([current | rest])
-        timed_out = collect_cancelled_shutdown_results([current | rest])
+
+        timed_out =
+          collect_cancelled_shutdown_results([current | rest], settle_start, cancel_grace_ms)
+
         Enum.reverse(results) ++ timed_out
     end
   end
@@ -588,21 +633,34 @@ defmodule Tightbeam.AdapterCoordinator do
     end)
   end
 
-  defp collect_cancelled_shutdown_results(tasks) do
-    cancel_deadline = System.monotonic_time(:millisecond) + @shutdown_cancel_grace_ms
+  defp collect_cancelled_shutdown_results(tasks, settle_start, cancel_grace_ms) do
+    # The park deadline already budgets one full grace ahead of the reserve, so
+    # a cancel that starts on time gets all of it. When park collection overran
+    # its own deadline, the grace is truncated at the reserve boundary rather
+    # than allowed to spend the settlement slice: a brutal kill over an
+    # unrecorded outcome beats a recorded outcome settlement can no longer
+    # write.
+    cancel_deadline =
+      min(System.monotonic_time(:millisecond) + cancel_grace_ms, settle_start)
 
-    Enum.map(tasks, fn {key, process_row, task} ->
-      remaining = max(cancel_deadline - System.monotonic_time(:millisecond), 0)
+    yielded =
+      Enum.map(tasks, fn {key, process_row, task} ->
+        remaining = max(cancel_deadline - System.monotonic_time(:millisecond), 0)
+        {key, process_row, task, Task.yield(task, remaining)}
+      end)
 
-      case Task.yield(task, remaining) do
-        {:ok, _result} ->
-          :ok
+    # Kill every task that outlived its grace before awaiting any of them, so
+    # the DOWN waits overlap. Awaiting each kill inside the yield loop let the
+    # waits accumulate serially, and on a starved scheduler their sum spent the
+    # settlement reserve just like the unbudgeted grace did.
+    Enum.each(yielded, fn
+      {_key, _process_row, task, nil} -> Process.exit(task.pid, :kill)
+      _ -> :ok
+    end)
 
-        {:exit, _reason} ->
-          :ok
-
-        nil ->
-          _ = Task.shutdown(task, :brutal_kill)
+    Enum.map(yielded, fn {key, process_row, task, outcome} ->
+      if outcome == nil do
+        _ = Task.shutdown(task, :brutal_kill)
       end
 
       {key, process_row, {:error, :shutdown_budget_exhausted}}
@@ -637,8 +695,8 @@ defmodule Tightbeam.AdapterCoordinator do
     end
   end
 
-  # Past the park deadline only the settlement reserve is left, so DECIDING each
-  # late entry's outcome is all that may happen here. This is pure: it reads the
+  # Past the reserve boundary only the settlement reserve is left, so DECIDING
+  # each late entry's outcome is all that may happen here. This is pure: it reads the
   # adapter map, builds the unresolved result, and captures the pid to act on
   # later. No cast, no exit, no logging — every one of those moved to
   # `dispatch_late_cleanup/2`, which runs AFTER durable settlement. That is what
