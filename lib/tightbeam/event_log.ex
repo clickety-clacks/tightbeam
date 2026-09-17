@@ -616,20 +616,28 @@ defmodule Tightbeam.EventLog do
   Stamp `epoch` as cleanly shut down. Must run while the DB is still up
   (`c:Application.prep_stop/1`, not stop) or the next boot infers a dirty
   exit.
-  """
-  @spec clean_shutdown(db(), pos_integer()) :: :ok
-  def clean_shutdown(db \\ Tightbeam.DB, epoch) do
-    {:ok, _} =
-      DB.transaction(db, fn txn ->
-        Txn.q(txn, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
 
-        Tightbeam.Firehose.Publisher.lifecycle_in_txn(
-          txn,
-          "lifecycle.clean_shutdown",
-          %{epoch: epoch},
-          %{"epoch" => epoch}
-        )
-      end)
+  A monotonic `deadline` bounds the stamp by the shutdown's own budget instead
+  of the global call timeout; `:infinity` takes the ordinary call timeout.
+  """
+  @spec clean_shutdown(db(), pos_integer(), integer() | :infinity) :: :ok
+  def clean_shutdown(db \\ Tightbeam.DB, epoch, deadline \\ :infinity) do
+    stamp = fn txn ->
+      Txn.q(txn, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
+
+      Tightbeam.Firehose.Publisher.lifecycle_in_txn(
+        txn,
+        "lifecycle.clean_shutdown",
+        %{epoch: epoch},
+        %{"epoch" => epoch}
+      )
+    end
+
+    {:ok, _} =
+      case deadline do
+        :infinity -> DB.transaction(db, stamp)
+        deadline when is_integer(deadline) -> DB.transaction_until(db, stamp, deadline)
+      end
 
     :ok
   end

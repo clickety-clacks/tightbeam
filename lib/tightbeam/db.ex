@@ -48,6 +48,35 @@ defmodule Tightbeam.DB do
 
   ## Client
 
+  # How long a client waits for the owner to answer. Every call here used to
+  # take the inherited GenServer default of 5s — not a knob, just what nobody
+  # passed. Calls are short (prepared statements, microseconds); this bounds a
+  # wedged or deeply queued owner, so it is a ceiling, not a budget.
+  #
+  # Validated once in `init/1` rather than on this path: the DB client path is
+  # hot, and a bad value should stop the owner starting, not surface as a
+  # per-call crash.
+  @default_call_timeout_ms 30_000
+
+  @doc "Configured client wait for a DB call, ms (`:db_call_timeout_ms`, default 30_000)."
+  @spec call_timeout() :: pos_integer()
+  def call_timeout do
+    Application.get_env(:tightbeam, :db_call_timeout_ms, @default_call_timeout_ms)
+  end
+
+  @doc false
+  @spec validate_call_timeout!() :: pos_integer()
+  def validate_call_timeout! do
+    case Application.get_env(:tightbeam, :db_call_timeout_ms, @default_call_timeout_ms) do
+      ms when is_integer(ms) and ms > 0 ->
+        ms
+
+      bad ->
+        raise ArgumentError,
+              ":db_call_timeout_ms must be a positive integer of milliseconds, got #{inspect(bad)}"
+    end
+  end
+
   @doc "Start the owner. Required: `:path` (SQLite file or `\":memory:\"`). Optional `:name`."
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -65,13 +94,43 @@ defmodule Tightbeam.DB do
   end
 
   def query(server, sql, params) do
-    GenServer.call(server, {:query, sql, params})
+    GenServer.call(server, {:query, sql, params}, call_timeout())
+  end
+
+  @doc """
+  `query/3` bounded by the caller's monotonic deadline.
+
+  The wait is the SMALLER of the configured call timeout and the time left, so
+  an enclosing deadline can only shorten it. Returns `DeadlineExceeded` rather
+  than exiting, because a caller holding a deadline has somewhere else to be.
+  """
+  @spec query_until(server(), String.t(), [term()], integer()) ::
+          {:ok, [row()]} | {:error, Exception.t() | term()}
+  def query_until(server, sql, params, deadline) when is_integer(deadline) do
+    case timeout_until(deadline) do
+      :expired ->
+        {:error, %DeadlineExceeded{}}
+
+      timeout ->
+        try do
+          GenServer.call(server, {:query, sql, params}, timeout)
+        catch
+          :exit, {:timeout, _} -> {:error, %DeadlineExceeded{}}
+          :exit, reason -> {:error, reason}
+        end
+    end
+  end
+
+  defp timeout_until(deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0, do: :expired, else: min(call_timeout(), remaining)
   end
 
   @doc "Execute DDL / statements without results."
   @spec execute(server(), String.t()) :: :ok | {:error, term()}
   def execute(server \\ __MODULE__, sql) do
-    GenServer.call(server, {:execute, sql})
+    GenServer.call(server, {:execute, sql}, call_timeout())
   end
 
   @doc """
@@ -84,7 +143,7 @@ defmodule Tightbeam.DB do
           {:ok, result} | {:error, Exception.t()}
         when result: term()
   def transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
-    GenServer.call(server, {:transaction, fun})
+    GenServer.call(server, {:transaction, fun}, call_timeout())
   end
 
   @doc """
@@ -127,7 +186,7 @@ defmodule Tightbeam.DB do
 
   def transaction_then(server, prepare, after_commit)
       when is_function(prepare, 1) and is_function(after_commit, 1) do
-    case GenServer.call(server, {:transaction, prepare}) do
+    case GenServer.call(server, {:transaction, prepare}, call_timeout()) do
       {:ok, result} -> run_after_commit(after_commit, result, MapSet.new())
       {:error, error} -> {:error, error}
     end
@@ -135,7 +194,7 @@ defmodule Tightbeam.DB do
 
   def transaction_then(server, prepare, after_commit)
       when is_function(prepare, 1) and is_function(after_commit, 2) do
-    GenServer.call(server, {:transaction_then, prepare, after_commit})
+    GenServer.call(server, {:transaction_then, prepare, after_commit}, call_timeout())
   end
 
   @doc "Atomically check references and hold a monitored archetype-release fence."
@@ -146,13 +205,17 @@ defmodule Tightbeam.DB do
         ) :: {:ok, reference(), term()} | {:error, term()}
   def begin_reference_fence(server \\ __MODULE__, archetypes, check)
       when is_list(archetypes) and is_function(check, 1) do
-    GenServer.call(server, {:begin_reference_fence, Enum.uniq(archetypes), check, self()})
+    GenServer.call(
+      server,
+      {:begin_reference_fence, Enum.uniq(archetypes), check, self()},
+      call_timeout()
+    )
   end
 
   @doc "Release a fence previously returned by begin_reference_fence/3."
   @spec end_reference_fence(server(), reference()) :: :ok
   def end_reference_fence(server \\ __MODULE__, token) when is_reference(token) do
-    GenServer.call(server, {:end_reference_fence, token})
+    GenServer.call(server, {:end_reference_fence, token}, call_timeout())
   end
 
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
@@ -279,14 +342,14 @@ defmodule Tightbeam.DB do
   ## Server
 
   @doc false
-  def prepare_schema(server), do: GenServer.call(server, :prepare_schema)
+  def prepare_schema(server), do: GenServer.call(server, :prepare_schema, call_timeout())
 
   @doc false
-  def finish_schema(server), do: GenServer.call(server, :finish_schema)
+  def finish_schema(server), do: GenServer.call(server, :finish_schema, call_timeout())
 
   @doc false
   def assert_base_admitted!(server, base) do
-    case GenServer.call(server, {:assert_base_admitted, base}) do
+    case GenServer.call(server, {:assert_base_admitted, base}, call_timeout()) do
       :ok -> :ok
       {:error, error} -> raise error
     end
@@ -294,6 +357,11 @@ defmodule Tightbeam.DB do
 
   @impl true
   def init(opts) do
+    # Before the connection: a bad call timeout stops this owner starting, which
+    # under the tree's rest_for_one ordering stops the boot, rather than
+    # crashing the first caller that happens to need the DB.
+    _ = validate_call_timeout!()
+
     path = Keyword.fetch!(opts, :path)
     {path, admission} = prepare_persistent_admission!(path, opts)
 
