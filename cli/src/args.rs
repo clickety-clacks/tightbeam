@@ -90,6 +90,10 @@ pub enum Command {
         content_sha256: Option<String>,
         produced_by_assignment_id: Option<String>,
     },
+    ArtifactContentFetch {
+        identity: Identity,
+        artifact_id: String,
+    },
     Artifacts {
         identity: Identity,
         work_item_id: Option<String>,
@@ -128,6 +132,13 @@ pub enum Command {
         identity: Identity,
         session_key: String,
         idempotency_key: Option<String>,
+    },
+    SessionReparent {
+        identity: Identity,
+        session_key: String,
+        parent_session_key: String,
+        assignment_id: String,
+        idempotency_key: String,
     },
     Tune {
         identity: Identity,
@@ -225,6 +236,14 @@ pub enum Command {
         context: Option<String>,
         outcome: Option<String>,
         turn_seq: Option<String>,
+        idempotency_key: String,
+    },
+    AssignmentCommitRefCorrect {
+        identity: Identity,
+        assignment_id: String,
+        commit_refs: Vec<serde_json::Value>,
+        reason: String,
+        evidence_artifact_id: String,
         idempotency_key: String,
     },
     WorkItemCreate {
@@ -373,6 +392,9 @@ pub enum Command {
         identity: Identity,
         provider: String,
         api_key: bool,
+        daemon_credential: bool,
+        endpoint: Option<String>,
+        provider_name: Option<String>,
         hostname: Option<String>,
         remote: Option<String>,
     },
@@ -538,6 +560,9 @@ COMMANDS:
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
+  artifact-content-fetch <artifactId>
+      Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
+      Reads stored custody only, never the origin path; uncaptured content is reported unavailable.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
@@ -562,6 +587,9 @@ COMMANDS:
       org's shape — archetypes (with allowed hosts), known hosts, and the
       valid model catalog per harness — and, for admins, pending devices.
         tightbeam list --as orchestrator:news
+
+  session-reparent --session <key> --parent <key> --assignment <id> --key <key>
+      Owner-as-user correction of one custom session and its sole open assignment.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
@@ -683,6 +711,13 @@ COMMANDS:
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
+  assignment-commitref-correct <assignmentId>
+      --commit-refs '[{"repo":"host:/repo","remote":"<origin>",
+                       "ref":"refs/heads/main","commit":"<sha>"}]'
+      --evidence <artifactId> --reason "..." --key <idempotencyKey>
+      Append one canonical commitRef correction to a CLOSED historical
+      assignment. This does not create an attest, change the assignment outcome,
+      or rewrite lifecycle history.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
       [--artifact <artifactId> --sha256 <hash>]
@@ -743,6 +778,17 @@ COMMANDS:
         printenv CURSOR_API_KEY | tightbeam onboard cursor --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+  onboard opencode-go (--api-key | --daemon-credential)
+      Bank an OpenCode Go API key for Pi. --api-key reads and validates the key
+      from stdin. --daemon-credential asks the gateway daemon to read the fixed
+      owner-private opencode-go-api-key file from its configured credentials
+      directory; no key or staging path crosses the CLI wire. OpenCode Go has no
+      subscription onboarding path here.
+  onboard local-openai --name NAME --endpoint URL [--api-key]
+      Bank a host-scoped local OpenAI-compatible provider. The endpoint base URL
+      is required. An API key is optional and, when present, is read from stdin
+      -- never as an argument. The endpoint is live-probed with GET /v1/models
+      before anything is banked.
   onboard github [--hostname github.com] [--remote URL]
       Prove or create this host's GitHub CLI browser/device login, then stamp
       non-secret capability metadata. The credential is banked file-backed
@@ -858,6 +904,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "after-turn",
     "api-key",
     "clear-spec-ref",
+    "daemon-credential",
     "dry-run",
     "help",
     "history",
@@ -1472,6 +1519,20 @@ fn parse_with_optional_catalog(
                 payload: nonempty(flags, "payload"),
             })
         }
+        "artifact-content-fetch" => {
+            if parsed.positional.len() != 2
+                || parsed.positional[1].is_empty()
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "as" | "as-user" | "as-process"))
+            {
+                return Err("usage: tightbeam artifact-content-fetch <artifactId>".to_owned());
+            }
+            Ok(Command::ArtifactContentFetch {
+                identity: identity(flags)?,
+                artifact_id: parsed.positional[1].clone(),
+            })
+        }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
                 return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--produced-by-assignment <assignmentId>]".to_owned());
@@ -1562,6 +1623,21 @@ fn parse_with_optional_catalog(
                 identity: identity(flags)?,
                 session_key: session_key.expect("checked above"),
                 idempotency_key: nonempty(flags, "key"),
+            })
+        }
+        "session-reparent" => {
+            if parsed.positional.len() != 1
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
+                return Err("usage: tightbeam session-reparent --session <key> --parent <key> --assignment <id> --key <key>".to_owned());
+            }
+            Ok(Command::SessionReparent {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or("--session is required")?,
+                parent_session_key: nonempty(flags, "parent").ok_or("--parent is required")?,
+                assignment_id: nonempty(flags, "assignment").ok_or("--assignment is required")?,
+                idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
             })
         }
         "tune" => parse_tune(&parsed, flags),
@@ -1818,6 +1894,28 @@ fn parse_with_optional_catalog(
                 turn_seq: nonempty(flags, "turn")
                     .map(|value| js_number_json(number_coercion(&value))),
                 idempotency_key: key.expect("checked above"),
+            })
+        }
+        "assignment-commitref-correct" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam assignment-commitref-correct <assignmentId> --commit-refs <json> --evidence <artifactId> --reason <text> --key <idempotencyKey>".to_owned());
+            }
+            let commit_refs = nonempty(flags, "commit-refs")
+                .ok_or_else(|| "--commit-refs is required".to_owned())
+                .and_then(|encoded| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
+                        .map_err(|_| "--commit-refs must be a JSON array".to_owned())
+                })?;
+            Ok(Command::AssignmentCommitRefCorrect {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                commit_refs,
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+                evidence_artifact_id: nonempty(flags, "evidence")
+                    .ok_or_else(|| "--evidence is required".to_owned())?,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
             })
         }
         "work-item-create" => {
@@ -2291,7 +2389,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2608,19 +2706,28 @@ fn parse_identity_command(
 
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
-        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+        return Err(
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key | --daemon-credential] [--hostname HOST]"
+                .to_owned(),
+        );
     }
     let provider = parsed.positional[1].clone();
     let fixture_provider = cfg!(test) && provider == "fixture-provider";
     if !matches!(
         provider.as_str(),
-        "openai" | "anthropic" | "cursor" | "github"
+        "openai" | "anthropic" | "cursor" | "opencode-go" | "local-openai" | "github"
     ) && !fixture_provider
     {
-        return Err("provider must be openai, anthropic, cursor, or github".to_owned());
+        return Err(
+            "provider must be openai, anthropic, cursor, opencode-go, local-openai, or github"
+                .to_owned(),
+        );
     }
     let allowed = [
         "api-key",
+        "daemon-credential",
+        "endpoint",
+        "name",
         "hostname",
         "remote",
         "as",
@@ -2628,15 +2735,53 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         "as-process",
     ];
     if flags.keys().any(|flag| !allowed.contains(&flag.as_str())) {
-        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+        return Err(
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key | --daemon-credential] [--hostname HOST]"
+                .to_owned(),
+        );
     }
+    let endpoint = nonempty(flags, "endpoint");
+    let provider_name = nonempty(flags, "name");
     let hostname = nonempty(flags, "hostname");
     let remote = nonempty(flags, "remote");
+    let daemon_credential = flags.contains_key("daemon-credential");
+    if daemon_credential && flags.contains_key("api-key") {
+        return Err("--daemon-credential and --api-key are mutually exclusive".to_owned());
+    }
+    if daemon_credential && provider != "opencode-go" {
+        return Err(
+            "--daemon-credential is only valid for tightbeam onboard opencode-go".to_owned(),
+        );
+    }
     if provider == "github" && flags.contains_key("api-key") {
         return Err(
             "tightbeam onboard github does not accept --api-key; use GitHub CLI browser/device auth"
                 .to_owned(),
         );
+    }
+    if provider == "opencode-go" && !flags.contains_key("api-key") && !daemon_credential {
+        return Err(
+            "tightbeam onboard opencode-go requires --api-key or --daemon-credential; OpenCode Go has no subscription onboarding path"
+                .to_owned(),
+        );
+    }
+    if provider == "local-openai" {
+        if endpoint.is_none() {
+            return Err("tightbeam onboard local-openai requires --endpoint URL".to_owned());
+        }
+        if provider_name.is_none() {
+            return Err("tightbeam onboard local-openai requires --name NAME".to_owned());
+        }
+        if hostname.is_some() || remote.is_some() {
+            return Err(
+                "tightbeam onboard local-openai does not accept --hostname or --remote".to_owned(),
+            );
+        }
+    } else if endpoint.is_some() {
+        return Err("--endpoint is only valid for tightbeam onboard local-openai".to_owned());
+    }
+    if provider != "local-openai" && provider_name.is_some() {
+        return Err("--name is only valid for tightbeam onboard local-openai".to_owned());
     }
     if provider == "github"
         && ["as", "as-user", "as-process"]
@@ -2668,10 +2813,10 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     Ok(Command::Onboard {
         identity: identity(flags)?,
         provider,
-        // A BOOLEAN flag, deliberately. `--api-key <value>` would put the key in
-        // this process's argv, where anyone on the box can read it out of the
-        // process table. The key arrives on stdin instead.
         api_key: flags.contains_key("api-key"),
+        daemon_credential,
+        endpoint,
+        provider_name,
         hostname,
         remote,
     })
@@ -3184,6 +3329,9 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             })
@@ -3203,6 +3351,9 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: Some("github.example".to_owned()),
                 remote: None,
             })
@@ -3218,6 +3369,9 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: Some("https://github.com/example/project.git".to_owned()),
             })
@@ -3252,6 +3406,9 @@ mod tests {
                 identity: Identity::Session,
                 provider: "cursor".to_owned(),
                 api_key: true,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             })
@@ -3264,6 +3421,116 @@ mod tests {
                 "tightbeam onboard cursor requires --api-key; Cursor has no subscription login"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn opencode_go_onboard_is_api_key_only() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--api-key",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "opencode-go".to_owned(),
+                api_key: true,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
+                hostname: None,
+                remote: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "opencode-go"])),
+            Err(
+                "tightbeam onboard opencode-go requires --api-key or --daemon-credential; OpenCode Go has no subscription onboarding path"
+                    .to_owned()
+            )
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--daemon-credential",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "opencode-go".to_owned(),
+                api_key: false,
+                daemon_credential: true,
+                endpoint: None,
+                provider_name: None,
+                hostname: None,
+                remote: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--api-key",
+                "--daemon-credential"
+            ])),
+            Err("--daemon-credential and --api-key are mutually exclusive".to_owned())
+        );
+    }
+
+    #[test]
+    fn local_openai_onboard_requires_endpoint_and_name() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "local-openai",
+                "--name",
+                "spark",
+                "--endpoint",
+                "https://spark.example/v1",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "local-openai".to_owned(),
+                api_key: false,
+                daemon_credential: false,
+                endpoint: Some("https://spark.example/v1".to_owned()),
+                provider_name: Some("spark".to_owned()),
+                hostname: None,
+                remote: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "local-openai", "--as-user", "flynn"])),
+            Err("tightbeam onboard local-openai requires --endpoint URL".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "local-openai",
+                "--endpoint",
+                "https://spark.example/v1",
+                "--as-user",
+                "flynn"
+            ])),
+            Err("tightbeam onboard local-openai requires --name NAME".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "openai",
+                "--endpoint",
+                "https://x/v1"
+            ])),
+            Err("--endpoint is only valid for tightbeam onboard local-openai".to_owned())
         );
     }
 
@@ -3347,6 +3614,7 @@ mod tests {
                 "assign",
                 "assignments",
                 "artifact-record",
+                "artifact-content-fetch",
                 "artifacts",
                 "attest",
                 "attests",
@@ -3373,7 +3641,9 @@ mod tests {
                 "operator-rule",
                 "operator-withdraw",
                 "retire",
+                "session-reparent",
                 "repair-assignment",
+                "assignment-commitref-correct",
                 "revoke-assignment",
                 "reopen-assignment",
                 "spawn",
@@ -3417,6 +3687,8 @@ mod tests {
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
             "onboard cursor --api-key",
+            "onboard opencode-go (--api-key | --daemon-credential)",
+            "onboard local-openai --name NAME --endpoint URL [--api-key]",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
             "config get default-archetype|default-priority",
@@ -4035,10 +4307,78 @@ mod tests {
     }
 
     #[test]
+    fn commitref_correction_requires_every_audit_and_proof_field() {
+        let usage = "usage: tightbeam assignment-commitref-correct <assignmentId> --commit-refs <json> --evidence <artifactId> --reason <text> --key <idempotencyKey>";
+
+        assert_eq!(
+            parse(strings(&[
+                "assignment-commitref-correct",
+                "--as-user",
+                "flynn"
+            ])),
+            Err(usage.to_owned())
+        );
+
+        for missing in ["commit-refs", "evidence", "reason", "key"] {
+            let mut args = vec![
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "historical backfill",
+                "--key",
+                "backfill-1",
+                "--as-user",
+                "flynn",
+            ];
+            let flag = format!("--{missing}");
+            let index = args.iter().position(|value| *value == flag).unwrap();
+            args.drain(index..=index + 1);
+            assert!(
+                parse(strings(&args)).is_err(),
+                "missing {missing} must refuse"
+            );
+        }
+
+        assert!(matches!(
+            parse(strings(&[
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "historical backfill",
+                "--key",
+                "backfill-1",
+                "--as-user",
+                "flynn",
+            ]))
+            .unwrap(),
+            Command::AssignmentCommitRefCorrect {
+                assignment_id,
+                evidence_artifact_id,
+                reason,
+                idempotency_key,
+                commit_refs,
+                ..
+            } if assignment_id == "asg_1"
+                && evidence_artifact_id == "art_1"
+                && reason == "historical backfill"
+                && idempotency_key == "backfill-1"
+                && commit_refs.len() == 1
+        ));
+    }
+
+    #[test]
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -4228,6 +4568,43 @@ mod tests {
             assert_eq!(
                 parse(args),
                 Err("usage: tightbeam doctor [--json] [--base-dir DIR]".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_content_fetch_accepts_only_id_and_identity() {
+        assert_eq!(
+            parse(strings(&[
+                "artifact-content-fetch",
+                "art_fixture",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::ArtifactContentFetch {
+                identity: Identity::User("flynn".to_owned()),
+                artifact_id: "art_fixture".to_owned(),
+            })
+        );
+        for values in [
+            strings(&["artifact-content-fetch"]),
+            strings(&["artifact-content-fetch", "art_fixture", "extra"]),
+            strings(&[
+                "artifact-content-fetch",
+                "art_fixture",
+                "--path",
+                "/not/read",
+            ]),
+            strings(&[
+                "artifact-content-fetch",
+                "art_fixture",
+                "--session",
+                "other",
+            ]),
+        ] {
+            assert_eq!(
+                parse(values),
+                Err("usage: tightbeam artifact-content-fetch <artifactId>".to_owned())
             );
         }
     }
@@ -4620,6 +4997,9 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     provider: "openai".to_owned(),
                     api_key: false,
+                    daemon_credential: false,
+                    endpoint: None,
+                    provider_name: None,
                     hostname: None,
                     remote: None,
                 },

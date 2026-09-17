@@ -45,6 +45,14 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @adapter_readiness_timeout 185_000
   @adapter_checkout_timeout 190_000
+  @shutdown_budget_ms 30_000
+  # Match the DB owner's busy timeout so a contended durable write still has
+  # room to finish before the supervisor's outer shutdown deadline.
+  @shutdown_settlement_budget_ms 5_000
+  # Give a park task a chance to close the port it owns before the coordinator
+  # has to force-kill the task. This is part of the settlement reservation, not
+  # an extension of the supervisor's shutdown budget.
+  @shutdown_cancel_grace_ms 100
 
   @type adapter_key :: Tightbeam.Placement.adapter_key()
 
@@ -73,10 +81,9 @@ defmodule Tightbeam.AdapterCoordinator do
       start: {__MODULE__, :start_link, [opts]},
       type: :worker,
       restart: :permanent,
-      # Gateway shutdown must settle durable process groups before the adapter
-      # supervisor disappears. The normal worker default (5s) is shorter than
-      # the reviewed close grace and can strand a privileged harness child.
-      shutdown: 30_000
+      # The normal worker default (5s) is shorter than identity recovery plus
+      # signal delivery. Let terminate/2 settle the durable process group.
+      shutdown: @shutdown_budget_ms
     }
   end
 
@@ -186,9 +193,8 @@ defmodule Tightbeam.AdapterCoordinator do
 
   @impl true
   def init(opts) do
-    # A supervisor shuts down a worker with an exit signal. Trap it so OTP runs
-    # terminate/2 and the coordinator can settle every durable harness group
-    # before AdapterSupervisor disappears.
+    # Supervisor shutdown must reach terminate/2 before AdapterSupervisor goes
+    # away, because that callback settles the OS process group it owns.
     Process.flag(:trap_exit, true)
 
     db = Keyword.get(opts, :db, Tightbeam.DB)
@@ -217,29 +223,51 @@ defmodule Tightbeam.AdapterCoordinator do
        # its monitor ref is exactly that.
        ready_refs: MapSet.new(),
        load_active: %{},
-       load_queue: %{}
+       load_queue: %{},
+       # The production child spec supplies the 30-second default. The
+       # private overrides make deadline exhaustion deterministic in tests.
+       shutdown_budget_ms: Keyword.get(opts, :shutdown_budget_ms, @shutdown_budget_ms),
+       shutdown_settlement_budget_ms:
+         Keyword.get(opts, :shutdown_settlement_budget_ms, @shutdown_settlement_budget_ms),
+       # Owner for cleanup that outlives terminate/2; see dispatch_late_cleanup/2.
+       # Overridable so a standalone coordinator can be given its own owner.
+       shutdown_cleanup_supervisor:
+         Keyword.get(opts, :shutdown_cleanup_supervisor, Tightbeam.TurnTaskSupervisor)
      }}
   end
 
   @impl true
   def terminate(_reason, state) do
-    Enum.each(state.adapters, fn {key, entry} ->
-      if is_pid(entry.readiness_task) and Process.alive?(entry.readiness_task),
-        do: Process.exit(entry.readiness_task, :kill)
+    # One monotonic clock covers preparation, park attempts, durable settlement,
+    # and nonblocking retirement. Reserve the final slice for settlement; if
+    # either DB phase cannot finish, keep the outcome explicitly unresolved.
+    deadline = System.monotonic_time(:millisecond) + state.shutdown_budget_ms
+    park_deadline = deadline - state.shutdown_settlement_budget_ms
 
-      if is_pid(entry.pid) and Process.alive?(entry.pid),
-        do: DynamicSupervisor.terminate_child(state.adapter_sup, entry.pid)
+    {pending, state, preparation} = prepare_shutdown(state, park_deadline)
 
-      case Tightbeam.HarnessProcess.reconcile_key(state.db, key) do
-        result when result in [:ok, :already_resolved] ->
-          :ok
+    results =
+      case preparation do
+        :ok ->
+          if System.monotonic_time(:millisecond) >= park_deadline do
+            budget_exhausted_results(pending)
+          else
+            pending
+            |> start_shutdown_tasks(state.db)
+            |> collect_shutdown_results(park_deadline)
+          end
 
         {:error, reason} ->
-          Logger.error(
-            "adapter shutdown process cleanup failed for #{key_name(key)}: #{inspect(reason)}"
-          )
+          preparation_unresolved_results(pending, reason)
       end
-    end)
+
+    {results, state, late_targets} = retire_shutdown_results(results, state, park_deadline)
+
+    # Durable settlement runs before any late cleanup, so it is reachable inside
+    # the configured deadline no matter how many adapters were retained; the
+    # cleanup those late entries still need is handed to its own owner after.
+    settle_shutdown_results(results, state, deadline)
+    dispatch_late_cleanup(late_targets, state)
 
     :ok
   end
@@ -456,6 +484,278 @@ defmodule Tightbeam.AdapterCoordinator do
     {result, state}
   end
 
+  # OTP ignores the return value from a child's terminate/2 callback, and the
+  # application master catches the application's stop callback as well. The
+  # shutdown result therefore has to remain durable in the harness ledger and
+  # lifecycle stream; returning an error here would falsely suggest that
+  # Application.stop/1 can report the cleanup failure.
+  defp prepare_shutdown(state, deadline) do
+    keys = Map.keys(state.adapters)
+
+    state =
+      Enum.reduce(keys, state, fn key, state ->
+        cancel_pending_starts(key, state)
+      end)
+
+    case Tightbeam.HarnessProcess.begin_park_many_until(state.db, keys, deadline) do
+      {:ok, pending} ->
+        {pending, state, :ok}
+
+      {:error, reason} ->
+        Logger.error(
+          "adapter shutdown preparation unresolved before deadline: #{inspect(reason)}"
+        )
+
+        pending = Enum.map(keys, &{&1, :no_launch})
+        {pending, state, {:error, reason}}
+    end
+  end
+
+  defp preparation_unresolved_results(pending, reason) do
+    Enum.map(pending, fn {key, process_row} ->
+      {key, process_row, {:error, {:shutdown_preparation_unresolved, reason}}}
+    end)
+  end
+
+  defp budget_exhausted_results(pending) do
+    Enum.map(pending, fn {key, process_row} ->
+      {key, process_row, {:error, :shutdown_budget_exhausted}}
+    end)
+  end
+
+  # Park every recorded process group at once. A serial reduce made the
+  # supervisor's 30-second shutdown allowance proportional to the number of
+  # adapters, so later keys could never even reach begin_park/2 in a busy
+  # gateway shutdown.
+  defp start_shutdown_tasks(pending, db) do
+    Enum.map(pending, fn {key, process_row} ->
+      task =
+        Task.async(fn ->
+          shutdown_process(db, process_row)
+        end)
+
+      {key, process_row, task}
+    end)
+  end
+
+  defp shutdown_process(_db, :no_launch), do: :ok
+
+  defp shutdown_process(db, row) do
+    try do
+      Tightbeam.HarnessProcess.park(db, row)
+    rescue
+      error -> {:error, {:exception, error, __STACKTRACE__}}
+    catch
+      kind, reason -> {:error, {kind, reason, __STACKTRACE__}}
+    end
+  end
+
+  defp collect_shutdown_results(tasks, deadline) do
+    collect_shutdown_results(tasks, deadline, [])
+  end
+
+  defp collect_shutdown_results([], _deadline, results), do: Enum.reverse(results)
+
+  defp collect_shutdown_results(
+         [{key, process_row, task} = current | rest],
+         deadline,
+         results
+       ) do
+    case Task.yield(task, max(deadline - System.monotonic_time(:millisecond), 0)) do
+      {:ok, result} ->
+        collect_shutdown_results(rest, deadline, [{key, process_row, result} | results])
+
+      {:exit, reason} ->
+        collect_shutdown_results(
+          rest,
+          deadline,
+          [{key, process_row, {:error, {:shutdown_task_exit, reason}}} | results]
+        )
+
+      nil ->
+        # Cancel every outstanding task together. Waiting for one task before
+        # notifying the others would spend the reserved settlement slice on
+        # serial cancellation and recreate the original adapter-count hazard.
+        cancel_shutdown_tasks([current | rest])
+        timed_out = collect_cancelled_shutdown_results([current | rest])
+        Enum.reverse(results) ++ timed_out
+    end
+  end
+
+  defp cancel_shutdown_tasks(tasks) do
+    Enum.each(tasks, fn {_key, _process_row, task} ->
+      send(task.pid, {:tightbeam_shutdown_cancel, self()})
+    end)
+  end
+
+  defp collect_cancelled_shutdown_results(tasks) do
+    cancel_deadline = System.monotonic_time(:millisecond) + @shutdown_cancel_grace_ms
+
+    Enum.map(tasks, fn {key, process_row, task} ->
+      remaining = max(cancel_deadline - System.monotonic_time(:millisecond), 0)
+
+      case Task.yield(task, remaining) do
+        {:ok, _result} ->
+          :ok
+
+        {:exit, _reason} ->
+          :ok
+
+        nil ->
+          _ = Task.shutdown(task, :brutal_kill)
+      end
+
+      {key, process_row, {:error, :shutdown_budget_exhausted}}
+    end)
+  end
+
+  # Retirement is deliberately before durable settlement so a cutoff can turn
+  # every later entry into an explicit unresolved outcome while the reserved
+  # settlement slice is still available to persist it. The old serial loop
+  # retired entries after settlement and kept doing so past the supervisor's
+  # deadline without a truthful durable result for the entries it never
+  # reached.
+  defp retire_shutdown_results(results, state, deadline) do
+    retire_shutdown_results(results, state, deadline, [])
+  end
+
+  defp retire_shutdown_results([], state, _deadline, retired),
+    do: {Enum.reverse(retired), state, []}
+
+  defp retire_shutdown_results(
+         [{key, process_row, result} | rest],
+         state,
+         deadline,
+         retired
+       ) do
+    if System.monotonic_time(:millisecond) >= deadline do
+      {late, targets} = late_shutdown_outcomes([{key, process_row, result} | rest], state)
+      {Enum.reverse(retired) ++ late, state, targets}
+    else
+      state = retire_shutdown_adapter(key, state)
+      retire_shutdown_results(rest, state, deadline, [{key, process_row, result} | retired])
+    end
+  end
+
+  # Past the park deadline only the settlement reserve is left, so DECIDING each
+  # late entry's outcome is all that may happen here. This is pure: it reads the
+  # adapter map, builds the unresolved result, and captures the pid to act on
+  # later. No cast, no exit, no logging — every one of those moved to
+  # `dispatch_late_cleanup/2`, which runs AFTER durable settlement. That is what
+  # makes settlement reachable inside the single configured deadline whatever the
+  # retained-adapter count and whatever the logger is doing: a blocked logger
+  # cannot delay a path that no longer logs.
+  defp late_shutdown_outcomes(entries, state) do
+    entries
+    |> Enum.map(fn {key, process_row, _result} ->
+      pid =
+        case state.adapters[key] do
+          %{pid: pid} when is_pid(pid) -> pid
+          _ -> nil
+        end
+
+      {{key, process_row,
+        {:error, {:shutdown_retirement_unresolved, :shutdown_budget_exhausted}}}, {key, pid}}
+    end)
+    |> Enum.unzip()
+  end
+
+  # Cleanup that must continue past the deadline, under an owner that is not us.
+  #
+  # The adapters still have to be closed and killed or their port-owned helper
+  # trees outlive the coordinator — abandoning them is not an option. But doing
+  # it on terminate/2's stack is what the V6 and V7 reviews both rejected: it
+  # competes with the settlement reserve and dies at the supervisor's deadline.
+  #
+  # Tightbeam.TurnTaskSupervisor is started BEFORE the coordinator in the
+  # rest_for_one root tree, so it is still alive here and shuts down after us.
+  # It owns this work and bounds it by its own child shutdown. Durable outcomes
+  # are already persisted by the time we reach this, so a task cut short leaves
+  # the record truthful rather than silent, and the fences already written for
+  # these keys are what make the remainder reapable.
+  #
+  # No demonitor here: a monitor may only be cleared by the process that set it,
+  # and the coordinator's monitors die with the coordinator anyway.
+  defp dispatch_late_cleanup([], _state), do: :ok
+
+  defp dispatch_late_cleanup(targets, state) do
+    cleanup = fn ->
+      Enum.each(targets, fn {_key, pid} ->
+        if is_pid(pid) do
+          Tightbeam.Acp.Adapter.request_close(pid)
+          if Process.alive?(pid), do: Process.exit(pid, :kill)
+        end
+      end)
+
+      Logger.error(
+        "adapter shutdown retirement late entry unresolved before deadline for " <>
+          "#{length(targets)} adapter(s): " <> late_batch_names(targets)
+      )
+    end
+
+    # start_child/2 is a call into the owner, so an absent owner EXITS rather
+    # than returning an error tuple. Catching it matters: terminate/2 must not
+    # die here, or the cleanup this function exists to guarantee is lost along
+    # with the callback.
+    handoff =
+      try do
+        Task.Supervisor.start_child(state.shutdown_cleanup_supervisor, cleanup)
+      catch
+        :exit, reason -> {:error, {:cleanup_owner_unavailable, reason}}
+      end
+
+    case handoff do
+      {:ok, _pid} ->
+        :ok
+
+      # The owner is gone or was never started — a coordinator run standalone.
+      # Running inline is still strictly better than the reviewed behaviour,
+      # because durable settlement has already completed by now; say so rather
+      # than drop the cleanup silently.
+      other ->
+        Logger.error(
+          "adapter shutdown late cleanup owner #{inspect(state.shutdown_cleanup_supervisor)} " <>
+            "unavailable (#{inspect(other)}); running cleanup inline after settlement"
+        )
+
+        cleanup.()
+    end
+
+    :ok
+  end
+
+  # The count above is the complete fact; the names are for the operator reading
+  # the line. Naming every key would build an unbounded string, so the sample is
+  # capped and the remainder is counted.
+  @late_batch_named 20
+  defp late_batch_names(targets) do
+    named = Enum.take(targets, @late_batch_named)
+    rest = length(targets) - length(named)
+    names = Enum.map_join(named, ", ", fn {key, _pid} -> key_name(key) end)
+
+    if rest > 0, do: names <> ", and #{rest} more", else: names
+  end
+
+  defp settle_shutdown_results(results, state, deadline) do
+    case Tightbeam.HarnessProcess.settle_park_results_until(state.db, results, deadline) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "adapter shutdown durable outcomes unresolved before deadline: #{inspect(reason)}"
+        )
+    end
+
+    Enum.reduce(results, state, fn {key, _process_row, result}, state ->
+      if result not in [:ok, :already_resolved] do
+        Logger.error("adapter shutdown cleanup failed for #{key_name(key)}: #{inspect(result)}")
+      end
+
+      state
+    end)
+  end
+
   # The REASON comes back, not just the fact of an exit. "Closed as asked" and
   # "was killed while we asked" are different deaths wearing the same boolean,
   # and only the reason tells them apart.
@@ -570,6 +870,18 @@ defmodule Tightbeam.AdapterCoordinator do
   # Sessions reach a key the way the gateway builds one — harness and host,
   # shared archetype — so a key of any other shape is resident to nobody.
   defp told_sessions(_db, _key, _was_ready?), do: []
+
+  defp retire_shutdown_adapter(key, state) do
+    case state.adapters[key] do
+      %{pid: pid} when is_pid(pid) ->
+        Tightbeam.Acp.Adapter.request_close(pid)
+
+      _ ->
+        :ok
+    end
+
+    retire_adapter(key, state)
+  end
 
   defp retire_adapter(key, state) do
     case state.adapters[key] do

@@ -23,5 +23,13 @@
     "cli_binary": "cursor-agent",
     "process_markers": ["cursor-agent acp"],
     "enabled": false
+  },
+  {
+    "module": "Tightbeam.Harness.Pi",
+    "id": "pi",
+    "wire_name": "pi",
+    "install_package": "pi-acp",
+    "cli_binary": "pi",
+    "process_markers": ["pi-acp"]
   }
 ]

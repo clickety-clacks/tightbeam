@@ -102,7 +102,16 @@ defmodule Tightbeam.LiveBasePayloadTest do
              )
 
     archive = Path.join(tmp, "package.tgz")
-    assert {_, 0} = System.cmd("tar", ["czf", archive, "-C", tmp, "tightbeam"])
+
+    # Match the shipped assembler: Darwin metadata can create a ._tightbeam entry
+    # outside the package root, which the extractor correctly refuses.
+    metadata_flags =
+      if :os.type() == {:unix, :darwin},
+        do: ["--no-mac-metadata", "--no-xattrs", "--no-acls", "--no-fflags"],
+        else: []
+
+    assert {_, 0} =
+             System.cmd("tar", metadata_flags ++ ["-czf", archive, "-C", tmp, "tightbeam"])
 
     assert {output, 0} =
              System.cmd("sh", ["packaging/verify-payload.sh", archive], stderr_to_stdout: true)

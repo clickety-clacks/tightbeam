@@ -11,6 +11,7 @@ defmodule Tightbeam.Spinup do
 
   alias Tightbeam.{Credentials, EventLog, Harness, Homes, Placement}
   alias Tightbeam.Harness.Support
+  alias Tightbeam.LocalOpenAi.Providers
 
   @type denial :: %{code: String.t(), message: String.t()}
 
@@ -20,6 +21,8 @@ defmodule Tightbeam.Spinup do
     db = Keyword.get(opts, :db, Tightbeam.DB)
     sh = Keyword.get(opts, :sh, &system_cmd/1)
     module = Harness.module!(harness)
+    credential_provider = Keyword.get(opts, :credential_provider, module.credential_provider())
+    credential_names = Keyword.get(opts, :credential_names)
 
     {result, detail} =
       case Map.fetch(Placement.hosts(config.base_dir, db), host_name) do
@@ -41,7 +44,7 @@ defmodule Tightbeam.Spinup do
               :error -> target
             end
 
-          ensure_host(target, module)
+          ensure_host(target, module, credential_provider, credential_names)
       end
 
     :ok = EventLog.lifecycle(db, "spinup", "#{harness}@#{host_name}", detail)
@@ -175,7 +178,7 @@ defmodule Tightbeam.Spinup do
       " (reinstall the ACP adapters on #{target.host_name}, then verify the ACP adapter installation on #{target.host_name} produced an executable at #{path})"
   end
 
-  defp ensure_host(target, module) do
+  defp ensure_host(target, module, credential_provider, credential_names) do
     host = target.host_config
 
     reachability =
@@ -238,25 +241,36 @@ defmodule Tightbeam.Spinup do
                 {{:error, denial}, "reached; directories ensured; DENIED: #{denial.message}"}
 
               {:ok, adapter_detail} ->
-                if module.credential_ready?(target, home) do
+                if credential_ready?(
+                     target,
+                     module,
+                     home,
+                     credential_provider,
+                     credential_names
+                   ) do
                   {:ok, "reached; directories ensured; #{adapter_detail}; credentials present"}
                 else
                   credential_location =
-                    if module == Tightbeam.Harness.Cursor do
-                      store = Credentials.store_dir(host.base_dir, :cursor)
-                      "Tightbeam keeps its own credential under #{store}."
-                    else
-                      "The credential belongs only in #{home}."
+                    cond do
+                      module == Tightbeam.Harness.Cursor ->
+                        store = Credentials.store_dir(host.base_dir, :cursor)
+                        "Tightbeam keeps its own credential under #{store}."
+
+                      credential_provider == :local_openai ->
+                        auth_dir = Providers.providers_dir(host.base_dir)
+                        "The credential belongs only in #{auth_dir}."
+
+                      true ->
+                        "The credential belongs only in #{home}."
                     end
 
                   message =
                     "host #{target.host_name} is not ready for #{module.wire_name()}: " <>
-                      "Tightbeam has no credential for #{module.credential_provider()} on " <>
+                      "Tightbeam has no credential for #{credential_provider} on " <>
                       "#{target.host_name}. It does not use or import your normal " <>
                       "#{module.wire_name()} CLI login. #{credential_location} " <>
                       "Run on #{target.host_name}: " <>
-                      "#{Credentials.onboard_command(module.credential_provider())} " <>
-                      "--as-user <userId>"
+                      Credentials.onboard_command(credential_provider)
 
                   {{:error, host_unready(message)},
                    "reached; directories ensured; #{adapter_detail}; DENIED: #{message}"}
@@ -272,6 +286,18 @@ defmodule Tightbeam.Spinup do
         {{:error, host_unready(message)}, "DENIED: #{message}"}
     end
   end
+
+  defp credential_ready?(target, _module, _home, provider, names)
+       when provider == :local_openai and is_list(names),
+       do:
+         Homes.credential_ready?(
+           target,
+           Providers.providers_dir(target.host_config.base_dir),
+           names
+         )
+
+  defp credential_ready?(target, module, home, _provider, _names),
+    do: module.credential_ready?(target, home)
 
   defp remote_command(destination, script) do
     ["ssh" | Support.ssh_opts()] ++ [destination, "sh", "-c", shell_quote(script)]

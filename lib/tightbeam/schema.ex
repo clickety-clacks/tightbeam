@@ -25,6 +25,7 @@ defmodule Tightbeam.Schema do
     Tightbeam.WorkItems,
     Tightbeam.Assignments,
     Tightbeam.CommandExecutions,
+    Tightbeam.AssignmentCommitRefCorrections,
     Tightbeam.EffortCheckin,
     Tightbeam.Placement,
     Tightbeam.RecurrenceSuppression,
@@ -267,6 +268,9 @@ defmodule Tightbeam.Schema do
   @r1_shape "row-driven-r1-v1-019"
   # Composed 019: R1 storage plus the complete Firehose schema suffix.
   @firehose_shape "firehose-r1-v1-019"
+  @reparent_shape "session-reparent-v1-019"
+  # Artifact durability successor: captured content storage over the reparent shape.
+  @durability_shape "artifact-content-v1-019"
   @o2_shape "row-driven-o2-v1-019"
   @o2_pre_liveness_shape "row-driven-o2-pre-liveness-v1-019"
   @shape "row-driven-admission-v1-019"
@@ -279,8 +283,9 @@ defmodule Tightbeam.Schema do
   @pre_liveness_identity_shape "identity-universal-root-render-pre-liveness-v1-019"
   @row_driven_waits_previous_shape "row-driven-rules-v1-019"
   @row_driven_rules_previous_shape "liveness-progress-receipts-v1-019"
+  @pi_shape "pi-providers-artifact-content-v1-019"
   @cursor_provider_shape "cursor-provider-v1-020"
-  @cursor_provider_previous_shape @firehose_shape
+  @cursor_provider_previous_shape @pi_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
@@ -290,6 +295,16 @@ defmodule Tightbeam.Schema do
   @terminal_decision_liveness_shape "terminal-operator-decision-parity-liveness-v1-019"
   @operator_decision_shape "operator-decision-requests-v1"
   @model_identity_shape "model-identity-v1"
+  @pi_provider_values "'anthropic','openai','opencode_go','local_openai'" <>
+                        if(Application.compile_env(:tightbeam, :fixture_harness, false),
+                          do: ",'fixture_provider'",
+                          else: ""
+                        )
+
+  @sessions_indexes_ddl """
+  CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
+  CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
+  """
 
   @cursor_session_columns "sessionKey,displayName,kind,orderIndex,isBuiltIn,adopted," <>
                             "ownerUserId,origin,spawnedBy,handle,archetype,overrides," <>
@@ -298,7 +313,7 @@ defmodule Tightbeam.Schema do
                             "thinkingLevel,modelContext,host,clearedThroughSeq,state,createdAt,updatedAt," <>
                             "mechanicalStatus"
   @cursor_marker_columns "id,kind,principal,subagentRef,sourceEventRef,harness,at,assignmentId"
-  @cursor_provider_values "'anthropic','openai','cursor'" <>
+  @cursor_provider_values "'anthropic','openai','cursor','opencode_go','local_openai'" <>
                             if(
                               Application.compile_env(
                                 :tightbeam,
@@ -1263,6 +1278,9 @@ defmodule Tightbeam.Schema do
   def guard_compatible_stamps do
     [
       @cursor_provider_shape,
+      @pi_shape,
+      @durability_shape,
+      @reparent_shape,
       @firehose_shape,
       @r1_shape,
       @o2_shape,
@@ -1311,7 +1329,12 @@ defmodule Tightbeam.Schema do
     {:ok, [[predecessor]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
     Enum.each(@schema_modules, fn module ->
-      :ok = bootstrap_module(db, module, predecessor == @firehose_shape)
+      :ok =
+        bootstrap_module(
+          db,
+          module,
+          predecessor in [@firehose_shape, @reparent_shape, @durability_shape, @pi_shape]
+        )
     end)
 
     activated_at = System.system_time(:millisecond)
@@ -1344,6 +1367,9 @@ defmodule Tightbeam.Schema do
 
     :ok = upgrade_r1(db)
     :ok = upgrade_firehose_r1(db)
+    :ok = upgrade_session_reparent(db)
+    :ok = upgrade_artifact_durability(db)
+    :ok = upgrade_pi_providers(db)
     :ok = upgrade_cursor_provider_v1_020(db)
     Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
@@ -1409,7 +1435,14 @@ defmodule Tightbeam.Schema do
 
     validate_activation_epoch!(txn)
 
-    Enum.each(@supervision_liveness_enforcement_objects, fn object ->
+    [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+
+    enforcement_objects =
+      if shape in [@reparent_shape, @durability_shape, @pi_shape, @cursor_provider_shape],
+        do: reparent_liveness_enforcement_objects(),
+        else: @supervision_liveness_enforcement_objects
+
+    Enum.each(enforcement_objects, fn object ->
       if owned_object_present?(txn, object) do
         validate_owned_object!(txn, object)
       else
@@ -1920,9 +1953,16 @@ defmodule Tightbeam.Schema do
 
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cursor_provider_shape]]} ->
+        :ok
+
+      {:ok, [[@pi_shape]]} ->
+        :ok
+
       {:ok, [[stamp]]}
       when stamp in [
-             @cursor_provider_shape,
+             @durability_shape,
+             @reparent_shape,
              @firehose_shape,
              @r1_shape,
              @o2_shape,
@@ -1964,14 +2004,17 @@ defmodule Tightbeam.Schema do
         upgrade_liveness_progress_receipts_v1(db)
 
       {:ok, [[@identity_render_stamp_previous_shape]]} ->
-        upgrade_identity_render_stamp_v1(db)
+        :ok = upgrade_identity_render_stamp_v1(db)
+        check_shape(db)
 
       {:ok, [[@effort_request_exit_previous_shape]]} ->
         :ok = upgrade_effort_request_exit_v1(db)
-        upgrade_identity_render_stamp_v1(db)
+        :ok = upgrade_identity_render_stamp_v1(db)
+        check_shape(db)
 
       {:ok, [[@notice_batching_pre_liveness_shape]]} ->
-        upgrade_identity_render_stamp_v1(db, @notice_batching_pre_liveness_shape)
+        :ok = upgrade_identity_render_stamp_v1(db, @notice_batching_pre_liveness_shape)
+        check_shape(db)
 
       {:ok, [[@terminal_decision_shape]]} ->
         :ok = migrate_notice_batching_v1_019(db, @terminal_decision_shape, true)
@@ -2043,7 +2086,14 @@ defmodule Tightbeam.Schema do
              [[@cursor_provider_shape]] ->
                :ok
 
-             [[stamp]] when stamp in [@firehose_shape, @r1_shape] ->
+             [[stamp]]
+             when stamp in [
+                    @pi_shape,
+                    @durability_shape,
+                    @reparent_shape,
+                    @firehose_shape,
+                    @r1_shape
+                  ] ->
                :ok
 
              [[@o2_shape]] ->
@@ -2075,6 +2125,11 @@ defmodule Tightbeam.Schema do
        when module in [Tightbeam.Org, Tightbeam.Escalation, Tightbeam.Artifacts],
        do: module.ensure_r1_schema(db)
 
+  # The correction table is additive current-build storage. Keep its DDL out
+  # of the bootstrap pass so a refused migration preserves the exact
+  # predecessor snapshot; the final schema pass installs it after migrations.
+  defp bootstrap_module(_db, Tightbeam.AssignmentCommitRefCorrections, _current?), do: :ok
+
   defp bootstrap_module(db, Tightbeam.AdminProjection, _current?),
     do: Tightbeam.AdminProjection.ensure_storage(db)
 
@@ -2086,7 +2141,8 @@ defmodule Tightbeam.Schema do
       {:ok, [[@cursor_provider_shape]]} ->
         :ok
 
-      {:ok, [[@firehose_shape]]} ->
+      {:ok, [[stamp]]}
+      when stamp in [@pi_shape, @durability_shape, @reparent_shape, @firehose_shape] ->
         :ok
 
       {:ok, [[@r1_shape]]} ->
@@ -2133,11 +2189,175 @@ defmodule Tightbeam.Schema do
     end
   end
 
+  @doc false
+  # Historical migrations retain their exact DDL. Only the reparent successor
+  # resolves current lineage in the holder-continuation admission trigger.
+  defp reparent_liveness_enforcement_objects do
+    Enum.map(@supervision_liveness_enforcement_objects, fn
+      %{name: "supervision_liveness_sidecar_insert_coherent"} = object ->
+        sql =
+          object.sql
+          |> String.replace(
+            "SELECT sessionKey,spawnedBy FROM sessions",
+            "SELECT sessionKey,#{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions"
+          )
+          |> String.replace(
+            "SELECT ancestor.sessionKey,ancestor.spawnedBy",
+            "SELECT ancestor.sessionKey,#{Tightbeam.Org.current_parent_sql("ancestor")}"
+          )
+
+        %{object | sql: sql}
+
+      object ->
+        object
+    end)
+  end
+
+  def upgrade_session_reparent(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@cursor_provider_shape]] ->
+               :ok
+
+             [[@pi_shape]] ->
+               :ok
+
+             [[@durability_shape]] ->
+               :ok
+
+             [[@reparent_shape]] ->
+               :ok
+
+             [[@firehose_shape]] ->
+               :ok = Tightbeam.SessionReparent.migrate_in_txn(txn)
+               :ok = Tightbeam.Idempotency.migrate_reparent_in_txn(txn)
+
+               trigger =
+                 Enum.find(reparent_liveness_enforcement_objects(), fn object ->
+                   object.name == "supervision_liveness_sidecar_insert_coherent"
+                 end)
+
+               :ok = Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
+               :ok = Txn.exec(txn, trigger.sql)
+
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                 @reparent_shape,
+                 System.system_time(:millisecond),
+                 @firehose_shape
+               ])
+
+               if Txn.changes(txn) != 1,
+                 do: raise(ShapeError, message: "session reparent stamp race")
+
+               [] = Txn.q(txn, "PRAGMA foreign_key_check")
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible session reparent predecessor: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  @doc false
+  # Artifact durability successor over session-reparent-v1-019. Creates the
+  # captured-content store only; every historical module DDL is left alone.
+  def upgrade_artifact_durability(db) do
+    case DB.transaction(db, fn txn ->
+           case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@cursor_provider_shape]] ->
+               validate_artifact_content_schema!(txn)
+
+             [[@pi_shape]] ->
+               validate_artifact_content_schema!(txn)
+
+             [[@durability_shape]] ->
+               validate_artifact_content_schema!(txn)
+
+             [[@reparent_shape]] ->
+               existing =
+                 Txn.q(
+                   txn,
+                   "SELECT name FROM sqlite_master WHERE name IN ('artifact_contents', 'artifacts_released_requires_content_insert', 'artifacts_released_requires_content_update', 'artifact_contents_released_immutable', 'artifact_contents_released_retained') ORDER BY name"
+                 )
+
+               if existing != [],
+                 do:
+                   raise(ShapeError,
+                     message: "incompatible artifact durability objects: #{inspect(existing)}"
+                   )
+
+               :ok = Tightbeam.ArtifactContent.schema_in_txn(txn)
+
+               # Existing rows are left exactly as they are. A legacy `released`
+               # row with no stored content is the EXTERNAL case: its bytes were
+               # never taken into custody, so there is nothing for this store to
+               # account for and nothing to revoke. Terminal state stays
+               # `released`, origin stays intact, no custody is implied.
+               Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+                 @durability_shape,
+                 System.system_time(:millisecond),
+                 @reparent_shape
+               ])
+
+               if Txn.changes(txn) != 1,
+                 do: raise(ShapeError, message: "artifact durability stamp race")
+
+               # Scoped: the argument-less form walks the WHOLE database, a real stall
+               # inside this transaction on a live 15G state.db for no added coverage.
+               [] = Txn.q(txn, "PRAGMA foreign_key_check(artifacts)")
+               [] = Txn.q(txn, "PRAGMA foreign_key_check(artifact_contents)")
+               :ok
+
+             rows ->
+               raise ShapeError,
+                 message: "incompatible artifact durability predecessor: #{inspect(rows)}"
+           end
+         end) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp validate_artifact_content_schema!(txn) do
+    Enum.each(Tightbeam.ArtifactContent.schema_objects(), fn {type, name, expected} ->
+      # SQLite removes IF NOT EXISTS and the statement terminator when storing
+      # DDL. Preserve every other byte, including quoted trigger predicates and
+      # error text: a stamped store must not silently repair a changed contract.
+      expected =
+        expected
+        |> String.replace(
+          "CREATE #{String.upcase(type)} IF NOT EXISTS ",
+          "CREATE #{String.upcase(type)} ",
+          global: false
+        )
+        |> String.trim()
+        |> String.trim_trailing(";")
+
+      case Txn.q(txn, "SELECT type, sql FROM sqlite_master WHERE name=?1", [name]) do
+        [[^type, ^expected]] -> :ok
+        _ -> raise ShapeError, message: "incompatible artifact durability object: #{name}"
+      end
+    end)
+
+    :ok
+  end
+
   defp upgrade_o2(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cursor_provider_shape]]} ->
+        :ok
+
+      {:ok, [[@pi_shape]]} ->
+        :ok
+
       {:ok, [[stamp]]}
       when stamp in [
-             @cursor_provider_shape,
+             @durability_shape,
+             @reparent_shape,
              @firehose_shape,
              @r1_shape,
              @o2_shape,
@@ -3151,6 +3371,148 @@ defmodule Tightbeam.Schema do
     :ok
   end
 
+  defp upgrade_pi_providers(db) do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cursor_provider_shape]]} -> :ok
+      {:ok, [[@pi_shape]]} -> :ok
+      {:ok, [[@durability_shape]]} -> migrate_sessions_provider_shape(db, @durability_shape)
+      rows -> raise ShapeError, message: "incompatible Pi provider predecessor: #{inspect(rows)}"
+    end
+  end
+
+  defp migrate_sessions_provider_shape(db, source_shape) do
+    {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+    # The current schema has triggers on other tables that reference sessions.
+    # During the table swap their referenced name is briefly absent. Preserve
+    # those references rather than validating the intermediate schema at rename.
+    :ok = DB.execute(db, "PRAGMA legacy_alter_table = ON")
+
+    try do
+      case DB.transaction(db, &migrate_sessions_provider_shape_in_txn(&1, source_shape)) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{source_shape} -> #{@pi_shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA legacy_alter_table = #{legacy_alter_table}")
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp migrate_sessions_provider_shape_in_txn(%Txn{} = txn, source_shape) do
+    [[session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions")
+
+    :ok = Txn.exec(txn, pi_sessions_ddl())
+
+    Txn.q(
+      txn,
+      """
+      INSERT INTO sessions_new (
+        sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+        ownerUserId, origin, spawnedBy, handle, archetype, overrides,
+        identityName, identityRevision, identityRenderContract, identityGuidanceDigest,
+        cliToken, harness, provider, model,
+        thinkingLevel, modelContext, host, clearedThroughSeq, state, mechanicalStatus, createdAt, updatedAt
+      )
+      SELECT
+        sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
+        ownerUserId, origin, spawnedBy, handle, archetype, overrides,
+        identityName, identityRevision, identityRenderContract, identityGuidanceDigest,
+        cliToken, harness, provider, model,
+        thinkingLevel, modelContext, host, clearedThroughSeq, state, mechanicalStatus, createdAt, updatedAt
+      FROM sessions
+      """
+    )
+
+    if Txn.changes(txn) != session_count do
+      raise ShapeError,
+        message:
+          "migration #{source_shape} -> #{@pi_shape} copied #{Txn.changes(txn)} of #{session_count} sessions"
+    end
+
+    [[^session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions_new")
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP INDEX sessions_owner;
+        DROP INDEX sessions_cli_token;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_new RENAME TO sessions;
+        #{@sessions_indexes_ddl}
+        """
+      )
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] ->
+        :ok
+
+      rows ->
+        raise ShapeError,
+          message:
+            "migration #{source_shape} -> #{@pi_shape} left invalid foreign keys: #{inspect(rows)}"
+    end
+
+    Txn.q(
+      txn,
+      "UPDATE schema_stamp SET shape = ?1, stampedAt = ?2 WHERE shape = ?3",
+      [@pi_shape, System.system_time(:millisecond), source_shape]
+    )
+
+    if Txn.changes(txn) != 1 do
+      raise ShapeError,
+        message: "migration #{source_shape} -> #{@pi_shape} lost its exact stamp transition"
+    end
+
+    :ok
+  end
+
+  defp pi_sessions_ddl do
+    harnesses = Enum.map_join(Tightbeam.Harness.all(), ",", &"'#{&1.wire_name()}'")
+
+    """
+    CREATE TABLE sessions_new (
+      sessionKey    TEXT PRIMARY KEY,
+      displayName   TEXT NOT NULL,
+      kind          TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('main','dm','custom')),
+      orderIndex    INTEGER NOT NULL DEFAULT 0,
+      isBuiltIn     INTEGER NOT NULL DEFAULT 0,
+      adopted       INTEGER NOT NULL DEFAULT 0,
+      ownerUserId   TEXT NOT NULL,
+      origin        TEXT NOT NULL,
+      spawnedBy     TEXT,
+      handle        TEXT UNIQUE,
+      archetype     TEXT NOT NULL,
+      overrides     TEXT,
+      identityName  TEXT,
+      identityRevision TEXT,
+      identityRenderContract TEXT,
+      identityGuidanceDigest TEXT,
+      cliToken      TEXT,
+      harness       TEXT NOT NULL CHECK (harness IN (#{harnesses})),
+      provider      TEXT NOT NULL CHECK (provider IN (#{@pi_provider_values})),
+      model         TEXT NOT NULL,
+      thinkingLevel TEXT,
+      modelContext  TEXT,
+      host          TEXT NOT NULL DEFAULT 'local',
+      clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+      state         TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+      mechanicalStatus TEXT NOT NULL DEFAULT 'idle' CHECK (mechanicalStatus IN ('idle','running')),
+      createdAt     INTEGER NOT NULL,
+      updatedAt     INTEGER NOT NULL
+    );
+    """
+  end
+
   defp upgrade_cursor_provider_v1_020(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@cursor_provider_shape]]} ->
@@ -3165,7 +3527,11 @@ defmodule Tightbeam.Schema do
   end
 
   defp migrate_cursor_provider_v1_020(db) do
+    {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
     :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+    # The current schema has triggers on other tables that reference sessions.
+    # Preserve their source-owned references during the table swap.
+    :ok = DB.execute(db, "PRAGMA legacy_alter_table = ON")
 
     try do
       case DB.transaction(db, &migrate_cursor_provider_v1_020_in_txn/1) do
@@ -3181,6 +3547,7 @@ defmodule Tightbeam.Schema do
               "migration #{@cursor_provider_previous_shape} -> #{@cursor_provider_shape} failed and was rolled back: #{Exception.message(error)}"
       end
     after
+      :ok = DB.execute(db, "PRAGMA legacy_alter_table = #{legacy_alter_table}")
       :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
     end
   end
@@ -3212,7 +3579,7 @@ defmodule Tightbeam.Schema do
     CREATE TABLE subagent_markers_cursor_provider_v1_020 (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       kind TEXT NOT NULL CHECK (kind IN ('subagent_start','subagent_stop')),
-      principal TEXT NOT NULL REFERENCES sessions_cursor_provider_v1_020(sessionKey),
+      principal TEXT NOT NULL REFERENCES sessions(sessionKey),
       subagentRef TEXT NOT NULL, sourceEventRef TEXT NOT NULL,
       harness TEXT NOT NULL CHECK (harness IN (#{harnesses})),
       at INTEGER NOT NULL, assignmentId TEXT, UNIQUE (kind, sourceEventRef)
@@ -3247,17 +3614,6 @@ defmodule Tightbeam.Schema do
       marker_count
     )
 
-    # This current-base trigger reads sessions. SQLite reparses surviving
-    # triggers while the referenced table is replaced, so carry its exact
-    # source-owned definition across the rebuild with the table and indexes.
-    sidecar_trigger =
-      Enum.find(
-        @supervision_liveness_enforcement_objects,
-        &(&1.name == "supervision_liveness_sidecar_insert_coherent")
-      )
-
-    :ok = Txn.exec(txn, "DROP TRIGGER supervision_liveness_sidecar_insert_coherent")
-
     :ok =
       Txn.exec(
         txn,
@@ -3278,8 +3634,6 @@ defmodule Tightbeam.Schema do
           ON subagent_markers (principal, id);
         """
       )
-
-    :ok = Txn.exec(txn, sidecar_trigger.sql)
 
     [[rebuilt_marker_sequence]] =
       Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM subagent_markers")

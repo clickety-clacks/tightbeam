@@ -1030,6 +1030,103 @@ defmodule Tightbeam.RailRemedyTest do
              DB.query(ctx.db, "SELECT count(*) FROM wakes WHERE assignmentId=?1", [assignment.id])
   end
 
+  test "assignment terminal handlers retain protocol review custody", ctx do
+    for terminal <- [:completion, :revocation] do
+      assignment = notice_assignment(ctx, "terminal protocol #{terminal}", "policy")
+      %{producer_id: root} = fire_review_notice(ctx, assignment)
+      mark_notice_turn(ctx.db, assignment.id, root, "failed_unknown")
+
+      episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+      reassessment_id = episode.notice_state["reassessment"]["wakeId"]
+
+      case terminal do
+        :completion ->
+          assert %{assignment: %{state: "closed"}} =
+                   Assignments.__handle__(ctx.db, "attest", completion_call(assignment.id))
+
+        :revocation ->
+          assert %{state: "closed"} =
+                   Assignments.__handle__(ctx.db, "revoke-assignment", %{
+                     verb: "revoke-assignment",
+                     origin: "agent:#{ctx.holder.session_key}",
+                     principal: {:session, ctx.holder.session_key},
+                     session_key: nil,
+                     params: %{assignment_id: assignment.id, reason: "test disposition"}
+                   })
+      end
+
+      assert %{status: "live", notice_state: state} =
+               RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+
+      assert state["reassessment"]["wakeId"] == reassessment_id
+
+      assert %{state: "pending", consumer: "review_remedy_reconcile"} =
+               Wakes.get(ctx.db, reassessment_id)
+
+      assert {:ok, [[0]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*) FROM wake_cancellations WHERE wakeId=?1",
+                 [reassessment_id]
+               )
+    end
+  end
+
+  test "scheduler precheck delivers protocol reconciliation after terminal row", ctx do
+    assignment = notice_assignment(ctx, "scheduler protocol custody")
+    %{producer_id: root} = fire_review_notice(ctx, assignment)
+    mark_notice_turn(ctx.db, assignment.id, root, "failed_unknown")
+
+    episode = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    reassessment_id = episode.notice_state["reassessment"]["wakeId"]
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [reassessment_id])
+
+    :ok = persist_terminal_race!(ctx.db, assignment.id, System.system_time(:millisecond))
+
+    test_pid = self()
+    scheduler = :"protocol_precheck_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Wakes,
+         name: scheduler,
+         db: ctx.db,
+         tick_ms: 60_000,
+         deliver: fn _wake -> flunk("protocol wake was diverted to prompt delivery") end,
+         internal_consumers: %{
+           "review_remedy_reconcile" => fn wake ->
+             send(test_pid, {:review_reconcile_delivered, wake.wake_id})
+             RailRemedy.reconcile_notice(ctx.db, %{supervision_interval_ms: 1_000}, wake)
+           end
+         }},
+        id: scheduler
+      )
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert_received {:review_reconcile_delivered, ^reassessment_id}
+
+    assert %{state: "fired", consumer: "review_remedy_reconcile"} =
+             Wakes.get(ctx.db, reassessment_id)
+
+    tracking = RailRemedy.episode(ctx.db, "completion-requires-review", assignment.id)
+    assert tracking.status == "live"
+    assert tracking.notice_state["need"]["state"] == "terminal"
+
+    assert [%{"wakeId" => recovery, "purpose" => "effects-reconcile"}] =
+             tracking.notice_state["recoveries"]
+
+    next_reassessment = tracking.notice_state["reassessment"]["wakeId"]
+
+    assert %{state: "pending", consumer: "review_remedy_reconcile", assignment_id: id} =
+             Wakes.get(ctx.db, next_reassessment)
+
+    assert is_nil(id)
+    assert Wakes.get(ctx.db, recovery).state == "pending"
+  end
+
   test "terminal producer tracks failed effects recovery to visible exhaustion", ctx do
     assignment = notice_assignment(ctx, "terminal unknown recovery")
     %{producer_id: root} = fire_review_notice(ctx, assignment)
@@ -1613,6 +1710,210 @@ defmodule Tightbeam.RailRemedyTest do
     refute second_wake_id == first_wake_id
     assert %{session_key: second_target} = Wakes.get(ctx.db, second_wake_id)
     assert second_target == target_session
+  end
+
+  test "completed and revoked assignments refuse new remedy episodes", ctx do
+    completed = assignment(ctx, "completed before rail", "policy")
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             Assignments.__handle__(ctx.db, "attest", completion_call(completed.id))
+
+    revoked = assignment(ctx, "revoked before rail", "policy")
+    assert %{state: "closed", outcome: "revoked"} = revoke(ctx, revoked.id)
+
+    put_rules(ctx, wake_gate())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    for assignment <- [completed, revoked] do
+      assert {:error, %{reason: "remedy_fired", producer: nil}} =
+               Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment.id))
+
+      assert RailRemedy.episode(ctx.db, "wake-remedy", assignment.id) == nil
+    end
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE origin = 'remedy:wake-remedy'")
+
+    assert ["assignment-not-open", "assignment-not-open"] ==
+             ctx.db
+             |> remedy_events()
+             |> Enum.map(& &1["outcome"])
+  end
+
+  test "assignment completion and revocation dispose pending remedy custody", ctx do
+    put_rules(ctx, wake_gate())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+
+    completed_work = work_item(ctx, "complete remedy custody")
+    completed = assignment(ctx, "complete with pending remedy", completed_work.id)
+    completed_wake = fire_wake_remedy(ctx, completed.id)
+    verdict(ctx, completed.id, "reviewed-clean")
+
+    assert {:ok, %{assignment: %{state: "closed", outcome: "completed"}}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(completed.id))
+
+    revoked_work = work_item(ctx, "revoke remedy custody")
+    revoked = assignment(ctx, "revoke with pending remedy", revoked_work.id)
+    revoked_wake = fire_wake_remedy(ctx, revoked.id)
+    assert %{state: "closed", outcome: "revoked"} = revoke(ctx, revoked.id)
+
+    for {assignment, wake_id} <- [{completed, completed_wake}, {revoked, revoked_wake}] do
+      assert %{state: "canceled", assignment_id: assignment_id} = Wakes.get(ctx.db, wake_id)
+      assert assignment_id == assignment.id
+      assert %{status: "closed"} = RailRemedy.episode(ctx.db, "wake-remedy", assignment.id)
+    end
+
+    assert {:ok,
+            [
+              [
+                "tightbeam:assignments",
+                "obligation_disposed",
+                "assignment_transition",
+                "linked_work_open",
+                1,
+                1
+              ],
+              [
+                "tightbeam:assignments",
+                "obligation_disposed",
+                "assignment_transition",
+                "linked_work_open",
+                1,
+                1
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT requesterId, reasonKind, causalSourceKind, workImpactKind,
+                      livenessTriggerKind IS NOT NULL, actionNeeded
+               FROM wake_cancellations
+               WHERE wakeId IN (?1, ?2)
+               ORDER BY wakeId
+               """,
+               [completed_wake, revoked_wake]
+             )
+  end
+
+  test "closing after remedy binding suppresses wake publication in its transaction", ctx do
+    assignment = assignment(ctx, "close during wake dispatch")
+    put_rules(ctx, wake_gate())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    wake_handler = ctx.handlers["wake"]
+
+    handlers =
+      Map.put(ctx.handlers, "wake", fn call ->
+        assert %{state: "closed", outcome: "revoked"} = revoke(ctx, assignment.id)
+        wake_handler.(call)
+      end)
+
+    assert {:error, %{reason: "remedy_fired", producer: nil}} =
+             Dispatch.dispatch(ctx.db, handlers, completion_call(assignment.id))
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM wakes WHERE origin = 'remedy:wake-remedy'")
+
+    assert %{status: "closed", producer_key: nil} =
+             RailRemedy.episode(ctx.db, "wake-remedy", assignment.id)
+
+    assert [%{"outcome" => "blocked", "producer_id" => nil}] = remedy_events(ctx.db)
+  end
+
+  test "scheduler restart disposes a legacy remedy wake for a closed assignment", ctx do
+    assignment = assignment(ctx, "legacy wake", "policy")
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             Assignments.__handle__(ctx.db, "attest", completion_call(assignment.id))
+
+    now = System.system_time(:millisecond)
+
+    assert {:ok, {wake_id, 1}} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(
+                 txn,
+                 """
+                 INSERT INTO rail_remedy_episodes
+                   (statute, subject, status, producerKey, occurrence, rewakeCount,
+                    claimToken, openedAt)
+                 VALUES ('completion-requires-verification', ?1, 'live', ?2, 1, 0,
+                         'legacy', ?3)
+                 """,
+                 [assignment.id, ctx.holder.session_key, now]
+               )
+
+               wake =
+                 Wakes.schedule_in_txn(txn, %{
+                   session_key: ctx.holder.session_key,
+                   origin: "remedy:completion-requires-verification",
+                   prompt: "legacy prompt must not be delivered",
+                   due_at: 0
+                 })
+
+               :ok =
+                 Idempotency.put_in_txn(txn, %{
+                   owner_user_id: "remedy:completion-requires-verification",
+                   operation: "wake",
+                   idempotency_key:
+                     "rail-dispatch:completion-requires-verification:#{assignment.id}:1",
+                   session_key: wake.wake_id
+                 })
+
+               {wake.wake_id, DB.Txn.changes(txn)}
+             end)
+
+    test_pid = self()
+    scheduler = :"closed_remedy_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Wakes,
+         name: scheduler,
+         db: ctx.db,
+         tick_ms: 60_000,
+         deliver: fn wake -> send(test_pid, {:legacy_remedy_delivered, wake.wake_id}) end},
+        id: scheduler
+      )
+    )
+
+    assert :ok = Wakes.fire_due(scheduler)
+    refute_received {:legacy_remedy_delivered, ^wake_id}
+    assert %{state: "canceled"} = Wakes.get(ctx.db, wake_id)
+
+    assert %{status: "closed"} =
+             RailRemedy.episode(
+               ctx.db,
+               "completion-requires-verification",
+               assignment.id
+             )
+
+    assert {:ok, [["tightbeam:assignments", "obligation_disposed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT requesterId, reasonKind FROM wake_cancellations WHERE wakeId = ?1",
+               [wake_id]
+             )
+  end
+
+  test "a stale due row cannot deliver after its assignment closes", ctx do
+    assignment = assignment(ctx, "close after scheduler read")
+    put_rules(ctx, wake_gate())
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    wake_id = fire_wake_remedy(ctx, assignment.id)
+    assignment_id = assignment.id
+
+    wake = Wakes.get(ctx.db, wake_id)
+    assert %{state: "pending", assignment_id: ^assignment_id} = wake
+    assert %{state: "closed", outcome: "revoked"} = revoke(ctx, assignment.id)
+
+    assert :skipped =
+             Gateway.deliver_prompt(wake.session_key, wake.origin, wake.prompt,
+               db: ctx.db,
+               wake_id: wake.wake_id,
+               sender: wake.origin
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [wake_id])
   end
 
   test "closed reopen and dead-live replacement bump occurrence and wire key", ctx do
@@ -2517,7 +2818,28 @@ defmodule Tightbeam.RailRemedyTest do
     attest_id
   end
 
-  defp assignment(ctx, subject, effect_kind \\ "code") do
+  defp work_item(ctx, title) do
+    WorkItems.__handle__(ctx.db, "work-item-create", %{
+      verb: "work-item-create",
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      params: %{title: title}
+    })
+  end
+
+  defp assignment(ctx, subject, effect_kind_or_work_item_id \\ nil) do
+    {effect_kind, work_item_id} =
+      case effect_kind_or_work_item_id do
+        nil ->
+          {"code", nil}
+
+        kind when kind in ~w(code policy release live_mutation evidence review coordination) ->
+          {kind, nil}
+
+        work_item_id ->
+          {"policy", work_item_id}
+      end
+
     Assignments.__handle__(ctx.db, "assign", %{
       verb: "assign",
       origin: "user:flynn",
@@ -2526,7 +2848,12 @@ defmodule Tightbeam.RailRemedyTest do
       target_role: nil,
       role_fallback: false,
       supervision_interval_ms: 1_000,
-      params: %{subject: subject, idempotency_key: nil, effect_kind: effect_kind}
+      params: %{
+        subject: subject,
+        work_item_id: work_item_id,
+        idempotency_key: nil,
+        effect_kind: effect_kind
+      }
     })
   end
 
@@ -2578,6 +2905,22 @@ defmodule Tightbeam.RailRemedyTest do
       )
 
     session_key
+  end
+
+  defp fire_wake_remedy(ctx, assignment_id) do
+    assert {:error, %{producer: wake_id}} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, completion_call(assignment_id))
+
+    assert %{session_key: ^wake_id} =
+             Idempotency.get(
+               ctx.db,
+               "remedy:wake-remedy",
+               "wake",
+               "rail-dispatch:wake-remedy:#{assignment_id}:1"
+             )
+
+    assert %{state: "pending", assignment_id: ^assignment_id} = Wakes.get(ctx.db, wake_id)
+    wake_id
   end
 
   defp revoke(ctx, assignment_id) do

@@ -14,7 +14,7 @@ defmodule Tightbeam.SchemaShapeTest do
   alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, Wakes}
 
   @shape "cursor-provider-v1-020"
-  @cursor_provider_previous_shape "firehose-r1-v1-019"
+  @cursor_provider_previous_shape "pi-providers-artifact-content-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"

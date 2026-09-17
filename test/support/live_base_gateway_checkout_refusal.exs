@@ -28,7 +28,14 @@ defmodule GuardCheckoutRefusal do
   def run do
     Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
       mode = Path.join(Path.dirname(base), "checkout-case.txt") |> File.read!()
-      assert mode in ["missing", "fresh", "transient", "cursor"]
+      assert mode in ["missing", "fresh", "transient", "cursor", "pi-local"]
+
+      {harness, provider, model} =
+        if mode == "pi-local" do
+          {"pi", "local_openai", Model.new("spark/qwen3.5-35b")}
+        else
+          {"claude", "anthropic", Model.new("fable")}
+        end
 
       Org.create(db, %{
         session_key: "k1",
@@ -37,9 +44,9 @@ defmodule GuardCheckoutRefusal do
         origin: "user:flynn",
         archetype: "default",
         host: "testhost",
-        harness: "claude",
-        provider: "anthropic",
-        model: Model.new("fable")
+        harness: harness,
+        provider: provider,
+        model: model
       })
 
       {:ok, lane} = GenServer.start_link(GuardCheckoutDoorbell, self())
@@ -93,10 +100,22 @@ defmodule GuardCheckoutRefusal do
             refreshing: true
           }
 
+          cache =
+            if mode == "pi-local" do
+              %{
+                cache
+                | entries: [
+                    %{hd(cache.entries) | family: "spark/qwen3.5-35b", provider: :local_openai}
+                  ]
+              }
+            else
+              cache
+            end
+
           %{
             state
             | hosts: fn -> %{"testhost" => %{base_dir: base, ssh: nil}} end,
-              entries: %{{"testhost", "claude"} => cache}
+              entries: %{{"testhost", harness} => cache}
           }
         end)
 
@@ -108,7 +127,8 @@ defmodule GuardCheckoutRefusal do
                   "missing" => "o6-refuse",
                   "fresh" => "o6-pbu",
                   "transient" => "o6-transient",
-                  "cursor" => "cursor-refusal-wire"
+                  "cursor" => "cursor-refusal-wire",
+                  "pi-local" => "o6-pi-local"
                 },
                 mode
               )
@@ -300,6 +320,26 @@ defmodule GuardCheckoutRefusal do
     assert reason =~ "is degraded"
     refute reason =~ "tightbeam onboard"
     refute reason =~ "--as-user"
+  end
+
+  defp prove("pi-local", db, lane, exact_registry, runner) do
+    degrade_host_catalog("testhost", "pi", {:needs_onboarding, :missing})
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "hi",
+               db: db,
+               conn_registry: exact_registry,
+               lane_manager: lane,
+               device_id: "o6-pi-local",
+               client_message_id: "c_o6_pi_local"
+             )
+
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "test")
+    assert {:error, %{reason: reason}} = runner.(Map.put(turn, :session_key, "k1"))
+
+    assert reason =~ "tightbeam onboard local-openai"
+    assert reason =~ "on testhost"
+    refute reason =~ "tightbeam onboard opencode-go"
   end
 
   defp degrade_host_catalog(host, harness, reason) do

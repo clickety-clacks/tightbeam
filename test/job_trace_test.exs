@@ -170,7 +170,7 @@ defmodule Tightbeam.JobTraceTest do
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
         assignment,
-        ~w(files holderKey id openerRef reviewsAssignmentId state)a
+        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id openerRef reviewsAssignmentId state)a
       )
     end)
 
@@ -178,6 +178,7 @@ defmodule Tightbeam.JobTraceTest do
     review = Enum.find(trace.assignments, &(&1.id == "asg_review"))
     assert direct.files == ["a.ex", "z.ex"]
     assert direct.openerRef == "user:owner"
+    assert direct.currentCoordinationParentRef == nil
     assert review.openerRef == "session:reviewer"
     assert review.reviewsAssignmentId == "asg_direct"
 
@@ -339,6 +340,9 @@ defmodule Tightbeam.JobTraceTest do
 
         "effort_generation" ->
           ~w(assignmentId at evidence id state type)a
+
+        "commit_ref_correction" ->
+          ~w(assignmentId at actorKind actorRef cause commitRefs evidenceArtifactId id type verifiedAt)a
 
         # job-forensics-v2 §3 — pinned EXACTLY: every key always present,
         # nullable where the spec marks it, so a consumer never has to

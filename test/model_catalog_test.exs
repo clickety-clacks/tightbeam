@@ -933,7 +933,7 @@ defmodule Tightbeam.ModelCatalogTest do
 
       message = Unroutable.message(unroutable)
       assert message =~ "anthropic has no usable credential on testhost"
-      assert message =~ "run tightbeam onboard anthropic on testhost"
+      assert message =~ "run tightbeam onboard anthropic --as-user <userId> on testhost"
       assert Unroutable.code(unroutable) == "catalog_unavailable"
 
       # It is not a verdict on the model: nothing here can see whether the host
@@ -1723,8 +1723,11 @@ defmodule Tightbeam.ModelCatalogTest do
       end
 
       probing_codex = fn command ->
-        generation = Agent.get_and_update(codex_generation, fn n -> {n + 1, n + 1} end)
-        send(test_pid, {:catalog_generation, :codex, generation})
+        if inspect(command) =~ "chatgpt.com" or inspect(command) =~ "api.openai.com" do
+          generation = Agent.get_and_update(codex_generation, fn n -> {n + 1, n + 1} end)
+          send(test_pid, {:catalog_generation, :codex, generation})
+        end
+
         ctx.codex_sh.(command)
       end
 

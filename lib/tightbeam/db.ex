@@ -31,7 +31,51 @@ defmodule Tightbeam.DB do
     defexception [:message]
   end
 
+  defmodule ReferenceFenceError do
+    @moduledoc "A reference write was refused while an archetype is being released."
+    defexception [:archetypes]
+
+    @impl true
+    def message(%__MODULE__{archetypes: archetypes}) do
+      "archetype release in progress: #{Enum.join(archetypes, ", ")}"
+    end
+  end
+
+  defmodule DeadlineExceeded do
+    @moduledoc false
+    defexception message: "database transaction deadline exceeded"
+  end
+
   ## Client
+
+  # How long a client waits for the owner to answer. Every call here used to
+  # take the inherited GenServer default of 5s — not a knob, just what nobody
+  # passed. Calls are short (prepared statements, microseconds); this bounds a
+  # wedged or deeply queued owner, so it is a ceiling, not a budget.
+  #
+  # Validated once in `init/1` rather than on this path: the DB client path is
+  # hot, and a bad value should stop the owner starting, not surface as a
+  # per-call crash.
+  @default_call_timeout_ms 30_000
+
+  @doc "Configured client wait for a DB call, ms (`:db_call_timeout_ms`, default 30_000)."
+  @spec call_timeout() :: pos_integer()
+  def call_timeout do
+    Application.get_env(:tightbeam, :db_call_timeout_ms, @default_call_timeout_ms)
+  end
+
+  @doc false
+  @spec validate_call_timeout!() :: pos_integer()
+  def validate_call_timeout! do
+    case Application.get_env(:tightbeam, :db_call_timeout_ms, @default_call_timeout_ms) do
+      ms when is_integer(ms) and ms > 0 ->
+        ms
+
+      bad ->
+        raise ArgumentError,
+              ":db_call_timeout_ms must be a positive integer of milliseconds, got #{inspect(bad)}"
+    end
+  end
 
   @doc "Start the owner. Required: `:path` (SQLite file or `\":memory:\"`). Optional `:name`."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -50,13 +94,43 @@ defmodule Tightbeam.DB do
   end
 
   def query(server, sql, params) do
-    GenServer.call(server, {:query, sql, params})
+    GenServer.call(server, {:query, sql, params}, call_timeout())
+  end
+
+  @doc """
+  `query/3` bounded by the caller's monotonic deadline.
+
+  The wait is the SMALLER of the configured call timeout and the time left, so
+  an enclosing deadline can only shorten it. Returns `DeadlineExceeded` rather
+  than exiting, because a caller holding a deadline has somewhere else to be.
+  """
+  @spec query_until(server(), String.t(), [term()], integer()) ::
+          {:ok, [row()]} | {:error, Exception.t() | term()}
+  def query_until(server, sql, params, deadline) when is_integer(deadline) do
+    case timeout_until(deadline) do
+      :expired ->
+        {:error, %DeadlineExceeded{}}
+
+      timeout ->
+        try do
+          GenServer.call(server, {:query, sql, params}, timeout)
+        catch
+          :exit, {:timeout, _} -> {:error, %DeadlineExceeded{}}
+          :exit, reason -> {:error, reason}
+        end
+    end
+  end
+
+  defp timeout_until(deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0, do: :expired, else: min(call_timeout(), remaining)
   end
 
   @doc "Execute DDL / statements without results."
   @spec execute(server(), String.t()) :: :ok | {:error, term()}
   def execute(server \\ __MODULE__, sql) do
-    GenServer.call(server, {:execute, sql})
+    GenServer.call(server, {:execute, sql}, call_timeout())
   end
 
   @doc """
@@ -69,21 +143,79 @@ defmodule Tightbeam.DB do
           {:ok, result} | {:error, Exception.t()}
         when result: term()
   def transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
-    GenServer.call(server, {:transaction, fun})
+    GenServer.call(server, {:transaction, fun}, call_timeout())
   end
 
   @doc """
-  Commit one transaction, then run a bounded publication callback before releasing the owner.
+  Run a transaction only while the monotonic deadline remains available.
 
-  An arity-one callback receives the prepared result and retains the original publication
-  semantics. An arity-two callback receives the owner's transaction handle followed by the
-  prepared result; it runs in a second transaction after the first commit. This is the
-  row-commit recognition seam: the callback cannot recursively enter the DB owner.
+  The deadline is enforced by the DB owner, not only by the caller's wait:
+  queued work is rejected before it starts, SQLite lock waits use the remaining
+  time, and a callback that overruns is rolled back before commit.
+  """
+  @spec transaction_until(server(), (Tightbeam.DB.Txn.t() -> result), integer()) ::
+          {:ok, result} | {:error, Exception.t() | term()}
+        when result: term()
+  def transaction_until(server \\ __MODULE__, fun, deadline)
+      when is_function(fun, 1) and is_integer(deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, %DeadlineExceeded{}}
+    else
+      try do
+        GenServer.call(server, {:transaction_until, fun, deadline}, remaining + 50)
+      catch
+        :exit, {:timeout, _} -> {:error, %DeadlineExceeded{}}
+        :exit, reason -> {:error, reason}
+      end
+    end
+  end
+
+  @doc """
+  Commit one transaction, then run a publication callback after the owner has replied.
+
+  An arity-one callback receives the prepared result in the caller process. Keeping arbitrary
+  publication work out of the DB owner means a slow filesystem or Git operation cannot stop
+  unrelated callers from being served. An arity-two callback receives the owner's transaction
+  handle followed by the prepared result; it runs in a second transaction after the first
+  commit. This is the row-commit recognition seam: the callback cannot recursively enter the
+  DB owner.
   """
   def transaction_then(server \\ __MODULE__, prepare, after_commit)
-      when is_function(prepare, 1) and
-             (is_function(after_commit, 1) or is_function(after_commit, 2)) do
-    GenServer.call(server, {:transaction_then, prepare, after_commit})
+
+  def transaction_then(server, prepare, after_commit)
+      when is_function(prepare, 1) and is_function(after_commit, 1) do
+    case GenServer.call(server, {:transaction, prepare}, call_timeout()) do
+      {:ok, result} -> run_after_commit(after_commit, result, MapSet.new())
+      {:error, error} -> {:error, error}
+    end
+  end
+
+  def transaction_then(server, prepare, after_commit)
+      when is_function(prepare, 1) and is_function(after_commit, 2) do
+    GenServer.call(server, {:transaction_then, prepare, after_commit}, call_timeout())
+  end
+
+  @doc "Atomically check references and hold a monitored archetype-release fence."
+  @spec begin_reference_fence(
+          server(),
+          [String.t()],
+          (Tightbeam.DB.Txn.t() -> {:ok, term()} | {:error, term()})
+        ) :: {:ok, reference(), term()} | {:error, term()}
+  def begin_reference_fence(server \\ __MODULE__, archetypes, check)
+      when is_list(archetypes) and is_function(check, 1) do
+    GenServer.call(
+      server,
+      {:begin_reference_fence, Enum.uniq(archetypes), check, self()},
+      call_timeout()
+    )
+  end
+
+  @doc "Release a fence previously returned by begin_reference_fence/3."
+  @spec end_reference_fence(server(), reference()) :: :ok
+  def end_reference_fence(server \\ __MODULE__, token) when is_reference(token) do
+    GenServer.call(server, {:end_reference_fence, token}, call_timeout())
   end
 
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
@@ -100,9 +232,45 @@ defmodule Tightbeam.DB do
             conn: reference(),
             outbox: reference() | nil,
             outbox_owner: pid() | nil,
-            query_trace: term()
+            query_trace: term(),
+            fenced_archetypes: MapSet.t(),
+            deadline: integer() | :infinity
           }
-    defstruct [:conn, :outbox, :outbox_owner, :query_trace]
+    defstruct [
+      :conn,
+      :outbox,
+      :outbox_owner,
+      :query_trace,
+      fenced_archetypes: MapSet.new(),
+      deadline: :infinity
+    ]
+
+    # Two independent guards on one transaction handle. `fenced_archetypes` is
+    # reference safety and `deadline` is time; neither reads the other's field
+    # and neither changes when the other fires. They are carried together only
+    # because a transaction has exactly one handle.
+    @doc false
+    @spec assert_archetype_available!(t(), String.t()) :: :ok
+    def assert_archetype_available!(%__MODULE__{fenced_archetypes: fenced}, archetype)
+        when is_binary(archetype) do
+      if MapSet.member?(fenced, archetype) do
+        raise Tightbeam.DB.ReferenceFenceError, archetypes: [archetype]
+      end
+
+      :ok
+    end
+
+    @doc false
+    def ensure_before_deadline(%__MODULE__{deadline: :infinity}), do: :ok
+
+    def ensure_before_deadline(%__MODULE__{deadline: deadline})
+        when is_integer(deadline) do
+      if System.monotonic_time(:millisecond) < deadline do
+        :ok
+      else
+        raise Tightbeam.DB.DeadlineExceeded
+      end
+    end
 
     @doc false
     def observe_queries(%__MODULE__{} = txn, trace), do: %{txn | query_trace: trace}
@@ -174,14 +342,14 @@ defmodule Tightbeam.DB do
   ## Server
 
   @doc false
-  def prepare_schema(server), do: GenServer.call(server, :prepare_schema)
+  def prepare_schema(server), do: GenServer.call(server, :prepare_schema, call_timeout())
 
   @doc false
-  def finish_schema(server), do: GenServer.call(server, :finish_schema)
+  def finish_schema(server), do: GenServer.call(server, :finish_schema, call_timeout())
 
   @doc false
   def assert_base_admitted!(server, base) do
-    case GenServer.call(server, {:assert_base_admitted, base}) do
+    case GenServer.call(server, {:assert_base_admitted, base}, call_timeout()) do
       :ok -> :ok
       {:error, error} -> raise error
     end
@@ -189,6 +357,11 @@ defmodule Tightbeam.DB do
 
   @impl true
   def init(opts) do
+    # Before the connection: a bad call timeout stops this owner starting, which
+    # under the tree's rest_for_one ordering stops the boot, rather than
+    # crashing the first caller that happens to need the DB.
+    _ = validate_call_timeout!()
+
     path = Keyword.fetch!(opts, :path)
     {path, admission} = prepare_persistent_admission!(path, opts)
 
@@ -213,7 +386,7 @@ defmodule Tightbeam.DB do
         end
 
         :ok = load_topline_unicode(conn)
-        {:ok, %{conn: conn, admission: admission}}
+        {:ok, %{conn: conn, admission: admission, reference_fences: %{}}}
       rescue
         error ->
           :ok = Sqlite3.close(conn)
@@ -346,19 +519,42 @@ defmodule Tightbeam.DB do
     Process.put(row_commit_key(conn), [])
 
     try do
-      {:reply, commit_phase(conn, fun), state}
+      {:reply, commit_phase(conn, fun, fenced_archetypes(state)), state}
     after
       Process.delete(row_commit_key(conn))
     end
   end
 
-  def handle_call({:transaction_then, prepare, after_commit}, _from, %{conn: conn} = state) do
+  def handle_call({:transaction_until, fun, deadline}, _from, %{conn: conn} = state) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:reply, {:error, %DeadlineExceeded{}}, state}
+    else
+      :ok = Sqlite3.execute(conn, "PRAGMA busy_timeout=#{max(remaining, 1)}")
+      Process.put(row_commit_key(conn), [])
+
+      try do
+        {:reply, commit_phase(conn, fun, fenced_archetypes(state), deadline), state}
+      after
+        Process.delete(row_commit_key(conn))
+        _ = Sqlite3.execute(conn, "PRAGMA busy_timeout=5000")
+      end
+    end
+  end
+
+  def handle_call(
+        {:transaction_then, prepare, after_commit},
+        _from,
+        %{conn: conn} = state
+      )
+      when is_function(after_commit, 2) do
     Process.put(row_commit_key(conn), [])
 
     try do
       reply =
-        case commit_phase(conn, prepare) do
-          {:ok, result} -> run_after_commit(conn, after_commit, result)
+        case commit_phase(conn, prepare, fenced_archetypes(state)) do
+          {:ok, result} -> run_after_commit(conn, after_commit, result, fenced_archetypes(state))
           {:error, error} -> {:error, error}
         end
 
@@ -368,28 +564,117 @@ defmodule Tightbeam.DB do
     end
   end
 
+  def handle_call(
+        {:begin_reference_fence, archetypes, check, owner},
+        _from,
+        %{conn: conn, reference_fences: fences} = state
+      ) do
+    case overlapping_fences(fences, archetypes) do
+      [] ->
+        case fence_check_phase(conn, check, fenced_archetypes(state)) do
+          {:ok, result} ->
+            token = make_ref()
+            monitor = Process.monitor(owner)
+
+            fence = %{archetypes: MapSet.new(archetypes), owner: owner, monitor: monitor}
+
+            {:reply, {:ok, token, result},
+             %{state | reference_fences: Map.put(fences, token, fence)}}
+
+          {:error, error} ->
+            {:reply, {:error, error}, state}
+        end
+
+      overlapping ->
+        {:reply, {:error, %ReferenceFenceError{archetypes: overlapping}}, state}
+    end
+  end
+
+  def handle_call(
+        {:end_reference_fence, token},
+        {owner, _tag},
+        %{reference_fences: fences} = state
+      ) do
+    case Map.get(fences, token) do
+      %{owner: ^owner, monitor: monitor} ->
+        Process.demonitor(monitor, [:flush])
+        {:reply, :ok, %{state | reference_fences: Map.delete(fences, token)}}
+
+      nil ->
+        {:reply, :ok, state}
+
+      _fence ->
+        {:reply, {:error, :not_fence_owner}, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:DOWN, monitor, :process, owner, _reason}, %{reference_fences: fences} = state) do
+    fences =
+      Enum.reduce(fences, fences, fn {token, fence}, acc ->
+        if fence.monitor == monitor and fence.owner == owner,
+          do: Map.delete(acc, token),
+          else: acc
+      end)
+
+    {:noreply, %{state | reference_fences: fences}}
+  end
+
   defp row_commit_key(conn), do: {__MODULE__, :row_commits, conn}
 
   # Each real transaction owns a distinct queue. Invalidate it before sending
   # casts; later recognition failure cannot undo the first committed phase.
-  defp commit_phase(conn, fun) do
+  # `deadline` is a fourth parameter with a default rather than a generalised
+  # one, so every caller that has no deadline keeps its existing three-argument
+  # call unchanged and :infinity makes the two deadline checks no-ops. The two
+  # guards stay independent: the fence is enforced inside `fun` via
+  # `assert_archetype_available!`, the deadline around it via
+  # `ensure_before_deadline`, and neither consults the other.
+  defp commit_phase(conn, fun, fenced_archetypes, deadline \\ :infinity) do
     token = make_ref()
     key = {Txn, :outbox, token}
     Process.put(key, [])
 
+    txn = %Txn{
+      conn: conn,
+      outbox: token,
+      outbox_owner: self(),
+      fenced_archetypes: fenced_archetypes,
+      deadline: deadline
+    }
+
     outcome =
       try do
+        # Before BEGIN, so an already-spent deadline never opens a transaction.
+        # This raise is why the outer rescue below exists: there is nothing to
+        # roll back yet.
+        Txn.ensure_before_deadline(txn)
         :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
 
         try do
-          result = fun.(%Txn{conn: conn, outbox: token, outbox_owner: self()})
+          result = fun.(txn)
+          Txn.ensure_before_deadline(txn)
           :ok = Sqlite3.execute(conn, "COMMIT")
           {:committed, result, Enum.reverse(Process.get(key))}
         rescue
           error ->
-            :ok = Sqlite3.execute(conn, "ROLLBACK")
+            # Not `:ok =`: under a deadline the busy_timeout is the remaining
+            # time, so ROLLBACK can itself fail, and asserting on it would
+            # replace the real error with a MatchError.
+            #
+            # But the result may not be DISCARDED either. This is the only place
+            # that learns the connection was not restored, and the tuple below
+            # asserts a rollback that may not have happened. Say so, and still
+            # return the real error.
+            case Sqlite3.execute(conn, "ROLLBACK") do
+              :ok -> :ok
+              other -> Logger.error("transaction rollback failed: #{inspect(other)}")
+            end
+
             {:rolled_back, error}
         end
+      rescue
+        error -> {:rolled_back, error}
       after
         Process.delete(key)
       end
@@ -414,7 +699,8 @@ defmodule Tightbeam.DB do
       :ok
   end
 
-  defp run_after_commit(_conn, after_commit, result) when is_function(after_commit, 1) do
+  defp run_after_commit(after_commit, result, _fenced_archetypes)
+       when is_function(after_commit, 1) do
     try do
       {:ok, after_commit.(result)}
     rescue
@@ -422,8 +708,53 @@ defmodule Tightbeam.DB do
     end
   end
 
-  defp run_after_commit(conn, after_commit, result) when is_function(after_commit, 2) do
-    commit_phase(conn, fn txn -> after_commit.(txn, result) end)
+  defp run_after_commit(conn, after_commit, result, fenced_archetypes)
+       when is_function(after_commit, 2) do
+    commit_phase(conn, fn txn -> after_commit.(txn, result) end, fenced_archetypes)
+  end
+
+  defp fenced_archetypes(%{reference_fences: fences}) do
+    Enum.reduce(fences, MapSet.new(), fn {_token, fence}, acc ->
+      MapSet.union(acc, fence.archetypes)
+    end)
+  end
+
+  defp overlapping_fences(fences, archetypes) do
+    wanted = MapSet.new(archetypes)
+
+    fences
+    |> Enum.flat_map(fn {_token, fence} ->
+      MapSet.to_list(MapSet.intersection(wanted, fence.archetypes))
+    end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  defp fence_check_phase(conn, check, fenced_archetypes) do
+    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+    try do
+      result =
+        check.(%Txn{conn: conn, fenced_archetypes: fenced_archetypes})
+
+      case result do
+        {:ok, value} ->
+          :ok = Sqlite3.execute(conn, "COMMIT")
+          {:ok, value}
+
+        {:error, reason} ->
+          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          {:error, reason}
+
+        other ->
+          :ok = Sqlite3.execute(conn, "ROLLBACK")
+          {:error, {:invalid_reference_fence_check, other}}
+      end
+    rescue
+      error ->
+        :ok = Sqlite3.execute(conn, "ROLLBACK")
+        {:error, error}
+    end
   end
 
   @doc false

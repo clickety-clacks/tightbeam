@@ -407,6 +407,13 @@ defmodule Tightbeam.Harness.Cursor do
 
   @impl true
   def reconcile_home(target, home, desired) do
+    desired =
+      Map.put_new(
+        desired,
+        :auth_dir,
+        Tightbeam.Credentials.store_dir(target.host_config.base_dir, credential_provider())
+      )
+
     # harvest_auth: false — the projection root is group-writable by the
     # execution identity, so a home-side cli-config.json can be replaced by
     # uid 503; harvesting it back would let execution-controlled content land

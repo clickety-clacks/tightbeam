@@ -109,7 +109,82 @@ defmodule Tightbeam.CredentialKindsTest do
       assert Credentials.kind_at(ctx.base, :anthropic) == :api_key
     end
 
-    test "a subscription banks with its kind and keeps its expiry", ctx do
+    test "an OpenCode Go API key banks in Pi's native auth.json", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
+
+      File.write!(
+        Path.join(staging, "auth.json"),
+        ~s({"opencode-go":{"type":"api_key","key":"fixture-go-key"}})
+      )
+
+      assert :ok = Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
+
+      store = Credentials.credential_path(ctx.base, "eezo", :opencode_go)
+
+      metadata_path =
+        Path.join([ctx.base, "homes", "eezo", "pi", ".tightbeam", "credential.json"])
+
+      assert JSON.decode!(File.read!(store)) == %{
+               "opencode-go" => %{"type" => "api_key", "key" => "fixture-go-key"}
+             }
+
+      assert File.stat!(store).mode |> Bitwise.band(0o777) == 0o600
+      assert File.stat!(metadata_path).mode |> Bitwise.band(0o777) == 0o600
+
+      metadata = metadata_path |> File.read!() |> JSON.decode!()
+      assert metadata["provider"] == "opencode_go"
+      assert metadata["kind"] == "api_key"
+      assert metadata["onboarded"] == true
+      assert metadata["expires_at"] == nil
+      assert Credentials.kind_at(ctx.base, "eezo", :opencode_go) == :api_key
+    end
+
+    test "Pi runtime credential replacement survives restart without a legacy bank", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
+      initial = ~s({"opencode-go":{"type":"api_key","key":"fixture-original"}})
+      rotated = ~s({"opencode-go":{"type":"api_key","key":"fixture-runtime-replacement"}})
+      File.write!(Path.join(staging, "auth.json"), initial)
+      assert :ok = Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
+
+      home = Tightbeam.Homes.home_path(ctx.base, "eezo", :pi)
+      credential = Credentials.credential_path(ctx.base, "eezo", :opencode_go)
+      assert credential == Path.join(home, "auth.json")
+      refute "auth.json" in Tightbeam.Harness.Pi.owned_home_entries()
+      legacy = Path.join([ctx.base, "auth", "pi", "auth.json"])
+      refute File.exists?(legacy)
+
+      # Simulate the harness replacing its native credential, then leave an old
+      # bank as a trap: restarting Tightbeam must not copy those stale bytes back.
+      File.write!(credential, rotated)
+      File.mkdir_p!(Path.dirname(legacy))
+      File.write!(legacy, initial)
+      GenServer.stop(server)
+      {:ok, restarted} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      assert Credentials.status(:opencode_go, restarted) == :onboarded
+      assert File.read!(credential) == rotated
+      assert File.read!(legacy) == initial
+      assert Credentials.kind_at(ctx.base, "eezo", :opencode_go) == :api_key
+      GenServer.stop(restarted)
+    end
+
+    test "a malformed Pi auth.json is refused before it reaches the store", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
+      File.write!(Path.join(staging, "auth.json"), ~s({"opencode-go":{"type":"api_key"}}))
+
+      assert {:error, {:hollow_credential, %{found: found, sentence: sentence}}} =
+               Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
+
+      assert found =~ "opencode-go.key is missing"
+      assert sentence =~ "tightbeam onboard opencode-go"
+      refute File.exists?(Credentials.credential_path(ctx.base, "eezo", :opencode_go))
+    end
+
+    test "a subscription banks with its kind without inferring expiry", ctx do
       {:ok, server} =
         start_credentials(
           name: nil,
@@ -140,7 +215,7 @@ defmodule Tightbeam.CredentialKindsTest do
         |> JSON.decode!()
 
       assert metadata["kind"] == "subscription"
-      assert is_integer(metadata["expires_at"])
+      refute Map.has_key?(metadata, "expires_at")
       assert metadata["subscription_status"] == "supported"
       assert Credentials.kind(:anthropic, server) == :subscription
     end
@@ -619,6 +694,39 @@ defmodule Tightbeam.CredentialKindsTest do
       # store, whose spelling is its own (invariant: one authority per
       # vocabulary).
       assert Credentials.kind(:anthropic, Credentials) == :none
+    end
+
+    test "OpenCode Go refuses subscription kind before opening a lease", ctx do
+      :ok = Tightbeam.Devices.ensure_schema(ctx.db)
+
+      {:ok, _rows} =
+        Tightbeam.DB.query(
+          ctx.db,
+          "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
+          ["go-admin", System.system_time(:second)]
+        )
+
+      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+
+      onboard =
+        Tightbeam.Gateway.handlers(%{
+          base_dir: ctx.base,
+          db: ctx.db,
+          onboarding_lease_ms: 1_800_000
+        })["onboard"]
+
+      call = %{
+        origin: "user:go-admin",
+        params: %{provider: "opencode-go", phase: "begin", kind: "subscription"}
+      }
+
+      assert %{
+               code: "invalid_message",
+               message: "opencode-go requires credential kind apiKey; subscription is unsupported"
+             } = onboard.(call)
+
+      assert %{provider: :opencode_go, kind: "apiKey", status: "ready"} =
+               onboard.(put_in(call.params[:kind], "apiKey"))
     end
   end
 

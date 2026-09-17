@@ -38,28 +38,37 @@ defmodule Tightbeam.Firehose.RetireCommitOrderTest do
       origin: "agent:critical-worker",
       principal: {:session, worker.session_key},
       session_key: worker.session_key,
-      params: %{for_ms: 1_000, reason: "synthetic critical proof"}
+      # The worst observed dispatch/notice path was 1_453 ms. A 12-second arm
+      # leaves more than 10 seconds of load margin, while two active arms still
+      # exceed the 20-second hard cap and exercise the renewal clamp.
+      params: %{for_ms: 12_000, reason: "synthetic critical proof"}
     }
 
     _ = receive_notices()
     assert {:ok, first} = Dispatch.dispatch(db, handlers, call)
-    notices = receive_notices()
-    assert Enum.map(notices, & &1["class"]) == ["verb.accepted", "critical_lease.updated"]
-
-    assert List.last(notices)["payload"] ==
-             StateResources.critical_state(Tightbeam.CriticalLeases.get(db, worker.session_key))
-
-    assert first.expires_at <= first.hard_deadline
+    first_stored = Tightbeam.CriticalLeases.get(db, worker.session_key)
     assert {:ok, renewed} = Dispatch.dispatch(db, handlers, call)
-    assert renewed.hard_deadline == first.hard_deadline
-    assert renewed.expires_at >= first.expires_at
+    stored = Tightbeam.CriticalLeases.get(db, worker.session_key)
 
-    assert Enum.map(receive_notices(), & &1["class"]) == [
+    assert first.expires_at < first.hard_deadline
+    assert renewed.hard_deadline == first.hard_deadline
+    assert stored.hard_deadline == first.hard_deadline
+    assert renewed.expires_at == first.hard_deadline
+    assert stored.expires_at == first.hard_deadline
+
+    notices = receive_notices()
+
+    assert Enum.map(notices, & &1["class"]) == [
+             "verb.accepted",
+             "critical_lease.updated",
              "verb.accepted",
              "critical_lease.updated"
            ]
 
-    before = Tightbeam.CriticalLeases.get(db, worker.session_key)
+    assert Enum.at(notices, 1)["payload"] == StateResources.critical_state(first_stored)
+    assert List.last(notices)["payload"] == StateResources.critical_state(stored)
+
+    before = stored
 
     assert {:error, _} =
              Dispatch.dispatch(db, handlers, %{

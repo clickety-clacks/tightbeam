@@ -7,12 +7,8 @@ defmodule Tightbeam.ArtifactsTest do
   setup do
     db = :"artifacts_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Org.ensure_schema(db)
-    :ok = Projection.ensure_schema(db)
-    :ok = WorkItems.ensure_schema(db)
-    :ok = Ledger.ensure_schema(db)
-    :ok = Assignments.ensure_schema(db)
-    :ok = Artifacts.ensure_schema(db)
+    # Normal artifact flows use the same complete schema as production boot.
+    :ok = Tightbeam.Schema.ensure_all(db)
 
     parent = session(db, "parent", nil)
     child = session(db, "child", parent.session_key)

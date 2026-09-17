@@ -197,6 +197,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "condition", vec![], params))
         }
+        Command::ArtifactContentFetch {
+            identity,
+            artifact_id,
+        } => Ok(request(
+            identity,
+            "artifact-content-fetch",
+            vec![],
+            vec![string_field("artifactId", artifact_id)],
+        )),
         Command::ArtifactRecord {
             identity,
             kind,
@@ -298,6 +307,23 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::SessionReparent {
+            identity,
+            session_key,
+            parent_session_key,
+            assignment_id,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "session-reparent",
+            vec![],
+            vec![
+                string_field("sessionKey", session_key),
+                string_field("parentSessionKey", parent_session_key),
+                string_field("assignmentId", assignment_id),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
         Command::Tune {
             identity,
             session_key,
@@ -603,6 +629,28 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "repair-assignment", vec![], params))
         }
+        Command::AssignmentCommitRefCorrect {
+            identity,
+            assignment_id,
+            commit_refs,
+            reason,
+            evidence_artifact_id,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "assignment-commitref-correct",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                format!(
+                    "\"commitRefs\":{}",
+                    serde_json::to_string(commit_refs).expect("commit refs are JSON serializable")
+                ),
+                string_field("reason", reason),
+                string_field("evidenceArtifactId", evidence_artifact_id),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
         Command::WorkItemCreate {
             identity,
             title,
@@ -1157,6 +1205,7 @@ pub fn build_onboard_phase_request(
     machine: Option<&str>,
     lease_id: Option<&str>,
     reason: Option<&str>,
+    source: Option<&str>,
 ) -> RequestSpec {
     // `kind` rides on EVERY phase, not just finish, so the conversation is
     // self-describing in a gateway log. Only finish acts on it.
@@ -1173,6 +1222,9 @@ pub fn build_onboard_phase_request(
     }
     if let Some(reason) = reason {
         params.push(string_field("reason", reason));
+    }
+    if let Some(source) = source {
+        params.push(string_field("source", source));
     }
     request(identity, "onboard", vec![], params)
 }
@@ -1660,6 +1712,9 @@ where
             identity,
             provider,
             api_key,
+            daemon_credential,
+            endpoint: local_endpoint,
+            provider_name: local_provider_name,
             hostname,
             remote,
         } => {
@@ -1675,6 +1730,9 @@ where
                 &identity,
                 &provider,
                 api_key,
+                daemon_credential,
+                local_endpoint.as_deref(),
+                local_provider_name.as_deref(),
                 &endpoint,
                 send_request,
                 load_harnesses,
@@ -1744,11 +1802,13 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
         | Command::ArtifactRecord { identity, .. }
+        | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
         | Command::Tune { identity, .. }
+        | Command::SessionReparent { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
@@ -1763,6 +1823,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::RevokeAssignment { identity, .. }
         | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
+        | Command::AssignmentCommitRefCorrect { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
@@ -1996,6 +2057,60 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn artifact_content_fetch_sends_only_id_and_authenticated_identity() {
+        let request = build_request(&parse(&[
+            "artifact-content-fetch",
+            "art_fixture",
+            "--as-user",
+            "flynn",
+        ]))
+        .unwrap();
+        assert_eq!(request.path, "/agent/dispatch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.body_json).unwrap(),
+            serde_json::json!({
+                "verb": "artifact-content-fetch",
+                "asUser": "flynn",
+                "params": {"artifactId": "art_fixture"}
+            })
+        );
+    }
+
+    #[test]
+    fn session_reparent_preserves_opaque_keys_and_requires_explicit_retry_key() {
+        assert_eq!(
+            body(&[
+                "session-reparent",
+                "--session",
+                "child with space",
+                "--parent",
+                "parent",
+                "--assignment",
+                "asg_one",
+                "--key",
+                "correction",
+                "--as-user",
+                "owner"
+            ]),
+            r#"{"asUser":"owner","verb":"session-reparent","params":{"sessionKey":"child with space","parentSessionKey":"parent","assignmentId":"asg_one","idempotencyKey":"correction"}}"#
+        );
+        for missing in ["--session", "--parent", "--assignment", "--key"] {
+            let mut args = vec!["session-reparent"];
+            for (flag, value) in [
+                ("--session", "child"),
+                ("--parent", "parent"),
+                ("--assignment", "asg_one"),
+                ("--key", "correction"),
+            ] {
+                if flag != missing {
+                    args.extend([flag, value]);
+                }
+            }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
     }
 
     #[test]
@@ -2654,6 +2769,23 @@ mod tests {
         );
         assert_eq!(
             body(&[
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "canonical historical backfill",
+                "--key",
+                "backfill-1",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"assignment-commitref-correct","params":{"assignmentId":"asg_1","commitRefs":[{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","remote":"git@example/repo","repo":"gibson:/repo"}],"reason":"canonical historical backfill","evidenceArtifactId":"art_1","idempotencyKey":"backfill-1"}}"#
+        );
+        assert_eq!(
+            body(&[
                 "assignments",
                 "--session",
                 "s1",
@@ -3138,6 +3270,7 @@ mod tests {
             Some("work-1"),
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -3158,6 +3291,7 @@ mod tests {
             Some("work-1"),
             Some("lease-7"),
             None,
+            None,
         );
 
         assert_eq!(
@@ -3165,6 +3299,31 @@ mod tests {
             r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1","leaseId":"lease-7"}}"#
         );
         assert!(!keyed.body_json.contains("sk-"));
+
+        let daemon = build_onboard_phase_request(
+            &Identity::User("flynn".to_owned()),
+            "opencode-go",
+            "begin",
+            "apiKey",
+            None,
+            None,
+            None,
+            Some("daemonCredential"),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&daemon.body_json).unwrap(),
+            serde_json::json!({
+                "asUser": "flynn",
+                "verb": "onboard",
+                "params": {
+                    "provider": "opencode-go",
+                    "phase": "begin",
+                    "kind": "apiKey",
+                    "source": "daemonCredential"
+                }
+            })
+        );
+        assert!(!daemon.body_json.contains("fake-daemon-key"));
     }
 
     #[test]
@@ -3687,6 +3846,9 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             },
@@ -3796,6 +3958,9 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             },
@@ -3891,6 +4056,7 @@ mod tests {
             "finish",
             "subscription",
             Some("work-1"),
+            None,
             None,
             None,
         );

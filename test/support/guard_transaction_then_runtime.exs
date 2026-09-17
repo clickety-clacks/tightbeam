@@ -50,11 +50,10 @@ try do
       end)
     end)
 
-  refute Task.yield(queued_writer, 50)
-  send(db, :release_publication)
+  assert {:ok, {:ok, :written}} = Task.yield(queued_writer, 1_000)
+  send(publication.pid, :release_publication)
 
   assert {:ok, :published} = Task.await(publication)
-  assert {:ok, :written} = Task.await(queued_writer)
   assert {:ok, [[1], [2]]} = DB.query(db, "SELECT id FROM publication_markers ORDER BY id")
 
   assert {:error, %RuntimeError{message: "publication crashed"}} =
