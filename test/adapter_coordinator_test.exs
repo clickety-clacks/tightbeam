@@ -991,8 +991,11 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     # terminate/2 promises to complete within shutdown_budget_ms, and the V7
     # concern — a callback overrunning its own budget passing unnoticed — still
     # governs: the allowance below is measurement-scale, not phase-scale, so a
-    # real overrun of the 500ms reserve still fails. Two costs land in
-    # elapsed_ms without being terminate's to spend: DB.transaction_until grants
+    # real overrun of the 500ms reserve still fails. Without the allowance the
+    # bound's margin is negative by construction — it forbids what the code's
+    # own contract permits and can fail on a quiet host on a scheduling hiccup.
+    # Two costs land in elapsed_ms without being terminate's to spend:
+    # DB.transaction_until grants
     # a final commit already in flight remaining + 50ms past the deadline rather
     # than abort a durable outcome (observed +8..22ms), and the measurement
     # starts before GenServer.stop dispatches, ahead of the callback's own clock
