@@ -644,8 +644,8 @@ defmodule Tightbeam.AdapterCoordinatorTest do
           ]
         end,
         db: ctx.db,
-        shutdown_budget_ms: 500,
-        shutdown_settlement_budget_ms: 100,
+        shutdown_budget_ms: 1_500,
+        shutdown_settlement_budget_ms: 500,
         name:
           String.to_atom("shutdown_preparation_coordinator_#{System.unique_integer([:positive])}")
       )
@@ -676,7 +676,13 @@ defmodule Tightbeam.AdapterCoordinatorTest do
       Task.async(fn ->
         DB.transaction(ctx.db, fn _txn ->
           send(parent, :shutdown_preparation_db_locked)
-          Process.sleep(450)
+          # Must hold the DB owner past the park deadline (budget minus
+          # settlement reserve) so preparation misses, while releasing well
+          # before the full budget so settlement still lands. Process.sleep
+          # only promises a minimum; the gap on each side absorbs the
+          # scheduler overshoot a loaded parallel suite adds, which at the
+          # old 450-in-500 margin recorded zero cleanup outcomes.
+          Process.sleep(1_200)
           :ok
         end)
       end)
