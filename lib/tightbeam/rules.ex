@@ -52,7 +52,7 @@ defmodule Tightbeam.Rules do
     EventLog,
     ObligationFacts,
     Org,
-    ProductOwner,
+    Lineage,
     RailEpisodes,
     RailRemedy,
     RailScript,
@@ -91,7 +91,14 @@ defmodule Tightbeam.Rules do
   @rearm_keys MapSet.new(["recovered_when", "recurred_when"])
   @recurrence_fingerprint ~w(statute target_session subject failure_class failure_code)
   @check_keys MapSet.new(["script", "returns", "timeout_ms", "effects"])
-  @notice_keys MapSet.new(["target_role", "target_session", "prompt"])
+  @notice_keys MapSet.new([
+                 "target_role",
+                 "target_session",
+                 "target_lineage_archetype",
+                 "target_item_card_opener",
+                 "coalesce",
+                 "prompt"
+               ])
   @remedy_keys MapSet.new([
                  "action",
                  "produces",
@@ -107,9 +114,9 @@ defmodule Tightbeam.Rules do
                  "on_rule_denied",
                  "params"
                ])
-  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin caller_key target_key product_owner_key work_owner_key)
+  @binding_tokens ~w(assignment_id work_item_id holder_key holder_role holder_archetype caller_origin caller_key target_key)
   @embedded_fields ~w(subject prompt display)
-  @whole_fields ~w(target_role target_session reviews work_item name harness model effort context archetype host after at)
+  @whole_fields ~w(target_role target_session target_lineage_archetype target_item_card_opener coalesce reviews work_item name harness model effort context archetype host after at)
   @verdict_facts ~w(
     assignment.verdicts
     assignment.independent_verdict_kinds
@@ -388,10 +395,40 @@ defmodule Tightbeam.Rules do
   def resolve_notice_in_txn(%DB.Txn{} = txn, rule, call) do
     bindings = notice_bindings(txn, call)
 
-    with {:ok, resolved} <- RailRemedy.resolve_notice(txn, rule.notice, bindings) do
-      {:ok, Map.put(resolved, :work_item_id, bindings.work_item_id)}
+    with {:ok, notice} <- address_notice(txn, rule.notice, bindings),
+         {:ok, resolved} <- RailRemedy.resolve_notice(txn, notice, bindings) do
+      {:ok,
+       Map.merge(resolved, %{
+         work_item_id: bindings.work_item_id,
+         coalesce: Map.get(rule.notice, :coalesce)
+       })}
     end
   end
+
+  # A notice may name its target by place in the org rather than by session or
+  # role: the nearest session of an archetype along the caller's lineage, or the
+  # opener of the open card an archetype holds on the item. The rule supplies the
+  # archetype; the substrate only knows the tree.
+  defp address_notice(db, %{target_lineage_archetype: archetype} = notice, bindings) do
+    key =
+      Lineage.nearest(db, bindings.caller_key, archetype) ||
+        Lineage.nearest(db, bindings.target_key, archetype) ||
+        Lineage.nearest(db, Lineage.creator_session(db, bindings.work_item_id), archetype)
+
+    case key do
+      nil -> {:error, {:unbound_lineage, archetype}}
+      key -> {:ok, notice |> Map.delete(:target_lineage_archetype) |> Map.put(:target_session, key)}
+    end
+  end
+
+  defp address_notice(db, %{target_item_card_opener: archetype} = notice, bindings) do
+    case Lineage.open_card_opener(db, bindings.work_item_id, archetype) do
+      nil -> {:error, {:unbound_card_opener, archetype}}
+      key -> {:ok, notice |> Map.delete(:target_item_card_opener) |> Map.put(:target_session, key)}
+    end
+  end
+
+  defp address_notice(_db, notice, _bindings), do: {:ok, notice}
 
   defp normalize_predicate_conditions(conditions) when is_list(conditions) do
     Enum.map(conditions, fn
@@ -732,11 +769,7 @@ defmodule Tightbeam.Rules do
       holder_archetype: assignment && assignment.holder_archetype,
       caller_origin: call.origin,
       caller_key: caller_key,
-      target_key: target_key,
-      product_owner_key:
-        ProductOwner.resolve(db, caller_key) || ProductOwner.resolve(db, target_key) ||
-          ProductOwner.resolve(db, ProductOwner.creator_session(db, work_item_id)),
-      work_owner_key: ProductOwner.work_owner(db, work_item_id)
+      target_key: target_key
     }
   end
 
@@ -1130,10 +1163,29 @@ defmodule Tightbeam.Rules do
     unknown = unknown_keys(notice, @notice_keys)
     if unknown != [], do: fail.("notice has unknown keys: #{Enum.join(unknown, ", ")}")
 
-    targets = Enum.filter(~w(target_role target_session), &Map.has_key?(notice, &1))
+    targets =
+      Enum.filter(
+        ~w(target_role target_session target_lineage_archetype target_item_card_opener),
+        &Map.has_key?(notice, &1)
+      )
 
     if length(targets) != 1,
-      do: fail.("notice requires exactly one of target_role or target_session")
+      do:
+        fail.(
+          "notice requires exactly one of target_role, target_session, target_lineage_archetype or target_item_card_opener"
+        )
+
+    for key <- ~w(target_lineage_archetype target_item_card_opener),
+        Map.has_key?(notice, key),
+        not valid_name?(Map.get(notice, key)) do
+      fail.("notice #{key} must be an archetype name")
+    end
+
+    case Map.get(notice, "coalesce") do
+      nil -> :ok
+      "work_item" -> :ok
+      other -> fail.("notice coalesce must be \"work_item\", got #{inspect(other)}")
+    end
 
     prompt = Map.get(notice, "prompt")
 

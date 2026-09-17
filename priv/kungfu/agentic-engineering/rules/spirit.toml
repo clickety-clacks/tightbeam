@@ -11,10 +11,14 @@
 # exists, ask again when it changes, route the objection, block nothing.
 #
 # `transition.fields` names the row fields a row-commit changed; these two rules
-# fire only on the spec pin, not on every write to the item. `{product_owner_key}`
-# is resolved from the caller's lineage (see Tightbeam.ProductOwner). When no
-# single PO resolves the notice is recorded as rule_notice_failed and the verb
-# proceeds.
+# fire only on the spec pin, not on every write to the item. The target is named
+# by place, not by session: `target_lineage_archetype = "product-owner"` asks the
+# substrate for the nearest active product-owner at or alongside the caller's
+# lineage. The substrate knows no archetype by name; this rule supplies it. When
+# no single one resolves the notice is recorded as rule_notice_failed and the
+# verb proceeds. `coalesce = "work_item"` keeps one unread request per item: a
+# newer pin absorbs into it and is recorded as the cause, so the PO judges the
+# pin current when it reads.
 [[rule]]
 name = "spec-pinned-summons-spirit"
 verb = "work-item-create"
@@ -26,7 +30,8 @@ deny_when = [
   { fact = "transition.fields", op = "in", value = ["spec_ref_sha256"] },
 ]
 [rule.notice]
-target_session = "{product_owner_key}"
+target_lineage_archetype = "product-owner"
+coalesce = "work_item"
 prompt = "Spirit rumination requested. Work item {work_item_id} now carries a spec, pinned by {caller_key}. Nothing is waiting on you and nothing is blocked. Read the spec as pinned when you read this, judge it against the product's intent, and record your judgment with the spec hash on a bounded product-owner assignment on this work item: spirit-approved, or changes-requested naming what must change. A changes-requested verdict reaches the current owner of the work by itself."
 
 [[rule]]
@@ -40,13 +45,15 @@ deny_when = [
   { fact = "transition.fields", op = "in", value = ["spec_ref_sha256"] },
 ]
 [rule.notice]
-target_session = "{product_owner_key}"
+target_lineage_archetype = "product-owner"
+coalesce = "work_item"
 prompt = "Spirit rumination requested. The spec on work item {work_item_id} changed, re-pinned by {caller_key}. Any earlier judgment was of the old spec. Nothing is waiting on you and nothing is blocked. Read the spec as pinned when you read this, judge it against the product's intent, and record your judgment with the spec hash on a bounded product-owner assignment on this work item: spirit-approved, or changes-requested naming what must change."
 
 # The objection travels on its own. The product owner's changes-requested is a
 # row write; this production recognizes the committed verdict row and wakes the
-# session that opened the open implementation card on that item, or the item's
-# creator when no implementation exists yet. Row-commit, so it fires on what was
+# session that opened the open coder card on that item, or the item's creator
+# when no implementation exists yet. `target_item_card_opener = "coder"` names
+# that archetype; the substrate answers from the item's open cards. Row-commit, so it fires on what was
 # written, once per verdict, and never refuses the verdict.
 [[rule]]
 name = "spirit-objection-reaches-owner"
@@ -61,5 +68,5 @@ deny_when = [
   { fact = "work_item.has_spec_ref", op = "eq", value = true },
 ]
 [rule.notice]
-target_session = "{work_owner_key}"
+target_item_card_opener = "coder"
 prompt = "Spirit objection on work you own. The product owner {caller_key} recorded changes-requested on {assignment_id} for work item {work_item_id}. Read its note and record your disposition on the affected card: retarget, hold, or contest with evidence. The record is the answer; nothing was stopped for you."

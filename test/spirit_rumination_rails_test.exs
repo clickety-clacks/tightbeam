@@ -16,7 +16,7 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
     EventLog,
     Gateway,
     Identity,
-    ProductOwner,
+    Lineage,
     Roles,
     Rules,
     Wakes,
@@ -98,27 +98,28 @@ defmodule Tightbeam.SpiritRuminationRailsTest do
     end
   end
 
-  describe "the product owner lookup" do
+  describe "the lineage lookup, archetype supplied by the rule" do
     test "walks lineage to the PO alongside the product delivery orchestrator", ctx do
-      assert ProductOwner.resolve(ctx.db, ctx.coder.session_key) == ctx.po.session_key
-      assert ProductOwner.resolve(ctx.db, ctx.lane.session_key) == ctx.po.session_key
-      assert ProductOwner.resolve(ctx.db, ctx.pdo.session_key) == ctx.po.session_key
-      assert ProductOwner.resolve(ctx.db, ctx.po.session_key) == ctx.po.session_key
+      assert Lineage.nearest(ctx.db, ctx.coder.session_key, "product-owner") == ctx.po.session_key
+      assert Lineage.nearest(ctx.db, ctx.lane.session_key, "product-owner") == ctx.po.session_key
+      assert Lineage.nearest(ctx.db, ctx.pdo.session_key, "product-owner") == ctx.po.session_key
+      assert Lineage.nearest(ctx.db, ctx.po.session_key, "product-owner") == ctx.po.session_key
     end
 
     test "answers nil rather than guess when nothing or several resolve", ctx do
-      assert ProductOwner.resolve(ctx.db, ctx.orphan.session_key) == nil
-      assert ProductOwner.resolve(ctx.db, nil) == nil
+      assert Lineage.nearest(ctx.db, ctx.orphan.session_key, "product-owner") == nil
+      assert Lineage.nearest(ctx.db, nil, "product-owner") == nil
+      assert Lineage.nearest(ctx.db, ctx.coder.session_key, "spec-writer") == nil
 
       other_pdo = session(ctx.db, "other-pdo", "orchestrator", ctx.root.session_key)
       first = session(ctx.db, "po-one", "product-owner", other_pdo.session_key)
       _second = session(ctx.db, "po-two", "product-owner", other_pdo.session_key)
       worker = session(ctx.db, "other-coder", "coder", other_pdo.session_key)
 
-      assert ProductOwner.resolve(ctx.db, worker.session_key) == nil
+      assert Lineage.nearest(ctx.db, worker.session_key, "product-owner") == nil
 
       Roles.create!(ctx.db, "product-owner:other", "flynn", first.session_key)
-      assert ProductOwner.resolve(ctx.db, worker.session_key) == first.session_key
+      assert Lineage.nearest(ctx.db, worker.session_key, "product-owner") == first.session_key
     end
   end
 

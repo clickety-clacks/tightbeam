@@ -108,8 +108,8 @@ Spirit rumination returned on 2026-09-17 as a prod, never a gate: a work item ga
 or changing its spec summons the product's PO to judge it, and a PO changes-requested
 on spec-backed work is delivered to the session that owns the work. Nothing blocks.
 The rules are `spec-pinned-summons-spirit`, `spec-repinned-summons-spirit` and
-`spirit-objection-reaches-owner`; the PO is found from lineage by
-`Tightbeam.ProductOwner`. The measured failure of the old deny is recorded in the
+`spirit-objection-reaches-owner`; the PO is addressed by place, `target_lineage_archetype = "product-owner"`, which the
+substrate answers from the tree without knowing the archetype (`Tightbeam.Lineage`). The measured failure of the old deny is recorded in the
 rule file's comment. Sol can manage familiar delivery while Astra or Fable reasons about
 a difficult decomposition. A strong model may own orchestration throughout when
 judgment stays difficult. Each owner can adapt its own subtree within authority;

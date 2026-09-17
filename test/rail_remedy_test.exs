@@ -2304,7 +2304,7 @@ defmodule Tightbeam.RailRemedyTest do
     cases = [
       {String.replace(review_gate(), ~s(subject = "review {assignment_id}"\n), ""),
        "params are missing subject"},
-      {wake_remedy(), "exactly one of target_role or target_session"},
+      {wake_remedy(), "exactly one of target_role, target_session, target_lineage_archetype or target_item_card_opener"},
       {String.replace(spawn_remedy(), ~s(model = "test"\n), ""), "missing model"},
       {String.replace(
          review_gate(),

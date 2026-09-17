@@ -1789,7 +1789,9 @@ defmodule Tightbeam.Wakes do
         origin = "remedy:#{rule.name}"
         work_item_id = Map.get(resolved, :work_item_id)
 
-        case pending_rule_notice_in_txn(txn, origin, resolved.bound_session, work_item_id) do
+        coalesce_key = if Map.get(resolved, :coalesce) == "work_item", do: work_item_id
+
+        case pending_rule_notice_in_txn(txn, origin, resolved.bound_session, coalesce_key) do
           nil ->
             wake =
               schedule_in_txn(txn, %{
@@ -1819,9 +1821,8 @@ defmodule Tightbeam.Wakes do
             :ok
 
           existing_wake_id ->
-            # The target already holds this rule's request about this work item and
-            # has not read it. A second request for the same item would ask twice;
-            # the pending one already says to judge the current state at read time.
+            # The rule declared coalesce = "work_item": the target already holds this
+            # rule's unread request about this item, and a second would ask twice.
             EventLog.lifecycle_in_txn(
               txn,
               "rule_notice_coalesced",
