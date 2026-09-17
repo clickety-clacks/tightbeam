@@ -43,6 +43,9 @@ defmodule Tightbeam.Boot do
   @doc "Run the boot sequence; returns :ignore so no process lingers."
   @spec start_link(String.t()) :: :ignore
   def start_link(base_dir) do
+    # The first thing boot does, before anything reads or writes the base: ask
+    # the DB owner whether this build was admitted to it.
+    :ok = Tightbeam.DB.assert_base_admitted!(Tightbeam.DB, base_dir)
     load_visitor_keyring!(base_dir, Tightbeam.DB, phase: :before_schema)
     ensure_schema!()
     load_visitor_keyring!(base_dir, Tightbeam.DB, phase: :after_schema)

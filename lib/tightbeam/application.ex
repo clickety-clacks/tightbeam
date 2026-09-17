@@ -151,12 +151,17 @@ defmodule Tightbeam.Application do
   @spec children() :: [Supervisor.child_spec() | {module(), term()} | module()]
   def children do
     base_dir = Application.get_env(:tightbeam, :base_dir, default_base_dir())
-    File.mkdir_p!(base_dir)
     db_path = Path.join(base_dir, "state.db")
 
+    # Child-list construction never creates or writes the base. The DB owner
+    # decides admission first, and creates the directory only once this build is
+    # the one that owns it.
     [
       # DB owner first — the serialization seam everything writes through.
-      {Tightbeam.DB, path: db_path, name: Tightbeam.DB},
+      {Tightbeam.DB,
+       path: db_path,
+       name: Tightbeam.DB,
+       guard_inputs: Application.get_env(:tightbeam, :live_base_guard, [])},
       # Schema + boot epoch as a transient one-shot after the DB is up.
       {Tightbeam.Boot, base_dir},
       # Lane naming registry and the task supervisor for turn work.

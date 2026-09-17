@@ -154,6 +154,9 @@ defmodule Tightbeam.Gateway do
       raise ArgumentError, "prod_limit must be an integer >= 0"
     end
 
+    # Nothing below may touch this base until the DB owner says this build is
+    # the one that owns it — including creating the directory.
+    :ok = DB.assert_base_admitted!(db, config.base_dir)
     File.mkdir_p!(config.base_dir)
 
     :ok = Schema.ensure_all(db)

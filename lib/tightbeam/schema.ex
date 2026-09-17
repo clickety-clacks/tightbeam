@@ -1014,6 +1014,30 @@ defmodule Tightbeam.Schema do
     defexception [:message]
   end
 
+  # The stamps this build can read: the current shape and exactly the
+  # predecessors `check_shape/1` names as supported upgrade sources. The head is
+  # the current target. The guard consults this list and never the operator's
+  # input, so an override can only select among shapes this build already
+  # migrates — it cannot declare an unknown one compatible.
+  @doc false
+  def guard_compatible_stamps do
+    [@shape, @artifact_digest_previous_shape, @principal_duty_previous_shape]
+  end
+
+  @doc false
+  def qualify_guard_stamp!(admission, rows) do
+    case rows do
+      [[stamp]] ->
+        case Tightbeam.LiveBaseGuard.qualify_schema(admission, stamp, guard_compatible_stamps()) do
+          :ok -> :ok
+          {:error, refusal} -> raise ShapeError, message: inspect(refusal)
+        end
+
+      _ ->
+        raise ShapeError, message: "invalid guard schema stamp rows: #{inspect(rows)}"
+    end
+  end
+
   @doc """
   Create every production schema in dependency-safe order.
 
@@ -1065,6 +1089,12 @@ defmodule Tightbeam.Schema do
         raise ShapeError,
           message:
             "incompatible_supervision_liveness_v1: additive activation failed: #{Exception.message(error)}"
+    end
+
+    # Migration reached the current shape, so this build may now claim the base.
+    case DB.finish_schema(db) do
+      :ok -> :ok
+      {:error, error} -> raise error
     end
   end
 
@@ -2397,12 +2427,12 @@ defmodule Tightbeam.Schema do
   end
 
   defp ensure_stamp_table(db) do
-    DB.execute(db, """
-    CREATE TABLE IF NOT EXISTS schema_stamp (
-      shape     TEXT PRIMARY KEY,
-      stampedAt INTEGER NOT NULL
-    );
-    """)
+    # The actual DB owner holds admission; callers cannot supply a Boolean.
+    # Revalidation and the first DDL share the owner's BEGIN IMMEDIATE.
+    case DB.prepare_schema(db) do
+      :ok -> :ok
+      {:error, error} -> raise error
+    end
   end
 
   defp check_shape(db) do

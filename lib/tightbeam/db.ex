@@ -166,26 +166,133 @@ defmodule Tightbeam.DB do
 
   ## Server
 
-  @impl true
-  def init(opts) do
-    path = Keyword.fetch!(opts, :path)
-    {:ok, conn} = Sqlite3.open(path)
+  @doc false
+  def prepare_schema(server), do: GenServer.call(server, :prepare_schema)
 
-    for pragma <- [
-          "PRAGMA journal_mode=WAL",
-          "PRAGMA foreign_keys=ON",
-          "PRAGMA synchronous=NORMAL",
-          "PRAGMA busy_timeout=5000"
-        ] do
-      :ok = Sqlite3.execute(conn, pragma)
+  @doc false
+  def finish_schema(server), do: GenServer.call(server, :finish_schema)
+
+  @doc false
+  def assert_base_admitted!(server, base) do
+    case GenServer.call(server, {:assert_base_admitted, base}) do
+      :ok -> :ok
+      {:error, error} -> raise error
     end
-
-    :ok = load_topline_unicode(conn)
-
-    {:ok, %{conn: conn}}
   end
 
   @impl true
+  def init(opts) do
+    path = Keyword.fetch!(opts, :path)
+    {path, admission} = prepare_persistent_admission!(path, opts)
+
+    # Admission is decided BEFORE the base exists, so a build that is not
+    # admitted here never creates the directory it was refused.
+    if admission do
+      _ = Tightbeam.LiveBaseAdmission.revalidate!(admission)
+      File.mkdir_p!(admission.base)
+    end
+
+    {:ok, conn} = Sqlite3.open(path)
+
+    try do
+      for pragma <- [
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA foreign_keys=ON",
+            "PRAGMA synchronous=NORMAL",
+            "PRAGMA busy_timeout=5000"
+          ] do
+        :ok = Sqlite3.execute(conn, pragma)
+      end
+
+      :ok = load_topline_unicode(conn)
+
+      {:ok, %{conn: conn, admission: admission}}
+    rescue
+      error ->
+        :ok = Sqlite3.close(conn)
+        reraise error, __STACKTRACE__
+    end
+  end
+
+  defp prepare_persistent_admission!(":memory:", _opts), do: {":memory:", nil}
+
+  defp prepare_persistent_admission!(path, opts) when is_binary(path) do
+    alias Tightbeam.LiveBaseAdmission
+
+    if String.starts_with?(path, "file:") or Path.basename(path) != "state.db",
+      do: raise(ArgumentError, "persistent DB requires a canonical base/state.db path")
+
+    base = LiveBaseAdmission.canonical!(Path.dirname(Path.expand(path)))
+    payload = LiveBaseAdmission.canonical!(Application.app_dir(:tightbeam))
+    inputs = Keyword.fetch!(opts, :guard_inputs)
+
+    # The operator may supply exactly one thing: the serialized transition being
+    # authorized. Nothing here accepts a verified/admitted flag or a substitute
+    # payload — those are observed, never declared.
+    unless Keyword.keyword?(inputs) and Enum.all?(Keyword.keys(inputs), &(&1 == :transition)),
+      do: raise(ArgumentError, "guard inputs accept only an exact transition")
+
+    admission = LiveBaseAdmission.prepare!(base, Keyword.put(inputs, :payload_root, payload))
+    {Path.join(base, "state.db"), admission}
+  end
+
+  @impl true
+  def handle_call({:assert_base_admitted, base}, _from, state) do
+    unless state.admission && Tightbeam.LiveBaseAdmission.canonical!(base) == state.admission.base,
+      do: raise(ArgumentError, "startup requires this base's persistent DB admission")
+
+    :ok = Tightbeam.LiveBaseAdmission.validate_owned_files!(state.admission)
+    {:reply, :ok, state}
+  rescue
+    error -> {:reply, {:error, error}, state}
+  end
+
+  def handle_call(:finish_schema, _from, %{admission: nil} = state),
+    do: {:reply, :ok, state}
+
+  def handle_call(:finish_schema, _from, %{conn: conn, admission: admission} = state) do
+    rows = run_query(conn, "SELECT shape FROM schema_stamp", [])
+    current = Tightbeam.LiveBaseAdmission.publish_marker!(admission, rows)
+    {:reply, :ok, %{state | admission: current}}
+  rescue
+    error -> {:reply, {:error, error}, state}
+  end
+
+  # Refuse migration, not just boot. The guard inspected the stamp read-only and
+  # outside any transaction; this recheck happens inside the writer's own
+  # BEGIN IMMEDIATE, so a stamp that changed in between is reported rather than
+  # migrated over.
+  def handle_call(:prepare_schema, _from, %{conn: conn, admission: admission} = state) do
+    :ok = Sqlite3.execute(conn, "BEGIN IMMEDIATE")
+
+    try do
+      if admission && admission.stamp != :fresh do
+        rows = run_query(conn, "SELECT shape FROM schema_stamp", [])
+
+        unless rows == admission.stamp,
+          do:
+            raise(Tightbeam.Schema.ShapeError, message: "schema changed after guarded inspection")
+
+        :ok = Tightbeam.Schema.qualify_guard_stamp!(admission.decision, rows)
+      end
+
+      :ok =
+        Sqlite3.execute(conn, """
+        CREATE TABLE IF NOT EXISTS schema_stamp (
+          shape TEXT PRIMARY KEY,
+          stampedAt INTEGER NOT NULL
+        );
+        """)
+
+      :ok = Sqlite3.execute(conn, "COMMIT")
+      {:reply, :ok, state}
+    rescue
+      error ->
+        :ok = Sqlite3.execute(conn, "ROLLBACK")
+        {:reply, {:error, error}, state}
+    end
+  end
+
   def handle_call({:query, sql, params}, _from, %{conn: conn} = state) do
     {:reply, {:ok, run_query(conn, sql, params)}, state}
   rescue
