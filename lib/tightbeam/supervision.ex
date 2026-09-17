@@ -1543,7 +1543,8 @@ defmodule Tightbeam.Supervision do
   #
   # ADDING A STEP (the lease — all four lines, or the shift rejects you):
   #   1. Add the atom HERE, in its semantically correct position.
-  #   2. Add a `turn_end_step/2` clause returning `:cont` or `{:halt, result}`.
+  #   2. Add a `turn_end_step/2` clause returning `:cont`, `{:cont, ctx}` to
+  #      hand an updated context to the steps after you, or `{:halt, result}`.
   #      Read state freely; any write must be idempotent (the terminal cast
   #      can be redelivered) and must NOT move the watermark — the watermark
   #      has ONE writer, the acting step that ends the shift.
@@ -1838,12 +1839,20 @@ defmodule Tightbeam.Supervision do
              ) do
           [] ->
             # An open obligation with no entitlement row: the ladder has nothing
-            # to claim, and only a new basis can change that. This was the one
-            # branch that returned without a watermark, so the assignment stayed
-            # eligible and every tick re-ran the whole shift, re-adjudicated the
-            # rail to the same :allow, and appended another identical
-            # rail_sweep(decision=none) row — 1,059,688 of them on one host,
-            # 100% decision none (GH #23). Marking it evaluated ends the
+            # to claim. Marking it evaluated does not cost it supervision, and
+            # the reason is claim_due_in_txn, not anything about how it later
+            # gets armed: the deadline path (liveness_cycle -> claim_due_in_txn)
+            # joins entitlements, assignments and sessions and never reads
+            # supervision_watermarks, so whichever site inserts the armed row,
+            # the next tick claims it with no new terminal required. The sibling
+            # branches below have relied on that all along — :not_due watermarks
+            # an obligation that is still owed its prod.
+            #
+            # This was the one branch that returned without a watermark, so the
+            # assignment stayed eligible and every tick re-ran the whole shift,
+            # re-adjudicated the rail to the same :allow, and appended another
+            # identical rail_sweep(decision=none) row — 1,059,688 of them on one
+            # host, 100% decision none (GH #23). Marking it evaluated ends the
             # repetition, not the record: the first pass still writes the row,
             # and a later terminal is evaluated normally.
             #
