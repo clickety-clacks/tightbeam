@@ -1,5 +1,8 @@
 defmodule Tightbeam.HarnessPiTest do
-  use Tightbeam.TestCase, async: true
+  # Not async: Tightbeam.TestCase registers Tightbeam.RailEpisodes and
+  # Tightbeam.TurnObservations under their module names in every test's setup,
+  # so two concurrent tests under this template race for one global name.
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Harness.Pi
 
