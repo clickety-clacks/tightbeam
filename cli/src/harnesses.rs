@@ -45,6 +45,7 @@ fn parse(encoded: &str) -> Result<HarnessCatalog, String> {
     let rows: Vec<Value> = serde_json::from_str(encoded).map_err(|error| error.to_string())?;
     let harnesses = rows
         .into_iter()
+        .filter(|row| row.get("enabled").and_then(Value::as_bool) != Some(false))
         .map(|row| {
             let string = |key: &str| {
                 row.get(key)

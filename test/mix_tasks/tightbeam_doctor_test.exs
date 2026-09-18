@@ -34,6 +34,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
        %{
          "claude" => [entry("claude-live", ["medium"])],
          "codex" => [entry("codex-live", ["high"])],
+         "cursor" => [entry("auto", [])],
          "pi" => [entry("opencode-go/gpt-5.6-luna", ["medium"])],
          "fixture" => [entry("fixture-model", [])]
        }}
@@ -157,6 +158,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     probe = fn
       :claude, _cli_bin -> {:ok, %{bin: "/fake/claude", version: "claude 1.0"}}
       :codex, _cli_bin -> {:error, :not_found}
+      :cursor, _cli_bin -> {:error, :not_found}
       :pi, _cli_bin -> {:error, :not_found}
       :fixture, _cli_bin -> {:error, :not_found}
     end
@@ -328,7 +330,10 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
              storage: "file"
            }
 
-    refute Doctor.format(report, :human) =~ "PAT"
+    # Word-boundary match: the report legitimately prints filesystem paths, and
+    # a random temp dir name can embed the substring (observed live in CI:
+    # `…0PATJgI2…`). The assertion is about the WORD "PAT", not those bytes.
+    refute Doctor.format(report, :human) =~ ~r/\bPAT\b/
   end
 
   test "github auth failure names onboarding repair and never asks for a PAT", ctx do
@@ -442,6 +447,7 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     probe = fn
       :claude, _cli_bin -> {:ok, %{bin: "/fake/claude", version: "claude 1.0"}}
       :codex, _cli_bin -> {:error, {:exec_failed, "node: not found"}}
+      :cursor, _cli_bin -> {:ok, %{bin: "/fake/cursor", version: "cursor 1.0"}}
       :pi, _cli_bin -> {:ok, %{bin: "/fake/pi", version: "pi 1.0"}}
       :fixture, _cli_bin -> {:ok, %{bin: "/fake/fixture", version: "fixture 1.0"}}
     end

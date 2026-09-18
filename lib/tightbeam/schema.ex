@@ -283,8 +283,10 @@ defmodule Tightbeam.Schema do
   @pre_liveness_identity_shape "identity-universal-root-render-pre-liveness-v1-019"
   @row_driven_waits_previous_shape "row-driven-rules-v1-019"
   @row_driven_rules_previous_shape "liveness-progress-receipts-v1-019"
-  @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @pi_shape "pi-providers-artifact-content-v1-019"
+  @cursor_provider_shape "cursor-provider-v1-020"
+  @cursor_provider_previous_shape @pi_shape
+  @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -303,6 +305,24 @@ defmodule Tightbeam.Schema do
   CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
   CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
   """
+
+  @cursor_session_columns "sessionKey,displayName,kind,orderIndex,isBuiltIn,adopted," <>
+                            "ownerUserId,origin,spawnedBy,handle,archetype,overrides," <>
+                            "identityName,identityRevision,identityRenderContract," <>
+                            "identityGuidanceDigest,cliToken,harness,provider,model," <>
+                            "thinkingLevel,modelContext,host,clearedThroughSeq,state,createdAt,updatedAt," <>
+                            "mechanicalStatus"
+  @cursor_marker_columns "id,kind,principal,subagentRef,sourceEventRef,harness,at,assignmentId"
+  @cursor_provider_values "'anthropic','openai','cursor','opencode_go','local_openai'" <>
+                            if(
+                              Application.compile_env(
+                                :tightbeam,
+                                :fixture_harness,
+                                false
+                              ),
+                              do: ",'fixture_provider'",
+                              else: ""
+                            )
 
   # Exact target for the one stamped predecessor. Legacy wakes acquire no
   # classification or batching state: every old row copies with NULL class
@@ -1257,6 +1277,7 @@ defmodule Tightbeam.Schema do
   @doc false
   def guard_compatible_stamps do
     [
+      @cursor_provider_shape,
       @pi_shape,
       @durability_shape,
       @reparent_shape,
@@ -1349,6 +1370,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_session_reparent(db)
     :ok = upgrade_artifact_durability(db)
     :ok = upgrade_pi_providers(db)
+    :ok = upgrade_cursor_provider_v1_020(db)
     Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
 
@@ -1416,7 +1438,7 @@ defmodule Tightbeam.Schema do
     [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
     enforcement_objects =
-      if shape in [@reparent_shape, @durability_shape, @pi_shape],
+      if shape in [@reparent_shape, @durability_shape, @pi_shape, @cursor_provider_shape],
         do: reparent_liveness_enforcement_objects(),
         else: @supervision_liveness_enforcement_objects
 
@@ -1931,6 +1953,9 @@ defmodule Tightbeam.Schema do
 
   defp check_shape(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cursor_provider_shape]]} ->
+        :ok
+
       {:ok, [[@pi_shape]]} ->
         :ok
 
@@ -2019,15 +2044,17 @@ defmodule Tightbeam.Schema do
         this Tightbeam database was written by a different build.
 
           stamped: #{found}
-          this build: #{@pi_shape}
+          this build: #{@cursor_provider_shape}
 
         This build can migrate #{@model_identity_shape} or #{@operator_decision_shape}
         to #{@terminal_decision_liveness_shape}, then #{@effort_request_exit_previous_shape}.
         It can migrate #{@terminal_decision_shape} through
         #{@effort_request_exit_previous_shape} to #{@row_driven_waits_previous_shape},
-        then #{@shape}. It can also migrate
+        then #{@shape}, #{@o2_shape}, #{@r1_shape}, #{@firehose_shape}, and
+        #{@cursor_provider_shape}.
+        It can also migrate
         #{@effort_request_exit_previous_shape} to #{@effort_request_exit_shape},
-        then #{@shape}.
+        then through the same row-driven chain to #{@cursor_provider_shape}.
 
         No migration is defined for the stamped shape above. Keep the database
         in place and run a Tightbeam build that recognizes that exact stamp.
@@ -2041,7 +2068,7 @@ defmodule Tightbeam.Schema do
         this Tightbeam database carries MORE THAN ONE shape stamp.
 
           stamped: #{rows |> List.flatten() |> Enum.join(", ")}
-          this build: #{@pi_shape}
+          this build: #{@cursor_provider_shape}
 
         Nothing in Tightbeam writes a second stamp, so this database was
         assembled by something else. Move it aside and let it be recreated.
@@ -2056,6 +2083,9 @@ defmodule Tightbeam.Schema do
   defp upgrade_r1(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@cursor_provider_shape]] ->
+               :ok
+
              [[stamp]]
              when stamp in [
                     @pi_shape,
@@ -2108,6 +2138,9 @@ defmodule Tightbeam.Schema do
   @doc false
   def upgrade_firehose_r1(db, opts \\ []) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cursor_provider_shape]]} ->
+        :ok
+
       {:ok, [[stamp]]}
       when stamp in [@pi_shape, @durability_shape, @reparent_shape, @firehose_shape] ->
         :ok
@@ -2183,6 +2216,9 @@ defmodule Tightbeam.Schema do
   def upgrade_session_reparent(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@cursor_provider_shape]] ->
+               :ok
+
              [[@pi_shape]] ->
                :ok
 
@@ -2232,6 +2268,9 @@ defmodule Tightbeam.Schema do
   def upgrade_artifact_durability(db) do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
+             [[@cursor_provider_shape]] ->
+               validate_artifact_content_schema!(txn)
+
              [[@pi_shape]] ->
                validate_artifact_content_schema!(txn)
 
@@ -2309,6 +2348,9 @@ defmodule Tightbeam.Schema do
 
   defp upgrade_o2(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cursor_provider_shape]]} ->
+        :ok
+
       {:ok, [[@pi_shape]]} ->
         :ok
 
@@ -3331,6 +3373,7 @@ defmodule Tightbeam.Schema do
 
   defp upgrade_pi_providers(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cursor_provider_shape]]} -> :ok
       {:ok, [[@pi_shape]]} -> :ok
       {:ok, [[@durability_shape]]} -> migrate_sessions_provider_shape(db, @durability_shape)
       rows -> raise ShapeError, message: "incompatible Pi provider predecessor: #{inspect(rows)}"
@@ -3468,6 +3511,190 @@ defmodule Tightbeam.Schema do
       updatedAt     INTEGER NOT NULL
     );
     """
+  end
+
+  defp upgrade_cursor_provider_v1_020(db) do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cursor_provider_shape]]} ->
+        :ok
+
+      {:ok, [[@cursor_provider_previous_shape]]} ->
+        migrate_cursor_provider_v1_020(db)
+
+      other ->
+        raise ShapeError, message: "incompatible Cursor-provider predecessor: #{inspect(other)}"
+    end
+  end
+
+  defp migrate_cursor_provider_v1_020(db) do
+    {:ok, [[legacy_alter_table]]} = DB.query(db, "PRAGMA legacy_alter_table")
+    :ok = DB.execute(db, "PRAGMA foreign_keys = OFF")
+    # The current schema has triggers on other tables that reference sessions.
+    # Preserve their source-owned references during the table swap.
+    :ok = DB.execute(db, "PRAGMA legacy_alter_table = ON")
+
+    try do
+      case DB.transaction(db, &migrate_cursor_provider_v1_020_in_txn/1) do
+        {:ok, :ok} ->
+          :ok
+
+        {:error, %ShapeError{} = error} ->
+          raise error
+
+        {:error, error} ->
+          raise ShapeError,
+            message:
+              "migration #{@cursor_provider_previous_shape} -> #{@cursor_provider_shape} failed and was rolled back: #{Exception.message(error)}"
+      end
+    after
+      :ok = DB.execute(db, "PRAGMA legacy_alter_table = #{legacy_alter_table}")
+      :ok = DB.execute(db, "PRAGMA foreign_keys = ON")
+    end
+  end
+
+  defp migrate_cursor_provider_v1_020_in_txn(%Txn{} = txn) do
+    harnesses = Enum.map_join(Tightbeam.Harness.known(), ",", &"'#{&1.wire_name()}'")
+
+    session_ddl = """
+    CREATE TABLE sessions_cursor_provider_v1_020 (
+      sessionKey TEXT PRIMARY KEY, displayName TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'custom' CHECK (kind IN ('main','dm','custom')),
+      orderIndex INTEGER NOT NULL DEFAULT 0, isBuiltIn INTEGER NOT NULL DEFAULT 0,
+      adopted INTEGER NOT NULL DEFAULT 0, ownerUserId TEXT NOT NULL, origin TEXT NOT NULL,
+      spawnedBy TEXT, handle TEXT UNIQUE, archetype TEXT NOT NULL, overrides TEXT,
+      identityName TEXT, identityRevision TEXT, identityRenderContract TEXT,
+      identityGuidanceDigest TEXT, cliToken TEXT,
+      harness TEXT NOT NULL CHECK (harness IN (#{harnesses})),
+      provider TEXT NOT NULL CHECK (provider IN (#{@cursor_provider_values})),
+      model TEXT NOT NULL, thinkingLevel TEXT, modelContext TEXT,
+      host TEXT NOT NULL DEFAULT 'local', clearedThroughSeq INTEGER NOT NULL DEFAULT 0,
+      state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active','retired')),
+      createdAt INTEGER NOT NULL, updatedAt INTEGER NOT NULL,
+      mechanicalStatus TEXT NOT NULL DEFAULT 'idle'
+        CHECK (mechanicalStatus IN ('idle','running'))
+    )
+    """
+
+    marker_ddl = """
+    CREATE TABLE subagent_markers_cursor_provider_v1_020 (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind TEXT NOT NULL CHECK (kind IN ('subagent_start','subagent_stop')),
+      principal TEXT NOT NULL REFERENCES sessions(sessionKey),
+      subagentRef TEXT NOT NULL, sourceEventRef TEXT NOT NULL,
+      harness TEXT NOT NULL CHECK (harness IN (#{harnesses})),
+      at INTEGER NOT NULL, assignmentId TEXT, UNIQUE (kind, sourceEventRef)
+    )
+    """
+
+    [[session_count]] = Txn.q(txn, "SELECT COUNT(*) FROM sessions")
+    [[marker_count]] = Txn.q(txn, "SELECT COUNT(*) FROM subagent_markers")
+
+    marker_sequence =
+      case Txn.q(txn, "SELECT seq FROM sqlite_sequence WHERE name='subagent_markers'") do
+        [] -> 0
+        [[sequence]] -> sequence
+      end
+
+    :ok = Txn.exec(txn, session_ddl)
+    :ok = Txn.exec(txn, marker_ddl)
+
+    copy_exact_table!(
+      txn,
+      "sessions",
+      "sessions_cursor_provider_v1_020",
+      @cursor_session_columns,
+      session_count
+    )
+
+    copy_exact_table!(
+      txn,
+      "subagent_markers",
+      "subagent_markers_cursor_provider_v1_020",
+      @cursor_marker_columns,
+      marker_count
+    )
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        DROP INDEX IF EXISTS subagent_markers_one_stop;
+        DROP INDEX IF EXISTS subagent_markers_principal;
+        DROP TABLE subagent_markers;
+        DROP INDEX IF EXISTS sessions_owner;
+        DROP INDEX IF EXISTS sessions_cli_token;
+        DROP TABLE sessions;
+        ALTER TABLE sessions_cursor_provider_v1_020 RENAME TO sessions;
+        ALTER TABLE subagent_markers_cursor_provider_v1_020 RENAME TO subagent_markers;
+        CREATE INDEX sessions_owner ON sessions (ownerUserId, state);
+        CREATE UNIQUE INDEX sessions_cli_token ON sessions(cliToken);
+        CREATE UNIQUE INDEX subagent_markers_one_stop
+          ON subagent_markers (subagentRef) WHERE kind = 'subagent_stop';
+        CREATE INDEX subagent_markers_principal
+          ON subagent_markers (principal, id);
+        """
+      )
+
+    [[rebuilt_marker_sequence]] =
+      Txn.q(txn, "SELECT COALESCE(MAX(id), 0) FROM subagent_markers")
+
+    marker_sequence = max(marker_sequence, rebuilt_marker_sequence)
+
+    Txn.q(txn, "UPDATE sqlite_sequence SET seq=?1 WHERE name='subagent_markers'", [
+      marker_sequence
+    ])
+
+    if Txn.changes(txn) == 0 do
+      Txn.q(txn, "INSERT INTO sqlite_sequence(name, seq) VALUES ('subagent_markers', ?1)", [
+        marker_sequence
+      ])
+    end
+
+    case Txn.q(txn, "PRAGMA foreign_key_check") do
+      [] -> :ok
+      rows -> incompatible_cursor_provider!("left invalid foreign keys: #{inspect(rows)}")
+    end
+
+    Txn.q(txn, "UPDATE schema_stamp SET shape=?1, stampedAt=?2 WHERE shape=?3", [
+      @cursor_provider_shape,
+      System.system_time(:millisecond),
+      @cursor_provider_previous_shape
+    ])
+
+    if Txn.changes(txn) != 1,
+      do: incompatible_cursor_provider!("lost its exact stamp transition")
+
+    :ok
+  end
+
+  defp copy_exact_table!(txn, source, target, columns, expected_count) do
+    Txn.q(txn, "INSERT INTO #{target} (#{columns}) SELECT #{columns} FROM #{source}")
+
+    if Txn.changes(txn) != expected_count,
+      do:
+        incompatible_cursor_provider!(
+          "copied #{Txn.changes(txn)} of #{expected_count} rows from #{source}"
+        )
+
+    case Txn.q(
+           txn,
+           "SELECT #{columns} FROM #{source} EXCEPT SELECT #{columns} FROM #{target}"
+         ) do
+      [] -> :ok
+      rows -> incompatible_cursor_provider!("changed #{source} rows: #{inspect(rows)}")
+    end
+
+    case Txn.q(
+           txn,
+           "SELECT #{columns} FROM #{target} EXCEPT SELECT #{columns} FROM #{source}"
+         ) do
+      [] -> :ok
+      rows -> incompatible_cursor_provider!("invented #{target} rows: #{inspect(rows)}")
+    end
+  end
+
+  defp incompatible_cursor_provider!(detail) do
+    raise ShapeError, message: "incompatible_cursor_provider_v1_020: #{detail}"
   end
 
   # A FRESH DATABASE MUST NEVER BE REFUSED, which is why the stamp is written

@@ -10,6 +10,8 @@ use std::process::{ChildStdout, Command as ProcessCommand, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
+
 use crate::args::{AssimilateArgs, Identity};
 use crate::child_process::{
     RunError, Supervised, exited_without_reaping, nonblocking, reset_sigchld_before_spawn,
@@ -135,12 +137,50 @@ where
     S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
     H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
 {
+    onboard_with_cursor_prerequisite_and_provisioning(
+        identity,
+        provider,
+        api_key,
+        daemon_credential,
+        local_endpoint,
+        provider_name,
+        endpoint,
+        send_request,
+        load_harnesses,
+        crate::cursor_execution_identity::require_onboard_prerequisite,
+        dispatch::provisioned(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn onboard_with_cursor_prerequisite_and_provisioning<S, H, P>(
+    identity: &Identity,
+    provider: &str,
+    api_key: bool,
+    daemon_credential: bool,
+    local_endpoint: Option<&str>,
+    provider_name: Option<&str>,
+    endpoint: &Endpoint,
+    send_request: S,
+    load_harnesses: H,
+    cursor_prerequisite: P,
+    provisioned: dispatch::Provisioned,
+) -> Result<(), String>
+where
+    S: Fn(&Endpoint, &RequestSpec, Option<Instant>) -> Result<Option<serde_json::Value>, String>,
+    H: Fn(&Endpoint, Instant) -> Result<Option<HarnessCatalog>, String>,
+    P: Fn(&str) -> Result<(), String>,
+{
     let machine = onboard_machine(
         std::env::var("TIGHTBEAM_MACHINE")
             .ok()
             .filter(|name| !name.is_empty()),
-        dispatch::provisioned(),
+        provisioned,
     )?;
+    if provider == "cursor" {
+        let cursor_machine = machine.clone().unwrap_or_else(this_host);
+        cursor_prerequisite(&cursor_machine)?;
+    }
     onboard_for_machine(
         identity,
         provider,
@@ -902,6 +942,7 @@ fn run_api_key_onboarding(
     match provider {
         "openai" => bank_openai_api_key(staging, &key, ceremony),
         "anthropic" => bank_anthropic_api_key(staging, &key),
+        "cursor" => bank_cursor_api_key(staging, &key),
         "opencode-go" => bank_opencode_go_api_key(staging, &key),
         #[cfg(test)]
         "fixture-provider" => fs::write(std::path::Path::new(staging).join("fixture.json"), &key)
@@ -943,6 +984,10 @@ fn read_api_key_from(reader: &mut impl io::Read) -> Result<String, String> {
 /// `unnamed_machine`.
 fn api_key_needs_a_pipe(provider: &str) -> String {
     let (variable, command) = match provider {
+        "cursor" => (
+            "CURSOR_API_KEY",
+            format!("tightbeam onboard {provider} --api-key"),
+        ),
         "openai" => (
             "OPENAI_API_KEY",
             format!("tightbeam onboard {provider} --api-key"),
@@ -1034,6 +1079,14 @@ fn validate_api_key_with_timeout(
             .get("https://api.openai.com/v1/models")
             .set("authorization", &format!("Bearer {key}"))
             .call(),
+        // Cursor documents /v0/me with HTTP Basic authentication: the API key
+        // is the username and the password is empty. A rejected key still comes
+        // back HTTP 401, handled by the shared Status(..) arm below exactly as
+        // anthropic/openai are.
+        "cursor" => {
+            let (url, (name, value)) = cursor_api_key_probe(key);
+            agent.get(url).set(name, &value).call()
+        }
         "opencode-go" => {
             let request_id = opencode_go_validation_request_id();
             agent
@@ -1070,6 +1123,14 @@ fn validate_api_key_with_timeout(
             Err(unvalidated_api_key(provider, &error.to_string(), host))
         }
     }
+}
+
+fn cursor_api_key_probe(key: &str) -> (&'static str, (&'static str, String)) {
+    let credentials = base64::engine::general_purpose::STANDARD.encode(format!("{key}:"));
+    (
+        "https://api.cursor.com/v0/me",
+        ("authorization", format!("Basic {credentials}")),
+    )
 }
 
 /// Let codex write its own `auth.json`.
@@ -1159,6 +1220,25 @@ fn codex_staged_a_credential(status: ExitStatus, staging: &str, what: &str) -> R
 /// kinds; only the recorded kind differs.
 fn bank_anthropic_api_key(staging: &str, key: &str) -> Result<(), String> {
     let path = std::path::Path::new(staging).join(".credentials.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))?;
+    file.write_all(key.as_bytes())
+        .map_err(|error| format!("could not stage the API key at {}: {error}", path.display()))
+}
+
+/// Cursor, like anthropic, has no CLI login affordance a headless host can drive
+/// -- cursor-agent takes its key ONLY from the CURSOR_API_KEY environment
+/// variable -- so the validated key is staged directly, at 0600, under the
+/// `api-key` name the gateway's cursor install reads (credentials.ex
+/// `staged_path(:cursor, _)`). The bytes are the bare key; the harness injects
+/// them as CURSOR_API_KEY at spawn, so nothing downstream links this into a home.
+fn bank_cursor_api_key(staging: &str, key: &str) -> Result<(), String> {
+    let path = std::path::Path::new(staging).join("api-key");
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -2536,6 +2616,31 @@ fn target_from_probe(output: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cursor_prerequisite_refuses_before_the_gateway_begins_or_reads_a_key() {
+        let endpoint = Endpoint {
+            base: "http://unused.invalid".to_owned(),
+            token: "unused".to_owned(),
+            origin: crate::dispatch::Origin::Provisioned,
+        };
+        let error = onboard_with_cursor_prerequisite_and_provisioning(
+            &Identity::User("operator".to_owned()),
+            "cursor",
+            true,
+            false,
+            None,
+            None,
+            &endpoint,
+            |_, _, _| panic!("gateway begin must not run before the prerequisite"),
+            |_, _| panic!("harness lookup must not run before the prerequisite"),
+            |_| Err("dedicated Cursor identity is absent".to_owned()),
+            dispatch::Provisioned::GatewayHost,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "dedicated Cursor identity is absent");
+    }
+
     /// Serializes the tests that drive `emit_delivery`, because `write_delivery_file` writes into
     /// the process-wide current directory (the shared crate root under `cargo test`) and each such
     /// test globs + deletes `onboard-delivery-openai-*.json` to clean up. Without this lock two of
@@ -2605,11 +2710,20 @@ mod tests {
     /// guessing at an invocation that does not exist anywhere else.
     #[test]
     fn refusing_a_terminal_names_the_pipe_form() {
-        let message = api_key_needs_a_pipe("anthropic");
+        let anthropic = api_key_needs_a_pipe("anthropic");
+        assert!(anthropic.contains("printenv ANTHROPIC_API_KEY"));
+        assert!(anthropic.contains("tightbeam onboard anthropic --api-key"));
+        assert!(anthropic.contains("scrollback"));
 
-        assert!(message.contains("printenv"));
-        assert!(message.contains("--api-key"));
-        assert!(message.contains("scrollback"));
+        let cursor = api_key_needs_a_pipe("cursor");
+        assert!(cursor.contains("printenv CURSOR_API_KEY"));
+        assert!(cursor.contains("tightbeam onboard cursor --api-key"));
+        assert!(!cursor.contains("anthropic"));
+
+        let openai = api_key_needs_a_pipe("openai");
+        assert!(openai.contains("printenv OPENAI_API_KEY"));
+        assert!(openai.contains("tightbeam onboard openai --api-key"));
+        assert!(!openai.contains("anthropic"));
     }
 
     #[test]
@@ -2709,6 +2823,20 @@ mod tests {
             !names.contains(&"x-api-key"),
             "x-api-key is the OTHER kind's header"
         );
+    }
+
+    /// Cursor's documented user-key probe is GET /v0/me with the key as the
+    /// Basic-auth username and an empty password. The old /v1/me Bearer probe
+    /// returned the same 401 body for several invalid shapes, so a generic 401
+    /// fixture could not detect this request-shape regression.
+    #[test]
+    fn a_cursor_api_key_uses_the_documented_basic_auth_probe() {
+        let (url, (name, value)) = cursor_api_key_probe("cur-test-key");
+
+        assert_eq!(url, "https://api.cursor.com/v0/me");
+        assert_eq!(name, "authorization");
+        assert_eq!(value, "Basic Y3VyLXRlc3Qta2V5Og==");
+        assert!(!value.contains("Bearer"));
     }
 
     /// The refusal a truncated capture earns. Recorded signature: a bearer route answers
@@ -2811,6 +2939,49 @@ mod tests {
 
         let staged = staging.join(filename);
         assert_eq!(fs::read_to_string(&staged).unwrap(), "sk-ant-api03-test");
+        let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = fs::remove_dir_all(&staging);
+    }
+
+    /// The same cross-language contract for cursor: the bare key is staged at
+    /// 0600 under a filename the Elixir gateway's `staged_credential(:cursor, _)`
+    /// reads. Cursor has no CLI login, so this direct stage IS the ceremony's
+    /// whole banking leg — if the filename drifts from the gateway's, the key is
+    /// staged where nothing installs it and onboarding fails silently.
+    #[test]
+    fn a_cursor_api_key_stages_a_filename_the_gateway_accepts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let staging = std::env::temp_dir().join(format!(
+            "tightbeam-api-key-stage-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).unwrap();
+
+        bank_cursor_api_key(staging.to_str().unwrap(), "cur-test-key").unwrap();
+
+        let entries = fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the ceremony must stage exactly one credential"
+        );
+        let filename = &entries[0];
+        let gateway = include_str!("../../lib/tightbeam/credentials.ex");
+        assert!(
+            gateway.contains(&format!("File.read(Path.join(path, \"{filename}\"))")),
+            "Rust staged {filename}, but the Elixir gateway does not read that filename"
+        );
+
+        let staged = staging.join(filename);
+        assert_eq!(fs::read_to_string(&staged).unwrap(), "cur-test-key");
         let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
 

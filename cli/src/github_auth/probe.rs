@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::bank::Gh;
+use super::bank::{BankLayout, Gh};
 use super::redact::Scrubbed;
 use super::{GithubState, GithubStatus, gh_config_dir};
 
@@ -75,9 +75,11 @@ pub(super) fn onboard_with(
 
     // gh may have created or reused files with an operator umask. Onboarding
     // cannot report success until every banked directory and file has the
-    // capability's 0700/0600 modes.
+    // bank layout's modes: operator-only 0700/0600, or — on a host provisioned
+    // for the dedicated Cursor identity — the workspace grant's 0710/0750/0640,
+    // which credential rotation must never revoke.
     gh.secure_banked_files()?;
-    write_metadata(base_dir, &status)?;
+    write_metadata(base_dir, &status, gh.bank_layout())?;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -346,16 +348,23 @@ fn metadata_path(base_dir: &Path, hostname: &str) -> PathBuf {
         .join("capability.json")
 }
 
-fn write_metadata(base_dir: &Path, status: &GithubStatus) -> Result<(), String> {
+fn write_metadata(
+    base_dir: &Path,
+    status: &GithubStatus,
+    layout: BankLayout,
+) -> Result<(), String> {
     let path = metadata_path(base_dir, &status.hostname);
     let parent = path
         .parent()
         .ok_or_else(|| format!("metadata path has no parent: {}", path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    // The traversal dirs keep the bank layout (a provisioned host grants
+    // them 0710); the metadata dirs are operator-only regardless.
+    for dir in [base_dir.join("auth"), base_dir.join("auth").join("github")] {
+        layout.apply(&dir, layout.traversal_mode())?;
+    }
     for dir in [
-        base_dir.join("auth"),
-        base_dir.join("auth").join("github"),
         base_dir.join("auth").join("github").join(&status.hostname),
         parent.to_path_buf(),
     ] {

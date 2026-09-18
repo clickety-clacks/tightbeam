@@ -110,6 +110,35 @@ defmodule Tightbeam.LaneTest do
            end)
   end
 
+  test "a coded refusal crosses the lane as stable JSON instead of inspected Elixir", ctx do
+    enqueue!(ctx.db, "k1", "refuse")
+
+    refusal = %{
+      code: "DIV-CURSOR-API-KEY-ONLY",
+      message: "Cursor requires a banked API key"
+    }
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: fn _turn -> {:error, refusal} end,
+        interval: 60_000,
+        name: :coded_refusal_lane_manager
+      )
+
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+    assert {:ok, [["failed", encoded]]} = DB.query(ctx.db, "SELECT status,error FROM turns")
+
+    assert JSON.decode!(encoded) == %{
+             "code" => "DIV-CURSOR-API-KEY-ONLY",
+             "message" => "Cursor requires a banked API key"
+           }
+
+    refute encoded =~ "%{"
+  end
+
   test "reconciler starts a lane for committed work with NO doorbell (liveness)", ctx do
     {:ok, agent} = Agent.start_link(fn -> [] end)
     # commit work, then start the manager — no nudge was ever sent

@@ -1,5 +1,5 @@
 defmodule Tightbeam.HarnessPiTest do
-  use Tightbeam.TestCase, async: true
+  use Tightbeam.TestCase, async: false
 
   alias Tightbeam.Harness.Pi
 
