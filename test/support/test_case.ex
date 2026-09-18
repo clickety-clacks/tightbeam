@@ -47,7 +47,27 @@ defmodule Tightbeam.TestCase do
     {Tightbeam.Application, :draining}
   ]
 
-  using do
+  # `async: true` is unsound under this template, not merely risky. The `setup`
+  # below registers Tightbeam.RailEpisodes and Tightbeam.TurnObservations under
+  # their module names, so two tests running at once contend for one global name
+  # and the loser fails every test in its module with {:already_started, ...}.
+  # Whether they overlap is an ExUnit ordering accident, so a green run does not
+  # show a module is safe. Refuse it where it is written instead of leaving the
+  # trap armed for the next module that opts in.
+  using case_opts do
+    if is_list(case_opts) and Keyword.get(case_opts, :async) == true do
+      raise ArgumentError, """
+      Tightbeam.TestCase does not support `async: true`.
+
+      Its setup registers Tightbeam.RailEpisodes and Tightbeam.TurnObservations
+      under their module names, so concurrent tests race for one global name and
+      the loser fails with {:already_started, ...}.
+
+      Use `async: false`. Making this template safe for concurrency means the two
+      singletons stop being globally named, which changes their call sites.
+      """
+    end
+
     quote do
       import Tightbeam.TestCase,
         only: [
