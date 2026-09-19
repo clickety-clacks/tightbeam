@@ -33,9 +33,8 @@ and relevant evidence, and leave unrelated history out. Use preferred-models for
 frugal selection by expected total cost, including supervision, repeated context,
 corrective work, idle roles and possible cache reuse.
 
-Compose the elected archetypes first: orchestrator, product-owner, spec-writer, coder,
-reviewer-code, reviewer-spec, recon, guidance-writer, guidance-reviewer and integrator.
-Vary their number, scope, model, effort and lifetime. A new archetype needs a distinct
+Compose from the archetype roster in your guidance: one job per archetype, chosen for
+what it produces. Vary their number, scope, model, effort and lifetime. A new archetype needs a distinct
 reusable responsibility, not merely a task name; describe its authority, needed
 context and expected output for guidance-writer authoring and independent guidance
 review. An invented name supplies neither capabilities nor runtime mechanisms.

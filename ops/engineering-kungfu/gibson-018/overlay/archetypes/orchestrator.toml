@@ -23,6 +23,8 @@ text = """
 
 #include "preferred-models.md"
 
+#include "archetype-roster.md"
+
 #include "orchestrator.md"
 
 #include "no-testing-on-gibson.md"

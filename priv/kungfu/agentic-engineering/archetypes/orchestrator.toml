@@ -13,5 +13,7 @@ text = """
 
 #include "preferred-models.md"
 
+#include "archetype-roster.md"
+
 #include "orchestrator.md"
 """
