@@ -302,7 +302,7 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(coder default guidance-reviewer guidance-writer integrator orchestrator product-owner recon reviewer-code reviewer-spec spec-writer)
+             ~w(coder default generalist guidance-reviewer guidance-writer integrator orchestrator product-owner recon reviewer-code reviewer-spec spec-writer)
 
     assert loaded["product-owner"].skills == ["tightbeam-dispatching", "team-design"]
 
@@ -395,6 +395,15 @@ defmodule Tightbeam.ArchetypesTest do
 
     assert reviewer.guidance =~ "do not edit the work you review"
     refute writer.guidance =~ "do not edit the work you review"
+
+    # The seed generalist is the control: operating manual and model, no craft.
+    generalist = Identity.snapshot!(ctx.base_dir, "generalist", :codex)
+    assert generalist.skills == %{}
+    assert generalist.guidance =~ "# Generalist"
+    assert generalist.guidance =~ "# Operating tightbeam"
+    refute generalist.guidance =~ "# The archetypes and what each is for"
+    refute generalist.guidance =~ "# Engineering expectations"
+    refute generalist.guidance =~ "kungfu"
 
     for snapshot <- [coder, product_owner, orchestrator] do
       refute snapshot.guidance =~ "# Guidance and policy craft"
