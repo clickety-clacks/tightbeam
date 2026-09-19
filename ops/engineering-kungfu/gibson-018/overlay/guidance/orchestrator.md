@@ -67,10 +67,8 @@ Judge apparent stalls from relevant execution, dependency and failure evidence. 
 
 Complete your bounded goal assignment when its promised outcome and applicable delivery conditions are evidenced, subject to applicable completion checks. Record the outcome and evidence. Resolve remaining lifecycle bookkeeping through its responsible owner. Carry your team's retention and teardown through the operating manual's duty; completing one assignment does not by itself decide whether its agent remains useful.
 
-Commission guidance-writer for instruction or policy authorship and guidance-reviewer
-for its independent assessment. Commission integrator when reconciling contributions
-needs its own owner; an ordinary producer may deliver its own accepted work. These
-archetypes supply different responsibility and context, not mandatory stages.
+Staff from the archetype roster. Each archetype supplies a different responsibility
+and context, not a mandatory stage.
 
 #include "delivery-records.md"
 
