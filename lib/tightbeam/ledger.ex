@@ -17,7 +17,7 @@ defmodule Tightbeam.Ledger do
   - No automatic retries: `failed_unknown` is terminal; nothing here re-sends.
   """
 
-  alias Tightbeam.{DB, HarnessHealth, Org}
+  alias Tightbeam.{DB, HarnessHealth, Org, QueuedMessageSuppression}
   alias Tightbeam.DB.Txn
   alias Tightbeam.Firehose.Publisher
 
@@ -164,6 +164,7 @@ defmodule Tightbeam.Ledger do
       )
 
       [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+      :ok = QueuedMessageSuppression.record_in_txn(txn, seq, attrs)
       Org.sync_mechanical_status_in_txn(txn, session_key)
       {:ok, seq}
     else
@@ -465,6 +466,8 @@ defmodule Tightbeam.Ledger do
             :busy
 
           [] ->
+            QueuedMessageSuppression.suppress_before_claim_in_txn(txn, session_key)
+
             selected_mind =
               case Txn.q(
                      txn,
@@ -533,6 +536,33 @@ defmodule Tightbeam.Ledger do
       end)
 
     result
+  end
+
+  @doc "Cancel one queued turn through the normal terminal publication seam."
+  @spec cancel_queued_in_txn(Txn.t(), integer(), String.t()) :: boolean()
+  def cancel_queued_in_txn(%Txn{} = txn, seq, reason)
+      when is_integer(seq) and is_binary(reason) do
+    transition = turn_terminal_transition_in_txn(txn, seq, "queued", "canceled")
+
+    Txn.q(
+      txn,
+      "UPDATE turns SET status='canceled',endedAt=?2,error=?3 WHERE seq=?1 AND status='queued'",
+      [seq, System.system_time(:millisecond), "queued-message-suppressed: " <> reason]
+    )
+
+    won = Txn.changes(txn) == 1
+
+    if won do
+      if transition, do: DB.record_row_commit(txn, transition)
+      Publisher.turn_in_txn(txn, "turn.ended", seq)
+
+      case Txn.q(txn, "SELECT sessionKey FROM turns WHERE seq=?1", [seq]) do
+        [[session_key]] -> Org.sync_mechanical_status_in_txn(txn, session_key)
+        [] -> :ok
+      end
+    end
+
+    won
   end
 
   # Nothing moved. Either the queue is empty, or it holds work whose session

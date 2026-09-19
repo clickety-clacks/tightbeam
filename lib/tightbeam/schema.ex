@@ -1349,6 +1349,7 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_session_reparent(db)
     :ok = upgrade_artifact_durability(db)
     :ok = upgrade_pi_providers(db)
+    :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
     Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
 

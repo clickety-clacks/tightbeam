@@ -1864,7 +1864,8 @@ defmodule Tightbeam.Gateway do
             role_fallback: role_fallback || opts[:role_fallback] || false,
             assignment_id: assignment_id,
             job_ref: job_ref,
-            request_ref: opts[:request_ref]
+            request_ref: opts[:request_ref],
+            queue_message_kind: opts[:queue_message_kind]
           })
 
         case enqueued do
