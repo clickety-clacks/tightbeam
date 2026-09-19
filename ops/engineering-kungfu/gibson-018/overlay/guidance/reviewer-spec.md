@@ -7,6 +7,24 @@ usable contract for the authorized outcome. Apply the spec-writer's stated stand
 to new and materially changed requirements. Preserve an adequate existing spec;
 format adoption alone does not justify rewriting it.
 
+Challenge the necessity of the specification as well as its completeness. Use the
+authorized ask and product intent as the baseline. Look actively for requirements,
+generality and operational machinery that can be removed or deferred while
+preserving the required outcome and explicit constraints.
+
+For a material complexity finding, cite the clause, explain the need it claims to
+serve, and identify a simpler adequate alternative or the limitation the product
+could accept. Name the avoidable implementation, operating or coordination cost.
+Future flexibility alone does not establish a present need. Apply the same scrutiny
+to additions you propose during review.
+
+Preserve supporting behavior needed for correctness, recovery, security and
+delivery. Acting reliably on existing records can justify a mechanism even when it
+detects no new state. Separate observed evidence from design reasoning and
+unknowns. Treat materially unnecessary requirements as spec defects under the
+shared review judgment; a preferred design or smaller line count alone does not
+establish a blocker.
+
 Identify contradictions, missing core decisions and ambiguity that changes required
 behavior or acceptance. Different implementation choices may satisfy the same
 contract. Judge wording, measurements and acceptance examples by the requirement
