@@ -37,7 +37,10 @@ defmodule Tightbeam.ArchetypesTest do
     end
 
     assert Path.wildcard(Path.join(identity_dir, "archetypes/*.toml")) ==
-             [Path.join(identity_dir, "archetypes/default.toml")]
+             [
+               Path.join(identity_dir, "archetypes/default.toml"),
+               Path.join(identity_dir, "archetypes/generalist.toml")
+             ]
 
     assert File.regular?(Path.join([identity_dir, "guidance", "operating-model.md"]))
 
@@ -403,7 +406,8 @@ defmodule Tightbeam.ArchetypesTest do
     assert generalist.guidance =~ "# Operating tightbeam"
     refute generalist.guidance =~ "# The archetypes and what each is for"
     refute generalist.guidance =~ "# Engineering expectations"
-    refute generalist.guidance =~ "kungfu"
+    refute generalist.guidance =~ "# Preferred models"
+    refute generalist.guidance =~ "spirit"
 
     for snapshot <- [coder, product_owner, orchestrator] do
       refute snapshot.guidance =~ "# Guidance and policy craft"

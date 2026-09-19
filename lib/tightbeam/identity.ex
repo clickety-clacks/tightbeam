@@ -21,10 +21,10 @@ defmodule Tightbeam.Identity do
   @required_refs ["main", @upstream, @live]
   @reserved_prefix "tightbeam__"
   @seed_owned_paths [
-                      "archetypes/default.toml",
-                      "archetypes/generalist.toml",
-                      "guidance/operating-model.md"
-                    ]
+    "archetypes/default.toml",
+    "archetypes/generalist.toml",
+    "guidance/operating-model.md"
+  ]
   @bundle_doc_paths ~w(capabilities.md intake.md preferred-models.md manifest.toml)
   @render_contract "universal-root-render-v1"
   @universal_roots ["operating-model.md", "operating-manual.md"]
