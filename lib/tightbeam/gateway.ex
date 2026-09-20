@@ -3312,6 +3312,9 @@ defmodule Tightbeam.Gateway do
                       {:error, {:model_apply_failed, _reason}} = error ->
                         error
 
+                      {:error, {:mode_apply_failed, _reason}} = error ->
+                        error
+
                       # An adapter that could not answer has NOT told us the harness
                       # lost the session; falling back would forfeit the model
                       # context over an adapter fault and record a false

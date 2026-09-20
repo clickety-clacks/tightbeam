@@ -6529,6 +6529,15 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  @tag cold_gateway: true, gateway_reattach_mode_failure: true, tmp_dir: true
+  test "reattach mode refusal fails the turn without fallback or prompting", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_reattach_mode_failure.exs",
+      "guarded-gateway-reattach-mode-failure: ok"
+    )
+  end
+
   @tag cold_gateway: true, gateway_unknown_default: true, tmp_dir: true
   test "unknown new-session paths keep and capture the harness default", %{tmp_dir: tmp} do
     Tightbeam.GuardRuntimeFixture.run!(
