@@ -170,6 +170,45 @@ When a dispute claims that two unchanged sources differ, hash the exact bytes at
 locations. Matching hashes settle their identity and end that verification. Do not repeat
 the comparison because paths, labels, messages, or memories disagree with the bytes.
 
+## Harness failure other
+
+When a harness failure does not match a named class, record one evidence-bearing `other`
+observation instead of guessing a class. A good entry reuses the WORLD FACT format:
+observed state, the exact probe, an output digest (or the exact observed error), `validUntil`,
+and `PROVEN` or `UNKNOWN`. It also states the recovery condition and includes one line
+explaining why the failure is not a known class. Confirm redaction before admission; do not
+put credentials or credential-shaped output in the evidence.
+
+An `other` incident pauses prodding for that harness, routes to a living authority for review,
+and expires after its bounded validity interval. A normal successful turn may resolve it only
+with explicit, matching recovery evidence. Every incident is reviewed: confirm the class,
+reclassify it, or open a promotion case when the same description recurs. The shared
+prod-shape gate is the one suppression seam for all consumers; individual sweeps must not
+carry a second harness-health check.
+
+For a probe-backed observation, preserve the exact field names and the observed status:
+
+```text
+description: provider returned an unclassified transport failure
+descriptionDigest: <sha256(description)>
+observedState: provider connection was unavailable
+evidenceMode: probe_digest
+exactProbe: GET provider health endpoint
+outputDigest: <sha256(exact probe output)>
+recoveryCondition: a normal provider turn completes
+recoveryConditionDigest: <sha256(recoveryCondition)>
+notKnownClassReason: no auth, quota, adapter, model, task, or interruption signal
+validUntil: <bounded timestamp>
+worldStatus: PROVEN
+redactionConfirmed: true
+```
+
+When the world is unknown, retain the exact observed error instead of inventing a probe
+digest, and keep `worldStatus: UNKNOWN`. Recovery evidence is a separate normal-turn row:
+it carries the opening `descriptionDigest`, the matching `recoveryConditionDigest`, a
+successful probe/output digest, `recoverySatisfied: true`, `worldStatus: PROVEN`, and no
+opening-only description, exact error, or validity interval.
+
 - Record what you produced OUTSIDE your workdir as an artifact:
 
     tightbeam artifact-record --kind report --title "nginx config on host-b" \

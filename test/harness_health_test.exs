@@ -176,6 +176,71 @@ defmodule Tightbeam.HarnessHealthTest do
            )
   end
 
+  test "other admission carries evidence, review, idempotency, and matching recovery", ctx do
+    [member | _] = ctx.sessions
+
+    input = %{
+      harness: "claude",
+      host: "gibson",
+      source_session_key: member.session,
+      principal: {:session, member.session},
+      description: "provider returned an unclassified transport failure",
+      evidence_mode: "exact_error",
+      observed_state: "the provider connection was unavailable",
+      exact_observed_error: "transport reset by peer",
+      exact_probe: "GET provider health endpoint",
+      recovery_condition: "a normal provider turn completes",
+      not_known_class_reason:
+        "the response is neither an auth, quota, adapter, model, task, nor interruption signal",
+      observed_at: 100,
+      accepted_at: 100,
+      valid_until: 500,
+      world_status: "UNKNOWN",
+      redaction_confirmed: true,
+      idempotency_key: "other-admission-1",
+      correlation_id: "other-admission-correlation"
+    }
+
+    assert {:opened, opened} = HarnessHealth.observe_other(ctx.db, input)
+    assert opened.failureClass == "other"
+    assert HarnessHealth.get(ctx.db, opened.id).repair.action == "review"
+    assert ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "other")
+
+    assert {:duplicate, duplicate} = HarnessHealth.observe_other(ctx.db, input)
+    assert duplicate["id"] == opened.id
+
+    assert {:ok, %{state: "closed", outcome: "confirmed_other"}} =
+             HarnessHealth.review_other(ctx.db, %{
+               incident_id: opened.id,
+               outcome: "confirmed_other",
+               cause: "the provider evidence remains outside the named classes",
+               principal: {:session, member.session}
+             })
+
+    probe = "normal turn 101 delivered"
+
+    recovery = %{
+      harness: "claude",
+      host: "gibson",
+      session_key: member.session,
+      principal: {:session, member.session},
+      observed_state: "normal turn delivered",
+      exact_probe: probe,
+      output_digest: :crypto.hash(:sha256, probe) |> Base.encode16(case: :lower),
+      recovery_condition: "a normal provider turn completes",
+      recovery_satisfied: true,
+      world_status: "PROVEN",
+      redaction_confirmed: true,
+      cause: "normal turn 101 delivered",
+      observed_at: 101,
+      correlation_id: "other-recovery-correlation"
+    }
+
+    assert {:resolved, resolved} = HarnessHealth.resolve_other(ctx.db, recovery)
+    assert resolved.state == "resolved"
+    refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "other")
+  end
+
   test "captured terminal errors preserve auth, rate-limit, and unrelated classes" do
     assert HarnessHealth.classify_turn_failure(@captured_codex_rate_limit) == "rate-limit-dead"
     assert HarnessHealth.classify_turn_failure(@captured_claude_rate_limit) == "rate-limit-dead"

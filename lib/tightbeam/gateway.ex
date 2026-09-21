@@ -1226,6 +1226,34 @@ defmodule Tightbeam.Gateway do
       {"repair-assignment", ["message.created", "session.updated"]} => fn call ->
         repair_assignment_result(config, db, call)
       end,
+      {"harness-health-observe-other", ["harness_health.other_observed"]} => fn call ->
+        params =
+          call.params
+          |> Map.put_new(:source_session_key, call.session_key)
+          |> Map.put(:principal, call.principal)
+
+        case HarnessHealth.observe_other(db, params) do
+          {:error, error} -> error
+          {status, detail} -> %{ok: true, status: status, incident: detail}
+        end
+      end,
+      {"harness-health-resolve-other", ["harness_health.other_resolved"]} => fn call ->
+        params = call.params |> Map.put(:principal, call.principal)
+
+        case HarnessHealth.resolve_other(db, params) do
+          {:error, error} -> error
+          {status, detail} -> %{ok: true, status: status, incident: detail}
+          :already_healthy -> %{ok: true, status: :already_healthy}
+        end
+      end,
+      {"harness-health-review-other", ["harness_health.other_reviewed"]} => fn call ->
+        params = call.params |> Map.put(:principal, call.principal)
+
+        case HarnessHealth.review_other(db, params) do
+          {:error, error} -> error
+          {:ok, detail} -> %{ok: true, review: detail}
+        end
+      end,
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
       {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,

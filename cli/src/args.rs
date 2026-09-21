@@ -80,6 +80,46 @@ pub enum Command {
         idempotency_key: Option<String>,
         payload: Option<String>,
     },
+    HarnessHealthObserveOther {
+        identity: Identity,
+        harness: String,
+        host: String,
+        source_session: String,
+        description: String,
+        evidence_mode: String,
+        observed_state: String,
+        exact_error: Option<String>,
+        exact_probe: String,
+        output_digest: Option<String>,
+        recovery_condition: String,
+        not_known_class: String,
+        observed_at: Option<String>,
+        valid_until: String,
+        world_status: String,
+        redaction_confirmed: bool,
+        idempotency_key: String,
+        correlation_id: Option<String>,
+    },
+    HarnessHealthResolveOther {
+        identity: Identity,
+        harness: String,
+        host: String,
+        incident_id: Option<String>,
+        observed_state: String,
+        exact_probe: String,
+        output_digest: String,
+        recovery_condition: String,
+        cause: String,
+        session_key: Option<String>,
+        correlation_id: Option<String>,
+    },
+    HarnessHealthReviewOther {
+        identity: Identity,
+        incident_id: String,
+        outcome: String,
+        named_class: Option<String>,
+        cause: Option<String>,
+    },
     ArtifactRecord {
         identity: Identity,
         kind: String,
@@ -560,6 +600,20 @@ COMMANDS:
       File an observable fact. Matching condition wakes receive the fact as a new
       notification turn; they never resume or replay prior work.
 
+  harness-health-observe-other --harness <harness> --host <host>
+      --source-session <session> --description <text> --evidence-mode exact_error|probe_digest
+      --observed-state <text> --exact-probe <text> --recovery-condition <text>
+      --not-known-class <text> --valid-until <epochMs> --world-status PROVEN|UNKNOWN
+      --redaction-confirmed --key <idempotencyKey>
+      Admit a redacted, bounded evidence observation for a not-yet-named failure.
+  harness-health-resolve-other --harness <harness> --host <host>
+      --observed-state <text> --exact-probe <text> --output-digest <sha256>
+      --recovery-condition <text> --cause <text>
+      Record a PROVEN recovery observation for an open other incident.
+  harness-health-review-other <incidentId>
+      --outcome confirmed_other|reclassified|promotion_required
+      Close the mandatory review for an other incident.
+
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
                   [--produced-by-assignment <assignmentId>]
@@ -913,6 +967,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "history",
     "json",
     "manifest",
+    "redaction-confirmed",
     "resolve",
     "rm",
     "tree",
@@ -1520,6 +1575,158 @@ fn parse_with_optional_catalog(
                 scope: nonempty(flags, "scope"),
                 idempotency_key: nonempty(flags, "key"),
                 payload: nonempty(flags, "payload"),
+            })
+        }
+        "harness-health-observe-other" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "harness",
+                "host",
+                "source-session",
+                "description",
+                "evidence-mode",
+                "observed-state",
+                "exact-error",
+                "exact-probe",
+                "output-digest",
+                "recovery-condition",
+                "not-known-class",
+                "observed-at",
+                "valid-until",
+                "world-status",
+                "redaction-confirmed",
+                "key",
+                "correlation-id",
+            ];
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> --valid-until <ms> --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey>".to_owned());
+            }
+            let evidence_mode = nonempty(flags, "evidence-mode")
+                .ok_or_else(|| "--evidence-mode is required".to_owned())?;
+            if !matches!(evidence_mode.as_str(), "exact_error" | "probe_digest") {
+                return Err("--evidence-mode must be exact_error or probe_digest".to_owned());
+            }
+            let world_status = nonempty(flags, "world-status")
+                .ok_or_else(|| "--world-status is required".to_owned())?;
+            if !matches!(world_status.as_str(), "PROVEN" | "UNKNOWN") {
+                return Err("--world-status must be PROVEN or UNKNOWN".to_owned());
+            }
+            let exact_error = nonempty(flags, "exact-error");
+            let output_digest = nonempty(flags, "output-digest");
+            if evidence_mode == "exact_error" && exact_error.is_none() {
+                return Err("--exact-error is required for exact_error evidence".to_owned());
+            }
+            if evidence_mode == "probe_digest" && output_digest.is_none() {
+                return Err("--output-digest is required for probe_digest evidence".to_owned());
+            }
+            if !flags.contains_key("redaction-confirmed") {
+                return Err("--redaction-confirmed is required".to_owned());
+            }
+            Ok(Command::HarnessHealthObserveOther {
+                identity: identity(flags)?,
+                harness: nonempty(flags, "harness")
+                    .ok_or_else(|| "--harness is required".to_owned())?,
+                host: nonempty(flags, "host").ok_or_else(|| "--host is required".to_owned())?,
+                source_session: nonempty(flags, "source-session")
+                    .ok_or_else(|| "--source-session is required".to_owned())?,
+                description: nonempty(flags, "description")
+                    .ok_or_else(|| "--description is required".to_owned())?,
+                evidence_mode,
+                observed_state: nonempty(flags, "observed-state")
+                    .ok_or_else(|| "--observed-state is required".to_owned())?,
+                exact_error,
+                exact_probe: nonempty(flags, "exact-probe")
+                    .ok_or_else(|| "--exact-probe is required".to_owned())?,
+                output_digest,
+                recovery_condition: nonempty(flags, "recovery-condition")
+                    .ok_or_else(|| "--recovery-condition is required".to_owned())?,
+                not_known_class: nonempty(flags, "not-known-class")
+                    .ok_or_else(|| "--not-known-class is required".to_owned())?,
+                observed_at: nonempty(flags, "observed-at")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                valid_until: js_number_json(number_coercion(
+                    &nonempty(flags, "valid-until")
+                        .ok_or_else(|| "--valid-until is required".to_owned())?,
+                )),
+                world_status,
+                redaction_confirmed: true,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+                correlation_id: nonempty(flags, "correlation-id"),
+            })
+        }
+        "harness-health-resolve-other" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "harness",
+                "host",
+                "incident",
+                "observed-state",
+                "exact-probe",
+                "output-digest",
+                "recovery-condition",
+                "cause",
+                "session",
+                "correlation-id",
+            ];
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-resolve-other --harness <harness> --host <host> --observed-state <text> --exact-probe <text> --output-digest <sha256> --recovery-condition <text> --cause <text>".to_owned());
+            }
+            Ok(Command::HarnessHealthResolveOther {
+                identity: identity(flags)?,
+                harness: nonempty(flags, "harness")
+                    .ok_or_else(|| "--harness is required".to_owned())?,
+                host: nonempty(flags, "host").ok_or_else(|| "--host is required".to_owned())?,
+                incident_id: nonempty(flags, "incident"),
+                observed_state: nonempty(flags, "observed-state")
+                    .ok_or_else(|| "--observed-state is required".to_owned())?,
+                exact_probe: nonempty(flags, "exact-probe")
+                    .ok_or_else(|| "--exact-probe is required".to_owned())?,
+                output_digest: nonempty(flags, "output-digest")
+                    .ok_or_else(|| "--output-digest is required".to_owned())?,
+                recovery_condition: nonempty(flags, "recovery-condition")
+                    .ok_or_else(|| "--recovery-condition is required".to_owned())?,
+                cause: nonempty(flags, "cause").ok_or_else(|| "--cause is required".to_owned())?,
+                session_key: nonempty(flags, "session"),
+                correlation_id: nonempty(flags, "correlation-id"),
+            })
+        }
+        "harness-health-review-other" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "outcome",
+                "named-class",
+                "cause",
+            ];
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-review-other <incidentId> --outcome confirmed_other|reclassified|promotion_required [--named-class <class>] [--cause <text>]".to_owned());
+            }
+            let outcome =
+                nonempty(flags, "outcome").ok_or_else(|| "--outcome is required".to_owned())?;
+            if !matches!(
+                outcome.as_str(),
+                "confirmed_other" | "reclassified" | "promotion_required"
+            ) {
+                return Err("--outcome is invalid".to_owned());
+            }
+            Ok(Command::HarnessHealthReviewOther {
+                identity: identity(flags)?,
+                incident_id: parsed.positional[1].clone(),
+                outcome,
+                named_class: nonempty(flags, "named-class"),
+                cause: nonempty(flags, "cause"),
             })
         }
         "artifact-content-fetch" => {
@@ -3607,6 +3814,9 @@ mod tests {
                 "doctor",
                 "effort-rule",
                 "harness-process",
+                "harness-health-observe-other",
+                "harness-health-resolve-other",
+                "harness-health-review-other",
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",

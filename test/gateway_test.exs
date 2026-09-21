@@ -13,6 +13,10 @@ defmodule Tightbeam.GatewayTest do
     expected =
       expected ++ ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch)
 
+    expected =
+      expected ++
+        ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other)
+
     assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
     assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
     assert Enum.all?(Map.values(handlers), &is_function(&1, 1))

@@ -65,6 +65,26 @@ defmodule Tightbeam.Supervision do
   )
   """
 
+  @prod_shape_consumers ["assignment_prodder"]
+  @prod_shape_action_sinks [
+    {"turn", "Ledger.enqueue_in_txn/2"},
+    {"wake", "Wakes.schedule_in_txn/2"},
+    {"wake", "Wakes.retarget_in_txn/3"},
+    {"prompt", "Acp.Adapter.prompt/3"},
+    {"prompt", "Acp.Adapter.prompt/4"},
+    {"acp_request", "Acp.Conn.request/3"},
+    {"acp_request", "Acp.Conn.request/4"},
+    {"command", "signal"},
+    {"command", "job"},
+    {"command", "request"}
+  ]
+
+  @doc "The manifest of consumers that must use the shared prod-shape gate."
+  def prod_shape_consumers, do: @prod_shape_consumers
+
+  @doc "The reviewed action sinks covered by the shared prod-shape gate."
+  def prod_shape_action_sinks, do: @prod_shape_action_sinks
+
   @doc false
   def watermarks_ddl, do: @watermarks_ddl
 
@@ -1384,7 +1404,24 @@ defmodule Tightbeam.Supervision do
   defp terminal_gate(_terminal_seq), do: :evaluable
 
   defp harness_gate(db, session_key) do
-    if harness_unavailable?(db, session_key), do: :unavailable, else: :available
+    case query(db, "SELECT harness, host FROM sessions WHERE sessionKey=?1", [session_key]) do
+      [[harness, host]] ->
+        case DB.transaction(db, fn txn ->
+               HarnessHealth.prod_shape_gate_in_txn(
+                 txn,
+                 harness,
+                 host,
+                 System.system_time(:millisecond)
+               )
+             end) do
+          {:ok, :available} -> :available
+          {:ok, {:unavailable, _}} -> :unavailable
+          {:error, _} -> :unavailable
+        end
+
+      [] ->
+        :available
+    end
   end
 
   defp harness_unavailable?(db, session_key) do

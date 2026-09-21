@@ -859,10 +859,10 @@ defmodule Tightbeam.SchemaShapeTest do
     assert :ok = Schema.ensure_all(db)
 
     assert table_columns(db, "harness_health_observations") ==
-             ~w(id correlationId harness host failureClass evidenceKind sessionKey assignmentId observedAt cause principal incidentId)
+             ~w(id correlationId harness host failureClass evidenceKind sessionKey assignmentId observedAt cause principal incidentId description descriptionDigest observedState evidenceMode exactObservedError exactProbe outputDigest recoveryCondition recoveryConditionDigest recoverySatisfied notKnownClassReason validUntil worldStatus redactionConfirmed)
 
     assert table_columns(db, "harness_health_incidents") ==
-             ~w(id harness host failureClass state openedAt openObservationId openedFactId resolvedAt resolutionObservationId resolvedFactId)
+             ~w(id harness host failureClass state openedAt openObservationId openedFactId resolvedAt resolutionObservationId resolvedFactId descriptionDigest expiresAt expiredAt expiryFactId)
 
     assert table_columns(db, "harness_health_members") == ~w(incidentId sessionKey)
 
