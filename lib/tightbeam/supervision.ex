@@ -92,6 +92,8 @@ defmodule Tightbeam.Supervision do
         Code.ensure_loaded?(module) and function_exported?(module, function, arity)
       end)
 
+    missing_bindings = Enum.reject(@prod_shape_action_sinks, &prod_shape_action_bound?/1)
+
     %{
       consumers: @prod_shape_consumers,
       sinks: @prod_shape_action_sinks,
@@ -99,10 +101,217 @@ defmodule Tightbeam.Supervision do
       guardedConsumers: @prod_shape_consumers,
       sinkCount: length(@prod_shape_action_sinks),
       missingSinks: missing_sinks,
-      uncovered: missing_sinks,
-      verified: missing_sinks == [] and @prod_shape_consumers == ["assignment_prodder"]
+      boundSinks: @prod_shape_action_sinks -- missing_bindings,
+      missingBindings: missing_bindings,
+      uncovered: missing_sinks ++ missing_bindings,
+      verified:
+        missing_sinks == [] and missing_bindings == [] and
+          @prod_shape_consumers == ["assignment_prodder"]
     }
   end
+
+  @doc """
+  Execute one reviewed prod-shaped action behind the shared transaction gate.
+
+  These clauses are intentionally explicit. The reviewed sink set is small and
+  fixed, and each clause names the actual module/function call that must remain
+  inside `HarnessHealth.prod_shape_act_in_txn/6`; an exported MFA list alone is
+  not a proof that a sink is reached only after the gate.
+  """
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:turn, Ledger, :enqueue_in_txn, 2},
+        candidate_id,
+        harness,
+        host,
+        attrs
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> apply(Ledger, :enqueue_in_txn, [txn, attrs]) end
+    )
+  end
+
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:wake, Wakes, :schedule_in_txn, 2},
+        candidate_id,
+        harness,
+        host,
+        attrs
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> Wakes.schedule_in_txn(txn, attrs) end
+    )
+  end
+
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:wake, Wakes, :retarget_in_txn, 3},
+        candidate_id,
+        harness,
+        host,
+        {wake_id, replacement_target}
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> Wakes.retarget_in_txn(txn, wake_id, replacement_target) end
+    )
+  end
+
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:prompt, Tightbeam.Acp.Adapter, :prompt, 3},
+        candidate_id,
+        harness,
+        host,
+        {adapter, session_id, text}
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> Tightbeam.Acp.Adapter.prompt(adapter, session_id, text) end
+    )
+  end
+
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:prompt, Tightbeam.Acp.Adapter, :prompt, 4},
+        candidate_id,
+        harness,
+        host,
+        {adapter, session_id, text, opts}
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> Tightbeam.Acp.Adapter.prompt(adapter, session_id, text, opts) end
+    )
+  end
+
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:acp_request, Tightbeam.Acp.Conn, :request, 3},
+        candidate_id,
+        harness,
+        host,
+        {conn, method, params}
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> Tightbeam.Acp.Conn.request(conn, method, params) end
+    )
+  end
+
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:acp_request, Tightbeam.Acp.Conn, :request, 4},
+        candidate_id,
+        harness,
+        host,
+        {conn, method, params, opts}
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> Tightbeam.Acp.Conn.request(conn, method, params, opts) end
+    )
+  end
+
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:command_signal, Tightbeam.CommandEdge, :signal, 2},
+        candidate_id,
+        harness,
+        host,
+        {edge, command}
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> Tightbeam.CommandEdge.signal(edge, command) end
+    )
+  end
+
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:command_job, Tightbeam.CommandEdge, :job, 2},
+        candidate_id,
+        harness,
+        host,
+        {edge, command}
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> Tightbeam.CommandEdge.job(edge, command) end
+    )
+  end
+
+  def prod_shape_action_in_txn(
+        %Txn{} = txn,
+        {:command_request, Tightbeam.CommandEdge, :request, 4},
+        candidate_id,
+        harness,
+        host,
+        {edge, command, label, request_ids}
+      ) do
+    HarnessHealth.prod_shape_act_in_txn(
+      txn,
+      "assignment_prodder",
+      candidate_id,
+      harness,
+      host,
+      fn -> Tightbeam.CommandEdge.request(edge, command, label, request_ids) end
+    )
+  end
+
+  def prod_shape_action_in_txn(%Txn{}, _sink, _candidate_id, _harness, _host, _args),
+    do: raise(ArgumentError, "unreviewed_prod_shape_sink")
+
+  defp prod_shape_action_bound?({:turn, Ledger, :enqueue_in_txn, 2}), do: true
+  defp prod_shape_action_bound?({:wake, Wakes, :schedule_in_txn, 2}), do: true
+  defp prod_shape_action_bound?({:wake, Wakes, :retarget_in_txn, 3}), do: true
+  defp prod_shape_action_bound?({:prompt, Tightbeam.Acp.Adapter, :prompt, 3}), do: true
+  defp prod_shape_action_bound?({:prompt, Tightbeam.Acp.Adapter, :prompt, 4}), do: true
+  defp prod_shape_action_bound?({:acp_request, Tightbeam.Acp.Conn, :request, 3}), do: true
+  defp prod_shape_action_bound?({:acp_request, Tightbeam.Acp.Conn, :request, 4}), do: true
+  defp prod_shape_action_bound?({:command_signal, Tightbeam.CommandEdge, :signal, 2}), do: true
+  defp prod_shape_action_bound?({:command_job, Tightbeam.CommandEdge, :job, 2}), do: true
+  defp prod_shape_action_bound?({:command_request, Tightbeam.CommandEdge, :request, 4}), do: true
+  defp prod_shape_action_bound?(_sink), do: false
 
   @doc false
   def watermarks_ddl, do: @watermarks_ddl
