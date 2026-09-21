@@ -344,7 +344,7 @@ defmodule Tightbeam.HarnessHealthTest do
     assert is_binary(first_recipient)
     assert is_integer(first_turn_seq)
     assert is_binary(first_wake)
-    expected_request_ref = "other-review-#{opened.id}"
+    expected_request_ref = "other-review:#{opened.id}"
     expected_wake_id = "other-review:#{opened.id}:#{first_recipient}"
 
     assert {:ok, [[^expected_request_ref, ^expected_wake_id]]} =
@@ -419,7 +419,7 @@ defmodule Tightbeam.HarnessHealthTest do
                idempotency_key: "restart-route"
              })
 
-    request_ref = "other-review-#{opened.id}"
+    request_ref = "other-review:#{opened.id}"
 
     assert {:ok, [[route_recipient, first_state, first_wake, first_turn]]} =
              DB.query(

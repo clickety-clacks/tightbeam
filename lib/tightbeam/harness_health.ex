@@ -3529,7 +3529,7 @@ defmodule Tightbeam.HarnessHealth do
           session_key: target_ref,
           message_id: marker.id,
           wake_id: wake_id,
-          request_ref: "other-review-#{incident_id}",
+          request_ref: "other-review:#{incident_id}",
           origin: "process:tightbeam",
           prompt: message
         })
