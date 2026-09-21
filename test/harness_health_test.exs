@@ -289,49 +289,48 @@ defmodule Tightbeam.HarnessHealthTest do
                idempotency_key: "route-settlement"
              })
 
-    assert {:ok,
-            [
-              [_, first_ordinal, _state, first_turn_seq, _wake],
-              [_, _skipped_ordinal, "skipped", nil, nil],
-              [_, second_ordinal, "pending", nil, nil]
-            ]} =
+    assert {:ok, [[first_recipient, first_ordinal, "pending", first_turn_seq, first_wake]]} =
              DB.query(
                ctx.db,
-               "SELECT incidentId,ordinal,state,turnSeq,noticeWakeId FROM harness_health_other_routes WHERE incidentId=?1 ORDER BY ordinal",
+               "SELECT recipient,ordinal,state,turnSeq,noticeWakeId FROM harness_health_other_routes WHERE incidentId=?1 AND state='pending' ORDER BY ordinal LIMIT 1",
                [opened.id]
              )
 
-    assert first_ordinal < second_ordinal
+    assert is_binary(first_recipient)
     assert is_integer(first_turn_seq)
+    assert is_binary(first_wake)
 
-    assert {:ok, %{kind: :other_route, ordinal: ^second_ordinal, plan: plan}} =
-             DB.transaction(ctx.db, fn txn ->
-               HarnessHealth.settle_other_route_in_txn(
-                 txn,
-                 first_turn_seq,
-                 "failed",
-                 at + 1
-               )
-             end)
+    assert {:ok, %{seq: ^first_turn_seq}} =
+             Ledger.claim_next(ctx.db, first_recipient, "route-settlement")
 
-    assert plan != []
+    assert :ok = Ledger.finish(ctx.db, first_turn_seq, "failed")
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
 
-    assert {:ok, [["non_delivered", "failed"], ["skipped", _], ["pending", _]]} =
+    assert {:ok, [["non_delivered", "failed"]]} =
              DB.query(
                ctx.db,
-               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 ORDER BY ordinal",
-               [opened.id]
+               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=?2",
+               [opened.id, first_ordinal]
              )
 
-    assert {:ok, nil} =
-             DB.transaction(ctx.db, fn txn ->
-               HarnessHealth.settle_other_route_in_txn(
-                 txn,
-                 first_turn_seq,
-                 "failed",
-                 at + 2
-               )
-             end)
+    assert {:ok, [[second_ordinal, "pending", second_wake, second_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT ordinal,state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND state='pending' AND ordinal>?2 ORDER BY ordinal LIMIT 1",
+               [opened.id, first_ordinal]
+             )
+
+    assert second_ordinal > first_ordinal
+    assert is_binary(second_wake)
+    assert is_integer(second_turn)
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+
+    assert {:ok, [["pending", ^second_wake, ^second_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=?2",
+               [opened.id, second_ordinal]
+             )
   end
 
   test "restart resume publishes an unmarked rung once and does not replay it", ctx do
@@ -365,31 +364,50 @@ defmodule Tightbeam.HarnessHealthTest do
                idempotency_key: "restart-route"
              })
 
-    assert {:ok, [["pending", _wake, _turn]]} =
+    assert {:ok, [[route_recipient, first_state, first_wake, first_turn]]} =
              DB.query(
                ctx.db,
-               "UPDATE harness_health_other_routes SET state='pending',noticeWakeId=NULL,turnSeq=NULL WHERE incidentId=?1 AND ordinal=0 RETURNING state,noticeWakeId,turnSeq",
+               "SELECT recipient,state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
                [opened.id]
              )
 
-    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
-
-    assert {:ok, [["pending", first_wake, first_turn]]} =
-             DB.query(
-               ctx.db,
-               "SELECT state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
-               [opened.id]
-             )
-
+    assert is_binary(route_recipient)
+    assert first_state == "pending"
     assert is_binary(first_wake)
     assert is_integer(first_turn)
 
+    assert {:ok, %{seq: ^first_turn}} =
+             Ledger.claim_next(ctx.db, route_recipient, "restart-recovery")
+
+    assert :ok = Ledger.finish(ctx.db, first_turn, "failed")
+
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
 
-    assert {:ok, [["pending", ^first_wake, ^first_turn]]} =
+    assert {:ok, [["non_delivered", "failed", next_wake, next_turn]]} =
              DB.query(
                ctx.db,
-               "SELECT state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               "SELECT state,closedReason,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               [opened.id]
+             )
+
+    assert next_wake == first_wake
+    assert next_turn == first_turn
+
+    assert {:ok, [["pending", second_wake, second_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=2",
+               [opened.id]
+             )
+
+    assert is_binary(second_wake)
+    assert is_integer(second_turn)
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+
+    assert {:ok, [["pending", ^second_wake, ^second_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=2",
                [opened.id]
              )
   end
@@ -424,7 +442,7 @@ defmodule Tightbeam.HarnessHealthTest do
                idempotency_key: "record-only-route"
              })
 
-    assert {:ok, [["non_delivered", "target_retired", nil, nil]]} =
+    assert {:ok, [["alerted", "no_active_main", nil, nil]]} =
              DB.query(
                ctx.db,
                "SELECT state,closedReason,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND targetKind='owner_user'",
@@ -544,12 +562,13 @@ defmodule Tightbeam.HarnessHealthTest do
     attest_id = "att_public_promotion_clean"
     spec_sha = String.duplicate("a", 64)
     report_sha = String.duplicate("b", 64)
+    candidate_commit = String.duplicate("c", 40)
 
     assert {:ok, []} =
              DB.query(
                ctx.db,
-               "INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt) VALUES(?1,'public promotion','flynn','flynn',?2)",
-               [work_item_id, at]
+               "INSERT INTO work_items(id,title,specRefName,specRefSha256,ownerUserId,createdByUser,createdAt) VALUES(?1,'public promotion','tightbeam-specs/public-promotion.md',?2,'flynn','flynn',?3)",
+               [work_item_id, spec_sha, at]
              )
 
     assert {:ok, []} =
@@ -583,8 +602,25 @@ defmodule Tightbeam.HarnessHealthTest do
     assert {:ok, []} =
              DB.query(
                ctx.db,
-               "INSERT INTO attests(id,assignmentId,kind,verdictKind,bySession,artifactId,contentSha256,ts) VALUES(?1,?2,'verdict','reviewed-clean',?3,?4,?5,?6)",
-               [attest_id, review_id, ctx.outside_session, report_id, report_sha, at]
+               "INSERT INTO attests(id,assignmentId,kind,verdictKind,bySession,commitRefs,artifactId,contentSha256,ts) VALUES(?1,?2,'verdict','reviewed-clean',?3,?4,?5,?6,?7)",
+               [
+                 attest_id,
+                 review_id,
+                 ctx.outside_session,
+                 JSON.encode!([%{"repo" => "racter", "commit" => candidate_commit}]),
+                 report_id,
+                 report_sha,
+                 at
+               ]
+             )
+
+    unrelated_spec_id = "art_public_promotion_unrelated_spec"
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,contentSha256,state,createdAt,updatedAt) VALUES(?1,'spec','unrelated spec',?2,?3,'tightbeam-specs/unrelated.md',?4,'in-workspace',?5,?5)",
+               [unrelated_spec_id, member.session, work_item_id, String.duplicate("d", 64), at]
              )
 
     close_params = %{
@@ -594,8 +630,29 @@ defmodule Tightbeam.HarnessHealthTest do
       review_artifact_id: report_id,
       review_attest_id: attest_id,
       review_assignment_id: review_id,
+      candidate_commit: candidate_commit,
       idempotency_key: "public-promotion-close"
     }
+
+    assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
+             handlers["harness-health-close-promotion"].(%{
+               principal: {:user, "flynn"},
+               params:
+                 Map.merge(close_params, %{
+                   named_class: "auth-dead",
+                   idempotency_key: "public-promotion-existing-class"
+                 })
+             })
+
+    assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
+             handlers["harness-health-close-promotion"].(%{
+               principal: {:user, "flynn"},
+               params:
+                 Map.merge(close_params, %{
+                   spec_artifact_id: unrelated_spec_id,
+                   idempotency_key: "public-promotion-unrelated-spec"
+                 })
+             })
 
     assert %{code: "not_authorized", message: "not_authorized"} =
              handlers["harness-health-close-promotion"].(%{
@@ -626,6 +683,19 @@ defmodule Tightbeam.HarnessHealthTest do
     assert duplicate["state"] == "closed"
     assert duplicate["namedClass"] == "provider-network-drift"
     assert duplicate["reviewAttestId"] == attest_id
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "UPDATE artifacts SET contentSha256=?1 WHERE artifactId=?2",
+               [String.duplicate("e", 64), report_id]
+             )
+
+    assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
+             handlers["harness-health-close-promotion"].(%{
+               principal: {:user, "flynn"},
+               params: %{close_params | idempotency_key: "public-promotion-mutated-report"}
+             })
   end
 
   test "captured terminal errors preserve auth, rate-limit, and unrelated classes" do

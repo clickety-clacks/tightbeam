@@ -18,7 +18,7 @@ defmodule Tightbeam.SessionLane do
 
   use GenServer
   require Logger
-  alias Tightbeam.{DB, EventLog, Harness, HarnessProcess, Ledger, Placement}
+  alias Tightbeam.{DB, EventLog, Harness, HarnessHealth, HarnessProcess, Ledger, Placement}
 
   defstruct [
     :session_key,
@@ -136,16 +136,37 @@ defmodule Tightbeam.SessionLane do
     do: {:reply, :not_running, state}
 
   def handle_call(:cancel_current, _from, state) do
-    case Ledger.finish(state.db, state.current_seq, "canceled") do
-      :ok ->
+    {:ok, {won, route_publication}} =
+      DB.transaction_then(
+        state.db,
+        fn txn ->
+          if Ledger.finish_in_txn(txn, state.current_seq, "canceled") do
+            {true,
+             HarnessHealth.settle_other_route_in_txn(
+               txn,
+               state.current_seq,
+               "canceled",
+               System.system_time(:millisecond)
+             )}
+          else
+            {false, nil}
+          end
+        end,
+        fn txn, result ->
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
+          result
+        end
+      )
+
+    case won do
+      true ->
+        publish_route_publication(route_publication)
         state.on_terminal.(state.session_key, state.current_seq)
         reply = {:ok, %{seq: state.current_seq, message_id: state.current_message_id}}
         if is_pid(state.task_pid), do: Process.exit(state.task_pid, :kill)
-        # The :DOWN for the killed task clears task_ref and drains; its
-        # finalize hits :already_terminal (we won the CAS) — no double publish.
         {:reply, reply, state}
 
-      :already_terminal ->
+      false ->
         {:reply, :not_running, state}
     end
   end
@@ -318,38 +339,33 @@ defmodule Tightbeam.SessionLane do
           {"failed", error_text(reason), nil, nil, nil}
       end
 
-    {finish_result, recorded} =
-      if in_txn do
-        {:ok, {won, recorded}} =
-          DB.transaction_then(
-            state.db,
-            fn txn ->
-              if Ledger.finish_in_txn(txn, seq, terminal, error) do
-                recorded = in_txn.(txn)
+    {:ok, {won, recorded}} =
+      DB.transaction_then(
+        state.db,
+        fn txn ->
+          if Ledger.finish_in_txn(txn, seq, terminal, error) do
+            recorded = if is_function(in_txn, 1), do: in_txn.(txn), else: nil
 
-                route_publication =
-                  Tightbeam.HarnessHealth.settle_other_route_in_txn(
-                    txn,
-                    seq,
-                    terminal,
-                    System.system_time(:millisecond)
-                  )
+            route_publication =
+              HarnessHealth.settle_other_route_in_txn(
+                txn,
+                seq,
+                terminal,
+                System.system_time(:millisecond)
+              )
 
-                {true, {:terminal_recorded, recorded, route_publication}}
-              else
-                {false, nil}
-              end
-            end,
-            fn txn, result ->
-              Tightbeam.Wakes.row_commit_in_txn(txn, [])
-              result
-            end
-          )
+            {true, {:terminal_recorded, recorded, route_publication}}
+          else
+            {false, nil}
+          end
+        end,
+        fn txn, result ->
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
+          result
+        end
+      )
 
-        {if(won, do: :ok, else: :already_terminal), recorded}
-      else
-        {Ledger.finish(state.db, seq, terminal, error), nil}
-      end
+    {finish_result, recorded} = {if(won, do: :ok, else: :already_terminal), recorded}
 
     case finish_result do
       :ok ->
