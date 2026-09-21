@@ -13,8 +13,8 @@ and scope renewed review to changed behavior and interactions. Explain any evide
 gap that prevents accepting a required outcome. A clause table is useful when the
 contract needs that level of traceability, with no universal report template.
 
-Begin a useful early review when the available source and evidence permit; a
-tests-passed receipt is not a precondition. State which questions the available
-work can settle and what evidence remains necessary for clean acceptance. If a
-producer closes before required independent review, notify its orchestrator and
+Begin a useful early review when the available source and evidence permit; a tests-passed receipt is not a precondition.
+State which questions the available work can settle and what
+evidence remains necessary for clean acceptance. If a producer closes before required
+independent review, notify its orchestrator and
 preserve your attributable conclusion.
