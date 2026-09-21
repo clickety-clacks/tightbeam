@@ -251,6 +251,7 @@ defmodule Tightbeam.IdentityTest do
     assert engineering_rule =~ ~s(action = "wake")
     refute engineering_rule =~ ~s(action = "assign")
     refute engineering_rule =~ ~s(target_role = "reviewer")
+    refute engineering_rule =~ ~s(target_role = "reviewer-code")
 
     for {role, present_axis, absent_axis} <- [
           {"reviewer-code", "## Code judgment", "## Spec judgment"},
@@ -261,6 +262,10 @@ defmodule Tightbeam.IdentityTest do
       assert review.guidance =~ present_axis
       refute review.guidance =~ absent_axis
       refute Regex.match?(~r/^#include/m, review.guidance)
+
+      if role == "reviewer-code" do
+        assert review.guidance =~ "a tests-passed receipt is not a precondition"
+      end
 
       assert review.skills == %{}
 
