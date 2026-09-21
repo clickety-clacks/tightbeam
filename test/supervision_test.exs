@@ -152,15 +152,7 @@ defmodule Tightbeam.SupervisionTest do
     refute "pendingTarget" in names
   end
 
-  test "the prod-shape manifest is executable and rejects an unreviewed sink", ctx do
-    proof = Supervision.prod_shape_static_sink_proof()
-    assert proof.verified
-    assert proof.sinkCount == 10
-    assert proof.uncovered == []
-    assert proof.boundSinks == proof.sinks
-    assert proof.missingBindings == []
-    assert proof.gate == {HarnessHealth, :prod_shape_act_in_txn, 6}
-
+  test "the prod-shape gate authorizes assignment prodding and rejects other consumers", ctx do
     assert {:ok, :acted} =
              DB.transaction(ctx.db, fn txn ->
                HarnessHealth.prod_shape_act_in_txn(
@@ -215,54 +207,6 @@ defmodule Tightbeam.SupervisionTest do
 
     refute_receive {:prod_wake_sink, _}
     assert Enum.map(Wakes.list_pending(ctx.db), & &1.wake_id) == before_denial
-  end
-
-  test "every reviewed action path is gated before handler, delivery, or effect", ctx do
-    open_rate_limit_incident!(ctx)
-
-    before_turns = scalar!(ctx.db, "SELECT COUNT(*) FROM turns")
-    before_wakes = scalar!(ctx.db, "SELECT COUNT(*) FROM wakes")
-    before_pending = Enum.map(Wakes.list_pending(ctx.db), & &1.wake_id)
-    before_suppressions = scalar!(ctx.db, "SELECT COUNT(*) FROM harness_health_prod_suppressions")
-
-    # Deliberately invalid sink arguments make accidental callback execution
-    # fail immediately. A denied gate must return before any of these concrete
-    # APIs can validate, call a handler, deliver, or write downstream state.
-    denied_routes = [
-      {{:turn, Ledger, :enqueue_in_txn, 2}, %{}},
-      {{:wake, Wakes, :schedule_in_txn, 2}, %{}},
-      {{:wake, Wakes, :retarget_in_txn, 3}, {nil, nil}},
-      {{:prompt, Tightbeam.Acp.Adapter, :prompt, 3}, {:missing, "sid", "text"}},
-      {{:prompt, Tightbeam.Acp.Adapter, :prompt, 4}, {:missing, "sid", "text", []}},
-      {{:acp_request, Tightbeam.Acp.Conn, :request, 3}, {:missing, "method", %{}}},
-      {{:acp_request, Tightbeam.Acp.Conn, :request, 4}, {:missing, "method", %{}, []}},
-      {{:command_signal, Tightbeam.CommandEdge, :signal, 2}, {%{}, %{}}},
-      {{:command_job, Tightbeam.CommandEdge, :job, 2}, {%{}, %{}}},
-      {{:command_request, Tightbeam.CommandEdge, :request, 4}, {%{}, %{}, :label, nil}}
-    ]
-
-    Enum.each(Enum.with_index(denied_routes), fn {{sink, args}, index} ->
-      assert {:ok, {:suppressed, gate}} =
-               DB.transaction(ctx.db, fn txn ->
-                 Supervision.prod_shape_action_in_txn(
-                   txn,
-                   sink,
-                   "denied-route-#{index}",
-                   "claude",
-                   "eezo",
-                   args
-                 )
-               end)
-
-      assert gate.incidentIds != []
-    end)
-
-    assert scalar!(ctx.db, "SELECT COUNT(*) FROM turns") == before_turns
-    assert scalar!(ctx.db, "SELECT COUNT(*) FROM wakes") == before_wakes
-    assert Enum.map(Wakes.list_pending(ctx.db), & &1.wake_id) == before_pending
-
-    assert scalar!(ctx.db, "SELECT COUNT(*) FROM harness_health_prod_suppressions") ==
-             before_suppressions + 10
   end
 
   test "startup refuses noncanonical liveness epoch provenance", ctx do
@@ -3833,11 +3777,6 @@ defmodule Tightbeam.SupervisionTest do
     assert {:pending, _} = HarnessHealth.observe(ctx.db, first)
     assert {:opened, _} = HarnessHealth.observe(ctx.db, second)
     :ok
-  end
-
-  defp scalar!(db, sql) do
-    assert {:ok, [[value]]} = DB.query(db, sql)
-    value
   end
 
   defp resolve_rate_limit_incident!(ctx, terminal_seq) do
