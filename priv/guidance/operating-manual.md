@@ -214,7 +214,7 @@ at=$(date +%s%3N)
 probe_digest=$(printf '%s' 'GET provider health endpoint: 503 transport reset' | sha256sum | cut -d' ' -f1)
 condition_digest=$(printf '%s' "$condition" | sha256sum | cut -d' ' -f1)
 tightbeam harness-health-observe-other \
-  --harness claude --host racter --source-session agent:example:worker \
+  --harness claude --host host-b --source-session agent:example:worker \
   --description "$description" --evidence-mode probe_digest \
   --observed-state 'provider connection was unavailable' \
   --exact-probe 'GET provider health endpoint' --output-digest "$probe_digest" \
@@ -227,7 +227,7 @@ tightbeam harness-health-observe-other \
 ```sh
 at=$(date +%s%3N)
 tightbeam harness-health-observe-other \
-  --harness claude --host racter --source-session agent:example:worker \
+  --harness claude --host host-b --source-session agent:example:worker \
   --description 'provider returned an unclassified transport failure' \
   --evidence-mode exact_error --observed-state 'provider response was unavailable' \
   --exact-probe 'GET provider health endpoint' \
