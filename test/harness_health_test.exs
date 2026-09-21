@@ -1,7 +1,17 @@
 defmodule Tightbeam.HarnessHealthTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{ConditionFacts, DB, EventLog, HarnessHealth, Ledger, Model, Org, Projection}
+  alias Tightbeam.{
+    ConditionFacts,
+    DB,
+    EventLog,
+    Gateway,
+    HarnessHealth,
+    Ledger,
+    Model,
+    Org,
+    Projection
+  }
 
   # Captured, not invented: immutable process-failure provenance report
   # process-failure-provenance-recon-frozen-214ac797f19e-2026-08-09.md,
@@ -324,6 +334,104 @@ defmodule Tightbeam.HarnessHealthTest do
              end)
   end
 
+  test "restart resume publishes an unmarked rung once and does not replay it", ctx do
+    [child, parent | _] = ctx.sessions
+    at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+               child.session,
+               parent.session
+             ])
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: child.session,
+               principal: {:session, child.session},
+               description: "restart route evidence",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "restart reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "restart-route"
+             })
+
+    assert {:ok, [["pending", _wake, _turn]]} =
+             DB.query(
+               ctx.db,
+               "UPDATE harness_health_other_routes SET state='pending',noticeWakeId=NULL,turnSeq=NULL WHERE incidentId=?1 AND ordinal=0 RETURNING state,noticeWakeId,turnSeq",
+               [opened.id]
+             )
+
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+
+    assert {:ok, [["pending", first_wake, first_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               [opened.id]
+             )
+
+    assert is_binary(first_wake)
+    assert is_integer(first_turn)
+
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+
+    assert {:ok, [["pending", ^first_wake, ^first_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               [opened.id]
+             )
+  end
+
+  test "record-only fallback settles without a wake or turn token", ctx do
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [
+               ctx.main_session
+             ])
+
+    [member | _] = ctx.sessions
+    at = System.system_time(:millisecond)
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: member.session,
+               principal: {:session, member.session},
+               description: "record-only route evidence",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "no owner turn",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "record-only-route"
+             })
+
+    assert {:ok, [["non_delivered", "target_retired", nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND targetKind='owner_user'",
+               [opened.id]
+             )
+  end
+
   test "promotion review cannot be selected for a first occurrence", ctx do
     [member | _] = ctx.sessions
     at = System.system_time(:millisecond)
@@ -357,6 +465,167 @@ defmodule Tightbeam.HarnessHealthTest do
                principal: {:session, member.session},
                idempotency_key: "promotion-first-review"
              })
+  end
+
+  test "public recurrence promotion closes a new class only from bound review bytes", ctx do
+    [member | _] = ctx.sessions
+    at = System.system_time(:millisecond)
+    description = "recurring public promotion evidence"
+
+    common = %{
+      harness: "claude",
+      host: "gibson",
+      source_session_key: member.session,
+      principal: {:session, member.session},
+      description: description,
+      evidence_mode: "exact_error",
+      observed_state: "provider route failed",
+      exact_observed_error: "recurring reset",
+      exact_probe: "provider health probe",
+      recovery_condition: "a normal provider turn completes",
+      not_known_class_reason: "not one of the named classes",
+      world_status: "UNKNOWN",
+      redaction_confirmed: true
+    }
+
+    assert {:opened, first} =
+             HarnessHealth.observe_other(
+               ctx.db,
+               Map.merge(common, %{
+                 observed_at: at - 100,
+                 accepted_at: at - 100,
+                 valid_until: at - 1,
+                 idempotency_key: "public-promotion-first"
+               })
+             )
+
+    handlers = Gateway.handlers(%{db: ctx.db})
+
+    assert %{ok: true, status: :opened, incident: second} =
+             handlers["harness-health-observe-other"].(%{
+               principal: {:session, member.session},
+               session_key: member.session,
+               params:
+                 Map.merge(common, %{
+                   observed_at: at,
+                   accepted_at: at,
+                   valid_until: at + 500,
+                   idempotency_key: "public-promotion-second"
+                 })
+             })
+
+    assert first.id != second.id
+
+    assert {:ok, [[promotion_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT promotionCaseId FROM harness_health_other_reviews WHERE incidentId=?1",
+               [second.id]
+             )
+
+    assert is_binary(promotion_id)
+
+    assert %{ok: true, review: %{state: "closed", outcome: "promotion_required"}} =
+             handlers["harness-health-review-other"].(%{
+               principal: {:session, member.session},
+               params: %{
+                 incident_id: second.id,
+                 outcome: "promotion_required",
+                 cause: "recurrence requires a named-class promotion",
+                 idempotency_key: "public-promotion-review"
+               }
+             })
+
+    work_item_id = "wi_public_promotion"
+    candidate_id = "asg_public_promotion_candidate"
+    review_id = "asg_public_promotion_review"
+    spec_id = "art_public_promotion_spec"
+    report_id = "art_public_promotion_report"
+    attest_id = "att_public_promotion_clean"
+    spec_sha = String.duplicate("a", 64)
+    report_sha = String.duplicate("b", 64)
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO work_items(id,title,ownerUserId,createdByUser,createdAt) VALUES(?1,'public promotion','flynn','flynn',?2)",
+               [work_item_id, at]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,workItemId) VALUES(?1,'candidate',?2,'flynn',?3,'open',?4)",
+               [candidate_id, member.session, at, work_item_id]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO assignments(id,subject,holderKey,openedByUser,openedAt,state,workItemId,reviewsAssignmentId) VALUES(?1,'independent review',?2,'flynn',?3,'open',?4,?5)",
+               [review_id, ctx.outside_session, at, work_item_id, candidate_id]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,contentSha256,state,createdAt,updatedAt) VALUES(?1,'spec','reviewed spec',?2,?3,'tightbeam-specs/public-promotion.md',?4,'in-workspace',?5,?5)",
+               [spec_id, member.session, work_item_id, spec_sha, at]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO artifacts(artifactId,kind,title,createdBySession,workItemId,originPath,contentSha256,state,createdAt,updatedAt) VALUES(?1,'report','reviewed report',?2,?3,'reports/public-promotion.md',?4,'in-workspace',?5,?5)",
+               [report_id, ctx.outside_session, work_item_id, report_sha, at]
+             )
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "INSERT INTO attests(id,assignmentId,kind,verdictKind,bySession,artifactId,contentSha256,ts) VALUES(?1,?2,'verdict','reviewed-clean',?3,?4,?5,?6)",
+               [attest_id, review_id, ctx.outside_session, report_id, report_sha, at]
+             )
+
+    close_params = %{
+      promotion_id: promotion_id,
+      named_class: "provider-network-drift",
+      spec_artifact_id: spec_id,
+      review_artifact_id: report_id,
+      review_attest_id: attest_id,
+      review_assignment_id: review_id,
+      idempotency_key: "public-promotion-close"
+    }
+
+    assert %{code: "not_authorized", message: "not_authorized"} =
+             handlers["harness-health-close-promotion"].(%{
+               principal: "process:tightbeam",
+               params: close_params
+             })
+
+    assert %{
+             ok: true,
+             promotion: %{
+               state: "closed",
+               namedClass: "provider-network-drift",
+               reviewAttestId: ^attest_id
+             }
+           } =
+             handlers["harness-health-close-promotion"].(%{
+               principal: {:user, "flynn"},
+               params: close_params
+             })
+
+    assert %{ok: true, promotion: duplicate} =
+             handlers["harness-health-close-promotion"].(%{
+               principal: {:user, "flynn"},
+               params: close_params
+             })
+
+    assert duplicate["promotionId"] == promotion_id
+    assert duplicate["state"] == "closed"
+    assert duplicate["namedClass"] == "provider-network-drift"
+    assert duplicate["reviewAttestId"] == attest_id
   end
 
   test "captured terminal errors preserve auth, rate-limit, and unrelated classes" do
@@ -1024,6 +1293,10 @@ defmodule Tightbeam.HarnessHealthTest do
 
     assert exact.incident.descriptionDigest == digest
     assert hd(exact.observations).description == description
+    assert exact.reviewNotice.digest == digest
+    assert exact.reviewNotice.pointer.incidentId == opened.id
+    assert is_integer(exact.reviewNotice.pointer.routeOrdinal)
+    refute Map.has_key?(ordinary, :reviewNotice)
     assert {:ok, _} = HarnessHealth.read_other_evidence(ctx.db, opened.id, {:user, "flynn"})
 
     assert {:error, %{code: "not_authorized"}} =

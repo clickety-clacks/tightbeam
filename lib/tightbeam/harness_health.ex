@@ -1976,6 +1976,8 @@ defmodule Tightbeam.HarnessHealth do
 
         [incident_row] = Txn.q(txn, incident_sql() <> " WHERE id=?1", [incident_id])
 
+        incident = incident(incident_row)
+
         observations =
           Txn.q(
             txn,
@@ -1984,7 +1986,28 @@ defmodule Tightbeam.HarnessHealth do
           )
           |> Enum.map(&observation/1)
 
-        {:ok, %{incident: incident(incident_row), observations: observations}}
+        review_notice =
+          case Txn.q(
+                 txn,
+                 "SELECT ordinal,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 ORDER BY ordinal LIMIT 1",
+                 [incident_id]
+               ) do
+            [[ordinal, notice_wake_id, turn_seq]] ->
+              %{
+                digest: incident.descriptionDigest,
+                pointer: %{
+                  incidentId: incident_id,
+                  routeOrdinal: ordinal,
+                  noticeWakeId: notice_wake_id,
+                  turnSeq: turn_seq
+                }
+              }
+
+            [] ->
+              nil
+          end
+
+        {:ok, %{incident: incident, observations: observations, reviewNotice: review_notice}}
 
       [] ->
         raise ArgumentError, "evidence_not_found"
@@ -3343,7 +3366,7 @@ defmodule Tightbeam.HarnessHealth do
     [[target_kind, target_ref, route_ordinal]] =
       Txn.q(
         txn,
-        "SELECT targetKind,targetRef,ordinal FROM harness_health_other_routes WHERE incidentId=?1 AND state IN ('pending','alerted') ORDER BY ordinal LIMIT 1",
+        "SELECT targetKind,targetRef,ordinal FROM harness_health_other_routes WHERE incidentId=?1 AND state IN ('pending','alerted') AND noticeWakeId IS NULL AND turnSeq IS NULL ORDER BY ordinal LIMIT 1",
         [incident_id]
       )
 
@@ -3366,7 +3389,7 @@ defmodule Tightbeam.HarnessHealth do
         attention: :high
       )
 
-    notice_wake_id = "hhnotice_#{incident_id}_#{route_ordinal}"
+    notice_wake_id = if(target_kind == "session", do: "hhnotice_#{incident_id}_#{route_ordinal}")
 
     marker_seq =
       case publication do
@@ -3807,7 +3830,7 @@ defmodule Tightbeam.HarnessHealth do
     next =
       case Txn.q(
              txn,
-             "SELECT ordinal FROM harness_health_other_routes WHERE incidentId=?1 AND state IN ('pending','alerted') AND noticeWakeId IS NULL ORDER BY ordinal LIMIT 1",
+             "SELECT ordinal FROM harness_health_other_routes WHERE incidentId=?1 AND state IN ('pending','alerted') AND noticeWakeId IS NULL AND turnSeq IS NULL ORDER BY ordinal LIMIT 1",
              [incident_id]
            ) do
         [[ordinal]] -> ordinal
@@ -3862,8 +3885,20 @@ defmodule Tightbeam.HarnessHealth do
 
     if input do
       case incident_notice_in_txn(txn, incident_id, input, :automatic) do
-        %{kind: :other_route} = publication -> publication
-        _ -> nil
+        %{kind: :other_route, plan: []} = publication ->
+          settle_other_route_notice_in_txn(
+            txn,
+            publication.incident_id,
+            publication.ordinal,
+            publication.plan,
+            publication.settled_at
+          )
+
+        %{kind: :other_route} = publication ->
+          publication
+
+        _ ->
+          nil
       end
     end
   end
@@ -3875,7 +3910,7 @@ defmodule Tightbeam.HarnessHealth do
       transaction!(db, fn txn ->
         Txn.q(
           txn,
-          "SELECT DISTINCT incidentId FROM harness_health_other_routes WHERE state IN ('pending','alerted') AND noticeWakeId IS NULL ORDER BY incidentId",
+          "SELECT DISTINCT incidentId FROM harness_health_other_routes WHERE state IN ('pending','alerted') AND noticeWakeId IS NULL AND turnSeq IS NULL ORDER BY incidentId",
           []
         )
         |> Enum.flat_map(fn [incident_id] ->
