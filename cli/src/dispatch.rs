@@ -327,6 +327,41 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::HarnessHealthClosePromotion {
+            identity,
+            promotion_id,
+            named_class,
+            spec_artifact_id,
+            spec_ref,
+            spec_sha256,
+            review_artifact_id,
+            review_attest_id,
+            review_assignment_id,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("promotionId", promotion_id),
+                string_field("namedClass", named_class),
+                string_field("specArtifactId", spec_artifact_id),
+                string_field("reviewArtifactId", review_artifact_id),
+                string_field("reviewAttestId", review_attest_id),
+                string_field("reviewAssignmentId", review_assignment_id),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+
+            for (name, value) in [("specRef", spec_ref), ("specSha256", spec_sha256)] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+
+            Ok(request(
+                identity,
+                "harness-health-close-promotion",
+                vec![],
+                params,
+            ))
+        }
         Command::ArtifactContentFetch {
             identity,
             artifact_id,
@@ -1949,6 +1984,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessHealthObserveOther { identity, .. }
         | Command::HarnessHealthResolveOther { identity, .. }
         | Command::HarnessHealthReviewOther { identity, .. }
+        | Command::HarnessHealthClosePromotion { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }

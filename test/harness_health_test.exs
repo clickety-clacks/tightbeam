@@ -864,6 +864,69 @@ defmodule Tightbeam.HarnessHealthTest do
     assert message =~ "may resolve exactly once"
   end
 
+  test "other evidence is immutable and ordinary reads omit sensitive detail", ctx do
+    [member | _] = ctx.sessions
+    description = "captured provider transport detail"
+    digest = :crypto.hash(:sha256, description) |> Base.encode16(case: :lower)
+    at = System.system_time(:millisecond)
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: member.session,
+               principal: {:session, member.session},
+               description: description,
+               evidence_mode: "exact_error",
+               observed_state: "provider transport failed",
+               exact_observed_error: "transport reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "immutable-evidence"
+             })
+
+    ordinary = HarnessHealth.get(ctx.db, opened.id)
+    refute Map.has_key?(ordinary, :descriptionDigest)
+
+    assert Enum.all?(ordinary.observations, fn observation ->
+             Enum.all?(
+               ~w(cause description description_digest exact_observed_error exact_probe),
+               fn key ->
+                 not Map.has_key?(observation, String.to_existing_atom(key))
+               end
+             )
+           end)
+
+    assert Enum.all?(EventLog.lifecycle_events(ctx.db), fn event ->
+             not String.contains?(event.detail, description) and
+               not String.contains?(event.detail, digest)
+           end)
+
+    assert {:error, %DB.Error{message: message}} =
+             DB.query(
+               ctx.db,
+               "UPDATE harness_health_observations SET description=?2 WHERE id=?1",
+               [opened.observationId, "changed"]
+             )
+
+    assert message =~ "evidence is immutable"
+
+    assert {:error, %DB.Error{message: message}} =
+             DB.query(
+               ctx.db,
+               "UPDATE harness_health_incidents SET descriptionDigest=?2 WHERE id=?1",
+               [opened.id, "changed"]
+             )
+
+    assert message =~ "incident identity is immutable"
+  end
+
   test "correlation idempotency refuses a different event", ctx do
     [first | _] = ctx.sessions
     input = authoritative(first, "auth-dead", 10, "same-correlation")

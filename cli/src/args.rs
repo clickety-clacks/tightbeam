@@ -124,6 +124,18 @@ pub enum Command {
         cause: Option<String>,
         idempotency_key: String,
     },
+    HarnessHealthClosePromotion {
+        identity: Identity,
+        promotion_id: String,
+        named_class: String,
+        spec_artifact_id: String,
+        spec_ref: Option<String>,
+        spec_sha256: Option<String>,
+        review_artifact_id: String,
+        review_attest_id: String,
+        review_assignment_id: String,
+        idempotency_key: String,
+    },
     ArtifactRecord {
         identity: Identity,
         kind: String,
@@ -617,6 +629,10 @@ COMMANDS:
   harness-health-review-other <incidentId>
       --outcome confirmed_other|reclassified|promotion_required
       Close the mandatory review for an other incident.
+  harness-health-close-promotion <promotionId> --named-class <class>
+      --spec-artifact <artifactId> --review-artifact <artifactId>
+      --review-attest <attestId> --review-assignment <assignmentId> --key <idempotencyKey>
+      Close a recurrence promotion after the Gateway verifies canonical provenance.
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
@@ -1741,6 +1757,46 @@ fn parse_with_optional_catalog(
                 outcome,
                 named_class: nonempty(flags, "named-class"),
                 cause: nonempty(flags, "cause"),
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+            })
+        }
+        "harness-health-close-promotion" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "named-class",
+                "spec-artifact",
+                "spec-ref",
+                "spec-sha256",
+                "review-artifact",
+                "review-attest",
+                "review-assignment",
+                "key",
+            ];
+
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-close-promotion <promotionId> --named-class <class> --spec-artifact <artifactId> --review-artifact <artifactId> --review-attest <attestId> --review-assignment <assignmentId> --key <idempotencyKey>".to_owned());
+            }
+
+            Ok(Command::HarnessHealthClosePromotion {
+                identity: identity(flags)?,
+                promotion_id: parsed.positional[1].clone(),
+                named_class: nonempty(flags, "named-class")
+                    .ok_or_else(|| "--named-class is required".to_owned())?,
+                spec_artifact_id: nonempty(flags, "spec-artifact")
+                    .ok_or_else(|| "--spec-artifact is required".to_owned())?,
+                spec_ref: nonempty(flags, "spec-ref"),
+                spec_sha256: nonempty(flags, "spec-sha256"),
+                review_artifact_id: nonempty(flags, "review-artifact")
+                    .ok_or_else(|| "--review-artifact is required".to_owned())?,
+                review_attest_id: nonempty(flags, "review-attest")
+                    .ok_or_else(|| "--review-attest is required".to_owned())?,
+                review_assignment_id: nonempty(flags, "review-assignment")
+                    .ok_or_else(|| "--review-assignment is required".to_owned())?,
                 idempotency_key: nonempty(flags, "key")
                     .ok_or_else(|| "--key is required".to_owned())?,
             })
@@ -3833,6 +3889,7 @@ mod tests {
                 "harness-health-observe-other",
                 "harness-health-resolve-other",
                 "harness-health-review-other",
+                "harness-health-close-promotion",
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",

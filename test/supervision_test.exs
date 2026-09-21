@@ -152,6 +152,69 @@ defmodule Tightbeam.SupervisionTest do
     refute "pendingTarget" in names
   end
 
+  test "the prod-shape manifest is executable and rejects an unreviewed sink", ctx do
+    proof = Supervision.prod_shape_static_sink_proof()
+    assert proof.verified
+    assert proof.sinkCount == 10
+    assert proof.uncovered == []
+    assert proof.gate == {HarnessHealth, :prod_shape_act_in_txn, 6}
+
+    assert {:ok, :acted} =
+             DB.transaction(ctx.db, fn txn ->
+               HarnessHealth.prod_shape_act_in_txn(
+                 txn,
+                 "assignment_prodder",
+                 "asg_1",
+                 "claude",
+                 "gibson",
+                 fn -> :acted end
+               )
+             end)
+
+    assert {:error, %ArgumentError{message: "unreviewed_prod_shape_consumer"}} =
+             DB.transaction(ctx.db, fn txn ->
+               HarnessHealth.prod_shape_act_in_txn(
+                 txn,
+                 "test_sink",
+                 "asg_1",
+                 "claude",
+                 "gibson",
+                 fn -> flunk("unreviewed sink was executed") end
+               )
+             end)
+  end
+
+  test "the real prod wake sink runs behind the gate transaction and denial has no effect",
+       ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    parent = self()
+    actual_wake = ctx.handlers["wake"]
+
+    instrumented =
+      Map.put(ctx.handlers, "wake", fn call ->
+        send(parent, {:prod_wake_sink, match?(%DB.Txn{}, call[:txn])})
+        actual_wake.(call)
+      end)
+
+    terminal = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(ctx.db, instrumented, 3, "holder", terminal)
+
+    assert_receive {:prod_wake_sink, true}
+    before_denial = Enum.map(Wakes.list_pending(ctx.db), & &1.wake_id)
+    assert length(before_denial) == 1
+
+    open_rate_limit_incident!(ctx)
+    denial_terminal = terminal!(ctx.db, "holder")
+
+    assert :harness_unavailable =
+             Supervision.evaluate(ctx.db, instrumented, 3, "holder", denial_terminal)
+
+    refute_receive {:prod_wake_sink, _}
+    assert Enum.map(Wakes.list_pending(ctx.db), & &1.wake_id) == before_denial
+  end
+
   test "startup refuses noncanonical liveness epoch provenance", ctx do
     {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_liveness_epoch")
 

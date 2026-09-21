@@ -85,6 +85,25 @@ defmodule Tightbeam.Supervision do
   @doc "The reviewed action sinks covered by the shared prod-shape gate."
   def prod_shape_action_sinks, do: @prod_shape_action_sinks
 
+  @doc "Executable manifest proof for the bounded prod-shape consumer surface."
+  def prod_shape_static_sink_proof do
+    missing_sinks =
+      Enum.reject(@prod_shape_action_sinks, fn {_kind, module, function, arity} ->
+        Code.ensure_loaded?(module) and function_exported?(module, function, arity)
+      end)
+
+    %{
+      consumers: @prod_shape_consumers,
+      sinks: @prod_shape_action_sinks,
+      gate: {HarnessHealth, :prod_shape_act_in_txn, 6},
+      guardedConsumers: @prod_shape_consumers,
+      sinkCount: length(@prod_shape_action_sinks),
+      missingSinks: missing_sinks,
+      uncovered: missing_sinks,
+      verified: missing_sinks == [] and @prod_shape_consumers == ["assignment_prodder"]
+    }
+  end
+
   @doc false
   def watermarks_ddl, do: @watermarks_ddl
 
@@ -2305,42 +2324,7 @@ defmodule Tightbeam.Supervision do
       clear_pending(db, pending)
       {:cleared, nil}
     else
-      case prod_shape_act(db, pending, target) do
-        :allowed ->
-          deliver_wake(db, handlers, pending, assignment, target)
-
-        {:suppressed, _gate} ->
-          clear_pending(db, pending)
-          {:cleared, :harness_unavailable}
-      end
-    end
-  end
-
-  defp prod_shape_act(db, pending, target) do
-    case query(db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [target]) do
-      [[harness, host]] ->
-        case DB.transaction(db, fn txn ->
-               HarnessHealth.prod_shape_act_in_txn(
-                 txn,
-                 "assignment_prodder",
-                 pending.pendingAssignment,
-                 harness,
-                 host,
-                 fn -> :allowed end
-               )
-             end) do
-          {:ok, :allowed} ->
-            :allowed
-
-          {:ok, {:suppressed, gate}} ->
-            {:suppressed, gate}
-
-          {:error, _} ->
-            {:suppressed, %{incidentIds: [], failureClasses: [], earliestExpiryAt: nil}}
-        end
-
-      [] ->
-        {:suppressed, %{incidentIds: [], failureClasses: [], earliestExpiryAt: nil}}
+      deliver_wake(db, handlers, pending, assignment, target)
     end
   end
 
@@ -2389,10 +2373,49 @@ defmodule Tightbeam.Supervision do
       params: params
     }
 
-    case Dispatch.dispatch(db, handlers, call) do
-      {:ok, _} ->
-        success_clear(db, pending)
+    result =
+      DB.transaction(db, fn txn ->
+        case query(txn, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [target]) do
+          [[harness, host]] ->
+            HarnessHealth.prod_shape_act_in_txn(
+              txn,
+              "assignment_prodder",
+              pending.pendingAssignment,
+              harness,
+              host,
+              fn ->
+                try do
+                  outcome = Map.fetch!(handlers, "wake").(Map.put(call, :txn, txn))
 
+                  case outcome do
+                    %{code: _} = error ->
+                      {:dispatch_error, error}
+
+                    wake when is_map(wake) ->
+                      if clear_pending_in_txn(txn, pending) do
+                        success_bookkeeping_in_txn(txn, pending)
+                        {:delivered, wake}
+                      else
+                        {:stale, wake}
+                      end
+
+                    other ->
+                      {:dispatch_error, %{code: "server_error", message: inspect(other)}}
+                  end
+                catch
+                  kind, reason ->
+                    {:dispatch_error, %{code: "handler_#{kind}", message: inspect(reason)}}
+                end
+              end
+            )
+
+          [] ->
+            {:suppressed, %{incidentIds: [], failureClasses: [], earliestExpiryAt: nil}}
+        end
+      end)
+
+    case result do
+      {:ok, {:delivered, _wake}} ->
         result =
           case pending.pendingBranch do
             "prod" -> {:prodded, pending.pendingK}
@@ -2401,14 +2424,19 @@ defmodule Tightbeam.Supervision do
 
         {:cleared, result}
 
-      {:error, %{code: code}} when code in ["reminder_pending", "reminder_not_eligible"] ->
-        # Coalescing is not notification success or a dispatch failure. Drop
-        # only this evaluation's dispatch branch so later reassessment can run;
-        # the durable reminder consumer and successful-delivery state stay owned.
+      {:ok, {:stale, _wake}} ->
+        {:cleared, :stale}
+
+      {:ok, {:suppressed, _gate}} ->
+        clear_pending(db, pending)
+        {:cleared, :harness_unavailable}
+
+      {:ok, {:dispatch_error, %{code: code}}}
+      when code in ["reminder_pending", "reminder_not_eligible"] ->
         clear_pending(db, pending)
         {:cleared, :coalesced}
 
-      {:error, %{code: code}} when code in ["rule_denied", "rule_error"] ->
+      {:ok, {:dispatch_error, %{code: code}}} when code in ["rule_denied", "rule_error"] ->
         denied_streak = denied_clear(db, pending)
         detail = "code=#{code} deniedStreak=#{denied_streak}"
         best_effort_lifecycle(db, "supervision_prod_denied", assignment.id, detail)
@@ -2419,9 +2447,23 @@ defmodule Tightbeam.Supervision do
 
         {:cleared, {:refused, code}}
 
-      {:error, %{code: code}} ->
+      {:ok, {:dispatch_error, %{code: code}}} ->
+        if String.starts_with?(code, "handler_") do
+          best_effort_lifecycle(db, "supervision_evaluate_failed", assignment.id, "code=#{code}")
+        end
+
         best_effort_lifecycle(db, "supervision_dispatch_failed", assignment.id, "code=#{code}")
         {:pending, {:refused, code}}
+
+      {:error, _} ->
+        best_effort_lifecycle(
+          db,
+          "supervision_dispatch_failed",
+          assignment.id,
+          "code=transaction_error"
+        )
+
+        {:pending, {:refused, "transaction_error"}}
     end
   end
 
@@ -2429,62 +2471,55 @@ defmodule Tightbeam.Supervision do
     transaction!(db, fn txn -> clear_pending_in_txn(txn, pending) end)
   end
 
-  defp success_clear(db, pending) do
-    _event_seq =
-      transaction!(db, fn txn ->
-        if clear_pending_in_txn(txn, pending) do
-          Txn.q(
-            txn,
-            "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
-            [pending.pendingAssignment, now()]
-          )
+  defp success_bookkeeping_in_txn(txn, pending) do
+    Txn.q(
+      txn,
+      "UPDATE assignment_prods SET prodCount = prodCount + 1, lastProdAt = ?2, deniedStreak = 0 WHERE assignmentId = ?1",
+      [pending.pendingAssignment, now()]
+    )
 
-          # prodCount is a mutable aggregate that RESETS on attest, and pendingK is
-          # overwritten every evaluation: the tier that fired has no other home.
-          if pending.pendingBranch == "prod" do
-            at = now()
-            job_ref = job_ref_in_txn(txn, pending.pendingAssignment)
+    # prodCount is a mutable aggregate that RESETS on attest, and pendingK is
+    # overwritten every evaluation: the tier that fired has no other home.
+    if pending.pendingBranch == "prod" do
+      at = now()
+      job_ref = job_ref_in_txn(txn, pending.pendingAssignment)
 
-            CausalEvents.append_in_txn(txn, %{
-              kind: "prod_fired",
-              assignment_id: pending.pendingAssignment,
-              job_ref: job_ref,
-              session_key: pending.sessionKey,
-              at: at,
-              detail: %{tier: pending.pendingK}
-            })
+      CausalEvents.append_in_txn(txn, %{
+        kind: "prod_fired",
+        assignment_id: pending.pendingAssignment,
+        job_ref: job_ref,
+        session_key: pending.sessionKey,
+        at: at,
+        detail: %{tier: pending.pendingK}
+      })
 
-            [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
+      [[seq]] = Txn.q(txn, "SELECT last_insert_rowid()")
 
-            event = %{
-              seq: seq,
-              at: at,
-              job_ref: job_ref,
-              assignment_id: pending.pendingAssignment,
-              session_key: pending.sessionKey,
-              kind: "prod_fired",
-              detail: %{tier: pending.pendingK}
-            }
+      event = %{
+        seq: seq,
+        at: at,
+        job_ref: job_ref,
+        assignment_id: pending.pendingAssignment,
+        session_key: pending.sessionKey,
+        kind: "prod_fired",
+        detail: %{tier: pending.pendingK}
+      }
 
-            Tightbeam.Firehose.Publisher.observation_in_txn(
-              txn,
-              "prod.fired",
-              event,
-              %{
-                "eventId" => seq,
-                "assignmentId" => pending.pendingAssignment,
-                "workItemId" => job_ref,
-                "sessionKey" => pending.sessionKey
-              },
-              at
-            )
+      Tightbeam.Firehose.Publisher.observation_in_txn(
+        txn,
+        "prod.fired",
+        event,
+        %{
+          "eventId" => seq,
+          "assignmentId" => pending.pendingAssignment,
+          "workItemId" => job_ref,
+          "sessionKey" => pending.sessionKey
+        },
+        at
+      )
 
-            seq
-          end
-        end
-      end)
-
-    :ok
+      seq
+    end
   end
 
   defp denied_clear(db, pending) do

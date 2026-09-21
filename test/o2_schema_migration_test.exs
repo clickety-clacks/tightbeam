@@ -78,6 +78,7 @@ defmodule Tightbeam.O2SchemaMigrationTest do
                  harness_health_incident_no_delete harness_health_incident_resolution_once
                  harness_health_member_immutable_delete harness_health_member_immutable_update
                  harness_health_observation_assignment_holder harness_health_observation_attachment_once
+                 harness_health_observation_evidence_immutable
                  harness_health_observation_identity_immutable harness_health_observation_no_delete
                ),
                &[&1]

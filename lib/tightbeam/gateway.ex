@@ -711,7 +711,10 @@ defmodule Tightbeam.Gateway do
               %{code: "unknown_caller"}
 
             true ->
-              wake_result(config, db, call)
+              case call[:txn] do
+                %DB.Txn{} = txn -> wake_result_in_txn(config, txn, call)
+                _ -> wake_result(config, db, call)
+              end
           end
         end,
       {"condition", ["condition_fact.filed", "wake.fired", "message.created", "session.updated"]} =>
@@ -1252,6 +1255,14 @@ defmodule Tightbeam.Gateway do
         case HarnessHealth.review_other(db, params) do
           {:error, error} -> error
           {:ok, detail} -> %{ok: true, review: detail}
+        end
+      end,
+      {"harness-health-close-promotion", []} => fn call ->
+        params = call.params |> Map.put(:principal, call.principal)
+
+        case HarnessHealth.close_other_promotion(db, params) do
+          {:error, error} -> error
+          {:ok, detail} -> %{ok: true, promotion: detail}
         end
       end,
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
@@ -5065,36 +5076,7 @@ defmodule Tightbeam.Gateway do
         due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
 
         result =
-          DB.transaction(db, fn txn ->
-            prior =
-              if p[:idempotency_key],
-                do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
-
-            if prior do
-              wake = Wakes.get_in_txn(txn, prior.session_key)
-
-              if is_map(wake),
-                do: Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
-
-              wake
-            else
-              wake = schedule_wake_in_txn(txn, call, session_key, due_at)
-
-              if p[:idempotency_key] && is_binary(wake[:wake_id]) do
-                Idempotency.put_in_txn(txn, %{
-                  owner_user_id: call.origin,
-                  operation: "wake",
-                  idempotency_key: p.idempotency_key,
-                  session_key: wake.wake_id
-                })
-              end
-
-              if is_map(wake) and is_binary(wake[:wake_id]),
-                do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, wake)
-
-              wake
-            end
-          end)
+          DB.transaction(db, fn txn -> wake_result_in_txn(config, txn, call) end)
 
         wake =
           case result do
@@ -5115,6 +5097,45 @@ defmodule Tightbeam.Gateway do
 
       _ ->
         %{code: "not_found"}
+    end
+  end
+
+  @doc false
+  def wake_in_txn(config, %DB.Txn{} = txn, call),
+    do: wake_result_in_txn(config, txn, call)
+
+  defp wake_result_in_txn(_config, txn, call) do
+    p = call.params
+    session_key = call.session_key
+    due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
+
+    prior =
+      if p[:idempotency_key],
+        do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
+
+    if prior do
+      wake = Wakes.get_in_txn(txn, prior.session_key)
+
+      if is_map(wake),
+        do: Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+      wake
+    else
+      wake = schedule_wake_in_txn(txn, call, session_key, due_at)
+
+      if p[:idempotency_key] && is_map(wake) && is_binary(wake[:wake_id]) do
+        Idempotency.put_in_txn(txn, %{
+          owner_user_id: call.origin,
+          operation: "wake",
+          idempotency_key: p.idempotency_key,
+          session_key: wake.wake_id
+        })
+      end
+
+      if is_map(wake) and is_binary(wake[:wake_id]),
+        do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, wake)
+
+      wake
     end
   end
 
