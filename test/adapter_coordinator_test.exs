@@ -296,6 +296,88 @@ defmodule Tightbeam.AdapterCoordinatorTest do
            end)
   end
 
+  test "an open circuit suppresses automatic restart but permits authoritative recovery", ctx do
+    old_value = Application.get_env(:tightbeam, :adapter_failure_circuit)
+
+    on_exit(fn ->
+      if old_value,
+        do: Application.put_env(:tightbeam, :adapter_failure_circuit, old_value),
+        else: Application.delete_env(:tightbeam, :adapter_failure_circuit)
+    end)
+
+    Application.put_env(:tightbeam, :adapter_failure_circuit, 1)
+
+    path = Path.join(ctx.test_dir, "circuit_recovery_fake.js")
+    File.write!(path, @fake)
+
+    owner = self()
+    boot_attempt = :atomics.new(1, signed: false)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         backoff_base_ms: 1,
+         adapter_context: fn _ -> [] end,
+         adapter_opts: fn _, context ->
+           attempt = :atomics.add_get(boot_attempt, 1, 1)
+
+           if attempt == 1 do
+             [harness: :claude, cmd: [System.find_executable("false")], home: "/tmp", cwd: "/tmp"]
+           else
+             send(owner, {:recovery_boot_started, self(), context})
+
+             receive do
+               {:release_recovery_boot, pid} when pid == self() ->
+                 [
+                   harness: :claude,
+                   cmd: [System.find_executable("node"), path],
+                   home: ctx.test_dir,
+                   cwd: ctx.test_dir
+                 ]
+             end
+           end
+         end,
+         db: ctx.db,
+         name: :circuit_latch_recovery_coordinator}
+      )
+
+    key = {:claude, "default", "testhost"}
+    assert {:ok, _first_adapter, 1} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    assert wait_until(fn ->
+             match?(
+               %{"claude:default@testhost" => %{circuit: :open, consecutive_failures: 1}},
+               AdapterCoordinator.health(coordinator)
+             )
+           end)
+
+    # The threshold opens the latch before any restart can be admitted. The
+    # public checkout must not observe a generation started by an automatic
+    # restart while the latch is open.
+    refute wait_until(fn -> :atomics.get(boot_attempt, 1) > 1 end, 100)
+    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    # Credential lifecycle recovery is the authoritative boundary: it may
+    # start a replacement while ordinary checkout remains degraded.
+    assert {:ok, recovery_adapter, 2} =
+             AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :subscription)
+
+    assert_receive {:recovery_boot_started, ^recovery_adapter, [credential_kind: :subscription]}
+    assert {:error, :degraded} = AdapterCoordinator.adapter_for(coordinator, key)
+
+    send(recovery_adapter, {:release_recovery_boot, recovery_adapter})
+
+    assert wait_until(fn ->
+             match?(
+               %{"claude:default@testhost" => %{circuit: :closed, consecutive_failures: 0}},
+               AdapterCoordinator.health(coordinator)
+             )
+           end)
+
+    assert {:ok, ^recovery_adapter, 2} = AdapterCoordinator.adapter_for(coordinator, key)
+  end
+
   # What the coordinator itself says it is doing: {holding a slot, waiting for one}.
   # Kept as a pair rather than a total because the total is what an uncapped
   # coordinator can also produce — the queued half is the cap's only footprint.
