@@ -301,7 +301,11 @@ defmodule Tightbeam.SessionLane do
 
         {:error, %{reason: reason, terminal_publish: fun, record_in_txn: action}}
         when is_function(fun, 1) and is_function(action, 1) ->
-          {"failed", error_text(reason), fun, action, nil}
+          after_commit = fn recorded ->
+            if is_function(recorded, 0), do: recorded.()
+          end
+
+          {"failed", error_text(reason), fun, action, after_commit}
 
         {:error, %{reason: reason, record_in_txn: action, after_commit: committed}}
         when is_function(action, 1) and is_function(committed, 1) ->
@@ -321,7 +325,17 @@ defmodule Tightbeam.SessionLane do
             state.db,
             fn txn ->
               if Ledger.finish_in_txn(txn, seq, terminal, error) do
-                {true, in_txn.(txn)}
+                recorded = in_txn.(txn)
+
+                route_publication =
+                  Tightbeam.HarnessHealth.settle_other_route_in_txn(
+                    txn,
+                    seq,
+                    terminal,
+                    System.system_time(:millisecond)
+                  )
+
+                {true, {:terminal_recorded, recorded, route_publication}}
               else
                 {false, nil}
               end
@@ -339,7 +353,10 @@ defmodule Tightbeam.SessionLane do
 
     case finish_result do
       :ok ->
+        {recorded, route_publication} = split_terminal_recorded(recorded)
+
         if is_function(after_commit, 1), do: after_commit.(recorded)
+        publish_route_publication(route_publication)
 
         if publish do
           publish.(terminal)
@@ -368,4 +385,14 @@ defmodule Tightbeam.SessionLane do
 
   defp error_text(reason) when is_binary(reason), do: reason
   defp error_text(reason), do: inspect(reason)
+
+  defp split_terminal_recorded({:terminal_recorded, recorded, route_publication}),
+    do: {recorded, route_publication}
+
+  defp split_terminal_recorded(recorded), do: {recorded, nil}
+
+  defp publish_route_publication(nil), do: :ok
+
+  defp publish_route_publication(%{plan: plan}) when is_list(plan),
+    do: Tightbeam.EventLog.publish(plan)
 end

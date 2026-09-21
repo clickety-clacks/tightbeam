@@ -136,6 +136,10 @@ pub enum Command {
         review_assignment_id: String,
         idempotency_key: String,
     },
+    HarnessHealthEvidenceOther {
+        identity: Identity,
+        incident_id: String,
+    },
     ArtifactRecord {
         identity: Identity,
         kind: String,
@@ -633,6 +637,8 @@ COMMANDS:
       --spec-artifact <artifactId> --review-artifact <artifactId>
       --review-attest <attestId> --review-assignment <assignmentId> --key <idempotencyKey>
       Close a recurrence promotion after the Gateway verifies canonical provenance.
+  harness-health-evidence-other <incidentId>
+      Read exact retained evidence as the authorized source, custodian, owner, or admin.
 
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
@@ -1799,6 +1805,21 @@ fn parse_with_optional_catalog(
                     .ok_or_else(|| "--review-assignment is required".to_owned())?,
                 idempotency_key: nonempty(flags, "key")
                     .ok_or_else(|| "--key is required".to_owned())?,
+            })
+        }
+        "harness-health-evidence-other" => {
+            let allowed = ["as", "as-user", "as-process"];
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err(
+                    "usage: tightbeam harness-health-evidence-other <incidentId>".to_owned(),
+                );
+            }
+
+            Ok(Command::HarnessHealthEvidenceOther {
+                identity: identity(flags)?,
+                incident_id: parsed.positional[1].clone(),
             })
         }
         "artifact-content-fetch" => {
@@ -3890,6 +3911,7 @@ mod tests {
                 "harness-health-resolve-other",
                 "harness-health-review-other",
                 "harness-health-close-promotion",
+                "harness-health-evidence-other",
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",

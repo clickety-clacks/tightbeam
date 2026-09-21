@@ -362,6 +362,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::HarnessHealthEvidenceOther {
+            identity,
+            incident_id,
+        } => Ok(request(
+            identity,
+            "harness-health-evidence-other",
+            vec![],
+            vec![string_field("incidentId", incident_id)],
+        )),
         Command::ArtifactContentFetch {
             identity,
             artifact_id,
@@ -1985,6 +1994,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessHealthResolveOther { identity, .. }
         | Command::HarnessHealthReviewOther { identity, .. }
         | Command::HarnessHealthClosePromotion { identity, .. }
+        | Command::HarnessHealthEvidenceOther { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }

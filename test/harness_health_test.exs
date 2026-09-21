@@ -248,6 +248,117 @@ defmodule Tightbeam.HarnessHealthTest do
     refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "other")
   end
 
+  test "non-delivered route settlement publishes the next rung once", ctx do
+    [child, parent | _] = ctx.sessions
+    at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+               child.session,
+               parent.session
+             ])
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: child.session,
+               principal: {:session, child.session},
+               description: "route settlement evidence",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "route reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "route-settlement"
+             })
+
+    assert {:ok,
+            [
+              [_, first_ordinal, _state, first_turn_seq, _wake],
+              [_, _skipped_ordinal, "skipped", nil, nil],
+              [_, second_ordinal, "pending", nil, nil]
+            ]} =
+             DB.query(
+               ctx.db,
+               "SELECT incidentId,ordinal,state,turnSeq,noticeWakeId FROM harness_health_other_routes WHERE incidentId=?1 ORDER BY ordinal",
+               [opened.id]
+             )
+
+    assert first_ordinal < second_ordinal
+    assert is_integer(first_turn_seq)
+
+    assert {:ok, %{kind: :other_route, ordinal: ^second_ordinal, plan: plan}} =
+             DB.transaction(ctx.db, fn txn ->
+               HarnessHealth.settle_other_route_in_txn(
+                 txn,
+                 first_turn_seq,
+                 "failed",
+                 at + 1
+               )
+             end)
+
+    assert plan != []
+
+    assert {:ok, [["non_delivered", "failed"], ["skipped", _], ["pending", _]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 ORDER BY ordinal",
+               [opened.id]
+             )
+
+    assert {:ok, nil} =
+             DB.transaction(ctx.db, fn txn ->
+               HarnessHealth.settle_other_route_in_txn(
+                 txn,
+                 first_turn_seq,
+                 "failed",
+                 at + 2
+               )
+             end)
+  end
+
+  test "promotion review cannot be selected for a first occurrence", ctx do
+    [member | _] = ctx.sessions
+    at = System.system_time(:millisecond)
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: member.session,
+               principal: {:session, member.session},
+               description: "promotion requires recurrence",
+               evidence_mode: "exact_error",
+               observed_state: "provider failed",
+               exact_observed_error: "transport reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "promotion-first-occurrence"
+             })
+
+    assert {:error, %{code: "promotion_required"}} =
+             HarnessHealth.review_other(ctx.db, %{
+               incident_id: opened.id,
+               outcome: "promotion_required",
+               cause: "promotion requires a second occurrence",
+               principal: {:session, member.session},
+               idempotency_key: "promotion-first-review"
+             })
+  end
+
   test "captured terminal errors preserve auth, rate-limit, and unrelated classes" do
     assert HarnessHealth.classify_turn_failure(@captured_codex_rate_limit) == "rate-limit-dead"
     assert HarnessHealth.classify_turn_failure(@captured_claude_rate_limit) == "rate-limit-dead"
@@ -907,6 +1018,19 @@ defmodule Tightbeam.HarnessHealthTest do
              not String.contains?(event.detail, description) and
                not String.contains?(event.detail, digest)
            end)
+
+    assert {:ok, exact} =
+             HarnessHealth.read_other_evidence(ctx.db, opened.id, {:session, member.session})
+
+    assert exact.incident.descriptionDigest == digest
+    assert hd(exact.observations).description == description
+    assert {:ok, _} = HarnessHealth.read_other_evidence(ctx.db, opened.id, {:user, "flynn"})
+
+    assert {:error, %{code: "not_authorized"}} =
+             HarnessHealth.read_other_evidence(ctx.db, opened.id, {:session, ctx.outside_session})
+
+    assert {:error, %{code: "not_authorized"}} =
+             HarnessHealth.read_other_evidence(ctx.db, opened.id, "process:tightbeam")
 
     assert {:error, %DB.Error{message: message}} =
              DB.query(

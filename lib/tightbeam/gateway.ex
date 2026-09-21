@@ -297,6 +297,7 @@ defmodule Tightbeam.Gateway do
       [
         {ModelCatalog, base_dir: config.base_dir, db: db},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
+        {Task, fn -> HarnessHealth.resume_other_routes(db) end},
         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
         # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
         # statute, and the episode writer must already own the ordering before the first
@@ -1263,6 +1264,12 @@ defmodule Tightbeam.Gateway do
         case HarnessHealth.close_other_promotion(db, params) do
           {:error, error} -> error
           {:ok, detail} -> %{ok: true, promotion: detail}
+        end
+      end,
+      {"harness-health-evidence-other", []} => fn call ->
+        case HarnessHealth.read_other_evidence(db, call.params.incident_id, call.principal) do
+          {:error, error} -> error
+          {:ok, detail} -> %{ok: true, evidence: detail}
         end
       end,
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
