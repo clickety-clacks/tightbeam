@@ -337,6 +337,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             review_artifact_id,
             review_attest_id,
             review_assignment_id,
+            candidate_commit,
             idempotency_key,
         } => {
             let mut params = vec![
@@ -345,6 +346,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("specArtifactId", spec_artifact_id),
                 string_field("reviewArtifactId", review_artifact_id),
                 string_field("reviewAttestId", review_attest_id),
+                string_field("candidateCommit", candidate_commit),
                 string_field("reviewAssignmentId", review_assignment_id),
                 string_field("idempotencyKey", idempotency_key),
             ];

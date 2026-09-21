@@ -45,7 +45,7 @@ defmodule Tightbeam.HarnessHealth do
   @harness_health_predecessor_stamp "addressed-po-consultation-v1-019"
   @legacy_object_set_sha256 "97ec5ee389c4f1b8d1b932dcfbc9fc59472a9c721a82968b013f63f54b52ebaf"
   @legacy_two_class_object_set_sha256 "be16933e4a429970358325fe941e258e6838e0e0b789a5d0b470bdb1269dcc3e"
-  @target_object_set_sha256 "36237bfaa53455a4510c58448ebd7f00bc34500fa6ba4f80c2b9682cf6a26363"
+  @target_object_set_sha256 "c811a7a0584197a7111e317f128b1bd9c08b21450511654b84f691ecc325a150"
   @target_object_names ~w(
     harness_health_observations harness_health_observation_window
     harness_health_observation_incident harness_health_incidents
@@ -63,6 +63,7 @@ defmodule Tightbeam.HarnessHealth do
     harness_health_assignment_immutable_update harness_health_assignment_immutable_delete
     harness_health_other_route_target_unique harness_health_other_route_identity_immutable
     harness_health_other_route_terminal_once harness_health_other_review_event_append_only_update
+    harness_health_other_route_pending_terminal harness_health_other_route_no_delete
     harness_health_other_review_event_append_only_delete harness_health_class_promotion_close_once
   )
 
@@ -309,14 +310,37 @@ defmodule Tightbeam.HarnessHealth do
   END;
 
   CREATE TRIGGER IF NOT EXISTS harness_health_other_route_terminal_once
-  BEFORE UPDATE OF state,closedReason,noticeWakeId,turnSeq
+  BEFORE UPDATE OF state,closedReason,noticeWakeId,turnSeq,resolvedAt,settledAt
   ON harness_health_other_routes
   WHEN OLD.state IN ('skipped','delivered','non_delivered','alerted') AND
        (NEW.state != OLD.state OR NEW.closedReason IS NOT OLD.closedReason OR
-        NEW.noticeWakeId IS NOT OLD.noticeWakeId OR NEW.turnSeq IS NOT OLD.turnSeq)
+        NEW.noticeWakeId IS NOT OLD.noticeWakeId OR NEW.turnSeq IS NOT OLD.turnSeq OR
+        NEW.resolvedAt IS NOT OLD.resolvedAt OR NEW.settledAt IS NOT OLD.settledAt)
   BEGIN
     SELECT RAISE(ABORT, 'harness health route is terminal and immutable');
   END;
+  CREATE TRIGGER IF NOT EXISTS harness_health_other_route_pending_terminal
+  BEFORE UPDATE OF state ON harness_health_other_routes
+  WHEN OLD.state = 'pending' AND NEW.state != 'pending' AND (
+    NEW.state NOT IN ('delivered','non_delivered','alerted') OR
+    (NEW.state = 'delivered' AND
+      (NEW.closedReason IS NOT NULL OR NEW.resolvedAt IS NULL OR NEW.settledAt IS NULL)) OR
+    (NEW.state = 'non_delivered' AND
+      (NEW.closedReason NOT IN ('failed','failed_unknown','canceled','target_retired') OR
+       NEW.resolvedAt IS NULL OR NEW.settledAt IS NULL)) OR
+    (NEW.state = 'alerted' AND
+      (NEW.closedReason IS NOT 'no_active_main' OR NEW.settledAt IS NULL))
+  )
+  BEGIN
+    SELECT RAISE(ABORT, 'harness health route transition is invalid');
+  END;
+
+  CREATE TRIGGER IF NOT EXISTS harness_health_other_route_no_delete
+  BEFORE DELETE ON harness_health_other_routes
+  BEGIN
+    SELECT RAISE(ABORT, 'harness health route rows are immutable');
+  END;
+
 
   CREATE TRIGGER IF NOT EXISTS harness_health_other_review_event_append_only_update
   BEFORE UPDATE ON harness_health_other_review_events
@@ -1375,7 +1399,7 @@ defmodule Tightbeam.HarnessHealth do
     if recurrence <= 1 and outcome == "promotion_required",
       do: raise(ArgumentError, "promotion_required")
 
-    unless outcome != "reclassified" or valid_promoted_class?(Map.get(input, :named_class)),
+    unless outcome != "reclassified" or Map.get(input, :named_class) in @failure_classes,
       do: raise(ArgumentError, "invalid_review_outcome")
 
     cause = required_review_cause!(input)
@@ -1509,7 +1533,8 @@ defmodule Tightbeam.HarnessHealth do
         spec_artifact_id: spec_artifact_id,
         review_artifact_id: review_artifact_id,
         review_attest_id: review_attest_id,
-        review_assignment_id: review_assignment_id
+        review_assignment_id: review_assignment_id,
+        candidate_commit: candidate_commit
       }
       |> JSON.encode!()
       |> sha256()
@@ -1781,7 +1806,7 @@ defmodule Tightbeam.HarnessHealth do
            txn,
            """
            SELECT review.holderKey,review.state,review.workItemId,review.reviewsAssignmentId,
-                  candidate.id,candidate.workItemId,candidate.reviewsAssignmentId
+                  candidate.id,candidate.holderKey,candidate.workItemId,candidate.reviewsAssignmentId
            FROM assignments review
            JOIN assignments candidate ON candidate.id=review.reviewsAssignmentId
            WHERE review.id=?1
@@ -1795,11 +1820,13 @@ defmodule Tightbeam.HarnessHealth do
           review_work_item_id,
           _parent,
           _candidate_id,
+          candidate_holder,
           candidate_work_item_id,
           nil
         ]
       ]
-      when state in ["open", "closed"] and review_work_item_id == candidate_work_item_id ->
+      when state in ["open", "closed"] and review_work_item_id == candidate_work_item_id and
+             candidate_holder != reviewer_session ->
         true
 
       _ ->
@@ -2965,18 +2992,25 @@ defmodule Tightbeam.HarnessHealth do
              [owner]
            ) do
       [[main]] ->
-        walked ++
-          [
-            %{
-              ordinal: ordinal,
-              recipient: main,
-              target_kind: "session",
-              target_ref: main,
-              relation: "owner_main",
-              state: "pending",
-              closed_reason: nil
-            }
-          ]
+        if Enum.any?(walked, fn route ->
+             route.target_kind == "session" and route.target_ref == main and
+               route.state != "skipped"
+           end) do
+          walked
+        else
+          walked ++
+            [
+              %{
+                ordinal: ordinal,
+                recipient: main,
+                target_kind: "session",
+                target_ref: main,
+                relation: "owner_main",
+                state: "pending",
+                closed_reason: nil
+              }
+            ]
+        end
 
       _ when is_binary(owner) ->
         walked ++
@@ -2987,8 +3021,8 @@ defmodule Tightbeam.HarnessHealth do
               target_kind: "owner_user",
               target_ref: "user:" <> owner,
               relation: "owner_user",
-              state: "alerted",
-              closed_reason: "no_active_main"
+              state: "pending",
+              closed_reason: nil
             }
           ]
 
@@ -3001,8 +3035,8 @@ defmodule Tightbeam.HarnessHealth do
               target_kind: "owner_user",
               target_ref: "user:unknown",
               relation: "owner_user",
-              state: "alerted",
-              closed_reason: "no_active_main"
+              state: "pending",
+              closed_reason: nil
             }
           ]
     end
@@ -3444,9 +3478,28 @@ defmodule Tightbeam.HarnessHealth do
         attention: :high
       )
 
+      owner_user = String.replace_prefix(target_ref, "user:", "")
+
+      case Txn.q(
+             txn,
+             "SELECT kind FROM condition_facts WHERE scope=?1 AND kind IN ('user-alerted','user-alert-cleared') ORDER BY id DESC LIMIT 1",
+             [owner_user]
+           ) do
+        [["user-alerted"]] ->
+          :already_standing
+
+        _ ->
+          ConditionFacts.file_in_txn(txn, %{
+            kind: "user-alerted",
+            scope: owner_user,
+            origin: "process:tightbeam",
+            owner_user_id: owner_user
+          })
+      end
+
       Txn.q(
         txn,
-        "UPDATE harness_health_other_routes SET state='alerted',closedReason='no_active_main',noticeWakeId=NULL,turnSeq=NULL,settledAt=?3 WHERE incidentId=?1 AND ordinal=?2 AND state='alerted' AND settledAt IS NULL",
+        "UPDATE harness_health_other_routes SET state='alerted',closedReason='no_active_main',noticeWakeId=NULL,turnSeq=NULL,settledAt=?3 WHERE incidentId=?1 AND ordinal=?2 AND state='pending' AND settledAt IS NULL",
         [incident_id, route_ordinal, input.observed_at]
       )
 
@@ -3469,13 +3522,14 @@ defmodule Tightbeam.HarnessHealth do
       {:appended, marker} =
         Projection.append_substrate_in_txn(txn, target_ref, message, :high)
 
-      wake_id = "hhnotice_#{incident_id}_#{route_ordinal}"
+      wake_id = "other-review:#{incident_id}:#{target_ref}"
 
       {:ok, turn_seq} =
         Ledger.enqueue_in_txn(txn, %{
           session_key: target_ref,
           message_id: marker.id,
           wake_id: wake_id,
+          request_ref: "other-review-#{incident_id}",
           origin: "process:tightbeam",
           prompt: message
         })

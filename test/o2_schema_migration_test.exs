@@ -83,7 +83,8 @@ defmodule Tightbeam.O2SchemaMigrationTest do
                  harness_health_observation_identity_immutable harness_health_observation_no_delete
                  harness_health_other_review_event_append_only_delete
                  harness_health_other_review_event_append_only_update
-                 harness_health_other_route_identity_immutable harness_health_other_route_terminal_once
+                 harness_health_other_route_identity_immutable harness_health_other_route_no_delete
+                 harness_health_other_route_pending_terminal harness_health_other_route_terminal_once
                ),
                &[&1]
              )

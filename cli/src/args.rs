@@ -134,6 +134,7 @@ pub enum Command {
         review_artifact_id: String,
         review_attest_id: String,
         review_assignment_id: String,
+        candidate_commit: String,
         idempotency_key: String,
     },
     HarnessHealthEvidenceOther {
@@ -635,7 +636,7 @@ COMMANDS:
       Close the mandatory review for an other incident.
   harness-health-close-promotion <promotionId> --named-class <class>
       --spec-artifact <artifactId> --review-artifact <artifactId>
-      --review-attest <attestId> --review-assignment <assignmentId> --key <idempotencyKey>
+      --review-attest <attestId> --review-assignment <assignmentId> --candidate-commit <commit> --key <idempotencyKey>
       Close a recurrence promotion after the Gateway verifies canonical provenance.
   harness-health-evidence-other <incidentId>
       Read exact retained evidence as the authorized source, custodian, owner, or admin.
@@ -1779,13 +1780,14 @@ fn parse_with_optional_catalog(
                 "review-artifact",
                 "review-attest",
                 "review-assignment",
+                "candidate-commit",
                 "key",
             ];
 
             if parsed.positional.len() != 2
                 || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam harness-health-close-promotion <promotionId> --named-class <class> --spec-artifact <artifactId> --review-artifact <artifactId> --review-attest <attestId> --review-assignment <assignmentId> --key <idempotencyKey>".to_owned());
+                return Err("usage: tightbeam harness-health-close-promotion <promotionId> --named-class <class> --spec-artifact <artifactId> --review-artifact <artifactId> --review-attest <attestId> --review-assignment <assignmentId> --candidate-commit <commit> --key <idempotencyKey>".to_owned());
             }
 
             Ok(Command::HarnessHealthClosePromotion {
@@ -1803,6 +1805,8 @@ fn parse_with_optional_catalog(
                     .ok_or_else(|| "--review-attest is required".to_owned())?,
                 review_assignment_id: nonempty(flags, "review-assignment")
                     .ok_or_else(|| "--review-assignment is required".to_owned())?,
+                candidate_commit: nonempty(flags, "candidate-commit")
+                    .ok_or_else(|| "--candidate-commit is required".to_owned())?,
                 idempotency_key: nonempty(flags, "key")
                     .ok_or_else(|| "--key is required".to_owned())?,
             })
@@ -3176,6 +3180,36 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn harness_health_close_promotion_round_trips_candidate_commit() {
+        let candidate_commit = "c".repeat(40);
+        let command = parse(strings(&[
+            "harness-health-close-promotion",
+            "promotion-1",
+            "--named-class",
+            "provider-network-drift",
+            "--spec-artifact",
+            "spec-1",
+            "--review-artifact",
+            "report-1",
+            "--review-attest",
+            "attest-1",
+            "--review-assignment",
+            "review-1",
+            "--candidate-commit",
+            &candidate_commit,
+            "--key",
+            "close-1",
+        ]))
+        .expect("candidate commit must be accepted by the real CLI parser");
+
+        let body = crate::dispatch::build_request(&command)
+            .expect("candidate commit must reach the Gateway request")
+            .body_json;
+
+        assert!(body.contains(&format!(r#""candidateCommit":"{candidate_commit}""#)));
     }
 
     #[test]

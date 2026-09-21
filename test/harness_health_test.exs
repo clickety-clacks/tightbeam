@@ -258,6 +258,51 @@ defmodule Tightbeam.HarnessHealthTest do
     refute ConditionFacts.harness_failure_standing?(ctx.db, "claude", "gibson", "other")
   end
 
+  test "public other opening deduplicates an owner main already present as an ancestor", ctx do
+    [child, parent | _] = ctx.sessions
+    at = System.system_time(:millisecond)
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+               child.session,
+               parent.session
+             ])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE sessions SET spawnedBy=?2 WHERE sessionKey=?1", [
+               parent.session,
+               ctx.main_session
+             ])
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: child.session,
+               principal: {:session, child.session},
+               description: "owner main appears as ancestor",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "ancestor duplicate",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "owner-main-dedupe"
+             })
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM harness_health_other_routes WHERE incidentId=?1 AND targetRef=?2 AND state != 'skipped'",
+               [opened.id, ctx.main_session]
+             )
+  end
+
   test "non-delivered route settlement publishes the next rung once", ctx do
     [child, parent | _] = ctx.sessions
     at = System.system_time(:millisecond)
@@ -299,6 +344,11 @@ defmodule Tightbeam.HarnessHealthTest do
     assert is_binary(first_recipient)
     assert is_integer(first_turn_seq)
     assert is_binary(first_wake)
+    expected_request_ref = "other-review-#{opened.id}"
+    expected_wake_id = "other-review:#{opened.id}:#{first_recipient}"
+
+    assert {:ok, [[^expected_request_ref, ^expected_wake_id]]} =
+             DB.query(ctx.db, "SELECT requestRef,wakeId FROM turns WHERE seq=?1", [first_turn_seq])
 
     assert {:ok, %{seq: ^first_turn_seq}} =
              Ledger.claim_next(ctx.db, first_recipient, "route-settlement")
@@ -313,16 +363,21 @@ defmodule Tightbeam.HarnessHealthTest do
                [opened.id, first_ordinal]
              )
 
-    assert {:ok, [[second_ordinal, "pending", second_wake, second_turn]]} =
+    assert {:ok, [[second_recipient, second_ordinal, "pending", second_wake, second_turn]]} =
              DB.query(
                ctx.db,
-               "SELECT ordinal,state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND state='pending' AND ordinal>?2 ORDER BY ordinal LIMIT 1",
+               "SELECT recipient,ordinal,state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND state='pending' AND ordinal>?2 ORDER BY ordinal LIMIT 1",
                [opened.id, first_ordinal]
              )
 
     assert second_ordinal > first_ordinal
     assert is_binary(second_wake)
     assert is_integer(second_turn)
+    expected_second_wake = "other-review:#{opened.id}:#{second_recipient}"
+
+    assert {:ok, [[^expected_request_ref, ^expected_second_wake]]} =
+             DB.query(ctx.db, "SELECT requestRef,wakeId FROM turns WHERE seq=?1", [second_turn])
+
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
 
     assert {:ok, [["pending", ^second_wake, ^second_turn]]} =
@@ -364,6 +419,8 @@ defmodule Tightbeam.HarnessHealthTest do
                idempotency_key: "restart-route"
              })
 
+    request_ref = "other-review-#{opened.id}"
+
     assert {:ok, [[route_recipient, first_state, first_wake, first_turn]]} =
              DB.query(
                ctx.db,
@@ -380,6 +437,10 @@ defmodule Tightbeam.HarnessHealthTest do
              Ledger.claim_next(ctx.db, route_recipient, "restart-recovery")
 
     assert :ok = Ledger.finish(ctx.db, first_turn, "failed")
+    assert first_wake == "other-review:#{opened.id}:#{route_recipient}"
+
+    assert {:ok, [[^request_ref, ^first_wake]]} =
+             DB.query(ctx.db, "SELECT requestRef,wakeId FROM turns WHERE seq=?1", [first_turn])
 
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
 
@@ -393,15 +454,21 @@ defmodule Tightbeam.HarnessHealthTest do
     assert next_wake == first_wake
     assert next_turn == first_turn
 
-    assert {:ok, [["pending", second_wake, second_turn]]} =
+    assert {:ok, [[second_recipient, "pending", second_wake, second_turn]]} =
              DB.query(
                ctx.db,
-               "SELECT state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=2",
+               "SELECT recipient,state,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=2",
                [opened.id]
              )
 
     assert is_binary(second_wake)
     assert is_integer(second_turn)
+    assert is_binary(second_recipient)
+    assert second_wake == "other-review:#{opened.id}:#{second_recipient}"
+
+    assert {:ok, [[^request_ref, ^second_wake]]} =
+             DB.query(ctx.db, "SELECT requestRef,wakeId FROM turns WHERE seq=?1", [second_turn])
+
     assert :ok = HarnessHealth.resume_other_routes(ctx.db)
 
     assert {:ok, [["pending", ^second_wake, ^second_turn]]} =
@@ -448,6 +515,98 @@ defmodule Tightbeam.HarnessHealthTest do
                "SELECT state,closedReason,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND targetKind='owner_user'",
                [opened.id]
              )
+
+    assert ConditionFacts.standing?(ctx.db, "user-alerted", "flynn")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM condition_facts WHERE kind='user-alerted' AND scope='flynn'"
+             )
+
+    assert {:duplicate, _} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: member.session,
+               principal: {:session, member.session},
+               description: "record-only route evidence",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "no owner turn",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "record-only-route"
+             })
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM condition_facts WHERE kind='user-alerted' AND scope='flynn'"
+             )
+  end
+
+  test "other route rows reject deletion, skipped transition, and terminal timestamp mutation",
+       ctx do
+    [member | _] = ctx.sessions
+    at = System.system_time(:millisecond)
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: member.session,
+               principal: {:session, member.session},
+               description: "route guard evidence",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "route guard",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "route-guards"
+             })
+
+    assert {:ok, [[ordinal, recipient, "pending", turn_seq]]} =
+             DB.query(
+               ctx.db,
+               "SELECT ordinal,recipient,state,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND state='pending' LIMIT 1",
+               [opened.id]
+             )
+
+    assert {:error, _} =
+             DB.query(ctx.db, "DELETE FROM harness_health_other_routes WHERE incidentId=?1", [
+               opened.id
+             ])
+
+    assert {:error, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE harness_health_other_routes SET state='skipped',closedReason='manual' WHERE incidentId=?1 AND ordinal=?2",
+               [opened.id, ordinal]
+             )
+
+    assert {:ok, %{seq: ^turn_seq}} = Ledger.claim_next(ctx.db, recipient, "route-guards")
+    assert :ok = Ledger.finish(ctx.db, turn_seq, "delivered")
+    assert :ok = HarnessHealth.resume_other_routes(ctx.db)
+
+    assert {:error, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE harness_health_other_routes SET settledAt=settledAt+1 WHERE incidentId=?1 AND ordinal=?2",
+               [opened.id, ordinal]
+             )
   end
 
   test "promotion review cannot be selected for a first occurrence", ctx do
@@ -482,6 +641,73 @@ defmodule Tightbeam.HarnessHealthTest do
                cause: "promotion requires a second occurrence",
                principal: {:session, member.session},
                idempotency_key: "promotion-first-review"
+             })
+  end
+
+  test "first reclassification accepts known classes but rejects new promotion classes", ctx do
+    [member | _] = ctx.sessions
+    at = System.system_time(:millisecond)
+
+    assert {:opened, known_incident} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: member.session,
+               principal: {:session, member.session},
+               description: "known-class first reclassification",
+               evidence_mode: "exact_error",
+               observed_state: "provider failed",
+               exact_observed_error: "known class",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "review found a named class",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 500,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "known-class-first-reclassification"
+             })
+
+    assert {:ok, %{outcome: "reclassified"}} =
+             HarnessHealth.review_other(ctx.db, %{
+               incident_id: known_incident.id,
+               outcome: "reclassified",
+               named_class: "auth-dead",
+               cause: "known class confirmed",
+               principal: {:session, member.session},
+               idempotency_key: "known-class-first-review"
+             })
+
+    assert {:opened, new_incident} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "gibson",
+               source_session_key: member.session,
+               principal: {:session, member.session},
+               description: "new-class first reclassification",
+               evidence_mode: "exact_error",
+               observed_state: "provider failed",
+               exact_observed_error: "new class",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at + 1,
+               accepted_at: at + 1,
+               valid_until: at + 501,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "new-class-first-reclassification"
+             })
+
+    assert {:error, %{code: "invalid_review_outcome"}} =
+             HarnessHealth.review_other(ctx.db, %{
+               incident_id: new_incident.id,
+               outcome: "reclassified",
+               named_class: "provider-network-drift",
+               cause: "new class requires recurrence promotion",
+               principal: {:session, member.session},
+               idempotency_key: "new-class-first-review"
              })
   end
 
@@ -563,6 +789,7 @@ defmodule Tightbeam.HarnessHealthTest do
     spec_sha = String.duplicate("a", 64)
     report_sha = String.duplicate("b", 64)
     candidate_commit = String.duplicate("c", 40)
+    second_candidate_commit = String.duplicate("d", 40)
 
     assert {:ok, []} =
              DB.query(
@@ -607,7 +834,10 @@ defmodule Tightbeam.HarnessHealthTest do
                  attest_id,
                  review_id,
                  ctx.outside_session,
-                 JSON.encode!([%{"repo" => "racter", "commit" => candidate_commit}]),
+                 JSON.encode!([
+                   %{"repo" => "racter", "commit" => candidate_commit},
+                   %{"repo" => "racter", "commit" => second_candidate_commit}
+                 ]),
                  report_id,
                  report_sha,
                  at
@@ -660,6 +890,36 @@ defmodule Tightbeam.HarnessHealthTest do
                params: close_params
              })
 
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE assignments SET holderKey=?1 WHERE id=?2", [
+               member.session,
+               review_id
+             ])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE attests SET bySession=?1 WHERE id=?2", [
+               member.session,
+               attest_id
+             ])
+
+    assert %{code: "invalid_promotion_close", message: "invalid_promotion_close"} =
+             handlers["harness-health-close-promotion"].(%{
+               principal: {:user, "flynn"},
+               params: %{close_params | idempotency_key: "public-promotion-same-holder"}
+             })
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE assignments SET holderKey=?1 WHERE id=?2", [
+               ctx.outside_session,
+               review_id
+             ])
+
+    assert {:ok, []} =
+             DB.query(ctx.db, "UPDATE attests SET bySession=?1 WHERE id=?2", [
+               ctx.outside_session,
+               attest_id
+             ])
+
     assert %{
              ok: true,
              promotion: %{
@@ -683,6 +943,12 @@ defmodule Tightbeam.HarnessHealthTest do
     assert duplicate["state"] == "closed"
     assert duplicate["namedClass"] == "provider-network-drift"
     assert duplicate["reviewAttestId"] == attest_id
+
+    assert %{code: "idempotency_conflict", message: "idempotency_conflict"} =
+             handlers["harness-health-close-promotion"].(%{
+               principal: {:user, "flynn"},
+               params: %{close_params | candidate_commit: second_candidate_commit}
+             })
 
     assert {:ok, []} =
              DB.query(
