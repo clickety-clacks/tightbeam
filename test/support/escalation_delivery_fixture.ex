@@ -563,6 +563,8 @@ defmodule Tightbeam.EscalationDeliveryFixture do
              # private. Still exactly one turn sink; it simply has a name now.
              {"lib/tightbeam/gateway.ex", "Ledger.enqueue_in_txn/2",
               "append_and_enqueue_in_txn/7"} => 1,
+             {"lib/tightbeam/harness_health.ex", "Ledger.enqueue_in_txn/2",
+              "incident_notice_in_txn/4"} => 1,
              {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "enqueue/2"} => 1,
              {"lib/tightbeam/ledger.ex", "Ledger.enqueue_in_txn/2", "append_repair_attempt/5"} =>
                1

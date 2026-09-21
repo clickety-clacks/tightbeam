@@ -74,12 +74,16 @@ defmodule Tightbeam.O2SchemaMigrationTest do
              Enum.map(
                ~w(
                  harness_health_assignment_holder harness_health_assignment_immutable_delete
-                 harness_health_assignment_immutable_update harness_health_incident_identity_immutable
+                 harness_health_assignment_immutable_update
+                 harness_health_class_promotion_close_once harness_health_incident_identity_immutable
                  harness_health_incident_no_delete harness_health_incident_resolution_once
                  harness_health_member_immutable_delete harness_health_member_immutable_update
                  harness_health_observation_assignment_holder harness_health_observation_attachment_once
                  harness_health_observation_evidence_immutable
                  harness_health_observation_identity_immutable harness_health_observation_no_delete
+                 harness_health_other_review_event_append_only_delete
+                 harness_health_other_review_event_append_only_update
+                 harness_health_other_route_identity_immutable harness_health_other_route_terminal_once
                ),
                &[&1]
              )
