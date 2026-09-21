@@ -203,6 +203,41 @@ worldStatus: PROVEN
 redactionConfirmed: true
 ```
 
+The following are complete CLI examples. The first records a PROVEN probe digest; the
+second records an UNKNOWN exact error. Keep the command's idempotency key stable on a
+retry, and do not replace either example with an ordinary turn or an invented class.
+
+```sh
+description='provider returned an unclassified transport failure'
+condition='a normal provider turn completes'
+at=$(date +%s%3N)
+probe_digest=$(printf '%s' 'GET provider health endpoint: 503 transport reset' | sha256sum | cut -d' ' -f1)
+condition_digest=$(printf '%s' "$condition" | sha256sum | cut -d' ' -f1)
+tightbeam harness-health-observe-other \
+  --harness claude --host racter --source-session agent:example:worker \
+  --description "$description" --evidence-mode probe_digest \
+  --observed-state 'provider connection was unavailable' \
+  --exact-probe 'GET provider health endpoint' --output-digest "$probe_digest" \
+  --recovery-condition "$condition" \
+  --not-known-class 'no auth, quota, adapter, model, task, or interruption signal' \
+  --valid-until "$((at + 900000))" --world-status PROVEN \
+  --redaction-confirmed --key other-proven-001
+```
+
+```sh
+at=$(date +%s%3N)
+tightbeam harness-health-observe-other \
+  --harness claude --host racter --source-session agent:example:worker \
+  --description 'provider returned an unclassified transport failure' \
+  --evidence-mode exact_error --observed-state 'provider response was unavailable' \
+  --exact-probe 'GET provider health endpoint' \
+  --exact-error 'transport reset by peer' \
+  --recovery-condition 'a normal provider turn completes' \
+  --not-known-class 'the captured error does not identify a named failure class' \
+  --valid-until "$((at + 900000))" --world-status UNKNOWN \
+  --redaction-confirmed --key other-unknown-001
+```
+
 When the world is unknown, retain the exact observed error instead of inventing a probe
 digest, and keep `worldStatus: UNKNOWN`. Recovery evidence is a separate normal-turn row:
 it carries the opening `descriptionDigest`, the matching `recoveryConditionDigest`, a

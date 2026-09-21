@@ -1226,7 +1226,7 @@ defmodule Tightbeam.Gateway do
       {"repair-assignment", ["message.created", "session.updated"]} => fn call ->
         repair_assignment_result(config, db, call)
       end,
-      {"harness-health-observe-other", ["harness_health.other_observed"]} => fn call ->
+      {"harness-health-observe-other", []} => fn call ->
         params =
           call.params
           |> Map.put_new(:source_session_key, call.session_key)
@@ -1237,7 +1237,7 @@ defmodule Tightbeam.Gateway do
           {status, detail} -> %{ok: true, status: status, incident: detail}
         end
       end,
-      {"harness-health-resolve-other", ["harness_health.other_resolved"]} => fn call ->
+      {"harness-health-resolve-other", []} => fn call ->
         params = call.params |> Map.put(:principal, call.principal)
 
         case HarnessHealth.resolve_other(db, params) do
@@ -1246,7 +1246,7 @@ defmodule Tightbeam.Gateway do
           :already_healthy -> %{ok: true, status: :already_healthy}
         end
       end,
-      {"harness-health-review-other", ["harness_health.other_reviewed"]} => fn call ->
+      {"harness-health-review-other", []} => fn call ->
         params = call.params |> Map.put(:principal, call.principal)
 
         case HarnessHealth.review_other(db, params) do

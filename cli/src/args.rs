@@ -108,8 +108,11 @@ pub enum Command {
         observed_state: String,
         exact_probe: String,
         output_digest: String,
-        recovery_condition: String,
+        recovery_condition_digest: String,
         cause: String,
+        observed_at: Option<String>,
+        accepted_at: Option<String>,
+        idempotency_key: String,
         session_key: Option<String>,
         correlation_id: Option<String>,
     },
@@ -119,6 +122,7 @@ pub enum Command {
         outcome: String,
         named_class: Option<String>,
         cause: Option<String>,
+        idempotency_key: String,
     },
     ArtifactRecord {
         identity: Identity,
@@ -1670,15 +1674,18 @@ fn parse_with_optional_catalog(
                 "observed-state",
                 "exact-probe",
                 "output-digest",
-                "recovery-condition",
+                "recovery-condition-digest",
                 "cause",
+                "observed-at",
+                "accepted-at",
+                "key",
                 "session",
                 "correlation-id",
             ];
             if parsed.positional.len() != 1
                 || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam harness-health-resolve-other --harness <harness> --host <host> --observed-state <text> --exact-probe <text> --output-digest <sha256> --recovery-condition <text> --cause <text>".to_owned());
+                return Err("usage: tightbeam harness-health-resolve-other --harness <harness> --host <host> --incident <id> --observed-state <text> --exact-probe <text> --output-digest <sha256> --recovery-condition-digest <sha256> --cause <text> --key <idempotencyKey>".to_owned());
             }
             Ok(Command::HarnessHealthResolveOther {
                 identity: identity(flags)?,
@@ -1692,9 +1699,15 @@ fn parse_with_optional_catalog(
                     .ok_or_else(|| "--exact-probe is required".to_owned())?,
                 output_digest: nonempty(flags, "output-digest")
                     .ok_or_else(|| "--output-digest is required".to_owned())?,
-                recovery_condition: nonempty(flags, "recovery-condition")
-                    .ok_or_else(|| "--recovery-condition is required".to_owned())?,
+                recovery_condition_digest: nonempty(flags, "recovery-condition-digest")
+                    .ok_or_else(|| "--recovery-condition-digest is required".to_owned())?,
                 cause: nonempty(flags, "cause").ok_or_else(|| "--cause is required".to_owned())?,
+                observed_at: nonempty(flags, "observed-at")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                accepted_at: nonempty(flags, "accepted-at")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
                 session_key: nonempty(flags, "session"),
                 correlation_id: nonempty(flags, "correlation-id"),
             })
@@ -1707,11 +1720,12 @@ fn parse_with_optional_catalog(
                 "outcome",
                 "named-class",
                 "cause",
+                "key",
             ];
             if parsed.positional.len() != 2
                 || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
             {
-                return Err("usage: tightbeam harness-health-review-other <incidentId> --outcome confirmed_other|reclassified|promotion_required [--named-class <class>] [--cause <text>]".to_owned());
+                return Err("usage: tightbeam harness-health-review-other <incidentId> --outcome confirmed_other|reclassified|promotion_required [--named-class <class>] [--cause <text>] --key <idempotencyKey>".to_owned());
             }
             let outcome =
                 nonempty(flags, "outcome").ok_or_else(|| "--outcome is required".to_owned())?;
@@ -1727,6 +1741,8 @@ fn parse_with_optional_catalog(
                 outcome,
                 named_class: nonempty(flags, "named-class"),
                 cause: nonempty(flags, "cause"),
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
             })
         }
         "artifact-content-fetch" => {

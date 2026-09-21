@@ -259,8 +259,11 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             observed_state,
             exact_probe,
             output_digest,
-            recovery_condition,
+            recovery_condition_digest,
             cause,
+            observed_at,
+            accepted_at,
+            idempotency_key,
             session_key,
             correlation_id,
         } => {
@@ -270,8 +273,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("observedState", observed_state),
                 string_field("exactProbe", exact_probe),
                 string_field("outputDigest", output_digest),
-                string_field("recoveryCondition", recovery_condition),
+                string_field("recoveryConditionDigest", recovery_condition_digest),
                 string_field("cause", cause),
+                string_field("idempotencyKey", idempotency_key),
                 "\"recoverySatisfied\":true".to_owned(),
                 "\"worldStatus\":\"PROVEN\"".to_owned(),
                 "\"redactionConfirmed\":true".to_owned(),
@@ -284,6 +288,12 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
                 }
+            }
+            if let Some(value) = observed_at {
+                params.push(format!("\"observedAt\":{value}"));
+            }
+            if let Some(value) = accepted_at {
+                params.push(format!("\"acceptedAt\":{value}"));
             }
             Ok(request(
                 identity,
@@ -298,6 +308,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             outcome,
             named_class,
             cause,
+            idempotency_key,
         } => {
             let mut params = vec![
                 string_field("incidentId", incident_id),
@@ -308,6 +319,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     params.push(string_field(name, value));
                 }
             }
+            params.push(string_field("idempotencyKey", idempotency_key));
             Ok(request(
                 identity,
                 "harness-health-review-other",

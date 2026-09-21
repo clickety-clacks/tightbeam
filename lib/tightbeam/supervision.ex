@@ -67,16 +67,16 @@ defmodule Tightbeam.Supervision do
 
   @prod_shape_consumers ["assignment_prodder"]
   @prod_shape_action_sinks [
-    {"turn", "Ledger.enqueue_in_txn/2"},
-    {"wake", "Wakes.schedule_in_txn/2"},
-    {"wake", "Wakes.retarget_in_txn/3"},
-    {"prompt", "Acp.Adapter.prompt/3"},
-    {"prompt", "Acp.Adapter.prompt/4"},
-    {"acp_request", "Acp.Conn.request/3"},
-    {"acp_request", "Acp.Conn.request/4"},
-    {"command", "signal"},
-    {"command", "job"},
-    {"command", "request"}
+    {:turn, Tightbeam.Ledger, :enqueue_in_txn, 2},
+    {:wake, Tightbeam.Wakes, :schedule_in_txn, 2},
+    {:wake, Tightbeam.Wakes, :retarget_in_txn, 3},
+    {:prompt, Tightbeam.Acp.Adapter, :prompt, 3},
+    {:prompt, Tightbeam.Acp.Adapter, :prompt, 4},
+    {:acp_request, Tightbeam.Acp.Conn, :request, 3},
+    {:acp_request, Tightbeam.Acp.Conn, :request, 4},
+    {:command_signal, Tightbeam.CommandEdge, :signal, 2},
+    {:command_job, Tightbeam.CommandEdge, :job, 2},
+    {:command_request, Tightbeam.CommandEdge, :request, 4}
   ]
 
   @doc "The manifest of consumers that must use the shared prod-shape gate."
@@ -1297,9 +1297,10 @@ defmodule Tightbeam.Supervision do
         result
 
       {:cleared, :deferred} ->
-        if harness_unavailable?(db, session_key),
-          do: :harness_unavailable,
-          else: evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval)
+        evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval)
+
+      {:cleared, :harness_unavailable} ->
+        :harness_unavailable
 
       {:cleared, _prior_result} ->
         evaluate_terminal(db, handlers, n, session_key, terminal_seq, interval)
@@ -1393,8 +1394,8 @@ defmodule Tightbeam.Supervision do
           {:match, assignment}
         else
           :retired -> {:no_match, :holder_retired}
-          :no_terminal -> {:no_match, :no_terminal, assignment}
           :unavailable -> {:no_match, :harness_unavailable, assignment}
+          :no_terminal -> {:no_match, :no_terminal, assignment}
           :blocked -> {:no_match, :work_blocked, assignment}
         end
     end
@@ -1421,13 +1422,6 @@ defmodule Tightbeam.Supervision do
 
       [] ->
         :available
-    end
-  end
-
-  defp harness_unavailable?(db, session_key) do
-    case query(db, "SELECT harness, host FROM sessions WHERE sessionKey=?1", [session_key]) do
-      [[harness, host]] -> HarnessHealth.unavailable?(db, harness, host)
-      [] -> false
     end
   end
 
@@ -2307,15 +2301,46 @@ defmodule Tightbeam.Supervision do
   # in working memory, and the production re-matches from current state after
   # retraction or normal-turn recovery.
   defp dispatch_wake(db, handlers, pending, assignment, target) do
-    suppressed? =
-      ConditionFacts.standing?(db, "work-blocked", pending.sessionKey) or
-        harness_unavailable?(db, pending.sessionKey)
-
-    if suppressed? do
+    if ConditionFacts.standing?(db, "work-blocked", pending.sessionKey) do
       clear_pending(db, pending)
       {:cleared, nil}
     else
-      deliver_wake(db, handlers, pending, assignment, target)
+      case prod_shape_act(db, pending, target) do
+        :allowed ->
+          deliver_wake(db, handlers, pending, assignment, target)
+
+        {:suppressed, _gate} ->
+          clear_pending(db, pending)
+          {:cleared, :harness_unavailable}
+      end
+    end
+  end
+
+  defp prod_shape_act(db, pending, target) do
+    case query(db, "SELECT harness,host FROM sessions WHERE sessionKey=?1", [target]) do
+      [[harness, host]] ->
+        case DB.transaction(db, fn txn ->
+               HarnessHealth.prod_shape_act_in_txn(
+                 txn,
+                 "assignment_prodder",
+                 pending.pendingAssignment,
+                 harness,
+                 host,
+                 fn -> :allowed end
+               )
+             end) do
+          {:ok, :allowed} ->
+            :allowed
+
+          {:ok, {:suppressed, gate}} ->
+            {:suppressed, gate}
+
+          {:error, _} ->
+            {:suppressed, %{incidentIds: [], failureClasses: [], earliestExpiryAt: nil}}
+        end
+
+      [] ->
+        {:suppressed, %{incidentIds: [], failureClasses: [], earliestExpiryAt: nil}}
     end
   end
 
@@ -3267,9 +3292,6 @@ defmodule Tightbeam.Supervision do
 
   defp gate_reason_in_txn(txn, assignment_id, holder) do
     cond do
-      harness_unavailable_in_txn?(txn, holder) ->
-        "harness_unavailable"
-
       Wakes.covering_continuation_in_txn?(txn, assignment_id) ->
         "pending_turn"
 
@@ -3421,7 +3443,6 @@ defmodule Tightbeam.Supervision do
       |> Assignments.list(%{state: "open"})
       |> Enum.map(& &1.holderKey)
       |> Enum.reject(&ConditionFacts.standing?(state.db, "work-blocked", &1))
-      |> Enum.reject(&harness_unavailable?(state.db, &1))
 
     {:ok, pending_rows} =
       DB.query(
@@ -3500,7 +3521,6 @@ defmodule Tightbeam.Supervision do
       |> Assignments.list(%{state: "open"})
       |> Enum.map(& &1.holderKey)
       |> Enum.reject(&ConditionFacts.standing?(state.db, "work-blocked", &1))
-      |> Enum.reject(&harness_unavailable?(state.db, &1))
 
     {:ok, pending_rows} =
       DB.query(

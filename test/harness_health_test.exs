@@ -178,6 +178,7 @@ defmodule Tightbeam.HarnessHealthTest do
 
   test "other admission carries evidence, review, idempotency, and matching recovery", ctx do
     [member | _] = ctx.sessions
+    at = System.system_time(:millisecond)
 
     input = %{
       harness: "claude",
@@ -192,9 +193,9 @@ defmodule Tightbeam.HarnessHealthTest do
       recovery_condition: "a normal provider turn completes",
       not_known_class_reason:
         "the response is neither an auth, quota, adapter, model, task, nor interruption signal",
-      observed_at: 100,
-      accepted_at: 100,
-      valid_until: 500,
+      observed_at: at,
+      accepted_at: at,
+      valid_until: at + 500,
       world_status: "UNKNOWN",
       redaction_confirmed: true,
       idempotency_key: "other-admission-1",
@@ -214,26 +215,32 @@ defmodule Tightbeam.HarnessHealthTest do
                incident_id: opened.id,
                outcome: "confirmed_other",
                cause: "the provider evidence remains outside the named classes",
-               principal: {:session, member.session}
+               principal: {:session, member.session},
+               idempotency_key: "other-review-1"
              })
 
-    probe = "normal turn 101 delivered"
+    probe = "normal turn #{at + 1} delivered"
+    recovery_at = at + 1
 
     recovery = %{
       harness: "claude",
       host: "gibson",
+      incident_id: opened.id,
       session_key: member.session,
       principal: {:session, member.session},
       observed_state: "normal turn delivered",
       exact_probe: probe,
       output_digest: :crypto.hash(:sha256, probe) |> Base.encode16(case: :lower),
-      recovery_condition: "a normal provider turn completes",
+      recovery_condition_digest:
+        :crypto.hash(:sha256, "a normal provider turn completes")
+        |> Base.encode16(case: :lower),
       recovery_satisfied: true,
       world_status: "PROVEN",
       redaction_confirmed: true,
       cause: "normal turn 101 delivered",
-      observed_at: 101,
-      correlation_id: "other-recovery-correlation"
+      observed_at: recovery_at,
+      accepted_at: recovery_at,
+      idempotency_key: "other-recovery-1"
     }
 
     assert {:resolved, resolved} = HarnessHealth.resolve_other(ctx.db, recovery)
