@@ -56,7 +56,7 @@ defmodule Tightbeam.FirehoseR1SchemaTest do
     assert :ok = Schema.ensure_all(db)
 
     assert rows(db, "SELECT shape FROM schema_stamp") == [
-             ["pi-providers-artifact-content-v1-019"]
+             ["addressed-po-consultation-v1-019"]
            ]
 
     for {table, column} <- [

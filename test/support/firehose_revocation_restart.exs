@@ -88,8 +88,7 @@ transition =
     "expectedSchema" => "row-driven-r1-v1-019"
   })
 
-{:ok, db} =
-  DB.start_link(path: path, name: nil, guard_inputs: [transition: transition])
+{:ok, db} = DB.start_link(path: path, name: nil, guard_inputs: [transition: transition])
 
 rows = fn db, sql ->
   {:ok, result} = DB.query(db, sql)
@@ -143,7 +142,7 @@ try do
     assert rows.(reopened, "SELECT priorClosedByProcess FROM assignment_reopenings") == [[nil]]
 
     assert rows.(reopened, "SELECT shape FROM schema_stamp") == [
-             ["pi-providers-artifact-content-v1-019"]
+             ["addressed-po-consultation-v1-019"]
            ]
 
     assert rows.(reopened, "PRAGMA foreign_key_check") == []

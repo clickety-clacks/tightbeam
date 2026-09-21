@@ -324,6 +324,21 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("idempotencyKey", idempotency_key),
             ],
         )),
+        Command::SessionPoSet {
+            identity,
+            session_key,
+            po_role,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "session-po-set",
+            vec![],
+            vec![
+                string_field("sessionKey", session_key),
+                string_field("poRole", po_role),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
         Command::Tune {
             identity,
             session_key,
@@ -1809,6 +1824,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Retire { identity, .. }
         | Command::Tune { identity, .. }
         | Command::SessionReparent { identity, .. }
+        | Command::SessionPoSet { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
@@ -2104,6 +2120,38 @@ mod tests {
                 ("--parent", "parent"),
                 ("--assignment", "asg_one"),
                 ("--key", "correction"),
+            ] {
+                if flag != missing {
+                    args.extend([flag, value]);
+                }
+            }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn session_po_set_preserves_exact_role_and_requires_explicit_retry_key() {
+        assert_eq!(
+            body(&[
+                "session-po-set",
+                "--session",
+                "orchestrator with space",
+                "--po-role",
+                "product-owner:news",
+                "--key",
+                "association-one",
+                "--as",
+                "orchestrator:delivery"
+            ]),
+            r#"{"as":"orchestrator:delivery","verb":"session-po-set","params":{"sessionKey":"orchestrator with space","poRole":"product-owner:news","idempotencyKey":"association-one"}}"#
+        );
+
+        for missing in ["--session", "--po-role", "--key"] {
+            let mut args = vec!["session-po-set"];
+            for (flag, value) in [
+                ("--session", "orchestrator"),
+                ("--po-role", "product-owner:news"),
+                ("--key", "association-one"),
             ] {
                 if flag != missing {
                     args.extend([flag, value]);

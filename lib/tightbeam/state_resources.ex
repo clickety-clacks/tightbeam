@@ -16,11 +16,13 @@ defmodule Tightbeam.StateResources do
   @secret_keys MapSet.new(["cliToken", "token", "identityToken"])
 
   @session_select """
-  SELECT sessionKey, displayName, kind, orderIndex, isBuiltIn, adopted,
-         ownerUserId, origin, spawnedBy, handle, archetype, overrides,
-         identityName, identityRevision, harness, provider, model,
-         thinkingLevel, modelContext, host, clearedThroughSeq, state,
-         createdAt, updatedAt, mechanicalStatus, updatedAt
+  SELECT sessions.sessionKey, sessions.displayName, sessions.kind, sessions.orderIndex,
+         sessions.isBuiltIn, sessions.adopted, sessions.ownerUserId, sessions.origin,
+         sessions.spawnedBy, sessions.handle, sessions.archetype, sessions.overrides,
+         sessions.identityName, sessions.identityRevision, sessions.harness,
+         sessions.provider, sessions.model, sessions.thinkingLevel, sessions.modelContext,
+         sessions.host, sessions.clearedThroughSeq, sessions.state, sessions.createdAt,
+         sessions.updatedAt, sessions.mechanicalStatus, sessions.updatedAt
   FROM sessions
   """
 
@@ -493,10 +495,10 @@ defmodule Tightbeam.StateResources do
            principal,
            @session_select <>
              """
-              WHERE sessionKey = ?1 AND (
+              WHERE sessions.sessionKey = ?1 AND (
                 ?2 = 1 OR
-                (?3 = 'session' AND sessionKey = ?4) OR
-                (?3 = 'user' AND ownerUserId = ?4)
+                (?3 = 'session' AND sessions.sessionKey = ?4) OR
+                (?3 = 'user' AND sessions.ownerUserId = ?4)
               )
              """,
            [id, if(is_admin, do: 1, else: 0), kind, principal_id]
@@ -507,7 +509,7 @@ defmodule Tightbeam.StateResources do
   end
 
   def query_session(db, id) when is_binary(id) do
-    case query(db, @session_select <> " WHERE sessionKey = ?1", [id]) do
+    case query(db, @session_select <> " WHERE sessions.sessionKey = ?1", [id]) do
       [row] -> session_query_row(row)
       [] -> nil
     end
@@ -1232,35 +1234,34 @@ defmodule Tightbeam.StateResources do
     stored_type = value(row, :message_type)
     message_type = nullable_string!(stored_type, "messageType")
 
-    item =
-      %{
-        "id" => required_string!(row, :id),
-        "seq" => required_integer!(row, :seq),
-        "sessionKey" => required_string!(row, :session_key),
-        "role" => required_string!(row, :role),
-        "messageType" => message_type,
-        "content" => required_wire_string!(value(row, :content), "content"),
-        "at" => message_at!(row),
-        "sender" => nullable_string!(value(row, :sender), "sender"),
-        "deviceId" => nullable_string!(value(row, :device_id), "deviceId"),
-        "clientMessageId" => nullable_string!(value(row, :client_message_id), "clientMessageId"),
-        "replyToMessageId" =>
-          nullable_string!(value(row, :reply_to_message_id), "replyToMessageId"),
-        "replyToClientMessageId" =>
-          nullable_string!(value(row, :reply_to_client_message_id), "replyToClientMessageId"),
-        "llmVisibleMessageId" => required_string!(row, :llm_visible_message_id),
-        "attachments" => required_list!(value(row, :attachments), "attachments"),
-        "attentionTier" => required_integer!(row, :attention_tier),
-        "turnSeq" => nullable_integer!(value(row, :turn_seq), "turnSeq"),
-        "assignmentId" => nullable_string!(value(row, :assignment_id), "assignmentId"),
-        "jobRef" => nullable_string!(value(row, :job_ref), "jobRef"),
-        "harness" => nullable_string!(value(row, :harness), "harness"),
-        "provider" => message_provider(row),
-        "model" => nullable_string!(value(row, :model), "model"),
-        "effort" => message_effort(row),
-        "context" => message_context(row),
-        "rowVersion" => message_row_version!(row)
-      }
+    item = %{
+      "id" => required_string!(row, :id),
+      "seq" => required_integer!(row, :seq),
+      "sessionKey" => required_string!(row, :session_key),
+      "role" => required_string!(row, :role),
+      "messageType" => message_type,
+      "content" => required_wire_string!(value(row, :content), "content"),
+      "at" => message_at!(row),
+      "sender" => nullable_string!(value(row, :sender), "sender"),
+      "deviceId" => nullable_string!(value(row, :device_id), "deviceId"),
+      "clientMessageId" => nullable_string!(value(row, :client_message_id), "clientMessageId"),
+      "replyToMessageId" =>
+        nullable_string!(value(row, :reply_to_message_id), "replyToMessageId"),
+      "replyToClientMessageId" =>
+        nullable_string!(value(row, :reply_to_client_message_id), "replyToClientMessageId"),
+      "llmVisibleMessageId" => required_string!(row, :llm_visible_message_id),
+      "attachments" => required_list!(value(row, :attachments), "attachments"),
+      "attentionTier" => required_integer!(row, :attention_tier),
+      "turnSeq" => nullable_integer!(value(row, :turn_seq), "turnSeq"),
+      "assignmentId" => nullable_string!(value(row, :assignment_id), "assignmentId"),
+      "jobRef" => nullable_string!(value(row, :job_ref), "jobRef"),
+      "harness" => nullable_string!(value(row, :harness), "harness"),
+      "provider" => message_provider(row),
+      "model" => nullable_string!(value(row, :model), "model"),
+      "effort" => message_effort(row),
+      "context" => message_context(row),
+      "rowVersion" => message_row_version!(row)
+    }
 
     item = if is_nil(message_type), do: Map.delete(item, "messageType"), else: item
     exact!("transcript messages", item)

@@ -8,7 +8,7 @@ defmodule Tightbeam.GatewayTest do
     effects = Tightbeam.Gateway.handler_effects(%{db: :registry_test_unused})
 
     expected =
-      ~w(post wake condition facts-read artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent retire assignment-commitref-correct)
+      ~w(post wake condition facts-read artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-po-set retire assignment-commitref-correct)
 
     expected =
       expected ++ ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch)
@@ -19,6 +19,7 @@ defmodule Tightbeam.GatewayTest do
     assert effects["reopen-assignment"] == ["assignment.reopened"]
     assert effects["artifact-content-fetch"] == []
     assert effects["repair-assignment"] == ["message.created", "session.updated"]
+    assert effects["session-po-set"] == ["wake.scheduled"]
 
     assert effects["wake"] == [
              "wake.scheduled",
@@ -1078,8 +1079,7 @@ defmodule Tightbeam.GatewayTest do
 
     {:ok, _turn} = Ledger.claim_next(ctx.db, "k1", "test-lane")
 
-    :ok =
-      Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown")
+    :ok = Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown")
 
     assert {:opened, incident} =
              HarnessHealth.observe(ctx.db, %{
@@ -2342,8 +2342,7 @@ defmodule Tightbeam.GatewayTest do
              harness: "fixture",
              provider: "fixture_provider",
              model: %Model{family: "fixture-model"}
-           } =
-             Org.get(ctx.db, spawned_key)
+           } = Org.get(ctx.db, spawned_key)
 
     assert %{ok: true, harness: "fixture", model: "fixture-model", effort: nil} =
              handlers["tune"].(%{
@@ -3451,8 +3450,7 @@ defmodule Tightbeam.GatewayTest do
              host: ^host,
              dirs: [],
              effect: "this host's adapter PATH now keeps the inherited value unchanged"
-           } =
-             set.(%{origin: "user:flynn", params: %{host: host, dirs: []}})
+           } = set.(%{origin: "user:flynn", params: %{host: host, dirs: []}})
 
     assert {:ok, []} = DB.query(ctx.db, "SELECT host FROM host_toolchain_dirs")
   end
@@ -3801,8 +3799,7 @@ defmodule Tightbeam.GatewayTest do
       start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
     })
 
-    spawn =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
 
     assert %{session_key: session_key} =
              spawn.(%{
@@ -3884,8 +3881,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: true} = retune.("gateway-only-model")
 
-    assert %{code: "model_unavailable", message: gateway_message} =
-             retune.("worker-only-model")
+    assert %{code: "model_unavailable", message: gateway_message} = retune.("worker-only-model")
 
     assert gateway_message =~ "on host testhost"
   end
@@ -4093,8 +4089,7 @@ defmodule Tightbeam.GatewayTest do
       {"", 0}
     end
 
-    spawn =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
 
     invalid = [
       nil,
@@ -4890,8 +4885,7 @@ defmodule Tightbeam.GatewayTest do
 
     status = Gateway.session_status("k-wire", ctx.db)
 
-    wide =
-      Enum.find(status.modelCatalog.models, &(&1.context == "1m"))
+    wide = Enum.find(status.modelCatalog.models, &(&1.context == "1m"))
 
     # OUTBOUND: the fields are named. `context` is a field a client can read,
     # not a bracket it would have to split off a string itself.
@@ -5698,8 +5692,7 @@ defmodule Tightbeam.GatewayTest do
       if hd(command) == "rsync", do: {"copy failed", 23}, else: {"", 0}
     end
 
-    tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
 
     result =
       tune.(%{
@@ -5722,8 +5715,7 @@ defmodule Tightbeam.GatewayTest do
       {"", 0}
     end
 
-    tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
 
     assert tune.(%{
              origin: "user:flynn",
@@ -5742,8 +5734,7 @@ defmodule Tightbeam.GatewayTest do
       if String.contains?(List.last(command), "test -f"), do: {"", 1}, else: {"", 0}
     end
 
-    tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
 
     assert %{code: "host_unready", message: message} =
              tune.(%{
@@ -6242,8 +6233,7 @@ defmodule Tightbeam.GatewayTest do
       sender: "process:tightbeam"
     ]
 
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "conversation", common)
+    assert :appended = Gateway.deliver_prompt("k1", "user:flynn", "conversation", common)
 
     assert :appended =
              Gateway.deliver_prompt(
@@ -7037,8 +7027,7 @@ defmodule Tightbeam.GatewayTest do
                  root_archetype: "orchestrator"
                }
              ]
-           } =
-             list.(%{origin: "agent:k1", params: %{}})
+           } = list.(%{origin: "agent:k1", params: %{}})
 
     assert purpose =~ "turn product ideas and bug reports into shipped software"
     assert "I want my code reviewed before it merges." in phrases

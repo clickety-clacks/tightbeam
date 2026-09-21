@@ -2,6 +2,8 @@ import ExUnit.Assertions
 alias Tightbeam.{DB, Gateway, Model, Org, RuleRuntime, Wakes}
 
 Tightbeam.GuardGatewayFixture.run!(fn %{db: db, config: config, base: base} ->
+  :ok = DB.execute(db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1)")
+
   for key <- ["k1", "boot-retired"] do
     Org.create(db, %{
       session_key: key,

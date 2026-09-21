@@ -140,6 +140,12 @@ pub enum Command {
         assignment_id: String,
         idempotency_key: String,
     },
+    SessionPoSet {
+        identity: Identity,
+        session_key: String,
+        po_role: String,
+        idempotency_key: String,
+    },
     Tune {
         identity: Identity,
         session_key: String,
@@ -590,6 +596,9 @@ COMMANDS:
 
   session-reparent --session <key> --parent <key> --assignment <id> --key <key>
       Owner-as-user correction of one custom session and its sole open assignment.
+
+  session-po-set --session <key> --po-role <role> --key <key>
+      Explicitly associate an exact session with its addressed product-owner role.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
@@ -1631,6 +1640,23 @@ fn parse_with_optional_catalog(
                 session_key: nonempty(flags, "session").ok_or("--session is required")?,
                 parent_session_key: nonempty(flags, "parent").ok_or("--parent is required")?,
                 assignment_id: nonempty(flags, "assignment").ok_or("--assignment is required")?,
+                idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
+            })
+        }
+        "session-po-set" => {
+            if parsed.positional.len() != 1
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
+                return Err(
+                    "usage: tightbeam session-po-set --session <key> --po-role <role> --key <key>"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::SessionPoSet {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or("--session is required")?,
+                po_role: nonempty(flags, "po-role").ok_or("--po-role is required")?,
                 idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
             })
         }
@@ -3595,6 +3621,7 @@ mod tests {
                 "operator-withdraw",
                 "retire",
                 "session-reparent",
+                "session-po-set",
                 "repair-assignment",
                 "assignment-commitref-correct",
                 "revoke-assignment",

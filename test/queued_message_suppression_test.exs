@@ -56,6 +56,7 @@ defmodule Tightbeam.QueuedMessageSuppressionTest do
   end
 
   test "suppresses an exact liveness wake after a newer assignment disposition", %{db: db} do
+    :ok = DB.execute(db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1)")
     assignment!(db, "asg_closed")
     wake = liveness_wake!(db, "asg_closed", "old effort check")
     seq = deliver_wake!(db, wake)

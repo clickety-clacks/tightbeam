@@ -24,6 +24,7 @@ defmodule Tightbeam.Wire.SeamTest do
     DB,
     Gateway,
     Org,
+    Roles,
     Rules
   }
 
@@ -42,6 +43,7 @@ defmodule Tightbeam.Wire.SeamTest do
       Path.join(System.tmp_dir!(), "tightbeam-wire-seam-#{System.unique_integer([:positive])}")
 
     on_exit(fn -> File.rm_rf!(base_dir) end)
+    Tightbeam.Archetypes.load!(base_dir)
 
     handlers = Gateway.handlers(%{db: db, base_dir: base_dir, wake_tick_ms: 1_000})
     Rules.load!(System.tmp_dir!(), Map.keys(handlers))
@@ -56,6 +58,42 @@ defmodule Tightbeam.Wire.SeamTest do
         session_status: fn _ -> nil end
       ]
     }
+  end
+
+  test "authenticated session-po-set dispatch returns and inspects the exact association", ctx do
+    target = create_session(ctx.db, "po-target", "flynn")
+    po = create_session(ctx.db, "po-reader", "flynn")
+    Roles.create!(ctx.db, "product-owner:wire", "flynn", po.session_key)
+
+    result =
+      ok!(
+        dispatch_cli(ctx, "tbc_wire_seam", %{
+          verb: "session-po-set",
+          asUser: "flynn",
+          params: %{
+            sessionKey: target.session_key,
+            poRole: "product-owner:wire",
+            idempotencyKey: "wire-association"
+          }
+        })
+      )
+
+    assert result["changed"]
+    assert result["association"]["sessionKey"] == target.session_key
+    assert result["association"]["poRole"] == "product-owner:wire"
+
+    inspected =
+      ok!(
+        dispatch_cli(ctx, "tbc_wire_seam", %{
+          verb: "inspect",
+          asUser: "flynn"
+        })
+      )
+
+    target_readback =
+      Enum.find(inspected["sessions"], &(&1["sessionKey"] == target.session_key))
+
+    assert target_readback["poAssociation"] == result["association"]
   end
 
   test "the assign wire word `reviews` normalizes to the edge it sets" do

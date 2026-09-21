@@ -88,6 +88,7 @@ defmodule Tightbeam.Gateway do
     Rules,
     Roles,
     Schema,
+    SessionPoAssociations,
     Spinup,
     StateResources,
     SubagentMarkers,
@@ -910,8 +911,7 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call ->
           p = call.params
 
-          result =
-            Placement.unset_env_overlay_with_firehose(db, p.host, p.harness, p.name, call)
+          result = Placement.unset_env_overlay_with_firehose(db, p.host, p.harness, p.name, call)
 
           %{
             host_environment:
@@ -1235,6 +1235,9 @@ defmodule Tightbeam.Gateway do
         tune_result(config, db, call)
       end,
       {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
+      {"session-po-set", ["wake.scheduled"]} => fn call ->
+        SessionPoAssociations.handle(db, call)
+      end,
       {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
         retire_result(config, db, call)
       end
@@ -1688,7 +1691,7 @@ defmodule Tightbeam.Gateway do
   then broadcasts the echo and nudges the lane. Returns the dedupe outcome.
   """
   @spec deliver_prompt(String.t(), String.t(), String.t(), keyword()) ::
-          :appended | :duplicate | :conflict | :skipped
+          :appended | :duplicate | :conflict | :skipped | {:terminal_notice_undeliverable, map()}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -1717,6 +1720,7 @@ defmodule Tightbeam.Gateway do
           | {:duplicate, map()}
           | {:conflict, map()}
           | :skipped
+          | {:terminal_notice_undeliverable, map()}
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
     case remedy_wake_delivery_admission_in_txn(txn, opts[:wake_id]) do
       :skip ->
@@ -1724,9 +1728,35 @@ defmodule Tightbeam.Gateway do
 
       :continue ->
         case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-          nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+          nil -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
           duplicate -> duplicate
         end
+    end
+  end
+
+  defp deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts) do
+    case Wakes.terminal_notice_delivery_in_txn(txn, opts[:wake_id]) do
+      :ordinary ->
+        deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+
+      {:terminal_notice, wake} ->
+        # Resolution and enqueue share this transaction. Only the persisted
+        # terminal event and its freshly authorized recipient may supply content
+        # and routing; the caller's stale gate/lineage/prompt cannot override them.
+        opts =
+          opts
+          |> Keyword.put(:target_gate, nil)
+          |> Keyword.put(:sender, wake.origin)
+          |> Keyword.put(:assignment_id, wake.assignment_id)
+          |> Keyword.put(:job_ref, wake.work_item_id)
+          |> Keyword.put(:role_ref, nil)
+          |> Keyword.put(:role_fallback, false)
+          |> Keyword.put(:fire_wake_in_txn, true)
+
+        deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts)
+
+      {:terminal_notice_undeliverable, _} = incomplete ->
+        incomplete
     end
   end
 
@@ -2055,7 +2085,8 @@ defmodule Tightbeam.Gateway do
   end
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."
-  @spec complete_delivery(DB.server(), term()) :: :appended | :duplicate | :conflict | :skipped
+  @spec complete_delivery(DB.server(), term()) ::
+          :appended | :duplicate | :conflict | :skipped | {:terminal_notice_undeliverable, map()}
   def complete_delivery(db, {:appended, actual_session_key, message, opts}) do
     registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
     publish_message(db, actual_session_key, message, registry)
@@ -2080,6 +2111,8 @@ defmodule Tightbeam.Gateway do
   def complete_delivery(_db, :skipped), do: :skipped
   def complete_delivery(_db, {:duplicate, _message}), do: :duplicate
   def complete_delivery(_db, {:conflict, _message}), do: :conflict
+
+  def complete_delivery(_db, {:terminal_notice_undeliverable, _} = incomplete), do: incomplete
 
   @doc false
   def delivery_target(_txn, session_key, nil), do: {session_key, nil, false}
@@ -2588,22 +2621,25 @@ defmodule Tightbeam.Gateway do
 
   # An agent reading `inspect` sees the identity as FIELDS, the same way it
   # supplies them back on spawn.
-  defp inspect_session(session) do
-    session
-    |> Map.take([
-      :session_key,
-      :display_name,
-      :handle,
-      :archetype,
-      :host,
-      :harness,
-      :origin,
-      :spawned_by,
-      :current_parent,
-      :state,
-      :created_at
-    ])
-    |> Map.merge(published_identity(session.model))
+  defp inspect_session(db, session) do
+    item =
+      session
+      |> Map.take([
+        :session_key,
+        :display_name,
+        :handle,
+        :archetype,
+        :host,
+        :harness,
+        :origin,
+        :spawned_by,
+        :current_parent,
+        :state,
+        :created_at
+      ])
+      |> Map.merge(published_identity(session.model))
+
+    Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
@@ -3472,8 +3508,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp append_transcript_self_inspection(guidance, session_key) do
-    transcript_command =
-      "tightbeam transcript --session #{inspect(session_key)} --limit 50"
+    transcript_command = "tightbeam transcript --session #{inspect(session_key)} --limit 50"
 
     guidance <>
       "\n\n## Inspect recent Tightbeam transcript\n\n" <>
@@ -3910,7 +3945,8 @@ defmodule Tightbeam.Gateway do
         reasons =
           [
             if(
-              is_nil(session.identity_render_contract) or is_nil(session.identity_guidance_digest),
+              is_nil(session.identity_render_contract) or
+                is_nil(session.identity_guidance_digest),
               do: "missing_render_stamp"
             ),
             if(session.identity_revision != live, do: "revision_mismatch"),
@@ -4560,8 +4596,7 @@ defmodule Tightbeam.Gateway do
        ) do
     case DB.transaction(db, fn txn ->
            if Archetypes.get(archetype_name) do
-             result =
-               Org.put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
+             result = Org.put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
 
              Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
 
@@ -4732,8 +4767,7 @@ defmodule Tightbeam.Gateway do
   defp replay_identity_publication(config, db, %{verb: "unlearn"} = call, marker) do
     name = call.params.name
 
-    archetypes =
-      Identity.bundle_archetype_names_at!(config.base_dir, marker.expected_prior, name)
+    archetypes = Identity.bundle_archetype_names_at!(config.base_dir, marker.expected_prior, name)
 
     candidate = identity_candidate_from_marker(marker)
 
@@ -4861,7 +4895,7 @@ defmodule Tightbeam.Gateway do
         }
 
         result = %{
-          sessions: Enum.map(sessions, &inspect_session/1),
+          sessions: Enum.map(sessions, &inspect_session(db, &1)),
           wakes: wakes,
           roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
@@ -7430,8 +7464,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp elected_attention(db, turn_seq) do
-    {:ok, [[tier]]} =
-      DB.query(db, "SELECT replyAttention FROM turns WHERE seq = ?1", [turn_seq])
+    {:ok, [[tier]]} = DB.query(db, "SELECT replyAttention FROM turns WHERE seq = ?1", [turn_seq])
 
     tier
   end
