@@ -30,13 +30,29 @@ defmodule Tightbeam.CliIntegrationTest do
 
   alias Tightbeam.Wire.Router
 
-  setup do
-    binary = Path.expand("../cli/target/release/tightbeam", __DIR__)
+  setup_all do
+    cli_dir = Path.expand("../cli", __DIR__)
+    target_dir = Path.join(cli_dir, "target/cli-integration")
+    binary = Path.join(target_dir, "release/tightbeam")
+
+    # Other suites rebuild target/release. This suite owns its parser executable.
+    {output, status} =
+      System.cmd("cargo", ["build", "--release"],
+        cd: cli_dir,
+        env: [{"CARGO_TARGET_DIR", target_dir}],
+        stderr_to_stdout: true
+      )
+
+    if status != 0, do: raise("CLI integration build failed:\n#{output}")
 
     unless File.exists?(binary) do
-      raise "CLI integration binary missing: #{binary}; run cargo build --release in cli/"
+      raise "CLI integration build did not produce #{binary}"
     end
 
+    {:ok, binary: binary}
+  end
+
+  setup %{binary: binary} do
     db = :"cli_integration_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
 
@@ -160,6 +176,374 @@ defmodule Tightbeam.CliIntegrationTest do
       workdir: workdir,
       outside: outside
     }
+  end
+
+  test "session reparent crosses the real CLI wire and preserves assignment continuity", ctx do
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    assert {created, 0} =
+             run.(["work-item-create", "--title", "reparent wire", "--as-user", "flynn"])
+
+    item = JSON.decode!(created)["id"]
+
+    assert {assigned, 0} =
+             run.([
+               "assign",
+               "--session",
+               "cli-holder",
+               "--subject",
+               "existing work",
+               "--effect-kind",
+               "coordination",
+               "--work-item",
+               item,
+               "--as-user",
+               "flynn"
+             ])
+
+    assignment = JSON.decode!(assigned)["id"]
+
+    args = [
+      "session-reparent",
+      "--session",
+      "cli-holder",
+      "--parent",
+      "cli-worker",
+      "--assignment",
+      assignment,
+      "--key",
+      "wire-reparent"
+    ]
+
+    {refused, status} = run.(args)
+    assert status != 0
+    assert refused =~ "user_principal_required"
+    assert {corrected, 0} = run.(args ++ ["--as-user", "flynn"])
+    result = JSON.decode!(corrected)
+    assert result["session"]["currentParent"] == "cli-worker"
+    assert result["session"]["originParent"] == nil
+    assert_receive {:cli_call, %{verb: "session-reparent", principal: {:user, "flynn"}}}
+    assert {retried, 0} = run.(args ++ ["--as-user", "flynn"])
+    assert JSON.decode!(retried) == result
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT spawnedBy FROM sessions WHERE sessionKey='cli-holder'")
+
+    assert {:ok, [["flynn", "cli-holder", "open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT openedByUser,holderKey,state FROM assignments WHERE id=?1",
+               [assignment]
+             )
+
+    assert {finished, 0} =
+             run.([
+               "attest",
+               assignment,
+               "--kind",
+               "completion",
+               "--note",
+               "existing work completed"
+             ])
+
+    assert JSON.decode!(finished)["assignment"]["state"] == "closed"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE sessionKey='cli-worker'")
+  end
+
+  test "typed consequence crosses the real CLI wire with authenticated assignment custody", ctx do
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       name: Tightbeam.WakeScheduler,
+       tick_ms: 60_000,
+       deliver: fn _ -> flunk("wire admission must not deliver an unrelated wake") end}
+    )
+
+    run = fn args -> System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true) end
+
+    assert {assigned, 0} =
+             run.(["assign", "--session", "cli-holder", "--subject", "R1 wire proof"])
+
+    assignment = JSON.decode!(assigned)["id"]
+    assert is_binary(assignment)
+
+    assert {attested, 0} =
+             run.([
+               "attest",
+               assignment,
+               "--kind",
+               "progress",
+               "--note",
+               "Wire consequence evidence"
+             ])
+
+    evidence = JSON.decode!(attested)["attest"]["id"]
+    assert is_binary(evidence)
+
+    payload = %{
+      "assignmentId" => assignment,
+      "consequenceKey" => "release",
+      "revision" => "wire-one",
+      "attentionRequestId" => "wire-attention-one",
+      "evidenceAttestId" => evidence,
+      "explicitAttention" => true
+    }
+
+    args = [
+      "condition",
+      "--kind",
+      "obligation-consequence-changed",
+      "--scope",
+      assignment,
+      "--payload",
+      JSON.encode!(payload)
+    ]
+
+    assert {filed, 0} = run.(args)
+    fact_id = JSON.decode!(filed)["factId"]
+    assert is_integer(fact_id) and fact_id > 0
+
+    assert_receive {:cli_call,
+                    %{
+                      verb: "condition",
+                      principal: {:session, "cli-holder"},
+                      params: %{payload: ^payload, scope: ^assignment}
+                    }}
+
+    assert {:ok, [[encoded, origin]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload,origin FROM condition_facts WHERE id=?1 AND scope=?2",
+               [fact_id, assignment]
+             )
+
+    assert JSON.decode!(encoded) == payload
+    assert origin == "agent:cli-holder"
+    assert {replay, 0} = run.(args)
+    assert JSON.decode!(replay)["factId"] == fact_id
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM condition_facts WHERE kind='obligation-consequence-changed' AND scope=?1",
+               [assignment]
+             )
+
+    other_dir = session_workdir!(ctx, ctx.worker)
+    assert {refused, 1} = System.cmd(ctx.binary, args, cd: other_dir, stderr_to_stdout: true)
+    assert refused =~ "not_authorized"
+
+    assert {malformed, 1} =
+             run.([
+               "condition",
+               "--kind",
+               "obligation-consequence-changed",
+               "--scope",
+               assignment,
+               "--payload",
+               "[]"
+             ])
+
+    assert malformed =~ "payload"
+
+    assert {:ok, [[^encoded, ^origin]]} =
+             DB.query(
+               ctx.db,
+               "SELECT payload,origin FROM condition_facts WHERE id=?1 AND scope=?2",
+               [fact_id, assignment]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM condition_facts WHERE kind='obligation-consequence-changed' AND scope=?1",
+               [assignment]
+             )
+
+    assert {:ok, [[state]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [assignment])
+
+    assert JSON.decode!(state)["currentConsequence"] == payload
+  end
+
+  test "manual obligation continuation examples register rows and deliver intact prompts", ctx do
+    {help, 0} = System.cmd(ctx.binary, ["wake", "--help"])
+    assert help =~ "--after-turn"
+    assert help =~ "--predicate"
+    assert help =~ "--fallback-after"
+    File.mkdir_p!(Path.join(ctx.base_dir, "identity/rules"))
+
+    File.cp!(
+      Path.expand("../priv/kungfu/agentic-engineering/rules/verification.toml", __DIR__),
+      Path.join(ctx.base_dir, "identity/rules/verification.toml")
+    )
+
+    Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
+    registry = start_supervised!({Tightbeam.ConnRegistry, name: :d3_cli_registry})
+    # Stop at the durable notification boundary; do not start an agent/provider lane.
+    lane =
+      spawn_link(fn ->
+        receive_loop = fn receive_loop ->
+          receive do
+            {:"$gen_call", from, {:ensure_lane, _key}} ->
+              GenServer.reply(from, :ok)
+              receive_loop.(receive_loop)
+          end
+        end
+
+        receive_loop.(receive_loop)
+      end)
+
+    on_exit(fn -> Process.exit(lane, :kill) end)
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       name: Tightbeam.WakeScheduler,
+       tick_ms: 60_000,
+       deliver: fn _wake -> true end,
+       delivery_opts: [conn_registry: registry, lane_manager: lane]}
+    )
+
+    ids =
+      for {key, subject} <- [{"cli-holder", "A"}, {"cli-worker", "R"}, {"cli-worker", "V"}] do
+        {output, 0} =
+          System.cmd(ctx.binary, ["assign", "--session", key, "--subject", subject],
+            cd: ctx.workdir,
+            stderr_to_stdout: true
+          )
+
+        JSON.decode!(output)["id"]
+      end
+
+    [assignment, resolver, verifier] = ids
+
+    {:ok, _} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "cli-holder",
+        message_id: "manual-turn",
+        origin: "agent:fixture",
+        prompt: "current turn"
+      })
+
+    {:ok, turn} = Ledger.claim_next(ctx.db, "cli-holder", "fixture")
+
+    after_prompt = "D3 manual: continue the named assignment"
+
+    after_result =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-holder",
+          "--assignment",
+          assignment,
+          "--after-turn",
+          "--prompt",
+          after_prompt
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert_receive {:cli_call, %{verb: "wake", params: wire_params}}
+    assert wire_params.assignment_id == assignment
+    {after_output, 0} = after_result
+    after_id = JSON.decode!(after_output)["wakeId"]
+    after_wake = Wakes.get(ctx.db, after_id)
+    assert after_wake.assignment_id == assignment
+    assert after_wake.obligation_ref == assignment
+    assert after_wake.creator_session_key == "cli-holder"
+    assert after_wake.originating_turn_seq == turn.seq
+    assert after_wake.wait_mode == "after-turn"
+    assert after_wake.prompt == after_prompt
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [after_id])
+
+    predicate = %{
+      "conditions" => [%{"fact" => "assignment.state", "op" => "eq", "value" => "closed"}],
+      "bindings" => %{"assignmentId" => resolver},
+      "resolverRef" => %{"kind" => "assignment", "id" => resolver},
+      "necessity" => "The resolver owns the required output.",
+      "verificationRef" => %{"kind" => "assignment", "id" => verifier}
+    }
+
+    dependency_prompt = "D3 manual: read the resolver disposition before acting"
+
+    {dependency_output, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "wake",
+          "--session",
+          "cli-holder",
+          "--assignment",
+          assignment,
+          "--predicate",
+          JSON.encode!(predicate),
+          "--fallback-after",
+          "1h",
+          "--prompt",
+          dependency_prompt
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    dependency_id = JSON.decode!(dependency_output)["wakeId"]
+    dependency = Wakes.get(ctx.db, dependency_id)
+    assert dependency.obligation_ref == assignment
+    assert dependency.creator_session_key == "cli-holder"
+    assert dependency.originating_turn_seq == turn.seq
+    assert dependency.verification_assignment_id == verifier
+    assert dependency.verification_state == "provisional"
+    assert dependency.selected_policy_name == "accountable-dependency-verifier"
+    assert dependency.resolver_id == resolver
+    assert dependency.due_at > System.system_time(:millisecond)
+    assert dependency.prompt == dependency_prompt
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM supervision_liveness_sidecar WHERE assignmentId=?1 AND controllerOrigin='holder_continuation'",
+               [assignment]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [dependency_id])
+
+    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
+    Wakes.fire_due(Tightbeam.WakeScheduler)
+
+    assert {:ok, [[after_delivered]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [after_id])
+
+    assert String.ends_with?(after_delivered, after_prompt)
+
+    {_, 0} =
+      System.cmd(ctx.binary, ["revoke-assignment", resolver, "--reason", "Resolver disposition"],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    Wakes.fire_due(Tightbeam.WakeScheduler)
+
+    assert {:ok, [[dependency_delivered]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE wakeId=?1", [dependency_id])
+
+    assert String.ends_with?(dependency_delivered, dependency_prompt)
+
+    Wakes.fire_due(Tightbeam.WakeScheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [after_id])
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [dependency_id])
   end
 
   test "real CLI states its built version when it connects", ctx do
@@ -405,12 +789,26 @@ defmodule Tightbeam.CliIntegrationTest do
     {revoked, 0} =
       System.cmd(
         ctx.binary,
-        ["revoke-assignment", assignment_id, "--as-user", "flynn"],
+        ["revoke-assignment", assignment_id, "--reason", "CLI disposition", "--as-user", "flynn"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
 
     assert revoked =~ "revoked"
+
+    assert {:ok, [["cli-other", "cli-worker", "flynn", "flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT a.openedBySession,a.holderKey,a.closedByUser,r.revokedByUser FROM assignments a JOIN assignment_revocations r ON r.assignmentId=a.id WHERE a.id=?1",
+               [assignment_id]
+             )
+
+    assert {:ok, [["other", "cli-other"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT ownerUserId,sessionKey FROM wakes WHERE assignmentId=?1 AND obligationRef=?2",
+               [assignment_id, "terminal-child-owner-notification:" <> assignment_id]
+             )
 
     assert_receive {:cli_call,
                     %{
@@ -435,6 +833,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "ship",
           "--session",
           "cli-holder",
+          "--effect-kind",
+          "coordination",
           "--key",
           "assign-cli"
         ],
@@ -536,7 +936,7 @@ defmodule Tightbeam.CliIntegrationTest do
                     }}
 
     {revoked, 0} =
-      System.cmd(ctx.binary, ["revoke-assignment", dispatch_id],
+      System.cmd(ctx.binary, ["revoke-assignment", dispatch_id, "--reason", "CLI disposition"],
         cd: ctx.workdir,
         stderr_to_stdout: true
       )
@@ -645,62 +1045,6 @@ defmodule Tightbeam.CliIntegrationTest do
 
     item_id = JSON.decode!(created)["id"]
 
-    # The posture gate refuses a coder card on an unpostured work item, so the
-    # org's orchestrator rules the slice first, through the same real CLI.
-    orchestrator =
-      Org.create(ctx.db, %{
-        session_key: "cli-orchestrator",
-        display_name: "CLI Orchestrator",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "orchestrator",
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("test")
-      })
-
-    Roles.create!(ctx.db, "cli-orchestrator", "flynn", orchestrator.session_key)
-
-    {slice, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "assign",
-          "--subject",
-          "orchestrate the slice",
-          "--session",
-          "cli-orchestrator",
-          "--work-item",
-          item_id,
-          "--as-user",
-          "flynn"
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
-    slice_id = JSON.decode!(slice)["id"]
-
-    {_postured, 0} =
-      System.cmd(
-        ctx.binary,
-        [
-          "attest",
-          slice_id,
-          "--kind",
-          "verdict",
-          "--verdict",
-          "posture-light",
-          "--note",
-          "e2e: the input is the spec",
-          "--as-user",
-          "flynn"
-        ],
-        cd: ctx.workdir,
-        stderr_to_stdout: true
-      )
-
     {assigned, 0} =
       System.cmd(
         ctx.binary,
@@ -710,6 +1054,8 @@ defmodule Tightbeam.CliIntegrationTest do
           "implement the feature",
           "--session",
           "cli-coder",
+          "--effect-kind",
+          "coordination",
           "--work-item",
           item_id,
           "--as-user",
@@ -723,6 +1069,14 @@ defmodule Tightbeam.CliIntegrationTest do
 
     repo = Path.expand("..", __DIR__)
     {commit, 0} = System.cmd("git", ["rev-parse", "HEAD"], cd: repo)
+
+    commit_refs =
+      JSON.encode!([
+        %{
+          "repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}",
+          "commit" => String.trim(commit)
+        }
+      ])
 
     {_receipt, 0} =
       System.cmd(
@@ -803,7 +1157,16 @@ defmodule Tightbeam.CliIntegrationTest do
     {_verified, 0} =
       System.cmd(
         ctx.binary,
-        ["attest", work_id, "--kind", "verdict", "--verdict", "verified"],
+        [
+          "attest",
+          work_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "verified",
+          "--commit-refs",
+          commit_refs
+        ],
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -892,10 +1255,9 @@ defmodule Tightbeam.CliIntegrationTest do
              RailRemedy.episode(ctx.db, "completion-requires-results-artifact", work_id)
   end
 
-  # verification-papertrail-v1 A7 x A5 (macOS half): an org with no learned
-  # statutes completes bare through the real CLI — no denial, no episode, no
-  # remedy wake.
-  test "real CLI bare completion passes on a rule-free org (A5)", ctx do
+  # O2 keeps its code-evidence edge active even when the org has no learned
+  # statutes. The refusal creates no remedy episode or wake.
+  test "real CLI refuses bare code completion on a rule-free org", ctx do
     Rules.load!(ctx.base_dir, Map.keys(ctx.handlers))
 
     coder =
@@ -944,13 +1306,20 @@ defmodule Tightbeam.CliIntegrationTest do
 
     work_id = JSON.decode!(assigned)["id"]
 
-    {completed, 0} =
+    {denied, denied_status} =
       System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
         cd: coder_dir,
         stderr_to_stdout: true
       )
 
-    assert completed =~ "closed"
+    assert denied_status != 0
+    assert denied =~ "inapplicable_code_evidence"
+
+    assert {:ok, [["open", nil]]} =
+             DB.query(ctx.db, "SELECT state,closingAttestId FROM assignments WHERE id=?1", [
+               work_id
+             ])
+
     assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM rail_remedy_episodes", [])
 
     assert {:ok, [[0]]} =
@@ -1726,5 +2095,19 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     request_id
+  end
+
+  test "real CLI rejects closed or retired Topline shapes before router dispatch", ctx do
+    for args <- [
+          ["topline-create", "--title", "Ship", "--key", "closed-key", "--bogus", "ignored"],
+          ["toplines", "--tree"],
+          ["topline", "tl_probe", "--under", "wi_probe"],
+          ["topline-placement-list", "--history"]
+        ] do
+      {output, status} = System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+      assert status != 0
+      assert output =~ "does not accept"
+      refute_receive {:cli_call, _call}
+    end
   end
 end

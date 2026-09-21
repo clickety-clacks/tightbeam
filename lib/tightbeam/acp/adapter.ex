@@ -15,8 +15,8 @@ defmodule Tightbeam.Acp.Adapter do
      session/set_config_option {configId:"model"}, and the effort — Tightbeam's
      own field — via the harness's effort config id. Nothing outside this
      module builds or reads a packed model string.
-  3. Permission requests auto-allowed by Conn (YOLO); sessions run in the
-     harness's bypass mode set at session/new time.
+  3. Permission requests auto-allowed by Conn (YOLO); session preparation
+     reasserts the harness's configured mode after new, load, and fork.
   """
 
   use GenServer
@@ -758,28 +758,33 @@ defmodule Tightbeam.Acp.Adapter do
            timeout: request_timeout
          ) do
       {:ok, result} ->
-        state =
-          state
-          |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-          |> put_in([Access.key(:models)], Map.delete(state.models, sid))
-          |> put_in([Access.key(:unprompted)], MapSet.delete(state.unprompted, sid))
-          |> remember_switchable_models(sid, result)
-          |> remember_config_options(sid, result)
-          |> put_in([Access.key(:chunks), sid], [])
+        with :ok <- set_mode(state, sid, request_timeout) do
+          state =
+            state
+            |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+            |> put_in([Access.key(:models)], Map.delete(state.models, sid))
+            |> put_in([Access.key(:unprompted)], MapSet.delete(state.unprompted, sid))
+            |> remember_switchable_models(sid, result)
+            |> remember_config_options(sid, result)
+            |> put_in([Access.key(:chunks), sid], [])
 
-        case model do
-          %Model{} = model ->
-            case apply_model_to_session(state, sid, model, request_timeout) do
-              {:ok, applied_model} ->
-                {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
+          case model do
+            %Model{} = model ->
+              case apply_model_to_session(state, sid, model, request_timeout) do
+                {:ok, applied_model} ->
+                  {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
 
-              {:error, reason} ->
-                {:reply, {:error, {:model_apply_failed, reason}},
-                 drop_model_residency(state, sid)}
-            end
+                {:error, reason} ->
+                  {:reply, {:error, {:model_apply_failed, reason}},
+                   drop_model_residency(state, sid)}
+              end
 
-          _unknown ->
-            {:reply, {:ok, :unknown}, state}
+            _unknown ->
+              {:reply, {:ok, :unknown}, state}
+          end
+        else
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
         end
 
       {:error, error} ->
@@ -1633,18 +1638,18 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp set_mode(state, sid, request_timeout) do
-    _ =
-      Conn.request(
-        state.conn,
-        "session/set_mode",
-        %{
-          sessionId: sid,
-          modeId: state.preset.permission_mode
-        },
-        timeout: request_timeout
-      )
-
-    :ok
+    case Conn.request(
+           state.conn,
+           "session/set_mode",
+           %{
+             sessionId: sid,
+             modeId: state.preset.permission_mode
+           },
+           timeout: request_timeout
+         ) do
+      {:ok, _result} -> :ok
+      {:error, reason} -> {:error, {:mode_apply_failed, reason}}
+    end
   end
 
   defp adapter_ready(opts) do
@@ -1732,6 +1737,17 @@ defmodule Tightbeam.Acp.Adapter do
   defp gate_update_output(%{"sessionUpdate" => kind, "content" => content})
        when kind in ["tool_call", "tool_call_update"],
        do: [JSON.encode!(content)]
+
+  # pi-acp reports a completed bash tool call with no top-level "content" key;
+  # its output (and the gate marker) live in _meta.terminal_output.data. Placed
+  # after the "content" clause above so that clause's matched set is unchanged:
+  # this only rescues content-less updates the fallback would otherwise drop.
+  defp gate_update_output(%{
+         "sessionUpdate" => kind,
+         "_meta" => %{"terminal_output" => %{"data" => data}}
+       })
+       when kind in ["tool_call", "tool_call_update"] and is_binary(data),
+       do: [data]
 
   defp gate_update_output(_update), do: []
 

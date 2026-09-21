@@ -51,6 +51,8 @@ pub enum Command {
     /// assimilate`. Printing the whole manual in answer to a question about one
     /// command buries the answer it was asked for.
     CommandHelp(String),
+    /// Print only the nearest session marker's non-secret session key.
+    IdentityCurrent,
     Doctor {
         json: bool,
         base_dir: Option<String>,
@@ -63,6 +65,9 @@ pub enum Command {
         at: Option<String>,
         condition_kind: Option<String>,
         condition_scope: Option<String>,
+        predicate: Option<serde_json::Value>,
+        assignment_id: Option<String>,
+        after_turn: bool,
         idempotency_key: Option<String>,
         /// Sender-elected delivery class. The vocabulary is extensible, so the
         /// CLI validates only that a supplied name is non-empty.
@@ -73,6 +78,68 @@ pub enum Command {
         kind: String,
         scope: Option<String>,
         idempotency_key: Option<String>,
+        payload: Option<String>,
+    },
+    HarnessHealthObserveOther {
+        identity: Identity,
+        harness: String,
+        host: String,
+        source_session: String,
+        description: String,
+        evidence_mode: String,
+        observed_state: String,
+        exact_error: Option<String>,
+        exact_probe: String,
+        output_digest: Option<String>,
+        recovery_condition: String,
+        not_known_class: String,
+        observed_at: Option<String>,
+        valid_until: String,
+        world_status: String,
+        redaction_confirmed: bool,
+        idempotency_key: String,
+        correlation_id: Option<String>,
+    },
+    HarnessHealthResolveOther {
+        identity: Identity,
+        harness: String,
+        host: String,
+        incident_id: Option<String>,
+        observed_state: String,
+        exact_probe: String,
+        output_digest: String,
+        recovery_condition_digest: String,
+        cause: String,
+        observed_at: Option<String>,
+        accepted_at: Option<String>,
+        idempotency_key: String,
+        session_key: Option<String>,
+        correlation_id: Option<String>,
+    },
+    HarnessHealthReviewOther {
+        identity: Identity,
+        incident_id: String,
+        outcome: String,
+        named_class: Option<String>,
+        cause: Option<String>,
+        idempotency_key: String,
+    },
+    HarnessHealthClosePromotion {
+        identity: Identity,
+        promotion_id: String,
+        named_class: String,
+        spec_artifact_id: String,
+        spec_ref: Option<String>,
+        spec_sha256: Option<String>,
+        review_artifact_id: String,
+        review_attest_id: String,
+        review_assignment_id: String,
+        candidate_commit: String,
+        idempotency_key: String,
+    },
+    HarnessHealthEvidenceOther {
+        identity: Identity,
+        incident_id: String,
     },
     ArtifactRecord {
         identity: Identity,
@@ -82,6 +149,11 @@ pub enum Command {
         description: Option<String>,
         work_item_id: Option<String>,
         content_sha256: Option<String>,
+        produced_by_assignment_id: Option<String>,
+    },
+    ArtifactContentFetch {
+        identity: Identity,
+        artifact_id: String,
     },
     Artifacts {
         identity: Identity,
@@ -122,6 +194,19 @@ pub enum Command {
         session_key: String,
         idempotency_key: Option<String>,
     },
+    SessionReparent {
+        identity: Identity,
+        session_key: String,
+        parent_session_key: String,
+        assignment_id: String,
+        idempotency_key: String,
+    },
+    SessionPoSet {
+        identity: Identity,
+        session_key: String,
+        po_role: String,
+        idempotency_key: String,
+    },
     Tune {
         identity: Identity,
         session_key: String,
@@ -136,6 +221,7 @@ pub enum Command {
         reviews: Option<String>,
         effect_kind: Option<String>,
         files: Option<Vec<String>>,
+        succeeds: Option<String>,
     },
     Dispatch {
         identity: Identity,
@@ -146,11 +232,28 @@ pub enum Command {
         workdir_root: Option<String>,
         brief: String,
         idempotency_key: Option<String>,
+        succeeds: Option<String>,
     },
     EffortRule {
         identity: Identity,
         request_id: String,
         action: String,
+    },
+    Ask {
+        identity: Identity,
+        target: Target,
+        question: String,
+        assignment_id: Option<String>,
+    },
+    Answer {
+        identity: Identity,
+        request_id: String,
+        answer: String,
+    },
+    Return {
+        identity: Identity,
+        request_id: String,
+        reason: String,
     },
     OperatorAsk {
         identity: Identity,
@@ -184,6 +287,12 @@ pub enum Command {
     RevokeAssignment {
         identity: Identity,
         assignment_id: String,
+        reason: String,
+    },
+    ReopenAssignment {
+        identity: Identity,
+        assignment_id: String,
+        reason: String,
     },
     RepairAssignment {
         identity: Identity,
@@ -194,6 +303,14 @@ pub enum Command {
         context: Option<String>,
         outcome: Option<String>,
         turn_seq: Option<String>,
+        idempotency_key: String,
+    },
+    AssignmentCommitRefCorrect {
+        identity: Identity,
+        assignment_id: String,
+        commit_refs: Vec<serde_json::Value>,
+        reason: String,
+        evidence_artifact_id: String,
         idempotency_key: String,
     },
     WorkItemCreate {
@@ -242,6 +359,20 @@ pub enum Command {
         identity: Identity,
         selection: ToplineSelection,
     },
+    ToplineMutation {
+        identity: Identity,
+        verb: String,
+        params: Vec<(String, String)>,
+    },
+    DurableToplines {
+        identity: Identity,
+        state: Option<String>,
+    },
+    DurableTopline {
+        identity: Identity,
+        topline_id: String,
+        history: bool,
+    },
     WorkItemIcebox {
         identity: Identity,
         work_item_id: String,
@@ -266,6 +397,9 @@ pub enum Command {
         verdict: Option<String>,
         note: Option<String>,
         commit_refs: Option<Vec<serde_json::Value>>,
+        artifact_id: Option<String>,
+        content_sha256: Option<String>,
+        wait_id: Option<String>,
     },
     Attests {
         identity: Identity,
@@ -325,6 +459,9 @@ pub enum Command {
         identity: Identity,
         provider: String,
         api_key: bool,
+        daemon_credential: bool,
+        endpoint: Option<String>,
+        provider_name: Option<String>,
         hostname: Option<String>,
         remote: Option<String>,
     },
@@ -453,6 +590,13 @@ COMMANDS:
           --when-fact <kind> [--when-scope <scope>]
           (--fallback-after 30s|5m|2h | --at <epochMs>)
           --prompt "<text>" [--key <idempotencyKey>]
+      Dependency wait:
+        tightbeam wake --session <holderSession> --assignment <assignmentId>
+          --predicate '<JSON object>'
+          (--fallback-after 30s|5m|2h | --at <epochMs>) --prompt "<continuation>"
+      Ready-now continuation:
+        tightbeam wake --session <holderSession> --assignment <assignmentId>
+          --after-turn --prompt "<continuation>"
       Send a prompt to the selected target. Immediate = a direct message; with --after or
       --at = a scheduled wake that fires later. A wake ALWAYS carries a prompt —
       there is no content-free ping. This is how you DM or nudge another
@@ -461,12 +605,14 @@ COMMANDS:
       It never resumes or replays prior work. The fact stamp reports why the prompt arrived.
       The accountable agent re-reads durable state and decides the next action.
       The fallback timer detects silence only; it does not select an action.
+      A dependency predicate names conditions, bindings, resolverRef, necessity,
+      and verificationRef. --after-turn captures the caller's running turn.
       --prompt is the caller's explicit instruction override.
       Tightbeam carries it without rewriting it.
       --class elects the receiver's delivery policy. Without --class the wake
       follows the existing one-notice path. An explicit --after or --at keeps
       the sender's chosen delivery time.
-        tightbeam wake --role reviewer --prompt "review PR 12" --as coder
+        tightbeam wake --role reviewer-code --prompt "review PR 12" --as coder
         tightbeam wake --session agent:coder:app --prompt "check CI" --after 5m --as coder
         tightbeam wake --role owner --when-fact build-finished --when-scope app \
           --fallback-after 2h --prompt "re-read the work and decide" --as-process ci
@@ -475,11 +621,35 @@ COMMANDS:
       File an observable fact. Matching condition wakes receive the fact as a new
       notification turn; they never resume or replay prior work.
 
+  harness-health-observe-other --harness <harness> --host <host>
+      --source-session <session> --description <text> --evidence-mode exact_error|probe_digest
+      --observed-state <text> --exact-probe <text> --recovery-condition <text>
+      --not-known-class <text> --valid-until <epochMs> --world-status PROVEN|UNKNOWN
+      --redaction-confirmed --key <idempotencyKey>
+      Admit a redacted, bounded evidence observation for a not-yet-named failure.
+  harness-health-resolve-other --harness <harness> --host <host>
+      --observed-state <text> --exact-probe <text> --output-digest <sha256>
+      --recovery-condition <text> --cause <text>
+      Record a PROVEN recovery observation for an open other incident.
+  harness-health-review-other <incidentId>
+      --outcome confirmed_other|reclassified|promotion_required
+      Close the mandatory review for an other incident.
+  harness-health-close-promotion <promotionId> --named-class <class>
+      --spec-artifact <artifactId> --review-artifact <artifactId>
+      --review-attest <attestId> --review-assignment <assignmentId> --candidate-commit <commit> --key <idempotencyKey>
+      Close a recurrence promotion after the Gateway verifies canonical provenance.
+  harness-health-evidence-other <incidentId>
+      Read exact retained evidence as the authorized source, custodian, owner, or admin.
+
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
+                  [--produced-by-assignment <assignmentId>]
       Record a deliberate artifact pointer for the calling session.
   artifacts [--work-item <workItemId>] [--session <key>]
       List artifact rows matching every supplied exact filter.
+  artifact-content-fetch <artifactId>
+      Fetch captured bytes as contentBase64 with contentSha256 and contentSize.
+      Reads stored custody only, never the origin path; uncaptured content is reported unavailable.
 
   spawn --display "<name>" [--name <role>] [--archetype <a>]
         [--harness {{HARNESSES_PIPE}}] [--model <model>] [--effort <level>]
@@ -489,7 +659,7 @@ COMMANDS:
       which is YOUR identity. --key makes the spawn idempotent
       (same key returns the same session). Omitted fields inherit the
       archetype's defaults.
-        tightbeam spawn --display "Reviewer" --name reviewer:x \
+        tightbeam spawn --display "Code reviewer" --name reviewer-code:x \
           --harness {{EXAMPLE_HARNESS}} --model <catalog-model> --effort <level> \
           --as orchestrator:news
       --host picks a machine WITHIN the archetype's allowed set (see list's
@@ -504,6 +674,12 @@ COMMANDS:
       org's shape — archetypes (with allowed hosts), known hosts, and the
       valid model catalog per harness — and, for admins, pending devices.
         tightbeam list --as orchestrator:news
+
+  session-reparent --session <key> --parent <key> --assignment <id> --key <key>
+      Owner-as-user correction of one custom session and its sole open assignment.
+
+  session-po-set --session <key> --po-role <role> --key <key>
+      Explicitly associate an exact session with its addressed product-owner role.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
@@ -544,7 +720,7 @@ COMMANDS:
       No cursor reads the tail (newest first page, shown oldest-first); page
       back with --before <oldestId> and catch up with --after <newestId>, both
       ids the previous response handed you. --limit defaults to 50, caps at 500.
-  toplines [--origin user|session|all] [--owner <userId>] [--state <state>]
+  execution-map [--origin user|session|all] [--owner <userId>] [--state <state>]
            [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]]
            [--session <key>] [--tree]
       The work telemetry the substrate already knows: every work item you can
@@ -555,14 +731,29 @@ COMMANDS:
       concurrency, not proven causality — every node states its own
       epistemic status (linked, from_turn, no_turn_observed, unrecorded).
       No percentages and no completion estimates: the rows do not support them.
-        tightbeam toplines --origin user --state open --as-user flynn
-        tightbeam toplines --quiet-over 2h --as-user flynn
-  topline (--under <workItemId> [roster filters] | --assignments <id,...>)
+        tightbeam execution-map --origin user --state open --as-user flynn
+        tightbeam execution-map --quiet-over 2h --as-user flynn
+  execution-map-select (--under <workItemId> [roster filters] | --assignments <id,...>)
       --under walks one item's causal subtree (the anchor plus its visible
       linked descendants). --assignments names an explicit assignment set and
       reports the items they resolve to; an assignment belonging to no item
       comes back in noItem rather than being silently dropped.
-        tightbeam topline --under wi_abc123 --as-user flynn
+        tightbeam execution-map-select --under wi_abc123 --as-user flynn
+  toplines [--state open|closed|all]
+      List your visible durable Toplines.
+  topline <toplineId> [--history]
+      Read one visible durable Topline; --history includes its event history.
+  topline-create --title <text> --key <idempotencyKey>
+  topline-update <toplineId> --title <text> --reason <text> --key <idempotencyKey>
+  topline-close <toplineId> --reason <text> --key <idempotencyKey>
+  topline-reopen <toplineId> --reason <text> --key <idempotencyKey>
+  topline-link-work <toplineId> <workItemId> --reason <text> --key <idempotencyKey>
+  topline-unlink-work <membershipId> --reason <text> --key <idempotencyKey>
+  topline-concern-create <toplineId> --title <text> --key <idempotencyKey>
+  topline-concern-link-work <concernId> <workItemId> --reason <text> --key <idempotencyKey>
+  topline-concern-unlink-work <concernId> <workItemId> --reason <text> --key <idempotencyKey>
+  topline-work-leave-unlinked <workItemId> --reason <text> --key <idempotencyKey>
+  topline-placement-list [--state pending|resolved|all]
   work-item-icebox <workItemId>
       Shelve an unstaffed item (open → iceboxed). Requires zero open
       assignments; work-item-reopen resumes it.
@@ -574,17 +765,21 @@ COMMANDS:
   assign --subject "<work>" (--session <key> | --role <name>)
          [--key <key>] [--work-item <workItemId>]
          [--reviews <assignmentId>] [--effect-kind <kind>]
-         [--files '["lib/a.ex","test/a_test.exs"]']
+         [--files '["lib/a.ex","test/a_test.exs"]'] [--succeeds <assignmentId>]
       Open an obligation held by a session; a work item is the durable thread
       across assignments. --files is an advisory suggestion that others can see;
       it reserves no path and does not limit the assignment's work.
   dispatch (--to <sessionKey> | --holder <sessionKey>) --subject "<work>"
            --brief "<one sentence>" [--work-item <workItemId>]
            [--effect-kind <kind>] [--workdir-root <relativePath>] [--key <key>]
+           [--succeeds <assignmentId>]
       Atomically open an assignment and wake its holder with the card id.
   effort-rule --request <decisionRequestId> --action continue|dismiss
       Rule an effort-without-effect check-in whose complete id you hold. The
       current expecter is the preferred responder, not an authorization gate.
+  ask (--session <key> | --role <name> | --user <id>) --question <text> [--about <assignment>]
+  answer --request <dr_id> --answer <text>
+  return --request <dr_id> --reason <text>
   operator-ask --question <q> [--note <t>] [--options a,b,c]
                [--assignment <asgId>] [--deadline <dur>] [--supersedes <dr_id>]
       File an owner-scoped operator decision request.
@@ -594,21 +789,32 @@ COMMANDS:
       only on the operator's explicit delegation, quoted in --rationale.
   operator-withdraw <dr_id> --reason <text>
       Withdraw an operator decision request as its owner or original asker.
-  decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]
+  decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]
       List decision requests visible to your principal.
   decision-request --request <decisionRequestId>
       Read one effort request by complete id. Other request kinds keep their
       existing visibility rules.
-  revoke-assignment <assignmentId>
+  revoke-assignment <assignmentId> --reason "..."
       Revoke when the assignment handler already authorizes your principal.
+  reopen-assignment <assignmentId> --reason <reason>
+      Reopen an authorized closed assignment and record the reason.
   repair-assignment <assignmentId> --action tune|restart|rerun|resume|relaunch --key <key>
       Repair a failed or never-launched holder without revoking its work.
       tune also requires --model; rerun requires --outcome not-completed.
+  assignment-commitref-correct <assignmentId>
+      --commit-refs '[{"repo":"host:/repo","remote":"<origin>",
+                       "ref":"refs/heads/main","commit":"<sha>"}]'
+      --evidence <artifactId> --reason "..." --key <idempotencyKey>
+      Append one canonical commitRef correction to a CLOSED historical
+      assignment. This does not create an attest, change the assignment outcome,
+      or rewrite lifecycle history.
   attest <assignmentId> --kind progress|completion|surrender|verdict
       [--commit-refs '[{"repo":"host:/abs/path","commit":"<commit>"}]']
-         [--verdict <kind>] [--note "..."]
+      [--artifact <artifactId> --sha256 <hash>]
+         [--verdict <kind>] [--wait <wakeId>] [--note "..."]
       File against an assignment. Verdicts on review cards require the review
-      holder; producer-card verdicts may be filed by any session or user.
+      holder; producer-card verdicts may be filed by any session or user. A
+      surrender requires --note and uses the session's implicit identity.
   attests <assignmentId>
       List every attest filed against an assignment.
   assignments [--session <key> | --role <name>] [--state open|closed|all]
@@ -621,6 +827,9 @@ COMMANDS:
   kungfu list
       List the kungfu bundles shipped with this Tightbeam build and each
       bundle's declared root archetype.
+
+  identity current
+      Print this session's key without printing its bearer credential.
 
   ADMIN (require --as-user of an admin, or an admin-owned agent handle):
   identity edit <archetype> [--manifest | --skill <name> [--rm]] [--key <idempotencyKey>]
@@ -637,9 +846,14 @@ COMMANDS:
   unlearn <bundle> [--key <idempotencyKey>]
       Remove a learned kungfu bundle by its committed receipt.
   identity status [<archetype>]
-      Report the live revision, session revisions, staleness, and conflicts.
+      Report the live revision, session revisions, staleness, and conflicts. A
+      session's identityRevision is the revision its Tightbeam skill files were
+      last written from, not the revision any running context loaded.
   identity apply (<session> | --all)
-      Refresh selected sessions from the current live identity revision.
+      Best-effort update of the selected sessions' Tightbeam-owned skill files
+      to the current live identity revision, followed by an ordinary prompt
+      asking each started session to re-read them. It cannot confirm that a
+      session did, and it does not reload any running model context.
   onboard openai|anthropic [--api-key]
       Run this machine's model-provider credential onboarding flow. Without
       --api-key this is the interactive subscription ceremony. With it the flow is
@@ -648,6 +862,17 @@ COMMANDS:
         printenv ANTHROPIC_API_KEY | tightbeam onboard anthropic --api-key
       The key is validated against the provider before it is banked, and it
       never leaves this machine.
+  onboard opencode-go (--api-key | --daemon-credential)
+      Bank an OpenCode Go API key for Pi. --api-key reads and validates the key
+      from stdin. --daemon-credential asks the gateway daemon to read the fixed
+      owner-private opencode-go-api-key file from its configured credentials
+      directory; no key or staging path crosses the CLI wire. OpenCode Go has no
+      subscription onboarding path here.
+  onboard local-openai --name NAME --endpoint URL [--api-key]
+      Bank a host-scoped local OpenAI-compatible provider. The endpoint base URL
+      is required. An API key is optional and, when present, is read from stdin
+      -- never as an argument. The endpoint is live-probed with GET /v1/models
+      before anything is banked.
   onboard github [--hostname github.com] [--remote URL]
       Prove or create this host's GitHub CLI browser/device login, then stamp
       non-secret capability metadata. The credential is banked file-backed
@@ -760,12 +985,16 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "abort",
     "admin",
     "all",
+    "after-turn",
     "api-key",
     "clear-spec-ref",
+    "daemon-credential",
     "dry-run",
     "help",
+    "history",
     "json",
     "manifest",
+    "redaction-confirmed",
     "resolve",
     "rm",
     "tree",
@@ -867,6 +1096,34 @@ fn identity(flags: &HashMap<String, String>) -> Result<Identity, String> {
     }
 }
 
+/// Durable Topline commands are a closed public surface.  In particular, the
+/// retired Execution Map flags must fail at parsing rather than be silently
+/// dropped before dispatch.
+fn closed_topline_flags(
+    verb: &str,
+    flags: &HashMap<String, String>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    let mut rejected = flags
+        .keys()
+        .filter(|flag| {
+            !matches!(flag.as_str(), "as" | "as-user" | "as-process")
+                && !allowed.contains(&flag.as_str())
+        })
+        .map(|flag| format!("--{flag}"))
+        .collect::<Vec<_>>();
+    rejected.sort();
+
+    if rejected.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "usage: tightbeam {verb} does not accept {}",
+            rejected.join(", ")
+        ))
+    }
+}
+
 pub fn parse_after(text: &str) -> Result<String, String> {
     parse_duration("after", text)
 }
@@ -892,9 +1149,11 @@ fn parse_duration(flag: &str, text: &str) -> Result<String, String> {
     Ok(js_number_json(value * multiplier))
 }
 
-const TOPLINES_USAGE: &str = "usage: tightbeam toplines [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
+const TOPLINES_USAGE: &str = "usage: tightbeam execution-map [--origin user|session|all] [--owner <userId>] [--state <state>] [--quiet-over <duration>] [--spec <name> [--spec-sha <sha>]] [--session <key>] [--tree]";
 
-const TOPLINE_USAGE: &str = "usage: tightbeam topline (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+const TOPLINE_USAGE: &str = "usage: tightbeam execution-map-select (--under <workItemId> | --assignments <id,...>) [the same roster filters]";
+const DURABLE_TOPLINES_USAGE: &str = "usage: tightbeam toplines [--state open|closed|all]";
+const DURABLE_TOPLINE_USAGE: &str = "usage: tightbeam topline <toplineId> [--history]";
 
 /// Every roster-filter flag, in one place, so the assignment-mode refusal and the
 /// filter builder cannot drift apart.
@@ -933,6 +1192,119 @@ fn topline_filters(flags: &HashMap<String, String>) -> Result<ToplineFilters, St
         spec: nonempty(flags, "spec"),
         spec_sha: nonempty(flags, "spec-sha"),
         session: nonempty(flags, "session"),
+    })
+}
+
+fn topline_mutation(
+    verb: &str,
+    positional: &[String],
+    flags: &HashMap<String, String>,
+) -> Result<Command, String> {
+    let allowed = match verb {
+        "topline-create" => &["title", "key"][..],
+        "topline-update" => &["title", "reason", "key"][..],
+        "topline-close" | "topline-reopen" => &["reason", "key"][..],
+        "topline-link-work" => &["reason", "key"][..],
+        "topline-unlink-work" => &["reason", "key"][..],
+        "topline-concern-create" => &["title", "key"][..],
+        "topline-concern-link-work" => &["reason", "key"][..],
+        "topline-concern-unlink-work" => &["reason", "key"][..],
+        "topline-work-leave-unlinked" => &["reason", "key"][..],
+        _ => return Err(format!("unknown Topline operation: {verb}")),
+    };
+    closed_topline_flags(verb, flags, allowed)?;
+    let required = |name| nonempty(flags, name).ok_or_else(|| format!("{verb} requires --{name}"));
+    let exact = |count| {
+        if positional.len() == count {
+            Ok(())
+        } else {
+            Err(format!(
+                "usage: tightbeam {verb} has an invalid argument count"
+            ))
+        }
+    };
+    let key = || required("key").map(|value| ("idempotencyKey".to_owned(), value));
+    let reason = || required("reason").map(|value| ("reason".to_owned(), value));
+    let title = || required("title").map(|value| ("title".to_owned(), value));
+    let params = match verb {
+        "topline-create" => {
+            exact(1)?;
+            vec![title()?, key()?]
+        }
+        "topline-update" => {
+            exact(2)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                title()?,
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-close" | "topline-reopen" => {
+            exact(2)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-link-work" => {
+            exact(3)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                ("workItemId".to_owned(), positional[2].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-unlink-work" => {
+            exact(2)?;
+            vec![
+                ("membershipId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-concern-create" => {
+            exact(2)?;
+            vec![
+                ("toplineId".to_owned(), positional[1].clone()),
+                title()?,
+                key()?,
+            ]
+        }
+        "topline-concern-link-work" => {
+            exact(3)?;
+            vec![
+                ("concernId".to_owned(), positional[1].clone()),
+                ("workItemId".to_owned(), positional[2].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-concern-unlink-work" => {
+            exact(3)?;
+            vec![
+                ("concernId".to_owned(), positional[1].clone()),
+                ("workItemId".to_owned(), positional[2].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        "topline-work-leave-unlinked" => {
+            exact(2)?;
+            vec![
+                ("workItemId".to_owned(), positional[1].clone()),
+                reason()?,
+                key()?,
+            ]
+        }
+        _ => unreachable!("closed above"),
+    };
+    Ok(Command::ToplineMutation {
+        identity: identity(flags)?,
+        verb: verb.to_owned(),
+        params,
     })
 }
 
@@ -1077,6 +1449,12 @@ fn parse_with_optional_catalog(
     }
 
     let flags = &parsed.flags;
+    if flags.contains_key("succeeds") && !matches!(command, Some("assign" | "dispatch")) {
+        return Err("--succeeds is valid only with assign or dispatch".to_owned());
+    }
+    if matches!(flags.get("succeeds"), Some(value) if value.is_empty()) {
+        return Err("--succeeds requires a non-empty assignment id".to_owned());
+    }
     match command.expect("checked above") {
         "doctor" => {
             let base_dir = nonempty(flags, "base-dir");
@@ -1129,11 +1507,25 @@ fn parse_with_optional_catalog(
             let at = nonempty(flags, "at").map(|value| js_number_json(number_coercion(&value)));
             let condition_kind = nonempty(flags, "when-fact");
             let condition_scope = nonempty(flags, "when-scope");
+            let predicate = nonempty(flags, "predicate")
+                .map(|encoded| {
+                    let value = serde_json::from_str::<serde_json::Value>(&encoded)
+                        .map_err(|_| "--predicate must be a JSON object".to_owned())?;
+                    if value.is_object() {
+                        Ok(value)
+                    } else {
+                        Err("--predicate must be a JSON object".to_owned())
+                    }
+                })
+                .transpose()?;
+            let assignment_id = nonempty(flags, "assignment");
+            let after_turn = flags.contains_key("after-turn");
+            let wait = predicate.is_some() || after_turn;
 
             if condition_scope.is_some() && condition_kind.is_none() {
                 return Err("--when-scope requires --when-fact".to_owned());
             }
-            if fallback_after_ms.is_some() && condition_kind.is_none() {
+            if fallback_after_ms.is_some() && condition_kind.is_none() && predicate.is_none() {
                 return Err("--fallback-after requires --when-fact".to_owned());
             }
             if after_ms.is_some() && fallback_after_ms.is_some() {
@@ -1150,7 +1542,33 @@ fn parse_with_optional_catalog(
             if fallback_after_ms.is_some() && at.is_some() {
                 return Err("--fallback-after and --at are mutually exclusive".to_owned());
             }
-            let idempotency_key = condition_kind.as_ref().and_then(|_| nonempty(flags, "key"));
+            if predicate.is_some() && after_turn {
+                return Err("--predicate and --after-turn are mutually exclusive".to_owned());
+            }
+            if wait && assignment_id.is_none() {
+                return Err("--predicate and --after-turn require --assignment".to_owned());
+            }
+            if !wait && assignment_id.is_some() {
+                return Err("--assignment requires --predicate or --after-turn".to_owned());
+            }
+            if predicate.is_some() && fallback_after_ms.is_none() && at.is_none() {
+                return Err(
+                    "a predicate wake requires a fallback (--fallback-after / --at)".to_owned(),
+                );
+            }
+            if after_turn && (after_ms.is_some() || fallback_after_ms.is_some() || at.is_some()) {
+                return Err("--after-turn uses registration time and cannot be combined with --after, --fallback-after, or --at".to_owned());
+            }
+            if wait && condition_kind.is_some() {
+                return Err(
+                    "--predicate/--after-turn cannot be combined with --when-fact".to_owned(),
+                );
+            }
+            let idempotency_key = if condition_kind.is_some() || wait {
+                nonempty(flags, "key")
+            } else {
+                None
+            };
             if flags.get("class").is_some_and(String::is_empty) {
                 return Err("--class requires a class name".to_owned());
             }
@@ -1162,6 +1580,9 @@ fn parse_with_optional_catalog(
                 at,
                 condition_kind,
                 condition_scope,
+                predicate,
+                assignment_id,
+                after_turn,
                 idempotency_key,
                 class: nonempty(flags, "class"),
             })
@@ -1180,11 +1601,248 @@ fn parse_with_optional_catalog(
                 })?,
                 scope: nonempty(flags, "scope"),
                 idempotency_key: nonempty(flags, "key"),
+                payload: nonempty(flags, "payload"),
+            })
+        }
+        "harness-health-observe-other" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "harness",
+                "host",
+                "source-session",
+                "description",
+                "evidence-mode",
+                "observed-state",
+                "exact-error",
+                "exact-probe",
+                "output-digest",
+                "recovery-condition",
+                "not-known-class",
+                "observed-at",
+                "valid-until",
+                "world-status",
+                "redaction-confirmed",
+                "key",
+                "correlation-id",
+            ];
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> --valid-until <ms> --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey>".to_owned());
+            }
+            let evidence_mode = nonempty(flags, "evidence-mode")
+                .ok_or_else(|| "--evidence-mode is required".to_owned())?;
+            if !matches!(evidence_mode.as_str(), "exact_error" | "probe_digest") {
+                return Err("--evidence-mode must be exact_error or probe_digest".to_owned());
+            }
+            let world_status = nonempty(flags, "world-status")
+                .ok_or_else(|| "--world-status is required".to_owned())?;
+            if !matches!(world_status.as_str(), "PROVEN" | "UNKNOWN") {
+                return Err("--world-status must be PROVEN or UNKNOWN".to_owned());
+            }
+            let exact_error = nonempty(flags, "exact-error");
+            let output_digest = nonempty(flags, "output-digest");
+            if evidence_mode == "exact_error" && exact_error.is_none() {
+                return Err("--exact-error is required for exact_error evidence".to_owned());
+            }
+            if evidence_mode == "probe_digest" && output_digest.is_none() {
+                return Err("--output-digest is required for probe_digest evidence".to_owned());
+            }
+            if !flags.contains_key("redaction-confirmed") {
+                return Err("--redaction-confirmed is required".to_owned());
+            }
+            Ok(Command::HarnessHealthObserveOther {
+                identity: identity(flags)?,
+                harness: nonempty(flags, "harness")
+                    .ok_or_else(|| "--harness is required".to_owned())?,
+                host: nonempty(flags, "host").ok_or_else(|| "--host is required".to_owned())?,
+                source_session: nonempty(flags, "source-session")
+                    .ok_or_else(|| "--source-session is required".to_owned())?,
+                description: nonempty(flags, "description")
+                    .ok_or_else(|| "--description is required".to_owned())?,
+                evidence_mode,
+                observed_state: nonempty(flags, "observed-state")
+                    .ok_or_else(|| "--observed-state is required".to_owned())?,
+                exact_error,
+                exact_probe: nonempty(flags, "exact-probe")
+                    .ok_or_else(|| "--exact-probe is required".to_owned())?,
+                output_digest,
+                recovery_condition: nonempty(flags, "recovery-condition")
+                    .ok_or_else(|| "--recovery-condition is required".to_owned())?,
+                not_known_class: nonempty(flags, "not-known-class")
+                    .ok_or_else(|| "--not-known-class is required".to_owned())?,
+                observed_at: nonempty(flags, "observed-at")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                valid_until: js_number_json(number_coercion(
+                    &nonempty(flags, "valid-until")
+                        .ok_or_else(|| "--valid-until is required".to_owned())?,
+                )),
+                world_status,
+                redaction_confirmed: true,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+                correlation_id: nonempty(flags, "correlation-id"),
+            })
+        }
+        "harness-health-resolve-other" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "harness",
+                "host",
+                "incident",
+                "observed-state",
+                "exact-probe",
+                "output-digest",
+                "recovery-condition-digest",
+                "cause",
+                "observed-at",
+                "accepted-at",
+                "key",
+                "session",
+                "correlation-id",
+            ];
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-resolve-other --harness <harness> --host <host> --incident <id> --observed-state <text> --exact-probe <text> --output-digest <sha256> --recovery-condition-digest <sha256> --cause <text> --key <idempotencyKey>".to_owned());
+            }
+            Ok(Command::HarnessHealthResolveOther {
+                identity: identity(flags)?,
+                harness: nonempty(flags, "harness")
+                    .ok_or_else(|| "--harness is required".to_owned())?,
+                host: nonempty(flags, "host").ok_or_else(|| "--host is required".to_owned())?,
+                incident_id: nonempty(flags, "incident"),
+                observed_state: nonempty(flags, "observed-state")
+                    .ok_or_else(|| "--observed-state is required".to_owned())?,
+                exact_probe: nonempty(flags, "exact-probe")
+                    .ok_or_else(|| "--exact-probe is required".to_owned())?,
+                output_digest: nonempty(flags, "output-digest")
+                    .ok_or_else(|| "--output-digest is required".to_owned())?,
+                recovery_condition_digest: nonempty(flags, "recovery-condition-digest")
+                    .ok_or_else(|| "--recovery-condition-digest is required".to_owned())?,
+                cause: nonempty(flags, "cause").ok_or_else(|| "--cause is required".to_owned())?,
+                observed_at: nonempty(flags, "observed-at")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                accepted_at: nonempty(flags, "accepted-at")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+                session_key: nonempty(flags, "session"),
+                correlation_id: nonempty(flags, "correlation-id"),
+            })
+        }
+        "harness-health-review-other" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "outcome",
+                "named-class",
+                "cause",
+                "key",
+            ];
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-review-other <incidentId> --outcome confirmed_other|reclassified|promotion_required [--named-class <class>] [--cause <text>] --key <idempotencyKey>".to_owned());
+            }
+            let outcome =
+                nonempty(flags, "outcome").ok_or_else(|| "--outcome is required".to_owned())?;
+            if !matches!(
+                outcome.as_str(),
+                "confirmed_other" | "reclassified" | "promotion_required"
+            ) {
+                return Err("--outcome is invalid".to_owned());
+            }
+            Ok(Command::HarnessHealthReviewOther {
+                identity: identity(flags)?,
+                incident_id: parsed.positional[1].clone(),
+                outcome,
+                named_class: nonempty(flags, "named-class"),
+                cause: nonempty(flags, "cause"),
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+            })
+        }
+        "harness-health-close-promotion" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "named-class",
+                "spec-artifact",
+                "spec-ref",
+                "spec-sha256",
+                "review-artifact",
+                "review-attest",
+                "review-assignment",
+                "candidate-commit",
+                "key",
+            ];
+
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-close-promotion <promotionId> --named-class <class> --spec-artifact <artifactId> --review-artifact <artifactId> --review-attest <attestId> --review-assignment <assignmentId> --candidate-commit <commit> --key <idempotencyKey>".to_owned());
+            }
+
+            Ok(Command::HarnessHealthClosePromotion {
+                identity: identity(flags)?,
+                promotion_id: parsed.positional[1].clone(),
+                named_class: nonempty(flags, "named-class")
+                    .ok_or_else(|| "--named-class is required".to_owned())?,
+                spec_artifact_id: nonempty(flags, "spec-artifact")
+                    .ok_or_else(|| "--spec-artifact is required".to_owned())?,
+                spec_ref: nonempty(flags, "spec-ref"),
+                spec_sha256: nonempty(flags, "spec-sha256"),
+                review_artifact_id: nonempty(flags, "review-artifact")
+                    .ok_or_else(|| "--review-artifact is required".to_owned())?,
+                review_attest_id: nonempty(flags, "review-attest")
+                    .ok_or_else(|| "--review-attest is required".to_owned())?,
+                review_assignment_id: nonempty(flags, "review-assignment")
+                    .ok_or_else(|| "--review-assignment is required".to_owned())?,
+                candidate_commit: nonempty(flags, "candidate-commit")
+                    .ok_or_else(|| "--candidate-commit is required".to_owned())?,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+            })
+        }
+        "harness-health-evidence-other" => {
+            let allowed = ["as", "as-user", "as-process"];
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err(
+                    "usage: tightbeam harness-health-evidence-other <incidentId>".to_owned(),
+                );
+            }
+
+            Ok(Command::HarnessHealthEvidenceOther {
+                identity: identity(flags)?,
+                incident_id: parsed.positional[1].clone(),
+            })
+        }
+        "artifact-content-fetch" => {
+            if parsed.positional.len() != 2
+                || parsed.positional[1].is_empty()
+                || flags
+                    .keys()
+                    .any(|flag| !matches!(flag.as_str(), "as" | "as-user" | "as-process"))
+            {
+                return Err("usage: tightbeam artifact-content-fetch <artifactId>".to_owned());
+            }
+            Ok(Command::ArtifactContentFetch {
+                identity: identity(flags)?,
+                artifact_id: parsed.positional[1].clone(),
             })
         }
         "artifact-record" => {
             if parsed.positional.len() != 1 {
-                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]".to_owned());
+                return Err("usage: tightbeam artifact-record --kind <kind> --title <title> --path <originPath> [--description <text>] [--work-item <workItemId>] [--sha256 <hex>] [--produced-by-assignment <assignmentId>]".to_owned());
             }
             Ok(Command::ArtifactRecord {
                 identity: identity(flags)?,
@@ -1195,6 +1853,7 @@ fn parse_with_optional_catalog(
                 description: nonempty(flags, "description"),
                 work_item_id: nonempty(flags, "work-item"),
                 content_sha256: nonempty(flags, "sha256"),
+                produced_by_assignment_id: nonempty(flags, "produced-by-assignment"),
             })
         }
         "tool-call-observed" => {
@@ -1273,6 +1932,38 @@ fn parse_with_optional_catalog(
                 idempotency_key: nonempty(flags, "key"),
             })
         }
+        "session-reparent" => {
+            if parsed.positional.len() != 1
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
+                return Err("usage: tightbeam session-reparent --session <key> --parent <key> --assignment <id> --key <key>".to_owned());
+            }
+            Ok(Command::SessionReparent {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or("--session is required")?,
+                parent_session_key: nonempty(flags, "parent").ok_or("--parent is required")?,
+                assignment_id: nonempty(flags, "assignment").ok_or("--assignment is required")?,
+                idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
+            })
+        }
+        "session-po-set" => {
+            if parsed.positional.len() != 1
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
+                return Err(
+                    "usage: tightbeam session-po-set --session <key> --po-role <role> --key <key>"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::SessionPoSet {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or("--session is required")?,
+                po_role: nonempty(flags, "po-role").ok_or("--po-role is required")?,
+                idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
+            })
+        }
         "tune" => parse_tune(&parsed, flags),
         "assign" => {
             let targets = [
@@ -1302,6 +1993,7 @@ fn parse_with_optional_catalog(
                 reviews: nonempty(flags, "reviews"),
                 effect_kind: nonempty(flags, "effect-kind"),
                 files,
+                succeeds: nonempty(flags, "succeeds"),
             })
         }
         "dispatch" => {
@@ -1324,6 +2016,7 @@ fn parse_with_optional_catalog(
                 workdir_root: nonempty(flags, "workdir-root"),
                 brief,
                 idempotency_key: nonempty(flags, "key"),
+                succeeds: nonempty(flags, "succeeds"),
             })
         }
         "effort-rule" => {
@@ -1344,6 +2037,52 @@ fn parse_with_optional_catalog(
                 request_id: request_id.expect("checked above"),
                 action,
             })
+        }
+        "ask" => {
+            let targets = [
+                nonempty(flags, "session").map(Target::Session),
+                nonempty(flags, "role").map(Target::Role),
+                nonempty(flags, "user").map(Target::User),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if parsed.positional.len() != 1 || targets.len() != 1 {
+                return Err("usage: tightbeam ask (--session <key> | --role <name> | --user <id>) --question <text> [--about <assignment>]".to_owned());
+            }
+            Ok(Command::Ask {
+                identity: identity(flags)?,
+                target: targets.into_iter().next().unwrap(),
+                question: nonempty(flags, "question")
+                    .ok_or_else(|| "--question is required".to_owned())?,
+                assignment_id: nonempty(flags, "about"),
+            })
+        }
+        "answer" | "return" => {
+            if parsed.positional.len() != 1
+                || ["session", "role", "user"]
+                    .iter()
+                    .any(|key| flags.contains_key(*key))
+            {
+                return Err("answer and return require --request and no target".to_owned());
+            }
+            let request_id =
+                nonempty(flags, "request").ok_or_else(|| "--request is required".to_owned())?;
+            if parsed.positional[0] == "answer" {
+                Ok(Command::Answer {
+                    identity: identity(flags)?,
+                    request_id,
+                    answer: nonempty(flags, "answer")
+                        .ok_or_else(|| "--answer is required".to_owned())?,
+                })
+            } else {
+                Ok(Command::Return {
+                    identity: identity(flags)?,
+                    request_id,
+                    reason: nonempty(flags, "reason")
+                        .ok_or_else(|| "--reason is required".to_owned())?,
+                })
+            }
         }
         "operator-ask" => {
             if parsed.positional.len() != 1 {
@@ -1401,7 +2140,7 @@ fn parse_with_optional_catalog(
         "decision-requests" => {
             if parsed.positional.len() != 1 {
                 return Err(
-                    "usage: tightbeam decision-requests [--status open|ruled|consumed|withdrawn|superseded|all]".to_owned(),
+                    "usage: tightbeam decision-requests [--status open|ruled|consumed|withdrawn|superseded|returned|all]".to_owned(),
                 );
             }
             Ok(Command::DecisionRequests {
@@ -1429,12 +2168,27 @@ fn parse_with_optional_catalog(
             })
         }
         "revoke-assignment" => {
-            if parsed.positional.len() != 2 {
-                return Err("usage: tightbeam revoke-assignment <assignmentId>".to_owned());
+            let usage = "usage: tightbeam revoke-assignment <assignmentId> --reason \"...\"";
+            if parsed.positional.len() != 2 || parsed.duplicates.contains("reason") {
+                return Err(usage.to_owned());
             }
+            let reason = nonempty(flags, "reason").ok_or_else(|| usage.to_owned())?;
             Ok(Command::RevokeAssignment {
                 identity: identity(flags)?,
                 assignment_id: parsed.positional[1].clone(),
+                reason,
+            })
+        }
+        "reopen-assignment" => {
+            let usage = "usage: tightbeam reopen-assignment <assignmentId> --reason <reason>";
+            if parsed.positional.len() != 2 {
+                return Err(usage.to_owned());
+            }
+            let reason = nonempty(flags, "reason").ok_or_else(|| usage.to_owned())?;
+            Ok(Command::ReopenAssignment {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                reason,
             })
         }
         "repair-assignment" => {
@@ -1464,6 +2218,28 @@ fn parse_with_optional_catalog(
                 turn_seq: nonempty(flags, "turn")
                     .map(|value| js_number_json(number_coercion(&value))),
                 idempotency_key: key.expect("checked above"),
+            })
+        }
+        "assignment-commitref-correct" => {
+            if parsed.positional.len() != 2 {
+                return Err("usage: tightbeam assignment-commitref-correct <assignmentId> --commit-refs <json> --evidence <artifactId> --reason <text> --key <idempotencyKey>".to_owned());
+            }
+            let commit_refs = nonempty(flags, "commit-refs")
+                .ok_or_else(|| "--commit-refs is required".to_owned())
+                .and_then(|encoded| {
+                    serde_json::from_str::<Vec<serde_json::Value>>(&encoded)
+                        .map_err(|_| "--commit-refs must be a JSON array".to_owned())
+                })?;
+            Ok(Command::AssignmentCommitRefCorrect {
+                identity: identity(flags)?,
+                assignment_id: parsed.positional[1].clone(),
+                commit_refs,
+                reason: nonempty(flags, "reason")
+                    .ok_or_else(|| "--reason is required".to_owned())?,
+                evidence_artifact_id: nonempty(flags, "evidence")
+                    .ok_or_else(|| "--evidence is required".to_owned())?,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
             })
         }
         "work-item-create" => {
@@ -1587,7 +2363,7 @@ fn parse_with_optional_catalog(
                     .map(|value| js_number_json(number_coercion(&value))),
             })
         }
-        "toplines" => {
+        "execution-map" => {
             if parsed.positional.len() != 1 {
                 return Err(TOPLINES_USAGE.to_owned());
             }
@@ -1597,7 +2373,7 @@ fn parse_with_optional_catalog(
                 tree: flags.contains_key("tree"),
             })
         }
-        "topline" => {
+        "execution-map-select" => {
             if parsed.positional.len() != 1 {
                 return Err(TOPLINE_USAGE.to_owned());
             }
@@ -1615,7 +2391,7 @@ fn parse_with_optional_catalog(
             let selection = match (under, assignments) {
                 (Some(_), Some(_)) | (None, None) => {
                     return Err(
-                        "topline requires exactly one of --under <workItemId> or --assignments <id,...>"
+                        "execution-map-select requires exactly one of --under <workItemId> or --assignments <id,...>"
                             .to_owned(),
                     )
                 }
@@ -1650,6 +2426,69 @@ fn parse_with_optional_catalog(
             Ok(Command::Topline {
                 identity: identity(flags)?,
                 selection,
+            })
+        }
+        "toplines" => {
+            closed_topline_flags("toplines", flags, &["state"])?;
+            if parsed.positional.len() != 1 {
+                return Err(DURABLE_TOPLINES_USAGE.to_owned());
+            }
+            let state = nonempty(flags, "state");
+            if let Some(value) = &state {
+                if !matches!(value.as_str(), "open" | "closed" | "all") {
+                    return Err(DURABLE_TOPLINES_USAGE.to_owned());
+                }
+            }
+            Ok(Command::DurableToplines {
+                identity: identity(flags)?,
+                state,
+            })
+        }
+        "topline" => {
+            closed_topline_flags("topline", flags, &["history"])?;
+            if parsed.positional.len() != 2 {
+                return Err(DURABLE_TOPLINE_USAGE.to_owned());
+            }
+            Ok(Command::DurableTopline {
+                identity: identity(flags)?,
+                topline_id: parsed.positional[1].clone(),
+                history: flags.contains_key("history"),
+            })
+        }
+        verb @ ("topline-create"
+        | "topline-update"
+        | "topline-close"
+        | "topline-reopen"
+        | "topline-link-work"
+        | "topline-unlink-work"
+        | "topline-concern-create"
+        | "topline-concern-link-work"
+        | "topline-concern-unlink-work"
+        | "topline-work-leave-unlinked") => topline_mutation(verb, &parsed.positional, flags),
+        "topline-placement-list" => {
+            closed_topline_flags("topline-placement-list", flags, &["state"])?;
+            if parsed.positional.len() != 1 {
+                return Err(
+                    "usage: tightbeam topline-placement-list [--state pending|resolved|all]"
+                        .to_owned(),
+                );
+            }
+            let state = nonempty(flags, "state");
+            if !matches!(
+                state.as_deref(),
+                None | Some("pending" | "resolved" | "all")
+            ) {
+                return Err(
+                    "usage: tightbeam topline-placement-list [--state pending|resolved|all]"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::ToplineMutation {
+                identity: identity(flags)?,
+                verb: "topline-placement-list".to_owned(),
+                params: state
+                    .map(|value| vec![("state".to_owned(), value)])
+                    .unwrap_or_default(),
             })
         }
         "work-item-icebox" => {
@@ -1710,6 +2549,26 @@ fn parse_with_optional_catalog(
                         .map_err(|_| "--commit-refs must be a JSON array".to_owned())
                 })
                 .transpose()?;
+            if kind == "surrender" && nonempty(flags, "note").is_none() {
+                return Err("--note is required when --kind is surrender".to_owned());
+            }
+            if kind == "surrender" && commit_refs.is_some() {
+                return Err("--commit-refs is not valid when --kind is surrender".to_owned());
+            }
+            let artifact_id = nonempty(flags, "artifact");
+            let content_sha256 = nonempty(flags, "sha256");
+            let wait_id = nonempty(flags, "wait");
+            if artifact_id.is_some() != content_sha256.is_some() {
+                return Err("--artifact and --sha256 must be supplied together".to_owned());
+            }
+            if kind != "verdict" && artifact_id.is_some() {
+                return Err(
+                    "--artifact and --sha256 are only valid when --kind is verdict".to_owned(),
+                );
+            }
+            if kind != "verdict" && wait_id.is_some() {
+                return Err("--wait is only valid when --kind is verdict".to_owned());
+            }
             Ok(Command::Attest {
                 identity: identity(flags)?,
                 assignment_id,
@@ -1717,6 +2576,9 @@ fn parse_with_optional_catalog(
                 verdict,
                 note: nonempty(flags, "note"),
                 commit_refs,
+                artifact_id,
+                content_sha256,
+                wait_id,
             })
         }
         "attests" => {
@@ -1851,7 +2713,7 @@ fn parse_with_optional_catalog(
             }))
         }
         unknown => Err(format!(
-            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process"
+            "unknown command: {unknown} — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process"
         )),
     }
 }
@@ -2076,6 +2938,9 @@ fn parse_identity_command(
     flags: &HashMap<String, String>,
 ) -> Result<Command, String> {
     match parsed.positional.get(1).map(String::as_str) {
+        Some("current") if parsed.positional.len() == 2 && flags.is_empty() => {
+            Ok(Command::IdentityCurrent)
+        }
         Some("edit") => {
             let archetype = parsed.positional.get(2).cloned().ok_or_else(|| {
                 "usage: tightbeam identity edit <archetype> [--manifest | --skill <name> [--rm]] [--file <path>] [--key <idempotencyKey>]".to_owned()
@@ -2157,21 +3022,35 @@ fn parse_identity_command(
                 all,
             })
         }
-        _ => Err("usage: tightbeam identity edit|status|relearn|repoint|apply ...".to_owned()),
+        _ => Err(
+            "usage: tightbeam identity current|edit|status|relearn|repoint|apply ...".to_owned(),
+        ),
     }
 }
 
 fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Command, String> {
     if parsed.positional.len() != 2 {
-        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+        return Err(
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key | --daemon-credential] [--hostname HOST]"
+                .to_owned(),
+        );
     }
     let provider = parsed.positional[1].clone();
     let fixture_provider = cfg!(test) && provider == "fixture-provider";
-    if !matches!(provider.as_str(), "openai" | "anthropic" | "github") && !fixture_provider {
-        return Err("provider must be openai, anthropic, or github".to_owned());
+    if !matches!(
+        provider.as_str(),
+        "openai" | "anthropic" | "opencode-go" | "local-openai" | "github"
+    ) && !fixture_provider
+    {
+        return Err(
+            "provider must be openai, anthropic, opencode-go, local-openai, or github".to_owned(),
+        );
     }
     let allowed = [
         "api-key",
+        "daemon-credential",
+        "endpoint",
+        "name",
         "hostname",
         "remote",
         "as",
@@ -2179,15 +3058,53 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
         "as-process",
     ];
     if flags.keys().any(|flag| !allowed.contains(&flag.as_str())) {
-        return Err("usage: tightbeam onboard <provider> [--api-key] [--hostname HOST]".to_owned());
+        return Err(
+            "usage: tightbeam onboard <provider> [--endpoint URL] [--api-key | --daemon-credential] [--hostname HOST]"
+                .to_owned(),
+        );
     }
+    let endpoint = nonempty(flags, "endpoint");
+    let provider_name = nonempty(flags, "name");
     let hostname = nonempty(flags, "hostname");
     let remote = nonempty(flags, "remote");
+    let daemon_credential = flags.contains_key("daemon-credential");
+    if daemon_credential && flags.contains_key("api-key") {
+        return Err("--daemon-credential and --api-key are mutually exclusive".to_owned());
+    }
+    if daemon_credential && provider != "opencode-go" {
+        return Err(
+            "--daemon-credential is only valid for tightbeam onboard opencode-go".to_owned(),
+        );
+    }
     if provider == "github" && flags.contains_key("api-key") {
         return Err(
             "tightbeam onboard github does not accept --api-key; use GitHub CLI browser/device auth"
                 .to_owned(),
         );
+    }
+    if provider == "opencode-go" && !flags.contains_key("api-key") && !daemon_credential {
+        return Err(
+            "tightbeam onboard opencode-go requires --api-key or --daemon-credential; OpenCode Go has no subscription onboarding path"
+                .to_owned(),
+        );
+    }
+    if provider == "local-openai" {
+        if endpoint.is_none() {
+            return Err("tightbeam onboard local-openai requires --endpoint URL".to_owned());
+        }
+        if provider_name.is_none() {
+            return Err("tightbeam onboard local-openai requires --name NAME".to_owned());
+        }
+        if hostname.is_some() || remote.is_some() {
+            return Err(
+                "tightbeam onboard local-openai does not accept --hostname or --remote".to_owned(),
+            );
+        }
+    } else if endpoint.is_some() {
+        return Err("--endpoint is only valid for tightbeam onboard local-openai".to_owned());
+    }
+    if provider != "local-openai" && provider_name.is_some() {
+        return Err("--name is only valid for tightbeam onboard local-openai".to_owned());
     }
     if provider == "github"
         && ["as", "as-user", "as-process"]
@@ -2207,10 +3124,10 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
     Ok(Command::Onboard {
         identity: identity(flags)?,
         provider,
-        // A BOOLEAN flag, deliberately. `--api-key <value>` would put the key in
-        // this process's argv, where anyone on the box can read it out of the
-        // process table. The key arrives on stdin instead.
         api_key: flags.contains_key("api-key"),
+        daemon_credential,
+        endpoint,
+        provider_name,
         hostname,
         remote,
     })
@@ -2218,10 +3135,130 @@ fn parse_onboard(parsed: &Flags, flags: &HashMap<String, String>) -> Result<Comm
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn revoke_requires_exactly_one_reason_before_dispatch() {
+        for args in [
+            strings(&["revoke-assignment", "asg_test"]),
+            strings(&["revoke-assignment", "asg_test", "--reason", ""]),
+            strings(&[
+                "revoke-assignment",
+                "asg_test",
+                "--reason",
+                "one",
+                "--reason",
+                "two",
+            ]),
+        ] {
+            assert!(parse(args).is_err());
+        }
+        assert!(matches!(
+            parse(strings(&["revoke-assignment", "asg_test", "--reason", "superseded"])),
+            Ok(Command::RevokeAssignment { assignment_id, reason, .. })
+                if assignment_id == "asg_test" && reason == "superseded"
+        ));
+    }
+
+    #[test]
+    fn identity_current_rejects_other_session_overrides() {
+        assert_eq!(
+            super::parse(vec!["identity".into(), "current".into()]),
+            Ok(super::Command::IdentityCurrent)
+        );
+        for suffix in [
+            vec!["--as", "other"],
+            vec!["--as-user", "other"],
+            vec!["--as-process", "other"],
+            vec!["other-session"],
+        ] {
+            let mut args = vec!["identity".to_owned(), "current".to_owned()];
+            args.extend(suffix.into_iter().map(str::to_owned));
+            assert!(super::parse(args).is_err());
+        }
+    }
+
     use super::*;
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn harness_health_close_promotion_round_trips_candidate_commit() {
+        let candidate_commit = "c".repeat(40);
+        let command = parse(strings(&[
+            "harness-health-close-promotion",
+            "promotion-1",
+            "--named-class",
+            "provider-network-drift",
+            "--spec-artifact",
+            "spec-1",
+            "--review-artifact",
+            "report-1",
+            "--review-attest",
+            "attest-1",
+            "--review-assignment",
+            "review-1",
+            "--candidate-commit",
+            &candidate_commit,
+            "--key",
+            "close-1",
+        ]))
+        .expect("candidate commit must be accepted by the real CLI parser");
+
+        let body = crate::dispatch::build_request(&command)
+            .expect("candidate commit must reach the Gateway request")
+            .body_json;
+
+        assert!(body.contains(&format!(r#""candidateCommit":"{candidate_commit}""#)));
+    }
+
+    #[test]
+    fn successor_assignment_input_parses_and_missing_values_refuse_locally() {
+        assert!(matches!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "work",
+                "--session",
+                "child",
+                "--succeeds",
+                "asg_full",
+            ])),
+            Ok(Command::Assign {
+                succeeds: Some(value),
+                ..
+            }) if value == "asg_full"
+        ));
+
+        assert!(matches!(
+            parse(strings(&[
+                "dispatch",
+                "--subject",
+                "work",
+                "--brief",
+                "continue it",
+                "--to",
+                "child",
+                "--succeeds",
+                "asg_full",
+            ])),
+            Ok(Command::Dispatch {
+                succeeds: Some(value),
+                ..
+            }) if value == "asg_full"
+        ));
+
+        assert_eq!(
+            parse(strings(&[
+                "assign",
+                "--subject",
+                "work",
+                "--session",
+                "child",
+                "--succeeds",
+            ])),
+            Err("--succeeds requires a non-empty assignment id".to_owned())
+        );
     }
 
     #[test]
@@ -2633,6 +3670,9 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "fixture-provider".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             })
@@ -2652,6 +3692,9 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: Some("github.example".to_owned()),
                 remote: None,
             })
@@ -2667,6 +3710,9 @@ mod tests {
                 identity: Identity::Session,
                 provider: "github".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: Some("https://github.com/example/project.git".to_owned()),
             })
@@ -2688,6 +3734,116 @@ mod tests {
         assert_eq!(
             parse(strings(&["onboard", "openai", "--hostname", "github.com"])),
             Err("--hostname is only valid for tightbeam onboard github".to_owned())
+        );
+    }
+
+    #[test]
+    fn opencode_go_onboard_is_api_key_only() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--api-key",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "opencode-go".to_owned(),
+                api_key: true,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
+                hostname: None,
+                remote: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "opencode-go"])),
+            Err(
+                "tightbeam onboard opencode-go requires --api-key or --daemon-credential; OpenCode Go has no subscription onboarding path"
+                    .to_owned()
+            )
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--daemon-credential",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "opencode-go".to_owned(),
+                api_key: false,
+                daemon_credential: true,
+                endpoint: None,
+                provider_name: None,
+                hostname: None,
+                remote: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "opencode-go",
+                "--api-key",
+                "--daemon-credential"
+            ])),
+            Err("--daemon-credential and --api-key are mutually exclusive".to_owned())
+        );
+    }
+
+    #[test]
+    fn local_openai_onboard_requires_endpoint_and_name() {
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "local-openai",
+                "--name",
+                "spark",
+                "--endpoint",
+                "https://spark.example/v1",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::Onboard {
+                identity: Identity::User("flynn".to_owned()),
+                provider: "local-openai".to_owned(),
+                api_key: false,
+                daemon_credential: false,
+                endpoint: Some("https://spark.example/v1".to_owned()),
+                provider_name: Some("spark".to_owned()),
+                hostname: None,
+                remote: None,
+            })
+        );
+        assert_eq!(
+            parse(strings(&["onboard", "local-openai", "--as-user", "flynn"])),
+            Err("tightbeam onboard local-openai requires --endpoint URL".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "local-openai",
+                "--endpoint",
+                "https://spark.example/v1",
+                "--as-user",
+                "flynn"
+            ])),
+            Err("tightbeam onboard local-openai requires --name NAME".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "onboard",
+                "openai",
+                "--endpoint",
+                "https://x/v1"
+            ])),
+            Err("--endpoint is only valid for tightbeam onboard local-openai".to_owned())
         );
     }
 
@@ -2764,10 +3920,14 @@ mod tests {
         assert_eq!(
             headings,
             [
+                "ask",
+                "answer",
+                "return",
                 "assimilate",
                 "assign",
                 "assignments",
                 "artifact-record",
+                "artifact-content-fetch",
                 "artifacts",
                 "attest",
                 "attests",
@@ -2781,6 +3941,11 @@ mod tests {
                 "doctor",
                 "effort-rule",
                 "harness-process",
+                "harness-health-observe-other",
+                "harness-health-resolve-other",
+                "harness-health-review-other",
+                "harness-health-close-promotion",
+                "harness-health-evidence-other",
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",
@@ -2794,8 +3959,12 @@ mod tests {
                 "operator-rule",
                 "operator-withdraw",
                 "retire",
+                "session-reparent",
+                "session-po-set",
                 "repair-assignment",
+                "assignment-commitref-correct",
                 "revoke-assignment",
+                "reopen-assignment",
                 "spawn",
                 "wake",
                 "work-item-close",
@@ -2807,8 +3976,21 @@ mod tests {
                 "transcript",
                 "tune",
                 "unlearn",
-                "topline",
+                "execution-map",
+                "execution-map-select",
                 "toplines",
+                "topline",
+                "topline-create",
+                "topline-update",
+                "topline-close",
+                "topline-reopen",
+                "topline-link-work",
+                "topline-unlink-work",
+                "topline-concern-create",
+                "topline-concern-link-work",
+                "topline-concern-unlink-work",
+                "topline-work-leave-unlinked",
+                "topline-placement-list",
                 "work-item-trace",
                 "work-item-icebox",
                 "work-item-reopen",
@@ -2823,6 +4005,8 @@ mod tests {
             "identity status [<archetype>]",
             "identity apply (<session> | --all)",
             "onboard openai|anthropic [--api-key]",
+            "onboard opencode-go (--api-key | --daemon-credential)",
+            "onboard local-openai --name NAME --endpoint URL [--api-key]",
             "onboard github [--hostname github.com] [--remote URL]",
             "add-user <userId> [--admin]",
             "config get default-archetype|default-priority",
@@ -2932,7 +4116,7 @@ mod tests {
             ("session", "agent:coder:app"),
         ] {
             let error = parse(strings(&[
-                "topline",
+                "execution-map-select",
                 "--assignments",
                 "asg_x",
                 &format!("--{flag}"),
@@ -2955,7 +4139,7 @@ mod tests {
     #[test]
     fn assignment_selection_sends_only_the_id_list() {
         let command = parse(strings(&[
-            "topline",
+            "execution-map-select",
             "--assignments",
             "asg_a,asg_b",
             "--as-user",
@@ -3003,7 +4187,7 @@ mod tests {
     #[test]
     fn under_selection_still_carries_roster_filters() {
         let command = parse(strings(&[
-            "topline",
+            "execution-map-select",
             "--under",
             "wi_abc",
             "--state",
@@ -3078,6 +4262,9 @@ mod tests {
                 at: None,
                 condition_kind: Some("build-finished".to_owned()),
                 condition_scope: Some("app".to_owned()),
+                predicate: None,
+                assignment_id: None,
+                after_turn: false,
                 idempotency_key: Some("wake-1".to_owned()),
                 class: None,
             })
@@ -3104,6 +4291,9 @@ mod tests {
                 at: Some("123".to_owned()),
                 condition_kind: Some("review-landed".to_owned()),
                 condition_scope: None,
+                predicate: None,
+                assignment_id: None,
+                after_turn: false,
                 idempotency_key: None,
                 class: None,
             })
@@ -3121,7 +4311,91 @@ mod tests {
                 kind: "review-landed".to_owned(),
                 scope: None,
                 idempotency_key: None,
+                payload: None,
             })
+        );
+    }
+
+    #[test]
+    fn parses_structured_dependency_and_after_turn_wakes() {
+        let predicate = r#"{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"bindings":{"assignmentId":"asg_r"},"resolverRef":{"kind":"assignment","id":"asg_r"},"necessity":"needs output","verificationRef":{"kind":"assignment","id":"asg_v"}}"#;
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--predicate",
+                predicate,
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "continue",
+                "--as",
+                "holder",
+            ])),
+            Ok(Command::Wake {
+                identity: Identity::Role("holder".to_owned()),
+                target: Target::Session("agent:holder".to_owned()),
+                prompt: "continue".to_owned(),
+                after_ms: Some("7200000".to_owned()),
+                at: None,
+                condition_kind: None,
+                condition_scope: None,
+                predicate: Some(serde_json::from_str(predicate).unwrap()),
+                assignment_id: Some("asg_a".to_owned()),
+                after_turn: false,
+                idempotency_key: None,
+                class: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--after-turn",
+                "--prompt",
+                "continue",
+                "--as",
+                "holder",
+            ])),
+            Ok(Command::Wake {
+                identity: Identity::Role("holder".to_owned()),
+                target: Target::Session("agent:holder".to_owned()),
+                prompt: "continue".to_owned(),
+                after_ms: None,
+                at: None,
+                condition_kind: None,
+                condition_scope: None,
+                predicate: None,
+                assignment_id: Some("asg_a".to_owned()),
+                after_turn: true,
+                idempotency_key: None,
+                class: None,
+            })
+        );
+
+        assert_eq!(
+            parse(strings(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--predicate",
+                "[]",
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "continue",
+            ])),
+            Err("--predicate must be a JSON object".to_owned())
         );
     }
 
@@ -3351,10 +4625,78 @@ mod tests {
     }
 
     #[test]
+    fn commitref_correction_requires_every_audit_and_proof_field() {
+        let usage = "usage: tightbeam assignment-commitref-correct <assignmentId> --commit-refs <json> --evidence <artifactId> --reason <text> --key <idempotencyKey>";
+
+        assert_eq!(
+            parse(strings(&[
+                "assignment-commitref-correct",
+                "--as-user",
+                "flynn"
+            ])),
+            Err(usage.to_owned())
+        );
+
+        for missing in ["commit-refs", "evidence", "reason", "key"] {
+            let mut args = vec![
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "historical backfill",
+                "--key",
+                "backfill-1",
+                "--as-user",
+                "flynn",
+            ];
+            let flag = format!("--{missing}");
+            let index = args.iter().position(|value| *value == flag).unwrap();
+            args.drain(index..=index + 1);
+            assert!(
+                parse(strings(&args)).is_err(),
+                "missing {missing} must refuse"
+            );
+        }
+
+        assert!(matches!(
+            parse(strings(&[
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "historical backfill",
+                "--key",
+                "backfill-1",
+                "--as-user",
+                "flynn",
+            ]))
+            .unwrap(),
+            Command::AssignmentCommitRefCorrect {
+                assignment_id,
+                evidence_artifact_id,
+                reason,
+                idempotency_key,
+                commit_refs,
+                ..
+            } if assignment_id == "asg_1"
+                && evidence_artifact_id == "art_1"
+                && reason == "historical backfill"
+                && idempotency_key == "backfill-1"
+                && commit_refs.len() == 1
+        ));
+    }
+
+    #[test]
     fn unknown_command_matches_reference_text() {
         assert_eq!(
             parse(strings(&["frobnicate", "--as-user", "flynn"])),
-            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, repair-assignment, work-item-create, work-item-update, work-item-get, attend, transcript, toplines, topline, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifacts, config, host-env-set, host-env-list, host-env-unset, host-toolchain-set, doctor, assimilate, harness-process".to_owned())
+            Err("unknown command: frobnicate — run 'tightbeam help' for usage. Commands: ask, answer, return, wake, condition, cancel-wake, attest, attests, assign, assignments, dispatch, effort-rule, operator-ask, operator-rule, operator-withdraw, decision-requests, decision-request, revoke-assignment, reopen-assignment, repair-assignment, assignment-commitref-correct, work-item-create, work-item-update, work-item-get, attend, transcript, execution-map, execution-map-select, toplines, topline, topline-create, topline-update, topline-close, topline-reopen, topline-link-work, topline-unlink-work, topline-concern-create, topline-concern-link-work, topline-concern-unlink-work, topline-work-leave-unlinked, topline-placement-list, work-item-trace, work-item-icebox, work-item-reopen, work-item-close, work-item-fail, spawn, retire, list, identity, kungfu, learn, unlearn, onboard, add-user, artifact-record, artifact-content-fetch, artifacts, config, host-env-set, host-env-list, host-env-unset, doctor, assimilate, harness-process".to_owned()),
         );
     }
 
@@ -3493,6 +4835,7 @@ mod tests {
     fn commands_outside_cli_surface_v1_are_not_exposed() {
         for command in [
             "rail-exec",
+            "rail-action",
             "probe",
             "facts-read",
             "artifact-get",
@@ -3543,6 +4886,43 @@ mod tests {
             assert_eq!(
                 parse(args),
                 Err("usage: tightbeam doctor [--json] [--base-dir DIR]".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_content_fetch_accepts_only_id_and_identity() {
+        assert_eq!(
+            parse(strings(&[
+                "artifact-content-fetch",
+                "art_fixture",
+                "--as-user",
+                "flynn"
+            ])),
+            Ok(Command::ArtifactContentFetch {
+                identity: Identity::User("flynn".to_owned()),
+                artifact_id: "art_fixture".to_owned(),
+            })
+        );
+        for values in [
+            strings(&["artifact-content-fetch"]),
+            strings(&["artifact-content-fetch", "art_fixture", "extra"]),
+            strings(&[
+                "artifact-content-fetch",
+                "art_fixture",
+                "--path",
+                "/not/read",
+            ]),
+            strings(&[
+                "artifact-content-fetch",
+                "art_fixture",
+                "--session",
+                "other",
+            ]),
+        ] {
+            assert_eq!(
+                parse(values),
+                Err("usage: tightbeam artifact-content-fetch <artifactId>".to_owned())
             );
         }
     }
@@ -3694,6 +5074,23 @@ mod tests {
             ])),
             Err("--verdict is only valid when --kind is verdict".to_owned())
         );
+        assert_eq!(
+            parse(strings(&["attest", "asg_1", "--kind", "surrender"])),
+            Err("--note is required when --kind is surrender".to_owned())
+        );
+        assert_eq!(
+            parse(strings(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "surrender",
+                "--note",
+                "done",
+                "--commit-refs",
+                "[]",
+            ])),
+            Err("--commit-refs is not valid when --kind is surrender".to_owned())
+        );
     }
 
     #[test]
@@ -3722,6 +5119,9 @@ mod tests {
                     at: Some("123".to_owned()),
                     condition_kind: None,
                     condition_scope: None,
+                    predicate: None,
+                    assignment_id: None,
+                    after_turn: false,
                     idempotency_key: None,
                     class: None,
                 },
@@ -3743,6 +5143,7 @@ mod tests {
                     kind: "build-finished".to_owned(),
                     scope: Some("app".to_owned()),
                     idempotency_key: Some("fact-1".to_owned()),
+                    payload: None,
                 },
             ),
             (
@@ -3914,6 +5315,9 @@ mod tests {
                     identity: Identity::User("flynn".to_owned()),
                     provider: "openai".to_owned(),
                     api_key: false,
+                    daemon_credential: false,
+                    endpoint: None,
+                    provider_name: None,
                     hostname: None,
                     remote: None,
                 },
@@ -3979,5 +5383,34 @@ mod tests {
             command,
             Command::IdentityEdit { content: Some(content), .. } if content == "a\u{fffd}b"
         ));
+    }
+
+    #[test]
+    fn durable_topline_commands_refuse_closed_or_retired_flags_before_dispatch() {
+        for args in [
+            strings(&[
+                "topline-create",
+                "--title",
+                "Ship",
+                "--key",
+                "k",
+                "--bogus",
+                "ignored",
+                "--as-user",
+                "flynn",
+            ]),
+            strings(&["toplines", "--tree", "--as-user", "flynn"]),
+            strings(&[
+                "topline",
+                "tl_probe",
+                "--under",
+                "wi_probe",
+                "--as-user",
+                "flynn",
+            ]),
+            strings(&["topline-placement-list", "--history", "--as-user", "flynn"]),
+        ] {
+            assert!(parse(args).unwrap_err().contains("does not accept"));
+        }
     }
 }

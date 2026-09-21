@@ -58,6 +58,12 @@ defmodule Tightbeam.Harness.Support do
   def catalog_probe_argv(dest, script),
     do: ["ssh" | @ssh_opts] ++ [dest, "sh", "-c", shell_quote(script)]
 
+  @doc false
+  def catalog_probe_argv(nil, script, %{sh: sh}), do: [sh, "-c", script]
+
+  def catalog_probe_argv(dest, script, %{ssh: ssh, sh: sh}),
+    do: [ssh | @ssh_opts] ++ [dest, sh, "-c", shell_quote(script)]
+
   @doc """
   The curl line every catalog probe ends in.
 
@@ -69,9 +75,14 @@ defmodule Tightbeam.Harness.Support do
   """
   @spec catalog_curl(String.t(), [String.t()], String.t()) :: String.t()
   def catalog_curl(url, headers, trailer \\ "") do
+    catalog_curl(url, headers, trailer, "curl")
+  end
+
+  @doc false
+  def catalog_curl(url, headers, trailer, curl) do
     header_args = Enum.map_join(headers, " ", &~s(-H "#{&1}"))
 
-    ~s(curl -sS --max-time #{@catalog_probe_timeout_s} ) <>
+    ~s(#{shell_quote(curl)} -sS --max-time #{@catalog_probe_timeout_s} ) <>
       ~s(-w "\\n%{http_code}#{trailer}" ) <> header_args <> " " <> ~s("#{url}")
   end
 
@@ -113,47 +124,84 @@ defmodule Tightbeam.Harness.Support do
   end
 
   @doc false
-  def owned_home_entries(credential_file, rails_file) do
+  def owned_home_entries(rails_file, extra \\ []) do
     [
       ".tightbeam/manifest",
-      credential_file,
       rails_file
-      | Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}")
+      | Enum.map(Tightbeam.Homes.baseline_skill_names(), &"skills/#{&1}") ++ extra
     ]
     |> Enum.sort()
   end
 
-  def credential_transport(target, %{command: command}) do
-    invocation =
-      if local?(target) do
-        command
-      else
-        ["ssh" | ssh_opts()] ++
-          [
-            target.host_config.ssh,
-            "sh",
-            "-lc",
-            shell_quote(Enum.map_join(command, " ", &shell_quote/1))
-          ]
+  def credential_transport(target, %{command: command} = request) do
+    with {:ok, invocation} <- credential_transport_argv(target, command) do
+      case target.sh.(invocation) do
+        {output, 0} ->
+          decode_credential_transport(request, output)
+
+        {output, exit} ->
+          {:error, {:transport_exit, exit, String.trim(output)}}
       end
+    end
+  end
 
-    case target.sh.(invocation) do
-      {output, 0} ->
-        case JSON.decode(output) do
-          {:ok, decoded} ->
-            {:ok,
-             %{
-               status: decoded["status"],
-               headers: decoded["headers"],
-               body: decoded["body"]
-             }}
+  defp credential_transport_argv(target, command) do
+    if local?(target) do
+      {:ok, command}
+    else
+      case absolute_executable(target, "ssh") do
+        {:ok, ssh} ->
+          {:ok,
+           [ssh | ssh_opts()] ++
+             [
+               target.host_config.ssh,
+               "/bin/sh",
+               "-lc",
+               shell_quote(Enum.map_join(command, " ", &shell_quote/1))
+             ]}
 
-          {:error, reason} ->
-            {:error, {:malformed_transport_response, reason}}
-        end
+        :error ->
+          {:error, {:executable_not_found, "ssh"}}
+      end
+    end
+  end
 
-      {output, exit} ->
-        {:error, {:transport_exit, exit, String.trim(output)}}
+  defp absolute_executable(container, name) do
+    find =
+      Map.get(container, :find_executable) ||
+        get_in(container, [:options, :find_executable]) ||
+        (&System.find_executable/1)
+
+    case find.(name) do
+      path when is_binary(path) ->
+        if Path.type(path) == :absolute, do: {:ok, path}, else: :error
+
+      _ ->
+        :error
+    end
+  end
+
+  defp decode_credential_transport(%{response: :catalog}, output) do
+    {body, trailer} = split_trailing_line(output)
+
+    case Integer.parse(String.trim(trailer)) do
+      {status, ""} -> {:ok, %{status: status, headers: %{}, body: body}}
+      _ -> {:error, {:malformed_transport_response, :missing_http_status}}
+    end
+  end
+
+  defp decode_credential_transport(_request, output) do
+    case JSON.decode(output) do
+      {:ok, decoded} ->
+        {:ok,
+         %{
+           status: decoded["status"],
+           headers: decoded["headers"],
+           body: decoded["body"]
+         }}
+
+      {:error, reason} ->
+        {:error, {:malformed_transport_response, reason}}
     end
   end
 
@@ -217,7 +265,7 @@ defmodule Tightbeam.Harness.Support do
       "owned_home_entries" => owned_home_entries_vectors(profile),
       "reconcile_home" => reconcile_home_vectors(module, profile),
       "materialize_skills" => materialize_skills_vectors(module, profile),
-      "credential_ready?/harvest_credential" => credential_vectors(module, profile),
+      "credential_ready?" => credential_vectors(module, profile),
       "credential_live?" => credential_live_vectors(module, profile),
       "install_cli_projection" => install_cli_projection_vectors(module),
       "probe_cli" => probe_cli_vectors(module, profile),
@@ -253,7 +301,7 @@ defmodule Tightbeam.Harness.Support do
   def observe_vector(module, "materialize_skills", %{input: input}),
     do: observe_materialize_skills(module, input.profile)
 
-  def observe_vector(module, "credential_ready?/harvest_credential", %{input: input}),
+  def observe_vector(module, "credential_ready?", %{input: input}),
     do: observe_credential(module, input.profile, input.case)
 
   def observe_vector(module, "credential_live?", %{input: input}),
@@ -303,7 +351,7 @@ defmodule Tightbeam.Harness.Support do
       home = Path.join(base, "home")
       local? = locality == :local
       adapter = adapter_path(base, profile.adapter_bin, locality)
-      token_path = Path.join([base, "auth", profile.home_scope, profile.credential_file])
+      token_path = Path.join(home, profile.credential_file)
       File.mkdir_p!(Path.dirname(token_path))
       File.write!(token_path, "vector-token\n")
 
@@ -312,8 +360,15 @@ defmodule Tightbeam.Harness.Support do
         host_name: "vector",
         host_config: %{base_dir: base, ssh: if(local?, do: nil, else: "vector@remote")},
         adapter_binary: adapter,
-        sh: fn _command -> {"", 0} end
+        sh: launch_probe_shell(profile)
       }
+
+      target =
+        if Map.has_key?(profile, :launch_catalog) do
+          Map.put(target, :credential_status, fn :opencode_go, _host -> :onboarded end)
+        else
+          target
+        end
 
       opts = [
         common_env: [{"COMMON", "1"}],
@@ -335,6 +390,14 @@ defmodule Tightbeam.Harness.Support do
     end)
   end
 
+  defp launch_probe_shell(%{launch_catalog: %{url: url, body: body}}) do
+    fn command ->
+      if String.contains?(Enum.join(command, " "), url), do: {body <> "\n200", 0}, else: {"", 0}
+    end
+  end
+
+  defp launch_probe_shell(_profile), do: fn _command -> {"", 0} end
+
   defp expected_launch(profile, locality, rails, kind) do
     base = "<BASE>"
     home = "<HOME>"
@@ -353,6 +416,9 @@ defmodule Tightbeam.Harness.Support do
           env: [{profile.home_env, home}, {"COMMON", "1"} | extra]
         ]
       else
+        ssh = if profile.wire_name == "pi", do: System.find_executable("ssh"), else: "ssh"
+        env = if profile.wire_name == "pi", do: "/usr/bin/env", else: "env"
+
         remote_env =
           profile.remote_prefix.(base, home, kind) ++
             ["REMOTE=1"] ++
@@ -363,8 +429,8 @@ defmodule Tightbeam.Harness.Support do
 
         [
           cmd:
-            ["ssh" | ssh_opts()] ++
-              ["vector@remote", "exec", "env" | remote_env] ++ [adapter],
+            [ssh | ssh_opts()] ++
+              ["vector@remote", "exec", env | remote_env] ++ [adapter],
           env: [{"TIGHTBEAM_LINEAGE", "tb-vector"}]
         ]
       end
@@ -373,7 +439,12 @@ defmodule Tightbeam.Harness.Support do
       if railed? and profile.railed_probe do
         Keyword.merge(plan,
           probe_cwd: Path.join(base, "work/gate-probe"),
-          probe_model: Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
+          probe_model:
+            Map.get(
+              profile,
+              :probe_model,
+              Tightbeam.Model.new("gpt-5.6-sol", effort: "medium")
+            )
         )
       else
         plan
@@ -550,7 +621,6 @@ defmodule Tightbeam.Harness.Support do
   defp observe_reconcile_home(module, profile) do
     with_tmp("home", fn base ->
       home = Path.join(base, "home")
-      auth_dir = Tightbeam.Credentials.store_dir(base, profile.provider)
 
       sentinels = %{
         "history/transcript" => "history-sentinel",
@@ -564,8 +634,6 @@ defmodule Tightbeam.Harness.Support do
         File.write!(path, bytes)
       end)
 
-      File.mkdir_p!(auth_dir)
-      File.write!(Path.join(auth_dir, profile.credential_file), "credential")
       before = leaf_snapshot(home)
 
       target = %{
@@ -578,8 +646,7 @@ defmodule Tightbeam.Harness.Support do
       module.reconcile_home(target, home, %{
         harness: module.id(),
         machine: "vector",
-        rails: profile.rails,
-        auth_dir: auth_dir
+        rails: profile.rails
       })
 
       after_snapshot = leaf_snapshot(home)
@@ -635,9 +702,9 @@ defmodule Tightbeam.Harness.Support do
     for case_name <- ["present", "absent", "rotated"] do
       expected =
         case case_name do
-          "present" -> %{ready?: true, harvested: nil}
-          "absent" -> %{ready?: false, harvested: nil}
-          "rotated" -> %{ready?: true, harvested: "rotated-bytes"}
+          "present" -> %{ready?: true}
+          "absent" -> %{ready?: false}
+          "rotated" -> %{ready?: true}
         end
 
       vector(case_name, expected, %{profile: profile, case: case_name})
@@ -646,25 +713,16 @@ defmodule Tightbeam.Harness.Support do
 
   defp observe_credential(module, profile, case_name) do
     with_tmp("credential", fn base ->
-      store = Tightbeam.Credentials.store_dir(base, profile.provider)
       home = Path.join(base, "home")
       File.mkdir_p!(home)
 
       if case_name in ["present", "rotated"] do
-        File.mkdir_p!(store)
-        File.write!(Path.join(store, profile.credential_file), "stored-bytes")
-      end
-
-      if case_name == "rotated" do
-        File.write!(Path.join(home, profile.credential_file), "rotated-bytes")
+        File.write!(Path.join(home, profile.credential_file), "credential-bytes")
       end
 
       target = %{host_config: %{ssh: nil, base_dir: base}, base_dir: base}
 
-      %{
-        ready?: module.credential_ready?(target, home),
-        harvested: module.harvest_credential(target, home)
-      }
+      %{ready?: module.credential_ready?(target, home)}
     end)
   end
 
@@ -954,7 +1012,16 @@ defmodule Tightbeam.Harness.Support do
 
   defp install_fake_adapter!(adapter, profile) do
     node_modules = adapter |> Path.dirname() |> Path.dirname()
-    package_dir = Path.join([node_modules, "@agentclientprotocol", profile.adapter_package])
+
+    package_dir =
+      case Map.get(profile, :adapter_scope, :agentclientprotocol) do
+        :unscoped ->
+          Path.join(node_modules, profile.adapter_package)
+
+        :agentclientprotocol ->
+          Path.join([node_modules, "@agentclientprotocol", profile.adapter_package])
+      end
+
     bundle = Path.join([package_dir, "dist", profile.adapter_bundle])
     File.mkdir_p!(Path.dirname(adapter))
     File.mkdir_p!(Path.dirname(bundle))

@@ -1,9 +1,65 @@
 defmodule Tightbeam.GatewayTest do
+  alias Tightbeam.GatewayTurnFixture.{AdapterStub, CoordinatorStub}
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
   # The committed packaging shim, for the writer→consumer seam test below.
   @shim Path.expand("../packaging/tightbeam-gateway", __DIR__)
+
+  test "handler registry preserves current verbs and rejects invalid effect bindings" do
+    handlers = Tightbeam.Gateway.handlers(%{db: :registry_test_unused})
+    effects = Tightbeam.Gateway.handler_effects(%{db: :registry_test_unused})
+
+    expected =
+      ~w(post wake condition facts-read artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-po-set retire assignment-commitref-correct)
+
+    expected =
+      expected ++ ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch)
+
+    expected =
+      expected ++
+        ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other)
+
+    assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
+    assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
+    assert Enum.all?(Map.values(handlers), &is_function(&1, 1))
+    assert effects["reopen-assignment"] == ["assignment.reopened"]
+    assert effects["artifact-content-fetch"] == []
+    assert effects["repair-assignment"] == ["message.created", "session.updated"]
+    assert effects["session-po-set"] == ["wake.scheduled"]
+
+    assert effects["wake"] == [
+             "wake.scheduled",
+             "wake.canceled",
+             "wake.fired",
+             "message.created",
+             "session.updated"
+           ]
+
+    assert effects["cancel"] == ["turn.ended", "session.updated"]
+    classes = Tightbeam.Gateway.emitted_state_classes(effects)
+    assert classes == Enum.sort(Enum.uniq(classes))
+
+    assert Enum.all?(
+             ~w(turn.started turn.ended artifact.archived artifact.released),
+             &(&1 in classes)
+           )
+
+    handler = fn call -> call end
+
+    for invalid <- [
+          %{"plain" => handler},
+          %{{"bad", ["same", "same"]} => handler},
+          %{{"bad", [:not_a_class]} => handler},
+          %{{"bad", []} => :not_a_handler},
+          %{{"duplicate", []} => handler, {"duplicate", ["turn.ended"]} => handler}
+        ] do
+      assert_raise ArgumentError, fn -> Tightbeam.Gateway.compile_handler_specs!(invalid) end
+    end
+
+    assert %{"valid" => %{handler: ^handler, effects: []}} =
+             Tightbeam.Gateway.compile_handler_specs!(%{{"valid", []} => handler})
+  end
 
   # How long a COLD runner Task is allowed to take to reach `Adapter.prompt`.
   #
@@ -66,12 +122,14 @@ defmodule Tightbeam.GatewayTest do
     Idempotency,
     LaneManager,
     Ledger,
+    LocalOpenAi.Providers,
     ModelCatalog,
     NoticeBatcher,
     Org,
     Placement,
     Projection,
     Rails,
+    RuleRuntime,
     Roles,
     Rules,
     SessionLane,
@@ -92,55 +150,12 @@ defmodule Tightbeam.GatewayTest do
       {:reply, :ok, parent}
     end
 
-    # identity apply ensures a lane WITHOUT ringing the doorbell. This stub only
-    # records it; tests that need a real lane start one themselves, so that the
-    # boundary they exercise is a real mailbox rather than a stub's reply.
+    # A session mutation ensures a lane WITHOUT ringing the doorbell. This stub
+    # only records it; tests that need a real lane start one themselves, so that
+    # the boundary they exercise is a real mailbox rather than a stub's reply.
     def handle_call({:ensure_lane_quiet, key}, _from, parent) do
       send(parent, {:ensure_lane_quiet, key})
       {:reply, :ok, parent}
-    end
-  end
-
-  defmodule CoordinatorStub do
-    use GenServer
-
-    def start_link({adapter, parent}),
-      do: GenServer.start_link(__MODULE__, {adapter, parent}, name: Tightbeam.AdapterCoordinator)
-
-    def start_link(adapter),
-      do: GenServer.start_link(__MODULE__, {adapter, nil}, name: Tightbeam.AdapterCoordinator)
-
-    def init({adapter, parent}), do: {:ok, {adapter, parent}}
-
-    def handle_call({:adapter_for, key}, _from, {adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, {:adapter_key, key})
-      reply = if is_function(adapter, 1), do: adapter.(key), else: {:ok, adapter, 1}
-      {:reply, reply, state}
-    end
-
-    def handle_call({:adapter_for, key, _context}, from, state),
-      do: handle_call({:adapter_for, key}, from, state)
-
-    def handle_call({:acquire_load_slot, _machine, _borrower}, _from, state),
-      do: {:reply, make_ref(), state}
-
-    def handle_call({:close_adapter, key}, _from, {adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, {:close_adapter, key})
-      GenServer.stop(adapter)
-      {:reply, :ok, state}
-    end
-
-    def handle_call(:harness_processes, _from, {_adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, :harness_processes)
-      {:reply, [%{launch_id: "launch-1", state: "kill_failed"}], state}
-    end
-
-    def handle_cast({:release_load_slot, _machine, _slot}, state), do: {:noreply, state}
-
-    def handle_cast({:close_adapter, key}, {adapter, parent} = state) do
-      if is_pid(parent), do: send(parent, {:close_adapter, key})
-      GenServer.stop(adapter)
-      {:noreply, state}
     end
   end
 
@@ -187,84 +202,6 @@ defmodule Tightbeam.GatewayTest do
 
     def handle_call(request, _from, state),
       do: {:reply, GenServer.call(state.db, request), state}
-  end
-
-  defmodule AdapterStub do
-    use GenServer
-    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
-    def init(parent), do: {:ok, parent}
-
-    def handle_call({:new_session, _model, _cwd, mcp_servers, _guidance}, _from, parent) do
-      send(parent, {:new_session_mcp_servers, mcp_servers})
-      {:reply, {:ok, "harness-1"}, parent}
-    end
-
-    def handle_call({:new_candidate_session, model, cwd, mcp_servers, guidance}, from, parent),
-      do: handle_call({:new_session, model, cwd, mcp_servers, guidance}, from, parent)
-
-    def handle_call(
-          {:new_session, model, cwd, mcp_servers, guidance, _request_timeout},
-          from,
-          parent
-        ),
-        do: handle_call({:new_session, model, cwd, mcp_servers, guidance}, from, parent)
-
-    def handle_call(:conn, _from, parent), do: {:reply, parent, parent}
-
-    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, false, parent}
-
-    def handle_call({:current_model, "harness-1"}, _from, parent),
-      do: {:reply, {:ok, Model.new("gpt-5.6-sol", effort: "medium")}, parent}
-
-    def handle_call({:load_session, _sid, _model, _cwd, _mcp_servers, _guidance}, _from, parent),
-      do: {:reply, {:error, %{"code" => -32602, "message" => "Invalid params"}}, parent}
-
-    def handle_call(
-          {:load_session, sid, model, cwd, mcp_servers, guidance, _request_timeout},
-          from,
-          parent
-        ),
-        do: handle_call({:load_session, sid, model, cwd, mcp_servers, guidance}, from, parent)
-
-    def handle_call({:close_session, sid}, _from, parent) do
-      send(parent, {:close_session, sid})
-      {:reply, :ok, parent}
-    end
-
-    def handle_call({:prompt, _sid, "fail this turn", _opts}, _from, parent),
-      do:
-        {:reply,
-         {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
-         parent}
-
-    def handle_call({:prompt, _sid, prompt, _opts}, from, parent) do
-      send(parent, {:prompt_started, self()})
-
-      messages =
-        case prompt do
-          "split assistant messages" ->
-            [
-              %{message_id: "fake-message-1", text: "FIRST"},
-              %{message_id: "fake-message-2", text: "SECOND"}
-            ]
-
-          _ ->
-            [%{message_id: "fake-message", text: String.upcase(prompt)}]
-        end
-
-      receive do: (:continue_prompt ->
-                     GenServer.reply(
-                       from,
-                       {:ok,
-                        %{
-                          text: Enum.map_join(messages, & &1.text),
-                          messages: messages,
-                          stop_reason: "end_turn"
-                        }}
-                     ))
-
-      {:noreply, parent}
-    end
   end
 
   defmodule CandidateAdapterStub do
@@ -406,7 +343,7 @@ defmodule Tightbeam.GatewayTest do
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
     def init(parent), do: {:ok, parent}
 
-    # A RESIDENT session: the adapter still holds it, so apply bounces it.
+    # A resident session: the adapter still holds it and answers a bounce.
     def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
 
     def handle_call({:close_session, sid}, _from, parent) do
@@ -421,93 +358,6 @@ defmodule Tightbeam.GatewayTest do
         ) do
       send(parent, {:identity_apply_load, sid, model, cwd, mcp_servers, guidance})
       {:reply, {:ok, model}, parent}
-    end
-  end
-
-  # Holds the bounce OPEN, so the apply-vs-claim window is real elapsed time
-  # rather than a scheduling accident the test hopes for: close_session parks
-  # until the test releases it.
-  defmodule HoldingAdapterStub do
-    use GenServer
-    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
-    def init(parent), do: {:ok, parent}
-
-    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
-
-    def handle_call({:close_session, sid}, _from, parent) do
-      send(parent, {:holding_close, sid})
-
-      receive do
-        :release -> :ok
-      end
-
-      {:reply, :ok, parent}
-    end
-
-    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
-      send(parent, {:holding_load, sid})
-      {:reply, {:ok, model}, parent}
-    end
-  end
-
-  # The state EVERY started session is in after a gateway restart: its pointer row
-  # survives in the DB, the adapter process is new and holds nothing.
-  defmodule GoneSessionAdapterStub do
-    use GenServer
-    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
-    def init(parent), do: {:ok, parent}
-
-    def handle_call({:knows_session?, sid}, _from, parent) do
-      send(parent, {:gone_residency_asked, sid})
-      {:reply, false, parent}
-    end
-
-    # Answering these at all is the point: the harness never heard of this
-    # session, so asking it to close one is what produced the raw -32603.
-    def handle_call({:close_session, sid}, _from, parent) do
-      send(parent, {:gone_close_attempted, sid})
-      {:reply, {:error, %{"code" => -32603, "message" => "Session not found"}}, parent}
-    end
-
-    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
-      send(parent, {:gone_load_attempted, sid})
-      {:reply, {:ok, model}, parent}
-    end
-  end
-
-  # One adapter, three sessions, one truthful answer each — the org-wide shape
-  # `--all` actually meets.
-  defmodule MixedResidencyAdapterStub do
-    use GenServer
-    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
-    def init(parent), do: {:ok, parent}
-
-    def handle_call({:knows_session?, sid}, _from, parent),
-      do: {:reply, sid == "thread-resident", parent}
-
-    def handle_call({:close_session, sid}, _from, parent) do
-      send(parent, {:mixed_close, sid})
-      {:reply, :ok, parent}
-    end
-
-    def handle_call({:load_session, sid, model, _cwd, _mcp, _guidance}, _from, parent) do
-      send(parent, {:mixed_load, sid})
-      {:reply, {:ok, model}, parent}
-    end
-  end
-
-  # A LIVE adapter that holds the session and fails for its own reason — which
-  # must still refuse, and must not be swallowed by the residency branch.
-  defmodule ApplyErrorAdapterStub do
-    use GenServer
-    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
-    def init(parent), do: {:ok, parent}
-
-    def handle_call({:knows_session?, _sid}, _from, parent), do: {:reply, true, parent}
-
-    def handle_call({:close_session, sid}, _from, parent) do
-      send(parent, {:apply_error_close, sid})
-      {:reply, {:error, %{"code" => -32000, "message" => "harness is shutting down"}}, parent}
     end
   end
 
@@ -588,28 +438,32 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
-  setup do
+  setup context do
+    if context[:cold_gateway], do: %{}, else: start_memory_fixture()
+  end
+
+  defp start_memory_fixture do
     db = :"gateway_db_#{System.unique_integer([:positive])}"
     registry = :"gateway_registry_#{System.unique_integer([:positive])}"
     start_supervised!({Task.Supervisor, name: Tightbeam.TurnTaskSupervisor})
     start_supervised!({DB, path: ":memory:", name: db})
     :ok = Tightbeam.Schema.ensure_all(db)
     start_supervised!({ConnRegistry, name: registry})
-    # Named globally, like CoordinatorStub: identity apply reaches its lane manager
-    # through `config[:lane_manager] || Tightbeam.LaneManager`, so the default has
-    # to resolve to something for every test that applies to a started session.
+    # Named globally, like CoordinatorStub: a prompt delivery reaches its lane
+    # manager through `config[:lane_manager] || Tightbeam.LaneManager`, so the
+    # default has to resolve to something for every test that delivers one.
     lane = start_supervised!({LaneDoorbell, {self(), Tightbeam.LaneManager}})
     # Production always has this (Application.children/0); the test env boots no
-    # tree, and identity apply now looks a session's lane up by name.
+    # tree, and the lane-boundary paths look a session's lane up by name.
     start_supervised!({Registry, keys: :unique, name: Tightbeam.LaneRegistry})
 
     catalog_base =
       Path.join(System.tmp_dir!(), "gateway-catalog-#{System.unique_integer([:positive])}")
 
-    File.mkdir_p!(Path.join([catalog_base, "auth", "claude"]))
+    File.mkdir_p!(Path.join([catalog_base, "homes", "testhost", "claude"]))
 
     File.write!(
-      Path.join([catalog_base, "auth", "claude", ".credentials.json"]),
+      Path.join([catalog_base, "homes", "testhost", "claude", ".credentials.json"]),
       ~s({"claudeAiOauth":{"accessToken":"test-token"}})
     )
 
@@ -690,74 +544,117 @@ defmodule Tightbeam.GatewayTest do
         subscriptions: MapSet.new(["chat"])
       })
 
+    Rules.load!(catalog_base, Map.keys(Gateway.handlers(%{db: db})))
+
     %{db: db, registry: registry, lane: lane, catalog_base: catalog_base, device: device}
   end
 
-  test "assignment handlers inject configured supervision and effort settings before mutation",
-       ctx do
-    ensure_global_registry()
-    base_dir = role_test_base("gateway-supervision-interval")
+  for {cadence, expected_interval} <- [
+        {%{}, 1_000},
+        {%{wake_tick_ms: 1_234}, 1_234},
+        {%{wake_tick_ms: 10, supervision_interval_ms: 4_321}, 4_321},
+        {%{wake_tick_ms: 900, supervision_interval_ms: 4_321}, 4_321}
+      ] do
+    test "assignment interval wiring #{inspect(cadence)}",
+         ctx do
+      ensure_global_registry()
+      base_dir = role_test_base("gateway-supervision-interval")
 
-    register_hosts(ctx.db, %{
-      "testhost" => %{ssh: "testhost", base_dir: base_dir, cli_bin: nil}
-    })
+      register_hosts(ctx.db, %{
+        "testhost" => %{ssh: "testhost", base_dir: base_dir, cli_bin: nil}
+      })
 
-    handlers =
-      Gateway.handlers(
-        gateway_config(base_dir, ctx.db, 0)
-        |> Map.put(:wake_tick_ms, 1_234)
-        |> Map.put(:effort_checkin_horizon_ms, 123)
-      )
+      cadence = unquote(Macro.escape(cadence))
+      expected_interval = unquote(expected_interval)
 
-    common = %{
-      origin: "user:flynn",
-      principal: {:user, "flynn"},
-      session_key: "k1",
-      target_role: nil,
-      role_fallback: false
-    }
+      handlers =
+        Gateway.handlers(
+          gateway_config(base_dir, ctx.db, 0)
+          |> Map.delete(:wake_tick_ms)
+          |> Map.merge(cadence)
+          |> Map.put(:effort_checkin_horizon_ms, 123)
+        )
 
-    assert %{id: assign_id} =
-             handlers["assign"].(
-               Map.merge(common, %{
-                 verb: "assign",
-                 params: %{subject: "gateway interval assign"}
-               })
-             )
+      common = %{
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: "k1",
+        target_role: nil,
+        role_fallback: false
+      }
 
-    assert %{id: dispatch_id} =
-             handlers["dispatch"].(
-               Map.merge(common, %{
-                 verb: "dispatch",
-                 params: %{
-                   subject: "gateway interval dispatch",
-                   brief: "prove the configured interval"
-                 }
-               })
-             )
+      assert %{id: assign_id} =
+               handlers["assign"].(
+                 Map.merge(common, %{
+                   verb: "assign",
+                   params: %{subject: "gateway interval assign"}
+                 })
+               )
 
-    assert {:ok, [[123, effort_root]]} =
-             DB.query(
-               ctx.db,
-               "SELECT baseHorizonMs,root FROM effort_checkin_generations WHERE assignmentId=?1",
-               [assign_id]
-             )
+      assert %{id: dispatch_id} =
+               handlers["dispatch"].(
+                 Map.merge(common, %{
+                   verb: "dispatch",
+                   params: %{
+                     subject: "gateway interval dispatch",
+                     brief: "prove the configured interval"
+                   }
+                 })
+               )
 
-    assert Path.dirname(effort_root) == Path.join(base_dir, "work")
-
-    for assignment_id <- [assign_id, dispatch_id] do
-      assert {:ok, [[1_234, 1_234]]} =
+      assert {:ok, [[123, effort_root]]} =
                DB.query(
                  ctx.db,
-                 """
-                 SELECT e.dueAt - a.openedAt, e.supervisionIntervalMs
-                 FROM assignments a
-                 JOIN supervision_entitlements e ON e.assignmentId=a.id
-                 WHERE a.id=?1
-                 """,
-                 [assignment_id]
+                 "SELECT baseHorizonMs,root FROM effort_checkin_generations WHERE assignmentId=?1",
+                 [assign_id]
                )
+
+      assert Path.dirname(effort_root) == Path.join(base_dir, "work")
+
+      for assignment_id <- [assign_id, dispatch_id] do
+        assert {:ok, [[^expected_interval, ^expected_interval]]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT e.dueAt - a.openedAt, e.supervisionIntervalMs
+                   FROM assignments a
+                   JOIN supervision_entitlements e ON e.assignmentId=a.id
+                   WHERE a.id=?1
+                   """,
+                   [assignment_id]
+                 )
+
+        assert %{attest: %{id: _}} =
+                 handlers["attest"].(%{
+                   origin: "agent:k1",
+                   principal: {:session, "k1"},
+                   session_key: "k1",
+                   params: %{assignment_id: assignment_id, kind: "progress"}
+                 })
+
+        assert {:ok, [["assignment_open", ^expected_interval, ^expected_interval]]} =
+                 DB.query(
+                   ctx.db,
+                   """
+                   SELECT e.basisKind, e.supervisionIntervalMs, e.dueAt - a.openedAt
+                   FROM supervision_entitlements e
+                   JOIN assignments a ON a.id=e.assignmentId
+                   WHERE e.assignmentId=?1
+                   ORDER BY e.generation DESC LIMIT 1
+                   """,
+                   [assignment_id]
+                 )
+      end
     end
+  end
+
+  @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
+  test "wake polling and supervision child cadence are independent", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_cadence.exs",
+      "guarded-gateway-cadence: ok"
+    )
   end
 
   test "retire refuses built-in mains — the fallback target is permanent", ctx do
@@ -846,6 +743,7 @@ defmodule Tightbeam.GatewayTest do
     result =
       handlers["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: root.session_key,
         params: %{}
       })
@@ -901,6 +799,7 @@ defmodule Tightbeam.GatewayTest do
         adapter_coordinator: coordinator
       })["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: session.session_key,
         params: %{}
       })
@@ -986,6 +885,7 @@ defmodule Tightbeam.GatewayTest do
     result =
       Gateway.handlers(%{db: ctx.db, base_dir: base_dir, wake_tick_ms: 1_000})["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: session.session_key,
         params: %{}
       })
@@ -1028,6 +928,7 @@ defmodule Tightbeam.GatewayTest do
         adapter_coordinator: coordinator
       })["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: retired.session_key,
         params: %{}
       })
@@ -1067,6 +968,7 @@ defmodule Tightbeam.GatewayTest do
         adapter_coordinator: coordinator
       })["retire"].(%{
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         session_key: session.session_key,
         params: %{}
       })
@@ -1103,7 +1005,13 @@ defmodule Tightbeam.GatewayTest do
     assert renewed.hard_deadline == first.hard_deadline
     assert renewed.expires_at == first.hard_deadline
 
-    call = %{origin: "user:flynn", session_key: root.session_key, params: %{}}
+    call = %{
+      origin: "user:flynn",
+      principal: {:user, "flynn"},
+      session_key: root.session_key,
+      params: %{}
+    }
+
     deferred = handlers["retire"].(call)
 
     assert deferred.retired_session_keys == []
@@ -1121,19 +1029,13 @@ defmodule Tightbeam.GatewayTest do
     assert same_wake.wake_id == wake.wake_id
   end
 
-  test "children preserves the cli token while refreshing the gateway port", ctx do
-    base_dir = Path.join(System.tmp_dir!(), "gateway_token_#{System.unique_integer([:positive])}")
-    config = gateway_config(base_dir, ctx.db, 4_321)
-
-    Gateway.children(config)
-    first = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
-
-    Gateway.children(%{config | port: 5_432})
-    second = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
-
-    assert first["cliToken"] == second["cliToken"]
-    assert second["port"] == 5_432
-    assert File.stat!(Path.join(base_dir, "gateway.json")).mode |> Bitwise.band(0o777) == 0o600
+  @tag cold_gateway: true, tmp_dir: true
+  test "children preserves the cli token while refreshing the gateway port", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_token.exs",
+      "guarded-gateway-token: ok"
+    )
   end
 
   test "children writes the instance's ACTUAL RELEASE_NODE and owned pid into the descriptor, fresh every boot",
@@ -1214,44 +1116,25 @@ defmodule Tightbeam.GatewayTest do
     refute out =~ ~r/prod-shared-cookie/
   end
 
-  test "children recovers liveness before any runtime child can start", ctx do
-    :ok =
-      DB.execute(
-        ctx.db,
-        "INSERT INTO assignments (id, subject, holderKey, openedByUser, openedAt) VALUES ('asg_boot_recovery', 'boot recovery', 'k1', 'flynn', 1)"
-      )
+  for {override, script} <- [
+        {%{}, "live_base_gateway_liveness_default.exs"},
+        {%{supervision_interval_ms: 4_321}, "live_base_gateway_liveness_override.exs"}
+      ] do
+    @tag cold_gateway: true, gateway_cadence: true, tmp_dir: true
+    test "children recovers liveness with interval #{inspect(override)}", %{tmp_dir: tmp} do
+      Tightbeam.GuardRuntimeFixture.run!(tmp, unquote(script), "guarded-gateway-liveness: ok")
+    end
+  end
 
-    children =
-      Gateway.children(
-        gateway_config(gateway_children_base!(), ctx.db, 0)
-        |> Map.put(:wake_tick_ms, 1_234)
-      )
-
-    assert {:ok,
-            [
-              [
-                1,
-                "armed",
-                "recovery_backfill",
-                "asg_boot_recovery",
-                "recovery_backfill",
-                "process:tightbeam",
-                1_234
-              ]
-            ]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT generation,state,basisKind,basisId,cause,principal,supervisionIntervalMs
-               FROM supervision_entitlements
-               WHERE assignmentId='asg_boot_recovery'
-               """
-             )
-
-    {Tightbeam.Supervision, supervision_opts} =
-      Enum.find(children, &match?({Tightbeam.Supervision, _}, &1))
-
-    assert Keyword.fetch!(supervision_opts, :recover) == false
+  @tag cold_gateway: true, gateway_retired: true, tmp_dir: true
+  test "children installs row recognition before recovery closes retired assignments", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_retired.exs",
+      "guarded-gateway-retired: ok"
+    )
   end
 
   test "repair-assignment requires outcome reconciliation and appends one deduped rerun", ctx do
@@ -1281,8 +1164,7 @@ defmodule Tightbeam.GatewayTest do
 
     {:ok, _turn} = Ledger.claim_next(ctx.db, "k1", "test-lane")
 
-    :ok =
-      Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown")
+    :ok = Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown")
 
     assert {:opened, incident} =
              HarnessHealth.observe(ctx.db, %{
@@ -1704,149 +1586,41 @@ defmodule Tightbeam.GatewayTest do
   # Hosts assimilated before the endpoint file existed, and hosts whose org token
   # has since been rotated, must not need a second ceremony: boot re-provisions
   # every registered satellite, so the operator shell heals on restart.
-  test "children re-provisions the endpoint of an already-registered satellite", ctx do
-    base_dir =
-      Path.join(System.tmp_dir!(), "gateway_endpoint_boot_#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(base_dir)
-
-    register_hosts(ctx.db, %{
-      "already-assimilated" => %{
-        ssh: "clu@already-assimilated",
-        base_dir: "/remote/tb",
-        cli_bin: nil
-      }
-    })
-
-    Application.put_env(:tightbeam, :advertised_url, "http://gateway.example:11373")
-    on_exit(fn -> Application.delete_env(:tightbeam, :advertised_url) end)
-    parent = self()
-
-    sh = fn command ->
-      if hd(command) == "rsync", do: send(parent, {:staged, File.read!(Enum.at(command, -2))})
-      {"", 0}
-    end
-
-    Gateway.children(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, sh))
-
-    token =
-      base_dir
-      |> Path.join("gateway.json")
-      |> File.read!()
-      |> JSON.decode!()
-      |> Map.fetch!("cliToken")
-
-    assert_receive {:staged, content}
-
-    assert JSON.decode!(content) == %{
-             "url" => "http://gateway.example:11373",
-             "cliToken" => token,
-             "machine" => "already-assimilated"
-           }
+  @tag cold_gateway: true, gateway_endpoint: true, tmp_dir: true
+  test "children re-provisions the endpoint of an already-registered satellite", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_endpoint.exs",
+      "guarded-gateway-endpoint: ok"
+    )
   end
 
+  @tag cold_gateway: true, gateway_audit: true, tmp_dir: true
   test "Proof 5: the boot audit logs conflicts without mutating and terminates on a synthetic cycle",
-       ctx do
-    first_item = create_work_item(ctx.db, "Audit reviewed")
-    second_item = create_work_item(ctx.db, "Audit conflict")
-
-    :ok =
-      DB.execute(
-        ctx.db,
-        """
-        INSERT INTO assignments
-          (id, subject, holderKey, openedByUser, openedAt, workItemId)
-        VALUES
-          ('asg_audit_target', 'target', 'k1', 'flynn', 1, '#{first_item.id}'),
-          ('asg_audit_conflict', 'conflict', 'k1', 'flynn', 2, '#{second_item.id}');
-        UPDATE assignments
-        SET reviewsAssignmentId = 'asg_audit_target'
-        WHERE id = 'asg_audit_conflict';
-
-        INSERT INTO assignments
-          (id, subject, holderKey, openedByUser, openedAt)
-        VALUES
-          ('asg_cycle_a', 'cycle a', 'k1', 'flynn', 3),
-          ('asg_cycle_b', 'cycle b', 'k1', 'flynn', 4);
-        UPDATE assignments SET reviewsAssignmentId = 'asg_cycle_b' WHERE id = 'asg_cycle_a';
-        UPDATE assignments SET reviewsAssignmentId = 'asg_cycle_a' WHERE id = 'asg_cycle_b';
-        """
-      )
-
-    {:ok, before_rows} =
-      DB.query(
-        ctx.db,
-        """
-        SELECT id, workItemId, reviewsAssignmentId
-        FROM assignments
-        WHERE id LIKE 'asg_audit_%' OR id LIKE 'asg_cycle_%'
-        ORDER BY id
-        """
-      )
-
-    base_dir = role_test_base("review-item-audit")
-
-    log =
-      capture_log(fn ->
-        Gateway.children(gateway_config(base_dir, ctx.db, 0))
-      end)
-
-    assert log =~ "review_item_conflict legacy assignment=asg_audit_conflict"
-    assert log =~ "workItemId=#{second_item.id}"
-    assert log =~ "reviewedWorkItemId=#{inspect(first_item.id)}"
-
-    assert {:ok, ^before_rows} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT id, workItemId, reviewsAssignmentId
-               FROM assignments
-               WHERE id LIKE 'asg_audit_%' OR id LIKE 'asg_cycle_%'
-               ORDER BY id
-               """
-             )
+       %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_audit.exs",
+      "guarded-gateway-audit: ok"
+    )
   end
 
-  test "children mints a cli token when gateway.json is missing", ctx do
-    base_dir =
-      Path.join(System.tmp_dir!(), "gateway_missing_#{System.unique_integer([:positive])}")
-
-    Gateway.children(gateway_config(base_dir, ctx.db, 0))
-
-    assert %{"cliToken" => "tbc_" <> token} =
-             base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
-
-    assert token != ""
+  @tag cold_gateway: true, gateway_mint: true, tmp_dir: true
+  test "children mints a cli token when gateway.json is missing", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_missing.exs",
+      "guarded-gateway-missing: ok"
+    )
   end
 
-  test "fresh auth seeds Main while the model catalog is genuinely empty", ctx do
-    base_dir = role_test_base("fresh-auth-empty-catalog")
-    children = Gateway.children(gateway_config(base_dir, ctx.db, 0))
-
-    {Bandit, bandit_opts} = List.last(children)
-    {Tightbeam.Wire.Router, socket_deps} = Keyword.fetch!(bandit_opts, :plug)
-    socket_deps = %{socket_deps | conn_registry: ctx.registry}
-
-    empty_catalog(:not_derived)
-
-    {:pending, pending} =
-      Devices.pair(ctx.db, %{
-        device_id: "fresh-empty",
-        claimed_name: "Fresh Empty",
-        platform: nil,
-        model: nil
-      })
-
-    device = Devices.approve(ctx.db, pending.device_id)
-
-    {:ok, socket} = Tightbeam.Wire.Socket.init(socket_deps)
-    auth = %{"type" => "auth", "token" => device.token, "deviceId" => device.device_id}
-
-    assert {:push, _frames, _state} =
-             Tightbeam.Wire.Socket.handle_in({JSON.encode!(auth), opcode: :text}, socket)
-
-    assert %{harness: "claude", provider: "anthropic", model: %Model{family: "claude-fable-5"}} =
-             Org.get(ctx.db, Org.personal_session_key(device.user_id))
+  @tag cold_gateway: true, gateway_fresh_auth: true, tmp_dir: true
+  test "fresh auth seeds Main while the model catalog is genuinely empty", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_fresh_auth.exs",
+      "guarded-gateway-fresh-auth: ok"
+    )
   end
 
   # Both spellings of the routability question reach the running catalog: the
@@ -1921,41 +1695,15 @@ defmodule Tightbeam.GatewayTest do
     refute message =~ "for claude on host testhost: {:unavailable,"
   end
 
-  test "children refuses a broken harness on PATH without creating any org artifact", ctx do
-    base_dir =
-      Path.join(System.tmp_dir!(), "gateway_no_harness_#{System.unique_integer([:positive])}")
-
-    bin_dir =
-      Path.join(System.tmp_dir!(), "gateway_broken_bin_#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(bin_dir)
-    codex = Path.join(bin_dir, "codex")
-    File.write!(codex, "#!/bin/sh\necho broken >&2\nexit 1\n")
-    File.chmod!(codex, 0o755)
-    previous_path = System.get_env("PATH")
-    System.put_env("PATH", bin_dir)
-    File.rm_rf!(base_dir)
-
-    on_exit(fn ->
-      if previous_path,
-        do: System.put_env("PATH", previous_path),
-        else: System.delete_env("PATH")
-
-      File.rm_rf!(base_dir)
-      File.rm_rf!(bin_dir)
-    end)
-
-    exception =
-      assert_raise RuntimeError, fn ->
-        Gateway.children(gateway_config(base_dir, ctx.db, 0))
-      end
-
-    message = Exception.message(exception)
-
-    assert message =~ "no usable harness CLI"
-    assert message =~ "codex: exec failed"
-    assert message =~ "Install a registered harness CLI"
-    refute File.exists?(base_dir)
+  @tag cold_gateway: true, gateway_refusal: true, tmp_dir: true
+  test "children refuses a broken harness on PATH without creating any org artifact", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_refusal.exs",
+      "guarded-gateway-refusal: ok"
+    )
   end
 
   test "session projections never expose cli tokens", ctx do
@@ -2100,193 +1848,64 @@ defmodule Tightbeam.GatewayTest do
     assert_receive {:repair_close_adapter, ^adapter_key}
   end
 
-  test "children sweeps newer credentials from abandoned identity homes before adapters", ctx do
-    base_dir = Path.join(System.tmp_dir!(), "gateway_sweep_#{System.unique_integer([:positive])}")
-    auth_dir = Path.join([base_dir, "auth", "codex"])
-    abandoned = Path.join([base_dir, "homes", "default--abandoned", "codex"])
-    File.mkdir_p!(auth_dir)
-    File.mkdir_p!(abandoned)
-    store = Path.join(auth_dir, "auth.json")
-    rotated = Path.join(abandoned, "auth.json")
-    File.write!(store, "stale")
-    File.write!(rotated, "rotated")
-    File.touch!(store, {{2026, 1, 1}, {0, 0, 0}})
-    File.touch!(rotated, {{2026, 1, 2}, {0, 0, 0}})
-
-    Gateway.children(gateway_config(base_dir, ctx.db, 0))
-
-    assert File.read!(store) == "rotated"
+  @tag cold_gateway: true, gateway_no_harvest: true, tmp_dir: true
+  test "children preserves authoritative credentials without importing abandoned homes", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_no_harvest.exs",
+      "guarded-gateway-no-harvest: ok"
+    )
   end
 
-  test "children mints a cli token when gateway.json is corrupt", ctx do
-    base_dir =
-      Path.join(System.tmp_dir!(), "gateway_corrupt_#{System.unique_integer([:positive])}")
-
-    File.rm_rf!(base_dir)
-    File.mkdir_p!(base_dir)
-    File.write!(Path.join(base_dir, "gateway.json"), "not json")
-
-    Gateway.children(gateway_config(base_dir, ctx.db, 0))
-
-    assert %{"cliToken" => "tbc_" <> token} =
-             base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
-
-    assert token != ""
+  @tag cold_gateway: true, gateway_mint: true, tmp_dir: true
+  test "children mints a cli token when gateway.json is corrupt", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_corrupt.exs",
+      "guarded-gateway-corrupt: ok"
+    )
   end
 
-  test "children installs the release Rust CLI, and refuses instead of falling back", ctx do
-    repo_dir =
-      Path.join(
-        System.tmp_dir!(),
-        "gateway_cli_install_#{System.unique_integer([:positive])}"
-      )
+  @tag cold_gateway: true, gateway_source_layout: true, tmp_dir: true
+  test "children installs the release Rust CLI, and refuses instead of falling back", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      Path.join(tmp, "copy"),
+      "live_base_gateway_source_copy.exs",
+      "guarded-gateway-source-copy: ok"
+    )
 
-    rust_cli = Path.join(repo_dir, "cli/target/release/tightbeam")
-    rust_base = Path.join(repo_dir, "rust-base")
-    fallback_base = Path.join(repo_dir, "fallback-base")
-    File.mkdir_p!(Path.dirname(rust_cli))
-    File.write!(rust_cli, "rust-cli-binary")
-
-    on_exit(fn -> File.rm_rf!(repo_dir) end)
-
-    File.cd!(repo_dir, fn ->
-      Gateway.children(gateway_config(rust_base, ctx.db, 0))
-      installed = Path.join(rust_base, "bin/tightbeam")
-      assert File.read!(installed) == "rust-cli-binary"
-      assert File.stat!(installed).mode |> Bitwise.band(0o777) == 0o755
-
-      File.rm!(rust_cli)
-      Gateway.children(gateway_config(fallback_base, ctx.db, 0))
-      fallback = Path.join(fallback_base, "bin/tightbeam")
-      body = File.read!(fallback)
-
-      # This test's subject is unchanged — what gets installed at bin/tightbeam
-      # when the Rust CLI is absent — but the answer is now the OPPOSITE of its old
-      # name. There is deliberately no fallback: it pointed at the retired
-      # TypeScript CLI in a sibling checkout, so on a machine that had one the
-      # operator silently ran a different implementation than the gateway that
-      # installed it, and on a machine without one an executable that died on a
-      # path they never chose.
-      refute body =~ "exec node"
-      refute body =~ "dist/cli/main.js"
-
-      assert body =~ "tightbeam CLI is not installed"
-      assert body =~ "cargo build --release --manifest-path cli/Cargo.toml"
-      assert body =~ rust_cli
-      assert File.stat!(fallback).mode |> Bitwise.band(0o777) == 0o755
-
-      # Executed, not merely matched: it must actually refuse.
-      assert {refusal, 127} = System.cmd(fallback, ["list"], stderr_to_stdout: true)
-      assert refusal =~ "tightbeam CLI is not installed"
-      assert refusal =~ "cargo build --release"
-    end)
+    Tightbeam.GuardRuntimeFixture.run!(
+      Path.join(tmp, "missing"),
+      "live_base_gateway_source_missing.exs",
+      "guarded-gateway-source-missing: ok"
+    )
   end
 
-  test "children installs the CLI from the RELEASE layout when there is no source tree", ctx do
-    # The release-install defect both first-install agents found within minutes
-    # of each other (macOS and linux, 2026-08-04): the seeding knew only
-    # cli/target/release, so every npm install got a bin/tightbeam telling a
-    # toolchain-free customer to run cargo. In a release, the compiled CLI is
-    # the npm package's own bin — a sibling of RELEASE_ROOT.
-    pkg_dir =
-      Path.join(System.tmp_dir!(), "gateway_release_cli_#{System.unique_integer([:positive])}")
-
-    release_root = Path.join(pkg_dir, "release")
-    File.mkdir_p!(Path.join(pkg_dir, "bin"))
-    File.mkdir_p!(release_root)
-    File.write!(Path.join(pkg_dir, "bin/tightbeam"), "release-cli-binary")
-
-    # cwd deliberately holds NO cli/target — a customer box has no source tree.
-    cwd = Path.join(pkg_dir, "cwd")
-    File.mkdir_p!(cwd)
-    base = Path.join(pkg_dir, "base")
-
-    previous = System.get_env("RELEASE_ROOT")
-    System.put_env("RELEASE_ROOT", release_root)
-
-    on_exit(fn ->
-      if previous,
-        do: System.put_env("RELEASE_ROOT", previous),
-        else: System.delete_env("RELEASE_ROOT")
-
-      File.rm_rf!(pkg_dir)
-    end)
-
-    File.cd!(cwd, fn ->
-      Gateway.children(gateway_config(base, ctx.db, 0))
-      installed = Path.join(base, "bin/tightbeam")
-      assert File.read!(installed) == "release-cli-binary"
-      assert File.stat!(installed).mode |> Bitwise.band(0o777) == 0o755
-    end)
+  @tag cold_gateway: true, gateway_release_layout: true, tmp_dir: true
+  test "children installs the CLI from the RELEASE layout when there is no source tree", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_release_layout.exs",
+      "guarded-gateway-release-layout: ok"
+    )
   end
 
+  @tag cold_gateway: true, gateway_shim: true, tmp_dir: true
   test "children installs the codex hook-trust shim and preserves missing or self-resolved codex",
-       ctx do
-    root =
-      Path.join(
-        System.tmp_dir!(),
-        "gateway_codex_shim_#{System.unique_integer([:positive])}"
+       %{tmp_dir: tmp} do
+    for phase <- ["copy", "missing", "self"] do
+      Tightbeam.GuardRuntimeFixture.run!(
+        Path.join(tmp, phase),
+        "live_base_gateway_shim_#{phase}.exs",
+        "guarded-gateway-shim-#{phase}: ok"
       )
-
-    real_bin = Path.join(root, "real-bin")
-    real_codex = Path.join(real_bin, "codex")
-    shim_base = Path.join(root, "shim-base")
-    missing_bin = Path.join(root, "missing-bin")
-    missing_base = Path.join(root, "missing-base")
-    self_base = Path.join(root, "self-base")
-    self_codex = Path.join(self_base, "bin/codex")
-    original_path = System.get_env("PATH")
-    git = System.find_executable("git")
-
-    File.mkdir_p!(real_bin)
-    File.write!(real_codex, "#!/bin/sh\n")
-    File.chmod!(real_codex, 0o755)
-    File.ln_s!(git, Path.join(real_bin, "git"))
-    File.mkdir_p!(missing_bin)
-    File.ln_s!(git, Path.join(missing_bin, "git"))
-    File.mkdir_p!(Path.dirname(self_codex))
-    File.write!(self_codex, "self-sentinel")
-    File.chmod!(self_codex, 0o755)
-    File.ln_s!(git, Path.join(Path.dirname(self_codex), "git"))
-
-    for base <- [shim_base, missing_base, self_base], do: Identity.init!(base)
-
-    on_exit(fn ->
-      File.rm_rf!(root)
-
-      if original_path do
-        System.put_env("PATH", original_path)
-      else
-        System.delete_env("PATH")
-      end
-    end)
-
-    System.put_env("PATH", real_bin)
-
-    Gateway.children(gateway_config(shim_base, ctx.db, 0))
-
-    shim = Path.join(shim_base, "bin/codex")
-
-    assert File.read!(shim) ==
-             "#!/bin/sh\nexec \"#{real_codex}\" --dangerously-bypass-hook-trust \"$@\"\n"
-
-    assert File.stat!(shim).mode |> Bitwise.band(0o777) == 0o755
-
-    System.put_env("PATH", missing_bin)
-
-    assert_raise RuntimeError, ~r/no registered harness CLI is installed/, fn ->
-      Gateway.children(gateway_config(missing_base, ctx.db, 0))
     end
-
-    refute File.exists?(Path.join(missing_base, "bin/codex"))
-
-    System.put_env("PATH", Path.dirname(self_codex))
-
-    assert_raise RuntimeError, ~r/no usable harness CLI/, fn ->
-      Gateway.children(gateway_config(self_base, ctx.db, 0))
-    end
-
-    assert File.read!(self_codex) == "self-sentinel"
   end
 
   test "wake idempotency replays one scheduled wake", ctx do
@@ -2458,125 +2077,24 @@ defmodule Tightbeam.GatewayTest do
              )
   end
 
-  test "role wakes late-bind at fire time and deleted roles fail visibly", ctx do
-    base_dir = role_test_base("late-bind")
-    config = gateway_config(base_dir, ctx.db, 0)
-    children = Gateway.children(config)
-    {Wakes, wake_opts} = Enum.find(children, &match?({Wakes, _}, &1))
-    scheduler = :"role_wakes_#{System.unique_integer([:positive])}"
-
-    start_supervised!(%{
-      id: :role_conn_registry,
-      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-    })
-
-    start_supervised!({Wakes, Keyword.put(wake_opts, :name, scheduler)})
-
-    old = create_session(ctx.db, "agent:old", "flynn")
-    new = create_session(ctx.db, "agent:new", "flynn")
-    Roles.create!(ctx.db, "reviewer", "flynn", old.session_key)
-    wake_handler = Gateway.handlers(Map.put(config, :wake_scheduler, scheduler))["wake"]
-    future = System.system_time(:millisecond) + 60_000
-
-    scheduled =
-      wake_handler.(%{
-        origin: "user:flynn",
-        session_key: old.session_key,
-        target_role: "reviewer",
-        role_fallback: false,
-        params: %{prompt: "review this", at: future}
-      })
-
-    assert Wakes.get(ctx.db, scheduled.wake_id).target_role == "reviewer"
-    assert :ok = Roles.bind(ctx.db, "reviewer", new.session_key)
-
-    {:ok, _} =
-      DB.query(ctx.db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [scheduled.wake_id])
-
-    assert :ok = Wakes.fire_due(scheduler)
-
-    assert {:ok, [["agent:new", "reviewer", 0]]} =
-             DB.query(
-               ctx.db,
-               "SELECT sessionKey, roleRef, roleFallback FROM turns WHERE wakeId = ?1",
-               [scheduled.wake_id]
-             )
-
-    deleted =
-      wake_handler.(%{
-        origin: "user:flynn",
-        session_key: new.session_key,
-        target_role: "reviewer",
-        role_fallback: false,
-        params: %{prompt: "will disappear", at: future}
-      })
-
-    assert :ok = Roles.rm(ctx.db, "reviewer")
-    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt = 0 WHERE wakeId = ?1", [deleted.wake_id])
-    assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, deleted.wake_id).state == "fired"
-
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [deleted.wake_id])
-
-    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "wake_unresolved" and event.subject == deleted.wake_id and
-               event.detail == "role reviewer no longer exists"
-           end)
+  @tag cold_gateway: true, gateway_role_binding: true, tmp_dir: true
+  test "role wakes late-bind at fire time and deleted roles fail visibly", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_role_binding.exs",
+      "guarded-gateway-role-binding: ok"
+    )
   end
 
-  test "removed role makes a notice batch terminally fail instead of claiming delivery", ctx do
-    base_dir = role_test_base("batched-role-removal")
-    config = gateway_config(base_dir, ctx.db, 0)
-    {Wakes, wake_opts} = Gateway.children(config) |> Enum.find(&match?({Wakes, _}, &1))
-    scheduler = :"batched_role_wakes_#{System.unique_integer([:positive])}"
-
-    start_supervised!(%{
-      id: :batched_role_conn_registry,
-      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-    })
-
-    start_supervised!({Wakes, Keyword.put(wake_opts, :name, scheduler)})
-
-    recipient = create_session(ctx.db, "agent:batch-recipient", "flynn")
-    Roles.create!(ctx.db, "batch-recipient", "flynn", recipient.session_key)
-
-    {:ok, _policy} =
-      DB.transaction(ctx.db, fn txn ->
-        Org.apply_notice_batching_lane_policy_in_txn(
-          txn,
-          %{session_key: recipient.session_key, target_role: "batch-recipient"},
-          true,
-          "notice-batching-test-policy:role-removal",
-          "agent:test-policy",
-          "role-removal-regression",
-          1
-        )
-      end)
-
-    source =
-      Wakes.schedule(ctx.db, %{
-        session_key: recipient.session_key,
-        target_role: "batch-recipient",
-        origin: "process:tightbeam",
-        prompt: "batched role delivery",
-        due_at: 0,
-        class: "fyi"
-      })
-
-    [carrier_id] = Wakes.materialize_digests(ctx.db, source.due_at)
-    [%{batch_id: batch_id}] = NoticeBatcher.source_refs(ctx.db, source.wake_id)
-    assert :ok = Roles.rm(ctx.db, "batch-recipient")
-    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [carrier_id])
-
-    assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, carrier_id).state == "fired"
-
-    assert %{state: "delivery_failed", terminal_cause: ":skipped"} =
-             NoticeBatcher.batch(ctx.db, batch_id)
-
-    assert {:ok, [[0]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [carrier_id])
+  @tag cold_gateway: true, gateway_removed_batch: true, tmp_dir: true
+  test "removed role makes a notice batch terminally fail instead of claiming delivery", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_removed_batch.exs",
+      "guarded-gateway-removed-batch: ok"
+    )
   end
 
   test "inspect exposes batch refs and denies a batch when any source is unauthorized", ctx do
@@ -2651,105 +2169,15 @@ defmodule Tightbeam.GatewayTest do
     refute Enum.any?(denied.wakes, &(&1.wake_id == second.wake_id))
   end
 
-  test "Gateway.children effort consumer routes a due dispatch bracket through Wakes once", ctx do
-    base_dir = role_test_base("effort-wake-seam")
-
-    config =
-      gateway_config(base_dir, ctx.db, 0)
-      |> Map.put(:effort_checkin_horizon_ms, 1)
-      # Injected at the SHELL: the real observation command is built, run and
-      # parsed; only what a filesystem would have said is supplied.
-      |> Map.put(:sh, fn _invocation -> {"B\tobserved\t0\n/w\n", 0} end)
-
-    {Wakes, wake_opts} =
-      config
-      |> Gateway.children()
-      |> Enum.find(&match?({Wakes, _}, &1))
-
-    scheduler = :"effort_wakes_#{System.unique_integer([:positive])}"
-
-    start_supervised!(%{
-      id: :effort_conn_registry,
-      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-    })
-
-    start_supervised!({Wakes, Keyword.put(wake_opts, :name, scheduler)})
-
-    create_session(ctx.db, "effort-parent", "flynn")
-
-    :ok =
-      DB.execute(ctx.db, "UPDATE sessions SET spawnedBy='effort-parent' WHERE sessionKey='k1'")
-
-    assignment =
-      Gateway.handlers(config)["dispatch"].(%{
-        verb: "dispatch",
-        origin: "agent:effort-parent",
-        principal: {:session, "effort-parent"},
-        session_key: "k1",
-        target_role: nil,
-        role_fallback: false,
-        params: %{subject: "scheduler seam", brief: "exercise the real effort wake route"}
-      })
-
-    {:ok, [[wake_id]]} =
-      DB.query(
-        ctx.db,
-        "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-        [assignment.id]
-      )
-
-    assert %{consumer: "effort_probe", state: "pending"} = Wakes.get(ctx.db, wake_id)
-    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [wake_id])
-
-    # Rung one prods the HOLDER and re-arms; the owner's request is rung two.
-    assert :ok = Wakes.fire_due(scheduler)
-
-    {:ok, [[rearmed_wake_id]]} =
-      DB.query(
-        ctx.db,
-        "SELECT wakeId FROM effort_checkin_generations WHERE assignmentId=?1 AND state='armed'",
-        [assignment.id]
-      )
-
-    {:ok, _} = DB.query(ctx.db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [rearmed_wake_id])
-    assert :ok = Wakes.fire_due(scheduler)
-
-    assert {:ok, [[request_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT id FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
-               [assignment.id]
-             )
-
-    assert is_binary(request_id)
-    assert Wakes.get(ctx.db, wake_id).state == "fired"
-
-    # The expecter notification is a durable ungated wake armed with the request,
-    # still pending: the same tick that opened the request delivers nothing.
-    assert {:ok, [[notify_id]]} =
-             DB.query(
-               ctx.db,
-               "SELECT wakeId FROM wakes WHERE targetGate = 0 AND state = 'pending'"
-             )
-
-    assert %{consumer: "prompt", session_key: expecter} = Wakes.get(ctx.db, notify_id)
-
-    # The next ordinary tick delivers it through the gateway's own configured
-    # prompt closure — real ConnRegistry, real lane nudge, one turn.
-    assert :ok = Wakes.fire_due(scheduler)
-    assert Wakes.get(ctx.db, notify_id).state == "fired"
-
-    assert {:ok, [[1]]} =
-             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId = ?1", [notify_id])
-
-    assert_received {:ensure_lane, ^expecter}
-
-    assert {:ok, [[1]]} =
-             DB.query(
-               ctx.db,
-               "SELECT COUNT(*) FROM decision_requests WHERE kind='effort' AND assignmentId=?1",
-               [assignment.id]
-             )
+  @tag cold_gateway: true, gateway_effort: true, tmp_dir: true
+  test "Gateway.children effort consumer routes a due dispatch bracket through Wakes once", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_effort.exs",
+      "guarded-gateway-effort: ok"
+    )
   end
 
   test "spawn --name creates a bound role and role_exists rolls back the session", ctx do
@@ -2964,7 +2392,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "registered fixture is selectable as the default spawn path and by tune", ctx do
     base_dir = role_test_base("fixture-default")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -2999,8 +2427,7 @@ defmodule Tightbeam.GatewayTest do
              harness: "fixture",
              provider: "fixture_provider",
              model: %Model{family: "fixture-model"}
-           } =
-             Org.get(ctx.db, spawned_key)
+           } = Org.get(ctx.db, spawned_key)
 
     assert %{ok: true, harness: "fixture", model: "fixture-model", effort: nil} =
              handlers["tune"].(%{
@@ -3017,13 +2444,13 @@ defmodule Tightbeam.GatewayTest do
 
     fixture_home = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
 
-    assert File.read_link!(Path.join(fixture_home, "fixture.json")) ==
-             Path.join(auth_dir, "fixture.json")
+    assert File.read!(Path.join(fixture_home, "fixture.json")) == "fixture-token"
+    assert {:ok, %{type: :regular}} = File.lstat(Path.join(fixture_home, "fixture.json"))
   end
 
   test "a harness swap leaves a tombstone ABOVE its own barrier", ctx do
     base_dir = role_test_base("swap-tombstone")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -3080,7 +2507,7 @@ defmodule Tightbeam.GatewayTest do
 
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), Org.get(ctx.db, "swapme"))
 
-    assert File.read!(Path.join(cwd, ".fixture/skills/tightbeam__worktree-session/SKILL.md"))
+    assert File.read!(Path.join(cwd, ".fixture/skills/tightbeam__model-release-intake/SKILL.md"))
 
     refute guidance =~ "[engine swap]"
 
@@ -3120,7 +2547,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "a failure between the barrier and its tombstone rolls BOTH back", ctx do
     base_dir = role_test_base("swap-atomic")
-    auth_dir = Path.join([base_dir, "auth", "fixture"])
+    auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :fixture)
     adapter = Path.join([base_dir, "adapters", "node_modules", ".bin", "fixture-acp"])
     File.mkdir_p!(auth_dir)
     File.write!(Path.join(auth_dir, "fixture.json"), "fixture-token")
@@ -3359,6 +2786,41 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[^before_count]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM sessions")
     assert Roles.get(ctx.db, "unready") == nil
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-unready") == nil
+  end
+
+  test "Pi spawn validates the selected catalog provider independently", ctx do
+    base_dir = role_test_base("spawn-pi-selected-provider", false)
+    Archetypes.load!(base_dir)
+
+    put_host_catalog("testhost", "pi", [
+      {"spark/qwen3.5-35b", [], :local_openai}
+    ])
+
+    config =
+      gateway_config(base_dir, ctx.db, 0)
+      |> Map.put(:default_harness, :pi)
+      |> Map.put(:default_model, Model.new("spark/qwen3.5-35b"))
+      |> Map.put(:credential_status, fn
+        :local_openai, "testhost" -> {:needs_onboarding, :missing}
+        :opencode_go, "testhost" -> raise "unrelated OpenCode credential was consulted"
+      end)
+
+    assert %{
+             code: "placement_denied",
+             detail: %{code: "needs_onboarding"},
+             message: message
+           } =
+             Gateway.handlers(config)["spawn"].(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Spark selected provider",
+                 idempotency_key: "spawn-pi-selected-provider"
+               }
+             })
+
+    assert message =~ "local_openai"
+    refute message =~ "opencode_go"
   end
 
   test "spawn uses the next where host when the first cannot run the requested harness", ctx do
@@ -3731,7 +3193,7 @@ defmodule Tightbeam.GatewayTest do
       Supervisor.delete_child(Tightbeam.Supervisor, child_id)
     end)
 
-    assert %{host: ^machine} =
+    assert %{host: %{"host" => ^machine}} =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -3780,13 +3242,13 @@ defmodule Tightbeam.GatewayTest do
       # bound itself, which is the racing regime; 3.5s is the middle of the only
       # room the interval leaves. Widening past 5s would not be a safer budget,
       # it would be a different and weaker test.
-      assert %{host: ^machine} = Task.await(reregister, 3_500)
+      assert %{host: %{"host" => ^machine}} = Task.await(reregister, 3_500)
       assert GenServer.whereis(server) == first_pid
     after
       :ok = :sys.resume(first_pid)
     end
 
-    assert %{host: ^machine} =
+    assert %{host: %{"host" => ^machine}} =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -3843,30 +3305,45 @@ defmodule Tightbeam.GatewayTest do
         }
       })
 
-    assert set.host == host
-    assert set.harness == "claude"
-    assert set.name == "EXAMPLE_OVERLAY_VAR"
-    assert set.value == "example"
-    assert set.set_by == "user:flynn"
-    assert is_integer(set.set_at)
+    assert set.changed
+    assert set.host_environment["host"] == host
+    assert set.host_environment["harness"] == "claude"
+    assert set.host_environment["name"] == "EXAMPLE_OVERLAY_VAR"
+    assert set.host_environment["value"] == nil
+    assert set.host_environment["valuePresent"]
+    assert is_integer(set.host_environment["updatedAt"])
+    assert set.host_environment["rowVersion"] == 1
+    assert [stored] = Placement.env_overlays(ctx.db)
+    assert stored.value == "example"
+    assert stored.set_by == "user:flynn"
+    assert is_integer(stored.set_at)
     assert set.effect == "takes effect on next claude adapter start on #{host}"
 
     assert %{overlays: [listed]} =
              handlers["host-env-list"].(%{
-               origin: "agent:operator",
+               origin: "user:flynn",
                params: %{host: host, harness: "claude"}
              })
 
-    assert listed == Map.delete(set, :effect)
+    assert listed == set.host_environment
 
-    assert %{host: ^host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR", removed: true} =
+    assert %{
+             host_environment: %{
+               "host" => ^host,
+               "harness" => "claude",
+               "name" => "EXAMPLE_OVERLAY_VAR",
+               "valuePresent" => false
+             },
+             changed: true,
+             removed: true
+           } =
              handlers["host-env-unset"].(%{
                origin: "user:flynn",
                params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
              })
 
-    assert %{overlays: []} =
-             handlers["host-env-list"].(%{origin: "agent:operator", params: %{}})
+    assert %{overlays: [%{"value" => nil, "valuePresent" => false, "rowVersion" => 2}]} =
+             handlers["host-env-list"].(%{origin: "user:flynn", params: %{}})
   end
 
   test "host-env-set names every reserved and malformed boundary refusal", ctx do
@@ -3945,7 +3422,8 @@ defmodule Tightbeam.GatewayTest do
     assert Placement.env_overlays(ctx.db) == []
   end
 
-  test "host env writes refuse a resolved non-admin agent while list stays readable", ctx do
+  test "host env writes and canonical list enforce admin while preserving attributed storage",
+       ctx do
     handlers = Gateway.handlers(%{db: ctx.db})
     host = Placement.local_host_name()
 
@@ -3962,7 +3440,7 @@ defmodule Tightbeam.GatewayTest do
     operator = create_session(ctx.db, "operator-session", "operator")
     Roles.create!(ctx.db, "operator", "operator", operator.session_key)
 
-    assert %{set_by: "user:flynn"} =
+    assert %{host_environment: %{"valuePresent" => true, "value" => nil}} =
              handlers["host-env-set"].(%{
                origin: "user:flynn",
                params: %{
@@ -3990,11 +3468,24 @@ defmodule Tightbeam.GatewayTest do
                params: %{host: host, harness: "claude", name: "EXAMPLE_OVERLAY_VAR"}
              })
 
-    assert %{overlays: [%{name: "EXAMPLE_OVERLAY_VAR", value: "example"}]} =
+    assert %{code: "forbidden", message: "admin required"} =
              handlers["host-env-list"].(%{
                origin: "agent:operator",
                params: %{host: host, harness: "claude"}
              })
+
+    assert %{
+             overlays: [
+               %{"name" => "EXAMPLE_OVERLAY_VAR", "value" => nil, "valuePresent" => true}
+             ]
+           } =
+             handlers["host-env-list"].(%{
+               origin: "user:flynn",
+               params: %{host: host, harness: "claude"}
+             })
+
+    assert [%{name: "EXAMPLE_OVERLAY_VAR", value: "example", set_by: "user:flynn"}] =
+             Placement.env_overlays(ctx.db)
   end
 
   test "host-toolchain-set replaces one ordered registry row set and previews the PATH switch",
@@ -4044,8 +3535,7 @@ defmodule Tightbeam.GatewayTest do
              host: ^host,
              dirs: [],
              effect: "this host's adapter PATH now keeps the inherited value unchanged"
-           } =
-             set.(%{origin: "user:flynn", params: %{host: host, dirs: []}})
+           } = set.(%{origin: "user:flynn", params: %{host: host, dirs: []}})
 
     assert {:ok, []} = DB.query(ctx.db, "SELECT host FROM host_toolchain_dirs")
   end
@@ -4127,14 +3617,14 @@ defmodule Tightbeam.GatewayTest do
   test "add-user lets an admin add admins and non-admins but refuses a non-admin", ctx do
     handler = Gateway.handlers(gateway_config(ctx.catalog_base, ctx.db, 0))["add-user"]
 
-    assert %{user: %{user_id: "second-admin", is_admin: true}} =
+    assert %{user: %{"userId" => "second-admin", "isAdmin" => true}} =
              handler.(%{
                origin: "user:flynn",
                session_key: nil,
                params: %{user_id: "second-admin", is_admin: true}
              })
 
-    assert %{user: %{user_id: "guest", is_admin: false}} =
+    assert %{user: %{"userId" => "guest", "isAdmin" => false}} =
              handler.(%{
                origin: "user:second-admin",
                session_key: nil,
@@ -4236,7 +3726,7 @@ defmodule Tightbeam.GatewayTest do
     # server with a foreign base_dir + non-nil ssh wedges every local spawn
     # until restart (fail-closed), and Placement.hosts/1 ignores the registry
     # entry for the local name anyway.
-    assert %{host: ^local} =
+    assert %{host: %{"host" => ^local}} =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -4293,7 +3783,7 @@ defmodule Tightbeam.GatewayTest do
 
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, sh))
 
-    assert %{host: ^machine} =
+    assert %{host: %{"host" => ^machine}} =
              handlers["register-host"].(%{
                origin: "user:flynn",
                session_key: nil,
@@ -4394,8 +3884,7 @@ defmodule Tightbeam.GatewayTest do
       start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
     })
 
-    spawn =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
 
     assert %{session_key: session_key} =
              spawn.(%{
@@ -4477,8 +3966,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: true} = retune.("gateway-only-model")
 
-    assert %{code: "model_unavailable", message: gateway_message} =
-             retune.("worker-only-model")
+    assert %{code: "model_unavailable", message: gateway_message} = retune.("worker-only-model")
 
     assert gateway_message =~ "on host testhost"
   end
@@ -4686,8 +4174,7 @@ defmodule Tightbeam.GatewayTest do
       {"", 0}
     end
 
-    spawn =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
 
     invalid = [
       nil,
@@ -5062,7 +4549,18 @@ defmodule Tightbeam.GatewayTest do
     # a leaked one would answer for every later test in the run. ExUnit owning
     # its lifecycle is what keeps that from happening.
     defp owner!(base) do
-      start_supervised!({Credentials, name: Credentials, base_dir: base, machine: "kindhost"})
+      home = Tightbeam.Homes.home_path(base, "kindhost", :claude)
+      warm = ["env", "CLAUDE_CONFIG_DIR=#{home}", "claude", "-p", "ok", "--model", "sonnet"]
+
+      runner = fn argv ->
+        assert argv == warm, "unexpected credential fixture command: #{inspect(argv)}"
+        {"", 0}
+      end
+
+      start_supervised!(
+        {Credentials, name: Credentials, base_dir: base, machine: "kindhost", sh: runner}
+      )
+
       Credentials
     end
 
@@ -5102,7 +4600,7 @@ defmodule Tightbeam.GatewayTest do
     end
 
     test "an unreadable credential store refuses status instead of reporting none", ctx do
-      store = Path.join([ctx.cred_base, "auth", "claude"])
+      store = Tightbeam.Homes.home_path(ctx.cred_base, "kindhost", :claude)
       target = Path.join(ctx.cred_base, "credential-target")
       File.mkdir_p!(target)
       File.mkdir_p!(Path.dirname(store))
@@ -5126,6 +4624,61 @@ defmodule Tightbeam.GatewayTest do
 
       # The session row was never touched between the two reads.
       assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
+    end
+
+    test "a Pi session reports the persisted local provider's credential kind", ctx do
+      store = Providers.provider_path(ctx.cred_base, "spark")
+      File.mkdir_p!(Path.dirname(store))
+
+      File.write!(
+        store,
+        JSON.encode!(%{
+          "name" => "spark",
+          "type" => "local-openai",
+          "endpoint" => "https://spark.example/v1"
+        })
+      )
+
+      metadata =
+        Path.join([
+          ctx.cred_base,
+          "homes",
+          "kindhost",
+          "pi",
+          ".tightbeam",
+          "local-openai-credential.json"
+        ])
+
+      File.mkdir_p!(Path.dirname(metadata))
+      File.write!(metadata, JSON.encode!(%{"provider" => "local_openai", "kind" => "api_key"}))
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE sessions SET harness = 'pi', provider = 'local_openai' WHERE sessionKey = 'k-kind'"
+        )
+
+      owner!(ctx.cred_base)
+
+      assert Gateway.session_status("k-kind", ctx.db).display.credentialKind == "apiKey"
+    end
+
+    test "an unknown persisted Pi provider fails closed instead of selecting OpenCode", ctx do
+      :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints = ON")
+
+      try do
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "UPDATE sessions SET harness = 'pi', provider = 'provider-from-nowhere' WHERE sessionKey = 'k-kind'"
+          )
+
+        assert_raise ArgumentError, ~r/unsupported persisted Pi credential provider/, fn ->
+          Gateway.session_status("k-kind", ctx.db)
+        end
+      after
+        :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints = OFF")
+      end
     end
   end
 
@@ -5417,8 +4970,7 @@ defmodule Tightbeam.GatewayTest do
 
     status = Gateway.session_status("k-wire", ctx.db)
 
-    wide =
-      Enum.find(status.modelCatalog.models, &(&1.context == "1m"))
+    wide = Enum.find(status.modelCatalog.models, &(&1.context == "1m"))
 
     # OUTBOUND: the fields are named. `context` is a field a client can read,
     # not a bracket it would have to split off a string itself.
@@ -6225,8 +5777,7 @@ defmodule Tightbeam.GatewayTest do
       if hd(command) == "rsync", do: {"copy failed", 23}, else: {"", 0}
     end
 
-    tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
 
     result =
       tune.(%{
@@ -6249,8 +5800,7 @@ defmodule Tightbeam.GatewayTest do
       {"", 0}
     end
 
-    tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
 
     assert tune.(%{
              origin: "user:flynn",
@@ -6269,8 +5819,7 @@ defmodule Tightbeam.GatewayTest do
       if String.contains?(List.last(command), "test -f"), do: {"", 1}, else: {"", 0}
     end
 
-    tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
 
     assert %{code: "host_unready", message: message} =
              tune.(%{
@@ -6306,7 +5855,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "model-free session-control round trip uses each destination harness default", ctx do
     base_dir = role_test_base("harness-destination-default-round-trip")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     Archetypes.load!(base_dir)
@@ -6491,88 +6040,19 @@ defmodule Tightbeam.GatewayTest do
     assert Org.get(ctx.db, "k1") == before_refusal
   end
 
+  @tag timeout: 180_000
+  @tag cold_gateway: true, gateway_harness_switch: true, tmp_dir: true
   test "set_harness changes the engine and projects its home at a turn boundary", ctx do
-    base_dir = role_test_base("harness-turn-boundary")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
-    File.mkdir_p!(codex_auth)
-    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
-    Archetypes.load!(base_dir)
-    ensure_global_registry()
-
-    config =
-      gateway_config(base_dir, ctx.db, 0)
-      |> Map.put(:conn_registry, ctx.registry)
-      |> Map.put(:lane_manager, ctx.lane)
-
-    {Tightbeam.LaneManager, lane_opts} =
-      config
-      |> Gateway.children()
-      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-
-    local_host = Placement.local_host_name()
-    Org.set_host(ctx.db, "k1", local_host)
-    put_host_catalog(local_host, "codex", [])
-
-    put_host_catalog_entry(local_host, "codex", %{
-      family: "gpt-5.6-sol",
-      efforts: ["medium"],
-      provider: :openai
-    })
-
-    start_lane!(ctx.db, "k1", runner)
-
-    assert %{ok: true, harness: "codex", model: "gpt-5.6-sol", effort: "medium"} =
-             Gateway.handlers(config)["tune"].(%{
-               origin: "user:flynn",
-               session_key: "k1",
-               params: %{
-                 setting: "set_harness",
-                 harness: "codex",
-                 model: "gpt-5.6-sol",
-                 effort: "medium"
-               }
-             })
-
-    assert %{harness: "codex", provider: "openai", model: model} = Org.get(ctx.db, "k1")
-    assert model == Model.new("gpt-5.6-sol", effort: "medium")
-
-    home = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
-
-    assert JSON.decode!(File.read!(Path.join([home, ".tightbeam", "manifest"])))["harness"] ==
-             "codex"
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "next turn",
-               db: ctx.db,
-               conn_registry: ctx.registry,
-               lane_manager: ctx.lane,
-               device_id: "d1",
-               client_message_id: "after-harness-switch"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
-
-    assert_receive {:adapter_key, {:codex, "shared", ^local_host}}
-    assert_receive {:new_session_mcp_servers, _mcp_servers}, @cold_runner_prompt_timeout
-    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
-
-    send(adapter, :continue_prompt)
-    assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-    publish.("delivered")
-
-    assert %{harness_session_id: "harness-1", harness: "codex"} =
-             Org.current_pointer(ctx.db, "k1")
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_harness_switch.exs",
+      "guarded-gateway-harness-switch: ok"
+    )
   end
 
   test "a committed harness replacement reports and records an unverified source close", ctx do
     base_dir = role_test_base("harness-unverified-source-close")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     Archetypes.load!(base_dir)
@@ -6637,7 +6117,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "set_harness refuses before writing the new home while a turn runs", ctx do
     base_dir = role_test_base("harness-running-turn")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     Archetypes.load!(base_dir)
@@ -6649,7 +6129,6 @@ defmodule Tightbeam.GatewayTest do
 
     local_host = Placement.local_host_name()
     Org.set_host(ctx.db, "k1", local_host)
-    before = Org.get(ctx.db, "k1")
     put_host_catalog(local_host, "codex", [])
 
     put_host_catalog_entry(local_host, "codex", %{
@@ -6677,8 +6156,11 @@ defmodule Tightbeam.GatewayTest do
     end)
 
     assert_receive {:set_harness_turn_started, runner}
+    before = Org.get(ctx.db, "k1")
+    assert before.mechanical_status == "running"
     home = Tightbeam.Homes.home_path(base_dir, local_host, :codex)
-    refute File.exists?(home)
+    assert File.read!(Path.join(home, "auth.json")) == "test-token"
+    refute File.exists?(Path.join([home, ".tightbeam", "manifest"]))
 
     assert %{ok: false, code: "turn_in_progress", message: message} =
              Gateway.handlers(config)["tune"].(%{
@@ -6694,7 +6176,8 @@ defmodule Tightbeam.GatewayTest do
 
     assert message =~ "Try again once the current turn finishes"
     assert Org.get(ctx.db, "k1") == before
-    refute File.exists?(home)
+    assert File.read!(Path.join(home, "auth.json")) == "test-token"
+    refute File.exists?(Path.join([home, ".tightbeam", "manifest"]))
     send(runner, :finish_set_harness_turn)
   end
 
@@ -6706,7 +6189,7 @@ defmodule Tightbeam.GatewayTest do
   # and was refused by the other as "not offered by codex on testhost" (#69).
   test "set_harness accepts the bare model id the picker advertises", ctx do
     base_dir = role_test_base("harness-bare-model")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     Archetypes.load!(base_dir)
@@ -6749,7 +6232,7 @@ defmodule Tightbeam.GatewayTest do
 
   test "set_harness keeps an overridden identity name and projects the new harness home", ctx do
     base_dir = role_test_base("harness-override")
-    codex_auth = Path.join([base_dir, "auth", "codex"])
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     put_skill!(base_dir, "review", "# Review")
@@ -6835,8 +6318,7 @@ defmodule Tightbeam.GatewayTest do
       sender: "process:tightbeam"
     ]
 
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "conversation", common)
+    assert :appended = Gateway.deliver_prompt("k1", "user:flynn", "conversation", common)
 
     assert :appended =
              Gateway.deliver_prompt(
@@ -6874,312 +6356,35 @@ defmodule Tightbeam.GatewayTest do
   # also 60_000, so the budget would be capped by the test timeout and would report
   # as "test timed out" rather than naming the wait that actually ran out. Raise the
   # ceiling above the budget it contains.
-  @tag timeout: 180_000
-  test "one turn stores and publishes distinct ACP assistant messages as separate records", ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :boundary_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
-
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "boundaries",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    config = %{
-      base_dir: gateway_children_base!(),
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    {Tightbeam.LaneManager, lane_opts} =
-      config
-      |> Gateway.children()
-      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "split assistant messages",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "boundaries",
-               client_message_id: "c_boundaries"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-    echo = Projection.get(ctx.db, turn.message_id)
-    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
-
-    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
-    send(adapter, :continue_prompt)
-    assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-    publish.("delivered")
-
-    replies =
-      ctx.db
-      |> Projection.list_after("k1", echo.id, 10)
-      |> Enum.filter(&(&1.sender == "tightbeam"))
-
-    assert Enum.map(replies, & &1.content) == ["FIRST", "SECOND"]
-    assert Enum.map(replies, & &1.reply_to_message_id) == [echo.id, echo.id]
-    assert Enum.map(replies, & &1.reply_to_client_message_id) == ["c_boundaries", "c_boundaries"]
-    assert Enum.map(replies, & &1.seq) == Enum.sort(Enum.map(replies, & &1.seq))
-
-    frames = collect_pushes(10, [])
-
-    assert Enum.map(frames, &frame_name/1) == [
-             "message:user",
-             "turn:accepted",
-             "turn:running",
-             "typing:true",
-             "activity:true",
-             "message:assistant",
-             "message:assistant",
-             "turn:delivered",
-             "typing:false",
-             "activity:false"
-           ]
-
-    assert frames
-           |> Enum.filter(&(&1["type"] == "message" and &1["role"] == "assistant"))
-           |> Enum.map(& &1["content"]) == ["FIRST", "SECOND"]
-  end
-
-  @tag timeout: 180_000
-  test "one fake-adapter turn uses the MCP fallback and publishes the golden frame order", ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :exact_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
-
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "golden",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base = gateway_children_base!()
-    put_skill!(base, "review", "# Review")
-    manifest_path = Path.join([base, "identity", "archetypes", "default.toml"])
-
-    identity_edit!(
-      base,
-      "default",
-      :manifest,
-      File.read!(manifest_path) <>
-        """
-
-        [mcp.xcodebuild]
-        command = "xcodebuildmcp"
-        args = ["--daemon"]
-        env = { XCODEBUILD_MCP_MODE = "cli" }
-        """,
-      "test"
+  @tag timeout: 180_000, cold_gateway: true, gateway_split_messages: true, tmp_dir: true
+  test "one turn stores and publishes distinct ACP assistant messages as separate records", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_split_messages.exs",
+      "guarded-gateway-split-messages: ok"
     )
-
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    children = Gateway.children(config)
-    archetype = Archetypes.get("default")
-
-    {:ok, overrides} =
-      Archetypes.normalize_overrides(base, archetype, %{"skills_add" => ["review"]})
-
-    identity_name = Placement.identity_name(config, archetype, overrides, :claude)
-    Org.set_identity(ctx.db, "k1", overrides, identity_name)
-
-    {_archetypes, fragments} = :persistent_term.get(Archetypes)
-    :persistent_term.put(Archetypes, {%{}, fragments})
-    refute Archetypes.get("default")
-    assert archetype.mcp != []
-    assert Archetypes.builtin_default().mcp == []
-
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "ping",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "golden",
-               client_message_id: "c_gold"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-
-    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
-
-    assert_receive {:adapter_key, {:claude, "shared", "testhost"}}
-
-    assert_receive {:new_session_mcp_servers, []}, @cold_runner_prompt_timeout
-
-    # Four ms behind the wait above in every sample: the forks are already paid.
-    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
-
-    digest =
-      :crypto.hash(:sha256, "k1")
-      |> Base.encode16(case: :lower)
-      |> binary_part(0, 12)
-
-    session_file = Path.join([base, "work", digest, ".tightbeam-session"])
-
-    assert File.read!(session_file) ==
-             JSON.encode!(%{
-               url: "http://127.0.0.1:0",
-               token: Org.get(ctx.db, "k1").cli_token,
-               sessionKey: "k1"
-             })
-
-    assert Bitwise.band(File.stat!(session_file).mode, 0o777) == 0o600
-    send(self(), {:push, Tightbeam.Wire.Payloads.ack("c_gold")})
-    send(adapter, :continue_prompt)
-    assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-    publish.("delivered")
-
-    frames = collect_pushes(10, [])
-
-    assert Enum.map(frames, &frame_name/1) == [
-             "message:user",
-             "turn:accepted",
-             "turn:running",
-             "typing:true",
-             "activity:true",
-             "ack",
-             "message:assistant",
-             "turn:delivered",
-             "typing:false",
-             "activity:false"
-           ]
   end
 
-  test "a disappeared turn host reaches the socket turn-state payload by name", ctx do
-    ensure_global_registry()
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
+  @tag timeout: 180_000, cold_gateway: true, gateway_mcp_fallback: true, tmp_dir: true
+  test "one fake-adapter turn uses the MCP fallback and publishes the golden frame order", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_mcp_fallback.exs",
+      "guarded-gateway-mcp-fallback: ok"
+    )
+  end
 
-    {:ok, _ref, nil} =
-      ConnRegistry.register(Tightbeam.ConnRegistry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "placement-refusal",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base = gateway_children_base!()
-
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    {Tightbeam.LaneManager, lane_opts} =
-      config
-      |> Gateway.children()
-      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
-
-    lane_sup =
-      start_supervised!(
-        {DynamicSupervisor, strategy: :one_for_one, name: :placement_refusal_lane_supervisor}
-      )
-
-    manager =
-      start_supervised!({
-        LaneManager,
-        db: ctx.db,
-        lane_sup: lane_sup,
-        task_sup: Tightbeam.TurnTaskSupervisor,
-        runner: Keyword.fetch!(lane_opts, :runner),
-        terminal_publisher: Keyword.fetch!(lane_opts, :terminal_publisher),
-        interval: 60_000,
-        name: :placement_refusal_lane_manager
-      })
-
-    Org.set_host(ctx.db, "k1", "eurisko")
-
-    expected =
-      "host eurisko is not configured for claude; run tightbeam assimilate <ssh-dest> " <>
-        "--name eurisko --as-user <adminUserId>"
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "try vanished host",
-               db: ctx.db,
-               conn_registry: Tightbeam.ConnRegistry,
-               lane_manager: manager,
-               device_id: "placement-refusal",
-               client_message_id: "c_placement_refusal"
-             )
-
-    frames = collect_pushes(10, [])
-
-    failed =
-      Enum.find(frames, fn
-        %{
-          "type" => "event",
-          "event" => "prompt_turn_state",
-          "payload" => %{"state" => "failed"}
-        } ->
-          true
-
-        _ ->
-          false
-      end)
-
-    assert failed["payload"]["error"] == expected
-
-    assert Enum.any?(frames, fn
-             %{"type" => "message", "content" => content} ->
-               content ==
-                 "[turn failed]\n\nThe agent could not answer the message above: " <> expected
-
-             _ ->
-               false
-           end)
+  @tag cold_gateway: true, gateway_missing_host: true, tmp_dir: true
+  test "a disappeared turn host reaches the socket turn-state payload by name", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_missing_host.exs",
+      "guarded-gateway-missing-host: ok"
+    )
   end
 
   # Install a fresh catalog for one {host, harness}, so a test can give two hosts
@@ -7210,7 +6415,12 @@ defmodule Tightbeam.GatewayTest do
   defp put_host_catalog(host, harness, models) do
     entries =
       Enum.map(models, fn spec ->
-        {family, efforts} = if is_tuple(spec), do: spec, else: {spec, []}
+        {family, efforts, provider} =
+          case spec do
+            {family, efforts, provider} -> {family, efforts, provider}
+            {family, efforts} -> {family, efforts, :anthropic}
+            family -> {family, [], :anthropic}
+          end
 
         %{
           family: family,
@@ -7220,7 +6430,7 @@ defmodule Tightbeam.GatewayTest do
           efforts: efforts,
           max_input_tokens: 200_000,
           capabilities: %{},
-          provider: :anthropic
+          provider: provider
         }
       end)
 
@@ -7346,130 +6556,13 @@ defmodule Tightbeam.GatewayTest do
   # as "test timed out" rather than naming the wait that actually ran out. Raise the
   # ceiling above the budget it contains.
   @tag timeout: 180_000
+  @tag cold_gateway: true, gateway_remote_url: true, tmp_dir: true
   test "next turn after set_host delivers the advertised remote URL", ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :remote_url_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
-
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, adapter})
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "remote-url",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base =
-      Path.join(System.tmp_dir!(), "gateway_remote_url_#{System.unique_integer([:positive])}")
-
-    File.rm_rf!(base)
-    Identity.init!(base)
-    manifest_path = Path.join([base, "identity", "archetypes", "default.toml"])
-
-    manifest =
-      manifest_path
-      |> File.read!()
-      |> String.replace(
-        "name = \"default\"",
-        "name = \"default\"\nwhere = [\"testhost\", \"worker\"]"
-      )
-
-    identity_edit!(base, "default", :manifest, manifest, "test")
-
-    old_url = Application.get_env(:tightbeam, :advertised_url)
-
-    on_exit(fn ->
-      File.rm_rf!(base)
-      :persistent_term.erase(Archetypes)
-
-      if old_url,
-        do: Application.put_env(:tightbeam, :advertised_url, old_url),
-        else: Application.delete_env(:tightbeam, :advertised_url)
-    end)
-
-    parent = self()
-
-    sh = fn command ->
-      if hd(command) == "rsync" do
-        stage_file = Enum.at(command, -2)
-
-        if String.contains?(stage_file, "/staging/session-files/") do
-          send(parent, {:delivered_session_file, File.read!(stage_file)})
-        end
-      end
-
-      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
-           Enum.any?(command, &String.contains?(&1, "cat")),
-         do: {"", 42},
-         else: {"", 0}
-    end
-
-    sh_out = fn command ->
-      if Enum.any?(command, &String.contains?(&1, "credential-harvest")) and
-           Enum.any?(command, &String.contains?(&1, "cat")),
-         do: {"", 42},
-         else: {"", 0}
-    end
-
-    config =
-      gateway_config(base, ctx.db, 4_321)
-      |> Map.put(:sh, sh)
-      |> Map.put(:sh_out, sh_out)
-
-    children = Gateway.children(config)
-
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    Application.put_env(:tightbeam, :advertised_url, "https://new-gateway.example")
-
-    register_hosts(ctx.db, %{
-      "worker" => %{ssh: "worker", base_dir: "/remote/tb", cli_bin: nil}
-    })
-
-    assert %{ok: true, host: "worker"} =
-             Gateway.handlers(config)["tune"].(%{
-               origin: "user:flynn",
-               session_key: "k1",
-               params: %{setting: "set_host", host: "worker"}
-             })
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "remote ping",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "d1",
-               client_message_id: "c_remote_url"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
-
-    token = Org.get(ctx.db, "k1").cli_token
-
-    assert_receive {:delivered_session_file, content}
-
-    assert JSON.decode!(content) == %{
-             "url" => "https://new-gateway.example",
-             "token" => token,
-             "sessionKey" => "k1"
-           }
-
-    # Proven late, not lost -- see @cold_runner_prompt_timeout for the measurement.
-    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
-    send(adapter, :continue_prompt)
-    assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-    publish.("delivered")
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_remote_url.exs",
+      "guarded-gateway-remote-url: ok"
+    )
   end
 
   # wi_263814d3 — the PROVISIONING SEAM, not just deliver_home: a real turn that
@@ -7479,88 +6572,13 @@ defmodule Tightbeam.GatewayTest do
   # unwritten on the turn path and fails this — the coverage the deliver_home
   # unit tests alone do not give (asg_6508eff5 finding #2).
   @tag timeout: 180_000
+  @tag cold_gateway: true, gateway_home_pin: true, tmp_dir: true
   test "provisioning a turn pins the shared home to the session's selected model", ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :home_pin_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
-
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, adapter})
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "home-pin",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base =
-      Path.join(System.tmp_dir!(), "gateway_home_pin_#{System.unique_integer([:positive])}")
-
-    File.rm_rf!(base)
-    Identity.init!(base)
-    Rails.load!(base)
-
-    manifest_path = Path.join([base, "identity", "archetypes", "default.toml"])
-
-    manifest =
-      manifest_path
-      |> File.read!()
-      |> String.replace("name = \"default\"", "name = \"default\"\nwhere = [\"testhost\"]")
-
-    identity_edit!(base, "default", :manifest, manifest, "test")
-
-    on_exit(fn ->
-      File.rm_rf!(base)
-      :persistent_term.erase(Archetypes)
-      :persistent_term.erase(Tightbeam.Rails)
-    end)
-
-    # Org default is claude-fable-5 (gateway_config); the session SELECTED a
-    # different catalog model. The provisioned home must follow the selection.
-    _ = Org.set_model(ctx.db, "k1", Model.new("claude-sonnet-4-6"), "anthropic")
-    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
-
-    config = gateway_config(base, ctx.db, 0)
-    assert config.default_model.family == "claude-fable-5"
-
-    children = Gateway.children(config)
-
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "ping",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "home-pin",
-               client_message_id: "c_home_pin"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
-
-    # new_session having been reached proves harness_session ran the pin first.
-    assert_receive {:new_session_mcp_servers, _}, @cold_runner_prompt_timeout
-
-    settings =
-      [base, "homes", "testhost", "claude", "settings.json"]
-      |> Path.join()
-      |> File.read!()
-      |> JSON.decode!()
-
-    assert settings["model"] == "claude-sonnet-4-6"
-
-    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
-    send(adapter, :continue_prompt)
-    assert {:ok, _} = Task.await(task)
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_home_pin.exs",
+      "guarded-gateway-home-pin: ok"
+    )
   end
 
   # @cold_runner_prompt_timeout is 60_000 and ExUnit's default per-test timeout is
@@ -7568,338 +6586,88 @@ defmodule Tightbeam.GatewayTest do
   # as "test timed out" rather than naming the wait that actually ran out. Raise the
   # ceiling above the budget it contains.
   @tag timeout: 180_000
-  test "a fallback turn appends the context-reset marker between echo and reply", ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :marker_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
-
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "marker",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base = gateway_children_base!()
-
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    children = Gateway.children(config)
-
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    # A pre-existing pointer the stub adapter refuses to load → the runner
-    # must fall back AND put the memory-loss line on the wire.
-    Org.append_pointer(ctx.db, "k1", "stale-harness-sid", "created")
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "ping",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "marker",
-               client_message_id: "c_marker"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-
-    task = Task.async(fn -> runner.(Map.put(turn, :session_key, "k1")) end)
-    assert_receive {:prompt_started, ^adapter}, @cold_runner_prompt_timeout
-    send(adapter, :continue_prompt)
-    assert {:ok, %{terminal_publish: publish}} = Task.await(task)
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-    publish.("delivered")
-
-    frames = collect_pushes(10, [])
-
-    assert Enum.map(frames, &frame_name/1) == [
-             "message:user",
-             "turn:accepted",
-             "turn:running",
-             "typing:true",
-             "activity:true",
-             "message:assistant",
-             "message:assistant",
-             "turn:delivered",
-             "typing:false",
-             "activity:false"
-           ]
-
-    marker = Enum.find(frames, &(&1["type"] == "message" and &1["sender"] == "process:tightbeam"))
-    assert String.starts_with?(marker["content"], "[context reset]\n")
-    assert marker["messageType"] == "marker"
-    assert marker["marker"]["kind"] == "session-restart"
-    assert marker["marker"]["from"] == "stale-harness-sid"
-    assert is_binary(marker["marker"]["to"])
-
-    assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
-
-    assert [%{kind: "pointer_fallback", subject: "k1"}] =
-             EventLog.lifecycle_events(ctx.db) |> Enum.filter(&(&1.kind == "pointer_fallback"))
+  @tag cold_gateway: true, gateway_context_reset: true, tmp_dir: true
+  test "a fallback turn appends the context-reset marker between echo and reply", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_context_reset.exs",
+      "guarded-gateway-context-reset: ok"
+    )
   end
 
-  test "reattach pushes the canonical record without requiring an owner read", ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :load_apply_failure_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
-
-    adapter = start_supervised!({LoadWithoutOwnerReadAdapterStub, self()})
-    start_supervised!({CoordinatorStub, adapter})
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "load-apply-failure",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base = gateway_children_base!()
-
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    {Tightbeam.LaneManager, lane_opts} =
-      config
-      |> Gateway.children()
-      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-    Org.append_pointer(ctx.db, "k1", "load-apply-session", "created")
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "ping",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "load-apply-failure",
-               client_message_id: "c_load_apply_failure"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-
-    assert {:ok, %{terminal_publish: publish}} =
-             runner.(Map.put(turn, :session_key, "k1"))
-
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-    publish.("delivered")
-    assert_receive {:load_apply_residency, "load-apply-session"}
-
-    assert_receive {:canonical_model_pushed_on_load, "load-apply-session",
-                    %Model{family: "fable"}}
-
-    assert_receive :load_without_owner_read_prompted
-    refute_receive :unexpected_load_apply_new_session
-    assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "loaded"]
-    refute Enum.any?(EventLog.lifecycle_events(ctx.db), &(&1.kind == "pointer_fallback"))
-
-    refute Enum.any?(Projection.list_after(ctx.db, "k1", nil, 100), fn message ->
-             String.starts_with?(message.content, "[context reset]")
-           end)
+  @tag cold_gateway: true, gateway_reattach: true, tmp_dir: true
+  test "reattach pushes the canonical record without requiring an owner read", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_reattach.exs",
+      "guarded-gateway-reattach: ok"
+    )
   end
 
-  test "unknown new-session paths keep and capture the harness default", ctx do
-    adapter = start_supervised!({UnknownDefaultAdapterStub, self()})
-    start_supervised!({CoordinatorStub, adapter})
-
-    start_supervised!(%{
-      id: :unknown_default_conn_registry,
-      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-    })
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(Tightbeam.ConnRegistry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "unknown-default",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    make_model_unknown(ctx.db, "k1")
-
-    config = %{
-      base_dir: gateway_children_base!(),
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    {Tightbeam.LaneManager, lane_opts} =
-      config
-      |> Gateway.children()
-      |> Enum.find(&match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "use the default",
-               db: ctx.db,
-               conn_registry: Tightbeam.ConnRegistry,
-               lane_manager: ctx.lane,
-               client_message_id: "c_unknown_default"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-    assert {:ok, %{terminal_publish: publish}} = runner.(Map.put(turn, :session_key, "k1"))
-    assert :ok = Ledger.finish(ctx.db, turn.seq, "delivered")
-    publish.("delivered")
-
-    assert_receive {:unknown_new_session, nil}
-    assert_receive :default_model_captured
-    assert_receive :default_session_prompted
-    assert Org.get(ctx.db, "k1").model == Model.new("harness-default")
-
-    # The session/load-lost fallback consumes the same unknown value: it must
-    # create without seeding, then capture the new harness default too.
-    make_model_unknown(ctx.db, "k1")
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "fall back to the default",
-               db: ctx.db,
-               conn_registry: Tightbeam.ConnRegistry,
-               lane_manager: ctx.lane,
-               client_message_id: "c_unknown_fallback"
-             )
-
-    assert {:ok, fallback_turn} = Ledger.claim_next(ctx.db, "k1", "test")
-
-    assert {:ok, %{terminal_publish: fallback_publish}} =
-             runner.(Map.put(fallback_turn, :session_key, "k1"))
-
-    assert :ok = Ledger.finish(ctx.db, fallback_turn.seq, "delivered")
-    fallback_publish.("delivered")
-
-    assert_receive {:unknown_load_lost, "default-session", nil}
-    assert_receive {:unknown_new_session, nil}
-    assert_receive :default_model_captured
-    assert_receive :default_session_prompted
-    assert Org.get(ctx.db, "k1").model == Model.new("harness-default")
-    assert Enum.map(Org.pointer_chain(ctx.db, "k1"), & &1.reason) == ["created", "fallback"]
+  @tag cold_gateway: true, gateway_reattach_mode_failure: true, tmp_dir: true
+  test "reattach mode refusal fails the turn without fallback or prompting", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_reattach_mode_failure.exs",
+      "guarded-gateway-reattach-mode-failure: ok"
+    )
   end
 
-  test "a failed turn publishes its reason as a chat marker and a terminal state", ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :failed_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
+  @tag cold_gateway: true, gateway_unknown_default: true, tmp_dir: true
+  test "unknown new-session paths keep and capture the harness default", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_unknown_default.exs",
+      "guarded-gateway-unknown-default: ok"
+    )
+  end
 
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, adapter})
+  # Captured from turns.error for Omarchy Ask PO turn 120945 on September 6,
+  # 2026 at 13:50:30 PT. The provider supplied no timezone for its retry date.
+  @quota_message "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 13th, 2026 6:39 AM."
+  for {label, reason, expected} <- [
+        {"nested quota message",
+         %{
+           "code" => -32603,
+           "message" => "Internal error",
+           "data" => %{"codexErrorInfo" => "usageLimitExceeded", "message" => @quota_message}
+         }, "Internal error " <> @quota_message},
+        {"details", %{"message" => "Internal error", "data" => %{"details" => "auth expired"}},
+         "Internal error auth expired"},
+        {"message and details",
+         %{
+           "message" => "Internal error",
+           "data" => %{"message" => "quota", "details" => "retry later"}
+         }, "Internal error quota retry later"},
+        {"string data", %{"message" => "Internal error", "data" => "retry later"},
+         "Internal error retry later"},
+        {"string reason", "provider unavailable", "provider unavailable"},
+        {"empty nested message",
+         %{
+           "message" => "Internal error",
+           "data" => %{"message" => "", "details" => "retry later"}
+         }, "Internal error retry later"},
+        {"false details", %{"message" => "Internal error", "data" => %{"details" => false}},
+         "Internal error"},
+        {"fallback", %{"code" => -32603}, inspect(%{"code" => -32603})}
+      ] do
+    @tag error_reason: reason,
+         expected_error: expected,
+         cold_gateway: true,
+         gateway_error_markers: true,
+         tmp_dir: true
+    test "a failed turn publishes #{label} as a chat marker and a terminal state", ctx do
+      File.write!(
+        Path.join(ctx.tmp_dir, "error-case.json"),
+        JSON.encode!(%{reason: ctx.error_reason, expected: ctx.expected_error})
+      )
 
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "failed",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base = gateway_children_base!()
-
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    children = Gateway.children(config)
-
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "fail this turn",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "failed",
-               client_message_id: "c_fail"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-
-    assert {:error, %{reason: _, terminal_publish: publish, record_in_txn: record}} =
-             runner.(Map.put(turn, :session_key, "k1"))
-
-    assert {:ok, true} =
-             DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "boom")
-               record.(txn)
-               true
-             end)
-
-    publish.("failed")
-
-    # EVERY failed turn speaks now. Adjudication used to route a failure into a
-    # brief instead of the marker, so deleting the brief (2026-08-05) would have
-    # left this class of failure with no channel at all — the "agent progress
-    # interrupted, no reason given" that Flynn hit on gibson twice.
-    frames = collect_pushes(9, [])
-
-    assert Enum.any?(frames, fn frame ->
-             frame["type"] == "message" and
-               String.starts_with?(frame["content"] || "", "[turn failed]\n")
-           end)
-
-    assert Enum.any?(EventLog.lifecycle_events(ctx.db), fn event ->
-             event.kind == "harness_turn_error" and event.subject == "k1"
-           end)
-
-    assert Enum.any?(
-             frames,
-             &match?(
-               %{"event" => "prompt_turn_state", "payload" => %{"state" => "failed"}},
-               &1
-             )
-           )
+      Tightbeam.GuardRuntimeFixture.run!(
+        ctx.tmp_dir,
+        "live_base_gateway_error_markers.exs",
+        "guarded-gateway-error-markers: ok"
+      )
+    end
   end
 
   # AC6 (spec 1ae8fa52 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name
@@ -7914,108 +6682,30 @@ defmodule Tightbeam.GatewayTest do
   # (spinup_test / "spawn refusal names every where host, harness, cause, and remedy");
   # this pins the turn seam — the AC6 intersection that previously had only generic
   # turn-failure coverage (see "a failed turn publishes its reason as a chat marker").
+  @tag :cold_gateway
+  @tag :gateway_checkout_refusal
+  @tag :tmp_dir
   test "a turn onto a needs_onboarding host is refused by name and fails-tells-records", ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :o6_refuse_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
+    File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "missing")
 
-    # Checkout DEGRADES — the engine cannot start — so the turn fails at the :checkout
-    # stage. No AdapterStub: the coordinator never yields an adapter, so no session/prompt
-    # engine call is ever made (the "never launch a dead engine" half of I7).
-    start_supervised!({CoordinatorStub, {fn _key -> {:error, :degraded} end, self()}})
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-checkout-refusal: ok"
+    )
+  end
 
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "o6-refuse",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
+  @tag :cold_gateway
+  @tag :gateway_checkout_refusal
+  @tag :tmp_dir
+  test "a Pi turn uses its persisted local-openai provider in the onboarding remedy", ctx do
+    File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "pi-local")
 
-    base = gateway_children_base!()
-
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    children = Gateway.children(config)
-
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    # testhost/claude has NO credential: the catalog affirmatively answers "missing"
-    # (`:missing`, not the `:credential_server_unavailable` transient — see the guard test).
-    degrade_host_catalog("testhost", "claude", {:needs_onboarding, :missing})
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "hi",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "o6-refuse",
-               client_message_id: "c_o6_refuse"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-
-    # FAILS (not parks): the runner returns an error with a terminal publish + record,
-    # never a hold/episode/queue.
-    assert {:error, %{reason: reason, terminal_publish: publish, record_in_txn: record}} =
-             runner.(Map.put(turn, :session_key, "k1"))
-
-    # TELLS: the EXACT remedy, on the host, naming the provider — NOT the raw
-    # "adapter is degraded" checkout fault (that fault is kept in the record instead).
-    assert reason =~ "tightbeam onboard anthropic --as-user <userId>"
-    assert reason =~ "on testhost"
-    refute reason =~ "is degraded"
-
-    # RECORDS: the failed row and the lifecycle event, one transaction. The record keeps
-    # the STAGE (:checkout — pre-engine) and the raw fault the user-facing sentence flattened.
-    assert {:ok, true} =
-             DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", reason)
-               record.(txn)
-               true
-             end)
-
-    publish.("failed")
-
-    lifecycle =
-      Enum.find(EventLog.lifecycle_events(ctx.db), fn event ->
-        event.kind == "harness_turn_error" and event.subject == "k1"
-      end)
-
-    assert lifecycle, "the refusal must record a harness_turn_error lifecycle event"
-    assert lifecycle.detail =~ "checkout"
-
-    # TELLS (chat channel): the remedy reaches the user durably as the `[turn failed]`
-    # marker, read from the projection rather than a brittle push count.
-    marker =
-      ctx.db
-      |> Projection.list_after("k1", nil, 100)
-      |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
-
-    assert marker, "a refused turn must speak its reason in chat"
-    assert marker.content =~ "tightbeam onboard anthropic --as-user <userId>"
-
-    # NEVER LAUNCHES A DEAD ENGINE: checkout failed pre-engine, so the session/prompt
-    # stages never ran — no engine was asked to serve (belt-and-suspenders to the
-    # :checkout stage recorded above).
-    refute_received {:new_session_mcp_servers, _}
-    refute_received {:prompt_started, _}
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-checkout-refusal: ok"
+    )
   end
 
   # AC6 (spec 1ae8fa52 §O6), the present-but-unverified clause: a host whose credential
@@ -8028,68 +6718,19 @@ defmodule Tightbeam.GatewayTest do
   # executability/adapter gap. This guards the `:fresh` axis of I7's narrow `:missing`
   # match; the `:credential_server_unavailable` transient axis is guarded by the next test
   # (the two together pin that I7 refuses on `:missing` specifically, never the wildcard).
+  @tag :cold_gateway
+  @tag :gateway_checkout_refusal
+  @tag :tmp_dir
+  @tag :gateway_checkout_fresh
   test "a turn on a fresh-but-unexecutable host is not misrouted to the onboarding remedy",
        ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :o6_pbu_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
+    File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "fresh")
 
-    start_supervised!({CoordinatorStub, {fn _key -> {:error, :degraded} end, self()}})
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "o6-pbu",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base = gateway_children_base!()
-
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    children = Gateway.children(config)
-
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    # No `degrade_host_catalog`: the setup left testhost/claude FRESH (await_catalog).
-    # A live credential is present; only executability (checkout) is broken.
-    assert {_entries, :fresh} = ModelCatalog.get("testhost", "claude", ModelCatalog)
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "hi",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "o6-pbu",
-               client_message_id: "c_o6_pbu"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-
-    assert {:error, %{reason: reason}} = runner.(Map.put(turn, :session_key, "k1"))
-
-    # The refusal names the REAL gap (executability/adapter degraded), never the
-    # onboarding remedy — the credential is present, so "run onboard" would be false.
-    assert reason =~ "is degraded"
-    refute reason =~ "tightbeam onboard"
-    refute reason =~ "--as-user"
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-checkout-refusal: ok"
+    )
   end
 
   # AC6 / I7 (spec 1ae8fa52 §O6), the r4.2 narrowing guard: I7 refuses ONLY on `:missing`
@@ -8105,73 +6746,18 @@ defmodule Tightbeam.GatewayTest do
   # gateway.ex:4117 `:missing` back to the wildcard `{:needs_onboarding, _}` passes both of
   # them but goes RED here. (The 29 adapter-heal arenas cover the SPAWN path's
   # credential_status, gateway.ex:4160 — a different seam from unonboarded_refusal.)
+  @tag :cold_gateway
+  @tag :gateway_checkout_refusal
+  @tag :tmp_dir
   test "a turn on a credential-server-unavailable transient is not misrouted to the onboarding remedy",
        ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :o6_transient_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
+    File.write!(Path.join(ctx.tmp_dir, "checkout-case.txt"), "transient")
 
-    start_supervised!({CoordinatorStub, {fn _key -> {:error, :degraded} end, self()}})
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "o6-transient",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base = gateway_children_base!()
-
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    children = Gateway.children(config)
-
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    # The transient: "could not ASK" (credential server unreachable), NOT an affirmative
-    # "absent". Health becomes {:unavailable, {:needs_onboarding, :credential_server_unavailable}},
-    # which is NOT :missing, so unonboarded_refusal returns :not_applicable.
-    degrade_host_catalog(
-      "testhost",
-      "claude",
-      {:needs_onboarding, :credential_server_unavailable}
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-checkout-refusal: ok"
     )
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "hi",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "o6-transient",
-               client_message_id: "c_o6_transient"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-
-    assert {:error, %{reason: reason}} = runner.(Map.put(turn, :session_key, "k1"))
-
-    # Refused by its real (executability/adapter) gap, never the onboarding remedy —
-    # a "could not ask" transient is not a "you have no credential" verdict.
-    assert reason =~ "is degraded"
-    refute reason =~ "tightbeam onboard"
-    refute reason =~ "--as-user"
   end
 
   # O6 reactive fix (spec 1ae8fa52) — THE INCIDENT PATH (G3 flatten). Guards A/B/C all force
@@ -8184,120 +6770,16 @@ defmodule Tightbeam.GatewayTest do
   # precise re-onboard NAMING of this health-blind :prompt 401 is the HELD option-a piece
   # (auth-shape detection), pending the PO's a-vs-b ruling; it lands on top without changing
   # this seam (preserved on branch o6-prompt401-naming-built).
+  @tag :cold_gateway
+  @tag :gateway_prompt_auth
+  @tag :tmp_dir
   test "an expired-credential turn 401ing at :prompt (fresh health) flattens the raw ACP map to prose (G3)",
        ctx do
-    exact_registry =
-      start_supervised!(%{
-        id: :o6_prompt401_conn_registry,
-        start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-      })
-
-    # A REAL adapter: checkout + session succeed; the 401 lands at :prompt. AdapterStub
-    # returns the auth-expired ACP error for the prompt "fail this turn" (gateway_test:162).
-    adapter = start_supervised!({AdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(exact_registry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "o6-prompt401",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
-
-    base = gateway_children_base!()
-
-    config = %{
-      base_dir: base,
-      cwd: "/tmp",
-      port: 0,
-      default_harness: :claude,
-      default_model: Model.new("claude-fable-5"),
-      max_live_sessions_per_user: 50,
-      wake_tick_ms: 1_000,
-      onboarding_lease_ms: 1_800_000,
-      db: ctx.db
-    }
-
-    children = Gateway.children(config)
-
-    {Tightbeam.LaneManager, lane_opts} =
-      Enum.find(children, &match?({Tightbeam.LaneManager, _}, &1))
-
-    runner = Keyword.fetch!(lane_opts, :runner)
-
-    # Incident-faithful: catalog LEFT FRESH — real expiry is storage-blind, so health gives
-    # NO signal. The only signal is the :prompt auth-fault shape.
-    assert {_entries, :fresh} = ModelCatalog.get("testhost", "claude", ModelCatalog)
-
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "fail this turn",
-               db: ctx.db,
-               conn_registry: exact_registry,
-               lane_manager: ctx.lane,
-               device_id: "o6-prompt401",
-               client_message_id: "c_o6_prompt401"
-             )
-
-    assert {:ok, turn} = Ledger.claim_next(ctx.db, "k1", "test")
-
-    assert {:error, %{reason: reason, terminal_publish: publish, record_in_txn: record}} =
-             runner.(Map.put(turn, :session_key, "k1"))
-
-    # It genuinely failed at :prompt — checkout + session succeeded (the incident path, not a
-    # pre-engine refusal). The record keeps the stage.
-    # reason is the raw ACP map here (health :fresh -> :not_applicable, no reclassify); the lane
-    # stringifies it via error_text before the ledger, and the OPERATOR-facing marker flattens
-    # it via error_sentence (asserted below). Finish with a stand-in string, as SessionLane's
-    # error_text would produce one.
-    assert {:ok, true} =
-             DB.transaction(ctx.db, fn txn ->
-               assert Ledger.finish_in_txn(txn, turn.seq, "failed", "prompt auth 401")
-               record.(txn)
-               true
-             end)
-
-    publish.("failed")
-
-    lifecycle =
-      Enum.find(EventLog.lifecycle_events(ctx.db), fn event ->
-        event.kind == "harness_turn_error" and event.subject == "k1"
-      end)
-
-    assert lifecycle, "the :prompt turn failure must record a harness_turn_error"
-    assert lifecycle.detail =~ "prompt"
-
-    assert HarnessHealth.active(ctx.db) == []
-
-    assert {:ok, [["auth-dead", "terminal-failure", "k1", cause]]} =
-             DB.query(
-               ctx.db,
-               """
-               SELECT failureClass,evidenceKind,sessionKey,cause
-               FROM harness_health_observations
-               WHERE correlationId=?1
-               """,
-               ["harness-turn:#{turn.seq}:auth-dead"]
-             )
-
-    assert cause =~ "stage=prompt"
-    assert cause =~ "auth expired"
-
-    # G3: the operator reads the human message/details as PROSE, never a raw inspected ACP
-    # error map. The auth detail survives as text; the map's inspect markers (`=>`, `%{`) do
-    # NOT. (The precise re-onboard NAMING for this health-blind :prompt 401 is the held
-    # option-a piece, pending the PO's a-vs-b ruling; the common path guarantees only that no
-    # raw map reaches chat.)
-    marker =
-      ctx.db
-      |> Projection.list_after("k1", nil, 100)
-      |> Enum.find(&String.starts_with?(&1.content || "", "[turn failed]"))
-
-    assert marker, "a :prompt failure must speak in chat"
-    assert marker.content =~ "auth expired"
-    refute marker.content =~ "=>"
-    refute marker.content =~ "%{"
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_prompt_auth.exs",
+      "guarded-gateway-prompt-auth: ok"
+    )
   end
 
   test "identity relearn reports a non-conflict git failure legibly", ctx do
@@ -8329,6 +6811,181 @@ defmodule Tightbeam.GatewayTest do
     assert message =~ "pre-merge policy rejected relearn"
   end
 
+  test "served stamp failure after Git publication keeps marker pending until replay", ctx do
+    alias Tightbeam.AdminProjection
+    base_dir = role_test_base("served-stamp-replay")
+    Identity.init!(base_dir)
+    :ok = AdminProjection.bootstrap_served(ctx.db, base_dir)
+    prior_live = Identity.live_revision!(base_dir)
+    prior_stamp = AdminProjection.stamped_item(ctx.db, "identity", "served")
+    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER fixture_refuse_served_stamp BEFORE INSERT ON admin_projection_versions
+      WHEN NEW.resource = 'identity'
+      BEGIN SELECT RAISE(ABORT, 'synthetic served stamp failure'); END;
+      """)
+
+    call = %{
+      verb: "learn",
+      invocation_id: "fixture-served-stamp-replay",
+      origin: "user:flynn",
+      params: %{name: "agentic-engineering"}
+    }
+
+    assert %{code: "projection_stamp_failed"} = handlers["learn"].(call)
+    published = Identity.live_revision!(base_dir)
+    refute published == prior_live
+    assert AdminProjection.stamped_item(ctx.db, "identity", "served") == prior_stamp
+
+    assert %{state: "pending", candidate_revision: ^published} =
+             AdminProjection.identity_publication_marker_by_invocation(ctx.db, call.invocation_id)
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM admin_projection_faults WHERE resource = 'identity'",
+               []
+             )
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER fixture_refuse_served_stamp")
+    assert %{state: "published", live_revision: ^published} = handlers["learn"].(call)
+    assert Identity.live_revision!(base_dir) == published
+
+    assert %{state: "accepted"} =
+             AdminProjection.identity_publication_marker_by_invocation(ctx.db, call.invocation_id)
+
+    stamp = AdminProjection.stamped_item(ctx.db, "identity", "served")
+    assert stamp["liveRevision"] == published
+    assert stamp["rowVersion"] == prior_stamp["rowVersion"] + 1
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM admin_projection_faults WHERE resource = 'identity'",
+               []
+             )
+
+    assert %{state: "published", live_revision: ^published} = handlers["learn"].(call)
+    assert AdminProjection.stamped_item(ctx.db, "identity", "served") == stamp
+  end
+
+  test "identity staleness alarm counts only active post-publication turns and dedupes by revision day",
+       ctx do
+    base_dir = role_test_base("identity-staleness-alarm")
+    assert :initialized = Identity.init!(base_dir)
+    :ok = Tightbeam.AdminProjection.bootstrap_served(ctx.db, base_dir)
+    ensure_main_session(ctx.db, "flynn")
+    ensure_global_registry()
+
+    {:ok, [[item, published_at]]} =
+      DB.query(
+        ctx.db,
+        "SELECT item, updatedAt FROM admin_projection_versions " <>
+          "WHERE resource = 'identity' AND primaryKey = 'served'"
+      )
+
+    %{"liveRevision" => revision} = JSON.decode!(item)
+    now = System.system_time(:millisecond)
+
+    assert :current = Gateway.identity_staleness_alarm_for_test(ctx.db, now)
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    create = fn key, stamped_revision ->
+      session = create_session(ctx.db, key, "flynn")
+
+      if is_binary(stamped_revision),
+        do: Org.set_identity_revision(ctx.db, key, stamped_revision)
+
+      session
+    end
+
+    terminal_turn = fn session, started_at ->
+      {:ok, seq} =
+        Ledger.enqueue(ctx.db, %{
+          session_key: session.session_key,
+          message_id: "identity-staleness-#{session.session_key}-#{started_at}",
+          origin: "user:flynn",
+          prompt: "fixture"
+        })
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE turns SET status = 'delivered', startedAt = ?2, endedAt = ?2 WHERE seq = ?1",
+          [seq, started_at]
+        )
+
+      seq
+    end
+
+    late_one = create.("agent:identity-late-one", "older-revision")
+    late_two = create.("agent:identity-late-two", nil)
+    quiet = create.("agent:identity-quiet", "older-revision")
+    early = create.("agent:identity-early", "older-revision")
+    current = create.("agent:identity-current", revision)
+    retired = create.("agent:identity-retired", "older-revision")
+
+    first_seq = terminal_turn.(late_one, published_at)
+    terminal_turn.(late_two, published_at + 1)
+    terminal_turn.(early, published_at - 1)
+    terminal_turn.(current, published_at + 1)
+    terminal_turn.(retired, published_at + 1)
+    Org.retire(ctx.db, retired.session_key, "test:identity-staleness", now)
+
+    assert Org.get(ctx.db, quiet.session_key).state == "active"
+
+    assert :ok =
+             Gateway.terminal_publisher_for_test(ctx.db).(%{
+               session_key: late_one.session_key,
+               message_id: "identity-staleness-publish",
+               status: "delivered",
+               seq: first_seq
+             })
+
+    assert {:ok, [[target, owner, prompt, "process:tightbeam", 0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT sessionKey, ownerUserId, prompt, origin, targetGate FROM wakes"
+             )
+
+    assert target == Org.personal_session_key("flynn")
+    assert owner == "flynn"
+
+    assert prompt ==
+             "Identity staleness: 2 active sessions are late for published revision #{revision}."
+
+    for session <- [late_one, late_two, quiet, early, current, retired] do
+      refute prompt =~ session.session_key
+    end
+
+    assert :already_notified = Gateway.identity_staleness_alarm_for_test(ctx.db, now)
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+
+    next_revision = "next-published-revision"
+    next_published_at = published_at + 10_000
+    next_item = item |> JSON.decode!() |> Map.put("liveRevision", next_revision) |> JSON.encode!()
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE admin_projection_versions SET item = ?1, updatedAt = ?2 " <>
+          "WHERE resource = 'identity' AND primaryKey = 'served'",
+        [next_item, next_published_at]
+      )
+
+    terminal_turn.(late_one, next_published_at)
+
+    assert {:scheduled, 1, ^next_revision} =
+             Gateway.identity_staleness_alarm_for_test(ctx.db, now)
+
+    assert {:scheduled, 1, ^next_revision} =
+             Gateway.identity_staleness_alarm_for_test(ctx.db, now + 86_400_000)
+
+    assert {:ok, [[3]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM wakes")
+  end
+
   test "learn and unlearn reload all law and unlearn names durable references", ctx do
     case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
       {:ok, _pid} -> :ok
@@ -8357,6 +7014,7 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Bundle active",
         owner_user_id: "flynn",
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         archetype: "coder",
         host: "testhost",
         harness: "claude",
@@ -8370,6 +7028,7 @@ defmodule Tightbeam.GatewayTest do
         display_name: "Bundle retired",
         owner_user_id: "flynn",
         origin: "user:flynn",
+        principal: {:user, "flynn"},
         archetype: "coder",
         host: "testhost",
         harness: "claude",
@@ -8395,6 +7054,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{state: "repointed", session_key: retired_key, archetype: "default"} =
              repoint.(%{
                origin: "user:flynn",
+               principal: {:user, "flynn"},
                session_key: retired.session_key,
                params: %{archetype: "default"}
              })
@@ -8404,6 +7064,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{retired_session_keys: [active_key]} =
              retire.(%{
                origin: "user:flynn",
+               principal: {:user, "flynn"},
                session_key: active.session_key,
                params: %{}
              })
@@ -8413,6 +7074,7 @@ defmodule Tightbeam.GatewayTest do
     assert %{state: "repointed", session_key: ^active_key, archetype: "default"} =
              repoint.(%{
                origin: "user:flynn",
+               principal: {:user, "flynn"},
                session_key: active.session_key,
                params: %{archetype: "default"}
              })
@@ -8447,11 +7109,10 @@ defmodule Tightbeam.GatewayTest do
                  name: "agentic-engineering",
                  purpose: purpose,
                  phrases: phrases,
-                 root_archetype: "product-owner"
+                 root_archetype: "orchestrator"
                }
              ]
-           } =
-             list.(%{origin: "agent:k1", params: %{}})
+           } = list.(%{origin: "agent:k1", params: %{}})
 
     assert purpose =~ "turn product ideas and bug reports into shipped software"
     assert "I want my code reviewed before it merges." in phrases
@@ -8464,7 +7125,7 @@ defmodule Tightbeam.GatewayTest do
   test "every unlearn reference kind supplies supported commands that clear it", ctx do
     ensure_global_registry()
     base_dir = role_test_base("unlearn-reference-property")
-    learn_engineering_identity!(base_dir)
+    learn_engineering_identity_without_apply_fixture_skills!(base_dir)
     handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))
 
     active =
@@ -8526,7 +7187,12 @@ defmodule Tightbeam.GatewayTest do
 
     for reference <- references, command <- reference.clear_commands do
       assert Map.has_key?(handlers, command.verb)
-      result = handlers[command.verb].(Map.put(command, :origin, "user:flynn"))
+
+      result =
+        handlers[command.verb].(
+          Map.merge(command, %{origin: "user:flynn", principal: {:user, "flynn"}})
+        )
+
       refute result[:code], inspect({reference, command, result})
     end
 
@@ -8564,8 +7230,13 @@ defmodule Tightbeam.GatewayTest do
     assert actual == expected
   end
 
-  test "identity apply refreshes one stamped session at a turn boundary without restarting runtime",
-       ctx do
+  # THE CONTRACT, in one test: apply rewrites the Tightbeam-owned skill FILES,
+  # stamps the session with the revision the writer returned success for, and then
+  # asks the session — through an ordinary prompt — to re-read them. It confirms
+  # nothing, waits for nothing, and never speaks to a harness. No adapter stub is
+  # started anywhere here: a call into the adapter layer would fail loudly rather
+  # than pass quietly.
+  test "identity apply refreshes the skill files, stamps, and nudges a started session", ctx do
     base_dir = role_test_base("identity-apply")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -8586,27 +7257,23 @@ defmodule Tightbeam.GatewayTest do
       })
 
     Org.append_pointer(ctx.db, session.session_key, "thread-stable", "created")
-    start_lane!(ctx.db, session.session_key)
     cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
     Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-    old_body = File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md"))
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+    old_body = File.read!(skill)
 
     next =
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "new served skill",
         "test"
       )
 
-    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
-             old_body
+    # Publishing alone changes nothing on disk. Apply is the whole of the effect.
+    assert File.read!(skill) == old_body
 
-    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
-    runtime_pid = adapter
-
-    start_supervised!({CoordinatorStub, {adapter, self()}})
     ensure_global_registry()
 
     {:ok, _ref, nil} =
@@ -8620,109 +7287,47 @@ defmodule Tightbeam.GatewayTest do
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
-    assert %{applied: [session_key], identity_revision: ^next} =
-             apply.(%{
-               origin: "user:flynn",
-               params: %{session_key: session.session_key}
-             })
+    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
+    assert %{applied: [session_key], identity_revision: ^next} = result
     assert session_key == session.session_key
-    assert_receive {:identity_apply_close, "thread-stable"}
 
-    assert_receive {:identity_apply_load, "thread-stable",
-                    %Model{family: "gpt-5.6-sol", effort: "medium"}, ^cwd, _mcp, guidance}
+    # No confirmation, no reload result, no effect id: the response says what was
+    # written and to which revision, and nothing about what any context loaded.
+    assert Map.keys(result) |> Enum.sort() == [:applied, :identity_revision]
 
-    assert guidance =~ "Codex developer message"
-    assert Process.alive?(runtime_pid)
-    assert Org.current_pointer(ctx.db, session.session_key).harness_session_id == "thread-stable"
+    assert File.read!(skill) == "new served skill"
     assert Org.get(ctx.db, session.session_key).identity_revision == next
 
+    # The pointer is untouched — nothing was closed, loaded, resumed, or rebound.
+    assert Org.current_pointer(ctx.db, session.session_key).harness_session_id == "thread-stable"
+
+    # Exactly one stream_updated for the session that reached the stamp.
     assert_receive {:push,
                     %{"type" => "stream_updated", "stream" => %{"sessionKey" => ^session_key}}}
 
-    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__worktree-session/SKILL.md")) ==
-             "new served skill"
+    refute_receive {:push, %{"type" => "stream_updated"}}, 200
 
-    assert {:ok, seq} =
-             Ledger.enqueue(ctx.db, %{
-               session_key: session.session_key,
-               message_id: "identity-apply-busy",
-               origin: "user:flynn",
-               prompt: "busy"
-             })
+    # An ORDINARY prompt: it lands in the queue behind whatever is already there
+    # and rings the same doorbell any delivery rings.
+    assert_receive {:ensure_lane, ^session_key}
 
-    # Claimed, not merely enqueued: the boundary is a turn IN FLIGHT. This test
-    # once asserted the refusal on the queued row alone, which is the conflation
-    # T-CONCURRENCY names.
-    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
+    assert {:ok, [[prompt]]} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
+               session.session_key
+             ])
 
-    assert %{code: "turn_in_progress", sessions: [session_key]} =
-             apply.(%{
-               origin: "user:flynn",
-               params: %{session_key: session.session_key}
-             })
-
-    assert session_key == session.session_key
-    refute_receive {:push, %{"type" => "stream_updated"}}
+    assert prompt ==
+             "[from process:tightbeam]\n\n" <>
+               "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
+               "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
+               "reload your current model context."
   end
 
-  # T-CONCURRENCY (PRIME INVARIANT): an org-wide operation may wait on RUNNING
-  # work, never on QUEUED work. Field-proven consequence of getting this wrong:
-  # a headless org's Main queues indefinitely with no client — the NORMAL state
-  # per TEST-HOSTS §3a — so counting queued as busy made org-wide apply
-  # permanently impossible, and the smoke manufactured its own wedge every run
-  # (drain series 25/11/6/13/8/6/8) from its own bracket nags and DR notifications.
-  test "identity apply proceeds with queued turns that have not started", ctx do
-    base_dir = role_test_base("identity-apply-queued")
-    learn_engineering_identity!(base_dir)
-    revision = Identity.live_revision!(base_dir)
-
-    session =
-      Org.create(ctx.db, %{
-        session_key: "agent:identity-apply-queued",
-        display_name: "Identity apply queued",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
-        identity_revision: revision,
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
-      })
-
-    # No pointer: the queued/running question is decided before any adapter work,
-    # so the never-started session isolates it from the whole harness layer.
-    for n <- 1..3 do
-      assert {:ok, _seq} =
-               Ledger.enqueue(ctx.db, %{
-                 session_key: session.session_key,
-                 message_id: "identity-apply-queued-#{n}",
-                 origin: "user:flynn",
-                 prompt: "queued, never started"
-               })
-    end
-
-    assert Ledger.pending_count(ctx.db, session.session_key) == 3
-    refute Ledger.running?(ctx.db, session.session_key)
-
-    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
-
-    assert %{applied: [session_key], identity_revision: ^revision} =
-             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
-
-    assert session_key == session.session_key
-
-    # The queued turns are untouched — apply is not a drain.
-    assert Ledger.pending_count(ctx.db, session.session_key) == 3
-  end
-
-  # The other half of the same line, and the one that must NOT weaken: a turn
-  # whose world is already composed still defers apply. `claim_next/3` sets
-  # `status = 'running'` and `startedAt` in one UPDATE, so this is the honest
-  # started-and-not-terminal discriminator.
-  test "identity apply refuses while a turn is genuinely running", ctx do
+  # T-CONCURRENCY, settled the other way: apply changes FILES, not the world a
+  # running turn has already composed, so there is no boundary to wait for and no
+  # turn to refuse. A running turn is applied through, not deferred.
+  test "identity apply proceeds through a running turn without refusing or waiting", ctx do
     base_dir = role_test_base("identity-apply-running")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -8742,511 +7347,69 @@ defmodule Tightbeam.GatewayTest do
         model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
+    Org.append_pointer(ctx.db, session.session_key, "thread-running", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    alpha = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+    beta = Path.join(cwd, ".codex/skills/tightbeam__human-communication/SKILL.md")
+    old_alpha = File.read!(alpha)
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "model-release-intake", false},
+      "alpha next",
+      "test"
+    )
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "human-communication", false},
+        "beta next",
+        "test"
+      )
+
     assert {:ok, seq} =
              Ledger.enqueue(ctx.db, %{
                session_key: session.session_key,
-               message_id: "identity-apply-running-1",
+               message_id: "identity-apply-running-turn",
                origin: "user:flynn",
-               prompt: "in flight"
+               prompt: "a turn already in flight"
              })
 
     assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, session.session_key, "test")
     assert Ledger.running?(ctx.db, session.session_key)
 
+    # What the running turn read BEFORE apply: a complete old document.
+    assert File.read!(alpha) == old_alpha
+
+    ensure_global_registry()
+
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
-    assert %{code: "turn_in_progress", sessions: [session_key]} =
+    assert %{applied: [session_key], identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
     assert session_key == session.session_key
 
-    # And org-wide is refused for the same reason, naming only the running session.
-    assert %{code: "turn_in_progress", sessions: [^session_key]} =
-             apply.(%{origin: "user:flynn", params: %{all: true}})
-
-    # Terminalizing it releases the boundary — nothing else had to change.
-    assert Ledger.finish(ctx.db, seq, "delivered") == :ok
-    refute Ledger.running?(ctx.db, session.session_key)
-
-    assert %{applied: applied, identity_revision: ^revision} =
-             apply.(%{origin: "user:flynn", params: %{all: true}})
-
-    assert session.session_key in applied
-  end
-
-  # The parity scenario, as a fixture. Measured on shrdlu 2026-07-30 13:47Z:
-  # leg 1 left queued turns on ITS session, which wedged leg 2's `identity apply
-  # --all` — so single-invocation two-harness parity was structurally impossible,
-  # and a pre-run drain could not help because the backlog is created BETWEEN the
-  # legs, inside the invocation. One session's queued work must never be another
-  # session's barrier.
-  test "queued turns on a bystander session do not block org-wide apply", ctx do
-    base_dir = role_test_base("identity-apply-bystander")
-    learn_engineering_identity!(base_dir)
-    revision = Identity.live_revision!(base_dir)
-
-    for {key, name} <- [{"agent:leg-one", "Leg one"}, {"agent:leg-two", "Leg two"}] do
-      Org.create(ctx.db, %{
-        session_key: key,
-        display_name: name,
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
-        identity_revision: revision,
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
-      })
-    end
-
-    # Leg one's own bracket nags and DR notifications, as the smoke produces them.
-    for n <- 1..8 do
-      assert {:ok, _seq} =
-               Ledger.enqueue(ctx.db, %{
-                 session_key: "agent:leg-one",
-                 message_id: "bystander-#{n}",
-                 origin: "process:tightbeam",
-                 prompt: "nag #{n}"
-               })
-    end
-
-    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
-
-    assert %{applied: applied, identity_revision: ^revision} =
-             apply.(%{origin: "user:flynn", params: %{all: true}})
-
-    # Neither leg is refused, and leg one's OWN backlog did not exempt it either.
-    assert "agent:leg-one" in applied
-    assert "agent:leg-two" in applied
-  end
-
-  # TOCTOU regression, found in review of the queued/running fix. The busy check
-  # and the adapter bounce are separated by adapter work, and the LANE can claim a
-  # queued turn inside that window — so apply would close and reload a harness
-  # session whose turn had just started, which is precisely the mid-turn identity
-  # change the boundary exists to prevent (T-CONCURRENCY; served-identity §520).
-  # Checking status twice cannot close this: any gateway-side sample is stale the
-  # instant it is read. Ordering is decided where serialization already exists —
-  # the lane's own mailbox — so apply asks the lane to perform-or-refuse.
-  #
-  # The old queued-counts-as-busy behavior MASKED this by rejecting the queued row
-  # outright, so this window is newly reachable and gets its own adversarial test.
-  test "a queued turn cannot start while apply is bouncing the session", ctx do
-    base_dir = role_test_base("identity-apply-toctou")
-    learn_engineering_identity!(base_dir)
-    revision = Identity.live_revision!(base_dir)
-
-    session =
-      Org.create(ctx.db, %{
-        session_key: "agent:identity-apply-toctou",
-        display_name: "Identity apply toctou",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
-        identity_revision: revision,
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
-      })
-
-    Org.append_pointer(ctx.db, session.session_key, "thread-toctou", "created")
-    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-
-    next =
-      identity_edit!(
-        base_dir,
-        "coder",
-        {:skill, "worktree-session", false},
-        "identity an in-flight turn must not be switched onto",
-        "test"
-      )
-
-    adapter = start_supervised!({HoldingAdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-    ensure_global_registry()
-
-    test_pid = self()
-
-    start_lane!(ctx.db, session.session_key, fn turn ->
-      send(test_pid, {:turn_started, turn.seq})
-      {:ok, %{}}
-    end)
-
-    # The precondition the whole race depends on: nothing is running, so the busy
-    # check passes and apply proceeds into the bounce.
-    refute Ledger.running?(ctx.db, session.session_key)
-
-    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
-
-    applier =
-      Task.async(fn ->
-        apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
-      end)
-
-    # Apply is now INSIDE the bounce, parked in close_session.
-    assert_receive {:holding_close, "thread-toctou"}, 5_000
-
-    # THE WINDOW: a turn arrives and the lane is nudged, exactly as a client post
-    # or a wake delivery would do it.
-    assert {:ok, _seq} =
-             Ledger.enqueue(ctx.db, %{
-               session_key: session.session_key,
-               message_id: "toctou-1",
-               origin: "user:flynn",
-               prompt: "must not start under the bounce"
-             })
-
-    assert :ok = SessionLane.nudge(session.session_key)
-
-    # THE ASSERTION: no turn starts while the session is being reloaded.
-    #
-    # The budget is deliberately generous and the asymmetry is the reason. While
-    # the boundary holds, this message never arrives at ANY budget, so a larger
-    # number cannot make the test flaky — it only costs wall time on the happy
-    # path. What it buys is the regression direction: if the seam is ever removed,
-    # the lane must be given enough room to claim on a loaded box, or this test
-    # goes quietly green while broken. Sized for load, not fitted to the observed
-    # fail-before (which fired in under 300ms on an idle machine).
-    refute_receive {:turn_started, _}, 2_000
-
-    send(adapter, :release)
-
-    assert %{applied: [session_key], identity_revision: ^next} = Task.await(applier, 10_000)
-    assert session_key == session.session_key
-
-    # Deferred, never dropped — the nudge waited in the lane's mailbox and the turn
-    # runs once the boundary is free, against the identity apply just installed.
-    assert_receive {:turn_started, _}, 5_000
-  end
-
-  # The same race through the door the first fix left open: a session with NO lane.
-  # "No lane exists" is a sample of a mutable fact, not a guarantee — a lane can be
-  # BORN inside the window, because a delivery calls ensure_lane and the newborn
-  # claims on its own init nudge. Most reachable exactly where apply matters most:
-  # after a restart every started session has a pointer and no lane. Apply now
-  # ensures the lane before deciding, so there is one path rather than two.
-  test "a lane born during the bounce cannot claim a turn either", ctx do
-    base_dir = role_test_base("identity-apply-newborn")
-    learn_engineering_identity!(base_dir)
-    revision = Identity.live_revision!(base_dir)
-
-    session =
-      Org.create(ctx.db, %{
-        session_key: "agent:identity-apply-newborn",
-        display_name: "Identity apply newborn",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
-        identity_revision: revision,
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
-      })
-
-    Org.append_pointer(ctx.db, session.session_key, "thread-newborn", "created")
-    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-
-    next =
-      identity_edit!(
-        base_dir,
-        "coder",
-        {:skill, "worktree-session", false},
-        "identity a newborn lane must not race",
-        "test"
-      )
-
-    adapter = start_supervised!({HoldingAdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-    ensure_global_registry()
-
-    test_pid = self()
-
-    # A REAL LaneManager, because the thing under test is lane CREATION racing the
-    # bounce. Its scan interval is parked so the only lane births in this test are
-    # the ones the test causes.
-    task_sup =
-      start_supervised!(
-        {Task.Supervisor, name: :"newborn_tasks_#{System.unique_integer([:positive])}"}
-      )
-
-    lane_sup =
-      start_supervised!(
-        {DynamicSupervisor,
-         strategy: :one_for_one, name: :"newborn_lanes_#{System.unique_integer([:positive])}"}
-      )
-
-    manager_name = :"newborn_manager_#{System.unique_integer([:positive])}"
-
-    start_supervised!(
-      {LaneManager,
-       name: manager_name,
-       db: ctx.db,
-       lane_sup: lane_sup,
-       task_sup: task_sup,
-       interval: 600_000,
-       runner: fn turn ->
-         send(test_pid, {:turn_started, turn.seq})
-         {:ok, %{}}
-       end}
-    )
-
-    # THE PRECONDITION: no lane exists for this session when apply begins.
-    assert Registry.lookup(Tightbeam.LaneRegistry, session.session_key) == []
-
-    config = Map.put(gateway_config(base_dir, ctx.db, 0), :lane_manager, manager_name)
-    apply = Gateway.handlers(config)["identity-apply"]
-
-    applier =
-      Task.async(fn ->
-        apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
-      end)
-
-    assert_receive {:holding_close, "thread-newborn"}, 5_000
-
-    # THE WINDOW: a delivery arrives — enqueue, then ensure_lane exactly as
-    # complete_delivery/3 does it. On the sampled version this is what creates the
-    # lane that then claims under the bounce.
-    assert {:ok, _seq} =
-             Ledger.enqueue(ctx.db, %{
-               session_key: session.session_key,
-               message_id: "newborn-1",
-               origin: "user:flynn",
-               prompt: "arrives while the session is being reloaded"
-             })
-
-    assert :ok = LaneManager.ensure_lane(manager_name, session.session_key)
-
-    refute_receive {:turn_started, _}, 2_000
-
-    send(adapter, :release)
-
-    assert %{applied: [session_key], identity_revision: ^next} = Task.await(applier, 10_000)
-    assert session_key == session.session_key
-
-    assert_receive {:turn_started, _}, 5_000
-  end
-
-  # The cancel verb inherited GenServer.call's 5s default back when the lane only
-  # ever did fast work. at_turn_boundary/2 made the lane occupiable for a whole
-  # adapter bounce, so that unchosen default became a deadline: a cancel issued
-  # during a bounce died of timeout instead of answering. Nothing was running, so
-  # the true answer was :not_running all along — a timeout exit reads as "something
-  # is broken" when the truth is "nothing was running".
-  test "cancel waits for the boundary instead of timing out under it", ctx do
-    base_dir = role_test_base("identity-apply-cancel-wait")
-    learn_engineering_identity!(base_dir)
-    revision = Identity.live_revision!(base_dir)
-
-    session =
-      Org.create(ctx.db, %{
-        session_key: "agent:identity-apply-cancel-wait",
-        display_name: "Identity apply cancel wait",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
-        identity_revision: revision,
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
-      })
-
-    Org.append_pointer(ctx.db, session.session_key, "thread-cancel-wait", "created")
-    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-
-    identity_edit!(
-      base_dir,
-      "coder",
-      {:skill, "worktree-session", false},
-      "identity applied while a cancel waits",
-      "test"
-    )
-
-    adapter = start_supervised!({HoldingAdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-    ensure_global_registry()
-    start_lane!(ctx.db, session.session_key)
-
-    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
-
-    applier =
-      Task.async(fn ->
-        apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
-      end)
-
-    assert_receive {:holding_close, "thread-cancel-wait"}, 5_000
-
-    # A cancel arrives while the lane is occupied by the bounce.
-    parent = self()
-
-    canceller =
-      spawn(fn ->
-        send(parent, {:cancel_result, SessionLane.cancel_current(session.session_key)})
-      end)
-
-    ref = Process.monitor(canceller)
-
-    # The wait is the subject, not incidental: it must outlast the 5s default this
-    # call used to inherit. Under that default the caller is already dead here.
-    refute_receive {:DOWN, ^ref, :process, _, _}, 5_500
-    refute_received {:cancel_result, _}
-
-    send(adapter, :release)
-
-    # The true answer, late rather than never: nothing was running.
-    assert_receive {:cancel_result, :not_running}, 10_000
-    assert %{applied: [_]} = Task.await(applier, 10_000)
-  end
-
-  # THE ACCEPTED RESIDUAL of ensuring the lane, documented so it is not rediscovered
-  # as a bug. A lane created here self-nudges from its own `init/1` — that nudge is
-  # in its mailbox before `at_turn_boundary/2` can land — so if claimable queued work
-  # exists, the newborn claims it and apply defers to the turn it just caused.
-  #
-  # Why that is acceptable, which is the whole argument and not a caveat on it: the
-  # wedge this branch removes was PERMANENT BY CONSTRUCTION — a headless org's Main
-  # queues forever, nothing drains it, org-wide apply impossible for the life of the
-  # org, no retry helps. This is TRANSIENT BY CONSTRUCTION — it needs an absent lane
-  # AND claimable queued work, the reconciler ensures a lane for every pending session
-  # each tick, and the turn we caused would have started inside that tick anyway. Those
-  # are different classes, not degrees: "impossible forever" versus "try again in a
-  # second". The refusal is also TRUE rather than spurious — a turn really is running
-  # by the time we ask — so nothing is ever bounced mid-turn.
-  #
-  # Note what is NOT claimed: "no lane implies no pending work" is not an invariant.
-  # A delivery commits its turn before it calls ensure_lane, so this state has a real
-  # window and is reachable rather than theoretical.
-  #
-  # Filed separately, deliberately not fixed here: under `--all` a refusal halts the
-  # whole pass (identity_apply_at_boundary's reduce_while), so one such session defers
-  # the org-wide apply. Changing that is a product decision about partial results, not
-  # this seam's to make.
-  test "a lane ensured over queued work defers, and the retry after it succeeds", ctx do
-    base_dir = role_test_base("identity-apply-residual")
-    learn_engineering_identity!(base_dir)
-    revision = Identity.live_revision!(base_dir)
-
-    session =
-      Org.create(ctx.db, %{
-        session_key: "agent:identity-apply-residual",
-        display_name: "Identity apply residual",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
-        identity_revision: revision,
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
-      })
-
-    Org.append_pointer(ctx.db, session.session_key, "thread-residual", "created")
-    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
-    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
-
-    next =
-      identity_edit!(
-        base_dir,
-        "coder",
-        {:skill, "worktree-session", false},
-        "identity the retry must land",
-        "test"
-      )
-
-    adapter = start_supervised!({IdentityApplyAdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-    ensure_global_registry()
-
-    test_pid = self()
-
-    task_sup =
-      start_supervised!(
-        {Task.Supervisor, name: :"residual_tasks_#{System.unique_integer([:positive])}"}
-      )
-
-    lane_sup =
-      start_supervised!(
-        {DynamicSupervisor,
-         strategy: :one_for_one, name: :"residual_lanes_#{System.unique_integer([:positive])}"}
-      )
-
-    manager_name = :"residual_manager_#{System.unique_integer([:positive])}"
-
-    # The runner HOLDS the turn open, so the refusal below is a stable state rather
-    # than a race the assertion has to win.
-    start_supervised!(
-      {LaneManager,
-       name: manager_name,
-       db: ctx.db,
-       lane_sup: lane_sup,
-       task_sup: task_sup,
-       interval: 600_000,
-       on_terminal: fn key, seq -> send(test_pid, {:turn_terminal, key, seq}) end,
-       runner: fn turn ->
-         send(test_pid, {:turn_started, turn.seq})
-
-         receive do
-           :finish_turn -> {:ok, %{}}
-         end
-       end}
-    )
-
-    assert {:ok, _seq} =
-             Ledger.enqueue(ctx.db, %{
-               session_key: session.session_key,
-               message_id: "residual-1",
-               origin: "user:flynn",
-               prompt: "queued before any lane existed"
-             })
-
-    # THE PRECONDITION: queued work, and no lane to run it.
-    assert Registry.lookup(Tightbeam.LaneRegistry, session.session_key) == []
-    refute Ledger.running?(ctx.db, session.session_key)
-
-    config = Map.put(gateway_config(base_dir, ctx.db, 0), :lane_manager, manager_name)
-    apply = Gateway.handlers(config)["identity-apply"]
-
-    assert %{code: "turn_in_progress", sessions: [session_key]} =
-             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
-
-    assert session_key == session.session_key
-
-    # The refusal is TRUE, not a lie: the newborn lane really did start the turn, and
-    # the stamp is untouched because nothing was bounced.
-    assert_receive {:turn_started, _}, 5_000
+    # And AFTER: complete new documents. A read spanning the update sees old-then-new
+    # per file; no single-revision snapshot is claimed for the turn, and none is owed.
+    assert File.read!(alpha) == "alpha next"
+    assert File.read!(beta) == "beta next"
+
+    # The turn is untouched: not cancelled, not finished, not bounced.
     assert Ledger.running?(ctx.db, session.session_key)
-    assert Org.get(ctx.db, session.session_key).identity_revision == revision
-
-    # TRANSIENT: the turn terminals and the retry lands. This is the "try again in a
-    # second" half, and it is what makes the trade a trade.
-    Enum.each(Task.Supervisor.children(task_sup), &send(&1, :finish_turn))
-
-    assert_receive {:turn_terminal, _, _}, 5_000
-    refute Ledger.running?(ctx.db, session.session_key)
-
-    assert %{applied: [^session_key], identity_revision: ^next} =
-             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
-
     assert Org.get(ctx.db, session.session_key).identity_revision == next
   end
 
-  # Regression: spawn creates the harness session LAZILY, so a freshly spawned session
-  # has no harness pointer until its first turn. identity-apply once raised on it —
-  # bricking `--all` org-wide whenever any never-started session existed (found by
-  # feature_smoke: it applied to the session it had just spawned). A pointer-less
-  # session has no adapter work, but apply still records the complete live render stamp.
-  test "identity apply stamps a never-started session without touching an adapter", ctx do
+  # Regression: spawn creates the harness session LAZILY, so a freshly spawned
+  # session has no harness pointer until its first turn. A pointer-less session has
+  # nobody to ask, so it gets the files and the stamp and no nudge — but it does
+  # reach the applied branch, and its native skill directory is created here even
+  # when nothing has ever written one.
+  test "identity apply materializes and stamps a never-started session without a nudge", ctx do
     base_dir = role_test_base("identity-apply-unstarted")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -9267,7 +7430,20 @@ defmodule Tightbeam.GatewayTest do
       })
 
     # No pointer appended: the session has never started. No adapter stub either —
-    # a no-op must not touch the adapter at all.
+    # nothing here may touch the adapter layer at all.
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    File.rm_rf!(Path.join(cwd, ".codex/skills"))
+    refute File.dir?(Path.join(cwd, ".codex/skills"))
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "unstarted served skill",
+        "test"
+      )
+
     ensure_global_registry()
 
     {:ok, _ref, nil} =
@@ -9281,123 +7457,110 @@ defmodule Tightbeam.GatewayTest do
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
-    assert %{applied: [session_key], identity_revision: ^revision} =
-             apply.(%{
-               origin: "user:flynn",
-               params: %{session_key: session.session_key}
-             })
+    assert %{applied: [session_key], identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
     assert session_key == session.session_key
-    assert Org.current_pointer(ctx.db, session.session_key) == nil
+
+    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")) ==
+             "unstarted served skill"
+
     stamped = Org.get(ctx.db, session.session_key)
+    assert stamped.identity_revision == next
     assert stamped.identity_render_contract == "universal-root-render-v1"
+    assert is_binary(stamped.identity_guidance_digest)
+    assert Org.current_pointer(ctx.db, session.session_key) == nil
 
-    base_guidance =
-      Identity.snapshot_at!(base_dir, revision, session.archetype, :codex).guidance
+    # The applied branch, so the stream push; but nobody to nudge, so no turn.
+    assert_receive {:push,
+                    %{"type" => "stream_updated", "stream" => %{"sessionKey" => ^session_key}}}
 
-    final_guidance =
-      base_guidance <>
-        "\n\n## Inspect recent Tightbeam transcript\n\n" <>
-        "Before continuing, inspect this session's recent Tightbeam transcript. " <>
-        "Run `tightbeam transcript --session #{inspect(session.session_key)} --limit 50` and read only the bounded result you need. " <>
-        "Do not replay or inject earlier messages, and do not assume another " <>
-        "harness's private memory transferred."
-
-    expected_digest =
-      :crypto.hash(:sha256, final_guidance) |> Base.encode16(case: :lower)
-
-    assert stamped.identity_guidance_digest == expected_digest
-
-    status = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-status"]
-    %{sessions: sessions} = status.(%{origin: "user:flynn", params: %{}})
-    rendered = Enum.find(sessions, &(&1.session_key == session.session_key))
-    assert rendered.expected_guidance_digest == expected_digest
-    refute "guidance_digest_mismatch" in rendered.identity_stale_reasons
-    assert_receive {:push, %{"type" => "stream_updated"}}
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+    refute_received {:ensure_lane, _}
   end
 
-  # Regression, found live on shrdlu: a pointer row outlives the adapter that
-  # made it, so after ANY gateway restart EVERY started session has a pointer
-  # naming a harness session no adapter holds. Apply bounced it anyway and the
-  # harness answered "Session not found" as a raw JSON-RPC -32603, which the
-  # verb then raised — so `identity apply --all` was broken org-wide until every
-  # session happened to resume. Main always qualifies.
-  test "identity apply advances the stamp of a started session the adapter no longer holds",
-       ctx do
-    base_dir = role_test_base("identity-apply-gone")
+  # Selection is the whole of the blast radius. There is no apply-specific root,
+  # home, manifest, or discovery rule: the ordinary writer reconciles the ordinary
+  # reserved paths of the ordinary selected session, and everything else — the
+  # bystander session, product files, non-reserved skills — is byte-identical after.
+  test "identity apply touches only the selected session's Tightbeam-owned files", ctx do
+    base_dir = role_test_base("identity-apply-selection")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
-    session =
-      Org.create(ctx.db, %{
-        session_key: "agent:identity-apply-gone",
-        display_name: "Identity apply gone",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "coder",
-        identity_name: "coder",
-        identity_revision: revision,
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
-      })
+    make = fn key ->
+      session =
+        Org.create(ctx.db, %{
+          session_key: key,
+          display_name: key,
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "coder",
+          identity_name: "coder",
+          identity_revision: revision,
+          host: "testhost",
+          harness: "codex",
+          provider: "openai",
+          model: Model.new("gpt-5.6-sol", effort: "medium")
+        })
 
-    Org.append_pointer(ctx.db, session.session_key, "thread-vanished", "created")
-    start_lane!(ctx.db, session.session_key)
+      Org.append_pointer(ctx.db, key, "thread-#{key}", "created")
+      cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+      Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+      {session, cwd}
+    end
+
+    {selected, selected_cwd} = make.("agent:apply-selected")
+    {bystander, bystander_cwd} = make.("agent:apply-bystander")
+
+    # Files that are not Tightbeam's to write, planted in the SELECTED session's
+    # own workdir: a product file, a skill the agent owns, and vendor state.
+    product = Path.join(selected_cwd, "README.md")
+    mine = Path.join(selected_cwd, ".codex/skills/mine/SKILL.md")
+    vendor = Path.join(selected_cwd, ".codex/state.json")
+    File.mkdir_p!(Path.dirname(mine))
+    File.write!(product, "product source")
+    File.write!(mine, "my own skill")
+    File.write!(vendor, ~s({"vendor":"state"}))
+
+    bystander_skill =
+      Path.join(bystander_cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+
+    bystander_body = File.read!(bystander_skill)
 
     next =
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
-        "guidance the restart must not lose",
+        {:skill, "model-release-intake", false},
+        "only the selected session gets this",
         "test"
       )
 
-    adapter = start_supervised!({GoneSessionAdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
     ensure_global_registry()
-
-    {:ok, _ref, nil} =
-      ConnRegistry.register(Tightbeam.ConnRegistry, %{
-        pid: self(),
-        user_id: "flynn",
-        device_id: "identity-apply-gone-device",
-        is_admin: false,
-        subscriptions: MapSet.new(["chat"])
-      })
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
     assert %{applied: [session_key], identity_revision: ^next} =
-             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+             apply.(%{origin: "user:flynn", params: %{session_key: selected.session_key}})
 
-    assert session_key == session.session_key
-    assert_receive {:gone_residency_asked, "thread-vanished"}
+    assert session_key == selected.session_key
 
-    # Nothing is asked of a harness that never heard of this session.
-    refute_receive {:gone_close_attempted, _}
-    refute_receive {:gone_load_attempted, _}
+    assert File.read!(
+             Path.join(selected_cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+           ) ==
+             "only the selected session gets this"
 
-    # THE STAMP IS THE APPLICATION here. The next start reloads from
-    # `identity_revision`, not from live, so a session left behind would
-    # materialize stale forever while `identity status` kept calling it stale.
-    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert File.read!(product) == "product source"
+    assert File.read!(mine) == "my own skill"
+    assert File.read!(vendor) == ~s({"vendor":"state"})
 
-    # And the pointer chain records only what happened: nothing was loaded.
-    assert Org.current_pointer(ctx.db, session.session_key).harness_session_id ==
-             "thread-vanished"
-
-    assert Org.current_pointer(ctx.db, session.session_key).reason == "created"
+    assert File.read!(bystander_skill) == bystander_body
+    assert Org.get(ctx.db, bystander.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, bystander.session_key) == 0
   end
 
-  # The condition this fix meets FIRST, not someday: deploying it restarts the
-  # gateway, which stales every started session's pointer at once, so the very
-  # next `identity apply --all` hits all three shapes together on a real org.
-  # Single-session coverage would not have pinned that.
-  test "identity apply --all handles resident, gone, and never-started sessions in one pass",
-       ctx do
+  test "identity apply --all covers started and never-started sessions in one pass", ctx do
     base_dir = role_test_base("identity-apply-all")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
@@ -9422,23 +7585,18 @@ defmodule Tightbeam.GatewayTest do
       session
     end
 
-    resident = make.("agent:apply-all-resident", "thread-resident")
-    gone = make.("agent:apply-all-gone", "thread-gone")
-    start_lane!(ctx.db, "agent:apply-all-resident")
-    start_lane!(ctx.db, "agent:apply-all-gone")
+    started = make.("agent:apply-all-started", "thread-started")
     unstarted = make.("agent:apply-all-unstarted", nil)
 
     next =
       identity_edit!(
         base_dir,
         "coder",
-        {:skill, "worktree-session", false},
+        {:skill, "model-release-intake", false},
         "org-wide guidance",
         "test"
       )
 
-    adapter = start_supervised!({MixedResidencyAdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
     ensure_global_registry()
 
     apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
@@ -9446,37 +7604,30 @@ defmodule Tightbeam.GatewayTest do
     assert %{applied: applied, identity_revision: ^next} =
              apply.(%{origin: "user:flynn", params: %{all: true}})
 
-    for key <- [resident.session_key, gone.session_key, unstarted.session_key] do
-      assert key in applied
-    end
+    for key <- [started.session_key, unstarted.session_key], do: assert(key in applied)
 
-    # Only the resident one is bounced, and only it.
-    assert_receive {:mixed_close, "thread-resident"}
-    assert_receive {:mixed_load, "thread-resident"}
-    refute_receive {:mixed_close, "thread-gone"}
-    refute_receive {:mixed_load, "thread-gone"}
-
-    # Both started sessions come out on the applied revision — the resident one
-    # through the bounce, the gone one through its stamp.
-    assert Org.get(ctx.db, resident.session_key).identity_revision == next
-    assert Org.get(ctx.db, gone.session_key).identity_revision == next
-
-    # The never-started one is left alone and does not need the stamp: it reads
-    # `live` at its first start rather than its stamp, so it self-corrects. That
-    # is the whole difference between it and the gone session, which reads its
-    # stamp and would otherwise materialize stale forever.
+    # Both are stamped; only the started one is asked to re-read.
+    assert Org.get(ctx.db, started.session_key).identity_revision == next
+    assert Org.get(ctx.db, unstarted.session_key).identity_revision == next
+    assert Ledger.pending_count(ctx.db, started.session_key) == 1
+    assert Ledger.pending_count(ctx.db, unstarted.session_key) == 0
     assert Org.current_pointer(ctx.db, unstarted.session_key) == nil
   end
 
-  test "identity apply refuses by name when a live adapter fails for its own reason", ctx do
-    base_dir = role_test_base("identity-apply-error")
+  # Writer first, stamp second, nudge third — and the ordering is load-bearing
+  # exactly here: a writer that raises leaves the PRIOR stamp standing and sends
+  # no nudge, because there is nothing new to re-read. Nothing rolls back, reads
+  # back, records an effect row, or repairs; the failure is a named refusal and
+  # the operator's move is to retry.
+  test "a writer failure refuses by name, leaves the prior stamp, and sends no nudge", ctx do
+    base_dir = role_test_base("identity-apply-writer-fail")
     learn_engineering_identity!(base_dir)
     revision = Identity.live_revision!(base_dir)
 
     session =
       Org.create(ctx.db, %{
-        session_key: "agent:identity-apply-error",
-        display_name: "Identity apply error",
+        session_key: "agent:identity-apply-writer-fail",
+        display_name: "Identity apply writer fail",
         owner_user_id: "flynn",
         origin: "user:flynn",
         archetype: "coder",
@@ -9488,95 +7639,21 @@ defmodule Tightbeam.GatewayTest do
         model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
-    Org.append_pointer(ctx.db, session.session_key, "thread-resident", "created")
-    start_lane!(ctx.db, session.session_key)
+    Org.append_pointer(ctx.db, session.session_key, "thread-writer-fail", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+
+    # The injection: a regular file where the harness skill root has to be, so the
+    # writer's own mkdir raises partway through the update.
+    File.mkdir_p!(cwd)
+    File.write!(Path.join(cwd, ".codex"), "not a directory")
 
     identity_edit!(
       base_dir,
       "coder",
-      {:skill, "worktree-session", false},
-      "guidance that cannot be delivered",
+      {:skill, "model-release-intake", false},
+      "never lands",
       "test"
     )
-
-    adapter = start_supervised!({ApplyErrorAdapterStub, self()})
-    start_supervised!({CoordinatorStub, {adapter, self()}})
-    ensure_global_registry()
-
-    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
-
-    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
-
-    # A NAMED refusal, not a raise and not a raw JSON-RPC envelope from three
-    # layers down. The residency branch must not have swallowed this.
-    assert %{code: "apply_failed", sessions: [session_key]} = result
-    assert session_key == session.session_key
-    assert result.message =~ "harness is shutting down"
-    refute result.message =~ "-32000"
-    assert_receive {:apply_error_close, "thread-resident"}
-
-    # A refused apply changes nothing.
-    assert Org.get(ctx.db, session.session_key).identity_revision == revision
-  end
-
-  test "credential transitions publish the captured provider-session set exactly once", ctx do
-    base_dir = role_test_base("credential-emission")
-    config = gateway_config(base_dir, ctx.db, 0)
-    children = Gateway.children(config)
-
-    %{start: {Credentials, :start_link, [credential_opts]}} =
-      Enum.find(children, &match?(%{id: {Credentials, "testhost"}}, &1))
-
-    first =
-      Org.create(ctx.db, %{
-        session_key: "agent:credential-first",
-        display_name: "Credential first",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
-      })
-
-    second =
-      Org.create(ctx.db, %{
-        session_key: "agent:credential-second",
-        display_name: "Credential second",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        host: "testhost",
-        harness: "codex",
-        provider: "openai",
-        model: Model.new("gpt-5.6-sol", effort: "medium")
-      })
-
-    fixture_session =
-      Org.create(ctx.db, %{
-        session_key: "agent:credential-fixture",
-        display_name: "Credential fixture",
-        owner_user_id: "flynn",
-        origin: "user:flynn",
-        archetype: "default",
-        host: "testhost",
-        harness: "fixture",
-        provider: "fixture_provider",
-        model: Model.new("fixture-model")
-      })
-
-    Org.create(ctx.db, %{
-      session_key: "agent:credential-nonmatching",
-      display_name: "Credential nonmatching",
-      owner_user_id: "flynn",
-      origin: "user:flynn",
-      archetype: "default",
-      host: "testhost",
-      harness: "claude",
-      provider: "anthropic",
-      model: Model.new("claude-fable-5")
-    })
 
     ensure_global_registry()
 
@@ -9584,178 +7661,669 @@ defmodule Tightbeam.GatewayTest do
       ConnRegistry.register(Tightbeam.ConnRegistry, %{
         pid: self(),
         user_id: "flynn",
-        device_id: "credential-emission-device",
+        device_id: "identity-apply-writer-fail-device",
         is_admin: false,
         subscriptions: MapSet.new(["chat"])
       })
 
-    parent = self()
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
 
-    park = fn :openai ->
-      Org.retire(ctx.db, first.session_key, "test:gateway", 1_000)
+    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
 
+    # A NAMED refusal, not a raise and not a raw envelope from three layers down.
+    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert session_key == session.session_key
+    assert result.message =~ session.session_key
+
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+    refute_receive {:push, %{"type" => "stream_updated"}}, 200
+
+    # No repair, either: what was in the way is still in the way.
+    assert File.read!(Path.join(cwd, ".codex")) == "not a directory"
+  end
+
+  # Retry converges, and a duplicate nudge is acceptable — the prompt is idempotent
+  # advice, not a command that must be delivered exactly once.
+  test "a retried apply converges and a repeated nudge is acceptable", ctx do
+    base_dir = role_test_base("identity-apply-retry")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
       Org.create(ctx.db, %{
-        session_key: "agent:credential-late",
-        display_name: "Credential late",
+        session_key: "agent:identity-apply-retry",
+        display_name: "Identity apply retry",
         owner_user_id: "flynn",
         origin: "user:flynn",
-        archetype: "default",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
         host: "testhost",
         harness: "codex",
         provider: "openai",
         model: Model.new("gpt-5.6-sol", effort: "medium")
       })
 
-      send(parent, :parked)
-      :ok
+    Org.append_pointer(ctx.db, session.session_key, "thread-retry", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "retried served skill",
+        "test"
+      )
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
+
+    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+
+    assert File.read!(Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")) ==
+             "retried served skill"
+
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+
+    assert {:ok, rows} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
+               session.session_key
+             ])
+
+    assert length(rows) >= 1
+
+    for [prompt] <- rows do
+      assert prompt =~ "Re-read your Tightbeam skills before you continue work."
     end
-
-    {:ok, park_receiver} = Tightbeam.CredentialParkTestReceiver.start_link(park)
-
-    opts =
-      credential_opts
-      |> Keyword.put(:name, nil)
-      |> Keyword.put(:park_edge, Tightbeam.CommandEdge.request_to(park_receiver))
-      |> Keyword.put(:stop, fn _provider -> :ok end)
-      |> Keyword.put(:start, fn _provider, _kind -> :ok end)
-      |> Keyword.put(:resume, fn _provider -> :ok end)
-      |> Keyword.put(:onboarders, %{
-        openai: fn _state -> {:ok, %{bytes: ~S({"token":"replacement"}), expires_at: nil}} end
-      })
-
-    {:ok, server} = Credentials.start_link(opts)
-
-    evidence = %{"authMode" => nil, "planType" => nil}
-
-    assert :ok = Credentials.mark_terminal(:openai, evidence, server)
-    assert_receive :parked
-
-    terminal_frames = collect_pushes(4, [])
-
-    assert Enum.frequencies_by(terminal_frames, & &1["type"]) == %{
-             "message" => 2,
-             "stream_updated" => 2
-           }
-
-    assert MapSet.new(
-             for %{
-                   "type" => "message",
-                   "role" => "user",
-                   "sessionKey" => key,
-                   "sender" => "process:tightbeam",
-                   "content" => content
-                 } <- terminal_frames,
-                 content =~ "credential" and content =~ "parked pending re-onboarding",
-                 do: key
-           ) == MapSet.new([first.session_key, second.session_key])
-
-    assert MapSet.new(
-             for %{"type" => "stream_updated", "stream" => %{"sessionKey" => key}} <-
-                   terminal_frames,
-                 do: key
-           ) == MapSet.new([first.session_key, second.session_key])
-
-    assert :ok = Credentials.mark_terminal(:openai, evidence, server)
-    refute_receive :parked
-    refute_receive {:push, _}
-    refute_receive {:push_message, _, _, _}
-
-    assert :ok = Credentials.onboard(:openai, server)
-    onboarded_frames = collect_pushes(4, [])
-
-    assert Enum.frequencies_by(onboarded_frames, & &1["type"]) == %{
-             "message" => 2,
-             "stream_updated" => 2
-           }
-
-    assert MapSet.new(
-             for %{
-                   "type" => "message",
-                   "role" => "user",
-                   "sessionKey" => key,
-                   "sender" => "process:tightbeam",
-                   "content" => content
-                 } <- onboarded_frames,
-                 content =~ "re-onboarded" and content =~ "may resume",
-                 do: key
-           ) ==
-             MapSet.new([
-               second.session_key,
-               "agent:credential-late"
-             ])
-
-    assert MapSet.new(
-             for %{"type" => "stream_updated", "stream" => %{"sessionKey" => key}} <-
-                   onboarded_frames,
-                 do: key
-           ) ==
-             MapSet.new([
-               second.session_key,
-               "agent:credential-late"
-             ])
-
-    assert Org.get(ctx.db, fixture_session.session_key).provider == "fixture_provider"
   end
 
-  test "provider onboarding starts every matching harness and aggregates runtime failures",
-       ctx do
-    base_dir = role_test_base("credential-runtime-aggregate")
-    config = gateway_config(base_dir, ctx.db, 0)
-    children = Gateway.children(config)
+  # R-02: a retired session is not a target. Retiring is a state flip, not a
+  # delete, so the row is still readable — and being readable is not the same as
+  # being writable. A retired key answers exactly as an unknown key does, because
+  # apply has nothing to do for either.
+  test "identity apply gives a retired session no file update and no nudge", ctx do
+    base_dir = role_test_base("identity-apply-retired")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
 
-    %{start: {Credentials, :start_link, [credential_opts]}} =
-      Enum.find(children, &match?(%{id: {Credentials, "testhost"}}, &1))
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-retired",
+        display_name: "Identity apply retired",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-retired", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+    old_body = File.read!(skill)
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "model-release-intake", false},
+      "not for the retired",
+      "test"
+    )
+
+    Org.retire(ctx.db, session.session_key, "test:gateway", 1_000)
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{code: "not_found"} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert File.read!(skill) == old_body
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+  end
+
+  # R-02 again, at the other end: `--all` captures its set ONCE, and a session can
+  # retire inside the pass. The row is re-read at ITS update, so the retirement is
+  # observed rather than raced past. Nothing holds the row still — this asserts a
+  # fresh read, not a lock, and a session retiring one instruction later would be
+  # updated, which is the honest boundary of a best-effort refresh.
+  test "identity apply --all skips a session that retires between capture and update",
+       ctx do
+    base_dir = role_test_base("identity-apply-mid-retire")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    make = fn key, order ->
+      session =
+        Org.create(ctx.db, %{
+          session_key: key,
+          display_name: key,
+          owner_user_id: "flynn",
+          origin: "user:flynn",
+          archetype: "coder",
+          identity_name: "coder",
+          identity_revision: revision,
+          order_index: order,
+          host: "testhost",
+          harness: "codex",
+          provider: "openai",
+          model: Model.new("gpt-5.6-sol", effort: "medium")
+        })
+
+      Org.append_pointer(ctx.db, key, "thread-#{order}", "created")
+      cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+      Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+      {session, Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")}
+    end
+
+    # `--all` orders by orderIndex, so first is updated before second.
+    {first, _first_skill} = make.("agent:apply-mid-first", 1)
+    {second, second_skill} = make.("agent:apply-mid-second", 2)
+    old_second = File.read!(second_skill)
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "mid-pass guidance",
+        "test"
+      )
+
+    # The injection: the second session retires exactly while the first is being
+    # stamped — inside the window between the capture and the second's own update.
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER identity_apply_retire_mid_pass
+      AFTER UPDATE OF identityRevision ON sessions
+      WHEN NEW.sessionKey = '#{first.session_key}'
+      BEGIN
+        UPDATE sessions SET state = 'retired' WHERE sessionKey = '#{second.session_key}';
+      END;
+      """)
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{applied: applied, identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{all: true}})
+
+    assert first.session_key in applied
+    refute second.session_key in applied
+
+    # The one that retired got nothing: no file update, no stamp, no nudge. The
+    # pass is not refused for it either — the other sessions are still served.
+    assert File.read!(second_skill) == old_second
+    assert Org.get(ctx.db, second.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, second.session_key) == 0
+    assert Org.get(ctx.db, first.session_key).identity_revision == next
+  end
+
+  # A-03/A-04: a writer that fails BETWEEN two skill files leaves a partial file
+  # set, and that is allowed. Apply makes no atomic-snapshot and no single-revision
+  # claim, so nothing rolls the written file back and nothing repairs it; the
+  # unwritten one stays as it was and the prior stamp stands.
+  test "a failure between two skill writes leaves the partial file set and no stamp", ctx do
+    base_dir = role_test_base("identity-apply-partial")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-partial",
+        display_name: "Identity apply partial",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-partial", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+
+    skills = Path.join(cwd, ".codex/skills")
+    alpha = Path.join(skills, "tightbeam__human-communication/SKILL.md")
+    beta_dir = Path.join(skills, "tightbeam__model-release-intake")
+    beta = Path.join(beta_dir, "SKILL.md")
+    old_beta = File.read!(beta)
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "human-communication", false},
+      "alpha next",
+      "test"
+    )
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "model-release-intake", false},
+      "beta next",
+      "test"
+    )
+
+    # The injection: the writer rewrites the elected skills in name order, so a
+    # directory it cannot replace stops it PARTWAY — alpha rewritten, beta not.
+    File.chmod!(beta_dir, 0o500)
+    on_exit(fn -> File.chmod(beta_dir, 0o700) end)
+
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "identity-apply-partial-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert session_key == session.session_key
+
+    # Partial, and left partial: the file that landed is the new one, the file
+    # that did not is untouched, and the stamp still names the prior revision.
+    assert File.read!(alpha) == "alpha next"
+    assert File.read!(beta) == old_beta
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+    refute_receive {:push, %{"type" => "stream_updated"}}, 200
+  end
+
+  # A-04: the stamp is the second step, and its failure is the writer's failure —
+  # files new, stamp old, no nudge. There is nothing to re-read on ANOTHER
+  # session's behalf and nothing to undo: a stamp that did not move is a stamp
+  # that will be moved by the retry.
+  test "a stamp failure after the files land sends no nudge and moves no stamp", ctx do
+    base_dir = role_test_base("identity-apply-stamp-fail")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-stamp-fail",
+        display_name: "Identity apply stamp fail",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-stamp-fail", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "stamp-fail served skill",
+        "test"
+      )
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER identity_apply_stamp_failure
+      BEFORE UPDATE OF identityRevision ON sessions
+      BEGIN SELECT RAISE(ABORT, 'injected-stamp-failure'); END;
+      """)
+
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "flynn",
+        device_id: "identity-apply-stamp-fail-device",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert session_key == session.session_key
+
+    assert File.read!(skill) == "stamp-fail served skill"
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+    refute_receive {:push, %{"type" => "stream_updated"}}, 200
+
+    # The retry converges once the injected failure is gone: same files, and now
+    # the stamp. No recovery protocol ran; the operator simply asked again.
+    :ok = DB.execute(ctx.db, "DROP TRIGGER identity_apply_stamp_failure")
+
+    assert %{applied: [_], identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+  end
+
+  # A-04: the nudge is the third step, and its failure is the LEAST consequential
+  # one — the files and the stamp are already true, so nothing is undone. What the
+  # caller gets is a named per-session refusal, not a silent success.
+  test "a prompt-submission failure keeps the files and the stamp and names the session",
+       ctx do
+    base_dir = role_test_base("identity-apply-nudge-fail")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-nudge-fail",
+        display_name: "Identity apply nudge fail",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-nudge-fail", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "nudge-fail served skill",
+        "test"
+      )
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER identity_apply_nudge_failure
+      BEFORE INSERT ON turns
+      BEGIN SELECT RAISE(ABORT, 'injected-nudge-failure'); END;
+      """)
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    result = apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert %{code: "apply_failed", sessions: [session_key]} = result
+    assert session_key == session.session_key
+    assert result.message =~ session.session_key
+
+    # Both earlier steps stand. The prompt is the only thing missing, and the
+    # operator's move is the same retry as for any other step.
+    assert File.read!(skill) == "nudge-fail served skill"
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER identity_apply_nudge_failure")
+
+    assert %{applied: [_], identity_revision: ^next} =
+             apply.(%{origin: "user:flynn", params: %{session_key: session.session_key}})
+
+    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+  end
+
+  # A-04, the last failure window: the prompt was ACCEPTED and the caller lost the
+  # response, so it retries a call that already fully succeeded. A second nudge is
+  # the correct outcome, not a defect to deduplicate — the prompt is idempotent
+  # advice, and suppressing it would need exactly the delivery bookkeeping this
+  # design refuses to carry.
+  test "a retry after a lost response converges and a duplicate nudge is permitted", ctx do
+    base_dir = role_test_base("identity-apply-lost-response")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-lost-response",
+        display_name: "Identity apply lost response",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-lost-response", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+
+    next =
+      identity_edit!(
+        base_dir,
+        "coder",
+        {:skill, "model-release-intake", false},
+        "lost-response served skill",
+        "test"
+      )
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+    call = %{origin: "user:flynn", params: %{session_key: session.session_key}}
+
+    # The call that succeeded, whose response the caller never saw.
+    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+    assert Ledger.pending_count(ctx.db, session.session_key) == 1
+
+    # The retry, issued because the caller cannot tell success from silence.
+    assert %{applied: [_], identity_revision: ^next} = apply.(call)
+
+    assert File.read!(skill) == "lost-response served skill"
+    assert Org.get(ctx.db, session.session_key).identity_revision == next
+    assert Ledger.pending_count(ctx.db, session.session_key) == 2
+
+    assert {:ok, rows} =
+             DB.query(ctx.db, "SELECT prompt FROM turns WHERE sessionKey=?1 ORDER BY seq", [
+               session.session_key
+             ])
+
+    assert length(rows) == 2
+
+    for [prompt] <- rows do
+      assert prompt ==
+               "[from process:tightbeam]\n\n" <>
+                 "Your Tightbeam-owned skill files changed to identity revision #{next}.\n" <>
+                 "Re-read your Tightbeam skills before you continue work. This update does not\n" <>
+                 "reload your current model context."
+    end
+  end
+
+  # The refusal is the existing privacy-preserving one, and it happens before any
+  # effect: no file written, no prompt queued, no stamp moved.
+  test "identity apply refuses an unauthorized principal with no effect at all", ctx do
+    base_dir = role_test_base("identity-apply-forbidden")
+    learn_engineering_identity!(base_dir)
+    revision = Identity.live_revision!(base_dir)
+
+    session =
+      Org.create(ctx.db, %{
+        session_key: "agent:identity-apply-forbidden",
+        display_name: "Identity apply forbidden",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "coder",
+        identity_name: "coder",
+        identity_revision: revision,
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("gpt-5.6-sol", effort: "medium")
+      })
+
+    Org.append_pointer(ctx.db, session.session_key, "thread-forbidden", "created")
+    cwd = Placement.holder_workdir(gateway_config(base_dir, ctx.db, 0), session)
+    Identity.provision_at!(base_dir, revision, "coder", :codex, cwd)
+    skill = Path.join(cwd, ".codex/skills/tightbeam__model-release-intake/SKILL.md")
+    body = File.read!(skill)
+
+    identity_edit!(
+      base_dir,
+      "coder",
+      {:skill, "model-release-intake", false},
+      "must not reach an outsider's apply",
+      "test"
+    )
+
+    ensure_global_registry()
+
+    apply = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["identity-apply"]
+
+    assert %{code: "forbidden", message: "admin required"} =
+             apply.(%{origin: "user:not-admin", params: %{session_key: session.session_key}})
+
+    assert File.read!(skill) == body
+    assert Org.get(ctx.db, session.session_key).identity_revision == revision
+    assert Ledger.pending_count(ctx.db, session.session_key) == 0
+  end
+
+  # A structural test, because the absences ARE the design. Everything the earlier
+  # design reached for — the adapter, the lane, a turn-status check — is gone, and
+  # nothing was minted to replace it: no atomic switch, staging tree, readback,
+  # effect store, generation, projection root, quiescence wait, or rollback. If a
+  # future change needs one of these, it needs a spec first, and this test is where
+  # it announces itself.
+  test "the identity apply path carries no adapter, lane, or atomic-switch machinery" do
+    chunks =
+      File.read!("lib/tightbeam/gateway.ex")
+      |> String.split(~r/\n(?=  defp? [a-z])/)
+      |> Enum.filter(&(&1 =~ ~r/\A\s*defp? identity_apply_/))
+
+    assert length(chunks) >= 5
+    source = Enum.join(chunks, "\n")
+
+    forbidden = [
+      ~r/Adapter/,
+      ~r/LaneManager/,
+      ~r/SessionLane/,
+      ~r/at_turn_boundary/,
+      ~r/ensure_lane_quiet/,
+      ~r/close_session/,
+      ~r/load_session/,
+      ~r/knows_session\?/,
+      ~r/running\?/,
+      ~r/turn_in_progress/,
+      ~r/File\.rename/,
+      ~r/generation/i,
+      ~r/staging/i,
+      ~r/readback/i,
+      ~r/rollback/i,
+      ~r/quiescen/i,
+      ~r/credential/i
+    ]
+
+    for pattern <- forbidden do
+      refute source =~ pattern, "identity apply path matched forbidden #{inspect(pattern)}"
+    end
+  end
+
+  # The cancel verb inherited GenServer.call's 5s default back when the lane only
+  # ever did fast work. `at_turn_boundary/2` makes the lane occupiable for as long
+  # as its caller needs, so that unchosen default was a deadline: a cancel issued
+  # while the lane was occupied died of timeout instead of answering. Nothing was
+  # running, so the true answer was :not_running all along — a timeout exit reads
+  # as "something is broken" when the truth is "nothing was running".
+  test "cancel waits for the boundary instead of timing out under it", ctx do
+    session = create_session(ctx.db, "agent:lane-cancel-wait", "flynn")
+    start_lane!(ctx.db, session.session_key)
+    assert [{lane_pid, _}] = Registry.lookup(Tightbeam.LaneRegistry, session.session_key)
 
     parent = self()
 
-    start_result = fn
-      {:codex, "shared", "testhost"} = key ->
-        send(parent, {:runtime_start, key})
-        {:error, :codex_failed}
+    occupier =
+      Task.async(fn ->
+        SessionLane.at_turn_boundary(session.session_key, fn ->
+          send(parent, :boundary_entered)
 
-      {:fixture, "shared", "testhost"} = key ->
-        send(parent, {:runtime_start, key})
-        {:ok, parent, 1}
-    end
+          receive do
+            :release -> :done
+          end
+        end)
+      end)
 
-    start_supervised!({CoordinatorStub, start_result})
+    assert_receive :boundary_entered, 5_000
 
-    opts =
-      credential_opts
-      |> Keyword.put(:name, nil)
-      |> Keyword.put(:stop, fn _provider -> :ok end)
-      |> Keyword.put(:resume, fn _provider -> :ok end)
-      |> Keyword.put(:onboarders, %{
-        openai: fn _state -> {:ok, %{bytes: ~S({"token":"replacement"}), expires_at: nil}} end
-      })
+    # A cancel arrives while the lane is occupied.
+    canceller =
+      spawn(fn ->
+        send(parent, {:cancel_result, SessionLane.cancel_current(session.session_key)})
+      end)
 
-    {:ok, server} = Credentials.start_link(opts)
+    ref = Process.monitor(canceller)
 
-    assert {:error,
-            {:provider_runtime_start_failed,
-             %{
-               started: [],
-               failed: [%{harness: "codex", reason: :codex_failed}]
-             }}} = Credentials.onboard(:openai, server)
+    # The wait is the subject, not incidental: it must outlast the 5s default this
+    # call used to inherit. Under that default the caller is already dead here.
+    refute_receive {:DOWN, ^ref, :process, _, _}, 5_500
+    refute_received {:cancel_result, _}
 
-    assert_receive {:runtime_start, {:codex, "shared", "testhost"}}
-    refute_receive {:runtime_start, {:fixture, "shared", "testhost"}}
-    refute Credentials.status(:openai, server) == :onboarded
+    send(lane_pid, :release)
 
-    fixture_opts =
-      credential_opts
-      |> Keyword.put(:name, nil)
-      |> Keyword.put(:stop, fn _provider -> :ok end)
-      |> Keyword.put(:resume, fn _provider -> :ok end)
-      |> Keyword.put(:onboarders, %{
-        fixture_provider: fn _state ->
-          {:ok, %{bytes: "fixture-provider-credential", expires_at: nil}}
-        end
-      })
+    # The true answer, late rather than never: nothing was running.
+    assert_receive {:cancel_result, :not_running}, 10_000
+    assert {:ok, :done} = Task.await(occupier, 10_000)
+  end
 
-    {:ok, fixture_server} = Credentials.start_link(fixture_opts)
-    assert :ok = Credentials.onboard(:fixture_provider, fixture_server)
-    assert_receive {:runtime_start, {:fixture, "shared", "testhost"}}
+  @tag cold_gateway: true, gateway_credential_transition: true, tmp_dir: true
+  test "credential transitions publish the captured provider-session set exactly once", ctx do
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_credential_transition.exs",
+      "guarded-gateway-credential-transition: ok"
+    )
+  end
+
+  @tag cold_gateway: true, gateway_credential_runtime: true, tmp_dir: true
+  test "provider onboarding starts every matching harness and aggregates runtime failures", ctx do
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_credential_runtime.exs",
+      "guarded-gateway-credential-runtime: ok"
+    )
   end
 
   # Driven through real spawns rather than hand-built session maps: the point of
@@ -9903,6 +8471,12 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp make_model_unknown(db, session_key) do
+    {:ok, [[sidecar_trigger]]} =
+      DB.query(
+        db,
+        "SELECT sql FROM sqlite_master WHERE name='supervision_liveness_sidecar_insert_coherent'"
+      )
+
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
 
     try do
@@ -9910,11 +8484,13 @@ defmodule Tightbeam.GatewayTest do
         DB.execute(
           db,
           """
+          DROP TRIGGER supervision_liveness_sidecar_insert_coherent;
           CREATE TABLE sessions_with_unknown AS SELECT * FROM sessions;
           DROP TABLE sessions;
           ALTER TABLE sessions_with_unknown RENAME TO sessions;
           CREATE UNIQUE INDEX sessions_unknown_key ON sessions(sessionKey);
           UPDATE sessions SET model=NULL WHERE sessionKey='#{session_key}';
+          #{sidecar_trigger};
           """
         )
     after
@@ -9953,7 +8529,7 @@ defmodule Tightbeam.GatewayTest do
     end
 
     if ready? do
-      auth_dir = Path.join([base_dir, "auth", "claude"])
+      auth_dir = Tightbeam.Homes.home_path(base_dir, "testhost", :claude)
       File.mkdir_p!(auth_dir)
 
       File.write!(
@@ -9971,6 +8547,26 @@ defmodule Tightbeam.GatewayTest do
   end
 
   defp learn_engineering_identity!(base_dir) do
+    learn_engineering_identity_without_apply_fixture_skills!(base_dir)
+
+    manifest_path = Path.join([base_dir, "identity", "archetypes", "coder.toml"])
+    manifest = File.read!(manifest_path)
+
+    assert manifest =~ ~s(skills = [])
+
+    fixture_manifest =
+      String.replace(
+        manifest,
+        ~s(skills = []),
+        ~s(skills = ["human-communication", "model-release-intake"]),
+        global: false
+      )
+
+    identity_edit!(base_dir, "coder", :manifest, fixture_manifest, "test")
+    Archetypes.load!(base_dir)
+  end
+
+  defp learn_engineering_identity_without_apply_fixture_skills!(base_dir) do
     assert :initialized = Identity.init!(base_dir)
     assert {:ok, _revision} = identity_learn!(base_dir, "agentic-engineering", "test")
     Archetypes.load!(base_dir)
@@ -10046,7 +8642,10 @@ defmodule Tightbeam.GatewayTest do
 
     case Enum.take(command, -3) do
       ["test", operator, path] when operator in ["-d", "-x"] ->
-        if String.ends_with?(path, "/auth") or String.ends_with?(path, "/auth/") do
+        if path in [
+             "/remote/tb/homes/credential-worker-registration",
+             "/remote/new-tb/homes/credential-worker-registration"
+           ] do
           {"", 0}
         else
           {"", 1}

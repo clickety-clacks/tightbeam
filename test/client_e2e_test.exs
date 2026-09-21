@@ -20,20 +20,27 @@ defmodule Tightbeam.ClientE2ETest do
   """
 
   use Tightbeam.TestCase, async: false
-  alias Tightbeam.Model
-
-  alias Tightbeam.{
-    ConnRegistry,
-    DB,
-    Gateway,
-    Org,
-    Rules
-  }
-
   alias Tightbeam.ClientE2E
-  alias Tightbeam.ClientE2E.{Journeys, Scorecard, SimClient}
+  alias Tightbeam.ClientE2E.{Journeys, Scorecard}
   alias Tightbeam.ClientE2E.Scorecard.Leg
-  alias Tightbeam.Wire.Router
+
+  test "WS close events retain codes while legacy recv stays compatible" do
+    alias Tightbeam.ClientE2E.WS
+
+    for code <- [1000, 1008, 1011] do
+      frame = <<0x88, 2, code::16>>
+      ws = %WS{socket: nil, buffer: frame}
+      assert {:ok, {:closed, ^code}, %{buffer: <<>>}} = WS.recv_event(ws, 0)
+      assert {:ok, :closed, %{buffer: <<>>}} = WS.recv(ws, 0)
+    end
+
+    assert {:ok, {:closed, nil}, _} = WS.recv_event(%WS{socket: nil, buffer: <<0x88, 0>>}, 0)
+    assert {:ok, :closed, _} = WS.recv(%WS{socket: nil, buffer: <<0x88, 0>>}, 0)
+    assert {:ok, {:text, "ok"}, _} = WS.recv_event(%WS{socket: nil, buffer: <<0x81, 2, "ok">>}, 0)
+
+    assert {:error, {:protocol_error, {:unexpected_opcode, 2}}, _} =
+             WS.recv_event(%WS{socket: nil, buffer: <<0x82, 2, "{}">>}, 0)
+  end
 
   describe "scorecard algebra" do
     test "journey coverage makes a green subset INCOMPLETE while failure still wins" do
@@ -898,7 +905,8 @@ defmodule Tightbeam.ClientE2ETest do
     # installing, and the run is poisoned before turn 1. The copy is same-host
     # by construction, so the template's node_modules (native deps included)
     # and its relative .bin symlinks are valid as-is.
-    test "provision! copies adapters/ alongside auth/, homes/ and identity/ — never state.db" do
+    @tag :selected_home_copy
+    test "provision! copies authoritative homes and adapters, never legacy auth or state.db" do
       template =
         Path.join(
           System.tmp_dir!(),
@@ -911,7 +919,13 @@ defmodule Tightbeam.ClientE2ETest do
 
       adapter = Path.join(["adapters", "node_modules", ".bin", "claude-agent-acp"])
 
-      for rel <- [adapter, "auth/claude/token", "homes/marker", "identity/marker"] do
+      for rel <- [
+            adapter,
+            "auth/claude/token",
+            "homes/testhost/claude/.credentials.json",
+            "homes/testhost/claude/.tightbeam/credential.json",
+            "identity/marker"
+          ] do
         path = Path.join(template, rel)
         File.mkdir_p!(Path.dirname(path))
         File.write!(path, rel)
@@ -926,8 +940,19 @@ defmodule Tightbeam.ClientE2ETest do
       assert File.exists?(Path.join(base_dir, adapter)),
              "the template's installed adapters must ride into the leg"
 
-      for rel <- ["auth/claude/token", "homes/marker", "identity/marker"] do
-        assert File.exists?(Path.join(base_dir, rel))
+      for rel <- [
+            "homes/testhost/claude/.credentials.json",
+            "homes/testhost/claude/.tightbeam/credential.json",
+            "identity/marker"
+          ] do
+        assert File.read!(Path.join(base_dir, rel)) == File.read!(Path.join(template, rel))
+      end
+
+      refute File.exists?(Path.join(base_dir, "auth"))
+      assert File.read!(Path.join(template, "auth/claude/token")) == "auth/claude/token"
+
+      assert_raise RuntimeError, ~r/already exists/, fn ->
+        LegGateway.provision!(template, base_dir)
       end
 
       refute File.exists?(Path.join(base_dir, "state.db"))
@@ -1394,8 +1419,8 @@ defmodule Tightbeam.ClientE2ETest do
           "tightbeam-client-e2e-credential-live-#{System.unique_integer([:positive])}"
         )
 
-      store = Tightbeam.Credentials.store_dir(base_dir, :openai)
       home = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
+      store = home
       File.mkdir_p!(store)
       File.mkdir_p!(home)
       File.write!(Path.join(store, "auth.json"), "{}")
@@ -1779,115 +1804,42 @@ defmodule Tightbeam.ClientE2ETest do
   end
 
   describe "the sim client against a real gateway" do
-    setup :real_gateway
+    @tag :tmp_dir
+    test "J0 passes: the wire pairs, authenticates, seeds Main and syncs", %{tmp_dir: tmp} do
+      File.write!(Path.join(tmp, "wire-case"), "0")
 
-    test "J0 passes: the wire pairs, authenticates, seeds Main and syncs", ctx do
-      {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-j0", claimed_name: "Flynn")
-
-      {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-j0")
-
-      {journey_ctx, rows} = Journeys.run(journey_ctx(ctx, client), "J0")
-      SimClient.disconnect(journey_ctx.client)
-
-      assert Enum.map(rows, & &1.status) == [:pass, :pass],
-             "J0 rows: #{inspect(Enum.map(rows, &{&1.step, &1.status, &1.note}))}"
-
-      assert journey_ctx.main_key =~ "main"
-    end
-
-    test "an unpaired token is refused and the driver reports the gateway's reason", ctx do
-      assert {:error, "auth_failed"} =
-               SimClient.connect("127.0.0.1", ctx.port, "not-a-token", device_id: "sim-bad")
-    end
-
-    test "posting with a malformed id is refused on the wire, not silently dropped", ctx do
-      {:ok, %{token: token}} =
-        SimClient.pair("127.0.0.1", ctx.port, device_id: "sim-bad-id", claimed_name: "Flynn")
-
-      {:ok, client} = SimClient.connect("127.0.0.1", ctx.port, token, device_id: "sim-bad-id")
-      watermark = SimClient.mark(client)
-      key = Org.personal_session_key(client.user_id)
-
-      :ok =
-        Tightbeam.ClientE2E.WS.send_text(
-          client.ws,
-          JSON.encode!(%{
-            "type" => "message",
-            "id" => "nope",
-            "sessionKey" => key,
-            "content" => "hi"
-          })
-        )
-
-      assert {:ok, frame, client} =
-               SimClient.await(client, watermark, &(&1["type"] == "error"), 5_000)
-
-      assert frame["code"] == "invalid_message"
-      SimClient.disconnect(client)
-    end
-  end
-
-  defp journey_ctx(ctx, client) do
-    %{
-      base_dir: ctx.base_dir,
-      host: "127.0.0.1",
-      port: ctx.port,
-      client: client,
-      main_key: nil,
-      gateway: nil,
-      leg: %{harness: "claude", host: "testhost", model: "fable"},
-      turn_wait_ms: 10_000,
-      settle_ms: 250
-    }
-  end
-
-  defp real_gateway(_ctx) do
-    base_dir =
-      Path.join(System.tmp_dir!(), "tightbeam-client-e2e-#{System.unique_integer([:positive])}")
-
-    File.mkdir_p!(base_dir)
-    on_exit(fn -> File.rm_rf!(base_dir) end)
-
-    db = :"client_e2e_db_#{System.unique_integer([:positive])}"
-    start_supervised!({DB, path: Path.join(base_dir, "state.db"), name: db})
-
-    :ok = Tightbeam.Schema.ensure_all(db)
-
-    start_supervised!(%{
-      id: :client_e2e_conn_registry,
-      start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
-    })
-
-    handlers = Gateway.handlers(%{db: db, base_dir: base_dir, port: 0})
-    Rules.load!(Path.join(base_dir, "no-rules"), Map.keys(handlers))
-    on_exit(fn -> Rules.load!(Path.join(System.tmp_dir!(), "client-e2e-reset"), []) end)
-
-    router_opts =
-      Router.init(
-        db: db,
-        base_dir: base_dir,
-        handlers: handlers,
-        conn_registry: Tightbeam.ConnRegistry,
-        cli_token: "tbc_client_e2e",
-        session_status: fn _key -> nil end,
-        defaults: %{
-          archetype: "default",
-          host: "testhost",
-          harness: :claude,
-          provider: fn -> :anthropic end,
-          model: Model.new("fable")
-        }
+      Tightbeam.GuardRuntimeFixture.run!(
+        tmp,
+        "guard_client_e2e_runtime.exs",
+        "guarded-client-wire-0: ok"
       )
+    end
 
-    bandit =
-      start_supervised!(
-        {Bandit, plug: {Router, router_opts}, port: 0, ip: {127, 0, 0, 1}, startup_log: false}
+    @tag :tmp_dir
+    test "an unpaired token is refused and the driver reports the gateway's reason", %{
+      tmp_dir: tmp
+    } do
+      File.write!(Path.join(tmp, "wire-case"), "1")
+
+      Tightbeam.GuardRuntimeFixture.run!(
+        tmp,
+        "guard_client_e2e_runtime.exs",
+        "guarded-client-wire-1: ok"
       )
+    end
 
-    {:ok, {_address, port}} = ThousandIsland.listener_info(bandit)
+    @tag :tmp_dir
+    test "posting with a malformed id is refused on the wire, not silently dropped", %{
+      tmp_dir: tmp
+    } do
+      File.write!(Path.join(tmp, "wire-case"), "2")
 
-    %{db: db, base_dir: base_dir, port: port}
+      Tightbeam.GuardRuntimeFixture.run!(
+        tmp,
+        "guard_client_e2e_runtime.exs",
+        "guarded-client-wire-2: ok"
+      )
+    end
   end
 
   defp closed_port do

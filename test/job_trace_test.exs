@@ -39,6 +39,9 @@ defmodule Tightbeam.JobTraceTest do
         ('asg_direct', 'direct', 'holder', 'owner', 2, 'open', 'wi_trace'),
         ('asg_bad', 'invalid ref', 'holder', 'owner', 3, 'open', 'wi_trace');
 
+      INSERT INTO assignment_effects (assignmentId, effectKind)
+      VALUES ('asg_direct', 'policy'), ('asg_bad', 'policy');
+
       INSERT INTO assignments
         (id, subject, holderKey, openedBySession, openedAt, state, reviewsAssignmentId)
       VALUES ('asg_review', 'review', 'reviewer', 'reviewer', 4, 'open', 'asg_direct');
@@ -110,7 +113,7 @@ defmodule Tightbeam.JobTraceTest do
       %{"repo" => "#{Tightbeam.Placement.local_host_name()}:#{repo}", "commit" => commit}
     ]
 
-    assert %{attest: %{commitRefs: ^commit_refs}} =
+    assert %{attest: %{commitRefs: ^commit_refs} = completion} =
              attest(db, {:session, "holder"}, "asg_direct", "completion", %{
                commit_refs: commit_refs
              })
@@ -167,7 +170,7 @@ defmodule Tightbeam.JobTraceTest do
     Enum.each(trace.assignments, fn assignment ->
       assert_keys(
         assignment,
-        ~w(files holderKey id openerRef reviewsAssignmentId state)a
+        ~w(commitRefCorrections currentCoordinationParentRef files holderKey id openerRef reviewsAssignmentId state)a
       )
     end)
 
@@ -175,6 +178,7 @@ defmodule Tightbeam.JobTraceTest do
     review = Enum.find(trace.assignments, &(&1.id == "asg_review"))
     assert direct.files == ["a.ex", "z.ex"]
     assert direct.openerRef == "user:owner"
+    assert direct.currentCoordinationParentRef == nil
     assert review.openerRef == "session:reviewer"
     assert review.reviewsAssignmentId == "asg_direct"
 
@@ -219,10 +223,58 @@ defmodule Tightbeam.JobTraceTest do
              _ -> false
            end)
 
-    refute Enum.any?(
-             trace.timeline,
-             &(&1.type in ["wake_canceled", "marker", "disposition"])
-           )
+    # The fixture has no personal Main for owner. Completion therefore records
+    # its exact terminal notice as undeliverable, with the remaining open work
+    # kept live by asg_bad's entitlement. Derive the notice identity from the
+    # immutable completion source, not from whichever cancellation trace returns.
+    notice_digest =
+      :crypto.hash(
+        :sha256,
+        JSON.encode!(["terminal-child-owner-notification", "attest", completion.id])
+      )
+      |> Base.encode16(case: :lower)
+
+    notice_id = "w_terminal_" <> notice_digest
+
+    assert {:ok, [[canceled_at, wake_rowid]]} =
+             DB.query(
+               db,
+               "SELECT canceledAt, rowid FROM wakes WHERE wakeId=?1 AND assignmentId='asg_direct' AND state='canceled'",
+               [notice_id]
+             )
+
+    assert is_integer(canceled_at) and canceled_at >= completion.ts
+
+    # Exact equality also excludes private prompt, attest and transcript fields.
+    assert Enum.filter(trace.timeline, &(&1.type == "wake_canceled")) == [
+             %{
+               assignmentId: "asg_direct",
+               at: canceled_at,
+               id: notice_id,
+               reason: nil,
+               seqTiebreak: wake_rowid,
+               type: "wake_canceled",
+               provenanceStatus: "proven",
+               schedulingOrigin: "process:tightbeam",
+               requesterKind: "process",
+               requesterId: "tightbeam:wake-scheduler",
+               reasonKind: "target_unresolvable",
+               causalSourceKind: "scheduler_delivery",
+               causalSourceId: notice_id,
+               outcomeKind: "no_replacement",
+               replacementWakeId: nil,
+               dispositionKind: nil,
+               dispositionId: nil,
+               primaryWorkKind: "work_item",
+               primaryWorkId: "wi_trace",
+               workImpactKind: "linked_work_open",
+               livenessTriggerKind: "supervision_entitlement",
+               livenessTriggerId: "asg_bad#1",
+               actionNeeded: true
+             }
+           ]
+
+    refute Enum.any?(trace.timeline, &(&1.type in ["marker", "disposition"]))
 
     at_100_types =
       trace.timeline
@@ -268,7 +320,10 @@ defmodule Tightbeam.JobTraceTest do
     end)
 
     remote_refs = [
-      %{"repo" => "remote-test:/srv/repo", "commit" => "0123456789abcdef"}
+      %{
+        "repo" => "remote-test:/srv/repo",
+        "commit" => "0123456789abcdef0123456789abcdef01234567"
+      }
     ]
 
     assert %{code: "not_holder"} =
@@ -286,7 +341,7 @@ defmodule Tightbeam.JobTraceTest do
     assert_received {:commit_ref_command, "ssh", args, [stderr_to_stdout: true]}
     assert "git@remote-test" in args
     assert List.last(args) =~ "/srv/repo"
-    assert List.last(args) =~ "0123456789abcdef^{commit}"
+    assert List.last(args) =~ "0123456789abcdef0123456789abcdef01234567^{commit}"
   end
 
   test "equal-time numeric turn ids sort numerically", %{db: db} do
@@ -334,6 +389,9 @@ defmodule Tightbeam.JobTraceTest do
         "effort_generation" ->
           ~w(assignmentId at evidence id state type)a
 
+        "commit_ref_correction" ->
+          ~w(assignmentId at actorKind actorRef cause commitRefs evidenceArtifactId id type verifiedAt)a
+
         # job-forensics-v2 §3 — pinned EXACTLY: every key always present,
         # nullable where the spec marks it, so a consumer never has to
         # distinguish absent from null.
@@ -341,10 +399,71 @@ defmodule Tightbeam.JobTraceTest do
           ~w(assignmentId at detail id jobRef kind seqTiebreak sessionKey type)a
 
         "wake_canceled" ->
-          ~w(assignmentId at id reason seqTiebreak type)a
+          ~w(assignmentId at id reason seqTiebreak type provenanceStatus schedulingOrigin
+             requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind
+             replacementWakeId dispositionKind dispositionId primaryWorkKind primaryWorkId
+             workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)a
       end
 
     assert_keys(entry, keys)
+
+    if type == "wake_canceled", do: assert_cancellation_values(entry)
+  end
+
+  defp assert_cancellation_values(entry) do
+    assert entry.reason == nil
+    assert is_binary(entry.schedulingOrigin)
+
+    case entry.provenanceStatus do
+      "not_proven" ->
+        for key <-
+              ~w(requesterKind requesterId reasonKind causalSourceKind causalSourceId
+                      outcomeKind replacementWakeId dispositionKind dispositionId primaryWorkKind
+                      primaryWorkId workImpactKind livenessTriggerKind livenessTriggerId actionNeeded)a do
+          assert Map.fetch!(entry, key) == nil
+        end
+
+      "proven" ->
+        for key <-
+              ~w(requesterKind requesterId reasonKind causalSourceKind causalSourceId outcomeKind workImpactKind)a do
+          assert is_binary(Map.fetch!(entry, key))
+        end
+
+        case entry.outcomeKind do
+          "replacement" ->
+            assert is_binary(entry.replacementWakeId)
+            assert {entry.dispositionKind, entry.dispositionId} == {nil, nil}
+
+          "disposition" ->
+            assert entry.replacementWakeId == nil
+            assert is_binary(entry.dispositionKind) and is_binary(entry.dispositionId)
+
+          "no_replacement" ->
+            assert {entry.replacementWakeId, entry.dispositionKind, entry.dispositionId} ==
+                     {nil, nil, nil}
+        end
+
+        if entry.workImpactKind == "no_linked_work" do
+          assert {entry.primaryWorkKind, entry.primaryWorkId} == {nil, nil}
+        else
+          assert entry.workImpactKind in ["linked_work_open", "linked_work_not_open"]
+          assert entry.primaryWorkKind in ["assignment", "work_item"]
+          assert is_binary(entry.primaryWorkId)
+        end
+
+        assert is_boolean(entry.actionNeeded)
+
+        if entry.actionNeeded do
+          assert entry.workImpactKind == "linked_work_open"
+          assert entry.outcomeKind in ["disposition", "no_replacement"]
+
+          assert entry.livenessTriggerKind in ~w(supervision_entitlement supervision_transfer pending_wake routing_bracket)
+
+          assert is_binary(entry.livenessTriggerId)
+        else
+          assert {entry.livenessTriggerKind, entry.livenessTriggerId} == {nil, nil}
+        end
+    end
   end
 
   defp assert_keys(map, keys), do: assert(Map.keys(map) |> Enum.sort() == Enum.sort(keys))

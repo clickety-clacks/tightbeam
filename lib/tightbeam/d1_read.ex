@@ -1,7 +1,7 @@
 defmodule Tightbeam.D1Read do
   @moduledoc false
 
-  alias Tightbeam.{DB, Identity}
+  alias Tightbeam.{DB, Identity, StateResources}
 
   @resources %{
     config: %{resource: "config", route: "config.collection", filters: ~w(key), order: ~w(key)},
@@ -39,12 +39,20 @@ defmodule Tightbeam.D1Read do
   def visible?(:hosts, _is_admin), do: true
   def visible?(_resource, is_admin), do: is_admin
 
-  @doc "Read and redact a fixed-shape D1 collection from current 0.1.9 sources."
+  @doc "Read a fixed-shape D1 collection from current 0.1.9 sources."
+
   def collection(db, base_dir, resource, filters) do
     resource
     |> rows(db, base_dir)
     |> Enum.filter(&matches?(&1, filters))
     |> Enum.sort_by(&tuple(resource, &1))
+  end
+
+  def detail(db, _base_dir, :host_environment, {host, harness, name}) do
+    case StateResources.query_host_environment(db, host, harness, name) do
+      nil -> nil
+      row -> StateResources.host_environment(row)
+    end
   end
 
   def detail(db, base_dir, resource, id) do
@@ -96,23 +104,9 @@ defmodule Tightbeam.D1Read do
   end
 
   defp rows(:host_environment, db, _base_dir) do
-    {:ok, rows} =
-      DB.query(
-        db,
-        "SELECT host, harness, name, setAt FROM harness_env_overlays ORDER BY host, harness, name"
-      )
-
-    Enum.map(rows, fn [host, harness, name, updated_at] ->
-      %{
-        "host" => host,
-        "harness" => harness,
-        "name" => name,
-        "value" => nil,
-        "valuePresent" => true,
-        "updatedAt" => updated_at,
-        "rowVersion" => updated_at
-      }
-    end)
+    db
+    |> StateResources.query_host_environment(%{})
+    |> Enum.map(&StateResources.host_environment/1)
   end
 
   defp rows(:hosts, db, _base_dir) do
@@ -164,20 +158,9 @@ defmodule Tightbeam.D1Read do
     ]
   end
 
-  defp rows(:kungfu, _db, _base_dir) do
-    Identity.available_bundles()
-    |> Enum.map(fn bundle ->
-      %{
-        "name" => bundle.name,
-        "purpose" => bundle.purpose,
-        "phrases" => Enum.sort(bundle.phrases),
-        "rootArchetype" => bundle.root_archetype,
-        "installedRevision" => nil,
-        "status" => "available",
-        "documents" => bundle_documents(bundle.name),
-        "rowVersion" => 1
-      }
-    end)
+  defp rows(:kungfu, _db, base_dir) do
+    Identity.public_kungfu_names(base_dir)
+    |> Enum.map(&Identity.public_kungfu(base_dir, &1))
   end
 
   defp matches?(item, filters) do
@@ -191,23 +174,4 @@ defmodule Tightbeam.D1Read do
   defp detail_id(:users, item), do: item["userId"]
   defp detail_id(:identity, item), do: item["name"]
   defp detail_id(:kungfu, item), do: item["name"]
-
-  defp bundle_documents(name) do
-    root = Application.app_dir(:tightbeam, Path.join("priv/kungfu", name))
-
-    root
-    |> Path.join("**/*")
-    |> Path.wildcard(match_dot: true)
-    |> Enum.filter(&File.regular?/1)
-    |> Enum.map(fn path ->
-      content = File.read!(path)
-
-      %{
-        "path" => Path.relative_to(path, root),
-        "content" => content,
-        "sha256" => :crypto.hash(:sha256, content) |> Base.encode16(case: :lower)
-      }
-    end)
-    |> Enum.sort_by(& &1["path"])
-  end
 end

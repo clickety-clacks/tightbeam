@@ -16,7 +16,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "local all-present allows without shell calls and records history", ctx do
-    credential = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
+    credential = Path.join([ctx.base_dir, "homes", "testhost", "claude", ".credentials.json"])
     File.mkdir_p!(Path.dirname(credential))
     File.write!(credential, "test-token")
     stage_claude!(ctx.base_dir)
@@ -45,13 +45,41 @@ defmodule Tightbeam.SpinupTest do
     assert detail =~ "credentials present"
   end
 
+  test "Pi spinup accepts its selected named provider without OpenCode credentials", ctx do
+    provider =
+      Tightbeam.LocalOpenAi.Providers.provider_path(ctx.base_dir, "spark")
+
+    File.mkdir_p!(Path.dirname(provider))
+
+    File.write!(
+      provider,
+      JSON.encode!(%{
+        "name" => "spark",
+        "type" => "local-openai",
+        "endpoint" => "https://spark.example/v1"
+      })
+    )
+
+    stage_pi!(ctx.base_dir)
+
+    assert :ok =
+             Spinup.ensure_ready(%{base_dir: ctx.base_dir}, :pi, "testhost",
+               db: ctx.db,
+               patch_adapter: no_patch(),
+               credential_provider: :local_openai,
+               credential_names: ["spark.json"]
+             )
+
+    refute File.exists?(Path.join([ctx.base_dir, "auth", "pi", "auth.json"]))
+  end
+
   # The gateway host used to be the only machine that could not supply its own adapters:
   # it refused and told the operator to go install them by hand, on the host tightbeam
   # was standing on. It provisions now, through the same mechanism the remote path uses
   # and at the same pinned versions (#46).
   test "local adapter missing provisions the pinned adapters into the host's base_dir", ctx do
     adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
-    credential = Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+    credential = Path.join([ctx.base_dir, "homes", "testhost", "codex", "auth.json"])
     File.mkdir_p!(Path.dirname(credential))
     File.write!(credential, "test-token")
     parent = self()
@@ -99,7 +127,7 @@ defmodule Tightbeam.SpinupTest do
   # a rewording here must carry that hint with it.
   test "adapter provisioning logs a start line and a complete line", ctx do
     adapter = Path.join([ctx.base_dir, "adapters", "node_modules", ".bin", "codex-acp"])
-    credential = Path.join([ctx.base_dir, "auth", "codex", "auth.json"])
+    credential = Path.join([ctx.base_dir, "homes", "testhost", "codex", "auth.json"])
     File.mkdir_p!(Path.dirname(credential))
     File.write!(credential, "test-token")
 
@@ -185,7 +213,7 @@ defmodule Tightbeam.SpinupTest do
   end
 
   test "missing credentials deny with separate login fact and exact remedy", ctx do
-    auth_dir = Path.join(ctx.base_dir, "auth")
+    home = Tightbeam.Homes.home_path(ctx.base_dir, "testhost", :claude)
     stage_claude!(ctx.base_dir)
 
     assert {:error, %{code: "host_unready", message: message}} =
@@ -196,7 +224,7 @@ defmodule Tightbeam.SpinupTest do
 
     assert message =~ "Tightbeam has no credential for anthropic on testhost"
     assert message =~ "normal claude CLI login"
-    assert message =~ "keeps its own credential under #{auth_dir}"
+    assert message =~ "The credential belongs only in #{home}"
     assert message =~ "Run on testhost: tightbeam onboard anthropic --as-user <userId>"
     assert [%{kind: "spinup", detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "DENIED"
@@ -396,6 +424,14 @@ defmodule Tightbeam.SpinupTest do
   # no-op here so these stay about presence and credentials.
   defp stage_claude!(base_dir) do
     path = Path.join([base_dir, "adapters", "node_modules", ".bin", "claude-agent-acp"])
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, "#!/bin/sh\nexit 0\n")
+    File.chmod!(path, 0o755)
+    path
+  end
+
+  defp stage_pi!(base_dir) do
+    path = Path.join([base_dir, "adapters", "node_modules", ".bin", "pi-acp"])
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "#!/bin/sh\nexit 0\n")
     File.chmod!(path, 0o755)

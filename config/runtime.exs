@@ -13,6 +13,12 @@ if config_env() != :test do
     config :tightbeam, :cwd, value
   end
 
+  if value =
+       System.get_env("TIGHTBEAM_CREDENTIALS_DIRECTORY") ||
+         System.get_env("CREDENTIALS_DIRECTORY") do
+    config :tightbeam, :credentials_directory, value
+  end
+
   if value = System.get_env("TIGHTBEAM_DEFAULT_HARNESS") do
     config :tightbeam, :default_harness, Tightbeam.Harness.parse!(value).id()
   end
@@ -30,6 +36,10 @@ if config_env() != :test do
 
   if value = System.get_env("TIGHTBEAM_WAKE_TICK_MS") do
     config :tightbeam, :wake_tick_ms, String.to_integer(value)
+  end
+
+  if value = System.get_env("TIGHTBEAM_SUPERVISION_INTERVAL_MS") do
+    config :tightbeam, :supervision_interval_ms, String.to_integer(value)
   end
 
   if value = System.get_env("TIGHTBEAM_PROD_LIMIT") do
@@ -56,6 +66,10 @@ if config_env() != :test do
 
   if value = System.get_env("TIGHTBEAM_DRAIN_TIMEOUT_MS") do
     config :tightbeam, :drain_timeout_ms, String.to_integer(value)
+  end
+
+  if value = System.get_env("TIGHTBEAM_DB_CALL_TIMEOUT_MS") do
+    config :tightbeam, :db_call_timeout_ms, String.to_integer(value)
   end
 
   if value = System.get_env("TIGHTBEAM_LOCAL_HOST_NAME") do

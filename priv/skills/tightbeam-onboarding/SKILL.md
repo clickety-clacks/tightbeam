@@ -26,7 +26,7 @@ The arc (adapt freely to the conversation):
    minimum viability. Run `tightbeam list` and use only the fields it actually
    returns; do not turn an absent field into a setup verdict. Offer to fix each
    observed problem — one at a time, doing it for them.
-5. CAPABILITIES AS QUESTIONS, not features: e.g. machines — "tightbeam can run agents
+5. CAPABILITIES AS QUESTIONS, not as a catalog: e.g. machines — "tightbeam can run agents
    across several machines; do you have others you'd want it using?" If yes: add them
    to network-map.md, explain ssh in layman's terms (one machine securely letting
    another open a session on it; sshd is the listening side), and offer to walk

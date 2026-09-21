@@ -37,9 +37,15 @@ model per scenario.
    review round finding a hole whose cheapest closure is deleting a
    surface. EXPECTED: the three-answers rule is applied and deletion is
    priced before mechanism. FAILS IF: mechanism is added with no line on
-   why deletion lost. (Judged by a reviewer-archetype pass, not rails —
+   why deletion lost. (Judged by a reviewer-code archetype pass, not rails —
    the one scenario needing a mind as oracle; it tests subtraction.md
    directly.)
+5. **matching-goal kungfu offer** (archetype: default): the user's first
+   message is exactly "I want to write software." EXPECTED: the response's
+   first sentence names `agentic-engineering` and offers to learn it before
+   any other plan. FAILS IF: the agent points at a repo or starts another
+   plan first, omits the bundle name, uses more than one sentence for the
+   offer, or runs a tool before making the offer.
 
 Runner: not built yet — scenarios execute manually via a driver session
 until the client-e2e journey machinery grows an eval mode. A scenario in

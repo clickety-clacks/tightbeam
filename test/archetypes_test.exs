@@ -3,7 +3,18 @@ defmodule Tightbeam.ArchetypesTest do
 
   alias Tightbeam.{Archetypes, Identity, Rails, Rules}
 
-  @golden_rule ~S("Pushing the product forwards is the goal of this kung-fu. No rule shall trump this rule. If there is a clear way forward, and that way forward is safe, then no rule, statute, or rail shall block it. If a rule, statute, or rail blocks this, it is necessarily wrong, and should be reported with a decision-request, but this DOES NOT BLOCK WORK. Get it done, and apologize later.")
+  @golden_rule """
+  # Operating principle
+
+  Agents run the work. Tightbeam makes coordination, communication, responsibility
+  and evidence durable and visible. Own your outcome within the authority granted;
+  use the scope and authority guidance for its boundaries.
+
+  Trust, but record. Prompt, don't prescribe. Use ordinary execution evidence and
+  record the intent and judgment it cannot show. Records make work inspectable;
+  supervisors judge fulfillment. A reminder brings an unmet expectation to your
+  attention, not a prescribed workflow or proof of failure.
+  """
 
   setup do
     base_dir = Path.join(System.tmp_dir!(), "tb-archetypes-#{System.unique_integer([:positive])}")
@@ -59,6 +70,12 @@ defmodule Tightbeam.ArchetypesTest do
              "bring ONE concrete offer at a natural pause, do it for them if they say yes, and record the answer. Once per need; a decline closes it."
 
     assert flat_guidance =~
+             "WHEN the user's stated goal matches the purpose or phrases of a bundle in the `Available kungfu bundles in this Tightbeam build` section of this composed context, NAME that bundle and OFFER to learn it in one sentence before any other plan."
+
+    assert flat_guidance =~
+             "This matching-goal offer overrides the do-not-lead rule, including on first contact."
+
+    assert flat_guidance =~
              "If two or more user-created default sessions are alive at once (origin `user:*`, archetype default)"
 
     assert flat_guidance =~ "user.md's Onboarding section is the offer record"
@@ -67,7 +84,8 @@ defmodule Tightbeam.ArchetypesTest do
              "Never re-raise after a recorded decline; a deferral waits for a new, stronger signal."
 
     assert snapshot.guidance =~ "default-archetype"
-    refute snapshot.guidance =~ "agentic-engineering"
+    assert snapshot.guidance =~ "## Available kungfu bundles in this Tightbeam build"
+    assert snapshot.guidance =~ "### `agentic-engineering`"
     refute snapshot.guidance =~ "tightbeam learn __list__"
 
     assert Rails.load!(ctx.base_dir) == []
@@ -133,6 +151,99 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
+  test "served neutral identity excludes engineering vocabulary", ctx do
+    assert :initialized = Identity.init!(ctx.base_dir)
+
+    forbidden = [
+      {"worktree", ~r/\bworktrees?\b/i},
+      {"branch", ~r/\bbranch(es)?\b/i},
+      {"spec", ~r/\bspecs?\b/i},
+      {"feature", ~r/\bfeatures?\b/i},
+      {"bug", ~r/\bbugs?\b/i},
+      {"product-owner", ~r/\bproduct[- ]owners?\b/i},
+      {"orchestrator", ~r/\borchestrators?\b/i},
+      {"coder", ~r/\bcoders?\b/i}
+    ]
+
+    for {concept, pattern} <- forbidden do
+      assert Regex.match?(pattern, concept),
+             "forbidden pattern does not match its singular concept #{concept}"
+    end
+
+    assert Regex.match?(
+             forbidden
+             |> Enum.find_value(fn
+               {"branch", pattern} -> pattern
+               _ -> nil
+             end),
+             "branches"
+           )
+
+    baseline_skill_names = Tightbeam.Homes.baseline_skill_names()
+    assert length(baseline_skill_names) == 9
+
+    baseline_skill_bodies =
+      Enum.map(baseline_skill_names, fn skill ->
+        Application.app_dir(:tightbeam, "priv/skills/#{skill}/SKILL.md")
+        |> File.read!()
+      end)
+
+    facts =
+      Application.app_dir(:tightbeam, "priv/kungfu/*/manifest.toml")
+      |> Path.wildcard()
+      |> Enum.sort()
+      |> Enum.map_join("\n\n", fn path ->
+        manifest = path |> File.read!() |> Toml.decode!()
+        name = path |> Path.dirname() |> Path.basename()
+        phrases = Enum.map_join(Map.fetch!(manifest, "phrases"), "\n", &"- #{&1}")
+        "### `#{name}`\nPurpose: #{Map.fetch!(manifest, "purpose")}\nPhrases:\n#{phrases}"
+      end)
+
+    assert facts != ""
+    heading = "## Available kungfu bundles in this Tightbeam build"
+
+    intro =
+      "Use these facts, composed from the installed build's shipped bundle manifests, to match a\n" <>
+        "user's stated goal before any tool call."
+
+    section = heading <> "\n\n" <> intro <> "\n\n" <> facts
+    boundary = section <> "\n\n# Your served identity\n"
+
+    validate_facts = fn guidance ->
+      assert length(:binary.matches(guidance, heading)) == 1
+      assert length(:binary.matches(guidance, facts)) == 1
+      assert length(:binary.matches(guidance, boundary)) == 1
+      remaining = String.replace(guidance, facts, "", global: false)
+      refute remaining =~ "Purpose:"
+      refute remaining =~ "Phrases:"
+      remaining
+    end
+
+    for harness <- [:claude, :codex] do
+      snapshot = Identity.snapshot!(ctx.base_dir, "default", harness)
+      neutral_guidance = validate_facts.(snapshot.guidance)
+
+      for invalid <- [
+            snapshot.guidance <> "\n\n" <> section,
+            String.replace(snapshot.guidance, facts, facts <> "\nextra fact text"),
+            String.replace(snapshot.guidance, "Purpose:", "MalformedPurpose:")
+          ] do
+        assert_raise ExUnit.AssertionError, fn -> validate_facts.(invalid) end
+      end
+
+      served =
+        Enum.join(
+          [neutral_guidance | Map.values(snapshot.skills) ++ baseline_skill_bodies],
+          "\n"
+        )
+
+      for {concept, pattern} <- forbidden do
+        refute Regex.match?(pattern, served),
+               "neutral default/#{harness} guidance contains engineering concept #{concept}"
+      end
+    end
+  end
+
   test "the operating manual names the shell as the path to every substrate verb" do
     manual = Archetypes.builtin_fragments()["operating-manual.md"]
     assert manual =~ "shell tool"
@@ -149,20 +260,24 @@ defmodule Tightbeam.ArchetypesTest do
     manual = Archetypes.builtin_fragments()["operating-manual.md"]
 
     assert manual =~ heading
-    assert manual =~ "No row holds a release line and no verb binds one"
-    assert manual =~ "The default is both active lines"
-    assert manual =~ "names the principal who must clear it"
-    assert manual =~ "This duty does not transfer to the user"
-    assert manual =~ ~s("done awaiting target" and "candidate remains unintegrated")
+    assert manual =~ "Carry only\nto authorized destinations"
+    refute manual =~ "The default is both active lines"
+    assert manual =~ "Reuse capable integration custody; create it when needed"
+    assert manual =~ "A recorded dependency retains ownership"
+    refute manual =~ "No row holds a release line and no verb binds one"
+    refute manual =~ ~s("done awaiting target" and "candidate remains unintegrated")
+
+    role_guidance = fn role ->
+      Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/guidance/#{role}.md")
+      |> File.read!()
+    end
+
+    assert role_guidance.("product-owner") =~ "Prioritize outcomes and propose ready work"
+    assert role_guidance.("orchestrator") =~ "Carry returned work"
 
     for role <- ~w(product-owner orchestrator) do
-      role_guidance =
-        Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/guidance/#{role}.md")
-        |> File.read!()
-
-      assert role_guidance =~ "the operating manual's finished-work carry"
-      refute role_guidance =~ heading
-      refute role_guidance =~ "The default is both active lines"
+      refute role_guidance.(role) =~ heading
+      refute role_guidance.(role) =~ "The default is both active lines"
     end
 
     Identity.init!(ctx.base_dir)
@@ -173,7 +288,7 @@ defmodule Tightbeam.ArchetypesTest do
       served = Identity.snapshot_at!(ctx.base_dir, revision, role, harness).guidance
 
       assert length(String.split(served, heading)) == 2
-      assert served =~ "the operating manual's finished-work carry"
+      assert served =~ "Reuse capable integration custody; create it when needed"
       refute Regex.match?(~r/^#include/m, served)
     end
   end
@@ -187,17 +302,43 @@ defmodule Tightbeam.ArchetypesTest do
     loaded = Archetypes.load!(ctx.base_dir)
 
     assert Map.keys(loaded) |> Enum.sort() ==
-             ~w(coder default orchestrator product-owner recon reviewer spec-writer)
+             ~w(coder default guidance-reviewer guidance-writer integrator orchestrator product-owner recon reviewer-code reviewer-spec spec-writer team-planner)
 
-    assert loaded["product-owner"].skills == [
-             "worktree-session",
-             "tightbeam-dispatching",
-             "product-discovery",
-             "human-communication"
-           ]
+    assert loaded["product-owner"].skills == ["tightbeam-dispatching"]
 
-    for role <- ~w(coder orchestrator product-owner reviewer) do
-      assert "worktree-session" in loaded[role].skills
+    for role <-
+          ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator) do
+      refute Enum.any?(
+               loaded[role].skills,
+               &(&1 in ~w(worktree-session team-design feature-cycle work-tracking unblocking product-discovery spirit-review bug-provenance committing-and-pushing))
+             )
+    end
+
+    assert Enum.all?(loaded, fn {_role, archetype} ->
+             "human-communication" not in archetype.skills
+           end)
+
+    refute Map.has_key?(loaded, "reviewer")
+
+    for role <- ~w(reviewer-code reviewer-spec) do
+      refute Enum.any?(loaded[role].skills, &String.starts_with?(&1, "review"))
+      refute "spec-conformance" in loaded[role].skills
+    end
+
+    refute File.exists?(
+             Application.app_dir(
+               :tightbeam,
+               "priv/kungfu/agentic-engineering/archetypes/reviewer.toml"
+             )
+           )
+
+    for skill <- ~w(reviewing-code reviewing-specs) do
+      refute File.dir?(
+               Application.app_dir(
+                 :tightbeam,
+                 "priv/kungfu/agentic-engineering/skills/#{skill}"
+               )
+             )
     end
 
     coder =
@@ -208,7 +349,8 @@ defmodule Tightbeam.ArchetypesTest do
         :codex
       )
 
-    assert coder.guidance =~ "Nontrivial bugs start with a causal verdict"
+    assert coder.guidance =~ ~r/Request focused recon when\s+you need an independent investigator/
+    assert coder.guidance =~ "for a consequential uncertainty"
 
     product_owner =
       Identity.snapshot_at!(
@@ -218,23 +360,54 @@ defmodule Tightbeam.ArchetypesTest do
         :codex
       )
 
-    assert Map.keys(product_owner.skills) == [
-             "human-communication",
-             "product-discovery",
-             "worktree-session"
-           ]
+    assert product_owner.skills == %{}
+    refute product_owner.guidance =~ "# Repository custody"
+    assert product_owner.guidance =~ "You retain\ncontent ownership"
+    assert product_owner.guidance =~ "publication through its repository custodian"
 
-    assert product_owner.skills["worktree-session"] =~
-             "Clone your own copy, into your own workdir"
+    assert product_owner.guidance =~
+             "A historical verdict does not establish applicability to changed intent"
 
-    assert product_owner.skills["worktree-session"] =~
-             "Push, so the remote holds the record"
+    assert coder.guidance =~ "Use your own clone in your workdir"
+    assert coder.guidance =~ "commits and pushes"
+    assert coder.guidance =~ "Remove a finished clone only after"
+    refute coder.guidance =~ "hands you a specific checkout"
 
-    assert product_owner.skills["worktree-session"] =~
-             "After your branch merges, delete your clone"
+    for role <- ~w(team-planner guidance-writer guidance-reviewer integrator) do
+      snapshot =
+        Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
 
-    refute product_owner.skills["worktree-session"] =~
-             "hands you a specific checkout"
+      assert snapshot.skills == %{}
+      assert snapshot.guidance =~ "# Operating tightbeam"
+      refute Regex.match?(~r/^#include/m, snapshot.guidance)
+    end
+
+    writer = Identity.snapshot!(ctx.base_dir, "guidance-writer", :codex)
+    reviewer = Identity.snapshot!(ctx.base_dir, "guidance-reviewer", :codex)
+    orchestrator = Identity.snapshot!(ctx.base_dir, "orchestrator", :codex)
+    planner = Identity.snapshot!(ctx.base_dir, "team-planner", :codex)
+
+    for snapshot <- [writer, reviewer] do
+      assert snapshot.guidance =~ "# Guidance and policy craft"
+      assert snapshot.guidance =~ "1. Assume professional competence"
+      assert snapshot.guidance =~ "## Enforcement and mechanisms"
+    end
+
+    assert reviewer.guidance =~ "do not edit the work you review"
+    refute writer.guidance =~ "do not edit the work you review"
+
+    for snapshot <- [coder, product_owner, orchestrator, planner] do
+      refute snapshot.guidance =~ "# Guidance and policy craft"
+    end
+
+    assert planner.guidance =~ "# Team planner"
+    assert planner.guidance =~ "does not staff a team"
+    refute planner.guidance =~ "# Delivery recovery"
+    assert orchestrator.guidance =~ "# Delivery recovery"
+    refute orchestrator.guidance =~ "# Team planner"
+
+    assert orchestrator.guidance =~
+             "Commission a spec and spec review when the work needs a new contract"
 
     refute File.regular?(
              Path.join([
@@ -247,7 +420,7 @@ defmodule Tightbeam.ArchetypesTest do
            )
   end
 
-  test "every engineering archetype serves the shared golden rule first", ctx do
+  test "every engineering archetype serves the shared operating principle first", ctx do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
@@ -278,32 +451,26 @@ defmodule Tightbeam.ArchetypesTest do
     end
   end
 
-  test "reviewer guidance serves the bounded verdict-note artifact remedy", ctx do
+  # V9 re-homes the verdict-note law in shared guidance for both review roles.
+  # The spec-conformance skill assertions drop because neither role elects it.
+  # The artifact requirement survives as the command, not the retired sentence.
+  test "both reviewing archetypes serve the bounded verdict-note law", ctx do
     Identity.init!(ctx.base_dir)
 
     assert {:ok, _revision} =
              learn!(ctx.base_dir, "agentic-engineering", "user:flynn")
 
-    reviewer =
-      Identity.snapshot_at!(
-        ctx.base_dir,
-        Identity.live_revision!(ctx.base_dir),
-        "reviewer",
-        :codex
-      )
+    revision = Identity.live_revision!(ctx.base_dir)
 
-    assert reviewer.guidance =~ "The verdict note has a 2,000-character cap"
-    assert reviewer.guidance =~ "record it as a report artifact on the work item"
-    assert reviewer.guidance =~ "report artifact's id and SHA-256"
-    assert reviewer.guidance =~ ~r/Do not copy the clause table into the\s+note/
+    for role <- ~w(reviewer-code reviewer-spec) do
+      guidance = Identity.snapshot_at!(ctx.base_dir, revision, role, :codex).guidance
 
-    conformance = reviewer.skills["spec-conformance"]
-    assert conformance =~ "The verdict note has a 2,000-character cap"
-    assert conformance =~ "The full clause table is REQUIRED in the review document"
-    assert conformance =~ "tightbeam artifact-record --kind report"
-    assert conformance =~ "--sha256 <hex>"
-    assert conformance =~ "artifact's id and SHA-256"
-    assert conformance =~ "<summary + art_id + sha256>"
+      assert guidance =~ "The note has a 2,000-character cap"
+      assert guidance =~ "report's artifact id and SHA-256"
+      assert guidance =~ "--note \"<summary + art_id + sha256>\""
+      assert guidance =~ "tightbeam artifact-record --kind report"
+      assert guidance =~ "--work-item <workItemId>"
+    end
   end
 
   # Every archetype x both harnesses, and each `snapshot_at!` is a chain of
@@ -500,7 +667,7 @@ defmodule Tightbeam.ArchetypesTest do
     cases = [
       {"name = \"bad\"\nware = [\"local\"]\n", ~r/unknown top-level archetype keys.*ware/},
       {"name = \"bad\"\n[defaults]\nharness = \"other\"\n",
-       ~r/unknown harness "other"; expected one of: claude, codex, fixture/},
+       ~r/unknown harness "other"; expected one of: claude, codex, pi, fixture/},
       {"name = \"bad\"\n[references]\nrepo = { access = \"read\" }\n",
        ~r/reference repo is missing location/}
     ]

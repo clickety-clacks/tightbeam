@@ -32,16 +32,28 @@ defmodule Tightbeam.RailScriptTest do
     Wakes
   }
 
-  setup do
+  setup context do
     db = :"rail_script_db_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: db})
-    :ok = Org.ensure_schema(db)
-    :ok = EventLog.ensure_schema(db)
-    :ok = ConditionFacts.ensure_schema(db)
-    :ok = Escalation.ensure_schema(db)
-    # Opening a request arms its owner notification wake in the same transaction.
-    :ok = Wakes.ensure_schema(db)
-    :ok = Placement.ensure_schema(db)
+
+    if context[:missing_assignments] do
+      # These two fault cases deliberately exercise an unavailable assignment
+      # context, not a normal fresh database or an absent assignment row.
+      :ok = Org.ensure_schema(db)
+      :ok = EventLog.ensure_schema(db)
+      :ok = ConditionFacts.ensure_schema(db)
+      :ok = Escalation.ensure_schema(db)
+      :ok = Wakes.ensure_schema(db)
+      :ok = Placement.ensure_schema(db)
+      # Current session reads require the event relation even in this deliberately
+      # incomplete fixture. Keep assignments absent: that is the tested fault.
+      assert {:ok, :ok} =
+               DB.transaction(db, &Tightbeam.SessionReparent.migrate_in_txn/1)
+
+      assert {:ok, []} = DB.query(db, "SELECT name FROM sqlite_master WHERE name='assignments'")
+    else
+      :ok = Tightbeam.Schema.ensure_all(db)
+    end
 
     {tmp, 0} = System.cmd("/bin/realpath", [System.tmp_dir!()])
 
@@ -507,6 +519,7 @@ defmodule Tightbeam.RailScriptTest do
     end
   end
 
+  @tag missing_assignments: true
   test "routes edges and evaluates the predicate before the script", ctx do
     turn_end =
       statute("rail-deny", %{"blocked" => "deny"},
@@ -934,6 +947,7 @@ defmodule Tightbeam.RailScriptTest do
   # byte-identical to a script that really did exit 1. That is task #43's fabrication,
   # surviving here because it sits a level above `rail_script.ex` where the rest of it
   # was cleaned out.
+  @tag missing_assignments: true
   test "an unresolvable invocation context records unreported, never a fabricated exit", ctx do
     handlers = %{
       "post" => fn _call -> flunk("an unresolved context must not run the handler") end

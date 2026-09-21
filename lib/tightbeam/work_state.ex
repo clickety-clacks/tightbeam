@@ -33,7 +33,12 @@ defmodule Tightbeam.WorkState do
   @assignment_columns """
   a.id, a.subject, a.holderKey, a.holderRole, a.holderFallback,
   a.openedByUser, a.openedBySession, a.openedAt, a.state, a.outcome,
-  a.closedAt, a.closedByUser, a.closedBySession, a.closingAttestId,
+  a.closedAt, a.closedByUser, a.closedBySession, a.closedByProcess, a.closingAttestId,
+  (SELECT r.reason FROM assignment_revocation_generations g
+   JOIN assignment_revocations r ON r.id = g.revocationId
+   WHERE g.assignmentId = a.id AND g.reopeningId IS
+     (SELECT reopening.id FROM assignment_reopenings reopening
+      WHERE reopening.assignmentId = a.id ORDER BY reopening.id DESC LIMIT 1)),
   a.workItemId, s.state,
   CASE
     WHEN a.state = 'closed' AND a.outcome IN ('surrendered', 'revoked') THEN 'abandoned'
@@ -350,7 +355,9 @@ defmodule Tightbeam.WorkState do
          closed_at,
          closed_by_user,
          closed_by_session,
+         closed_by_process,
          closing_attest_id,
+         revocation_reason,
          work_item_id,
          holder_state,
          status,
@@ -370,7 +377,9 @@ defmodule Tightbeam.WorkState do
       closedAt: closed_at,
       closedByUser: closed_by_user,
       closedBySession: closed_by_session,
+      closedByProcess: closed_by_process,
       closingAttestId: closing_attest_id,
+      revocationReason: revocation_reason,
       workItemId: work_item_id,
       holderState: holder_state,
       status: status,

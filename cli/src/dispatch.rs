@@ -117,6 +117,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
     match command {
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::GithubAuthCheck
         | Command::UpdateClients { .. }
@@ -131,6 +132,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             at,
             condition_kind,
             condition_scope,
+            predicate,
+            assignment_id,
+            after_turn,
             idempotency_key,
             class,
         } => {
@@ -145,6 +149,18 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = at {
                 params.push(format!("\"at\":{value}"));
+            }
+            if let Some(value) = predicate {
+                params.push(format!(
+                    "\"predicate\":{}",
+                    serde_json::to_string(value).expect("predicate is JSON serializable")
+                ));
+            }
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignmentId", value));
+            }
+            if *after_turn {
+                params.push("\"afterTurn\":true".to_owned());
             }
             for (name, value) in [
                 ("conditionKind", condition_kind),
@@ -163,8 +179,17 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             kind,
             scope,
             idempotency_key,
+            payload,
         } => {
             let mut params = vec![string_field("kind", kind)];
+            if let Some(encoded) = payload {
+                let value: Value = serde_json::from_str(encoded)
+                    .map_err(|_| "--payload requires a JSON object".to_owned())?;
+                if !value.is_object() {
+                    return Err("--payload requires a JSON object".to_owned());
+                }
+                params.push(format!("\"payload\":{}", value));
+            }
             for (name, value) in [("scope", scope), ("idempotencyKey", idempotency_key)] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -172,6 +197,191 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "condition", vec![], params))
         }
+        Command::HarnessHealthObserveOther {
+            identity,
+            harness,
+            host,
+            source_session,
+            description,
+            evidence_mode,
+            observed_state,
+            exact_error,
+            exact_probe,
+            output_digest,
+            recovery_condition,
+            not_known_class,
+            observed_at,
+            valid_until,
+            world_status,
+            redaction_confirmed,
+            idempotency_key,
+            correlation_id,
+        } => {
+            let mut params = vec![
+                string_field("harness", harness),
+                string_field("host", host),
+                string_field("sourceSessionKey", source_session),
+                string_field("description", description),
+                string_field("evidenceMode", evidence_mode),
+                string_field("observedState", observed_state),
+                string_field("exactProbe", exact_probe),
+                string_field("recoveryCondition", recovery_condition),
+                string_field("notKnownClassReason", not_known_class),
+                format!("\"validUntil\":{valid_until}"),
+                string_field("worldStatus", world_status),
+                format!("\"redactionConfirmed\":{redaction_confirmed}"),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+            for (name, value) in [
+                ("exactObservedError", exact_error),
+                ("outputDigest", output_digest),
+                ("correlationId", correlation_id),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            if let Some(value) = observed_at {
+                params.push(format!("\"observedAt\":{value}"));
+            }
+            Ok(request(
+                identity,
+                "harness-health-observe-other",
+                vec![],
+                params,
+            ))
+        }
+        Command::HarnessHealthResolveOther {
+            identity,
+            harness,
+            host,
+            incident_id,
+            observed_state,
+            exact_probe,
+            output_digest,
+            recovery_condition_digest,
+            cause,
+            observed_at,
+            accepted_at,
+            idempotency_key,
+            session_key,
+            correlation_id,
+        } => {
+            let mut params = vec![
+                string_field("harness", harness),
+                string_field("host", host),
+                string_field("observedState", observed_state),
+                string_field("exactProbe", exact_probe),
+                string_field("outputDigest", output_digest),
+                string_field("recoveryConditionDigest", recovery_condition_digest),
+                string_field("cause", cause),
+                string_field("idempotencyKey", idempotency_key),
+                "\"recoverySatisfied\":true".to_owned(),
+                "\"worldStatus\":\"PROVEN\"".to_owned(),
+                "\"redactionConfirmed\":true".to_owned(),
+            ];
+            for (name, value) in [
+                ("incidentId", incident_id),
+                ("sessionKey", session_key),
+                ("correlationId", correlation_id),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            if let Some(value) = observed_at {
+                params.push(format!("\"observedAt\":{value}"));
+            }
+            if let Some(value) = accepted_at {
+                params.push(format!("\"acceptedAt\":{value}"));
+            }
+            Ok(request(
+                identity,
+                "harness-health-resolve-other",
+                vec![],
+                params,
+            ))
+        }
+        Command::HarnessHealthReviewOther {
+            identity,
+            incident_id,
+            outcome,
+            named_class,
+            cause,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("incidentId", incident_id),
+                string_field("outcome", outcome),
+            ];
+            for (name, value) in [("namedClass", named_class), ("cause", cause)] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            params.push(string_field("idempotencyKey", idempotency_key));
+            Ok(request(
+                identity,
+                "harness-health-review-other",
+                vec![],
+                params,
+            ))
+        }
+        Command::HarnessHealthClosePromotion {
+            identity,
+            promotion_id,
+            named_class,
+            spec_artifact_id,
+            spec_ref,
+            spec_sha256,
+            review_artifact_id,
+            review_attest_id,
+            review_assignment_id,
+            candidate_commit,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("promotionId", promotion_id),
+                string_field("namedClass", named_class),
+                string_field("specArtifactId", spec_artifact_id),
+                string_field("reviewArtifactId", review_artifact_id),
+                string_field("reviewAttestId", review_attest_id),
+                string_field("candidateCommit", candidate_commit),
+                string_field("reviewAssignmentId", review_assignment_id),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+
+            for (name, value) in [("specRef", spec_ref), ("specSha256", spec_sha256)] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+
+            Ok(request(
+                identity,
+                "harness-health-close-promotion",
+                vec![],
+                params,
+            ))
+        }
+        Command::HarnessHealthEvidenceOther {
+            identity,
+            incident_id,
+        } => Ok(request(
+            identity,
+            "harness-health-evidence-other",
+            vec![],
+            vec![string_field("incidentId", incident_id)],
+        )),
+        Command::ArtifactContentFetch {
+            identity,
+            artifact_id,
+        } => Ok(request(
+            identity,
+            "artifact-content-fetch",
+            vec![],
+            vec![string_field("artifactId", artifact_id)],
+        )),
         Command::ArtifactRecord {
             identity,
             kind,
@@ -180,6 +390,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             description,
             work_item_id,
             content_sha256,
+            produced_by_assignment_id,
         } => {
             let mut params = vec![
                 string_field("kind", kind),
@@ -190,6 +401,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 ("description", description),
                 ("workItemId", work_item_id),
                 ("contentSha256", content_sha256),
+                ("producedByAssignmentId", produced_by_assignment_id),
             ] {
                 if let Some(value) = value {
                     params.push(string_field(name, value));
@@ -271,6 +483,38 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 params,
             ))
         }
+        Command::SessionReparent {
+            identity,
+            session_key,
+            parent_session_key,
+            assignment_id,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "session-reparent",
+            vec![],
+            vec![
+                string_field("sessionKey", session_key),
+                string_field("parentSessionKey", parent_session_key),
+                string_field("assignmentId", assignment_id),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
+        Command::SessionPoSet {
+            identity,
+            session_key,
+            po_role,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "session-po-set",
+            vec![],
+            vec![
+                string_field("sessionKey", session_key),
+                string_field("poRole", po_role),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
         Command::Tune {
             identity,
             session_key,
@@ -313,6 +557,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             reviews,
             effect_kind,
             files,
+            succeeds,
         } => {
             let target = match target {
                 Target::Session(value) => string_field("sessionKey", value),
@@ -338,6 +583,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     serde_json::to_string(value).expect("strings are JSON serializable")
                 ));
             }
+            if let Some(value) = succeeds {
+                params.push(string_field("succeedsAssignmentId", value));
+            }
             Ok(request(identity, "assign", vec![target], params))
         }
         Command::Dispatch {
@@ -349,6 +597,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             workdir_root,
             brief,
             idempotency_key,
+            succeeds,
         } => {
             let mut params = vec![
                 string_field("subject", subject),
@@ -365,6 +614,9 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             if let Some(value) = idempotency_key {
                 params.push(string_field("idempotencyKey", value));
+            }
+            if let Some(value) = succeeds {
+                params.push(string_field("succeedsAssignmentId", value));
             }
             Ok(request(
                 identity,
@@ -384,6 +636,49 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             vec![
                 string_field("request", request_id),
                 string_field("action", action),
+            ],
+        )),
+        Command::Ask {
+            identity,
+            target,
+            question,
+            assignment_id,
+        } => {
+            let target = match target {
+                Target::Session(value) => string_field("sessionKey", value),
+                Target::Role(value) => string_field("role", value),
+                Target::User(value) => string_field("userId", value),
+            };
+            let mut params = vec![string_field("question", question)];
+            if let Some(value) = assignment_id {
+                params.push(string_field("assignmentId", value));
+            }
+            Ok(request(identity, "ask", vec![target], params))
+        }
+        Command::Answer {
+            identity,
+            request_id,
+            answer,
+        } => Ok(request(
+            identity,
+            "answer",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("answer", answer),
+            ],
+        )),
+        Command::Return {
+            identity,
+            request_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "return",
+            vec![],
+            vec![
+                string_field("request", request_id),
+                string_field("reason", reason),
             ],
         )),
         Command::OperatorAsk {
@@ -471,11 +766,28 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         Command::RevokeAssignment {
             identity,
             assignment_id,
+            reason,
         } => Ok(request(
             identity,
             "revoke-assignment",
             vec![],
-            vec![string_field("assignmentId", assignment_id)],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
+        )),
+        Command::ReopenAssignment {
+            identity,
+            assignment_id,
+            reason,
+        } => Ok(request(
+            identity,
+            "reopen-assignment",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                string_field("reason", reason),
+            ],
         )),
         Command::RepairAssignment {
             identity,
@@ -508,6 +820,28 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "repair-assignment", vec![], params))
         }
+        Command::AssignmentCommitRefCorrect {
+            identity,
+            assignment_id,
+            commit_refs,
+            reason,
+            evidence_artifact_id,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "assignment-commitref-correct",
+            vec![],
+            vec![
+                string_field("assignmentId", assignment_id),
+                format!(
+                    "\"commitRefs\":{}",
+                    serde_json::to_string(commit_refs).expect("commit refs are JSON serializable")
+                ),
+                string_field("reason", reason),
+                string_field("evidenceArtifactId", evidence_artifact_id),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
         Command::WorkItemCreate {
             identity,
             title,
@@ -626,7 +960,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             if *tree {
                 params.push("\"tree\":true".to_owned());
             }
-            Ok(request(identity, "toplines", vec![], params))
+            Ok(request(identity, "execution-map", vec![], params))
         }
         // Every selector travels as an ordinary body PARAM: both verbs are declared
         // non-target at the router, and --session is a COHORT FILTER over creator
@@ -645,7 +979,7 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
         } => {
             let mut params = filter_params(filters);
             params.push(string_field("under", work_item_id));
-            Ok(request(identity, "topline", vec![], params))
+            Ok(request(identity, "execution-map-select", vec![], params))
         }
         Command::Topline {
             identity,
@@ -658,13 +992,44 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
 
             Ok(request(
                 identity,
-                "topline",
+                "execution-map-select",
                 vec![],
                 vec![format!(
                     "\"assignments\":{}",
                     serde_json::Value::Array(list)
                 )],
             ))
+        }
+        Command::ToplineMutation {
+            identity,
+            verb,
+            params,
+        } => Ok(request(
+            identity,
+            verb,
+            vec![],
+            params
+                .iter()
+                .map(|(name, value)| string_field(name, value))
+                .collect(),
+        )),
+        Command::DurableToplines { identity, state } => {
+            let params = state
+                .as_ref()
+                .map(|value| vec![string_field("state", value)])
+                .unwrap_or_default();
+            Ok(request(identity, "toplines", vec![], params))
+        }
+        Command::DurableTopline {
+            identity,
+            topline_id,
+            history,
+        } => {
+            let mut params = vec![string_field("toplineId", topline_id)];
+            if *history {
+                params.push("\"history\":true".to_owned());
+            }
+            Ok(request(identity, "topline", vec![], params))
         }
         Command::WorkItemIcebox {
             identity,
@@ -711,7 +1076,42 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             verdict,
             note,
             commit_refs,
+            artifact_id,
+            content_sha256,
+            wait_id,
         } => {
+            // A surrender is the sole terminal operation a stale session may make.
+            // Keep its wire shape apart from generic dispatch: that endpoint remains
+            // release-gated, and this one must never accept an asserted identity or
+            // ordinary attest fields.
+            if kind == "surrender" {
+                if !matches!(identity, Identity::Session) {
+                    return Err(
+                        "terminal surrender must use the session's implicit identity".to_owned(),
+                    );
+                }
+                let note = note
+                    .as_deref()
+                    .ok_or_else(|| "--note is required when --kind is surrender".to_owned())?;
+                if verdict.is_some()
+                    || commit_refs.is_some()
+                    || artifact_id.is_some()
+                    || content_sha256.is_some()
+                    || wait_id.is_some()
+                {
+                    return Err(
+                        "terminal surrender accepts only --kind surrender and --note".to_owned(),
+                    );
+                }
+                return Ok(RequestSpec {
+                    path: "/agent/terminal",
+                    body_json: object(vec![
+                        string_field("assignmentId", assignment_id),
+                        string_field("disposition", "surrender"),
+                        string_field("note", note),
+                    ]),
+                });
+            }
             let mut params = vec![
                 string_field("assignmentId", assignment_id),
                 string_field("kind", kind),
@@ -727,6 +1127,15 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                     "\"commitRefs\":{}",
                     serde_json::to_string(value).expect("commit refs are JSON serializable")
                 ));
+            }
+            if let Some(value) = artifact_id {
+                params.push(string_field("artifactId", value));
+            }
+            if let Some(value) = content_sha256 {
+                params.push(string_field("contentSha256", value));
+            }
+            if let Some(value) = wait_id {
+                params.push(string_field("waitId", value));
             }
             Ok(request(identity, "attest", vec![], params))
         }
@@ -987,6 +1396,7 @@ pub fn build_onboard_phase_request(
     machine: Option<&str>,
     lease_id: Option<&str>,
     reason: Option<&str>,
+    source: Option<&str>,
 ) -> RequestSpec {
     // `kind` rides on EVERY phase, not just finish, so the conversation is
     // self-describing in a gateway log. Only finish acts on it.
@@ -1003,6 +1413,9 @@ pub fn build_onboard_phase_request(
     }
     if let Some(reason) = reason {
         params.push(string_field("reason", reason));
+    }
+    if let Some(source) = source {
+        params.push(string_field("source", source));
     }
     request(identity, "onboard", vec![], params)
 }
@@ -1313,11 +1726,16 @@ pub(crate) fn gateway_request(
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout).timeout_connect(timeout);
     }
-    builder
+    let request = builder
         .build()
         .request(method, &format!("{}{path}", endpoint.base))
         .set("authorization", &format!("Bearer {}", endpoint.token))
-        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"))
+        .set("x-tightbeam-cli-version", env!("CARGO_PKG_VERSION"));
+    if path == "/agent/terminal" {
+        request.set("x-tightbeam-terminal-version", "1")
+    } else {
+        request
+    }
 }
 
 /// LOAD-BEARING WORDING. This sentence is control flow, not just prose.
@@ -1424,6 +1842,7 @@ where
         Command::Help | Command::CommandHelp(_) => {
             unreachable!("help is handled before dispatch")
         }
+        Command::IdentityCurrent => print_current_session_identity(),
         Command::Doctor { json, base_dir } => crate::probe::run(json, base_dir),
         Command::AddUser {
             identity,
@@ -1484,6 +1903,9 @@ where
             identity,
             provider,
             api_key,
+            daemon_credential,
+            endpoint: local_endpoint,
+            provider_name: local_provider_name,
             hostname,
             remote,
         } => {
@@ -1499,6 +1921,9 @@ where
                 &identity,
                 &provider,
                 api_key,
+                daemon_credential,
+                local_endpoint.as_deref(),
+                local_provider_name.as_deref(),
                 &endpoint,
                 send_request,
                 load_harnesses,
@@ -1567,22 +1992,35 @@ fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
+        | Command::HarnessHealthObserveOther { identity, .. }
+        | Command::HarnessHealthResolveOther { identity, .. }
+        | Command::HarnessHealthReviewOther { identity, .. }
+        | Command::HarnessHealthClosePromotion { identity, .. }
+        | Command::HarnessHealthEvidenceOther { identity, .. }
         | Command::ArtifactRecord { identity, .. }
+        | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
         | Command::Spawn { identity, .. }
         | Command::List { identity }
         | Command::Retire { identity, .. }
         | Command::Tune { identity, .. }
+        | Command::SessionReparent { identity, .. }
+        | Command::SessionPoSet { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
+        | Command::Ask { identity, .. }
+        | Command::Answer { identity, .. }
+        | Command::Return { identity, .. }
         | Command::OperatorAsk { identity, .. }
         | Command::OperatorRule { identity, .. }
         | Command::OperatorWithdraw { identity, .. }
         | Command::DecisionRequests { identity, .. }
         | Command::DecisionRequest { identity, .. }
         | Command::RevokeAssignment { identity, .. }
+        | Command::ReopenAssignment { identity, .. }
         | Command::RepairAssignment { identity, .. }
+        | Command::AssignmentCommitRefCorrect { identity, .. }
         | Command::WorkItemCreate { identity, .. }
         | Command::WorkItemUpdate { identity, .. }
         | Command::WorkItemGet { identity, .. }
@@ -1591,6 +2029,9 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Transcript { identity, .. }
         | Command::Toplines { identity, .. }
         | Command::Topline { identity, .. }
+        | Command::ToplineMutation { identity, .. }
+        | Command::DurableToplines { identity, .. }
+        | Command::DurableTopline { identity, .. }
         | Command::WorkItemIcebox { identity, .. }
         | Command::WorkItemReopen { identity, .. }
         | Command::WorkItemClose { identity, .. }
@@ -1618,6 +2059,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::HarnessProcesses { identity } => Some(identity),
         Command::Help
         | Command::CommandHelp(_)
+        | Command::IdentityCurrent
         | Command::Doctor { .. }
         | Command::ToolCallObserved
         | Command::GithubAuthCheck
@@ -1649,8 +2091,158 @@ fn tune_model_params(
     params
 }
 
+fn print_current_session_identity() -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    let session_key = current_session_key_from(&cwd)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"sessionKey": session_key}))
+            .expect("session identity serializes")
+    );
+    Ok(())
+}
+
+fn current_session_key_from(cwd: &Path) -> Result<String, String> {
+    for directory in cwd.ancestors() {
+        let path = directory.join(".tightbeam-session");
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(format!(
+                    "session identity unavailable: cannot inspect marker '{}'",
+                    path.display()
+                ));
+            }
+            Ok(_) => {}
+        }
+        // An existing but unreadable/broken nearest marker must never fall back
+        // to another session's ancestor. Errors omit both bytes and parser excerpts.
+        let encoded = fs::read_to_string(&path)
+            .map_err(|_| format!("malformed session marker '{}': unreadable", path.display()))?;
+        let config: Value = serde_json::from_str(&encoded).map_err(|_| {
+            format!(
+                "malformed session marker '{}': invalid JSON",
+                path.display()
+            )
+        })?;
+        return config
+            .get("sessionKey")
+            .and_then(Value::as_str)
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "malformed session marker '{}': missing sessionKey",
+                    path.display()
+                )
+            });
+    }
+    Err("session identity unavailable: no .tightbeam-session marker".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn builds_agent_decision_bodies() {
+        assert_eq!(
+            body(&[
+                "ask",
+                "--session",
+                "agent:r",
+                "--question",
+                "Why?",
+                "--about",
+                "asg_1",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"ask","sessionKey":"agent:r","params":{"question":"Why?","assignmentId":"asg_1"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "answer",
+                "--request",
+                "dr_1",
+                "--answer",
+                "Yes",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"answer","params":{"request":"dr_1","answer":"Yes"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "return",
+                "--request",
+                "dr_1",
+                "--reason",
+                "Need proof",
+                "--as",
+                "coder"
+            ]),
+            r#"{"as":"coder","verb":"return","params":{"request":"dr_1","reason":"Need proof"}}"#
+        );
+    }
+
+    #[test]
+    fn identity_current_projects_nearest_key_and_refuses_wrong_session_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "identity-current-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("nested");
+        let cwd = nested.join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let marker = nested.join(".tightbeam-session");
+        std::fs::write(
+            root.join(".tightbeam-session"),
+            r#"{"sessionKey":"ancestor","token":"ancestor-secret"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &marker,
+            r#"{"sessionKey":"nearest","token":"nearest-secret","url":"https://unused.invalid"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::current_session_key_from(&cwd).unwrap(), "nearest");
+        for malformed in [
+            r#"{"token":"private-value"}"#,
+            r#"{"sessionKey":42}"#,
+            r#"{"sessionKey":" "}"#,
+            r#"{"sessionKey":"private-value", broken"#,
+        ] {
+            std::fs::write(&marker, malformed).unwrap();
+            let error = super::current_session_key_from(&cwd).unwrap_err();
+            assert!(error.starts_with("malformed session marker"));
+            assert!(!error.contains("private-value"));
+            assert!(!error.contains("ancestor-secret"));
+        }
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&marker).unwrap();
+            std::os::unix::fs::symlink(nested.join("missing-target"), &marker).unwrap();
+            assert!(
+                super::current_session_key_from(&cwd)
+                    .unwrap_err()
+                    .contains("unreadable")
+            );
+            std::fs::remove_file(&marker).unwrap();
+        }
+        #[cfg(not(unix))]
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::remove_file(root.join(".tightbeam-session")).unwrap();
+        assert!(
+            super::current_session_key_from(&cwd)
+                .unwrap_err()
+                .starts_with("session identity unavailable")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use crate::args;
     use std::collections::HashMap;
@@ -1662,6 +2254,92 @@ mod tests {
 
     fn body(values: &[&str]) -> String {
         build_request(&parse(values)).unwrap().body_json
+    }
+
+    #[test]
+    fn artifact_content_fetch_sends_only_id_and_authenticated_identity() {
+        let request = build_request(&parse(&[
+            "artifact-content-fetch",
+            "art_fixture",
+            "--as-user",
+            "flynn",
+        ]))
+        .unwrap();
+        assert_eq!(request.path, "/agent/dispatch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.body_json).unwrap(),
+            serde_json::json!({
+                "verb": "artifact-content-fetch",
+                "asUser": "flynn",
+                "params": {"artifactId": "art_fixture"}
+            })
+        );
+    }
+
+    #[test]
+    fn session_reparent_preserves_opaque_keys_and_requires_explicit_retry_key() {
+        assert_eq!(
+            body(&[
+                "session-reparent",
+                "--session",
+                "child with space",
+                "--parent",
+                "parent",
+                "--assignment",
+                "asg_one",
+                "--key",
+                "correction",
+                "--as-user",
+                "owner"
+            ]),
+            r#"{"asUser":"owner","verb":"session-reparent","params":{"sessionKey":"child with space","parentSessionKey":"parent","assignmentId":"asg_one","idempotencyKey":"correction"}}"#
+        );
+        for missing in ["--session", "--parent", "--assignment", "--key"] {
+            let mut args = vec!["session-reparent"];
+            for (flag, value) in [
+                ("--session", "child"),
+                ("--parent", "parent"),
+                ("--assignment", "asg_one"),
+                ("--key", "correction"),
+            ] {
+                if flag != missing {
+                    args.extend([flag, value]);
+                }
+            }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn session_po_set_preserves_exact_role_and_requires_explicit_retry_key() {
+        assert_eq!(
+            body(&[
+                "session-po-set",
+                "--session",
+                "orchestrator with space",
+                "--po-role",
+                "product-owner:news",
+                "--key",
+                "association-one",
+                "--as",
+                "orchestrator:delivery"
+            ]),
+            r#"{"as":"orchestrator:delivery","verb":"session-po-set","params":{"sessionKey":"orchestrator with space","poRole":"product-owner:news","idempotencyKey":"association-one"}}"#
+        );
+
+        for missing in ["--session", "--po-role", "--key"] {
+            let mut args = vec!["session-po-set"];
+            for (flag, value) in [
+                ("--session", "orchestrator"),
+                ("--po-role", "product-owner:news"),
+                ("--key", "association-one"),
+            ] {
+                if flag != missing {
+                    args.extend([flag, value]);
+                }
+            }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
     }
 
     #[test]
@@ -1771,10 +2449,11 @@ mod tests {
             origin: Origin::Provisioned,
         };
 
-        for (method, path) in [
-            ("POST", "/agent/dispatch"),
-            ("POST", "/agent/tool-call-observed"),
-            ("GET", "/harnesses"),
+        for (method, path, terminal_protocol) in [
+            ("POST", "/agent/dispatch", false),
+            ("POST", "/agent/tool-call-observed", false),
+            ("POST", "/agent/terminal", true),
+            ("GET", "/harnesses", false),
         ] {
             let request = gateway_request(method, &endpoint, path, None);
             assert_eq!(request.method(), method);
@@ -1784,7 +2463,42 @@ mod tests {
                 request.header("x-tightbeam-cli-version"),
                 Some(env!("CARGO_PKG_VERSION"))
             );
+            assert_eq!(
+                request.header("x-tightbeam-terminal-version"),
+                terminal_protocol.then_some("1")
+            );
         }
+    }
+
+    #[test]
+    fn terminal_surrender_has_its_own_fixed_request_shape() {
+        let request = build_request(&parse(&[
+            "attest",
+            "asg_1",
+            "--kind",
+            "surrender",
+            "--note",
+            "incompatible client",
+        ]))
+        .unwrap();
+        assert_eq!(request.path, "/agent/terminal");
+        assert_eq!(
+            request.body_json,
+            r#"{"assignmentId":"asg_1","disposition":"surrender","note":"incompatible client"}"#
+        );
+        assert_eq!(
+            build_request(&parse(&[
+                "attest",
+                "asg_1",
+                "--kind",
+                "surrender",
+                "--note",
+                "no",
+                "--as",
+                "coder",
+            ])),
+            Err("terminal surrender must use the session's implicit identity".to_owned())
+        );
     }
 
     #[test]
@@ -1953,6 +2667,46 @@ mod tests {
     }
 
     #[test]
+    fn builds_byte_exact_structured_wait_and_wait_verdict_bodies() {
+        let predicate = r#"{"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"bindings":{"assignmentId":"asg_r"},"resolverRef":{"kind":"assignment","id":"asg_r"},"necessity":"needs output","verificationRef":{"kind":"assignment","id":"asg_v"}}"#;
+
+        assert_eq!(
+            body(&[
+                "wake",
+                "--session",
+                "agent:holder",
+                "--assignment",
+                "asg_a",
+                "--predicate",
+                predicate,
+                "--fallback-after",
+                "2h",
+                "--prompt",
+                "continue",
+                "--as",
+                "holder",
+            ]),
+            r#"{"as":"holder","verb":"wake","sessionKey":"agent:holder","params":{"prompt":"continue","afterMs":7200000,"predicate":{"bindings":{"assignmentId":"asg_r"},"conditions":[{"fact":"assignment.state","op":"eq","value":"closed"}],"necessity":"needs output","resolverRef":{"id":"asg_r","kind":"assignment"},"verificationRef":{"id":"asg_v","kind":"assignment"}},"assignmentId":"asg_a"}}"#
+        );
+
+        assert_eq!(
+            body(&[
+                "attest",
+                "asg_v",
+                "--kind",
+                "verdict",
+                "--verdict",
+                "wait-verified",
+                "--wait",
+                "w_1",
+                "--as",
+                "verifier",
+            ]),
+            r#"{"as":"verifier","verb":"attest","params":{"assignmentId":"asg_v","kind":"verdict","verdictKind":"wait-verified","waitId":"w_1"}}"#
+        );
+    }
+
+    #[test]
     fn builds_byte_exact_spawn_and_identity_edit_bodies() {
         assert_eq!(
             body(&[
@@ -2084,6 +2838,32 @@ mod tests {
             body(&[
                 "assign",
                 "--subject",
+                "continue",
+                "--session",
+                "agent:builder",
+                "--succeeds",
+                "asg_full",
+            ]),
+            r#"{"verb":"assign","sessionKey":"agent:builder","params":{"subject":"continue","succeedsAssignmentId":"asg_full"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "dispatch",
+                "--holder",
+                "agent:builder",
+                "--subject",
+                "continue",
+                "--brief",
+                "Continue it.",
+                "--succeeds",
+                "asg_full",
+            ]),
+            r#"{"verb":"dispatch","sessionKey":"agent:builder","params":{"subject":"continue","brief":"Continue it.","succeedsAssignmentId":"asg_full"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assign",
+                "--subject",
                 "ship",
                 "--role",
                 "builder",
@@ -2195,8 +2975,43 @@ mod tests {
             r#"{"as":"parent","verb":"operator-withdraw","params":{"request":"dr_2","reason":"moot after 013"}}"#
         );
         assert_eq!(
-            body(&["revoke-assignment", "asg_1", "--as", "parent",]),
-            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1"}}"#
+            body(&[
+                "revoke-assignment",
+                "asg_1",
+                "--as",
+                "parent",
+                "--reason",
+                "superseded"
+            ]),
+            r#"{"as":"parent","verb":"revoke-assignment","params":{"assignmentId":"asg_1","reason":"superseded"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "reopen-assignment",
+                "asg_1",
+                "--reason",
+                "continue work",
+                "--as",
+                "parent"
+            ]),
+            r#"{"as":"parent","verb":"reopen-assignment","params":{"assignmentId":"asg_1","reason":"continue work"}}"#
+        );
+        assert_eq!(
+            body(&[
+                "assignment-commitref-correct",
+                "asg_1",
+                "--commit-refs",
+                r#"[{"repo":"gibson:/repo","remote":"git@example/repo","ref":"refs/heads/main","commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]"#,
+                "--evidence",
+                "art_1",
+                "--reason",
+                "canonical historical backfill",
+                "--key",
+                "backfill-1",
+                "--as",
+                "parent",
+            ]),
+            r#"{"as":"parent","verb":"assignment-commitref-correct","params":{"assignmentId":"asg_1","commitRefs":[{"commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ref":"refs/heads/main","remote":"git@example/repo","repo":"gibson:/repo"}],"reason":"canonical historical backfill","evidenceArtifactId":"art_1","idempotencyKey":"backfill-1"}}"#
         );
         assert_eq!(
             body(&[
@@ -2423,6 +3238,166 @@ mod tests {
     }
 
     #[test]
+    fn builds_byte_exact_durable_topline_bodies() {
+        for (argv, expected) in [
+            (
+                &["toplines", "--state", "open", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"toplines","params":{"state":"open"}}"#,
+            ),
+            (
+                &["topline", "tl_1", "--history", "--as-user", "flynn"][..],
+                r#"{"asUser":"flynn","verb":"topline","params":{"toplineId":"tl_1","history":true}}"#,
+            ),
+            (
+                &[
+                    "topline-work-leave-unlinked",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-work-leave-unlinked","params":{"workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-placement-list",
+                    "--state",
+                    "resolved",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-placement-list","params":{"state":"resolved"}}"#,
+            ),
+            (
+                &[
+                    "topline-create",
+                    "--title",
+                    "Ship",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-create","params":{"title":"Ship","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-update",
+                    "tl_1",
+                    "--title",
+                    "Ship",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-update","params":{"toplineId":"tl_1","title":"Ship","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-close",
+                    "tl_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-close","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-reopen",
+                    "tl_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-reopen","params":{"toplineId":"tl_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-link-work",
+                    "tl_1",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-link-work","params":{"toplineId":"tl_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-unlink-work",
+                    "tlm_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-unlink-work","params":{"membershipId":"tlm_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-concern-create",
+                    "tl_1",
+                    "--title",
+                    "Risk",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-concern-create","params":{"toplineId":"tl_1","title":"Risk","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-concern-link-work",
+                    "tlc_1",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-concern-link-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+            (
+                &[
+                    "topline-concern-unlink-work",
+                    "tlc_1",
+                    "wi_1",
+                    "--reason",
+                    "why",
+                    "--key",
+                    "k",
+                    "--as-user",
+                    "flynn",
+                ][..],
+                r#"{"asUser":"flynn","verb":"topline-concern-unlink-work","params":{"concernId":"tlc_1","workItemId":"wi_1","reason":"why","idempotencyKey":"k"}}"#,
+            ),
+        ] {
+            assert_eq!(body(argv), expected);
+        }
+    }
+
+    #[test]
     fn builds_byte_exact_config_bodies() {
         assert_eq!(
             body(&["config", "get", "default-archetype", "--as-user", "flynn"]),
@@ -2524,6 +3499,7 @@ mod tests {
             Some("work-1"),
             None,
             None,
+            None,
         );
 
         assert_eq!(
@@ -2544,6 +3520,7 @@ mod tests {
             Some("work-1"),
             Some("lease-7"),
             None,
+            None,
         );
 
         assert_eq!(
@@ -2551,6 +3528,31 @@ mod tests {
             r#"{"asUser":"flynn","verb":"onboard","params":{"provider":"anthropic","phase":"finish","kind":"apiKey","machine":"work-1","leaseId":"lease-7"}}"#
         );
         assert!(!keyed.body_json.contains("sk-"));
+
+        let daemon = build_onboard_phase_request(
+            &Identity::User("flynn".to_owned()),
+            "opencode-go",
+            "begin",
+            "apiKey",
+            None,
+            None,
+            None,
+            Some("daemonCredential"),
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&daemon.body_json).unwrap(),
+            serde_json::json!({
+                "asUser": "flynn",
+                "verb": "onboard",
+                "params": {
+                    "provider": "opencode-go",
+                    "phase": "begin",
+                    "kind": "apiKey",
+                    "source": "daemonCredential"
+                }
+            })
+        );
+        assert!(!daemon.body_json.contains("fake-daemon-key"));
     }
 
     #[test]
@@ -3073,6 +4075,9 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             },
@@ -3182,6 +4187,9 @@ mod tests {
                 identity: Identity::User("flynn".to_owned()),
                 provider: "openai".to_owned(),
                 api_key: false,
+                daemon_credential: false,
+                endpoint: None,
+                provider_name: None,
                 hostname: None,
                 remote: None,
             },
@@ -3277,6 +4285,7 @@ mod tests {
             "finish",
             "subscription",
             Some("work-1"),
+            None,
             None,
             None,
         );

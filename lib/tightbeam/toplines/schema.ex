@@ -104,30 +104,14 @@ defmodule Tightbeam.Toplines.Schema do
           id                TEXT PRIMARY KEY CHECK (substr(id, 1, 4) = 'tlc_'),
           toplineId         TEXT NOT NULL REFERENCES toplines(id),
           title             ANY NOT NULL,
-          state             TEXT NOT NULL CHECK (state IN ('open','resolved')),
           createdActorKind  TEXT NOT NULL CHECK (createdActorKind IN ('user','session')),
           createdActorRef   TEXT NOT NULL CHECK (length(trim(createdActorRef)) > 0),
           createdAt         INTEGER NOT NULL,
-          updatedAt         INTEGER NOT NULL,
-          resolveReason     TEXT,
-          resolvedActorKind TEXT,
-          resolvedActorRef  TEXT,
-          resolvedAt        INTEGER,
           CHECK (typeof(title) = 'text'),
           CHECK (tightbeam_canonical_title(title) IS NOT NULL),
           CHECK (title = tightbeam_canonical_title(title)),
           CHECK (tightbeam_unicode_scalar_length(title) BETWEEN 1 AND 2000),
-          CHECK (typeof(createdAt) = 'integer'),
-          CHECK (typeof(updatedAt) = 'integer' AND updatedAt >= createdAt),
-          CHECK (
-            (state = 'open' AND resolveReason IS NULL AND resolvedActorKind IS NULL AND
-             resolvedActorRef IS NULL AND resolvedAt IS NULL) OR
-            (state = 'resolved' AND resolveReason IS NOT NULL AND
-             length(trim(resolveReason)) BETWEEN 1 AND 4000 AND
-             resolvedActorKind IS NOT NULL AND resolvedActorKind IN ('user','session') AND
-             resolvedActorRef IS NOT NULL AND length(trim(resolvedActorRef)) > 0 AND
-             typeof(resolvedAt) = 'integer' AND resolvedAt >= createdAt)
-          )
+          CHECK (typeof(createdAt) = 'integer')
         )
         """)
     },
@@ -142,44 +126,35 @@ defmodule Tightbeam.Toplines.Schema do
       sql:
         String.trim("""
         CREATE TABLE topline_concern_refs (
-          id                TEXT PRIMARY KEY CHECK (substr(id, 1, 5) = 'tlcr_'),
           toplineId         TEXT NOT NULL,
           concernId         TEXT NOT NULL,
-          membershipId      TEXT NOT NULL,
-          linkReason        TEXT NOT NULL CHECK (length(trim(linkReason)) BETWEEN 1 AND 4000),
-          linkedActorKind   TEXT NOT NULL CHECK (linkedActorKind IN ('user','session')),
-          linkedActorRef    TEXT NOT NULL CHECK (length(trim(linkedActorRef)) > 0),
-          linkedAt          INTEGER NOT NULL CHECK (typeof(linkedAt) = 'integer'),
-          unlinkReason      TEXT,
-          unlinkedActorKind TEXT,
-          unlinkedActorRef  TEXT,
-          unlinkedAt        INTEGER,
+          workItemId        TEXT NOT NULL REFERENCES work_items(id),
+          tagReason         TEXT NOT NULL CHECK (length(trim(tagReason)) BETWEEN 1 AND 4000),
+          taggedActorKind   TEXT NOT NULL CHECK (taggedActorKind IN ('user','session')),
+          taggedActorRef    TEXT NOT NULL CHECK (length(trim(taggedActorRef)) > 0),
+          taggedAt          INTEGER NOT NULL CHECK (typeof(taggedAt) = 'integer'),
+          PRIMARY KEY (concernId, workItemId),
           FOREIGN KEY (concernId, toplineId) REFERENCES topline_concerns(id, toplineId),
-          FOREIGN KEY (membershipId, toplineId)
-            REFERENCES topline_work_memberships(id, toplineId),
-          CHECK (
-            (unlinkedAt IS NULL AND unlinkReason IS NULL AND
-             unlinkedActorKind IS NULL AND unlinkedActorRef IS NULL) OR
-            (typeof(unlinkedAt) = 'integer' AND unlinkedAt >= linkedAt AND
-             unlinkReason IS NOT NULL AND
-             length(trim(unlinkReason)) BETWEEN 1 AND 4000 AND
-             unlinkedActorKind IS NOT NULL AND unlinkedActorKind IN ('user','session') AND
-             unlinkedActorRef IS NOT NULL AND length(trim(unlinkedActorRef)) > 0)
-          )
+          CHECK (length(trim(taggedActorRef)) > 0)
         )
         """)
     },
     %{
-      type: "index",
-      name: "topline_concern_refs_active_pair",
+      type: "trigger",
+      name: "topline_concern_refs_active_membership_insert",
       sql:
-        "CREATE UNIQUE INDEX topline_concern_refs_active_pair ON topline_concern_refs (concernId, membershipId) WHERE unlinkedAt IS NULL"
-    },
-    %{
-      type: "index",
-      name: "topline_concern_refs_id_tuple",
-      sql:
-        "CREATE UNIQUE INDEX topline_concern_refs_id_tuple ON topline_concern_refs (id, toplineId, concernId, membershipId)"
+        String.trim("""
+        CREATE TRIGGER topline_concern_refs_active_membership_insert
+        BEFORE INSERT ON topline_concern_refs
+        WHEN NOT EXISTS (
+          SELECT 1 FROM topline_work_memberships m
+          WHERE m.toplineId = NEW.toplineId AND m.workItemId = NEW.workItemId
+            AND m.unlinkedAt IS NULL
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'concern tag requires active topline membership');
+        END
+        """)
     },
     %{
       type: "table",
@@ -191,13 +166,11 @@ defmodule Tightbeam.Toplines.Schema do
           seq                 INTEGER NOT NULL CHECK (typeof(seq) = 'integer' AND seq >= 1),
           kind                TEXT NOT NULL CHECK (kind IN (
             'topline_created','topline_renamed','topline_closed','topline_reopened',
-            'work_linked','work_unlinked','concern_created','concern_renamed',
-            'concern_resolved','concern_reopened','concern_work_linked',
-            'concern_work_unlinked'
+            'work_linked','work_unlinked','concern_created','concern_work_tagged',
+            'concern_work_untagged'
           )),
           membershipId       TEXT,
           concernId          TEXT,
-          concernReferenceId TEXT,
           actorKind           TEXT NOT NULL CHECK (actorKind IN ('user','session')),
           actorRef            TEXT NOT NULL CHECK (length(trim(actorRef)) > 0),
           reason              TEXT,
@@ -207,17 +180,14 @@ defmodule Tightbeam.Toplines.Schema do
           FOREIGN KEY (membershipId, toplineId)
             REFERENCES topline_work_memberships(id, toplineId),
           FOREIGN KEY (concernId, toplineId) REFERENCES topline_concerns(id, toplineId),
-          FOREIGN KEY (concernReferenceId, toplineId, concernId, membershipId)
-            REFERENCES topline_concern_refs(id, toplineId, concernId, membershipId),
           CHECK (
             (kind IN ('topline_created','topline_renamed','topline_closed','topline_reopened') AND
-             membershipId IS NULL AND concernId IS NULL AND concernReferenceId IS NULL) OR
+             membershipId IS NULL AND concernId IS NULL) OR
             (kind IN ('work_linked','work_unlinked') AND membershipId IS NOT NULL AND
-             concernId IS NULL AND concernReferenceId IS NULL) OR
-            (kind IN ('concern_created','concern_renamed','concern_resolved','concern_reopened') AND
-             membershipId IS NULL AND concernId IS NOT NULL AND concernReferenceId IS NULL) OR
-            (kind IN ('concern_work_linked','concern_work_unlinked') AND
-             membershipId IS NOT NULL AND concernId IS NOT NULL AND concernReferenceId IS NOT NULL)
+             concernId IS NULL) OR
+            (kind = 'concern_created' AND membershipId IS NULL AND concernId IS NOT NULL) OR
+            (kind IN ('concern_work_tagged','concern_work_untagged') AND
+             membershipId IS NULL AND concernId IS NOT NULL)
           ),
           CHECK (
             (kind IN ('topline_created','concern_created') AND reason IS NULL) OR
@@ -228,11 +198,11 @@ defmodule Tightbeam.Toplines.Schema do
           CHECK (
             COALESCE((kind IN ('topline_created','concern_created') AND
              json_type(detail, '$.title') = 'text' AND json_remove(detail, '$.title') = '{}') OR
-            (kind IN ('topline_renamed','concern_renamed') AND
+            (kind = 'topline_renamed' AND
              json_type(detail, '$.fromTitle') = 'text' AND
              json_type(detail, '$.toTitle') = 'text' AND
              json_remove(detail, '$.fromTitle', '$.toTitle') = '{}') OR
-            (kind IN ('topline_closed','topline_reopened','concern_resolved','concern_reopened') AND
+            (kind IN ('topline_closed','topline_reopened') AND
              json_type(detail, '$.fromState') = 'text' AND
              json_type(detail, '$.toState') = 'text' AND
              json_remove(detail, '$.fromState', '$.toState') = '{}') OR
@@ -242,14 +212,13 @@ defmodule Tightbeam.Toplines.Schema do
             (kind = 'work_unlinked' AND json_type(detail, '$.workItemId') = 'text' AND
              json_type(detail, '$.unlinkReason') = 'text' AND
              json_remove(detail, '$.workItemId', '$.unlinkReason') = '{}') OR
-            (kind = 'concern_work_linked' AND json_type(detail, '$.membershipId') = 'text' AND
-             json_type(detail, '$.linkReason') = 'text' AND
-             json_remove(detail, '$.membershipId', '$.linkReason') = '{}') OR
-            (kind = 'concern_work_unlinked' AND
-             json_type(detail, '$.membershipId') = 'text' AND
-             json_type(detail, '$.unlinkReason') = 'text' AND
-             json_extract(detail, '$.cause') IN ('explicit','membership_unlinked') AND
-             json_remove(detail, '$.membershipId', '$.unlinkReason', '$.cause') = '{}'), 0)
+            (kind = 'concern_work_tagged' AND json_type(detail, '$.workItemId') = 'text' AND
+             json_type(detail, '$.tagReason') = 'text' AND
+             json_remove(detail, '$.workItemId', '$.tagReason') = '{}') OR
+            (kind = 'concern_work_untagged' AND
+             json_type(detail, '$.workItemId') = 'text' AND
+             json_type(detail, '$.untagReason') = 'text' AND
+             json_remove(detail, '$.workItemId', '$.untagReason') = '{}'), 0)
           )
         )
         """)
@@ -264,7 +233,6 @@ defmodule Tightbeam.Toplines.Schema do
           operation          TEXT NOT NULL CHECK (operation IN (
             'topline-create','topline-update','topline-close','topline-reopen',
             'topline-link-work','topline-unlink-work','topline-concern-create',
-            'topline-concern-update','topline-concern-resolve','topline-concern-reopen',
             'topline-concern-link-work','topline-concern-unlink-work',
             'topline-work-leave-unlinked'
           )),

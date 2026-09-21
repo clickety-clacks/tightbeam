@@ -136,7 +136,7 @@ defmodule Tightbeam.PlacementTest do
     db: db
   } do
     host = "unreadable-#{System.unique_integer([:positive])}"
-    store = Path.join(base_dir, "auth/claude")
+    store = Homes.home_path(base_dir, host, :claude)
     target = Path.join(base_dir, "credential-target")
     File.mkdir_p!(target)
     File.mkdir_p!(Path.dirname(store))
@@ -163,6 +163,23 @@ defmodule Tightbeam.PlacementTest do
     assert error.host == host
     assert error.harness == "claude"
     assert error.message =~ inspect(reason)
+  end
+
+  test "Pi adapter context accepts a named local provider when OpenCode is absent", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      credential_kind: fn
+        :opencode_go, "testhost" -> {:error, :missing}
+        :local_openai, "testhost" -> :api_key
+      end
+    }
+
+    assert [credential_kind: :api_key] =
+             Placement.adapter_context(config, {:pi, "shared", "testhost"})
   end
 
   test "workdir_path names a disappeared host instead of falling back to the gateway", %{

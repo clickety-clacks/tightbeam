@@ -15,11 +15,35 @@ says otherwise). First device to pair becomes the admin user. `tb` = the
 reference CLI with TIGHTBEAM_URL/TIGHTBEAM_TOKEN pointed at GATEWAY (token
 from `<base_dir>/gateway.json`).
 
+## Bounded fresh-agent deploy readiness
+
+The full feature smoke changes org rules, identity and config and sweeps open
+work. Do not run that suite as a production deploy-readiness check.
+Use an already-installed gateway in an explicitly authorized disposable base,
+with existing supported credentials and a permitted non-production test host:
+
+```sh
+TIGHTBEAM_BASE_DIR=/absolute/owned/test-base \
+TIGHTBEAM_SMOKE_OWNED_BASE=/absolute/owned/test-base \
+TIGHTBEAM_SMOKE_MODE=readiness \
+mix run --no-start scripts/feature_smoke.exs
+```
+
+Supply per-harness model/effort settings as required by the feature smoke.
+This route only spawns a new session, wakes it, reads its wake-bound delivered
+assistant reply and checks retirement. It does not install rules, edit identity
+or config, redeploy homes, or sweep unrelated work. The base acknowledgment
+records scope; it is not permission to use production. Record the installed
+package/source identity alongside the emitted lifecycle IDs and retirement
+result. No real-harness proof is implied by unit tests. Harness parity below
+still applies; narrowed runs are incomplete for skipped harnesses.
+
 ## Harness parity (normative for every run)
 
 This runbook is a MATRIX, not a list: one full pass PER HARNESS the org
 supports (today: claude on `claude-sonnet-5` at effort `medium`, codex on
-`gpt-5.6-sol` at effort `medium`), using a
+`gpt-5.6-sol` at effort `medium`, Pi on `opencode-go/gpt-5.6-luna` at effort
+`medium`), using a
 session of that harness for every step. A smoke run's verdict is
 INCOMPLETE — not passed — until every harness leg has run or been WAIVED by
 name with the blocker stated (e.g. "codex leg waived: no codex grant in the
@@ -31,7 +55,7 @@ Steps behave identically across harnesses unless annotated:
   codex the step becomes its NEGATIVE check where one is stated.
 - **[codex-only]** — the mechanism exists only on codex; claude does not run
   that step.
-- **[divergent]** — both harnesses run it, PASS conditions differ as noted.
+- **[divergent]** — all harnesses run it, PASS conditions differ as noted.
 
 Every `codex exec` invocation redirects `</dev/null`; an open stdin hangs it.
 
@@ -48,12 +72,15 @@ Per-harness annotations for the existing sections:
   `gpt-5.6-sol[low..xhigh]`, `gpt-5.6-luna[medium]`.
 - §9 rails (17–24): [divergent]. Claude asserts hooks in `settings.json`;
   codex asserts `hooks.json` with the org entries plus the trailing
-  `tightbeam-probe` entry, still NO `settings.json` in the codex home.
-  Neither home contains archetype guidance.
+  `tightbeam-probe` entry, still NO `settings.json` in the codex home; Pi
+  asserts `extensions/tightbeam.ts`, whose embedded hook map has the same
+  entries and trailing probe.
+  No projected home contains archetype guidance.
 - Skills verification (when a step exercises one): [divergent] — claude
   invokes via its native Skill tool; codex must READ the skill file by the
   path the Operations pointer names. PASS for codex is the agent quoting
-  skill content it read on demand, not a claim of native discovery.
+  skill content it read on demand, not a claim of native discovery. Pi uses
+  native discovery under `.pi/skills`.
 
 ## Preflight: harnesses are installed and logged in
 
@@ -94,9 +121,9 @@ A fresh base_dir is NOT ready after copying files around; each item below is a
 seam with its own shape, and every one of these was rediscovered the hard way
 on 2026-07-25:
 
-- **Credentials are store rows, not loose files** — three parts per provider,
-  and the metadata row's `kind` is what every credential seam dispatches on.
-  Copying an org's `auth/` around does not make a host logged in. See
+- **Credentials live only in exact harness homes** — one regular credential file
+  plus the same home's metadata row. The metadata `kind` tells each credential
+  seam which provider route to use. Copying another host's home is not onboarding. See
   `docs/ONBOARDING.md` for the layout and the only sanctioned path to create
   it (`tightbeam onboard <provider>`, run on that host).
 - **Codex model catalog** needs nothing seeded. It is one HTTPS call the host
@@ -104,6 +131,9 @@ on 2026-07-25:
   binary — so a working credential and a current `codex` on PATH are the whole
   requirement. An outdated `codex` yields an EMPTY catalog with no error from
   the provider; the refusal names the version and says to upgrade the binary.
+- **Pi model catalog** is a host-local call to Pi's public provider catalog.
+  The credential gate still requires the host's banked OpenCode Go key before
+  the inventory is routable; catalog membership alone is not model liveness.
 - **Default model must match default harness** (`TIGHTBEAM_DEFAULT_HARNESS` /
   `TIGHTBEAM_DEFAULT_MODEL`, or archetype `[defaults]`); the claude default
   against a codex org fails `model_unavailable` at spawn.
@@ -117,7 +147,8 @@ on 2026-07-25:
   request away from the parent before it can rule, which loses the race on the
   slower codex leg every time.
 - **"Copy the org" means two DIFFERENT things depending on which harness you
-  are driving.** `ClientE2E.LegGateway.provision!/2` copies `auth/`, `homes/`
+  are driving.** `ClientE2E.LegGateway.provision!/2` copies
+  `adapters/` and authoritative `homes/`, never legacy `auth/`
   and `identity/` and deliberately OMITS `state.db`, because a client-e2e leg
   must have no history and bootstraps its first user through the app's own J0
   pairing. `feature_smoke.exs` needs the opposite: a fully provisioned org
@@ -131,7 +162,7 @@ on 2026-07-25:
 - **`feature_smoke.exs` is a LOCAL-HOST HERMETIC driver, and only that.** It
   runs one leg per registry harness, every one of them on
   `Placement.local_host_name()` — there is no host dimension. It also spawns
-  into the `reviewer` archetype and commits a rule fixture into the identity
+  into the `reviewer-code` archetype and commits a rule fixture into the identity
   repo as a side effect, so it wants an org it may mutate. **The satellite
   host×harness matrix is agent-driven through the journeys below, and
   deliberately has no script**: real-host e2e is a runbook plus a flexible
@@ -151,6 +182,7 @@ on 2026-07-25:
   TIGHTBEAM_BASE_DIR=~/.tightbeam-beam \
   TIGHTBEAM_SMOKE_MODEL_CLAUDE='claude-sonnet-5' TIGHTBEAM_SMOKE_EFFORT_CLAUDE='medium' \
   TIGHTBEAM_SMOKE_MODEL_CODEX='gpt-5.6-sol' TIGHTBEAM_SMOKE_EFFORT_CODEX='medium' \
+  TIGHTBEAM_SMOKE_MODEL_PI='opencode-go/gpt-5.6-luna' TIGHTBEAM_SMOKE_EFFORT_PI='medium' \
   mix run --no-start scripts/feature_smoke.exs
   ```
 
@@ -352,7 +384,9 @@ the tool call, with the statute text delivered only as the denial reason.
     `settings.json` decodes with one `hooks.PreToolUse` entry per statute
     (matcher "Bash"). The codex home's `hooks.json` decodes with one entry
     per statute plus `tightbeam-probe` LAST; the codex home still has NO
-    `settings.json`. Existing sessions are not refreshed automatically.
+    `settings.json`. The Pi home's `extensions/tightbeam.ts` embeds that same
+    ordered hook set and trailing probe. Existing sessions are not refreshed
+    automatically.
     **Count every statute the org has, not just the ones you copied.**
     `mix tightbeam.init` seeds `identity/rails/engineering.toml` (5 statutes),
     so a real org shows those plus the example's — the assertion is a 1:1
@@ -362,28 +396,32 @@ the tool call, with the statute text delivered only as the denial reason.
     `AGENTS.md`, nor archetype skill directories. Run `tightbeam identity
     status <archetype>` and inspect both composed instruction channels.
     PASS: statute names/text are absent from the composed guidance; guidance
-    arrives only through the Codex developer message / Claude system prompt.
+    arrives only through the Codex developer message, Claude system prompt, or
+    Pi's Tightbeam-owned `before_agent_start` carrier.
 19. [manual] Live refusal [divergent]: in a scratch git repo, tell a real session to
     run exactly `git reset --hard HEAD`, then `git status`, and report what
     happened. The claude fallback is `claude -p
     --dangerously-skip-permissions` inside the projected home.
     PASS: the reset is refused BEFORE execution. Claude's reply quotes
     `[gate: no-history-rewrites]`; codex quotes `Command blocked by
-    PreToolUse hook: [gate: no-history-rewrites] …`. In both, the agent must
+    PreToolUse hook: [gate: no-history-rewrites] …`; Pi receives the same
+    `[gate: no-history-rewrites]` reason from its pre-tool extension. In every
+    leg, the agent must
     report that the runtime refused it, not that it declined; `git status`
     runs normally and the repo is untouched. Repeat with `git push origin
     main` → `[gate: no-push-main]` refusal.
-20. [manual] Boot wiring-check evidence [codex-only]: confirm the codex adapter boot
-    log contains `gate wiring-check PASS [gate: tightbeam-probe]`. Delete the
-    projected home's `hooks.json` and restart the adapter.
+20. [manual] Boot wiring-check evidence [divergent]: for Codex and Pi, confirm
+    the adapter boot log contains `gate wiring-check PASS [gate:
+    tightbeam-probe]`. Delete Codex's projected `hooks.json` or Pi's projected
+    `extensions/tightbeam.ts`, then restart that adapter.
     PASS: the adapter REFUSES to boot with `gate_attestation_failed`, and no
-    codex session is served. Restore by changing MANIFEST BYTES: edit a
+    session on that harness is served. Restore by changing MANIFEST BYTES: edit a
     statute, or delete the home's `.tightbeam/manifest` stamp, then **spawn a
     session** — regeneration is ownership-scoped to projection, which happens at
     SPAWN, not at gateway restart. A restart alone does not rewrite `hooks.json`,
-    and waiting for one to leaves the adapter looping on `wiring-check FAIL`.
+    and waiting for one leaves the adapter looping on `wiring-check FAIL`.
     Then confirm regeneration is real rather than cached: the rewritten
-    `hooks.json` must carry the edited statute's current text.
+    regenerated harness artifact must carry the edited statute's current text.
     This demonstrates silent-misconfig detection, NOT tamper resistance.
 
     Do NOT assert that `sessions/`, history, transcripts and memory stay
@@ -520,3 +558,8 @@ and raises on any miss.
     two runs surfaced the single-flight provisioning contract and the
     park-fence/kill_failed defect chain — treat any new red as a finding,
     not a flake.
+
+ClientE2E provisioning is not permission to activate copied credentials. Keep
+the source quiescent before a separately authorized leg run; never run two Codex
+refreshers for one grant. Synthetic copy-boundary checks do not prove provider
+liveness or authorize access to real credentials.

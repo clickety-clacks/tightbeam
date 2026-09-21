@@ -339,7 +339,8 @@ defmodule Tightbeam.Acp.AdapterTest do
       case "session/set_mode": {
         capture(m);
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: {} }), 75);
-        if (failMode === "fail") {
+        if (failMode === "fail" ||
+            (failMode === "fork-mode-fail" && m.params.sessionId.startsWith("sess-fork-"))) {
           return send({ id: m.id, error: { code: -32000, message: "mode refused" } });
         }
         return send({ id: m.id, result: {} });
@@ -380,6 +381,10 @@ defmodule Tightbeam.Acp.AdapterTest do
           }
           if (gateMode === "pass-tool") {
             send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "tool_call", content: [{ type: "content", content: { type: "text", text: "Command blocked [gate: tightbeam-probe]" } }] } } });
+            return send({ id: m.id, result: { stopReason: "end_turn" } });
+          }
+          if (gateMode === "pass-tool-pi-bash-meta") {
+            send({ method: "session/update", params: { sessionId: sid, update: { sessionUpdate: "tool_call_update", _meta: { terminal_output: { data: "Command blocked [gate: tightbeam-probe]" } } } } });
             return send({ id: m.id, result: { stopReason: "end_turn" } });
           }
           if (gateMode === "no-marker") {
@@ -707,6 +712,44 @@ defmodule Tightbeam.Acp.AdapterTest do
              session_requests(capture_path)
 
     assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(a, "sess-1", "again")
+  end
+
+  test "load_session reapplies the preset mode before model preparation" do
+    for {harness, expected_mode} <- [
+          {:claude, "bypassPermissions"},
+          {:codex, "agent-full-access"}
+        ] do
+      {adapter, capture_path} = start_adapter(harness: harness)
+
+      assert {:ok, %Model{family: "haiku"}} =
+               Adapter.load_session(adapter, "sess-1", Model.new("haiku"), "/tmp", [], "guidance")
+
+      requests = captured_requests(capture_path)
+      load_index = Enum.find_index(requests, &(&1["method"] == "session/load"))
+      mode_index = Enum.find_index(requests, &(&1["method"] == "session/set_mode"))
+      model_index = Enum.find_index(requests, &(&1["method"] == "session/set_config_option"))
+
+      assert is_integer(load_index)
+      assert is_integer(mode_index)
+      assert is_integer(model_index)
+      assert load_index < mode_index
+      assert mode_index < model_index
+
+      assert Enum.at(requests, mode_index)["modeId"] == expected_mode
+    end
+  end
+
+  test "load_session propagates a mode refusal without registering a promptable session" do
+    {adapter, capture_path} = start_adapter(fail_mode: "fail")
+
+    assert {:error, {:mode_apply_failed, %{"message" => "mode refused"}}} =
+             Adapter.load_session(adapter, "sess-1", Model.new("haiku"), "/tmp", [], "guidance")
+
+    refute Adapter.knows_session?(adapter, "sess-1")
+
+    assert ["session/load", "session/set_mode"] =
+             captured_requests(capture_path)
+             |> Enum.map(& &1["method"])
   end
 
   test "Claude model switch forks the conversation and applies the model to the new session" do
@@ -1114,6 +1157,72 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert [%{"method" => "session/close", "sessionId" => "sess-1"}] =
              Enum.filter(captured_requests(capture_path), &(&1["method"] == "session/close"))
+  end
+
+  test "Claude cold load sends isolated guidance before the first resumed prompt" do
+    # Adapter transport proof only. Pinned Claude 0.73.0 createSession forwards
+    # this append before query; warm guidance-only load is not a refresh.
+    for role <- ["coder", "reviewer"] do
+      {adapter, capture_path} = start_adapter(harness: :claude)
+      cwd = Path.dirname(capture_path)
+      model = Model.new("haiku")
+      mcp = [%{"name" => "local", "command" => "fixture-only", "args" => [], "env" => []}]
+      old = "old #{role} guidance"
+
+      guidance =
+        "#{role}: preserve product constraints\n" <> String.duplicate("bounded context\n", 1000)
+
+      assert {:ok, "sess-1"} = Adapter.new_session(adapter, model, cwd, mcp, old)
+      assert :ok = Adapter.close_session(adapter, "sess-1")
+      refute Adapter.knows_session?(adapter, "sess-1")
+
+      assert {:ok, %Model{family: "haiku", effort: nil}} =
+               Adapter.load_session(adapter, "sess-1", model, cwd, mcp, guidance)
+
+      assert Adapter.knows_session?(adapter, "sess-1")
+      assert {:ok, _} = Adapter.prompt(adapter, "sess-1", "hello")
+
+      requests = captured_requests(capture_path)
+
+      assert [created, closed, loaded, prompted] =
+               Enum.filter(
+                 requests,
+                 &(&1["method"] in [
+                     "session/new",
+                     "session/close",
+                     "session/load",
+                     "session/prompt"
+                   ])
+               )
+
+      assert created["meta"]["systemPrompt"]["append"] == old
+      assert closed["sessionId"] == "sess-1"
+      assert loaded["sessionId"] == "sess-1"
+      assert loaded["cwd"] == cwd
+      assert loaded["mcpServers"] == mcp
+
+      assert loaded["meta"] == %{
+               "systemPrompt" => %{
+                 "type" => "preset",
+                 "preset" => "claude_code",
+                 "append" => guidance
+               }
+             }
+
+      assert prompted["sessionId"] == "sess-1"
+      load_index = Enum.find_index(requests, &(&1["method"] == "session/load"))
+      prompt_index = Enum.find_index(requests, &(&1["method"] == "session/prompt"))
+      between = Enum.slice(requests, (load_index + 1)..(prompt_index - 1))
+
+      assert Enum.any?(
+               between,
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+             )
+
+      refute Enum.any?(requests, &(&1["method"] == "session/fork"))
+      other = if role == "coder", do: "reviewer:", else: "coder:"
+      refute loaded["meta"]["systemPrompt"]["append"] =~ other
+    end
   end
 
   test "new_session and load_session still send an empty mcpServers list" do
@@ -1675,9 +1784,25 @@ defmodule Tightbeam.Acp.AdapterTest do
         :ok
       end)
 
+    credential_owner = Tightbeam.Credentials.server("testhost")
+    home = Tightbeam.Homes.home_path(base, "testhost", :codex)
+    metadata_dir = Path.join(home, ".tightbeam")
+    File.mkdir_p!(metadata_dir)
+
+    File.write!(
+      Path.join(metadata_dir, "credential.json"),
+      JSON.encode!(%{
+        "provider" => "openai",
+        "onboarded" => true,
+        "terminal" => false,
+        "kind" => "subscription",
+        "expires_at" => nil
+      })
+    )
+
     start_supervised!(
       {Tightbeam.Credentials,
-       name: Tightbeam.Credentials,
+       name: credential_owner,
        base_dir: base,
        machine: "testhost",
        park_edge: Tightbeam.CommandEdge.request_to(park_receiver)}
@@ -1720,7 +1845,10 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
 
     Process.demonitor(monitor, [:flush])
-    assert {:needs_onboarding, :revoked} = Tightbeam.Credentials.status(:openai)
+
+    assert {:needs_onboarding, :revoked} =
+             Tightbeam.Credentials.status(:openai, credential_owner)
+
     assert Process.alive?(adapter)
   end
 
@@ -2020,24 +2148,41 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
-  test "load does not assert mode" do
-    {plain, plain_capture} = start_adapter()
-
-    assert {:ok, %Model{family: "haiku", effort: nil}} =
-             Adapter.load_session(plain, "sess-1", Model.new("haiku"), "/tmp", [], "guidance")
-
-    refute Enum.any?(captured_requests(plain_capture), &(&1["method"] == "session/set_mode"))
-  end
-
-  test "new session mode set stays best effort" do
+  test "new session propagates a mode refusal" do
     {plain, _capture} = start_adapter(fail_mode: "fail")
 
-    assert {:ok, "sess-1"} =
+    assert {:error, {:mode_apply_failed, %{"message" => "mode refused"}}} =
              Adapter.new_session(plain, Model.new("haiku"), "/tmp", [], "guidance")
   end
 
-  test "gate wiring-check passes on message or tool content and discards the probe session" do
-    for gate_mode <- ["pass-message", "pass-tool"] do
+  test "fork mode refusal reaches the caller and closes the failed candidate" do
+    {adapter, capture_path} = start_adapter(harness: :claude, fail_mode: "fork-mode-fail")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(adapter, Model.new("haiku"), "/tmp", [], "guidance")
+
+    assert {:ok, %{stop_reason: "end_turn"}} =
+             Adapter.prompt(adapter, "sess-1", "persist this conversation")
+
+    assert {:error, {:model_apply_failed, {:mode_apply_failed, %{"message" => "mode refused"}}}} =
+             Adapter.switch_model_session(
+               adapter,
+               "sess-1",
+               Model.new("claude-sonnet-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    refute Adapter.knows_session?(adapter, "sess-fork-1")
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-fork-1"
+           end)
+  end
+
+  test "gate wiring-check passes on message, tool content, or pi-acp terminal-output meta and discards the probe session" do
+    for gate_mode <- ["pass-message", "pass-tool", "pass-tool-pi-bash-meta"] do
       parent = self()
 
       {adapter, capture_path} =

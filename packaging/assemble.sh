@@ -45,6 +45,7 @@ cp packaging/tightbeam-gateway "$OUT/bin/tightbeam-gateway"
 cp -R _build/prod/rel/tightbeam_gateway "$OUT/release"
 sed "s/\"name\": \"tightbeam\"/\"name\": \"tightbeam\",\n  \"version\": \"$VERSION\",\n  \"os\": [\"$OS\"],\n  \"cpu\": [\"$NPM_CPU\"]/" packaging/package.json > "$OUT/package.json"
 ARTIFACT="_build/npm/tightbeam-$VERSION-$OS-$ARCH.tgz"
+elixir packaging/payload-manifest.exs generate "$OUT"
 TEMP_ARTIFACT="$ARTIFACT.tmp.$$"
 trap 'rm -f "$TEMP_ARTIFACT"' EXIT HUP INT TERM
 (cd _build/npm && tar $TAR_METADATA_FLAGS -czf "$(basename "$TEMP_ARTIFACT")" tightbeam)

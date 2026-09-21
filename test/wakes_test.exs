@@ -6,6 +6,132 @@ defmodule Tightbeam.WakesTest do
   alias Tightbeam.{DB, EventLog, Wakes}
   alias Tightbeam.DB.Txn
 
+  describe "terminal notification identity and payload (no admission)" do
+    test "exact replay and recipient changes preserve identity and immutable payload" do
+      event = terminal_notice_event()
+      assert {:ok, notice} = Wakes.terminal_notification(event)
+      assert notice.wake_id =~ ~r/^w_terminal_[0-9a-f]{64}$/
+      assert {:ok, ^notice} = Wakes.terminal_notification(event, notice)
+
+      assert {:ok, ^notice} =
+               Wakes.terminal_notification(
+                 Map.put(event, :session_key, "new-owner"),
+                 Map.merge(notice, %{session_key: "old-owner", state: "fired"})
+               )
+
+      assert {:ok, ^notice} =
+               Wakes.terminal_notification(event |> Enum.reverse() |> Map.new())
+
+      for {key, value} <- event do
+        assert notice.prompt =~ "#{key}=#{JSON.encode!(value)}"
+      end
+
+      refute notice.prompt =~ "new-owner"
+      refute notice.prompt =~ "old-owner"
+    end
+
+    test "revocation source tokens distinguish reopened generations, not recipients" do
+      event = %{
+        terminal_notice_event()
+        | source_kind: "assignment_revocation",
+          outcome: "revoked"
+      }
+
+      first = %{event | source_token: "rev_first"}
+      second = %{event | source_token: "rev_second", terminal_at: event.terminal_at + 1}
+      assert {:ok, first_notice} = Wakes.terminal_notification(first)
+      assert {:ok, second_notice} = Wakes.terminal_notification(second)
+      refute first_notice.wake_id == second_notice.wake_id
+      assert {:ok, ^first_notice} = Wakes.terminal_notification(first, first_notice)
+      assert {:ok, ^second_notice} = Wakes.terminal_notification(second, second_notice)
+
+      assert {:error, %{code: "invalid_terminal_notification"}} =
+               Wakes.terminal_notification(%{event | source_token: event.assignment_id})
+    end
+
+    test "same token in different source kinds does not collide" do
+      event = terminal_notice_event()
+      assert {:ok, completion} = Wakes.terminal_notification(event)
+
+      assert {:ok, revocation} =
+               Wakes.terminal_notification(%{
+                 event
+                 | source_kind: "assignment_revocation",
+                   outcome: "revoked"
+               })
+
+      refute completion.wake_id == revocation.wake_id
+    end
+
+    test "conflicting immutable event fields refuse without changing durable rows", %{db: db} do
+      event = terminal_notice_event()
+      assert {:ok, notice} = Wakes.terminal_notification(event)
+      assert {:ok, before_rows} = DB.query(db, "SELECT * FROM wakes")
+
+      for {key, value} <- [
+            assignment_id: "asg_other",
+            work_item_id: "wi_other",
+            child_session_key: "other-child",
+            owner_user_id: "other-user",
+            opened_by_kind: "user",
+            opened_by_id: "other-opener",
+            outcome: "surrendered",
+            terminal_at: event.terminal_at + 1
+          ] do
+        changed = Map.put(event, key, value)
+        assert {:ok, same_identity} = Wakes.terminal_notification(changed)
+        assert same_identity.wake_id == notice.wake_id
+
+        assert {:error, %{code: "terminal_notification_conflict"}} =
+                 Wakes.terminal_notification(changed, notice)
+      end
+
+      assert {:error, %{code: "terminal_notification_conflict"}} =
+               Wakes.terminal_notification(event, %{notice | wake_id: "w_other"})
+
+      assert {:ok, ^before_rows} = DB.query(db, "SELECT * FROM wakes")
+    end
+
+    test "missing or invalid terminal fields refuse; optional work item is explicit" do
+      event = terminal_notice_event()
+
+      for key <- Map.keys(event) do
+        assert {:error, %{code: "invalid_terminal_notification"}} =
+                 Wakes.terminal_notification(Map.delete(event, key))
+      end
+
+      for invalid <- [
+            nil,
+            %{},
+            %{event | terminal_at: -1},
+            %{event | outcome: "running"},
+            %{event | source_token: " "},
+            %{event | source_token: <<255>>}
+          ] do
+        assert {:error, %{code: "invalid_terminal_notification"}} =
+                 Wakes.terminal_notification(invalid)
+      end
+
+      assert {:ok, notice} = Wakes.terminal_notification(%{event | work_item_id: nil})
+      assert notice.prompt =~ "work_item_id=null"
+    end
+  end
+
+  defp terminal_notice_event do
+    %{
+      source_kind: "attest",
+      source_token: "att_closed",
+      assignment_id: "asg_child",
+      work_item_id: "wi_work",
+      child_session_key: "child-session",
+      owner_user_id: "owner",
+      opened_by_kind: "session",
+      opened_by_id: "parent-session",
+      outcome: "completed",
+      terminal_at: 1234
+    }
+  end
+
   setup do
     name = :"db_#{System.unique_integer([:positive])}"
     scheduler = :"wake_#{System.unique_integer([:positive])}"
@@ -858,4 +984,194 @@ defmodule Tightbeam.WakesTest do
   defp requester_principal(%{kind: "user", id: id}), do: {:user, id}
   defp requester_principal(%{kind: "session", id: id}), do: {:session, id}
   defp requester_principal(%{kind: "process", id: id}), do: {:process, id}
+
+  describe "accountable parent terminal relation" do
+    test "user opener owns notice despite a distinct child owner", %{db: db} do
+      personal = parent_relation_fixture(db)
+
+      assert {:ok, {:ok, wake}} =
+               DB.transaction(
+                 db,
+                 &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
+               )
+
+      assert wake.owner_user_id == "parent-owner"
+      assert wake.session_key == personal
+      assert wake.creator_session_key == "independent-child"
+      assert wake.prompt =~ "owner_user_id=\"parent-owner\""
+      assert wake.prompt =~ "opened_by_id=\"parent-owner\""
+      assert wake.prompt =~ "source_token=\"att_parent_relation\""
+
+      assert {:ok, [["child-owner", "parent-owner", "independent-child"]]} =
+               DB.query(
+                 db,
+                 "SELECT h.ownerUserId,a.openedByUser,a.closedBySession FROM assignments a JOIN sessions h ON h.sessionKey=a.holderKey WHERE a.id='asg_parent_relation'"
+               )
+
+      before = parent_relation_snapshot(db)
+
+      assert {:ok, {:ok, ^wake}} =
+               DB.transaction(
+                 db,
+                 &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
+               )
+
+      assert parent_relation_snapshot(db) == before
+    end
+
+    test "session opener is preferred and fallback stays with parent owner, never child", %{
+      db: db
+    } do
+      personal = parent_relation_fixture(db)
+
+      :ok =
+        DB.execute(
+          db,
+          "UPDATE assignments SET openedByUser=NULL,openedBySession='accountable-parent' WHERE id='asg_parent_relation'"
+        )
+
+      assert {:ok, {:ok, wake}} =
+               DB.transaction(
+                 db,
+                 &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
+               )
+
+      assert wake.session_key == "accountable-parent"
+      assert wake.owner_user_id == "parent-owner"
+
+      assert {:ok, {:terminal_notice, preferred}} =
+               DB.transaction(db, &Wakes.terminal_notice_delivery_in_txn(&1, wake.wake_id))
+
+      assert preferred.session_key == "accountable-parent"
+
+      :ok =
+        DB.execute(
+          db,
+          "UPDATE sessions SET state='retired' WHERE sessionKey='accountable-parent'"
+        )
+
+      assert {:ok, {:terminal_notice, fallback}} =
+               DB.transaction(db, &Wakes.terminal_notice_delivery_in_txn(&1, wake.wake_id))
+
+      assert fallback.session_key == personal
+      assert fallback.prompt == wake.prompt
+      assert fallback.wake_id == wake.wake_id
+
+      assert {:ok, [["active"]]} =
+               DB.query(db, "SELECT state FROM sessions WHERE sessionKey='independent-child'")
+
+      assert {:ok, []} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+    end
+
+    for {name, mutation} <- [
+          {"missing user opener",
+           "UPDATE assignments SET openedByUser='missing-user' WHERE id='asg_parent_relation'"},
+          {"missing session opener",
+           "UPDATE assignments SET openedByUser=NULL,openedBySession='missing-session' WHERE id='asg_parent_relation'"},
+          {"session opener without durable owner",
+           "UPDATE assignments SET openedByUser=NULL,openedBySession='accountable-parent' WHERE id='asg_parent_relation'; UPDATE sessions SET ownerUserId='missing-user' WHERE sessionKey='accountable-parent'"},
+          {"work owner conflicts with parent",
+           "UPDATE work_items SET ownerUserId='child-owner' WHERE id='wi_parent_relation'"},
+          {"closing timestamp mismatch",
+           "UPDATE attests SET ts=101 WHERE id='att_parent_relation'"},
+          {"foreign closing session",
+           "UPDATE attests SET bySession='accountable-parent' WHERE id='att_parent_relation'"}
+        ] do
+      @relation_mutation mutation
+      test "#{name} refuses with no terminal or notification mutation", %{db: db} do
+        parent_relation_fixture(db)
+        :ok = DB.execute(db, @relation_mutation)
+        before = parent_relation_snapshot(db)
+
+        assert {:ok, {:error, %{code: "invalid_terminal_notification_relation"}}} =
+                 DB.transaction(
+                   db,
+                   &Wakes.admit_terminal_notification_in_txn(&1, "asg_parent_relation")
+                 )
+
+        assert parent_relation_snapshot(db) == before
+      end
+    end
+
+    test "admin revocation preserves independent holder and actual opener authority", %{db: db} do
+      personal = parent_relation_fixture(db, false)
+
+      assert %{state: "closed", outcome: "revoked"} =
+               Tightbeam.Assignments.__handle__(db, "revoke-assignment", %{
+                 principal: {:user, "admin"},
+                 origin: "user:admin",
+                 params: %{
+                   assignment_id: "asg_parent_relation",
+                   reason: "accountable parent regression"
+                 }
+               })
+
+      assert {:ok, [[token, ts, "admin", nil]]} =
+               DB.query(
+                 db,
+                 "SELECT id,revokedAt,revokedByUser,revokedBySession FROM assignment_revocations WHERE assignmentId='asg_parent_relation'"
+               )
+
+      assert {:ok, [["parent-owner", "independent-child", "admin", ^ts]]} =
+               DB.query(
+                 db,
+                 "SELECT openedByUser,holderKey,closedByUser,closedAt FROM assignments WHERE id='asg_parent_relation'"
+               )
+
+      assert {:ok, {:ok, wake}} =
+               DB.transaction(
+                 db,
+                 &Wakes.admit_terminal_revocation_in_txn(&1, "asg_parent_relation", token)
+               )
+
+      assert wake.owner_user_id == "parent-owner"
+      assert wake.session_key == personal
+      assert wake.due_at == ts
+      assert wake.prompt =~ "source_token=#{JSON.encode!(token)}"
+      before = parent_relation_snapshot(db)
+
+      assert {:ok, {:ok, ^wake}} =
+               DB.transaction(
+                 db,
+                 &Wakes.admit_terminal_revocation_in_txn(&1, "asg_parent_relation", token)
+               )
+
+      assert parent_relation_snapshot(db) == before
+    end
+  end
+
+  defp parent_relation_fixture(db, close \\ true) do
+    personal = Tightbeam.Org.personal_session_key("parent-owner")
+
+    :ok =
+      DB.execute(db, """
+      INSERT INTO users (userId,isAdmin,createdAt) VALUES ('parent-owner',0,1),('child-owner',0,1),('admin',1,1);
+      INSERT INTO sessions (sessionKey,displayName,ownerUserId,origin,archetype,harness,provider,model,host,state,createdAt,updatedAt) VALUES
+      ('independent-child','child','child-owner','user:child-owner','default','claude','anthropic','fable','eezo','active',1,1),
+      ('accountable-parent','parent','parent-owner','user:parent-owner','default','claude','anthropic','fable','eezo','active',1,1),
+      ('#{personal}','personal','parent-owner','user:parent-owner','default','claude','anthropic','fable','eezo','active',1,1);
+      INSERT INTO work_items (id,title,ownerUserId,state,createdByUser,createdAt) VALUES ('wi_parent_relation','parent work','parent-owner','open','parent-owner',1);
+      INSERT INTO assignments (id,subject,holderKey,openedByUser,openedAt,workItemId) VALUES ('asg_parent_relation','independent child','independent-child','parent-owner',1,'wi_parent_relation');
+      """)
+
+    if close do
+      :ok =
+        DB.execute(db, """
+        INSERT INTO attests (id,assignmentId,kind,bySession,ts) VALUES ('att_parent_relation','asg_parent_relation','completion','independent-child',100);
+        UPDATE assignments SET state='closed',outcome='completed',closedAt=100,closedBySession='independent-child',closingAttestId='att_parent_relation' WHERE id='asg_parent_relation';
+        """)
+    end
+
+    personal
+  end
+
+  defp parent_relation_snapshot(db) do
+    Map.new(
+      ~w(users sessions assignments attests work_items wakes wake_cancellations lifecycle_events turns assignment_revocations assignment_revocation_generations wake_retry_attempts),
+      fn table ->
+        assert {:ok, rows} = DB.query(db, "SELECT * FROM #{table} ORDER BY rowid")
+        {table, rows}
+      end
+    )
+  end
 end

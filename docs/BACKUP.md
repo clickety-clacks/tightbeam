@@ -105,20 +105,20 @@ Zero assignments referenced a missing work item.
 | `gateway.json` | **yes** | holds the org `cliToken`. Preserved if present, but **regenerated with a new random token if missing** — lose it and every agent's injected `TIGHTBEAM_TOKEN` silently stops working |
 | `identity/` | **yes** (or push it) | git repo: archetypes, guidance, skills, rails — the org's law. A remote counts |
 | `state/users/<user>/user.md` | **yes** | agent-authored, durable, and nothing in `lib/` regenerates it |
-| `auth/` | **see below** | secrets, and restoring them can be actively harmful |
+| `auth/` | no | legacy shared-auth state; it is never credential authority |
 | `work/` | your call | session workdirs — real repos. Committed work is on its remotes; **uncommitted work is not** |
-| `homes/` | no | build outputs, regenerated from manifests on identity change |
+| `homes/` | **see below** | harness-owned state, including the sole credential files |
 | `harnesses.json` | no | rewritten from the code's registry on every boot |
 | `bin/` | no | the CLI projection, reinstalled on boot |
 | `*.log`, `adapter-*.stderr.log` | no | diagnostics |
 
-**On `auth/`, deliberately not a simple yes.** Claude's grant is a non-rotating
-setup token, so a restored copy still works. Codex's `auth.json` holds a
-refresh token that **rotates on use**, so restoring a stale copy can make two
-stores hold one grant and silently revoke each other. Prefer
-`tightbeam onboard <provider>` over restoring codex credentials. Backing this
-directory up at all means backing up secrets — an explicit decision, not a
-default.
+**On `homes/`, deliberately not a simple yes.** Each exact harness home contains
+the only credential file for that `{machine, harness}` plus sessions and other
+harness-owned state. The selected Claude setup token is non-rotating; do not
+claim the same lifecycle for Codex. Codex owns its rotating grant in place and
+must have a single refresher. Restoring a stale Codex home can conflict with a
+newer grant. Prefer fresh onboarding over credential restoration. Protect home
+backups as secrets; a non-rotating token is not proof of current provider liveness.
 
 **Also not covered:** the harness's own conversation transcripts. The projection
 store in `state.db` is a one-way cache of them (spec T2) — restoring it gives you

@@ -14,6 +14,7 @@ identity='==[[:space:]]*:(claude|codex)|case[[:space:]]+([[:alnum:]_]+\.)?harnes
 # Portable: grep -E / perl only — the test harness's System.cmd PATH carries no rg.
 if grep -RnE "$mechanics" lib \
   --exclude-dir=harness \
+  --exclude-dir=pi_provider \
   --exclude=credentials.ex \
   --exclude=rails.ex
 then

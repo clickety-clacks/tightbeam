@@ -24,9 +24,17 @@ defmodule Tightbeam.Artifacts do
   through `recorded_kinds/3`, which reads neither column.
   """
 
-  alias Tightbeam.{DB, TurnObservations}
+  alias Tightbeam.{ArtifactContent, DB, TurnObservations}
+  alias Tightbeam.DB.Txn
+  alias Tightbeam.Firehose.Publisher
 
   @outside_workspace "artifact origin is outside its session workspace"
+  @maximum_version 9_223_372_036_854_775_807
+  @floor_definition """
+  artifactId TEXT NOT NULL PRIMARY KEY,
+  rowVersion INTEGER NOT NULL
+    CHECK (typeof(rowVersion) = 'integer' AND rowVersion > 0)
+  """
 
   @table_definition """
     artifactId        TEXT PRIMARY KEY,
@@ -35,6 +43,7 @@ defmodule Tightbeam.Artifacts do
     description       TEXT,
     createdBySession  TEXT NOT NULL REFERENCES sessions(sessionKey),
     workItemId        TEXT NOT NULL REFERENCES work_items(id),
+    producedByAssignmentId TEXT NULL REFERENCES assignments(id),
     parentSession     TEXT REFERENCES sessions(sessionKey),
     originPath        TEXT NOT NULL,
     contentSha256     TEXT,
@@ -52,6 +61,7 @@ defmodule Tightbeam.Artifacts do
 
   @index_ddl [
     "CREATE INDEX IF NOT EXISTS artifacts_work_item ON artifacts (workItemId)",
+    "CREATE INDEX IF NOT EXISTS artifacts_producer ON artifacts (producedByAssignmentId)",
     "CREATE INDEX IF NOT EXISTS artifacts_created_by_session ON artifacts (createdBySession)",
     "CREATE INDEX IF NOT EXISTS artifacts_recorded_message ON artifacts (recordedMessageId)"
   ]
@@ -63,9 +73,92 @@ defmodule Tightbeam.Artifacts do
   #{Enum.join(@index_ddl, ";\n")};
   """
 
+  @doc false
+  def ensure_r1_schema(db), do: DB.execute(db, @ddl)
+
   @doc "Create the artifact registry schema."
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
-  def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
+  def ensure_schema(db \\ Tightbeam.DB) do
+    :ok = DB.execute(db, @ddl)
+    DB.execute(db, "CREATE TABLE IF NOT EXISTS artifact_version_floors (#{@floor_definition})")
+  end
+
+  @doc false
+  def migrate_version_floors_in_txn(%Txn{} = txn) do
+    # The stamped predecessor owns eligibility; this is not a history detector.
+    invalid =
+      Txn.q(txn, """
+      SELECT artifactId FROM artifacts
+      WHERE typeof(createdAt) <> 'integer' OR createdAt <= 0
+         OR createdAt >= #{@maximum_version}
+      """)
+
+    if invalid != [], do: raise(ArgumentError, "artifact_version_seed_invalid")
+
+    Txn.q(txn, "CREATE TABLE artifact_version_floors (#{@floor_definition})")
+
+    Txn.q(txn, """
+    INSERT INTO artifact_version_floors (artifactId, rowVersion)
+    SELECT artifactId, createdAt + 1 FROM artifacts
+    """)
+
+    :ok
+  end
+
+  @doc false
+  def reserve_version_in_txn(%Txn{} = txn, artifact_id) do
+    case Txn.q(txn, "SELECT rowVersion FROM artifact_version_floors WHERE artifactId=?1", [
+           artifact_id
+         ]) do
+      [] ->
+        if get_in_txn(txn, artifact_id) != nil,
+          do: raise(ArgumentError, "artifact_projection_invalid: missing floor")
+
+        Txn.q(txn, "INSERT INTO artifact_version_floors (artifactId,rowVersion) VALUES (?1,1)", [
+          artifact_id
+        ])
+
+        1
+
+      [[version]] when is_integer(version) and version > 0 and version < @maximum_version ->
+        Txn.q(
+          txn,
+          """
+          UPDATE artifact_version_floors SET rowVersion=rowVersion+1
+          WHERE artifactId=?1 AND rowVersion=?2 AND rowVersion<#{@maximum_version}
+          """,
+          [artifact_id, version]
+        )
+
+        if Txn.changes(txn) != 1, do: raise(ArgumentError, "artifact_version_compare_failed")
+        version + 1
+
+      _ ->
+        raise ArgumentError, "artifact_version_invalid_or_exhausted"
+    end
+  end
+
+  @doc false
+  def canonical_in_txn(%Txn{} = txn, artifact_id) do
+    selected = columns() |> String.split(",") |> Enum.map_join(",", &("a." <> String.trim(&1)))
+
+    case Txn.q(
+           txn,
+           """
+           SELECT #{selected}, f.rowVersion FROM artifacts a
+           LEFT JOIN artifact_version_floors f ON f.artifactId=a.artifactId
+           WHERE a.artifactId=?1
+           """,
+           [artifact_id]
+         ) do
+      [] ->
+        nil
+
+      [row] ->
+        {fields, [version]} = Enum.split(row, -1)
+        Map.put(artifact(fields), :row_version, version)
+    end
+  end
 
   @doc """
   Record a deliberate artifact pointer for the authenticated calling session.
@@ -87,35 +180,81 @@ defmodule Tightbeam.Artifacts do
         parent_session = parent_session(db, session_key)
         {recorded_message_id, evidence} = turn_evidence(db, session_key)
         now = now()
+        producer_id = call.params[:produced_by_assignment_id]
 
-        {:ok, _} =
-          DB.query(
-            db,
-            """
-            INSERT INTO artifacts
-              (artifactId, kind, title, description, createdBySession, workItemId,
-               parentSession, originPath, contentSha256, recordedMessageId,
-               recordedTurnEvidence, state, home, createdAt, updatedAt)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                    'in-workspace', NULL, ?12, ?12)
-            """,
-            [
-              artifact_id,
-              call.params.kind,
-              call.params.title,
-              call.params[:description],
-              session_key,
-              work_item_id,
-              parent_session,
-              call.params.origin_path,
-              call.params[:content_sha256],
-              recorded_message_id,
-              evidence,
-              now
-            ]
-          )
+        case DB.transaction_then(
+               db,
+               fn txn ->
+                 case validate_producer_in_txn(txn, producer_id, session_key, work_item_id) do
+                   :ok ->
+                     reserve_version_in_txn(txn, artifact_id)
 
-        get(db, artifact_id)
+                     Txn.q(
+                       txn,
+                       """
+                       INSERT INTO artifacts
+                         (artifactId, kind, title, description, createdBySession, workItemId,
+                          producedByAssignmentId, parentSession, originPath, contentSha256,
+                          recordedMessageId, recordedTurnEvidence, state, home, createdAt, updatedAt)
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                               'in-workspace', NULL, ?13, ?13)
+                       """,
+                       [
+                         artifact_id,
+                         call.params.kind,
+                         call.params.title,
+                         call.params[:description],
+                         session_key,
+                         work_item_id,
+                         producer_id,
+                         parent_session,
+                         call.params.origin_path,
+                         call.params[:content_sha256],
+                         recorded_message_id,
+                         evidence,
+                         now
+                       ]
+                     )
+
+                     Publisher.maybe_observed_accepted_in_txn(txn, call)
+                     publish_in_txn(txn, "artifact.recorded", artifact_id, call)
+                     {:created, artifact_in_txn(txn, artifact_id)}
+
+                   error ->
+                     error
+                 end
+               end,
+               fn txn, result ->
+                 case result do
+                   {:created, artifact} ->
+                     [[owner]] =
+                       Txn.q(txn, "SELECT ownerUserId FROM work_items WHERE id=?1", [work_item_id])
+
+                     Tightbeam.Wakes.row_commit_in_txn(txn, %{
+                       verb: "artifact-record",
+                       domain: "artifact",
+                       row_id: artifact_id,
+                       owner_user_id: owner,
+                       principal: "session:#{session_key}",
+                       bindings: %{
+                         artifact: %{
+                           artifactId: artifact_id,
+                           contentSha256: artifact.content_sha256
+                         }
+                       },
+                       fields: %{present: %{old: false, new: true}}
+                     })
+
+                     artifact
+
+                   error ->
+                     error
+                 end
+               end
+             ) do
+          {:ok, result} -> result
+          {:error, error} -> raise error
+        end
 
       {{:session, session_key}, session_key, _work_item_id} when is_binary(session_key) ->
         %{code: "invalid", message: "artifact-record requires provenance edges"}
@@ -123,6 +262,41 @@ defmodule Tightbeam.Artifacts do
       _ ->
         %{code: "invalid", message: "artifact-record requires a session caller"}
     end
+  end
+
+  defp validate_producer_in_txn(_txn, nil, _session_key, _work_item_id), do: :ok
+
+  defp validate_producer_in_txn(txn, producer_id, session_key, work_item_id)
+       when is_binary(producer_id) and producer_id != "" do
+    case Txn.q(
+           txn,
+           """
+           SELECT 1
+           FROM assignments a
+           JOIN sessions s ON s.sessionKey=a.holderKey
+           JOIN work_items wi ON wi.id=a.workItemId
+           WHERE a.id=?1 AND a.holderKey=?2 AND a.workItemId=?3
+             AND s.ownerUserId=wi.ownerUserId
+           """,
+           [producer_id, session_key, work_item_id]
+         ) do
+      [[1]] ->
+        :ok
+
+      [] ->
+        %{
+          code: "invalid_producer",
+          message: "artifact producer must be a held assignment on the artifact work item"
+        }
+    end
+  end
+
+  defp validate_producer_in_txn(_txn, _producer_id, _session_key, _work_item_id),
+    do: %{code: "invalid_producer", message: "producedByAssignmentId must be nonblank text"}
+
+  defp publish_in_txn(txn, class, artifact_id, call \\ %{}) do
+    snapshot = canonical_in_txn(txn, artifact_id)
+    Publisher.artifact_in_txn(txn, class, snapshot, call)
   end
 
   # The best edge the substrate OBSERVED, with the observation method named.
@@ -159,6 +333,21 @@ defmodule Tightbeam.Artifacts do
     case DB.query(db, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [artifact_id]) do
       {:ok, [row]} -> artifact(row)
       {:ok, []} -> nil
+    end
+  end
+
+  defp artifact_in_txn(txn, artifact_id) do
+    case Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId=?1", [artifact_id]) do
+      [row] -> artifact(row)
+    end
+  end
+
+  @doc false
+  @spec get_in_txn(Txn.t(), String.t() | nil) :: map() | nil
+  def get_in_txn(%Txn{} = txn, artifact_id) do
+    case Txn.q(txn, "SELECT #{columns()} FROM artifacts WHERE artifactId = ?1", [artifact_id]) do
+      [row] -> artifact(row)
+      [] -> nil
     end
   end
 
@@ -226,7 +415,29 @@ defmodule Tightbeam.Artifacts do
   """
   @spec archive_session(DB.server(), String.t(), String.t() | nil, String.t()) :: :ok
   def archive_session(db \\ Tightbeam.DB, session_key, workspace_path, archive_root) do
-    rows = list(db, %{session_key: session_key})
+    # Filesystem custody has no fixed upper duration. Wait for the actual
+    # serialized transaction result; unrelated DB calls retain their budgets.
+    case GenServer.call(
+           db,
+           {:transaction, &archive_session_in_txn(&1, session_key, workspace_path, archive_root)},
+           :infinity
+         ) do
+      {:ok, :ok} -> :ok
+      {:error, error} -> raise error
+    end
+  end
+
+  defp archive_session_in_txn(txn, session_key, workspace_path, archive_root) do
+    # Serialize the eligibility read and filesystem custody operation together.
+    # A contender must see the winner's committed state before inspecting a moved workspace.
+    rows =
+      Txn.q(
+        txn,
+        "SELECT #{columns()} FROM artifacts WHERE createdBySession=?1 ORDER BY createdAt DESC, artifactId DESC",
+        [session_key]
+      )
+      |> Enum.map(&artifact/1)
+
     live = Enum.filter(rows, &(&1.state == "in-workspace"))
 
     if live == [] do
@@ -252,38 +463,16 @@ defmodule Tightbeam.Artifacts do
 
       updated_at = now()
 
-      {:ok, :ok} =
-        DB.transaction(db, fn txn ->
-          Enum.each(relative_paths, fn {artifact_id, relative_path} ->
-            DB.Txn.q(
-              txn,
-              """
-              UPDATE artifacts
-              SET state = 'archived', home = ?2, updatedAt = ?3
-              WHERE artifactId = ?1 AND state = 'in-workspace'
-              """,
-              [
-                artifact_id,
-                Path.join(archived_path, relative_path),
-                updated_at
-              ]
-            )
-          end)
+      transitions =
+        Enum.map(relative_paths, fn {id, {relative, custody}} ->
+          {id, "archived", Path.join(archived_path, relative), custody}
+        end) ++ Enum.map(external, &{&1, "released", nil, nil})
 
-          Enum.each(external, fn artifact_id ->
-            DB.Txn.q(
-              txn,
-              """
-              UPDATE artifacts
-              SET state = 'released', home = NULL, updatedAt = ?2
-              WHERE artifactId = ?1 AND state = 'in-workspace'
-              """,
-              [artifact_id, updated_at]
-            )
-          end)
-
-          :ok
-        end)
+      transitions
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.each(fn {id, state, home, custody} ->
+        transition_in_txn(txn, id, "in-workspace", state, home, updated_at, custody)
+      end)
     end
 
     :ok
@@ -313,7 +502,8 @@ defmodule Tightbeam.Artifacts do
     # that is not there says THAT rather than blaming the origin for it.
     ensure_workspace_available!(workspace_path)
     relative_path = archived_relative_path!(row.origin_path, workspace_path)
-    {Map.put(paths, row.artifact_id, relative_path), external, errors}
+    custody = custody_bytes(row, workspace_path, relative_path)
+    {Map.put(paths, row.artifact_id, {relative_path, custody}), external, errors}
   rescue
     error in ArgumentError ->
       if error.message == @outside_workspace do
@@ -323,26 +513,88 @@ defmodule Tightbeam.Artifacts do
       end
   end
 
+  # Read the bytes BEFORE the workspace moves, from the same canonical path the
+  # relative path was derived from.
+  #
+  # This DECLINES custody rather than failing: it adds no error path that
+  # archival did not already have. Archival moves the workspace wholesale and
+  # never had to read an individual file, so a directory origin or an unreadable
+  # one archived fine before this function existed and still does. Making it
+  # raise instead would invent a way for retirement to fail on an artifact,
+  # which is the one thing retirement must never do.
+  #
+  # Declining is safe precisely because custody is keyed on the stored content
+  # row and not on `archived`: a row we took no bytes for claims no content and
+  # is never refused later. See `Tightbeam.ArtifactContent`.
+  defp custody_bytes(row, workspace_path, relative_path) do
+    canonical_workspace = canonical_path!(Path.expand(workspace_path))
+
+    with {:ok, bytes} <- File.read(Path.join(canonical_workspace, relative_path)),
+         digest = Base.encode16(:crypto.hash(:sha256, bytes), case: :lower),
+         # A digest declared at filing time is a claim about these bytes. If they
+         # disagree, the origin is not the artifact that was filed: take no
+         # custody over it and leave the declared claim untouched rather than
+         # overwrite it with bytes nobody vouched for.
+         true <- not is_binary(row.content_sha256) or row.content_sha256 == digest do
+      {digest, bytes}
+    else
+      _ -> nil
+    end
+  end
+
   @doc "Mark an archived artifact as released from Tightbeam custody."
   @spec release(DB.server(), String.t()) :: map() | nil
   def release(db \\ Tightbeam.DB, artifact_id) do
-    {:ok, _} =
-      DB.query(
-        db,
-        """
-        UPDATE artifacts
-        SET state = 'released', home = NULL, updatedAt = ?2
-        WHERE artifactId = ?1 AND state = 'archived'
-        """,
-        [artifact_id, now()]
-      )
+    case DB.transaction(db, fn txn ->
+           transition_in_txn(txn, artifact_id, "archived", "released", nil, now())
+           get_in_txn(txn, artifact_id)
+         end) do
+      {:ok, row} -> row
+      {:error, error} -> raise error
+    end
+  end
 
-    get(db, artifact_id)
+  defp transition_in_txn(txn, id, prior, state, home, updated_at, custody \\ nil) do
+    case get_in_txn(txn, id) do
+      %{state: ^prior} ->
+        reserve_version_in_txn(txn, id)
+
+        # The stored bytes and the digest the row will be accounted by land in the
+        # same transaction as the transition that takes custody. One reserved
+        # version covers both: the durable content is part of becoming archived,
+        # not a second lifecycle event.
+        digest =
+          case custody do
+            {digest, bytes} ->
+              :ok = ArtifactContent.store_in_txn(txn, id, digest, bytes, updated_at)
+              digest
+
+            nil ->
+              nil
+          end
+
+        Txn.q(
+          txn,
+          """
+          UPDATE artifacts SET state=?2, home=?3, updatedAt=?4,
+                 contentSha256=COALESCE(?6, contentSha256)
+          WHERE artifactId=?1 AND state=?5
+          """,
+          [id, state, home, updated_at, prior, digest]
+        )
+
+        if Txn.changes(txn) != 1, do: raise(ArgumentError, "artifact_transition_race")
+        publish_in_txn(txn, "artifact." <> state, id)
+
+      _ ->
+        :ok
+    end
   end
 
   defp remove_workspace(nil), do: :ok
 
   defp remove_workspace(workspace_path) do
+    custody_test_boundary()
     if File.exists?(workspace_path), do: File.rm_rf!(workspace_path)
     :ok
   end
@@ -451,7 +703,11 @@ defmodule Tightbeam.Artifacts do
   end
 
   defp parent_session(db, session_key) do
-    case DB.query(db, "SELECT spawnedBy FROM sessions WHERE sessionKey = ?1", [session_key]) do
+    case DB.query(
+           db,
+           "SELECT #{Tightbeam.Org.current_parent_sql("sessions")} FROM sessions WHERE sessionKey = ?1",
+           [session_key]
+         ) do
       {:ok, [[parent]]} -> parent
       {:ok, []} -> nil
     end
@@ -462,7 +718,7 @@ defmodule Tightbeam.Artifacts do
   defp columns do
     """
     artifactId, kind, title, description, createdBySession, workItemId,
-    parentSession, originPath, contentSha256, recordedMessageId,
+    producedByAssignmentId, parentSession, originPath, contentSha256, recordedMessageId,
     recordedTurnEvidence, state, home, createdAt, updatedAt
     """
   end
@@ -474,6 +730,7 @@ defmodule Tightbeam.Artifacts do
          description,
          created_by_session,
          work_item_id,
+         produced_by_assignment_id,
          parent_session,
          origin_path,
          content_sha256,
@@ -491,6 +748,7 @@ defmodule Tightbeam.Artifacts do
       description: description,
       created_by_session: created_by_session,
       work_item_id: work_item_id,
+      produced_by_assignment_id: produced_by_assignment_id,
       parent_session: parent_session,
       origin_path: origin_path,
       content_sha256: content_sha256,
@@ -503,5 +761,22 @@ defmodule Tightbeam.Artifacts do
     }
   end
 
-  defp now, do: System.system_time(:millisecond)
+  if Mix.env() == :test do
+    defp custody_test_boundary do
+      case Process.get({__MODULE__, :test_custody_boundary}) do
+        nil -> :ok
+        callback when is_function(callback, 0) -> callback.()
+      end
+    end
+
+    defp now do
+      case Process.get({__MODULE__, :test_clock}) do
+        value when is_integer(value) -> value
+        nil -> System.system_time(:millisecond)
+      end
+    end
+  else
+    defp custody_test_boundary, do: :ok
+    defp now, do: System.system_time(:millisecond)
+  end
 end

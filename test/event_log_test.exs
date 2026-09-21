@@ -10,6 +10,57 @@ defmodule Tightbeam.EventLogTest do
     %{db: name}
   end
 
+  test "Firehose lifecycle follows committed boot and rollback without changing epoch semantics",
+       %{db: db} do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: Hub})
+
+    :ok =
+      Hub.register(hub, self(), %{mode: :all, db: db, user_id: "synthetic-admin", is_admin: true})
+
+    first = EventLog.boot(db)
+    assert_receive {:firehose_notice, %{"class" => "lifecycle.boot", "payload" => first_notice}}
+    assert first_notice["epoch"] == first
+    Hub.delivered(hub, self())
+    :ok = EventLog.clean_shutdown(db, first)
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "lifecycle.clean_shutdown", "payload" => clean}}
+
+    assert clean["epoch"] == first
+    Hub.delivered(hub, self())
+    second = EventLog.boot(db)
+    assert_receive {:firehose_notice, %{"class" => "lifecycle.boot"}}
+    Hub.delivered(hub, self())
+    assert EventLog.lifecycle_events(db) == []
+    third = EventLog.boot(db)
+    assert third > second
+    assert_receive {:firehose_notice, %{"class" => "lifecycle.dirty_exit", "payload" => dirty}}
+    assert dirty["epoch"] == second
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "lifecycle.boot", "payload" => latest}}
+    assert latest["epoch"] == third
+    Hub.delivered(hub, self())
+    before = EventLog.lifecycle_events(db)
+    assert [%{kind: "dirty_exit"}] = before
+
+    assert {:error, %RuntimeError{message: "rollback lifecycle"}} =
+             DB.transaction(db, fn txn ->
+               :ok = EventLog.lifecycle_in_txn(txn, "takeover", "synthetic", "rollback")
+               raise "rollback lifecycle"
+             end)
+
+    assert EventLog.lifecycle_events(db) == before
+    refute_receive {:firehose_notice, _}
+    :ok = EventLog.lifecycle(db, "takeover", "synthetic", "committed")
+    assert_receive {:firehose_notice, %{"class" => "lifecycle.takeover", "payload" => takeover}}
+    assert takeover["subject"] == "synthetic"
+    assert takeover["detail"] == "committed"
+    Hub.delivered(hub, self())
+    :ok = EventLog.lifecycle(db, "adapter_restart", "synthetic", "record only")
+    refute_receive {:firehose_notice, _}
+  end
+
   test "verb events append and tail in order; kind is constrained", %{db: db} do
     :ok = EventLog.append_event(db, "verb", "post", "user:flynn", "k1", %{a: 1})
 

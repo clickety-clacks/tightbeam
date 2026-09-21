@@ -22,7 +22,7 @@ defmodule Tightbeam.ModelCatalog do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Model, Placement, Unroutable}
+  alias Tightbeam.{Harness, Model, PiProvider, Placement, Unroutable}
 
   @default_ttl_ms :timer.minutes(15)
 
@@ -338,18 +338,20 @@ defmodule Tightbeam.ModelCatalog do
 
   # The RHS of the credential-present recognition (O4/I5): re-derive the catalog
   # for every harness that spends `provider` on `host`, NOW, reading current
-  # world-state. Provider-scoped by the same rule the runtime uses — a harness
-  # spends exactly one provider's credential — so a claude re-derivation is never
-  # gated on codex, and vice-versa.
+  # world-state. Pi also consumes named local providers; the other harnesses
+  # retain their single-provider association.
   @impl true
   def handle_cast({:credential_present, host, provider}, state) do
     keys =
       for harness <- harness_names(),
-          Harness.parse!(harness).credential_provider() == provider,
+          catalog_uses_provider?(Harness.parse!(harness), provider),
           do: {host, harness}
 
     {:noreply, Enum.reduce(keys, state, &force_rederive(&2, &1))}
   end
+
+  defp catalog_uses_provider?(Tightbeam.Harness.Pi, :local_openai), do: true
+  defp catalog_uses_provider?(module, provider), do: module.credential_provider() == provider
 
   @impl true
   def handle_info(:refresh_due, state), do: {:noreply, refresh_due(state)}
@@ -499,26 +501,31 @@ defmodule Tightbeam.ModelCatalog do
   defp safely_derive({host, harness}, probe, state) do
     try do
       module = Harness.parse!(harness)
-      provider = module.credential_provider()
 
-      with :onboarded <- credential_status(state, provider, host),
+      catalog_state =
+        probe
+        |> Map.put(:host_name, host)
+        |> Map.put(:options, state.options)
+        |> Map.put(:credential_status, fn provider, machine ->
+          credential_status(state, provider, machine)
+        end)
+
+      with :onboarded <- catalog_onboarding_status(module, catalog_state, state, host),
            kind when kind in [:api_key, :subscription] <-
-             credential_kind(state, provider, host) do
+             catalog_credential_kind(module, catalog_state, state, host) do
         probe = Map.put(probe, :credential_kind, kind)
 
-        probe
-        |> module.fetch_catalog()
-        |> retry_after_rotation_harvest(kind, probe, module)
+        module.fetch_catalog(probe)
       else
         {:needs_onboarding, reason} ->
           {:error, {:needs_onboarding, reason}}
 
-        # Onboarded, but the store records no kind. Refused rather than
+        # Onboarded, but the harness-home metadata records no kind. Refused rather than
         # defaulted: the two kinds read different routes, so a catalog derived
         # against a guessed kind would be a confident answer about the wrong
         # account. Production cannot reach this — `:onboarded` and a readable
         # kind have the same preconditions — but a half-migrated or
-        # hand-assembled store can, and it deserves a refusal, not a guess.
+        # hand-assembled home can, and it deserves a refusal, not a guess.
         :none ->
           {:error, {:needs_onboarding, :missing}}
 
@@ -532,46 +539,44 @@ defmodule Tightbeam.ModelCatalog do
     end
   end
 
-  # A subscription bearer 401 on the STORE copy can mean the credential is
-  # genuinely revoked, or it can mean Claude Code rotated it inside the
-  # harness home: the vendor's write-temp-then-rename severs the store's
-  # symlink, the store copy freezes on the pre-rotation token, and the
-  # provider revokes the superseded one (issue #9). `Homes.sweep_auth/2`
-  # already knows how to harvest a severed home's regular file back into the
-  # store and is a no-op when nothing is severed, so trying it here costs
-  # nothing against a truly revoked credential and turns the staleness
-  # window into its own repair trigger — instead of waiting on the next boot
-  # sweep or a session spawn's home reconciliation to close it.
-  #
-  # `sweep_auth/2` reads the LOCAL filesystem only (gateway.ex's boot call
-  # does the same), so this is scoped to a local probe; a remote host's
-  # credential lives on that host and this cannot reach it.
-  defp retry_after_rotation_harvest(
-         {:error, {:http_status, 401, _} = initial_401} = error,
-         :subscription,
-         %{host_config: %{ssh: nil}} = probe,
-         module
-       ) do
-    Tightbeam.Homes.sweep_auth(probe.base_dir, module.id())
+  defp catalog_onboarding_status(Tightbeam.Harness.Pi, catalog_state, state, host) do
+    cond do
+      credential_status(state, :opencode_go, host) ==
+          {:needs_onboarding, :credential_server_unavailable} ->
+        {:needs_onboarding, :credential_server_unavailable}
 
-    case module.fetch_catalog(probe) do
-      {:ok, _entries} = success ->
-        success
+      credential_status(state, :local_openai, host) ==
+          {:needs_onboarding, :credential_server_unavailable} ->
+        {:needs_onboarding, :credential_server_unavailable}
 
-      {:error, retry_failure} ->
-        {:error,
-         {:rotation_retry_failed,
-          %{
-            initial_401: initial_401,
-            initial_guidance: "sign in again to repair the original 401",
-            retry_failure: retry_failure
-          }}}
+      PiProvider.pi_catalog_ready?(catalog_state) ->
+        :onboarded
+
+      true ->
+        {:needs_onboarding, :missing}
     end
-  rescue
-    _ -> error
   end
 
-  defp retry_after_rotation_harvest(result, _kind, _probe, _module), do: result
+  defp catalog_onboarding_status(module, _catalog_state, state, host) do
+    credential_status(state, module.credential_provider(), host)
+  end
+
+  defp catalog_credential_kind(Tightbeam.Harness.Pi, _catalog_state, state, host) do
+    cond do
+      credential_status(state, :opencode_go, host) == :onboarded ->
+        credential_kind(state, :opencode_go, host)
+
+      credential_status(state, :local_openai, host) == :onboarded ->
+        :api_key
+
+      true ->
+        :api_key
+    end
+  end
+
+  defp catalog_credential_kind(module, _catalog_state, state, host) do
+    credential_kind(state, module.credential_provider(), host)
+  end
 
   defp credential_status(%{credential_status: status}, provider, _host)
        when is_function(status, 1),

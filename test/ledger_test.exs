@@ -38,6 +38,153 @@ defmodule Tightbeam.LedgerTest do
     seq
   end
 
+  test "Firehose terminal publication follows winning commit and excludes rollback and replay", %{
+    db: db
+  } do
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    seq = enqueue!(db, "k1", "terminal publication")
+    assert {:ok, _} = Ledger.claim_next(db, "k1", "lane")
+    :ok = DB.execute(db, "UPDATE sessions SET mechanicalStatus='running' WHERE sessionKey='k1'")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+
+    assert {:error, %RuntimeError{message: "rollback terminal"}} =
+             DB.transaction(db, fn txn ->
+               assert Ledger.finish_in_txn(txn, seq, "delivered", nil)
+               raise "rollback terminal"
+             end)
+
+    refute_receive {:firehose_notice, _}
+    assert {:ok, [["running"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [["running"]]} =
+             DB.query(db, "SELECT mechanicalStatus FROM sessions WHERE sessionKey='k1'")
+
+    assert :ok = Ledger.finish(db, seq, "delivered")
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "turn.ended", "refs" => refs, "payload" => payload}}
+
+    assert refs["turnSeq"] == seq
+    assert refs["sessionKey"] == "k1"
+    assert payload["status"] == "delivered"
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "session.updated"}}
+    Hub.delivered(hub, self())
+
+    assert {:ok, [["idle"]]} =
+             DB.query(db, "SELECT mechanicalStatus FROM sessions WHERE sessionKey='k1'")
+
+    assert :already_terminal = Ledger.finish(db, seq, "failed", "late callback")
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [["delivered", nil]]} =
+             DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [seq])
+  end
+
+  test "Firehose enqueue and claim publish mechanical state and one winning start", %{db: db} do
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+    seq = enqueue!(db, "k1", "start publication")
+    assert_receive {:firehose_notice, %{"class" => "session.updated", "payload" => session}}
+    assert session["mechanicalStatus"] == "running"
+    Hub.delivered(hub, self())
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "lane")
+    assert turn.seq == seq
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "turn.started", "refs" => refs, "payload" => payload}}
+
+    assert refs["turnSeq"] == seq
+    assert payload["status"] == "running"
+    Hub.delivered(hub, self())
+    assert Tightbeam.Org.get(db, "k1").mechanical_status == "running"
+    assert :busy = Ledger.claim_next(db, "k1", "loser")
+    assert :none = Ledger.claim_next(db, "k2", "empty")
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [["running", "lane"]]} =
+             DB.query(db, "SELECT status,owner FROM turns WHERE seq=?1", [seq])
+  end
+
+  test "Firehose retirement drain preserves row commits and suppresses rollback and replay", %{
+    db: db
+  } do
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    seq = enqueue!(db, "k1", "retirement")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+
+    assert {:error, %RuntimeError{message: "retire rollback"}} =
+             DB.transaction(db, fn txn ->
+               assert [^seq] = Ledger.drain_queued_for_retire_in_txn(txn, "k1", "retired")
+
+               assert [%{domain: "turn", row_id: ^seq, field: %{new: "canceled"}}] =
+                        DB.take_row_commits(txn)
+
+               raise "retire rollback"
+             end)
+
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [["queued", nil]]} =
+             DB.query(db, "SELECT status,endedAt FROM turns WHERE seq=?1", [seq])
+
+    assert {:ok, [^seq]} =
+             DB.transaction(db, fn txn ->
+               result = Ledger.drain_queued_for_retire_in_txn(txn, "k1", "retired")
+
+               assert [%{domain: "turn", row_id: ^seq, field: %{old: "queued", new: "canceled"}}] =
+                        DB.take_row_commits(txn)
+
+               result
+             end)
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "turn.ended", "refs" => refs, "payload" => payload}}
+
+    assert refs["turnSeq"] == seq
+    assert payload["status"] == "canceled"
+    Hub.delivered(hub, self())
+
+    assert {:ok, []} =
+             DB.transaction(db, &Ledger.drain_queued_for_retire_in_txn(&1, "k1", "retired"))
+
+    refute_receive {:firehose_notice, _}
+  end
+
+  test "Firehose unclaimable emits only newly failed turns and preserves active queued work", %{
+    db: db
+  } do
+    alias Tightbeam.Firehose.Hub
+    :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES('flynn',0,1)")
+    failed = enqueue!(db, "k1", "unclaimable")
+    active = enqueue!(db, "k2", "active")
+    :ok = DB.execute(db, "UPDATE sessions SET state='retired' WHERE sessionKey='k1'")
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: db, user_id: "flynn", is_admin: false})
+    assert [^failed] = Ledger.fail_unclaimable(db, "k1", :session_retired)
+
+    assert_receive {:firehose_notice,
+                    %{"class" => "turn.ended", "refs" => refs, "payload" => payload}}
+
+    assert refs["turnSeq"] == failed
+    assert payload["status"] == "failed"
+    assert payload["error"] =~ "session retired"
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "session.updated"}}
+    Hub.delivered(hub, self())
+    assert Tightbeam.Org.get(db, "k1").mechanical_status == "idle"
+    assert [] = Ledger.fail_unclaimable(db, "k1", :session_retired)
+    assert [] = Ledger.fail_unclaimable(db, "k2", :session_retired)
+    refute_receive {:firehose_notice, _}
+    assert {:ok, [["queued"]]} = DB.query(db, "SELECT status FROM turns WHERE seq=?1", [active])
+  end
+
   test "seq is the authoritative execution order", %{db: db} do
     s1 = enqueue!(db, "k1", "first")
     s2 = enqueue!(db, "k1", "second")

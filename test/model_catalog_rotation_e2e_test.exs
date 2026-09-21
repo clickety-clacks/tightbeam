@@ -34,15 +34,20 @@ defmodule Tightbeam.ModelCatalogRotationE2ETest do
     %{base_dir: base_dir}
   end
 
-  test "E2E: a public catalog route repairs one severed local subscription credential", ctx do
+  test "E2E: a public catalog route reads the authoritative home without importing a stale legacy credential",
+       ctx do
     stale = ~s({"claudeAiOauth":{"accessToken":"fixture-token-STALE"}})
     rotated = ~s({"claudeAiOauth":{"accessToken":"fixture-token-ROTATED"}})
 
     store = Path.join([ctx.base_dir, "auth", "claude", ".credentials.json"])
-    metadata = Path.join([ctx.base_dir, "auth", "claude", ".tightbeam", "credential.json"])
+
+    metadata =
+      Path.join([ctx.base_dir, "homes", @host, "claude", ".tightbeam", "credential.json"])
+
     home = Path.join([ctx.base_dir, "homes", @host, "claude", ".credentials.json"])
 
     File.mkdir_p!(Path.dirname(metadata))
+    File.mkdir_p!(Path.dirname(store))
     File.write!(store, stale)
 
     File.write!(
@@ -104,11 +109,13 @@ defmodule Tightbeam.ModelCatalogRotationE2ETest do
       )
     end)
 
-    assert_receive {:catalog_token, "fixture-token-STALE"}
+    refute_receive {:catalog_token, "fixture-token-STALE"}
     assert_receive {:catalog_token, "fixture-token-ROTATED"}
     refute_receive {:catalog_token, _}
 
-    assert File.read!(store) == rotated
+    assert File.read!(store) == stale
+    assert File.read!(home) == rotated
+    assert File.lstat!(home).type == :regular
 
     assert {:ok, %{harness: "claude", provider: "anthropic", health: :fresh}} =
              ModelCatalog.route(

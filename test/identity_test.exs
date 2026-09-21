@@ -25,6 +25,46 @@ defmodule Tightbeam.IdentityTest do
     %{base: runtime, root: base, source: source}
   end
 
+  test "served bootstrap seeds exact identity and raw kungfu without notices", ctx do
+    alias Tightbeam.{AdminProjection, DB, Schema, StateResources, Firehose.Hub}
+    assert :initialized = Identity.init!(ctx.base)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Schema.ensure_all(db)
+    hub = start_supervised!({Hub, name: Hub})
+    :ok = Hub.register(hub, self(), %{mode: :all, user_id: "synthetic-admin", is_admin: true})
+    entries = AdminProjection.served_entries(db, ctx.base)
+    assert Enum.count(entries, &(&1.resource == "identity")) == 1
+
+    assert Enum.count(entries, &(&1.resource == "kungfu")) ==
+             length(Identity.public_kungfu_names(ctx.base))
+
+    assert :ok = AdminProjection.bootstrap_served(db, ctx.base)
+
+    for entry <- entries do
+      assert AdminProjection.stamped_item(db, entry.resource, entry.key) ==
+               Map.put(entry.item, "rowVersion", 1)
+
+      if entry.resource == "kungfu" do
+        assert entry.item ==
+                 Identity.public_kungfu(ctx.base, entry.key) |> Map.delete("rowVersion")
+
+        assert StateResources.kungfu(Map.put(entry.item, "rowVersion", 1))["documents"] ==
+                 entry.item["documents"]
+      end
+    end
+
+    {:ok, before} =
+      DB.query(db, "SELECT * FROM admin_projection_versions ORDER BY resource,primaryKey")
+
+    assert :ok = AdminProjection.bootstrap_served(db, ctx.base)
+
+    assert {:ok, ^before} =
+             DB.query(db, "SELECT * FROM admin_projection_versions ORDER BY resource,primaryKey")
+
+    assert AdminProjection.stamped_item(db, "identity", "missing") == nil
+    refute_receive {:firehose_notice, _}
+  end
+
   test "neutral seed creates the exact three refs and only the two seed files", ctx do
     assert :initialized = Identity.init!(ctx.base)
     dir = Path.join(ctx.base, "identity")
@@ -58,9 +98,33 @@ defmodule Tightbeam.IdentityTest do
                  "The same bug keeps coming back and nobody finds the cause.",
                  "I want to know a change was actually tested, not just claimed."
                ],
-               root_archetype: "product-owner"
+               root_archetype: "orchestrator"
              }
            ]
+  end
+
+  test "the default snapshot composes every available bundle's offer facts", ctx do
+    assert :initialized = Identity.init!(ctx.base)
+    assert {:ok, _revision} = learn!(ctx.base, "agentic-engineering", "test")
+
+    default = Identity.snapshot!(ctx.base, "default", :codex)
+    coder = Identity.snapshot!(ctx.base, "coder", :codex)
+
+    assert default.guidance =~ "## Available kungfu bundles in this Tightbeam build"
+    refute coder.guidance =~ "## Available kungfu bundles in this Tightbeam build"
+    assert default.render_contract == Identity.render_contract()
+
+    assert default.guidance_digest ==
+             :crypto.hash(:sha256, default.guidance) |> Base.encode16(case: :lower)
+
+    for bundle <- Identity.available_bundles() do
+      assert default.guidance =~ "### `#{bundle.name}`"
+      assert default.guidance =~ "Purpose: #{bundle.purpose}"
+
+      for phrase <- bundle.phrases do
+        assert default.guidance =~ "- #{phrase}"
+      end
+    end
   end
 
   test "concurrent neutral-seed initialization publishes one complete repository", ctx do
@@ -172,7 +236,8 @@ defmodule Tightbeam.IdentityTest do
     assert {:noop, ^revision} = learn!(ctx.base, "agentic-engineering", "operator")
   end
 
-  test "shipped engineering bundle imports the test receipt rule and role guidance", ctx do
+  test "shipped engineering bundle keeps completion review without receipt admission",
+       ctx do
     shipped = Path.expand("priv/kungfu/agentic-engineering")
     Application.put_env(:tightbeam, :identity_source_dir, shipped)
     base = Path.join(ctx.root, "shipped-runtime")
@@ -180,14 +245,41 @@ defmodule Tightbeam.IdentityTest do
     assert {:ok, _revision} = learn!(base, "agentic-engineering", "operator")
 
     engineering_rule = File.read!(Path.join(base, "identity/rules/engineering.toml"))
-    assert engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
+    refute engineering_rule =~ ~s(name = "code-review-requires-passing-tests")
+    assert engineering_rule =~ ~s(name = "completion-requires-review")
     assert engineering_rule =~ ~s(on_rule_denied = "surface")
+    assert engineering_rule =~ ~s(action = "wake")
+    refute engineering_rule =~ ~s(action = "assign")
+    refute engineering_rule =~ ~s(target_role = "reviewer")
+    refute engineering_rule =~ ~s(target_role = "reviewer-code")
 
-    reviewer = Identity.snapshot!(base, "reviewer", :codex)
-    assert reviewer.guidance =~ "producer holder filed the `tests-passed`"
+    for {role, present_axis, absent_axis} <- [
+          {"reviewer-code", "## Code judgment", "## Spec judgment"},
+          {"reviewer-spec", "## Spec judgment", "## Code judgment"}
+        ] do
+      review = Identity.snapshot!(base, role, :codex)
+      assert review.guidance =~ "# Review"
+      assert review.guidance =~ present_axis
+      refute review.guidance =~ absent_axis
+      refute Regex.match?(~r/^#include/m, review.guidance)
+
+      if role == "reviewer-code" do
+        assert review.guidance =~ "a tests-passed receipt is not a precondition"
+      end
+
+      assert review.skills == %{}
+
+      if role == "reviewer-code" do
+        assert review.guidance =~ "# Repository custody"
+      else
+        refute review.guidance =~ "# Repository custody"
+      end
+
+      refute review.guidance =~ "# Guidance and policy craft"
+    end
 
     coder = Identity.snapshot!(base, "coder", :codex)
-    assert coder.guidance =~ "Before the ready-for-review progress attest"
+    assert coder.guidance =~ "Review can start before a passing-test receipt"
     assert coder.guidance =~ "--verdict tests-passed"
   end
 

@@ -66,6 +66,40 @@ defmodule FeatureSmoke do
   @lane_slack_ms 60_000
 
   def run do
+    Tightbeam.DeployReadiness.route!(
+      System.get_env("TIGHTBEAM_SMOKE_MODE"),
+      &run_readiness/0,
+      &run_full/0
+    )
+  end
+
+  defp run_readiness do
+    base_dir = System.fetch_env!("TIGHTBEAM_BASE_DIR")
+
+    unless System.get_env("TIGHTBEAM_SMOKE_OWNED_BASE") == Path.expand(base_dir) do
+      raise "readiness requires explicit TIGHTBEAM_SMOKE_OWNED_BASE for its authorized disposable base"
+    end
+
+    gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
+    announce_selection!(Tightbeam.FeatureSmokePlan.selection(Tightbeam.Harness.all()))
+
+    for leg <- Tightbeam.FeatureSmokePlan.legs(Tightbeam.Harness.all()) do
+      preflight!(leg, base_dir)
+      state = %{port: gw["port"], token: gw["cliToken"], base_dir: base_dir, leg: leg, pass: 0}
+
+      proof =
+        Tightbeam.DeployReadiness.run!(
+          fn verb, params -> post(state, verb, params) end,
+          fn session, wake ->
+            Tightbeam.DeployReadiness.observe!(Path.join(base_dir, "state.db"), session, wake)
+          end
+        )
+
+      IO.puts("PASS fresh-agent readiness #{leg.wire_name}: #{JSON.encode!(proof)}")
+    end
+  end
+
+  defp run_full do
     base_dir = System.get_env("TIGHTBEAM_BASE_DIR") || Path.expand("~/.tightbeam-beam")
     install_smoke_rule!(base_dir)
     gw = base_dir |> Path.join("gateway.json") |> File.read!() |> JSON.decode!()
@@ -122,7 +156,7 @@ defmodule FeatureSmoke do
 
     session =
       ok!(state, "spawn", %{
-        "archetype" => "reviewer",
+        "archetype" => "reviewer-code",
         "displayName" => "smoke-local-deploy-#{unique()}",
         "idempotencyKey" => "local-deploy-#{unique()}"
       })
@@ -163,19 +197,20 @@ defmodule FeatureSmoke do
         )
       end)
 
-      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer", harness)
+      snapshot = Tightbeam.Identity.snapshot!(state.base_dir, "reviewer-code", harness)
 
       assert(
         state,
         map_size(snapshot.skills) > 0,
-        "local deployment elected no skills for reviewer at #{cwd}"
+        "local deployment elected no skills for reviewer-code at #{cwd}"
       )
 
-      ok!(state, "wake", %{
-        "sessionKey" => session_key,
-        "prompt" => "Reply with exactly: LOCAL DEPLOYMENT READY",
-        "idempotencyKey" => "local-deploy-wake-#{unique()}"
-      })
+      wake =
+        ok!(state, "wake", %{
+          "sessionKey" => session_key,
+          "prompt" => "Reply with exactly: LOCAL DEPLOYMENT READY",
+          "idempotencyKey" => "local-deploy-wake-#{unique()}"
+        })
 
       await_materialized_skills!(state, cwd, snapshot.skills)
 
@@ -206,7 +241,18 @@ defmodule FeatureSmoke do
         %{"title" => "smoke agent-created wi #{unique()}", "idempotencyKey" => "awi-#{unique()}"}
       )
 
-      await_turn_boundary!(state, session_key)
+      Tightbeam.DeployReadiness.await_reply!(
+        fn session, wake_id ->
+          Tightbeam.DeployReadiness.observe!(
+            Path.join(state.base_dir, "state.db"),
+            session,
+            wake_id
+          )
+        end,
+        session_key,
+        wake["wakeId"],
+        "LOCAL DEPLOYMENT READY"
+      )
 
       sentinel_bytes = "durable-local-deployment-#{unique()}\n"
       File.write!(sentinel, sentinel_bytes)
@@ -533,13 +579,13 @@ defmodule FeatureSmoke do
   defp check_flagship_review_loop(state) do
     u = unique()
     # A reviewer role bound to a live reviewer session (the remedy's assign target).
-    post(state, "role-create", %{"name" => "reviewer"})
+    post(state, "role-create", %{"name" => "reviewer-code"})
 
     reviewer =
       ok!(state, "spawn", %{"displayName" => "smoke-reviewer-#{u}", "idempotencyKey" => "rv-#{u}"})
 
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer", "sessionKey" => reviewer_key})
+    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
     reviewer_tok = session_token(state, reviewer_key)
 
     # A coder holding a work assignment.
@@ -703,10 +749,10 @@ defmodule FeatureSmoke do
     reviewer_leg = independent_leg(state)
     preflight_independent!(state, reviewer_leg)
 
-    post(state, "role-create", %{"name" => "reviewer"})
+    post(state, "role-create", %{"name" => "reviewer-code"})
 
     # The reviewer is spawned through the other SELECTED leg where this run has one. The
-    # `reviewer` bind does double duty: a session acting under its own credential needs a
+    # `reviewer-code` bind does double duty: a session acting under its own credential needs a
     # bound role or the router refuses it `no_role`, and `Roles.bind/3` REPLACES
     # `boundSessionKey`, which is what points the review statute's `target_role` at a live
     # session instead of whatever retired one a previous group left behind.
@@ -717,7 +763,7 @@ defmodule FeatureSmoke do
       })
 
     reviewer_key = get_in(reviewer, ["stream", "sessionKey"]) || reviewer["sessionKey"]
-    ok!(state, "role-bind", %{"name" => "reviewer", "sessionKey" => reviewer_key})
+    ok!(state, "role-bind", %{"name" => "reviewer-code", "sessionKey" => reviewer_key})
     reviewer_tok = session_token(state, reviewer_key)
 
     wi =
@@ -1769,11 +1815,11 @@ defmodule FeatureSmoke do
     ok!(state, "config", %{
       "action" => "set",
       "setting" => "default-archetype",
-      "value" => "reviewer"
+      "value" => "reviewer-code"
     })
 
     got = ok!(state, "config", %{"action" => "get", "setting" => "default-archetype"})["value"]
-    assert(state, got == "reviewer", "config: set did not persist (#{inspect(got)})")
+    assert(state, got == "reviewer-code", "config: set did not persist (#{inspect(got)})")
 
     spawn =
       ok!(state, "spawn", %{
@@ -1789,7 +1835,7 @@ defmodule FeatureSmoke do
       "value" => original || "default"
     })
 
-    assert(state, arch in ["reviewer", nil], "config: spawn archetype was #{inspect(arch)}")
+    assert(state, arch in ["reviewer-code", nil], "config: spawn archetype was #{inspect(arch)}")
     retire(state, spawn)
     pass(state, "config default-archetype set/get persists and steers spawn")
   end
@@ -1953,7 +1999,11 @@ defmodule FeatureSmoke do
     request2 = await_effort_request!(parent_state, first_id, request1_id)
     request2_id = request2["id"]
 
-    revoked = ok!(parent_state, "revoke-assignment", %{"assignmentId" => first_id})
+    revoked =
+      ok!(parent_state, "revoke-assignment", %{
+        "assignmentId" => first_id,
+        "reason" => "Effort smoke replaces the first assignment to verify request supersession"
+      })
 
     assert(
       state,
@@ -1997,7 +2047,11 @@ defmodule FeatureSmoke do
       "replacement dispatch did not arm a fresh bracket: #{inspect(replacement_request)}"
     )
 
-    ok!(parent_state, "revoke-assignment", %{"assignmentId" => second_id})
+    ok!(parent_state, "revoke-assignment", %{
+      "assignmentId" => second_id,
+      "reason" => "Effort smoke completed the replacement assignment checks"
+    })
+
     retire(state, first_holder)
     retire(state, second_holder)
     retire(state, parent)
@@ -2282,7 +2336,10 @@ defmodule FeatureSmoke do
       got = ok!(state, "work-item-get", %{"workItemId" => item["id"]})
 
       for asg <- got["assignments"] || [], asg["state"] == "open" do
-        ok!(state, "revoke-assignment", %{"assignmentId" => asg["id"]})
+        ok!(state, "revoke-assignment", %{
+          "assignmentId" => asg["id"],
+          "reason" => "Smoke setup clears an open assignment left by a previous run"
+        })
       end
 
       ok!(state, "work-item-close", %{"workItemId" => item["id"]})
@@ -2372,8 +2429,7 @@ defmodule FeatureSmoke do
   end
 
   defp retire(state, spawn) do
-    key = get_in(spawn, ["stream", "sessionKey"]) || spawn["sessionKey"]
-    if is_binary(key), do: post(state, "retire", %{"sessionKey" => key})
+    Tightbeam.DeployReadiness.retire!(fn verb, params -> post(state, verb, params) end, spawn)
   end
 
   defp leaf_entries(root), do: leaf_entries(root, root, [])
@@ -2441,33 +2497,6 @@ defmodule FeatureSmoke do
       true ->
         Process.sleep(100)
         await_materialized_skills!(state, cwd, skills, deadline)
-    end
-  end
-
-  defp await_turn_boundary!(state, session_key) do
-    deadline = System.monotonic_time(:millisecond) + 30_000
-    await_turn_boundary!(state, session_key, deadline)
-  end
-
-  defp await_turn_boundary!(state, session_key, deadline) do
-    db = Path.join(state.base_dir, "state.db")
-
-    {out, 0} =
-      System.cmd("sqlite3", [
-        db,
-        "SELECT count(*) FROM turns WHERE sessionKey = #{sql_quote(session_key)} AND status IN ('queued','running')"
-      ])
-
-    cond do
-      String.trim(out) == "0" ->
-        state
-
-      System.monotonic_time(:millisecond) >= deadline ->
-        assert(state, false, "local deployment turn did not settle for CWD: #{session_key}")
-
-      true ->
-        Process.sleep(100)
-        await_turn_boundary!(state, session_key, deadline)
     end
   end
 

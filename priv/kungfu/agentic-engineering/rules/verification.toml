@@ -20,7 +20,7 @@ prompt = "Your completion of {assignment_id} is blocked: no verification verdict
 # Widened 2026-08-18 from coder-only to the other archetypes whose deliverable is
 # a FILE. The shape was right and already proven; only its reach was short, and
 # the loss concentrated exactly where it did not reach. Measured across the fleet that
-# day, closed assignments carrying NO artifact on their work item: reviewer
+# day, closed assignments carrying NO artifact on their work item: review sessions
 # 456/682, spec-writer 35/71, recon 34/148 — against coder's 118/397, the one
 # archetype this rule already covered.
 #
@@ -29,7 +29,7 @@ prompt = "Your completion of {assignment_id} is blocked: no verification verdict
 # holds only if the verdict can carry the review. It cannot: the note field caps
 # at 2000 characters, and reviewers already route around it in the open — "FULL
 # CLAUSE TABLE + EVIDENCE: art_xxxxxxx, the 2000-char note cap forced the card's
-# clause table". So a reviewer that files a verdict and records nothing has kept
+# clause table". So a review holder that files a verdict and records nothing has kept
 # the DECISION and dropped the REASONING behind it. The review document is the
 # verdict's substance, not an optional companion to it.
 #
@@ -54,7 +54,7 @@ effect = "remedy"
 text = "completion requires a recorded results artifact from the holder"
 deny_when = [
   { fact = "attest.kind", op = "eq", value = "completion" },
-  { fact = "assignment.holder_archetype", op = "in", value = ["coder", "reviewer", "spec-writer", "recon"] },
+  { fact = "assignment.holder_archetype", op = "in", value = ["coder", "reviewer-code", "reviewer-spec", "spec-writer", "recon"] },
   { fact = "assignment.artifact_kinds", op = "not_in", value = ["report", "spec", "doc", "data", "other"] },
 ]
 [rule.remedy]
@@ -62,3 +62,50 @@ action = "wake"
 target_session = "{holder_key}"
 [rule.remedy.params]
 prompt = "Your completion of {assignment_id} is blocked: no artifact is recorded on its work item. Your session workspace is REMOVED when it closes, so a document you did not record is destroyed with it — the row survives and the bytes do not. Record what you produced (report, spec, evidence, logs) with `tightbeam artifact-record --kind <kind> --title <title> --path <path> --work-item <workItemId>`, then complete."
+
+[[policy]]
+name = "accountable-dependency-verifier"
+purpose = "wait-verification-admission"
+when = [
+  { fact = "verifier.open", op = "eq", value = true },
+  { fact = "verifier.holder_is_other", op = "eq", value = true },
+]
+verification = { trigger = "registration", terminal = "bound-verdict-or-obligation-terminal", fallback = "wake-due-at" }
+
+[[policy]]
+name = "holder-continuation-coverage"
+purpose = "wait-prod-coverage"
+when = [
+  { fact = "wait.obligation_matches", op = "eq", value = true },
+  { fact = "wait.admitted", op = "eq", value = true },
+  { fact = "wait.after_turn_eligible", op = "eq", value = true },
+  { fact = "wait.coverage_valid", op = "eq", value = true },
+  { fact = "wait.continuation_state", op = "in", value = ["pending", "queued", "running"] },
+]
+
+[[policy]]
+name = "justified-unresolved-dependency"
+purpose = "wait-effort-relief"
+when = [
+  { fact = "wait.obligation_matches", op = "eq", value = true },
+  { fact = "wait.admitted", op = "eq", value = true },
+  { fact = "wait.continuation_state", op = "eq", value = "pending" },
+  { fact = "wait.recognized", op = "eq", value = false },
+  { fact = "resolver.open", op = "eq", value = true },
+  { fact = "resolver.owed_by_other", op = "eq", value = true },
+  { fact = "wait.declaration_complete", op = "eq", value = true },
+  { fact = "wait.verification_accountable", op = "eq", value = true },
+  { fact = "wait.verification_state", op = "in", value = ["provisional", "confirmed"] },
+]
+
+[[rule]]
+name = "wake-obligation-registration-authority"
+verb = "wake"
+edges = ["verb"]
+effect = "deny"
+text = "Register this obligation wake as its holder or through an authorized ancestor."
+deny_when = [
+  { fact = "wake.has_obligation", op = "eq", value = true },
+  { fact = "wake.registrant_is_holder", op = "eq", value = false },
+  { fact = "wake.registrant_is_ancestor", op = "eq", value = false },
+]

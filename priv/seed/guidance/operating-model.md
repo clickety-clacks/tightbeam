@@ -46,7 +46,7 @@ document you produced that anyone might need again:
 `tightbeam artifact-record --kind <kind> --title "<title>" --path <originPath>
 [--work-item <workItemId>]`
 
-Record specs, plans, reports, reviews, analyses, and any evidence file another row cites.
+Record requirements, plans, reports, reviews, analyses, and any evidence file another row cites.
 Skip build outputs, scratch probes, and anything a single command reproduces. When you are
 unsure, record it: an unneeded artifact costs one row, an unrecorded one costs the work.
 

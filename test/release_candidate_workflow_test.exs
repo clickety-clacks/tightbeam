@@ -27,9 +27,23 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
     assert {_, 0} = command("tar", ["xf", archive, "-C", capture_root])
     File.rm!(archive)
     File.ln_s!(Path.join(@root, "deps"), Path.join(capture_root, "deps"))
-    File.ln_s!(Path.join(@root, "cli/target"), Path.join(capture_root, "cli/target"))
+    private_target = Path.join(capture_root, "cli/target")
+    File.mkdir_p!(private_target)
+    assert {:ok, %{type: :directory}} = File.lstat(private_target)
+    source_build = source_build_fingerprint()
 
-    {assemble_output, 0} = command("sh", ["packaging/assemble.sh"], cd: capture_root)
+    {assemble_output, assemble_status} =
+      command("sh", ["packaging/assemble.sh"],
+        cd: capture_root,
+        env: [
+          {"LC_ALL", "C"},
+          {"CARGO_TARGET_DIR", nil},
+          {"CARGO_NET_OFFLINE", "true"}
+        ]
+      )
+
+    assert source_build_fingerprint() == source_build
+    assert assemble_status == 0, assemble_output
     [artifact] = Regex.run(~r/^artifact: (.+)$/m, assemble_output, capture: :all_but_first)
     package = Path.join(capture_root, artifact)
     assert File.regular?(package)
@@ -404,6 +418,23 @@ defmodule Tightbeam.ReleaseCandidateWorkflowTest do
   defp remote_ref!(remote, branch) do
     output = git!(remote, ["rev-parse", "refs/heads/#{branch}"])
     String.trim(output)
+  end
+
+  defp source_build_fingerprint do
+    target = Path.join(@root, "cli/target/release")
+
+    ([Path.join(target, "tightbeam"), Path.join(target, "tightbeam.d")] ++
+       Path.wildcard(Path.join(target, ".fingerprint/tightbeam-*/*")))
+    |> Enum.sort()
+    |> Map.new(fn path ->
+      value =
+        case File.read(path) do
+          {:ok, bytes} -> {:sha256, :crypto.hash(:sha256, bytes)}
+          {:error, :enoent} -> :absent
+        end
+
+      {path, value}
+    end)
   end
 
   defp command(executable, arguments, options \\ []) do

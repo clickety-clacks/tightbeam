@@ -45,6 +45,2493 @@ defmodule Tightbeam.AssignmentsTest do
     %{db: db, holder: holder, other: other, handlers: handlers}
   end
 
+  describe "terminal notification atomic admission" do
+    for {kind, outcome} <- [{"completion", "completed"}, {"surrender", "surrendered"}] do
+      @terminal_kind kind
+      @terminal_outcome outcome
+      test "#{kind} admits one exact durable parent notice and replays without writes", ctx do
+        session(ctx.db, "notice-parent", "flynn")
+        session(ctx.db, "unrelated-parent", "flynn")
+
+        {:ok, _} =
+          DB.query(
+            ctx.db,
+            "UPDATE sessions SET spawnedBy='unrelated-parent' WHERE sessionKey='holder'"
+          )
+
+        item = create_work_item(ctx, "terminal notice")
+
+        # Neither the holder's spawning lineage nor the subject selects the recipient.
+        assignment =
+          handle(
+            ctx,
+            "assign",
+            terminal_notice_assign_call(
+              {:session, "notice-parent"},
+              "notify other-session instead",
+              item.id
+            )
+          )
+
+        closed =
+          handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, @terminal_kind))
+
+        assert closed.assignment.outcome == @terminal_outcome
+
+        event = %{
+          source_kind: "attest",
+          source_token: closed.attest.id,
+          assignment_id: assignment.id,
+          work_item_id: item.id,
+          child_session_key: "holder",
+          owner_user_id: "flynn",
+          opened_by_kind: "session",
+          opened_by_id: "notice-parent",
+          outcome: @terminal_outcome,
+          terminal_at: closed.assignment.closedAt
+        }
+
+        assert event.source_token == closed.assignment.closingAttestId
+        assert event.terminal_at == closed.attest.ts
+        assert {:ok, expected} = Wakes.terminal_notification(event)
+        assert [wake] = terminal_notices(ctx.db)
+        assert wake.wake_id == expected.wake_id
+        assert wake.prompt == expected.prompt
+        assert wake.session_key == "notice-parent"
+        assert wake.owner_user_id == "flynn"
+        assert wake.creator_session_key == "holder"
+        assert wake.assignment_id == assignment.id
+        assert wake.work_item_id == item.id
+        assert wake.origin == "process:tightbeam"
+        assert wake.state == "pending"
+        assert wake.fired_at == nil
+        assert wake.due_at == closed.attest.ts
+
+        before = terminal_notice_snapshot(ctx.db)
+        assert {:ok, {:ok, ^wake}} = admit_terminal_notice(ctx.db, assignment.id)
+        assert terminal_notice_snapshot(ctx.db) == before
+        assert [^wake] = terminal_notices(ctx.db)
+
+        assert {:ok, []} =
+                 DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+      end
+    end
+
+    test "human opener without a work item admits to its durable owner's main", ctx do
+      personal = Org.personal_session_key("flynn")
+      session(ctx.db, personal, "flynn")
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
+
+      closed =
+        handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+      assert closed.assignment.state == "closed"
+      assert [wake] = terminal_notices(ctx.db)
+      assert wake.session_key == personal
+      assert wake.work_item_id == nil
+      assert wake.prompt =~ "opened_by_kind=\"user\"\nopened_by_id=\"flynn\""
+      assert wake.prompt =~ "work_item_id=null"
+    end
+
+    test "unavailable durable parent admits to the same owner's active main", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      personal = Org.personal_session_key("flynn")
+      session(ctx.db, personal, "flynn")
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:session, "notice-parent"}))
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
+
+      closed =
+        handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "surrender"))
+
+      assert closed.assignment.state == "closed"
+      assert [wake] = terminal_notices(ctx.db)
+      assert wake.session_key == personal
+      assert wake.prompt =~ "opened_by_id=\"notice-parent\""
+    end
+
+    test "conflicting persisted payload or immutable relation refuses without mutation", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:session, "notice-parent"}))
+      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+      assert [wake] = terminal_notices(ctx.db)
+
+      for {sql, params} <- [
+            {"UPDATE wakes SET prompt=?2 WHERE wakeId=?1", [wake.wake_id, "conflicting event"]},
+            {"UPDATE wakes SET prompt=?2,ownerUserId='other' WHERE wakeId=?1",
+             [wake.wake_id, wake.prompt]}
+          ] do
+        {:ok, _} = DB.query(ctx.db, sql, params)
+        before = terminal_notice_snapshot(ctx.db)
+
+        assert {:ok, {:error, %{code: "terminal_notification_conflict"}}} =
+                 admit_terminal_notice(ctx.db, assignment.id)
+
+        assert terminal_notice_snapshot(ctx.db) == before
+      end
+    end
+
+    test "replay preserves an already fired wake rather than rearming it", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:session, "notice-parent"}))
+      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+      assert [wake] = terminal_notices(ctx.db)
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=123 WHERE wakeId=?1", [
+          wake.wake_id
+        ])
+
+      before = terminal_notice_snapshot(ctx.db)
+
+      assert {:ok, {:ok, %{state: "fired", fired_at: 123}}} =
+               admit_terminal_notice(ctx.db, assignment.id)
+
+      assert terminal_notice_snapshot(ctx.db) == before
+    end
+
+    test "progress and failed-turn evidence do not fabricate a terminal event", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:session, "notice-parent"}))
+
+      progress =
+        handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+      assert progress.assignment.state == "open"
+      assert [] = terminal_notices(ctx.db)
+
+      # Synthetic durable failure evidence: no harness or provider is invoked.
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          """
+          INSERT INTO turns (sessionKey,messageId,origin,prompt,assignmentId,status,error,createdAt,endedAt)
+          VALUES ('holder','failed-evidence','process:tightbeam','failed child turn',?1,'failed','fixture',1,2)
+          """,
+          [assignment.id]
+        )
+
+      before = terminal_notice_snapshot(ctx.db)
+
+      assert {:ok, {:error, %{code: "invalid_terminal_notification_relation"}}} =
+               admit_terminal_notice(ctx.db, assignment.id)
+
+      assert terminal_notice_snapshot(ctx.db) == before
+      assert [] = terminal_notices(ctx.db)
+
+      assert handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id)).state ==
+               "open"
+    end
+
+    test "foreign opener or work owner rolls back the close and closing attest", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      item = create_work_item(ctx, "relation refusal")
+
+      assignment =
+        handle(
+          ctx,
+          "assign",
+          terminal_notice_assign_call({:session, "notice-parent"}, "child", item.id)
+        )
+
+      for {opener, work_owner} <- [
+            {"other-session", "flynn"},
+            {"missing-parent", "flynn"},
+            {"notice-parent", "other"}
+          ] do
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE assignments SET openedBySession=?2 WHERE id=?1", [
+            assignment.id,
+            opener
+          ])
+
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE work_items SET ownerUserId=?2 WHERE id=?1", [
+            item.id,
+            work_owner
+          ])
+
+        before = terminal_notice_snapshot(ctx.db)
+
+        assert %{code: "invalid_terminal_notification_relation"} =
+                 handle(
+                   ctx,
+                   "attest",
+                   attest_call({:session, "holder"}, assignment.id, "surrender")
+                 )
+
+        assert terminal_notice_snapshot(ctx.db) == before
+        assert [] = terminal_notices(ctx.db)
+      end
+    end
+
+    test "missing active recipient commits completion with durable incomplete intent", ctx do
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
+
+      assert %{assignment: %{state: "closed", outcome: "completed"}} =
+               handle(
+                 ctx,
+                 "attest",
+                 attest_call({:session, "holder"}, assignment.id, "completion")
+               )
+
+      assert [wake] = terminal_notices(ctx.db)
+      assert_incomplete_notice(ctx.db, assignment.id, wake)
+    end
+
+    test "closing-attest mismatch rolls back the terminal transaction", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:session, "notice-parent"}))
+
+      :ok =
+        DB.execute(ctx.db, """
+        CREATE TRIGGER fixture_corrupt_terminal_time AFTER UPDATE OF closingAttestId ON assignments
+        WHEN NEW.closingAttestId IS NOT NULL
+        BEGIN UPDATE attests SET ts=ts+1 WHERE id=NEW.closingAttestId; END
+        """)
+
+      before = terminal_notice_snapshot(ctx.db)
+
+      assert %{code: "invalid_terminal_notification_relation"} =
+               handle(
+                 ctx,
+                 "attest",
+                 attest_call({:session, "holder"}, assignment.id, "completion")
+               )
+
+      assert terminal_notice_snapshot(ctx.db) == before
+    end
+
+    test "wake insert storage refusal rolls back completion and surrender", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:session, "notice-parent"}))
+
+      :ok =
+        DB.execute(ctx.db, """
+        CREATE TRIGGER fixture_refuse_terminal_notice BEFORE INSERT ON wakes
+        WHEN NEW.wakeId LIKE 'w_terminal_%'
+        BEGIN SELECT RAISE(ABORT, 'fixture terminal notice admission refused'); END
+        """)
+
+      before = terminal_notice_snapshot(ctx.db)
+
+      for kind <- ["completion", "surrender"] do
+        assert_raise DB.Error, ~r/fixture terminal notice admission refused/, fn ->
+          handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, kind))
+        end
+
+        assert terminal_notice_snapshot(ctx.db) == before
+      end
+    end
+  end
+
+  describe "terminal notice delivery composition" do
+    for kind <- ["completion", "surrender"] do
+      @delivery_kind kind
+      test "#{kind} remains claimable through liveness suppression for its active parent", ctx do
+        {assignment, wake, _personal} = terminal_delivery_fixture(ctx, @delivery_kind)
+        assert wake.obligation_ref == "terminal-child-owner-notification:" <> assignment.id
+
+        {:ok, _} =
+          DB.transaction(ctx.db, fn txn ->
+            Tightbeam.ConditionFacts.file_in_txn(txn, %{
+              kind: "work-blocked",
+              scope: "notice-parent",
+              origin: "process:tightbeam"
+            })
+          end)
+
+        scheduler = terminal_notice_scheduler(ctx.db)
+        assert :ok = Wakes.fire_due(scheduler)
+        delivered_wake = Wakes.get(ctx.db, wake.wake_id)
+        assert delivered_wake.state == "fired"
+        assert delivered_wake.session_key == "notice-parent"
+        assert delivered_wake.prompt == wake.prompt
+
+        assert {:ok, [[seq, "notice-parent", "queued"]]} =
+                 DB.query(ctx.db, "SELECT seq,sessionKey,status FROM turns WHERE wakeId=?1", [
+                   wake.wake_id
+                 ])
+
+        assert {:ok, []} =
+                 DB.query(ctx.db, "SELECT 1 FROM queued_message_scopes WHERE turnSeq=?1", [seq])
+
+        assert {:ok, %{seq: ^seq, wake_id: wake_id}} =
+                 Ledger.claim_next(ctx.db, "notice-parent", "terminal-fixture")
+
+        assert wake_id == wake.wake_id
+        assert Wakes.get(ctx.db, wake_id).state == "fired"
+      end
+    end
+
+    test "retired-after-admission parent routes the same event to owner main, not lineage or prompt",
+         ctx do
+      {_assignment, wake, personal} = terminal_delivery_fixture(ctx, "completion")
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
+
+      # Deliberately stale/hostile caller routing cannot override the durable marker.
+      assert {:appended, ^personal, message, _} =
+               deliver_terminal_notice(ctx.db, wake,
+                 session_key: "notice-decoy",
+                 origin: "user:other",
+                 prompt: "notify notice-decoy",
+                 target_gate: %{reresolve: "lineage", reresolve_seed: "holder", reresolve_rung: 1}
+               )
+
+      assert message.content =~ wake.prompt
+      refute message.content =~ "notify notice-decoy"
+      routed = Wakes.get(ctx.db, wake.wake_id)
+      assert routed.session_key == personal
+      assert routed.prompt == wake.prompt
+      assert routed.wake_id == wake.wake_id
+      assert routed.obligation_ref == wake.obligation_ref
+      assert routed.state == "fired"
+
+      assert {:ok, [[seq, ^personal]]} =
+               DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+      assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, personal, "terminal-fixture")
+      assert Ledger.pending_count(ctx.db, "notice-decoy") == 0
+    end
+
+    test "no authorized recipient leaves typed non-fired evidence without a turn or retry", ctx do
+      {assignment, wake, personal} = terminal_delivery_fixture(ctx, "surrender")
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)", [
+          "notice-parent",
+          personal
+        ])
+
+      scheduler = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(scheduler)
+      incomplete = Wakes.get(ctx.db, wake.wake_id)
+      assert incomplete.state == "canceled"
+      assert incomplete.fired_at == nil
+      assert is_integer(incomplete.canceled_at)
+      assert incomplete.prompt == wake.prompt
+      assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+      assert {:ok,
+              [
+                [
+                  "tightbeam:wake-scheduler",
+                  "target_unresolvable",
+                  "scheduler_delivery",
+                  wake_id,
+                  "no_replacement",
+                  "routing_bracket"
+                ]
+              ]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind,livenessTriggerKind FROM wake_cancellations WHERE wakeId=?1",
+                 [wake.wake_id]
+               )
+
+      assert wake_id == wake.wake_id
+
+      assert {:ok, [[encoded]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT detail FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
+                 [wake.wake_id]
+               )
+
+      evidence = JSON.decode!(encoded)
+      assert evidence["outcome"] == "undelivered"
+      assert evidence["reason"] == "terminal_notification_recipient_unavailable"
+      assert evidence["assignment_id"] == assignment.id
+      assert evidence["wake_id"] == wake.wake_id
+
+      before = terminal_notice_snapshot(ctx.db)
+      assert :ok = Wakes.fire_due(scheduler)
+      stop_supervised!(scheduler)
+      restarted = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(restarted)
+      assert {:terminal_notice_undeliverable, _} = deliver_terminal_notice(ctx.db, wake)
+      assert {:ok, {:ok, ^incomplete}} = admit_terminal_notice(ctx.db, assignment.id)
+      assert terminal_notice_snapshot(ctx.db) == before
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT count(*) FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
+                 [wake.wake_id]
+               )
+    end
+
+    test "delivery revalidates owner relation even when recorded parent remains active", ctx do
+      {_assignment, wake, _personal} = terminal_delivery_fixture(ctx, "completion")
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE sessions SET ownerUserId='other' WHERE sessionKey='notice-parent'"
+        )
+
+      scheduler = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(scheduler)
+      assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, wake.wake_id)
+      assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+      assert {:ok, [[encoded]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT detail FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
+                 [wake.wake_id]
+               )
+
+      assert JSON.decode!(encoded)["reason"] == "invalid_terminal_notification_relation"
+    end
+
+    test "scheduler restart and stale delivery replay preserve one notice turn", ctx do
+      {assignment, wake, _personal} = terminal_delivery_fixture(ctx, "completion")
+      scheduler = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(scheduler)
+
+      assert {:ok, [[seq]]} =
+               DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+      stop_supervised!(scheduler)
+      restarted = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(restarted)
+      assert {:duplicate, %{turn_seq: ^seq}} = deliver_terminal_notice(ctx.db, wake)
+      assert {:ok, {:ok, replay}} = admit_terminal_notice(ctx.db, assignment.id)
+      assert replay.wake_id == wake.wake_id
+      assert replay.state == "fired"
+
+      assert {:ok, [[^seq]]} =
+               DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+    end
+
+    test "ordinary unmarked skipped wakes keep their existing scheduler semantics", ctx do
+      session(ctx.db, "notice-parent", "flynn")
+
+      ordinary =
+        Wakes.schedule(ctx.db, %{
+          session_key: "notice-parent",
+          origin: "process:tightbeam",
+          prompt: "ordinary",
+          due_at: 0
+        })
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
+
+      assert :skipped = deliver_terminal_notice(ctx.db, ordinary)
+      assert Wakes.get(ctx.db, ordinary.wake_id).state == "pending"
+      scheduler = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(scheduler)
+      assert Wakes.get(ctx.db, ordinary.wake_id).state == "fired"
+
+      assert {:ok, []} =
+               DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [ordinary.wake_id])
+
+      assert {:ok, []} =
+               DB.query(
+                 ctx.db,
+                 "SELECT detail FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
+                 [ordinary.wake_id]
+               )
+    end
+  end
+
+  describe "terminal revocation notice admission" do
+    for principal <- [{:session, "notice-parent"}, {:user, "flynn"}, {:user, "admin"}] do
+      @notice_revoker principal
+      test "ordinary revocation by #{inspect(principal)} binds exact immutable evidence", ctx do
+        {assignment, _item, personal} = revocation_notice_fixture(ctx)
+        principal = @notice_revoker
+
+        # Human revocation needs the corresponding human opener; admin may revoke
+        # the session-opened card under the existing authorization rule.
+        if principal == {:user, "flynn"} do
+          {:ok, _} =
+            DB.query(
+              ctx.db,
+              "UPDATE assignments SET openedByUser='flynn',openedBySession=NULL WHERE id=?1",
+              [assignment.id]
+            )
+        end
+
+        assert %{state: "closed", outcome: "revoked", closingAttestId: nil} =
+                 handle(ctx, "revoke-assignment", revoke_call(principal, assignment.id))
+
+        assert [wake] = terminal_notices(ctx.db)
+        assert_revocation_notice(ctx, assignment, wake)
+        expected_target = if principal == {:user, "flynn"}, do: personal, else: "notice-parent"
+        assert wake.session_key == expected_target
+        before = revocation_notice_snapshot(ctx.db)
+
+        assert %{outcome: "revoked"} =
+                 handle(ctx, "revoke-assignment", revoke_call(principal, assignment.id))
+
+        assert {:ok, {:ok, ^wake}} = admit_terminal_notice(ctx.db, assignment.id)
+        assert revocation_notice_snapshot(ctx.db) == before
+      end
+    end
+
+    test "revoke reopen revoke preserves both event identities and exact old-event replay", ctx do
+      {assignment, _item, _personal} = revocation_notice_fixture(ctx)
+      call = revoke_call({:session, "notice-parent"}, assignment.id)
+      assert %{outcome: "revoked"} = handle(ctx, "revoke-assignment", call)
+      assert [first] = terminal_notices(ctx.db)
+      first_token = assert_revocation_notice(ctx, assignment, first)
+
+      assert %{state: "open"} =
+               handle(
+                 ctx,
+                 "reopen-assignment",
+                 reopen_call(
+                   {:session, "notice-parent"},
+                   assignment.id,
+                   "new accountable attempt"
+                 )
+               )
+
+      assert %{outcome: "revoked"} = handle(ctx, "revoke-assignment", call)
+      assert [second] = Enum.reject(terminal_notices(ctx.db), &(&1.wake_id == first.wake_id))
+      second_token = assert_revocation_notice(ctx, assignment, second)
+      refute first_token == second_token
+      refute first.wake_id == second.wake_id
+
+      before = revocation_notice_snapshot(ctx.db)
+
+      for {wake, token} <- [{first, first_token}, {second, second_token}] do
+        assert {:ok, {:ok, replay}} =
+                 DB.transaction(
+                   ctx.db,
+                   &Wakes.admit_terminal_revocation_in_txn(&1, assignment.id, token)
+                 )
+
+        assert replay.wake_id == wake.wake_id
+        assert replay.prompt == wake.prompt
+      end
+
+      assert revocation_notice_snapshot(ctx.db) == before
+
+      # Both committed events remain unique material results; delivery does not
+      # substitute the current generation's payload for the earlier event.
+      scheduler = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(scheduler)
+      stop_supervised!(scheduler)
+      restarted = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(restarted)
+
+      for wake <- [first, second] do
+        assert %{state: "fired", prompt: prompt} = Wakes.get(ctx.db, wake.wake_id)
+        assert prompt == wake.prompt
+
+        assert {:ok, [[seq]]} =
+                 DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+        assert {:duplicate, %{turn_seq: ^seq}} = deliver_terminal_notice(ctx.db, wake)
+      end
+    end
+
+    for actor <- ["user:flynn", "session:holder", "process:tightbeam"] do
+      @notice_retirement_actor actor
+      test "retirement interruption by #{actor} retains accountable disposition evidence", ctx do
+        {assignment, item, personal} = revocation_notice_fixture(ctx)
+        actor = @notice_retirement_actor
+
+        assert {:ok, %{state: "retired"}} =
+                 DB.transaction(ctx.db, fn txn ->
+                   assert [%{assignment_id: id}] =
+                            Assignments.interrupt_for_retire_in_txn(txn, "holder", "flynn", actor)
+
+                   assert id == assignment.id
+                   Org.retire_in_txn(txn, "holder", actor, 1_000)
+                 end)
+
+        assert [wake] = terminal_notices(ctx.db)
+        token = assert_revocation_notice(ctx, assignment, wake)
+
+        assert {:ok, [["holder session retired", ts]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT reason,revokedAt FROM assignment_revocations WHERE id=?1",
+                   [token]
+                 )
+
+        assert {:ok, [["holder", "interrupted-by-retire", ^ts]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT sessionKey,reason,ts FROM assignment_interruptions WHERE assignmentId=?1",
+                   [assignment.id]
+                 )
+
+        assert {:ok, []} =
+                 DB.query(ctx.db, "SELECT id FROM attests WHERE assignmentId=?1", [assignment.id])
+
+        before = accountable_disposition_snapshot(ctx.db)
+        assert {:appended, "notice-parent", message, _} = deliver_terminal_notice(ctx.db, wake)
+        assert message.content =~ token
+        assert message.content =~ "outcome=\"revoked\""
+        assert accountable_disposition_snapshot(ctx.db) == before
+
+        assert {:ok, [["open"]]} =
+                 DB.query(ctx.db, "SELECT state FROM work_items WHERE id=?1", [item.id])
+
+        assert {:ok, [["active"]]} =
+                 DB.query(ctx.db, "SELECT state FROM sessions WHERE sessionKey=?1", [personal])
+
+        assert {:ok, []} =
+                 DB.transaction(
+                   ctx.db,
+                   &Assignments.interrupt_for_retire_in_txn(&1, "holder", "flynn", actor)
+                 )
+
+        assert length(terminal_notices(ctx.db)) == 1
+      end
+    end
+
+    test "ordinary revocation with unavailable recipient retains incomplete intent", ctx do
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
+
+      assert %{state: "closed", outcome: "revoked"} =
+               handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+
+      assert [wake] = terminal_notices(ctx.db)
+      assert_incomplete_notice(ctx.db, assignment.id, wake)
+      assert_revocation_notice(ctx, assignment, wake)
+    end
+
+    test "retirement with unavailable recipient commits interruption and incomplete intent",
+         ctx do
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
+
+      assert {:ok, [_]} =
+               DB.transaction(ctx.db, fn txn ->
+                 Org.retire_in_txn(txn, "holder", "user:flynn", 1_000)
+                 Assignments.interrupt_for_retire_in_txn(txn, "holder", "flynn", "user:flynn")
+               end)
+
+      assert {:ok, [["closed"]]} =
+               DB.query(ctx.db, "SELECT state FROM assignments WHERE id=?1", [assignment.id])
+
+      assert {:ok, [["retired"]]} =
+               DB.query(ctx.db, "SELECT state FROM sessions WHERE sessionKey='holder'")
+
+      assert {:ok, [["interrupted-by-retire"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT reason FROM assignment_interruptions WHERE assignmentId=?1",
+                 [assignment.id]
+               )
+
+      assert [wake] = terminal_notices(ctx.db)
+      assert_incomplete_notice(ctx.db, assignment.id, wake)
+      assert_revocation_notice(ctx, assignment, wake)
+    end
+
+    test "storage refusal rolls back ordinary and multi-child retirement admission", ctx do
+      {first, _item, _personal} = revocation_notice_fixture(ctx)
+
+      second =
+        handle(
+          ctx,
+          "assign",
+          terminal_notice_assign_call({:session, "notice-parent"}, "second child")
+        )
+
+      # Force the successfully admitted child first, so the second refusal
+      # proves rollback of a notice already inserted by the same retirement.
+      {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET openedAt=1 WHERE id=?1", [first.id])
+      {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET openedAt=2 WHERE id=?1", [second.id])
+
+      :ok =
+        DB.execute(ctx.db, """
+        CREATE TRIGGER fixture_refuse_revocation_notice BEFORE INSERT ON wakes
+        WHEN NEW.wakeId LIKE 'w_terminal_%' AND NEW.assignmentId='#{second.id}'
+        BEGIN SELECT RAISE(ABORT, 'fixture revocation admission refused'); END
+        """)
+
+      before = revocation_notice_snapshot(ctx.db)
+
+      assert_raise DB.Error, ~r/fixture revocation admission refused/, fn ->
+        handle(ctx, "revoke-assignment", revoke_call({:session, "notice-parent"}, second.id))
+      end
+
+      assert revocation_notice_snapshot(ctx.db) == before
+
+      assert {:error, %DB.Error{}} =
+               DB.transaction(ctx.db, fn txn ->
+                 Assignments.interrupt_for_retire_in_txn(
+                   txn,
+                   "holder",
+                   "flynn",
+                   "process:tightbeam"
+                 )
+
+                 Org.retire_in_txn(txn, "holder", "process:tightbeam", 1_000)
+               end)
+
+      assert revocation_notice_snapshot(ctx.db) == before
+    end
+
+    test "revocation replay refuses foreign source tokens and conflicting payload without writes",
+         ctx do
+      {assignment, _item, _personal} = revocation_notice_fixture(ctx)
+
+      assert %{outcome: "revoked"} =
+               handle(
+                 ctx,
+                 "revoke-assignment",
+                 revoke_call({:session, "notice-parent"}, assignment.id)
+               )
+
+      assert [wake] = terminal_notices(ctx.db)
+      token = assert_revocation_notice(ctx, assignment, wake)
+      before = revocation_notice_snapshot(ctx.db)
+
+      assert {:ok, {:error, %{code: "invalid_terminal_notification_relation"}}} =
+               DB.transaction(
+                 ctx.db,
+                 &Wakes.admit_terminal_revocation_in_txn(&1, assignment.id, "rev_missing")
+               )
+
+      assert revocation_notice_snapshot(ctx.db) == before
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE wakes SET prompt='conflicting durable payload' WHERE wakeId=?1",
+          [wake.wake_id]
+        )
+
+      corrupt = revocation_notice_snapshot(ctx.db)
+
+      assert {:ok, {:error, %{code: "terminal_notification_conflict"}}} =
+               DB.transaction(
+                 ctx.db,
+                 &Wakes.admit_terminal_revocation_in_txn(&1, assignment.id, token)
+               )
+
+      assert revocation_notice_snapshot(ctx.db) == corrupt
+    end
+
+    test "revoked notice retains current-recipient fallback and non-fired unavailable outcome",
+         ctx do
+      {assignment, _item, personal} = revocation_notice_fixture(ctx)
+
+      assert %{outcome: "revoked"} =
+               handle(
+                 ctx,
+                 "revoke-assignment",
+                 revoke_call({:session, "notice-parent"}, assignment.id)
+               )
+
+      assert [wake] = terminal_notices(ctx.db)
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
+
+      before = accountable_disposition_snapshot(ctx.db)
+      assert {:appended, ^personal, _, _} = deliver_terminal_notice(ctx.db, wake)
+      assert accountable_disposition_snapshot(ctx.db) == before
+
+      assert %{state: "open"} =
+               handle(
+                 ctx,
+                 "reopen-assignment",
+                 reopen_call({:user, "admin"}, assignment.id, "another accountable attempt")
+               )
+
+      assert %{outcome: "revoked"} =
+               handle(ctx, "revoke-assignment", revoke_call({:user, "admin"}, assignment.id))
+
+      assert [pending] = Enum.filter(terminal_notices(ctx.db), &(&1.state == "pending"))
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [personal])
+
+      assert {:terminal_notice_undeliverable,
+              %{outcome: "undelivered", reason: "terminal_notification_recipient_unavailable"}} =
+               deliver_terminal_notice(ctx.db, pending)
+
+      assert %{state: "canceled", fired_at: nil} = Wakes.get(ctx.db, pending.wake_id)
+
+      assert {:ok, []} =
+               DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [pending.wake_id])
+    end
+  end
+
+  describe "terminal notice explicit recovery" do
+    for status <- ["failed", "failed_unknown"] do
+      @recovery_status status
+      test "#{status} recovers the same semantic notice once to its current owner", ctx do
+        {assignment, root, personal} = terminal_delivery_fixture(ctx, "completion")
+        assert {:appended, "notice-parent", _, _} = deliver_terminal_notice(ctx.db, root)
+        assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
+
+        assert :ok =
+                 Ledger.finish(ctx.db, source.seq, @recovery_status, "fixture delivery failure")
+
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
+
+        before_disposition = accountable_disposition_snapshot(ctx.db)
+
+        assert {:ok, {:ok, %{wake: recovery, replay: false}}} =
+                 recover_notice(ctx.db, root.wake_id)
+
+        assert recovery.session_key == personal
+        assert recovery.prompt == root.prompt
+        assert recovery.obligation_ref == root.obligation_ref
+        assert recovery.owner_user_id == root.owner_user_id
+        refute recovery.wake_id == root.wake_id
+        assert recovery.state == "pending"
+        assert accountable_disposition_snapshot(ctx.db) == before_disposition
+        before_replay = recovery_snapshot(ctx.db)
+
+        assert {:ok, {:ok, %{wake: ^recovery, replay: true}}} =
+                 recover_notice(ctx.db, root.wake_id)
+
+        assert recovery_snapshot(ctx.db) == before_replay
+
+        evidence = notice_outcomes(ctx.db, assignment.id, root.wake_id)
+        assert evidence.delivered == []
+        assert Enum.any?(evidence.outstanding, &(&1.wake_id == recovery.wake_id))
+        assert Enum.any?(evidence.terminal, &(&1.wake_id == root.wake_id))
+        assert evidence.inconsistencies == []
+
+        scheduler = terminal_notice_scheduler(ctx.db)
+        assert :ok = Wakes.fire_due(scheduler)
+        stop_supervised!(scheduler)
+        restarted = terminal_notice_scheduler(ctx.db)
+        assert :ok = Wakes.fire_due(restarted)
+
+        assert {:ok, [[seq, ^personal]]} =
+                 DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [
+                   recovery.wake_id
+                 ])
+
+        assert seq == 3
+        assert {:ok, slate} = Ledger.claim_next(ctx.db, personal, "recovery-fixture")
+        assert slate.seq == 2
+        assert slate.seq < seq
+        assert slate.origin == "process:tightbeam"
+
+        assert slate.prompt ==
+                 "[from process:tightbeam]\n\nslate clear on #{assignment.workItemId}: close it, card more work, or rule it failed"
+
+        assert is_binary(slate.wake_id)
+        refute slate.wake_id == recovery.wake_id
+        assert :ok = Ledger.finish(ctx.db, slate.seq, "delivered")
+        assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, personal, "recovery-fixture")
+        assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+        assert notice_outcomes(ctx.db, assignment.id, root.wake_id).delivered != []
+        before_refusal = recovery_snapshot(ctx.db)
+
+        assert {:ok, {:error, %{code: "terminal_recovery_delivered"}}} =
+                 recover_notice(ctx.db, root.wake_id)
+
+        assert recovery_snapshot(ctx.db) == before_refusal
+        assert accountable_disposition_snapshot(ctx.db) == before_disposition
+      end
+    end
+
+    for state <- [:pending, :queued, :running, :delivered, :inconsistent] do
+      @refused_recovery_state state
+      test "#{state} terminal-notice evidence refuses recovery without writes", ctx do
+        {_assignment, root, _personal} = terminal_delivery_fixture(ctx, "surrender")
+        state = @refused_recovery_state
+
+        if state in [:queued, :running, :delivered] do
+          assert {:appended, _, _, _} = deliver_terminal_notice(ctx.db, root)
+        end
+
+        if state in [:running, :delivered] do
+          assert {:ok, turn} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
+          if state == :delivered, do: assert(:ok == Ledger.finish(ctx.db, turn.seq, "delivered"))
+        end
+
+        if state == :inconsistent do
+          {:ok, _} =
+            DB.query(ctx.db, "UPDATE wakes SET state='fired',firedAt=1 WHERE wakeId=?1", [
+              root.wake_id
+            ])
+        end
+
+        expected =
+          case state do
+            :delivered -> "terminal_recovery_delivered"
+            :inconsistent -> "terminal_recovery_inconsistent"
+            _ -> "terminal_recovery_outstanding"
+          end
+
+        before = recovery_snapshot(ctx.db)
+        assert {:ok, {:error, %{code: ^expected}}} = recover_notice(ctx.db, root.wake_id)
+        assert recovery_snapshot(ctx.db) == before
+      end
+    end
+
+    test "unavailable and unauthorized recovery refuse without mutation", ctx do
+      {_assignment, root, personal} = terminal_delivery_fixture(ctx, "completion")
+      assert {:appended, _, _, _} = deliver_terminal_notice(ctx.db, root)
+      assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
+      assert :ok = Ledger.finish(ctx.db, source.seq, "failed_unknown")
+      before = recovery_snapshot(ctx.db)
+
+      assert {:ok, {:error, %{code: "terminal_recovery_not_authorized"}}} =
+               recover_notice(ctx.db, root.wake_id, "user:other")
+
+      assert recovery_snapshot(ctx.db) == before
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)", [
+          "notice-parent",
+          personal
+        ])
+
+      unavailable = recovery_snapshot(ctx.db)
+
+      assert {:ok, {:error, %{code: "terminal_notification_recipient_unavailable"}}} =
+               recover_notice(ctx.db, root.wake_id)
+
+      assert recovery_snapshot(ctx.db) == unavailable
+    end
+
+    test "existing repair lineage is projected and blocks competing recovery", ctx do
+      {assignment, root, _personal} = terminal_delivery_fixture(ctx, "surrender")
+      assert {:appended, _, _, _} = deliver_terminal_notice(ctx.db, root)
+      assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
+      assert :ok = Ledger.finish(ctx.db, source.seq, "failed_unknown")
+
+      assert {:ok, {:appended, repair_seq, _}} =
+               Ledger.repair_terminal(
+                 ctx.db,
+                 source.seq,
+                 assignment.id,
+                 "existing-repair",
+                 "user:flynn"
+               )
+
+      evidence = notice_outcomes(ctx.db, assignment.id, root.wake_id)
+
+      assert Enum.any?(evidence.outstanding, fn item ->
+               Enum.any?(item.repairs, &(&1.attempt_seq == repair_seq))
+             end)
+
+      before = recovery_snapshot(ctx.db)
+
+      assert {:ok, {:error, %{code: "terminal_recovery_outstanding"}}} =
+               recover_notice(ctx.db, root.wake_id)
+
+      assert recovery_snapshot(ctx.db) == before
+      assert {:ok, %{seq: ^repair_seq}} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
+      assert :ok = Ledger.finish(ctx.db, repair_seq, "delivered")
+      delivered = recovery_snapshot(ctx.db)
+
+      assert {:ok, {:error, %{code: "terminal_recovery_delivered"}}} =
+               recover_notice(ctx.db, root.wake_id)
+
+      assert recovery_snapshot(ctx.db) == delivered
+    end
+
+    test "recovery admission storage failure rolls back both wake and lineage", ctx do
+      {_assignment, root, _personal} = terminal_delivery_fixture(ctx, "completion")
+      assert {:appended, _, _, _} = deliver_terminal_notice(ctx.db, root)
+      assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
+      assert :ok = Ledger.finish(ctx.db, source.seq, "failed")
+
+      :ok =
+        DB.execute(ctx.db, """
+        CREATE TRIGGER fixture_refuse_terminal_recovery BEFORE INSERT ON wake_retry_attempts
+        BEGIN SELECT RAISE(ABORT, 'fixture recovery lineage refusal'); END
+        """)
+
+      before = recovery_snapshot(ctx.db)
+      assert {:error, %DB.Error{}} = recover_notice(ctx.db, root.wake_id)
+      assert recovery_snapshot(ctx.db) == before
+    end
+  end
+
+  describe "route B unavailable-recipient intent" do
+    for kind <- ["completion", "surrender", "revocation"] do
+      @incomplete_kind kind
+      test "#{kind} survives unavailable replay and restart then resolves the current owner once",
+           ctx do
+        session(ctx.db, "notice-parent", "flynn")
+
+        assignment =
+          handle(ctx, "assign", terminal_notice_assign_call({:session, "notice-parent"}))
+
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
+
+        result =
+          if @incomplete_kind == "revocation" do
+            assert assignment.openedBySession == "notice-parent"
+
+            handle(
+              ctx,
+              "revoke-assignment",
+              revoke_call({:session, assignment.openedBySession}, assignment.id)
+            )
+          else
+            close_incomplete_fixture(ctx, assignment.id, @incomplete_kind)
+          end
+
+        if @incomplete_kind == "revocation",
+          do: assert(result.outcome == "revoked"),
+          else: assert(result.assignment.state == "closed")
+
+        assert [root] = terminal_notices(ctx.db)
+        assert_incomplete_notice(ctx.db, assignment.id, root)
+        disposition = accountable_disposition_snapshot(ctx.db)
+        before = recovery_snapshot(ctx.db)
+
+        for _ <- 1..2 do
+          assert {:ok, {:ok, ^root}} = admit_terminal_notice(ctx.db, assignment.id)
+
+          assert {:ok, {:error, %{code: "terminal_notification_recipient_unavailable"}}} =
+                   recover_notice(ctx.db, root.wake_id)
+
+          scheduler = terminal_notice_scheduler(ctx.db)
+          assert :ok = Wakes.fire_due(scheduler)
+          stop_supervised!(scheduler)
+          assert recovery_snapshot(ctx.db) == before
+        end
+
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='notice-parent'")
+
+        assert {:ok, {:ok, %{wake: successor, replay: false}}} =
+                 recover_notice(ctx.db, root.wake_id)
+
+        assert successor.session_key == "notice-parent"
+        assert successor.prompt == root.prompt
+        assert successor.obligation_ref == root.obligation_ref
+        replay_snapshot = recovery_snapshot(ctx.db)
+
+        assert {:ok, {:ok, %{wake: ^successor, replay: true}}} =
+                 recover_notice(ctx.db, root.wake_id)
+
+        assert recovery_snapshot(ctx.db) == replay_snapshot
+
+        assert {:ok, [[nil, "canceled", successor_id]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT sourceTurnSeq,outcome,retryWakeId FROM wake_retry_attempts WHERE wakeId=?1",
+                   [root.wake_id]
+                 )
+
+        assert successor_id == successor.wake_id
+
+        # Delivery re-resolves after admission; no parentage or root identity changes.
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'")
+
+        personal = Org.personal_session_key("flynn")
+        session(ctx.db, personal, "flynn")
+        scheduler = terminal_notice_scheduler(ctx.db)
+        assert :ok = Wakes.fire_due(scheduler)
+        stop_supervised!(scheduler)
+        restarted = terminal_notice_scheduler(ctx.db)
+        assert :ok = Wakes.fire_due(restarted)
+
+        assert {:ok, [[seq, ^personal]]} =
+                 DB.query(ctx.db, "SELECT seq,sessionKey FROM turns WHERE wakeId=?1", [
+                   successor.wake_id
+                 ])
+
+        assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, personal, "route-b-fixture")
+        assert :ok = Ledger.finish(ctx.db, seq, "delivered")
+        assert Wakes.get(ctx.db, root.wake_id) == root
+        evidence = notice_outcomes(ctx.db, assignment.id, root.wake_id)
+        assert length(evidence.delivered) == 1
+        assert evidence.outstanding == []
+        assert evidence.inconsistencies == []
+        after_delivery = recovery_snapshot(ctx.db)
+
+        assert {:ok, {:error, %{code: "terminal_recovery_delivered"}}} =
+                 recover_notice(ctx.db, root.wake_id)
+
+        assert recovery_snapshot(ctx.db) == after_delivery
+        # Only the newly added personal session differs, not terminal disposition.
+        assert Map.delete(accountable_disposition_snapshot(ctx.db), "sessions") ==
+                 Map.delete(disposition, "sessions")
+      end
+
+      test "#{kind} rolls back terminal disposition when incomplete evidence cannot persist",
+           ctx do
+        assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
+
+        :ok =
+          DB.execute(ctx.db, """
+          CREATE TRIGGER fixture_refuse_incomplete BEFORE INSERT ON lifecycle_events
+          WHEN NEW.kind='wake_undeliverable'
+          BEGIN SELECT RAISE(ABORT, 'fixture incomplete intent refused'); END
+          """)
+
+        before = recovery_snapshot(ctx.db)
+
+        assert_raise DB.Error, ~r/fixture incomplete intent refused/, fn ->
+          close_incomplete_fixture(ctx, assignment.id, @incomplete_kind)
+        end
+
+        assert recovery_snapshot(ctx.db) == before
+      end
+    end
+
+    test "incomplete recovery refuses missing reason evidence without mutations", ctx do
+      assignment = handle(ctx, "assign", terminal_notice_assign_call({:user, "flynn"}))
+      close_incomplete_fixture(ctx, assignment.id, "completion")
+      assert [root] = terminal_notices(ctx.db)
+
+      {:ok, _} =
+        DB.query(
+          ctx.db,
+          "UPDATE lifecycle_events SET detail='{}' WHERE kind='wake_undeliverable' AND subject=?1",
+          [root.wake_id]
+        )
+
+      session(ctx.db, Org.personal_session_key("flynn"), "flynn")
+      before = recovery_snapshot(ctx.db)
+
+      assert {:ok, {:error, %{code: "terminal_recovery_inconsistent"}}} =
+               recover_notice(ctx.db, root.wake_id)
+
+      assert recovery_snapshot(ctx.db) == before
+    end
+  end
+
+  defp close_incomplete_fixture(ctx, id, "revocation"),
+    do: handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, id))
+
+  defp close_incomplete_fixture(ctx, id, kind),
+    do: handle(ctx, "attest", attest_call({:session, "holder"}, id, kind))
+
+  defp assert_incomplete_notice(db, assignment_id, wake) do
+    assert wake.state == "canceled"
+    assert wake.fired_at == nil
+    assert wake.assignment_id == assignment_id
+    assert {:ok, []} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, [[detail]]} =
+             DB.query(
+               db,
+               "SELECT detail FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
+               [wake.wake_id]
+             )
+
+    assert JSON.decode!(detail) == %{
+             "wake_id" => wake.wake_id,
+             "assignment_id" => assignment_id,
+             "purpose" => "terminal-child-owner-notification",
+             "outcome" => "undelivered",
+             "reason" => "terminal_notification_recipient_unavailable"
+           }
+
+    evidence = notice_outcomes(db, assignment_id, wake.wake_id)
+    assert evidence.delivered == []
+    assert evidence.outstanding == []
+    assert evidence.inconsistencies == []
+    assert length(evidence.terminal) == 1
+  end
+
+  defp recover_notice(db, root, principal \\ "user:flynn"),
+    do: DB.transaction(db, &Wakes.recover_terminal_notification_in_txn(&1, root, principal))
+
+  defp notice_outcomes(db, assignment, root) do
+    {:ok, evidence} =
+      DB.transaction(
+        db,
+        &Wakes.delivery_outcomes_in_txn(&1, %{
+          root_wake_id: root,
+          recovery_wake_ids: [],
+          assignment_id: assignment
+        })
+      )
+
+    evidence
+  end
+
+  defp recovery_snapshot(db) do
+    Map.merge(
+      revocation_notice_snapshot(db),
+      Map.new(~w(wake_retry_attempts turn_repair_attempts), fn table ->
+        {:ok, rows} = DB.query(db, "SELECT * FROM #{table} ORDER BY rowid")
+        {table, rows}
+      end)
+    )
+  end
+
+  defp revocation_notice_fixture(ctx) do
+    session(ctx.db, "notice-parent", "flynn")
+    personal = Org.personal_session_key("flynn")
+    session(ctx.db, personal, "flynn")
+    item = create_work_item(ctx, "revocation disposition remains open")
+
+    assignment =
+      handle(
+        ctx,
+        "assign",
+        terminal_notice_assign_call({:session, "notice-parent"}, "child", item.id)
+      )
+
+    {assignment, item, personal}
+  end
+
+  defp assert_revocation_notice(ctx, assignment, wake) do
+    assert {:ok, [[opened_user, opened_session]]} =
+             DB.query(
+               ctx.db,
+               "SELECT openedByUser,openedBySession FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, rows} =
+             DB.query(
+               ctx.db,
+               "SELECT id,revokedAt FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert [token] =
+             (for [token, ts] <- rows,
+                  {:ok, notice} =
+                    Wakes.terminal_notification(%{
+                      source_kind: "assignment_revocation",
+                      source_token: token,
+                      assignment_id: assignment.id,
+                      work_item_id: assignment.workItemId,
+                      child_session_key: "holder",
+                      owner_user_id: "flynn",
+                      opened_by_kind: if(opened_session, do: "session", else: "user"),
+                      opened_by_id: opened_session || opened_user,
+                      outcome: "revoked",
+                      terminal_at: ts
+                    }),
+                  notice.wake_id == wake.wake_id do
+                assert wake.prompt == notice.prompt
+                assert wake.due_at == ts
+                refute token == assignment.id
+                token
+              end)
+
+    token
+  end
+
+  defp revocation_notice_snapshot(db) do
+    Map.merge(
+      terminal_notice_snapshot(db),
+      Map.new(
+        ~w(sessions assignment_revocations assignment_revocation_generations assignment_reopenings assignment_interruptions wake_cancellations lifecycle_events),
+        fn table ->
+          {:ok, rows} = DB.query(db, "SELECT * FROM #{table} ORDER BY rowid")
+          {table, rows}
+        end
+      )
+    )
+  end
+
+  defp accountable_disposition_snapshot(db) do
+    for {table, columns} <- [
+          {"assignments", "id,state,outcome,holderKey,closingAttestId,closedAt"},
+          {"work_items", "id,state"},
+          {"sessions", "sessionKey,state"},
+          {"assignment_revocations", "*"},
+          {"assignment_interruptions", "*"}
+        ],
+        into: %{} do
+      {:ok, rows} = DB.query(db, "SELECT #{columns} FROM #{table} ORDER BY rowid")
+      {table, rows}
+    end
+  end
+
+  defp terminal_delivery_fixture(ctx, kind) do
+    session(ctx.db, "notice-parent", "flynn")
+    session(ctx.db, "notice-decoy", "flynn")
+    personal = Org.personal_session_key("flynn")
+    session(ctx.db, personal, "flynn")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET spawnedBy='notice-decoy' WHERE sessionKey='holder'")
+
+    item = create_work_item(ctx, "terminal delivery")
+
+    assignment =
+      handle(
+        ctx,
+        "assign",
+        terminal_notice_assign_call({:session, "notice-parent"}, "notify notice-decoy", item.id)
+      )
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, kind))
+
+    assert [wake] = terminal_notices(ctx.db)
+    {assignment, wake, personal}
+  end
+
+  defp deliver_terminal_notice(db, wake, overrides \\ []) do
+    {:ok, result} =
+      DB.transaction(db, fn txn ->
+        Gateway.deliver_prompt_in_txn(
+          txn,
+          Keyword.get(overrides, :session_key, wake.session_key),
+          Keyword.get(overrides, :origin, wake.origin),
+          Keyword.get(overrides, :prompt, wake.prompt),
+          wake_id: wake.wake_id,
+          sender: wake.origin,
+          target_gate: Keyword.get(overrides, :target_gate, wake),
+          fire_wake_in_txn: true
+        )
+      end)
+
+    case result do
+      {:terminal_notice_undeliverable, _} -> Gateway.complete_delivery(db, result)
+      other -> other
+    end
+  end
+
+  defp terminal_notice_scheduler(db) do
+    name = :"terminal_notice_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      Supervisor.child_spec(
+        {Wakes, db: db, name: name, tick_ms: 60_000, deliver: &deliver_terminal_notice(db, &1)},
+        id: name
+      )
+    )
+
+    name
+  end
+
+  defp admit_terminal_notice(db, id),
+    do: DB.transaction(db, &Wakes.admit_terminal_notification_in_txn(&1, id))
+
+  defp terminal_notice_assign_call(
+         principal,
+         subject \\ "coordinate child outcome",
+         work_item \\ nil
+       ) do
+    assign_call(principal, subject, nil, work_item)
+    |> put_in([:params, :effect_kind], "coordination")
+  end
+
+  defp terminal_notices(db) do
+    {:ok, rows} =
+      DB.query(db, "SELECT wakeId FROM wakes WHERE wakeId LIKE 'w_terminal_%' ORDER BY wakeId")
+
+    Enum.map(rows, fn [id] -> Wakes.get(db, id) end)
+  end
+
+  defp terminal_notice_snapshot(db) do
+    for table <-
+          ~w(assignments attests wakes work_items turns events messages supervision_entitlements effort_checkin_generations),
+        into: %{} do
+      {:ok, rows} = DB.query(db, "SELECT * FROM #{table} ORDER BY rowid")
+      {table, rows}
+    end
+  end
+
+  for {actor, expected} <- [
+        {"user:flynn", {"flynn", nil, nil}},
+        {"session:holder", {nil, "holder", nil}},
+        {"process:tightbeam", {nil, nil, "process:tightbeam"}}
+      ] do
+    @retirement_actor actor
+    @retirement_expected expected
+    test "Firehose retirement retains exactly one actor generation for #{@retirement_actor}",
+         ctx do
+      assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "retirement provenance"))
+
+      progress =
+        handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+
+      assert progress.attest.kind == "progress"
+
+      {:ok, attest_before} =
+        DB.query(ctx.db, "SELECT * FROM attests WHERE assignmentId=?1", [assignment.id])
+
+      assert [_] = retirement_callback(ctx.db, @retirement_actor)
+      closed = handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+      assert closed.state == "closed"
+      assert closed.outcome == "revoked"
+
+      assert {closed.closedByUser, closed.closedBySession, closed.closedByProcess} ==
+               @retirement_expected
+
+      assert closed.revocationReason == "holder session retired"
+
+      assert {:ok, [[closed_at, by_user, by_session, by_process, "holder session retired"]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT revokedAt,revokedByUser,revokedBySession,revokedByProcess,reason FROM assignment_revocations WHERE assignmentId=?1",
+                 [assignment.id]
+               )
+
+      assert closed_at == closed.closedAt
+      assert {by_user, by_session, by_process} == @retirement_expected
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM assignment_revocation_generations WHERE assignmentId=?1 AND reopeningId IS NULL",
+                 [assignment.id]
+               )
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM assignment_interruptions WHERE assignmentId=?1",
+                 [assignment.id]
+               )
+
+      assert {:ok, ^attest_before} =
+               DB.query(ctx.db, "SELECT * FROM attests WHERE assignmentId=?1", [assignment.id])
+
+      assert [] = retirement_callback(ctx.db, @retirement_actor)
+
+      assert handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id)) ==
+               closed
+
+      assert {:ok, [[1]]} =
+               DB.query(
+                 ctx.db,
+                 "SELECT COUNT(*) FROM assignment_revocations WHERE assignmentId=?1",
+                 [assignment.id]
+               )
+
+      assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+    end
+  end
+
+  test "WorkState revocation reason follows the current reopening generation", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "work-state provenance"))
+
+    revoke =
+      put_in(revoke_call({:user, "flynn"}, assignment.id), [:params, :reason], "first generation")
+
+    assert %{outcome: "revoked"} = handle(ctx, "revoke-assignment", revoke)
+    first = WorkState.detail(ctx.db, assignment.id).assignment
+    assert first.revocationReason == "first generation"
+    assert first.closedByUser == "flynn"
+    assert first.closedByProcess == nil
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "new generation")
+             )
+
+    reopened = WorkState.detail(ctx.db, assignment.id).assignment
+    assert reopened.revocationReason == nil
+    assert reopened.closedByUser == nil
+    assert reopened.closedByProcess == nil
+
+    assert %{outcome: "revoked"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               put_in(revoke, [:params, :reason], "second generation")
+             )
+
+    second = WorkState.detail(ctx.db, assignment.id).assignment
+    assert second.revocationReason == "second generation"
+    assert second.closedByUser == "flynn"
+
+    assert {:ok, [[2]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  test "Firehose revocation preserves provenance and emits its committed state only once", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "explicit revocation"))
+    parent = self()
+
+    call =
+      revoke_call({:user, "flynn"}, assignment.id)
+      |> put_in([:params, :reason], "Owner selected a different successor — 修復")
+      |> Map.merge(%{
+        firehose_in_txn: true,
+        firehose_hub: hub,
+        on_assignment_change: fn id, from -> send(parent, {:changed, id, from}) end
+      })
+
+    revoked = handle(ctx, "revoke-assignment", call)
+    assert revoked.outcome == "revoked"
+    assert revoked.revocationReason == call.params.reason
+    assert revoked.closedByUser == "flynn"
+    assert revoked.closedBySession == nil
+    assert revoked.closedByProcess == nil
+    assert_receive {:changed, id, _}
+    assert id == assignment.id
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "assignment.closed", "payload" => payload}}
+    assert payload["id"] == assignment.id
+    assert payload["revocationReason"] == call.params.reason
+    Hub.delivered(hub, self())
+
+    assert handle(ctx, "revoke-assignment", call) == revoked
+    refute_receive {:changed, _, _}
+    refute_receive {:firehose_notice, _}
+
+    assert %{code: "assignment_closed"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               put_in(call, [:params, :reason], "different reason")
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_revocation_generations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1", [
+               assignment.id
+             ])
+
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
+  test "Firehose revocation validates reason after authority and keeps rejected rows open", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reason boundary"))
+    missing = call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id})
+    assert %{code: "missing_reason"} = handle(ctx, "revoke-assignment", missing)
+
+    for reason <- ["", "   ", 42, String.duplicate("x", 2001)] do
+      assert %{code: "invalid_reason"} =
+               handle(ctx, "revoke-assignment", put_in(missing, [:params, :reason], reason))
+    end
+
+    unauthorized = %{missing | principal: {:user, "other"}, origin: "user:other"}
+    assert %{code: "not_authorized"} = handle(ctx, "revoke-assignment", unauthorized)
+
+    assert handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id)).state ==
+             "open"
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  test "reopen restores custody, records the close, and rearms every existing monitor", ctx do
+    item = create_work_item(ctx, "reopen lifecycle")
+
+    assignment =
+      reopen_fixture_call({:user, "flynn"}, "reopen me", nil, item.id)
+      |> put_in([:params, :files], ["lib/tightbeam/assignments.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    closed = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+    assert closed.assignment.state == "closed"
+
+    assert {:ok, [[slate_wake_id]]} =
+             DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert is_binary(slate_wake_id)
+    assert Wakes.get(ctx.db, slate_wake_id).state == "pending"
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, assignment.id, "the assignment carries work again")
+      )
+
+    assert %{
+             state: "open",
+             outcome: nil,
+             closedAt: nil,
+             closedByUser: nil,
+             closedBySession: nil,
+             closingAttestId: nil
+           } = reopened
+
+    assert {:ok,
+            [
+              [
+                "completed",
+                prior_closed_at,
+                nil,
+                "holder",
+                prior_attest_id,
+                "flynn",
+                nil,
+                "the assignment carries work again"
+              ]
+            ]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT priorOutcome, priorClosedAt, priorClosedByUser, priorClosedBySession,
+                      priorClosingAttestId, reopenedByUser, reopenedBySession, reason
+               FROM assignment_reopenings WHERE assignmentId=?1
+               """,
+               [assignment.id]
+             )
+
+    assert prior_closed_at == closed.assignment.closedAt
+    assert prior_attest_id == closed.assignment.closingAttestId
+
+    assert {:ok, [["armed", "assignment_open"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,cause FROM supervision_entitlements WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[1, "canceled"], [2, "armed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT generation,state FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [assignment.id]
+             )
+
+    assert {:ok, [[nil]]} =
+             DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [item.id])
+
+    assert Wakes.get(ctx.db, slate_wake_id).state == "canceled"
+    assert Assignments.declared_files(ctx.db, assignment.id) == ["lib/tightbeam/assignments.ex"]
+
+    assert marker_contents(ctx.db, "holder")
+           |> Enum.member?(
+             "[assignment reopened: #{assignment.id} by user:flynn — the assignment carries work again]"
+           )
+
+    fetched = handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+    assert [history] = fetched.reopenings
+    assert history.assignmentId == assignment.id
+    assert history.priorOutcome == "completed"
+    assert history.priorClosedAt == prior_closed_at
+    assert history.priorClosingAttestId == prior_attest_id
+    assert history.reopenedByUser == "flynn"
+    assert history.reopenedBySession == nil
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+  end
+
+  test "reopen authorization and refusals preserve every durable surface", ctx do
+    assignment = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "authorization"))
+
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "why", "assignment_open")
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, nil, "missing_reason")
+    assert_reopen_refused!(ctx, {:user, "flynn"}, assignment.id, "   ", "invalid_reason")
+    assert_reopen_refused!(ctx, {:process, "cron"}, assignment.id, "why", "process_denied")
+    assert_reopen_refused!(ctx, {:user, "other"}, assignment.id, "why", "not_authorized")
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "holder"}, assignment.id, "holder repair")
+             )
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "admin"}, assignment.id, "admin repair")
+             )
+
+    assert %{code: "unknown_assignment"} =
+             handle(ctx, "reopen-assignment", reopen_call({:user, "flynn"}, "asg_missing", "why"))
+
+    retired = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "retired holder"))
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, retired.id, "completion"))
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='holder'")
+    assert_reopen_refused!(ctx, {:user, "flynn"}, retired.id, "why", "session_retired")
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET state='active' WHERE sessionKey='holder'")
+
+    item = create_work_item(ctx, "terminal item")
+
+    carded =
+      handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "item card", nil, item.id))
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, carded.id, "completion"))
+
+    _ =
+      handle(
+        ctx,
+        "work-item-close",
+        work_item_call("work-item-close", {:user, "flynn"}, %{work_item_id: item.id})
+      )
+
+    assert_reopen_refused!(ctx, {:user, "flynn"}, carded.id, "why", "work_item_not_open")
+  end
+
+  defp reopen_fixture_call(principal, subject, key \\ nil, work_item_id \\ nil) do
+    assign_call(principal, subject, key, work_item_id)
+    |> put_in([:params, :effect_kind], "coordination")
+  end
+
+  test "Firehose reopening crosses real Dispatch and Gateway with committed notice and refusal",
+       ctx do
+    alias Tightbeam.Firehose.Hub
+    assignment = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "routed reopen"))
+    closed = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+    assert closed.assignment.state == "closed"
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    handlers =
+      Gateway.handlers(%{
+        db: ctx.db,
+        base_dir: System.tmp_dir!(),
+        wake_tick_ms: 1000,
+        supervision_interval_ms: 3000
+      })
+
+    assert Map.has_key?(handlers, "reopen-assignment")
+
+    call =
+      reopen_call({:user, "flynn"}, assignment.id, "routed repair") |> Map.put(:firehose_hub, hub)
+
+    assert {:ok, reopened} = Dispatch.dispatch(ctx.db, handlers, call)
+    assert reopened.state == "open"
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "assignment.reopened", "payload" => payload}}
+    assert payload["id"] == assignment.id
+    assert payload["state"] == "open"
+    assert payload["outcome"] == nil
+    Hub.delivered(hub, self())
+
+    assert {:ok, [[3000]]} =
+             DB.query(
+               ctx.db,
+               "SELECT supervisionIntervalMs FROM supervision_entitlements WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM assignment_reopenings WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM events WHERE verb='reopen-assignment' AND kind='verb'"
+             )
+
+    before = reopen_mutation_snapshot(ctx.db, assignment.id)
+    assert {:error, %{code: "assignment_open"}} = Dispatch.dispatch(ctx.db, handlers, call)
+    assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
+    assert_receive {:firehose_notice, %{"class" => "verb.denied"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM events WHERE verb='reopen-assignment' AND kind='denied'"
+             )
+  end
+
+  test "Firehose audit handoff rolls back with its event", ctx do
+    parent = self()
+
+    assert_raise MatchError, fn ->
+      Tightbeam.EventLog.append_event_with_handoff(
+        ctx.db,
+        "verb",
+        "synthetic-audit",
+        "user:flynn",
+        nil,
+        %{},
+        {:user, "flynn"},
+        fn txn ->
+          DB.Txn.handoff(txn, parent, :must_rollback)
+          raise "synthetic rollback"
+        end
+      )
+    end
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM events WHERE verb='synthetic-audit'")
+
+    refute_receive {:"$gen_cast", :must_rollback}
+  end
+
+  test "Firehose reopening preserves an owned pending R1 reminder without false delivery", ctx do
+    alias Tightbeam.ReminderDelivery
+
+    assignment =
+      handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "pending remains owned"))
+
+    assert {:ok, wake} =
+             DB.transaction(ctx.db, fn txn ->
+               ReminderDelivery.schedule_in_txn(txn, assignment.id, "prod", "holder", fn ->
+                 Wakes.schedule_in_txn(txn, %{
+                   session_key: "holder",
+                   origin: "process:tightbeam",
+                   prompt: "Synthetic pending reminder",
+                   due_at: 9_000_000_000_000,
+                   assignment_id: assignment.id
+                 })
+               end)
+             end)
+
+    assert {:ok, [[claim]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [assignment.id])
+
+    state = JSON.decode!(claim)
+    assert state["pending"]["consumer"] == %{"wake" => wake.wake_id}
+    assert state["claimEpoch"] == 1
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+    assert {:ok, [[^claim]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [assignment.id])
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "resume without replay")
+             )
+
+    assert {:ok, [[^claim]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [assignment.id])
+
+    assert Wakes.get(ctx.db, wake.wake_id).state == "pending"
+    assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [wake.wake_id])
+
+    assert {:ok, %{code: "reminder_pending"}} =
+             DB.transaction(ctx.db, fn txn ->
+               ReminderDelivery.schedule_in_txn(txn, assignment.id, "prod", "holder", fn ->
+                 flunk("reopening must not create a duplicate ordinary reminder")
+               end)
+             end)
+
+    assert {:ok, :no_claim} = DB.transaction(ctx.db, &ReminderDelivery.delivered_in_txn(&1, -1))
+
+    assert {:ok, [[^claim]]} =
+             DB.query(ctx.db, "SELECT reminderState FROM assignments WHERE id=?1", [assignment.id])
+
+    refute Map.has_key?(state, "lastDeliveredAt")
+    refute Map.has_key?(state, "nextEligibleAt")
+  end
+
+  test "Firehose reopening rejects a stale effort arm and rolls back its transaction", ctx do
+    alias Tightbeam.EffortCheckin
+    assignment = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "generation fence"))
+
+    assert %{assignment: %{state: "closed"}} =
+             handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "completion"))
+
+    config = %{db: ctx.db, base_dir: System.tmp_dir!(), effort_checkin_horizon_ms: 14_400_000}
+    prepared = EffortCheckin.prepare_reopen_arm(ctx.db, config, assignment.id)
+    assert prepared.prior_generation == 1
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, assignment.id, "fresh generation")
+      )
+
+    assert reopened.state == "open"
+    before = reopen_mutation_snapshot(ctx.db, assignment.id)
+
+    assert {:ok, effort_before} =
+             DB.query(
+               ctx.db,
+               "SELECT * FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [assignment.id]
+             )
+
+    assert {:ok, wakes_before} = DB.query(ctx.db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:error, %RuntimeError{message: "effort generation changed before reopen commit"}} =
+             DB.transaction(ctx.db, fn txn ->
+               DB.Txn.q(txn, "UPDATE assignments SET subject='must roll back' WHERE id=?1", [
+                 assignment.id
+               ])
+
+               EffortCheckin.arm_reopened_in_txn(txn, config, reopened, prepared)
+             end)
+
+    assert reopen_mutation_snapshot(ctx.db, assignment.id) == before
+
+    assert {:ok, ^effort_before} =
+             DB.query(
+               ctx.db,
+               "SELECT * FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+               [assignment.id]
+             )
+
+    assert {:ok, ^wakes_before} = DB.query(ctx.db, "SELECT * FROM wakes ORDER BY wakeId")
+
+    assert {:ok, [[subject]]} =
+             DB.query(ctx.db, "SELECT subject FROM assignments WHERE id=?1", [assignment.id])
+
+    assert subject == assignment.subject
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
+  test "Firehose opening publishes once and keyed Dispatch replay emits observation only", ctx do
+    alias Tightbeam.Firehose.Hub
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    call =
+      reopen_fixture_call({:user, "flynn"}, "published assignment", "publish-key")
+      |> Map.put(:firehose_hub, hub)
+
+    assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert assignment.state == "open"
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "assignment.opened", "payload" => payload}}
+    assert payload["id"] == assignment.id
+    assert payload["state"] == "open"
+    Hub.delivered(hub, self())
+    assert {:ok, ^assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM assignments WHERE id=?1", [assignment.id])
+
+    assert {:ok, [[2]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM events WHERE verb='assign' AND kind='verb'")
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT COUNT(*) FROM effort_checkin_generations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  test "Firehose terminal attest keeps sixteen-field replay and publishes no duplicate close",
+       ctx do
+    alias Tightbeam.Firehose.Hub
+
+    assignment =
+      handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "terminal publication"))
+
+    hub = start_supervised!({Hub, name: nil})
+    :ok = Hub.register(hub, self(), %{mode: :all, db: ctx.db, user_id: "flynn", is_admin: false})
+
+    call =
+      attest_call({:session, "holder"}, assignment.id, "surrender")
+      |> Map.merge(%{terminal_surrender: true, firehose_hub: hub})
+
+    assert {:ok, result} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert result.assignment.outcome == "surrendered"
+    assert result.attest.kind == "surrender"
+
+    for key <- [:artifactId, :contentSha256, :waitId] do
+      assert Map.has_key?(result.attest, key)
+      assert result.attest[key] == nil
+    end
+
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "attest.filed", "payload" => attest}}
+    assert attest["id"] == result.attest.id
+    Hub.delivered(hub, self())
+    assert_receive {:firehose_notice, %{"class" => "assignment.closed", "payload" => closed}}
+    assert closed["id"] == assignment.id
+    assert closed["outcome"] == "surrendered"
+    Hub.delivered(hub, self())
+
+    assert {:ok, replay} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
+    assert replay.replayed
+    assert replay.attest == result.attest
+    assert replay.assignment == result.assignment
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+
+    # The same closed-read branch is reached when the precheck loses a race.
+    raced = handle(ctx, "attest", Map.put(call, :firehose_in_txn, true))
+    assert raced.replayed
+    assert raced.attest == result.attest
+    assert_receive {:firehose_notice, %{"class" => "verb.accepted"}}
+    Hub.delivered(hub, self())
+    refute_receive {:firehose_notice, _}
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM attests WHERE assignmentId=?1", [
+               assignment.id
+             ])
+
+    assert {:ok, []} = DB.query(ctx.db, "PRAGMA foreign_key_check")
+  end
+
+  # Exercise the assignment callback and its real second-transaction row
+  # recognition. Org.retire alone does not run Gateway's assignment cascade.
+  defp retirement_callback(db, actor) do
+    {:ok, retired} =
+      DB.transaction_then(
+        db,
+        fn txn ->
+          retired = Assignments.interrupt_for_retire_in_txn(txn, "holder", "flynn", actor)
+          {retired, DB.take_row_commits(txn)}
+        end,
+        fn txn, {retired, transitions} ->
+          assert length(transitions) == length(retired)
+          Wakes.row_commit_in_txn(txn, transitions)
+          retired
+        end
+      )
+
+    retired
+  end
+
+  @tag assignment_delta: true
+  test "reopen accepts all lawful close outcomes and keeps file declarations advisory", ctx do
+    surrendered = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "surrender repair"))
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, surrendered.id, "surrender"))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:session, "holder"}, surrendered.id, "the surrender was premature")
+             )
+
+    revoked = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "revocation repair"))
+    _ = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, revoked.id))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, revoked.id, "the revocation was mistaken")
+             )
+
+    assert {:ok, [["surrendered"], ["revoked"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT priorOutcome FROM assignment_reopenings WHERE assignmentId IN (?1,?2) ORDER BY id",
+               [surrendered.id, revoked.id]
+             )
+
+    first =
+      reopen_fixture_call({:user, "flynn"}, "first file card")
+      |> put_in([:params, :files], ["lib/tightbeam/assignments.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, first.id, "completion"))
+
+    second =
+      reopen_fixture_call({:user, "flynn"}, "second file card")
+      |> put_in([:params, :files], ["lib/tightbeam/assignments.ex"])
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{state: "open"} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, first.id, "resume both lanes")
+             )
+
+    assert Assignments.open_assignments_touching(ctx.db, ["lib/tightbeam/assignments.ex"]) ==
+             Enum.sort([first.id, second.id])
+  end
+
+  @tag assignment_delta: true
+  test "reopen validates close shape and rolls back a post-audit failure", ctx do
+    malformed = handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "malformed close"))
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, malformed.id, "completion"))
+
+    assert :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=ON")
+
+    assert {:ok, _} =
+             DB.query(ctx.db, "UPDATE assignments SET closedAt=NULL WHERE id=?1", [malformed.id])
+
+    assert :ok = DB.execute(ctx.db, "PRAGMA ignore_check_constraints=OFF")
+
+    assert_reopen_refused!(
+      ctx,
+      {:user, "flynn"},
+      malformed.id,
+      "do not infer the close",
+      "unexpected_assignment_shape"
+    )
+
+    rollback =
+      handle(ctx, "assign", reopen_fixture_call({:user, "flynn"}, "transaction rollback"))
+
+    _ = handle(ctx, "attest", attest_call({:session, "holder"}, rollback.id, "completion"))
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        """
+        INSERT INTO supervision_entitlements
+          (assignmentId,generation,dueAt,state,basisKind,basisId,cause,principal,
+           supervisionIntervalMs)
+        VALUES (?1,1,0,'armed','assignment_open',?1,'assignment_open','process:test',1000)
+        """,
+        [rollback.id]
+      )
+
+    before = reopen_mutation_snapshot(ctx.db, rollback.id)
+
+    assert_raise RuntimeError, ~r/invalid supervision transition result/, fn ->
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, rollback.id, "force a later transactional failure")
+      )
+    end
+
+    assert reopen_mutation_snapshot(ctx.db, rollback.id) == before
+  end
+
+  @tag assignment_delta: true
+  test "public revoke cannot claim the internal recovery process", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "process spoof"))
+
+    assert %{code: "process_denied"} =
+             handle(ctx, "revoke-assignment", revoke_call({:process, "tightbeam"}, assignment.id))
+
+    assert {:ok, [["open", nil, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedByUser,closedBySession,closedByProcess FROM assignments WHERE id=?1",
+               [assignment.id]
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+  end
+
+  @tag assignment_delta: true
+  test "revocation requires one durable bounded reason and projects its provenance", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "reason required"))
+
+    for params <- [
+          %{assignment_id: assignment.id},
+          %{assignment_id: assignment.id, reason: "   "},
+          %{assignment_id: assignment.id, reason: "\t"},
+          %{assignment_id: assignment.id, reason: "\u00A0"},
+          %{assignment_id: assignment.id, reason: "\u3000"},
+          %{assignment_id: assignment.id, reason: String.duplicate("x", 2001)},
+          %{assignment_id: assignment.id, reason: 7}
+        ] do
+      assert %{code: code} =
+               handle(
+                 ctx,
+                 "revoke-assignment",
+                 call("revoke-assignment", {:user, "flynn"}, nil, params)
+               )
+
+      assert code in ["missing_reason", "invalid_reason"]
+    end
+
+    assert %{state: "open", revocationReason: nil} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId = ?1",
+               [
+                 assignment.id
+               ]
+             )
+
+    for {reason, suffix} <- [{"\t", "tab"}, {"\u00A0", "nbsp"}, {"\u3000", "ideographic"}] do
+      assert {:error, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO assignment_revocations
+                   (id, assignmentId, revokedAt, revokedByUser, revokedBySession, reason)
+                 VALUES (?1, ?2, 1, 'flynn', NULL, ?3)
+                 """,
+                 ["revocation-whitespace-#{suffix}", assignment.id, reason]
+               )
+    end
+
+    revoked =
+      handle(
+        ctx,
+        "revoke-assignment",
+        call("revoke-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: "the work moved to its replacement"
+        })
+      )
+
+    assert revoked.revocationReason == "the work moved to its replacement"
+    assert revoked.closedByUser == "flynn"
+
+    assert %{revocationReason: "the work moved to its replacement"} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert %{
+             "class" => "assignment.closed",
+             "payload" => %{"revocationReason" => "the work moved to its replacement"}
+           } =
+             Tightbeam.Firehose.Publisher.state_notice(
+               ctx.db,
+               call("revoke-assignment", {:user, "flynn"}, nil, %{assignment_id: assignment.id}),
+               revoked
+             )
+
+    assert {:ok, [["flynn", nil, closed_at, "the work moved to its replacement"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT revokedByUser, revokedBySession, revokedAt, reason FROM assignment_revocations WHERE assignmentId = ?1",
+               [assignment.id]
+             )
+
+    assert closed_at == revoked.closedAt
+
+    replayed =
+      handle(
+        ctx,
+        "revoke-assignment",
+        call("revoke-assignment", {:user, "flynn"}, nil, %{
+          assignment_id: assignment.id,
+          reason: "the work moved to its replacement"
+        })
+      )
+
+    assert replayed.id == assignment.id
+    assert replayed.revocationReason == "the work moved to its replacement"
+
+    admin_revoked = handle(ctx, "assign", assign_call({:user, "flynn"}, "admin revocation"))
+
+    assert %{closedByUser: "admin"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "admin"}, admin_revoked.id)
+             )
+
+    assert %{code: "assignment_closed"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               revoke_call({:user, "flynn"}, admin_revoked.id)
+             )
+
+    assert %{code: "assignment_closed"} =
+             handle(
+               ctx,
+               "revoke-assignment",
+               call("revoke-assignment", {:user, "flynn"}, nil, %{
+                 assignment_id: assignment.id,
+                 reason: "a conflicting reason"
+               })
+             )
+
+    assert {:ok, [[1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM assignment_revocations WHERE assignmentId = ?1",
+               [
+                 assignment.id
+               ]
+             )
+  end
+
+  @tag assignment_delta: true
+  test "revocation reason binds the current reopening and refuses immutable edits", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "generation reason"))
+
+    first_call =
+      put_in(revoke_call({:user, "flynn"}, assignment.id), [:params, :reason], "first close")
+
+    first = handle(ctx, "revoke-assignment", first_call)
+    assert first.revocationReason == "first close"
+    assert handle(ctx, "revoke-assignment", first_call) == first
+
+    assert %{code: "assignment_closed"} =
+             handle(ctx, "revoke-assignment", put_in(first_call, [:params, :reason], "conflict"))
+
+    reopened =
+      handle(
+        ctx,
+        "reopen-assignment",
+        reopen_call({:user, "flynn"}, assignment.id, "new generation")
+      )
+
+    assert reopened.revocationReason == nil
+
+    second =
+      handle(ctx, "revoke-assignment", put_in(first_call, [:params, :reason], "second close"))
+
+    assert second.revocationReason == "second close"
+
+    assert {:ok, [["first close", nil], ["second close", reopening_id]]} =
+             DB.query(
+               ctx.db,
+               "SELECT r.reason, g.reopeningId FROM assignment_revocations r JOIN assignment_revocation_generations g ON g.revocationId=r.id WHERE r.assignmentId=?1 ORDER BY g.reopeningId",
+               [assignment.id]
+             )
+
+    assert is_integer(reopening_id)
+
+    assert {:error, _} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignment_revocations SET reason='changed' WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert {:error, _} =
+             DB.query(
+               ctx.db,
+               "DELETE FROM assignment_revocation_generations WHERE assignmentId=?1",
+               [assignment.id]
+             )
+
+    assert handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id)).revocationReason ==
+             "second close"
+  end
+
+  @tag assignment_delta: true
+  test "retirement records its actual actor and rolls back provenance with the close", ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "retirement provenance"))
+
+    retire = fn txn ->
+      Assignments.interrupt_for_retire_in_txn(txn, "holder", "flynn", "user:flynn")
+      Org.retire_in_txn(txn, "holder", "user:flynn", 1_000)
+    end
+
+    assert {:error, %RuntimeError{message: "retirement rollback"}} =
+             DB.transaction(ctx.db, fn txn ->
+               retire.(txn)
+               raise "retirement rollback"
+             end)
+
+    assert %{state: "open", revocationReason: nil} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM assignment_revocations")
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignment_revocation_generations")
+
+    assert {:ok, %{state: "retired"}} = DB.transaction(ctx.db, retire)
+    closed = handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+    assert closed.outcome == "revoked"
+    assert closed.revocationReason == "holder session retired"
+    assert closed.closedByUser == "flynn"
+    assert closed.closedBySession == nil
+    assert {:ok, %{state: "retired"}} = DB.transaction(ctx.db, retire)
+
+    assert handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id)) ==
+             closed
+
+    assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT count(*) FROM assignment_revocations")
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignment_revocation_generations")
+  end
+
+  @tag assignment_delta: true
+  test "internal process close rolls back and survives reopening without actor substitution",
+       ctx do
+    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "process generation"))
+
+    close = fn txn ->
+      Assignments.interrupt_for_retire_in_txn(txn, "holder", "flynn", "process:tightbeam")
+    end
+
+    assert {:error, %RuntimeError{message: "process rollback"}} =
+             DB.transaction(ctx.db, fn txn ->
+               close.(txn)
+               raise "process rollback"
+             end)
+
+    assert %{state: "open", closedByProcess: nil} =
+             handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM assignment_revocations")
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT count(*) FROM assignment_revocation_generations")
+
+    assert {:ok, [[0]]} = DB.query(ctx.db, "SELECT count(*) FROM assignment_interruptions")
+
+    assert {:ok, [_]} = DB.transaction(ctx.db, close)
+    closed = handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+    assert closed.closedByUser == nil
+    assert closed.closedBySession == nil
+    assert closed.closedByProcess == "process:tightbeam"
+    assert {:ok, []} = DB.transaction(ctx.db, close)
+
+    assert %{state: "open", closedByProcess: nil, revocationReason: nil} =
+             handle(
+               ctx,
+               "reopen-assignment",
+               reopen_call({:user, "flynn"}, assignment.id, "resume")
+             )
+
+    reopened = handle(ctx, "assignment-get", assignment_get_call({:user, "flynn"}, assignment.id))
+    assert [audit] = reopened.reopenings
+    assert audit.priorClosedByProcess == "process:tightbeam"
+    assert audit.priorClosedByUser == nil
+    assert audit.priorClosedBySession == nil
+    assert audit.priorClosedAt == closed.closedAt
+
+    # The old process receipt cannot authorize a close in the new generation.
+    assert {:error, %DB.Error{}} =
+             DB.query(
+               ctx.db,
+               "UPDATE assignments SET state='closed',outcome='revoked',closedAt=?2,closedByProcess='process:tightbeam' WHERE id=?1",
+               [assignment.id, closed.closedAt]
+             )
+
+    next = handle(ctx, "revoke-assignment", revoke_call({:user, "flynn"}, assignment.id))
+    assert next.closedByUser == "flynn"
+    assert next.closedByProcess == nil
+
+    assert {:ok, [[nil, "process:tightbeam"], ["flynn", nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT r.revokedByUser,r.revokedByProcess FROM assignment_revocations r JOIN assignment_revocation_generations g ON g.revocationId=r.id WHERE r.assignmentId=?1 ORDER BY g.reopeningId",
+               [assignment.id]
+             )
+  end
+
+  @tag assignment_delta: true
   test "schema pins every assignment consistency CHECK", %{db: db} do
     base =
       "INSERT INTO assignments (id, subject, holderKey, holderRole, holderFallback, openedByUser, openedBySession, openedAt, state, outcome, closedAt, closedByUser, closedBySession, closingAttestId) VALUES "
@@ -61,9 +2548,39 @@ defmodule Tightbeam.AssignmentsTest do
       "('a9','x','holder',NULL,0,'flynn',NULL,1,'closed','completed',2,'flynn',NULL,NULL)"
     ]
 
+    assert {:ok, [[assignment_ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='assignments'"
+             )
+
+    # Exercise the installed table's CHECKs independently of BEFORE triggers.
+    # The real assignments table and every production guard remain untouched.
+    check_ddl =
+      String.replace(
+        assignment_ddl,
+        "CREATE TABLE assignments",
+        "CREATE TABLE assignment_check_probe",
+        global: false
+      )
+
+    assert check_ddl != assignment_ddl
+    assert :ok = DB.execute(db, check_ddl)
+
+    check_base =
+      String.replace(base, "INSERT INTO assignments", "INSERT INTO assignment_check_probe",
+        global: false
+      )
+
     Enum.each(invalid, fn values ->
       assert {:error, %DB.Error{message: message}} = DB.query(db, base <> values)
-      assert message =~ "CHECK constraint"
+
+      if String.contains?(values, "'closed','revoked'"),
+        do: assert(message == "revoked assignment requires revocation provenance"),
+        else: assert(message =~ "CHECK constraint")
+
+      assert {:error, %DB.Error{message: check_message}} = DB.query(db, check_base <> values)
+      assert check_message =~ "CHECK constraint"
     end)
 
     assert {:error, %DB.Error{}} =
@@ -533,15 +3050,21 @@ defmodule Tightbeam.AssignmentsTest do
     end
   end
 
-  test "assignment-get returns the full assignment row or not_found", ctx do
+  @tag assignment_delta: true
+  test "assignment-get returns the full assignment row plus reopening history or not_found",
+       ctx do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "fetch me"))
 
+    # `assignment-get` carries every field `assign` returned, plus an empty
+    # `reopenings` and canonical correction lists for a card with no repair history.
     assert handle(
              ctx,
              "assignment-get",
              assignment_get_call({:session, "other-session"}, assignment.id)
            ) ==
              assignment
+             |> Map.put(:reopenings, [])
+             |> Map.put(:commitRefCorrections, [])
 
     assert handle(
              ctx,
@@ -872,6 +3395,7 @@ defmodule Tightbeam.AssignmentsTest do
     completion_target =
       assign_call({:user, "flynn"}, "outside-list completion")
       |> put_in([:params, :files], ["lib/a.ex"])
+      |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
     completion_call =
@@ -925,7 +3449,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "verdict attests freeze provenance and project inert producer history columns", ctx do
-    assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "verdict stamps"))
+    assignment =
+      assign_call({:user, "flynn"}, "verdict stamps")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
 
     ordinary =
       handle(ctx, "attest", %{
@@ -1225,7 +3752,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "a later revoked verdictless review cannot displace holder-reviewed-clean", ctx do
-    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "Surf Ace producer"))
+    producer =
+      assign_call({:user, "flynn"}, "Surf Ace producer")
+      |> put_in([:params, :effect_kind], "policy")
+      |> then(&handle(ctx, "assign", &1))
 
     clean_review =
       assign_call({:user, "flynn"}, "independent clean review")
@@ -1325,7 +3855,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "attest lifecycle, authorization precedence, and terminal race are atomic", ctx do
-    assignment = handle(ctx, "assign", assign_call({:session, "holder"}, "work"))
+    assignment =
+      assign_call({:session, "holder"}, "work")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
 
     assert %{code: "process_denied"} =
              handle(ctx, "attest", attest_call({:process, "cron"}, assignment.id, "progress"))
@@ -1383,7 +3916,10 @@ defmodule Tightbeam.AssignmentsTest do
     assert completed.assignment.outcome == "completed"
     assert completed.assignment.closingAttestId == completed.attest.id
 
-    race = handle(ctx, "assign", assign_call({:session, "holder"}, "race"))
+    race =
+      assign_call({:session, "holder"}, "race")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
 
     complete =
       Task.async(fn ->
@@ -1423,7 +3959,10 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "work lifecycle markers land in the actor transcript with exact event text", ctx do
-    completed = handle(ctx, "assign", assign_call({:user, "flynn"}, "completed markers"))
+    completed =
+      assign_call({:user, "flynn"}, "completed markers")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
 
     progress =
       handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "progress"))
@@ -1522,7 +4061,11 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   test "query filters, deterministic ordering, role-resolved holder input, and open_count", ctx do
-    a = handle(ctx, "assign", assign_call({:user, "flynn"}, "a"))
+    a =
+      assign_call({:user, "flynn"}, "a")
+      |> put_in([:params, :effect_kind], "coordination")
+      |> then(&handle(ctx, "assign", &1))
+
     b = handle(ctx, "assign", assign_call({:user, "flynn"}, "b"))
     _ = handle(ctx, "attest", attest_call({:session, "holder"}, a.id, "completion"))
     {:ok, _} = DB.query(ctx.db, "UPDATE assignments SET openedAt = 99")
@@ -1581,19 +4124,30 @@ defmodule Tightbeam.AssignmentsTest do
              Dispatch.dispatch(ctx.db, ctx.handlers, assign_call({:session, "holder"}, "denied"))
   end
 
-  test "zero rules allow completion without verdicts and verdict emits one verb event", ctx do
+  test "zero rules cannot bypass code completion evidence and verdict emits one verb event",
+       ctx do
     completion_assignment = dispatch!(ctx, assign_call({:session, "holder"}, "completion"))
 
-    assert {:ok, %{assignment: closed, attest: completion}} =
+    assert {:error, %{code: "inapplicable_code_evidence"}} =
              Dispatch.dispatch(
                ctx.db,
                ctx.handlers,
                attest_call({:session, "holder"}, completion_assignment.id, "completion")
              )
 
-    assert closed.state == "closed"
-    assert completion.verdictKind == nil
-    assert completion.byUser == nil
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, completion_assignment.id)
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [completion_assignment.id]
+             )
 
     assert {:ok, [[before_verdict]]} =
              DB.query(
@@ -1619,6 +4173,99 @@ defmodule Tightbeam.AssignmentsTest do
              )
 
     assert after_verdict == before_verdict + 1
+  end
+
+  test "a review retraction committed after applicability precheck defeats code completion",
+       ctx do
+    previous_runner = Application.get_env(:tightbeam, :commit_ref_command)
+
+    on_exit(fn ->
+      if previous_runner,
+        do: Application.put_env(:tightbeam, :commit_ref_command, previous_runner),
+        else: Application.delete_env(:tightbeam, :commit_ref_command)
+    end)
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      {"", 0}
+    end)
+
+    refs = [
+      %{
+        "repo" => "eezo:/tmp/o2-result",
+        "commit" => String.duplicate("a", 40)
+      }
+    ]
+
+    producer = handle(ctx, "assign", assign_call({:user, "flynn"}, "retraction producer"))
+
+    review =
+      assign_call({:user, "flynn"}, "retraction review")
+      |> Map.put(:session_key, "other-session")
+      |> put_in([:params, :reviews_assignment_id], producer.id)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert %{attest: %{verdictKind: "reviewed-clean"}} =
+             attest_call({:session, "other-session"}, review.id, "verdict")
+             |> put_in([:params, :verdict_kind], "reviewed-clean")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert %{attest: %{verdictKind: "verified"}} =
+             attest_call({:session, "holder"}, producer.id, "verdict")
+             |> put_in([:params, :verdict_kind], "verified")
+             |> put_in([:params, :commit_refs], refs)
+             |> then(&handle(ctx, "attest", &1))
+
+    assert Assignments.qualifying_review_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             refs
+           ) == ["reviewed-clean"]
+
+    assert Assignments.qualifying_verification_verdict_kinds(
+             ctx.db,
+             producer.id,
+             "holder",
+             refs
+           ) == ["verified"]
+
+    Application.put_env(:tightbeam, :commit_ref_command, fn _executable, _args, _opts ->
+      assert {:ok, _} =
+               DB.query(
+                 ctx.db,
+                 """
+                 INSERT INTO attests
+                   (id,assignmentId,kind,verdictKind,note,bySession,byHarness,byProvider,commitRefs,ts)
+                 VALUES
+                   ('att_concurrent_retraction',?1,'verdict','changes-requested','retracted',
+                    'other-session','claude','anthropic',?2,?3)
+                 """,
+                 [review.id, JSON.encode!(refs), System.system_time(:millisecond) + 1_000]
+               )
+
+      {"", 0}
+    end)
+
+    completion =
+      attest_call({:session, "holder"}, producer.id, "completion")
+      |> put_in([:params, :commit_refs], refs)
+
+    assert %{code: "inapplicable_code_evidence"} = handle(ctx, "attest", completion)
+
+    assert %{state: "open", closingAttestId: nil} =
+             handle(
+               ctx,
+               "assignment-get",
+               assignment_get_call({:session, "holder"}, producer.id)
+             )
+
+    assert {:ok, [[0]]} =
+             DB.query(
+               ctx.db,
+               "SELECT count(*) FROM attests WHERE assignmentId=?1 AND kind='completion'",
+               [producer.id]
+             )
   end
 
   test "attests returns every kind in timestamp and id order", ctx do
@@ -1677,6 +4324,7 @@ defmodule Tightbeam.AssignmentsTest do
               "attest",
               "attests",
               "revoke-assignment",
+              "reopen-assignment",
               "assignments"
             ],
        do:
@@ -1686,7 +4334,7 @@ defmodule Tightbeam.AssignmentsTest do
            call
            |> Map.put(:verb, verb)
            |> then(fn routed ->
-             if verb in ["assign", "dispatch"],
+             if verb in ["assign", "dispatch", "reopen-assignment"],
                do: Map.put_new(routed, :supervision_interval_ms, 1_000),
                else: routed
            end)
@@ -1718,6 +4366,54 @@ defmodule Tightbeam.AssignmentsTest do
     |> Projection.list_after(session_key, nil, 100)
     |> Enum.map(& &1.content)
   end
+
+  defp reopen_mutation_snapshot(db, assignment_id) do
+    {:ok, [assignment]} =
+      DB.query(
+        db,
+        "SELECT state,outcome,closedAt,closedByUser,closedBySession,closedByProcess,closingAttestId,reminderState " <>
+          "FROM assignments WHERE id=?1",
+        [assignment_id]
+      )
+
+    {:ok, [[reopening_count]]} =
+      DB.query(db, "SELECT count(*) FROM assignment_reopenings WHERE assignmentId=?1", [
+        assignment_id
+      ])
+
+    {:ok, supervision} =
+      DB.query(
+        db,
+        "SELECT generation,state,cause FROM supervision_entitlements WHERE assignmentId=?1",
+        [assignment_id]
+      )
+
+    {:ok, effort} =
+      DB.query(
+        db,
+        "SELECT generation,state,wakeId FROM effort_checkin_generations WHERE assignmentId=?1 ORDER BY generation",
+        [assignment_id]
+      )
+
+    %{
+      assignment: assignment,
+      reopeningCount: reopening_count,
+      supervision: supervision,
+      effort: effort
+    }
+  end
+
+  defp assert_reopen_refused!(ctx, principal, assignment_id, reason, expected_code) do
+    before = reopen_mutation_snapshot(ctx.db, assignment_id)
+
+    assert %{code: ^expected_code} =
+             handle(ctx, "reopen-assignment", reopen_call(principal, assignment_id, reason))
+
+    assert reopen_mutation_snapshot(ctx.db, assignment_id) == before
+  end
+
+  defp reopen_call(principal, id, reason),
+    do: call("reopen-assignment", principal, nil, %{assignment_id: id, reason: reason})
 
   defp assignment_count(db) do
     {:ok, [[count]]} = DB.query(db, "SELECT count(*) FROM assignments")
@@ -1752,7 +4448,11 @@ defmodule Tightbeam.AssignmentsTest do
     do: call("assignment-get", principal, nil, %{assignment_id: id})
 
   defp revoke_call(principal, id),
-    do: call("revoke-assignment", principal, nil, %{assignment_id: id})
+    do:
+      call("revoke-assignment", principal, nil, %{
+        assignment_id: id,
+        reason: "test authorized disposition"
+      })
 
   defp query_call(principal, state, holder),
     do: call("assignments", principal, holder, %{state: state})
@@ -1804,5 +4504,259 @@ defmodule Tightbeam.AssignmentsTest do
     }
 
     Org.create(db, Map.merge(input, overrides))
+  end
+
+  describe "B1 terminal recognition failure isolation" do
+    for persistence <- [:cancellation, :lifecycle] do
+      @failure_persistence persistence
+      test "#{persistence} refusal preserves its notice and carrier while unrelated work advances",
+           ctx do
+        {assignment, notice, personal} = terminal_delivery_fixture(ctx, "surrender")
+
+        assert {:ok, [[slate_id]]} =
+                 DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [
+                   assignment.workItemId
+                 ])
+
+        slate = Wakes.get(ctx.db, slate_id)
+        assert slate.state == "pending"
+
+        {:ok, _} =
+          DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)", [
+            "notice-parent",
+            personal
+          ])
+
+        {table, predicate} =
+          case @failure_persistence do
+            :cancellation ->
+              {"wake_cancellations", "NEW.wakeId='#{notice.wake_id}'"}
+
+            :lifecycle ->
+              {"lifecycle_events",
+               "NEW.kind='wake_undeliverable' AND NEW.subject='#{notice.wake_id}'"}
+          end
+
+        :ok =
+          DB.execute(
+            ctx.db,
+            "CREATE TRIGGER fixture_b1_refusal BEFORE INSERT ON #{table} WHEN #{predicate} BEGIN SELECT RAISE(ABORT, 'fixture B1 persistence refused'); END"
+          )
+
+        unrelated = b1_ordinary_wake(ctx.db, "unrelated B1")
+        observer = self()
+
+        scheduler =
+          b1_scheduler(ctx.db, fn wake ->
+            send(observer, {:b1_attempt, wake.wake_id})
+            deliver_terminal_notice(ctx.db, wake)
+          end)
+
+        scheduler_pid = Process.whereis(scheduler)
+        log = ExUnit.CaptureLog.capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
+        assert log =~ notice.wake_id
+        assert log =~ "persistence_refused"
+        assert Process.whereis(scheduler) == scheduler_pid
+        assert Process.alive?(scheduler_pid)
+        assert Wakes.get(ctx.db, notice.wake_id) == notice
+        assert Wakes.get(ctx.db, slate_id) == slate
+        assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
+        assert_b1_one_turn(ctx.db, unrelated.wake_id)
+        assert_received {:b1_attempt, id} when id == unrelated.wake_id
+        refute_received {:b1_attempt, _}
+
+        # The same scheduler remains usable under a persistent notice-specific
+        # refusal; it neither consumes the carrier nor redelivers unrelated work.
+        ExUnit.CaptureLog.capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
+        assert Process.whereis(scheduler) == scheduler_pid
+        assert Wakes.get(ctx.db, notice.wake_id) == notice
+        assert Wakes.get(ctx.db, slate_id) == slate
+        assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
+        assert_b1_one_turn(ctx.db, unrelated.wake_id)
+        refute_received {:b1_attempt, _}
+
+        :ok = DB.execute(ctx.db, "DROP TRIGGER fixture_b1_refusal")
+        assert :ok = Wakes.fire_due(scheduler)
+        assert Process.whereis(scheduler) == scheduler_pid
+        assert_incomplete_notice(ctx.db, assignment.id, Wakes.get(ctx.db, notice.wake_id))
+
+        assert {:ok, [["routing_bracket", item_id]]} =
+                 DB.query(
+                   ctx.db,
+                   "SELECT livenessTriggerKind,livenessTriggerId FROM wake_cancellations WHERE wakeId=?1",
+                   [notice.wake_id]
+                 )
+
+        assert item_id == assignment.workItemId
+        assert Wakes.get(ctx.db, slate_id).state == "fired"
+        assert_b1_one_turn(ctx.db, unrelated.wake_id)
+        assert_received {:b1_attempt, ^slate_id}
+        refute_received {:b1_attempt, _}
+      end
+    end
+
+    test "already consumed slate leaves unavailable notice pending without fabrication or starvation",
+         ctx do
+      {assignment, notice, personal} = terminal_delivery_fixture(ctx, "surrender")
+
+      # Keep the recorded parent available, but retire the slate's recipient.
+      # Its existing :skipped path consumes the slate without re-arming it.
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey=?1", [personal])
+
+      assert {:ok, [[slate_id]]} =
+               DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [
+                 assignment.workItemId
+               ])
+
+      :ok =
+        DB.execute(
+          ctx.db,
+          "CREATE TRIGGER fixture_b1_enqueue BEFORE INSERT ON turns WHEN NEW.wakeId='#{notice.wake_id}' BEGIN SELECT RAISE(ABORT, 'fixture B1 enqueue refused'); END"
+        )
+
+      scheduler = terminal_notice_scheduler(ctx.db)
+      scheduler_pid = Process.whereis(scheduler)
+      # Real Gateway enqueue failure, not a forced state change: the ordinary
+      # slate is skipped while the notice's attempted enqueue rolls back.
+      assert :ok = Wakes.fire_due(scheduler)
+      consumed_slate = Wakes.get(ctx.db, slate_id)
+      assert consumed_slate.state == "fired"
+      assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [slate_id])
+
+      assert {:ok, [[^slate_id]]} =
+               DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [
+                 assignment.workItemId
+               ])
+
+      assert Wakes.get(ctx.db, notice.wake_id) == notice
+      assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
+      :ok = DB.execute(ctx.db, "DROP TRIGGER fixture_b1_enqueue")
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)", [
+          "notice-parent",
+          personal
+        ])
+
+      unrelated = b1_ordinary_wake(ctx.db, "after consumed slate")
+      log = ExUnit.CaptureLog.capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
+      assert log =~ notice.wake_id
+      assert log =~ "missing_liveness_trigger"
+      assert Process.whereis(scheduler) == scheduler_pid
+      assert Wakes.get(ctx.db, notice.wake_id) == notice
+      assert Wakes.get(ctx.db, slate_id) == consumed_slate
+      assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
+      assert_b1_one_turn(ctx.db, unrelated.wake_id)
+      assert {:ok, []} = DB.query(ctx.db, "SELECT seq FROM turns WHERE wakeId=?1", [slate_id])
+
+      assert {:ok, [[^slate_id]]} =
+               DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [
+                 assignment.workItemId
+               ])
+
+      later = b1_ordinary_wake(ctx.db, "scheduler still usable")
+      ExUnit.CaptureLog.capture_log(fn -> assert :ok = Wakes.fire_due(scheduler) end)
+      assert Process.whereis(scheduler) == scheduler_pid
+      assert Wakes.get(ctx.db, notice.wake_id) == notice
+      assert Wakes.get(ctx.db, slate_id) == consumed_slate
+      assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
+      assert_b1_one_turn(ctx.db, unrelated.wake_id)
+      assert_b1_one_turn(ctx.db, later.wake_id)
+    end
+
+    test "a real rearmed slate permits later typed cancellation without fabricating a carrier",
+         ctx do
+      {assignment, notice, personal} = terminal_delivery_fixture(ctx, "surrender")
+
+      assert {:ok, [[slate_id]]} =
+               DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [
+                 assignment.workItemId
+               ])
+
+      :ok =
+        DB.execute(
+          ctx.db,
+          "CREATE TRIGGER fixture_b1_rearmed BEFORE INSERT ON turns WHEN NEW.wakeId='#{notice.wake_id}' BEGIN SELECT RAISE(ABORT, 'fixture B1 enqueue refused'); END"
+        )
+
+      scheduler = terminal_notice_scheduler(ctx.db)
+      assert :ok = Wakes.fire_due(scheduler)
+      assert_b1_one_turn(ctx.db, slate_id)
+      assert Wakes.get(ctx.db, notice.wake_id) == notice
+      assert_b1_no_terminal_effect(ctx.db, notice.wake_id)
+
+      assert {:ok, [[replacement_id]]} =
+               DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [
+                 assignment.workItemId
+               ])
+
+      refute replacement_id == slate_id
+      replacement = Wakes.get(ctx.db, replacement_id)
+      assert replacement.state == "pending"
+      :ok = DB.execute(ctx.db, "DROP TRIGGER fixture_b1_rearmed")
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey IN (?1,?2)", [
+          "notice-parent",
+          personal
+        ])
+
+      unrelated = b1_ordinary_wake(ctx.db, "existing replacement remains lawful")
+      assert :ok = Wakes.fire_due(scheduler)
+      assert_incomplete_notice(ctx.db, assignment.id, Wakes.get(ctx.db, notice.wake_id))
+      assert Wakes.get(ctx.db, replacement_id) == replacement
+
+      assert {:ok, [[^replacement_id]]} =
+               DB.query(ctx.db, "SELECT slateWakeId FROM work_items WHERE id=?1", [
+                 assignment.workItemId
+               ])
+
+      assert_b1_one_turn(ctx.db, slate_id)
+      assert_b1_one_turn(ctx.db, unrelated.wake_id)
+    end
+  end
+
+  defp b1_ordinary_wake(db, prompt) do
+    Wakes.schedule(db, %{
+      session_key: "other-session",
+      origin: "process:tightbeam",
+      prompt: prompt,
+      due_at: 0
+    })
+  end
+
+  defp b1_scheduler(db, deliver) do
+    name = :"b1_scheduler_#{System.unique_integer([:positive])}"
+
+    start_supervised!(
+      Supervisor.child_spec({Wakes, db: db, name: name, tick_ms: 60_000, deliver: deliver},
+        id: name
+      )
+    )
+
+    name
+  end
+
+  defp assert_b1_no_terminal_effect(db, wake_id) do
+    assert {:ok, []} = DB.query(db, "SELECT seq FROM turns WHERE wakeId=?1", [wake_id])
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT wakeId FROM wake_cancellations WHERE wakeId=?1", [wake_id])
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT subject FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
+               [wake_id]
+             )
+
+    assert {:ok, []} =
+             DB.query(db, "SELECT wakeId FROM wake_retry_attempts WHERE rootWakeId=?1", [wake_id])
+  end
+
+  defp assert_b1_one_turn(db, wake_id) do
+    assert Wakes.get(db, wake_id).state == "fired"
+    assert {:ok, [[1]]} = DB.query(db, "SELECT count(*) FROM turns WHERE wakeId=?1", [wake_id])
   end
 end

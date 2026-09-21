@@ -72,16 +72,12 @@ defmodule Tightbeam.ToplinesRailsTest do
     end)
   end
 
-  test "AC67 rejects invalid Concern state, actors, resolution, time, and titles", %{db: db} do
+  test "AC67 rejects invalid Concern actors, time, and titles", %{db: db} do
     insert!(db, "toplines", topline_row("tl_one"))
 
     invalid = [
-      %{state: "other"},
       %{createdActorRef: nil},
-      %{resolveReason: "done"},
-      resolved_concern(%{resolveReason: nil}),
-      resolved_concern(%{resolvedAt: "later"}),
-      resolved_concern(%{resolvedAt: 9}),
+      %{createdAt: "later"},
       %{title: " Intent"},
       %{title: String.duplicate("a", 2_001)}
     ]
@@ -95,22 +91,20 @@ defmodule Tightbeam.ToplinesRailsTest do
     end)
   end
 
-  test "AC68 rejects invalid Concern-reference actors, reasons, and end tuples", %{db: db} do
+  test "AC68 rejects invalid Concern-tag actors, reasons, and times", %{db: db} do
     seed_reference_parents!(db, "tl_one", "tlm_one", "tlc_one")
 
     invalid = [
-      %{linkedActorRef: nil},
-      %{linkReason: " "},
-      %{unlinkedAt: 20},
-      ended_reference(%{unlinkedAt: "later"}),
-      ended_reference(%{unlinkedAt: 9})
+      %{taggedActorRef: nil},
+      %{tagReason: " "},
+      %{taggedAt: "later"}
     ]
 
     Enum.each(invalid, fn overrides ->
       assert_rejected(
         db,
         "topline_concern_refs",
-        Map.merge(reference_row("tlcr_invalid", "tl_one", "tlc_one", "tlm_one"), overrides)
+        Map.merge(reference_row("tl_one", "tlc_one", "wi_one"), overrides)
       )
     end)
   end
@@ -253,7 +247,7 @@ defmodule Tightbeam.ToplinesRailsTest do
 
   test "AC70 rejects invalid event kinds, actors, times, detail, and identifiers", %{db: db} do
     seed_reference_parents!(db, "tl_one", "tlm_one", "tlc_one")
-    insert!(db, "topline_concern_refs", reference_row("tlcr_one", "tl_one", "tlc_one", "tlm_one"))
+    insert!(db, "topline_concern_refs", reference_row("tl_one", "tlc_one", "wi_one"))
 
     invalid = [
       %{kind: "other"},
@@ -290,7 +284,7 @@ defmodule Tightbeam.ToplinesRailsTest do
     end
   end
 
-  test "AC72 rejects a Concern reference whose parents belong to different Toplines", %{db: db} do
+  test "AC72 rejects a Concern tag without same-Topline active membership", %{db: db} do
     insert_work_item!(db, "wi_three", "flynn")
     insert!(db, "toplines", topline_row("tl_one"))
     insert!(db, "toplines", %{topline_row("tl_two") | ownerUserId: "flynn"})
@@ -305,7 +299,7 @@ defmodule Tightbeam.ToplinesRailsTest do
     assert_rejected(
       db,
       "topline_concern_refs",
-      reference_row("tlcr_cross_topline", "tl_one", "tlc_one", "tlm_two")
+      reference_row("tl_one", "tlc_one", "wi_three")
     )
   end
 
@@ -369,49 +363,23 @@ defmodule Tightbeam.ToplinesRailsTest do
       id: id,
       toplineId: topline_id,
       title: "Risk",
-      state: "open",
       createdActorKind: "user",
       createdActorRef: "flynn",
-      createdAt: 10,
-      updatedAt: 10,
-      resolveReason: nil,
-      resolvedActorKind: nil,
-      resolvedActorRef: nil,
-      resolvedAt: nil
+      createdAt: 10
     }
   end
 
-  defp resolved_concern(overrides) do
-    Map.merge(
-      %{
-        state: "resolved",
-        resolveReason: "done",
-        resolvedActorKind: "user",
-        resolvedActorRef: "flynn",
-        resolvedAt: 20
-      },
-      overrides
-    )
-  end
-
-  defp reference_row(id, topline_id, concern_id, membership_id) do
+  defp reference_row(topline_id, concern_id, work_item_id) do
     %{
-      id: id,
       toplineId: topline_id,
       concernId: concern_id,
-      membershipId: membership_id,
-      linkReason: "addresses risk",
-      linkedActorKind: "user",
-      linkedActorRef: "flynn",
-      linkedAt: 10,
-      unlinkReason: nil,
-      unlinkedActorKind: nil,
-      unlinkedActorRef: nil,
-      unlinkedAt: nil
+      workItemId: work_item_id,
+      tagReason: "addresses risk",
+      taggedActorKind: "user",
+      taggedActorRef: "flynn",
+      taggedAt: 10
     }
   end
-
-  defp ended_reference(overrides), do: ended_membership(overrides)
 
   defp placement_row(id) do
     %{
@@ -456,7 +424,6 @@ defmodule Tightbeam.ToplinesRailsTest do
       kind: "topline_created",
       membershipId: nil,
       concernId: nil,
-      concernReferenceId: nil,
       actorKind: "user",
       actorRef: "flynn",
       reason: nil,

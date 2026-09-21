@@ -38,6 +38,95 @@ defmodule Tightbeam.Identity do
   @doc "The immutable served-guidance composition contract."
   def render_contract, do: @render_contract
 
+  @doc "Names of shipped bundles and bundles in the published identity."
+  def public_kungfu_names(base_dir) do
+    dir = identity_dir(base_dir)
+
+    installed =
+      if File.dir?(Path.join(dir, ".git")) do
+        git_output!(dir, ["ls-tree", "-r", "--name-only", @live, "--", "kungfu"])
+        |> String.split("\n", trim: true)
+        |> Enum.flat_map(fn path ->
+          case String.split(path, "/") do
+            ["kungfu", name, "manifest.toml"] -> [name]
+            _ -> []
+          end
+        end)
+      else
+        []
+      end
+
+    Enum.sort(Enum.uniq(available_bundle_names() ++ installed))
+  end
+
+  @doc "Serve the three public document paths unchanged, with hashes of the served bytes."
+  def public_kungfu(base_dir, name) do
+    unless is_binary(name) and Regex.match?(~r/^[A-Za-z0-9][A-Za-z0-9_-]*$/, name),
+      do: raise(ArgumentError, "invalid kungfu name")
+
+    dir = identity_dir(base_dir)
+    available = Enum.find(available_bundles(), &(&1.name == name))
+    manifest_path = Path.join(["kungfu", name, "manifest.toml"])
+    installed? = File.dir?(Path.join(dir, ".git")) and path_exists_at?(dir, @live, manifest_path)
+
+    cond do
+      installed? ->
+        revision = git_output!(dir, ["rev-parse", @live])
+        manifest = bundle_manifest!(git_show!(dir, revision, manifest_path), manifest_path)
+
+        documents =
+          for path <- ~w(README.md capabilities.md preferred-models.md),
+              relative = Path.join(["kungfu", name, path]),
+              path_exists_at?(dir, revision, relative),
+              do: public_document(path, git_show_bytes!(dir, revision, relative))
+
+        %{
+          "name" => name,
+          "purpose" => manifest.purpose,
+          "phrases" => Enum.sort(manifest.phrases),
+          "rootArchetype" => manifest.root_archetype,
+          "installedRevision" => revision,
+          "status" => "installed",
+          "documents" => documents,
+          "rowVersion" => 1
+        }
+
+      available ->
+        documents =
+          for path <- ~w(README.md capabilities.md preferred-models.md),
+              full = Path.join(bundle_dir(name), path),
+              File.regular?(full),
+              do: public_document(path, File.read!(full))
+
+        %{
+          "name" => name,
+          "purpose" => available.purpose,
+          "phrases" => Enum.sort(available.phrases),
+          "rootArchetype" => available.root_archetype,
+          "installedRevision" => nil,
+          "status" => "available",
+          "documents" => documents,
+          "rowVersion" => 1
+        }
+
+      true ->
+        nil
+    end
+  end
+
+  defp public_document(path, bytes),
+    do: %{
+      "path" => path,
+      "content" => bytes,
+      "sha256" => :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
+    }
+
+  @doc false
+  def init_after_admission!(base_dir, db) do
+    :ok = Tightbeam.DB.assert_base_admitted!(db, base_dir)
+    init!(base_dir)
+  end
+
   @doc "Seed a new organization with the neutral identity substrate."
   @spec init!(String.t()) :: :initialized | :noop
   def init!(base_dir) do
@@ -162,6 +251,7 @@ defmodule Tightbeam.Identity do
       end)
 
     archetype_render = Archetypes.guidance_render(archetype, catalog)
+    bundle_context = available_bundle_context(archetype_name)
 
     root_parts =
       Enum.flat_map(@universal_roots, fn name ->
@@ -174,7 +264,8 @@ defmodule Tightbeam.Identity do
       end)
 
     guidance =
-      ([archetype_render.bytes] ++ root_parts)
+      ([archetype_render.bytes, bundle_context] ++ root_parts)
+      |> Enum.reject(&is_nil/1)
       |> Enum.join("\n\n")
       |> then(&Harness.module!(harness).session_config(%{identity: true}, &1).guidance)
 
@@ -203,6 +294,27 @@ defmodule Tightbeam.Identity do
       skills: skills
     }
   end
+
+  defp available_bundle_context("default") do
+    bundles =
+      available_bundles()
+      |> Enum.map_join("\n\n", fn bundle ->
+        phrases = Enum.map_join(bundle.phrases, "\n", &"- #{&1}")
+        "### `#{bundle.name}`\nPurpose: #{bundle.purpose}\nPhrases:\n#{phrases}"
+      end)
+
+    """
+    ## Available kungfu bundles in this Tightbeam build
+
+    Use these facts, composed from the installed build's shipped bundle manifests, to match a
+    user's stated goal before any tool call.
+
+    #{bundles}
+    """
+    |> String.trim()
+  end
+
+  defp available_bundle_context(_archetype_name), do: nil
 
   # A fragment the SUBSTRATE requires, which an org's tree may predate.
   #

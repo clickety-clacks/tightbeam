@@ -22,6 +22,25 @@ defmodule Tightbeam.CredentialKindsTest do
   alias Tightbeam.{Credentials, ModelCatalog}
   alias Tightbeam.Harness.{Claude, Codex}
 
+  defp start_credentials(opts), do: Credentials.start_link(credential_opts(opts))
+
+  defp credential_opts(opts) do
+    home =
+      Tightbeam.Homes.home_path(
+        Keyword.fetch!(opts, :base_dir),
+        Keyword.fetch!(opts, :machine),
+        :claude
+      )
+
+    synthetic_warm = fn argv ->
+      assert ["env", config_home, _binary, "-p", "ok", "--model", "sonnet"] = argv
+      assert config_home == "CLAUDE_CONFIG_DIR=#{home}"
+      {"", 0}
+    end
+
+    Keyword.put_new(opts, :sh, synthetic_warm)
+  end
+
   setup do
     base = Path.join(System.tmp_dir!(), "tb-cred-kinds-#{System.unique_integer([:positive])}")
     db = :"cred_kinds_db_#{System.unique_integer([:positive])}"
@@ -32,7 +51,7 @@ defmodule Tightbeam.CredentialKindsTest do
   end
 
   defp stage!(base, provider, filename, bytes) do
-    path = Path.join([base, "auth", provider, filename])
+    path = Path.join([base, "homes", Tightbeam.Placement.local_host_name(), provider, filename])
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, bytes)
     path
@@ -53,14 +72,26 @@ defmodule Tightbeam.CredentialKindsTest do
 
   describe "the credential store records the kind" do
     test "an API key banks with the kind recorded and no expiry", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} =
+        start_credentials(
+          name: nil,
+          base_dir: ctx.base,
+          machine: Tightbeam.Placement.local_host_name()
+        )
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(staging, ".credentials.json"), "sk-ant-api03-staged")
       assert :ok = Credentials.finish_onboard(:anthropic, :api_key, lease_id, server)
 
       metadata =
-        [ctx.base, "auth", "claude", ".tightbeam", "credential.json"]
+        [
+          ctx.base,
+          "homes",
+          Tightbeam.Placement.local_host_name(),
+          "claude",
+          ".tightbeam",
+          "credential.json"
+        ]
         |> Path.join()
         |> File.read!()
         |> JSON.decode!()
@@ -78,8 +109,88 @@ defmodule Tightbeam.CredentialKindsTest do
       assert Credentials.kind_at(ctx.base, :anthropic) == :api_key
     end
 
-    test "a subscription banks with its kind and keeps its expiry", ctx do
+    test "an OpenCode Go API key banks in Pi's native auth.json", ctx do
       {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
+
+      File.write!(
+        Path.join(staging, "auth.json"),
+        ~s({"opencode-go":{"type":"api_key","key":"fixture-go-key"}})
+      )
+
+      assert :ok = Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
+
+      store = Credentials.credential_path(ctx.base, "eezo", :opencode_go)
+
+      metadata_path =
+        Path.join([ctx.base, "homes", "eezo", "pi", ".tightbeam", "credential.json"])
+
+      assert JSON.decode!(File.read!(store)) == %{
+               "opencode-go" => %{"type" => "api_key", "key" => "fixture-go-key"}
+             }
+
+      assert File.stat!(store).mode |> Bitwise.band(0o777) == 0o600
+      assert File.stat!(metadata_path).mode |> Bitwise.band(0o777) == 0o600
+
+      metadata = metadata_path |> File.read!() |> JSON.decode!()
+      assert metadata["provider"] == "opencode_go"
+      assert metadata["kind"] == "api_key"
+      assert metadata["onboarded"] == true
+      assert metadata["expires_at"] == nil
+      assert Credentials.kind_at(ctx.base, "eezo", :opencode_go) == :api_key
+    end
+
+    test "Pi runtime credential replacement survives restart without a legacy bank", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
+      initial = ~s({"opencode-go":{"type":"api_key","key":"fixture-original"}})
+      rotated = ~s({"opencode-go":{"type":"api_key","key":"fixture-runtime-replacement"}})
+      File.write!(Path.join(staging, "auth.json"), initial)
+      assert :ok = Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
+
+      home = Tightbeam.Homes.home_path(ctx.base, "eezo", :pi)
+      credential = Credentials.credential_path(ctx.base, "eezo", :opencode_go)
+      assert credential == Path.join(home, "auth.json")
+      refute "auth.json" in Tightbeam.Harness.Pi.owned_home_entries()
+      legacy = Path.join([ctx.base, "auth", "pi", "auth.json"])
+      refute File.exists?(legacy)
+
+      # Simulate the harness replacing its native credential, then leave an old
+      # bank as a trap: restarting Tightbeam must not copy those stale bytes back.
+      File.write!(credential, rotated)
+      File.mkdir_p!(Path.dirname(legacy))
+      File.write!(legacy, initial)
+      GenServer.stop(server)
+      {:ok, restarted} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      assert Credentials.status(:opencode_go, restarted) == :onboarded
+      assert File.read!(credential) == rotated
+      assert File.read!(legacy) == initial
+      assert Credentials.kind_at(ctx.base, "eezo", :opencode_go) == :api_key
+      GenServer.stop(restarted)
+    end
+
+    test "a malformed Pi auth.json is refused before it reaches the store", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
+      File.write!(Path.join(staging, "auth.json"), ~s({"opencode-go":{"type":"api_key"}}))
+
+      assert {:error, {:hollow_credential, %{found: found, sentence: sentence}}} =
+               Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
+
+      assert found =~ "opencode-go.key is missing"
+      assert sentence =~ "tightbeam onboard opencode-go"
+      refute File.exists?(Credentials.credential_path(ctx.base, "eezo", :opencode_go))
+    end
+
+    test "a subscription banks with its kind without inferring expiry", ctx do
+      {:ok, server} =
+        start_credentials(
+          name: nil,
+          base_dir: ctx.base,
+          machine: Tightbeam.Placement.local_host_name()
+        )
 
       {:ok, staging, lease_id} = Credentials.begin_onboard(:anthropic, server)
 
@@ -91,19 +202,31 @@ defmodule Tightbeam.CredentialKindsTest do
       assert :ok = Credentials.finish_onboard(:anthropic, :subscription, lease_id, server)
 
       metadata =
-        [ctx.base, "auth", "claude", ".tightbeam", "credential.json"]
+        [
+          ctx.base,
+          "homes",
+          Tightbeam.Placement.local_host_name(),
+          "claude",
+          ".tightbeam",
+          "credential.json"
+        ]
         |> Path.join()
         |> File.read!()
         |> JSON.decode!()
 
       assert metadata["kind"] == "subscription"
-      assert is_integer(metadata["expires_at"])
+      refute Map.has_key?(metadata, "expires_at")
       assert metadata["subscription_status"] == "supported"
       assert Credentials.kind(:anthropic, server) == :subscription
     end
 
     test "no credential is its own state, not a kind", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} =
+        start_credentials(
+          name: nil,
+          base_dir: ctx.base,
+          machine: Tightbeam.Placement.local_host_name()
+        )
 
       assert Credentials.kind(:anthropic, server) == :none
       assert Credentials.kind(:openai, server) == :none
@@ -111,7 +234,12 @@ defmodule Tightbeam.CredentialKindsTest do
     end
 
     test "both providers on one host can hold different kinds", ctx do
-      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+      {:ok, server} =
+        start_credentials(
+          name: nil,
+          base_dir: ctx.base,
+          machine: Tightbeam.Placement.local_host_name()
+        )
 
       {:ok, claude_staging, claude_lease_id} = Credentials.begin_onboard(:anthropic, server)
       File.write!(Path.join(claude_staging, ".credentials.json"), "sk-ant-api03-staged")
@@ -147,7 +275,7 @@ defmodule Tightbeam.CredentialKindsTest do
     defp target(base, ssh) do
       %{
         base_dir: base,
-        host_name: "vector",
+        host_name: Tightbeam.Placement.local_host_name(),
         host_config: %{base_dir: base, ssh: ssh},
         adapter_binary: Path.join(base, "adapter"),
         sh: fn _command -> {"", 0} end
@@ -157,7 +285,13 @@ defmodule Tightbeam.CredentialKindsTest do
     test "a local api-key host gets ANTHROPIC_API_KEY and nothing else", ctx do
       stage!(ctx.base, "claude", ".credentials.json", "sk-ant-api03-local\n")
 
-      plan = Claude.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:api_key))
+      plan =
+        Claude.prepare_launch(
+          target(ctx.base, nil),
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :claude),
+          launch_opts(:api_key)
+        )
+
       env = Keyword.fetch!(plan, :env)
 
       assert {"ANTHROPIC_API_KEY", "sk-ant-api03-local"} in env
@@ -177,11 +311,19 @@ defmodule Tightbeam.CredentialKindsTest do
     test "a local subscription host gets no credential in its environment at all", ctx do
       stage!(ctx.base, "claude", ".credentials.json", ~s({"claudeAiOauth":{"accessToken":"a"}}))
 
-      plan = Claude.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:subscription))
+      plan =
+        Claude.prepare_launch(
+          target(ctx.base, nil),
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :claude),
+          launch_opts(:subscription)
+        )
+
       env = Keyword.fetch!(plan, :env)
 
       assert Enum.filter(env, fn {name, _} -> credential_variable?(name) end) == []
-      assert {"CLAUDE_CONFIG_DIR", "/home"} in env
+
+      assert {"CLAUDE_CONFIG_DIR",
+              Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :claude)} in env
     end
 
     test "a remote host expands its own credential and puts no secret in any argv", ctx do
@@ -190,7 +332,7 @@ defmodule Tightbeam.CredentialKindsTest do
       plan =
         Claude.prepare_launch(
           target(ctx.base, "vector@remote"),
-          "/home",
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :claude),
           launch_opts(:api_key)
         )
 
@@ -210,8 +352,19 @@ defmodule Tightbeam.CredentialKindsTest do
     test "codex's launch plan does not vary by kind", ctx do
       stage!(ctx.base, "codex", "auth.json", ~s({"OPENAI_API_KEY":"sk-proj-x"}))
 
-      keyed = Codex.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:api_key))
-      subbed = Codex.prepare_launch(target(ctx.base, nil), "/home", launch_opts(:subscription))
+      keyed =
+        Codex.prepare_launch(
+          target(ctx.base, nil),
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :codex),
+          launch_opts(:api_key)
+        )
+
+      subbed =
+        Codex.prepare_launch(
+          target(ctx.base, nil),
+          Tightbeam.Homes.home_path(ctx.base, Tightbeam.Placement.local_host_name(), :codex),
+          launch_opts(:subscription)
+        )
 
       # Codex reads its credential out of auth.json itself, so the kind cannot
       # reach the launch. Pinned rather than assumed.
@@ -429,7 +582,9 @@ defmodule Tightbeam.CredentialKindsTest do
           ["kind-admin", System.system_time(:second)]
         )
 
-      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+      start_supervised!(
+        {Credentials, credential_opts(name: Credentials, base_dir: ctx.base, machine: "testhost")}
+      )
 
       onboard =
         Tightbeam.Gateway.handlers(%{
@@ -474,7 +629,9 @@ defmodule Tightbeam.CredentialKindsTest do
           ["owner-admin", System.system_time(:second)]
         )
 
-      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+      start_supervised!(
+        {Credentials, credential_opts(name: Credentials, base_dir: ctx.base, machine: "testhost")}
+      )
 
       onboard =
         Tightbeam.Gateway.handlers(%{
@@ -504,7 +661,9 @@ defmodule Tightbeam.CredentialKindsTest do
           ["kind-admin", System.system_time(:second)]
         )
 
-      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+      start_supervised!(
+        {Credentials, credential_opts(name: Credentials, base_dir: ctx.base, machine: "testhost")}
+      )
 
       onboard =
         Tightbeam.Gateway.handlers(%{
@@ -535,6 +694,39 @@ defmodule Tightbeam.CredentialKindsTest do
       # store, whose spelling is its own (invariant: one authority per
       # vocabulary).
       assert Credentials.kind(:anthropic, Credentials) == :none
+    end
+
+    test "OpenCode Go refuses subscription kind before opening a lease", ctx do
+      :ok = Tightbeam.Devices.ensure_schema(ctx.db)
+
+      {:ok, _rows} =
+        Tightbeam.DB.query(
+          ctx.db,
+          "INSERT INTO users (userId, isAdmin, createdAt) VALUES (?1, 1, ?2)",
+          ["go-admin", System.system_time(:second)]
+        )
+
+      start_supervised!({Credentials, name: Credentials, base_dir: ctx.base, machine: "testhost"})
+
+      onboard =
+        Tightbeam.Gateway.handlers(%{
+          base_dir: ctx.base,
+          db: ctx.db,
+          onboarding_lease_ms: 1_800_000
+        })["onboard"]
+
+      call = %{
+        origin: "user:go-admin",
+        params: %{provider: "opencode-go", phase: "begin", kind: "subscription"}
+      }
+
+      assert %{
+               code: "invalid_message",
+               message: "opencode-go requires credential kind apiKey; subscription is unsupported"
+             } = onboard.(call)
+
+      assert %{provider: :opencode_go, kind: "apiKey", status: "ready"} =
+               onboard.(put_in(call.params[:kind], "apiKey"))
     end
   end
 

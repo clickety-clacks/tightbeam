@@ -41,8 +41,14 @@ mix run scripts/soak.exs -- --minutes 1440
 The default arena is `~/.tightbeam-soak`; use `--base-dir` and `--port` for a
 different dedicated arena. The driver refuses an existing directory unless
 it contains its `.soak-arena` marker, then recreates that marked arena for a
-fresh run. It symlinks the existing `~/.tightbeam-beam/auth/claude` directory
-into the arena; it never copies the OAuth token.
+fresh run. Set `TIGHTBEAM_SOAK_SOURCE_BASE` explicitly to an authorized,
+same-machine template base. There is no legacy-auth or live-home default.
+Preparation selects only `homes/<current-machine>/claude`, with its regular
+credential and same-home metadata, and the template adapters. It refuses linked
+home entries, missing metadata, and overlapping source/arena paths before reset.
+It does not import another machine's home or create another Codex refresher.
+Synthetic copy tests do not authorize real credential copying or provider runs;
+obtain the separate operational disposition before using this live-load driver.
 
 Results remain in the arena: `state.db` is the audited ledger,
 `soak-events.log` records load, kill, recovery, and audit events,

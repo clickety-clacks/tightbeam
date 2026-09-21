@@ -22,8 +22,11 @@ defmodule Tightbeam.Boot do
   end
 
   @doc "Run the boot sequence; returns :ignore so no process lingers."
-  @spec start_link(String.t()) :: :ignore
-  def start_link(base_dir) do
+  @spec start_link(map()) :: :ignore
+  def start_link(%{base_dir: base_dir} = config) do
+    :ok = Tightbeam.DB.assert_base_admitted!(Tightbeam.DB, base_dir)
+    Tightbeam.Identity.init_after_admission!(base_dir, Tightbeam.DB)
+    Tightbeam.Gateway.load_law!(config)
     :ok = Schema.ensure_all(Tightbeam.DB)
     epoch = EventLog.boot()
     Application.put_env(:tightbeam, :boot_epoch, epoch)
