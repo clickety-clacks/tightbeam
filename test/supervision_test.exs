@@ -209,6 +209,297 @@ defmodule Tightbeam.SupervisionTest do
     assert Enum.map(Wakes.list_pending(ctx.db), & &1.wake_id) == before_denial
   end
 
+  test "idle cleanup backfills quiet sessions with private evidence and no retirement", ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=1,updatedAt=1 WHERE sessionKey='supervisor'"
+      )
+
+    main_key = ctx.main.session_key
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_backfill_supervision)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert [%{session_key: ^main_key} = wake] = cleanup_wakes
+    assert wake.prompt =~ "child=supervisor"
+    assert wake.prompt =~ "ageMs="
+    assert wake.prompt =~ "lastAssignment=none"
+    assert wake.prompt =~ "outcome=none"
+    assert wake.prompt =~ "workItem=none"
+    assert wake.prompt =~ "custody=none"
+    assert wake.prompt =~ "cause=idle_cleanup_quiet; principal=process:tightbeam"
+    refute wake.prompt =~ "ship it"
+    refute wake.prompt =~ "assignment:"
+
+    assert {:ok, [["active"]]} =
+             DB.query(ctx.db, "SELECT state FROM sessions WHERE sessionKey='supervisor'")
+
+    assert [%{kind: "idle_cleanup_prompt_claimed"}] =
+             Enum.filter(EventLog.lifecycle_events(ctx.db), &(&1.subject == wake.wake_id))
+  end
+
+  test "idle cleanup applies its horizon and excludes open or pending sessions", ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 10_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    pending = session(ctx.db, "pending-child", ctx.supervisor.session_key)
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey IN ('supervisor','pending-child')",
+        [now - 9_000]
+      )
+
+    pending_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: pending.session_key,
+        origin: "user:flynn",
+        prompt: "pending ordinary wake",
+        due_at: now + 60_000
+      })
+
+    main_key = ctx.main.session_key
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_horizon_supervision)
+
+    refute Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
+             is_binary(wake.obligation_ref) and
+               String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+           end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey='supervisor'",
+        [System.system_time(:millisecond) - 11_000]
+      )
+
+    sweep_liveness!(:idle_cleanup_horizon_supervision)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert [%{session_key: ^main_key}] = cleanup_wakes
+    assert Wakes.get(ctx.db, pending_wake.wake_id).state == "pending"
+  end
+
+  test "idle cleanup mixes sibling eligibility, deduplicates, and escalates one group", ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    child_a = session(ctx.db, "child-a", ctx.supervisor.session_key)
+    child_b = session(ctx.db, "child-b", ctx.supervisor.session_key)
+    supervisor_key = ctx.supervisor.session_key
+    main_key = ctx.main.session_key
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey='child-a'",
+        [
+          now - 3_000
+        ]
+      )
+
+    Wakes.schedule(ctx.db, %{
+      session_key: ctx.supervisor.session_key,
+      origin: "user:flynn",
+      prompt: "parent activity",
+      due_at: now + 60_000
+    })
+
+    start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_cleanup_group_supervision)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert [%{session_key: ^supervisor_key, prompt: first_prompt} = first] = cleanup_wakes
+    assert first_prompt =~ "child=child-a"
+    refute first_prompt =~ "child=child-b"
+    assert first_prompt =~ "delivered=0"
+    assert first_prompt =~ "targetDepth=0"
+
+    # A second sweep and a second Supervision process see the same pending wake.
+    sweep_liveness!(:idle_cleanup_group_supervision)
+    assert :ok = stop_supervised(Supervision)
+    start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_cleanup_group_restart)
+
+    assert 1 ==
+             Enum.count(Wakes.list_pending(ctx.db), fn wake ->
+               is_binary(wake.obligation_ref) and
+                 String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+             end)
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: first.session_key,
+               message_id: "idle-cleanup-generation-1",
+               wake_id: first.wake_id,
+               origin: first.origin,
+               prompt: first.prompt
+             })
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1",
+        [first.wake_id, System.system_time(:millisecond) - 2_000]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey='child-b'",
+        [
+          System.system_time(:millisecond) - 3_000
+        ]
+      )
+
+    sweep_liveness!(:idle_cleanup_group_restart)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert [%{session_key: ^main_key, prompt: second_prompt}] = cleanup_wakes
+    assert second_prompt =~ "child=child-a"
+    assert second_prompt =~ "child=child-b"
+    assert second_prompt =~ "child=child-a;"
+    assert second_prompt =~ "delivered=1"
+    assert second_prompt =~ "targetDepth=1"
+    assert child_a.session_key == "child-a"
+    assert child_b.session_key == "child-b"
+
+    assert {:ok, [["active"], ["active"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM sessions WHERE sessionKey IN ('child-a','child-b') ORDER BY sessionKey"
+             )
+  end
+
+  test "idle cleanup climbs dormant or retired parents and routes living ancestors or Main",
+       ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    dormant_parent = session(ctx.db, "dormant-parent", ctx.supervisor.session_key)
+    _dormant_child = session(ctx.db, "dormant-child", dormant_parent.session_key)
+    retired_parent = session(ctx.db, "retired-parent", ctx.supervisor.session_key)
+    _retired_child = session(ctx.db, "retired-child", retired_parent.session_key)
+    living_parent = session(ctx.db, "living-parent", ctx.supervisor.session_key)
+    living_child = session(ctx.db, "living-child", living_parent.session_key)
+    _orphan = session(ctx.db, "orphan", nil)
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='retired-parent'")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey IN ('supervisor','dormant-parent','dormant-child','retired-child','living-child','orphan')",
+        [now - 3_000]
+      )
+
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_routing_supervision)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert Enum.any?(cleanup_wakes, fn wake -> wake.session_key == living_parent.session_key end)
+
+    assert Enum.all?(cleanup_wakes, fn wake ->
+             wake.session_key in [ctx.main.session_key, living_parent.session_key]
+           end)
+
+    main_prompts =
+      cleanup_wakes
+      |> Enum.filter(&(&1.session_key == ctx.main.session_key))
+      |> Enum.map(& &1.prompt)
+      |> Enum.join("\n")
+
+    assert main_prompts =~ "child=dormant-child"
+    assert main_prompts =~ "child=retired-child"
+    assert main_prompts =~ "child=orphan"
+    assert living_child.session_key == "living-child"
+  end
+
+  test "idle cleanup pauses on the existing shared harness incident", ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=1,updatedAt=1 WHERE sessionKey='supervisor'"
+      )
+
+    open_rate_limit_incident!(ctx)
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_incident_supervision)
+
+    refute Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
+             is_binary(wake.obligation_ref) and
+               String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+           end)
+
+    assert [%{kind: "harness_health_incident_opened"}] =
+             Enum.filter(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "harness_health_incident_opened")
+             )
+  end
+
   test "startup refuses noncanonical liveness epoch provenance", ctx do
     {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_liveness_epoch")
 
