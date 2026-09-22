@@ -2609,6 +2609,15 @@ defmodule Tightbeam.Wire.RouterTest do
                       transport_session_key: "holder-token"
                     }}
 
+    empty_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: ""})
+
+    assert empty_user.status == 403
+
+    assert JSON.decode!(empty_user.resp_body)["error"] == %{
+             "code" => "identity_not_yours",
+             "message" => "this session belongs to flynn"
+           }
+
     # Registering a satellite also provisions its operator endpoint over ssh; this
     # test is about the identity ladder, so the reach is stubbed and the gateway
     # is given the advertised url a real satellite registration requires.

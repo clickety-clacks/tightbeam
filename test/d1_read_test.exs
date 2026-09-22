@@ -316,6 +316,48 @@ defmodule Tightbeam.D1ReadRouteTest do
     assert get_resp_header(missing, "cache-control") == ["no-store"]
   end
 
+  test "session asUser distinguishes absent, empty, matching, and unauthorized identities", ctx do
+    assert get(ctx.opts, "/api/hosts", ctx.session.cli_token).status == 200
+    assert get(ctx.opts, "/api/hosts?asUser=admin", ctx.session.cli_token).status == 200
+
+    for query <- ["?asUser=", "?asUser=operator"] do
+      response = get(ctx.opts, "/api/hosts" <> query, ctx.session.cli_token)
+
+      assert response.status == 403
+
+      assert JSON.decode!(response.resp_body) == %{
+               "schemaVersion" => 1,
+               "resource" => "hosts",
+               "error" => %{
+                 "code" => "identity_not_yours",
+                 "message" => "this session belongs to admin"
+               }
+             }
+    end
+  end
+
+  test "missing REST details honor the 3ms not-found floor without a scheduler overshoot", ctx do
+    elapsed_us =
+      for _ <- 1..5 do
+        started_at = System.monotonic_time(:microsecond)
+        response = get(ctx.opts, "/api/assignments/missing", ctx.admin.token)
+        elapsed = System.monotonic_time(:microsecond) - started_at
+
+        assert response.status == 404
+
+        assert JSON.decode!(response.resp_body) == %{
+                 "schemaVersion" => 1,
+                 "resource" => "assignments",
+                 "error" => %{"code" => "not_found"}
+               }
+
+        elapsed
+      end
+
+    assert Enum.all?(elapsed_us, &(&1 >= 3_000))
+    assert Enum.min(elapsed_us) < 8_000
+  end
+
   @tag :kungfu_protection
   test "kungfu collection and detail serve unchanged listed bytes with exact hashes", ctx do
     first = get(ctx.opts, "/api/kungfu", ctx.admin.token)
