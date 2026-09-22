@@ -652,6 +652,60 @@ defmodule Tightbeam.AdapterCoordinatorTest do
     Process.sleep(100)
   end
 
+  test "authoritative same-context checkout waits for a pending Cursor rendezvous", ctx do
+    path = Path.join(ctx.test_dir, "authoritative_never_ready.js")
+    marker = Path.join(ctx.test_dir, "authoritative_never_ready.initializing")
+
+    File.write!(path, """
+    const fs = require("node:fs");
+    const rl = require("node:readline").createInterface({ input: process.stdin });
+    rl.on("line", (line) => {
+      const m = JSON.parse(line);
+      if (m.method === "initialize") fs.writeFileSync(#{JSON.encode!(marker)}, "pending");
+    });
+    """)
+
+    coordinator =
+      start_supervised!(
+        {AdapterCoordinator,
+         adapter_sup: ctx.sup,
+         readiness_timeout_ms: 200,
+         adapter_context: fn _ -> [credential_kind: :api_key] end,
+         adapter_opts: fn _, _ ->
+           [
+             harness: :cursor,
+             readiness_rendezvous: true,
+             cmd: [System.find_executable("node"), path],
+             home: ctx.test_dir,
+             cwd: ctx.test_dir
+           ]
+         end,
+         db: ctx.db,
+         name: :authoritative_pending_cursor_coordinator}
+      )
+
+    key = {:cursor, "default", "testhost"}
+    ordinary = Task.async(fn -> AdapterCoordinator.adapter_for(coordinator, key) end)
+    assert eventually(fn -> File.exists?(marker) end)
+    refute AdapterCoordinator.ready?(coordinator, key)
+
+    authoritative =
+      Task.async(fn ->
+        AdapterCoordinator.adapter_for(coordinator, key, credential_kind: :api_key)
+      end)
+
+    assert Task.yield(authoritative, 25) == nil
+
+    expected =
+      {:error,
+       {:launch_refused,
+        %{code: "adapter_readiness_timeout", message: "Adapter readiness timed out"}}}
+
+    assert Task.await(ordinary, 500) == expected
+    assert Task.await(authoritative, 500) == expected
+    assert DynamicSupervisor.count_children(ctx.sup).active == 0
+  end
+
   test "five consecutive boot failures open the circuit (async boot)", ctx do
     coordinator =
       start_supervised!(

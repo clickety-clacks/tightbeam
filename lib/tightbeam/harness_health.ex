@@ -45,7 +45,8 @@ defmodule Tightbeam.HarnessHealth do
   # existing PR31 database to the same exact object-set migration.
   @harness_health_predecessor_stamps [
     "addressed-po-consultation-v1-019",
-    "cursor-provider-v1-020"
+    "cursor-provider-v1-020",
+    "cursor-provider-addressed-po-v1-020"
   ]
   @legacy_object_set_sha256 "97ec5ee389c4f1b8d1b932dcfbc9fc59472a9c721a82968b013f63f54b52ebaf"
   @legacy_two_class_object_set_sha256 "be16933e4a429970358325fe941e258e6838e0e0b789a5d0b470bdb1269dcc3e"

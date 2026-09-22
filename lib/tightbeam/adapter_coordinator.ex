@@ -423,11 +423,14 @@ defmodule Tightbeam.AdapterCoordinator do
             {:reply, error, state}
         end
 
-      reusable_entry?(entry) or (authoritative? and live_entry?(entry)) ->
+      reusable_entry?(entry) ->
         {:reply, checkout(entry), state}
 
       readiness_pending?(entry) ->
         {:noreply, add_waiter(key, from, state)}
+
+      authoritative? and live_entry?(entry) ->
+        {:reply, checkout(entry), state}
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
         {:reply, {:error, {:park_fenced, key_name(key)}}, state}

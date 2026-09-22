@@ -11,9 +11,10 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, Wakes}
+  alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
 
-  @shape "cursor-provider-v1-020"
+  @shape "cursor-provider-addressed-po-v1-020"
+  @legacy_cursor_provider_shape "cursor-provider-v1-020"
   @cursor_provider_previous_shape "addressed-po-consultation-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
@@ -165,6 +166,34 @@ defmodule Tightbeam.SchemaShapeTest do
     :ok
   end
 
+  defp load_previous_pr31_fixture(db) do
+    fixture = File.read!(Path.join(__DIR__, "fixtures/previous_pr31_7f0c77d2.sql"))
+
+    assert Base.encode16(:crypto.hash(:sha256, fixture), case: :lower) ==
+             "a1409d2605af26623800065ee9314569ffe7a74d653a07ac4e9659fbebd15be5"
+
+    :ok = DB.execute(db, fixture)
+    :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+
+    assert {:ok, [[@legacy_cursor_provider_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_master WHERE type='table' AND name='session_po_associations'"
+             )
+
+    assert {:ok, [[wire_ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wire_idempotency'"
+             )
+
+    refute wire_ddl =~ "session-po-set"
+    :ok
+  end
+
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
@@ -204,6 +233,30 @@ defmodule Tightbeam.SchemaShapeTest do
                (kind, principal, subagentRef, sourceEventRef, harness, at)
              VALUES ('subagent_start', 'cursor-session', 'sub', 'event', 'cursor', 1);
              """)
+  end
+
+  test "the real previous PR31 schema gains addressed-PO storage before admission", %{db: db} do
+    assert :ok = load_previous_pr31_fixture(db)
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["session_po_associations"]]} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_master WHERE type='table' AND name='session_po_associations'"
+             )
+
+    assert {:ok, [[wire_ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wire_idempotency'"
+             )
+
+    assert wire_ddl =~ "session-po-set"
+    assert SessionPoAssociations.get(db, "missing-session") == nil
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+    assert :ok = Schema.ensure_all(db)
   end
 
   test "liveness-receipt shape advances through the cursor-provider migration", %{db: db} do
