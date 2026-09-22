@@ -500,6 +500,340 @@ defmodule Tightbeam.SupervisionTest do
              )
   end
 
+  test "idle cleanup declines a stale batch at actual delivery and replaces only due siblings",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-a", "idle-b", "idle-c"])
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_revalidation)
+    [batch] = idle_cleanup_wakes(ctx.db)
+
+    assignment(
+      ctx.db,
+      "idle-a-assignment",
+      "idle-a",
+      "new work",
+      System.system_time(:millisecond)
+    )
+
+    pending =
+      Wakes.schedule(ctx.db, %{
+        session_key: "idle-b",
+        origin: "user:flynn",
+        prompt: "causal operator notice",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert :skipped = admit_supervision_wake!(ctx.db, batch)
+    assert Wakes.get(ctx.db, batch.wake_id).state == "fired"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "pending"
+
+    sweep_liveness!(name)
+    [replacement] = idle_cleanup_wakes(ctx.db)
+    assert replacement.prompt =~ "child=idle-c;"
+    refute replacement.prompt =~ "child=idle-a;"
+    refute replacement.prompt =~ "child=idle-b;"
+    assert :appended = admit_supervision_wake!(ctx.db, replacement)
+    assert {:duplicate, _} = admit_supervision_wake!(ctx.db, replacement)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [replacement.wake_id])
+  end
+
+  test "idle cleanup scheduler defers a post-claim incident without consuming a generation",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_incident_delivery)
+    [batch] = idle_cleanup_wakes(ctx.db)
+    open_rate_limit_incident!(ctx)
+    scheduler = idle_cleanup_scheduler!(ctx)
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, batch.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+
+    resolve_rate_limit_incident!(ctx, 1)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, batch.wake_id).state == "fired"
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+  end
+
+  test "idle cleanup rechecks a recipient incident separately from eligible children", ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET host='other-host' WHERE sessionKey='idle-child'")
+
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_target_incident)
+    [batch] = idle_cleanup_wakes(ctx.db)
+    open_rate_limit_incident!(ctx)
+
+    assert {:idle_cleanup_deferred, :shared_harness_incident} =
+             admit_supervision_wake!(ctx.db, batch)
+
+    assert Wakes.get(ctx.db, batch.wake_id).state == "pending"
+    resolve_rate_limit_incident!(ctx, 2)
+    assert :appended = admit_supervision_wake!(ctx.db, batch)
+  end
+
+  test "idle cleanup delivery reroutes a retired or newly dormant parent in the enqueue transaction",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_target_delivery)
+    [batch] = idle_cleanup_wakes(ctx.db)
+    assert batch.session_key == "supervisor"
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=1,updatedAt=1 WHERE sessionKey='supervisor'"
+      )
+
+    assert {:error, %RuntimeError{message: "rollback delivery"}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert {:appended, target, _, _} =
+                        Gateway.deliver_prompt_in_txn(
+                          txn,
+                          batch.session_key,
+                          batch.origin,
+                          batch.prompt,
+                          wake_id: batch.wake_id
+                        )
+
+               assert target == ctx.main.session_key
+               raise "rollback delivery"
+             end)
+
+    assert Wakes.get(ctx.db, batch.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, batch.wake_id).session_key == "supervisor"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='supervisor'")
+
+    assert :appended = admit_supervision_wake!(ctx.db, batch)
+    delivered = Wakes.get(ctx.db, batch.wake_id)
+    assert delivered.session_key == ctx.main.session_key
+    assert delivered.prompt =~ "requestedDepth=0; targetDepth=1"
+    assert delivered.state == "fired"
+  end
+
+  test "idle cleanup resets canceled incoming wake occurrences with unchanged activity across restart",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["observed-child", "unobserved-child"])
+    name = start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_occurrence)
+    [batch] = idle_cleanup_wakes(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, batch)
+
+    observed =
+      Wakes.schedule(ctx.db, %{
+        session_key: "observed-child",
+        origin: "user:flynn",
+        prompt: "parent intervention",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    sweep_liveness!(name)
+    cancel_wake!(ctx.db, observed)
+
+    unobserved =
+      Wakes.schedule(ctx.db, %{
+        session_key: "unobserved-child",
+        origin: "user:flynn",
+        prompt: "between sweeps",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    cancel_wake!(ctx.db, unobserved)
+
+    assert :ok = stop_supervised(Supervision)
+    start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_occurrence_restart)
+    [next] = idle_cleanup_wakes(ctx.db)
+    assert next.session_key == "supervisor"
+    assert next.prompt =~ "child=observed-child;"
+    assert next.prompt =~ "child=unobserved-child;"
+
+    assert length(Regex.scan(~r/delivered=0; N=1; requestedDepth=0; targetDepth=0/, next.prompt)) ==
+             2
+
+    assert {:ok, [[1, 1], [1, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT createdAt,updatedAt FROM sessions WHERE sessionKey IN ('observed-child','unobserved-child')"
+             )
+
+    assert :appended = admit_supervision_wake!(ctx.db, next)
+  end
+
+  test "idle cleanup retains actual ancestor depth and Main across recovery with N greater than one",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+    session(ctx.db, "grandparent", ctx.main.session_key)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET spawnedBy='grandparent',createdAt=1,updatedAt=1 WHERE sessionKey='supervisor'"
+      )
+
+    name = start_liveness!(ctx, prod_limit: 3, sweep_ms: 60_000, name: :idle_depth)
+
+    first =
+      Enum.find(idle_cleanup_wakes(ctx.db), &String.contains?(&1.prompt, "child=idle-child;"))
+
+    assert first.session_key == "grandparent"
+    assert first.prompt =~ "requestedDepth=0; targetDepth=1"
+    assert :appended = admit_supervision_wake!(ctx.db, first)
+    idle_cleanup_elapsed!(ctx.db, first)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET updatedAt=?1 WHERE sessionKey='supervisor'", [
+        System.system_time(:millisecond)
+      ])
+
+    assert :ok = stop_supervised(Supervision)
+    name = start_liveness!(ctx, prod_limit: 3, sweep_ms: 60_000, name: name)
+
+    second =
+      Enum.find(idle_cleanup_wakes(ctx.db), &String.contains?(&1.prompt, "child=idle-child;"))
+
+    assert second.session_key == "grandparent"
+    assert second.prompt =~ "delivered=1; N=3; requestedDepth=0; targetDepth=1"
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='grandparent'")
+
+    assert :appended = admit_supervision_wake!(ctx.db, second)
+    assert Wakes.get(ctx.db, second.wake_id).session_key == ctx.main.session_key
+    assert Wakes.get(ctx.db, second.wake_id).prompt =~ "targetDepth=2"
+    idle_cleanup_elapsed!(ctx.db, second)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET state='active',updatedAt=?1 WHERE sessionKey='grandparent'",
+        [System.system_time(:millisecond)]
+      )
+
+    sweep_liveness!(name)
+
+    third =
+      Enum.find(idle_cleanup_wakes(ctx.db), &String.contains?(&1.prompt, "child=idle-child;"))
+
+    assert third.session_key == ctx.main.session_key
+    assert third.prompt =~ "delivered=2; N=3; requestedDepth=0; targetDepth=2"
+  end
+
+  test "idle cleanup refuses corrupt custody and configuration with row identities and remedy",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+    assignment(ctx.db, "idle-last", "idle-child", "private subject", 1)
+    attach_work_item!(ctx.db, "idle-last", "idle-corrupt-item")
+    persist_terminal_race!(ctx.db, "idle-last", 1)
+    attach_work_item!(ctx.db, "asg_1", "idle-corrupt-item")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE work_items SET state='closed' WHERE id='idle-corrupt-item'")
+
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_invalid_evidence)
+    assert idle_cleanup_wakes(ctx.db) == []
+    refusal = Enum.find(EventLog.lifecycle_events(ctx.db), &(&1.kind == "idle_cleanup_refused"))
+    assert refusal.subject == "idle-child"
+    assert refusal.detail =~ "terminal_work_item_still_held"
+    assert refusal.detail =~ "idle-corrupt-item"
+    assert refusal.detail =~ "remedy=repair_named_ledger_or_configuration_evidence"
+    refute refusal.detail =~ "private subject"
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE work_items SET state='open' WHERE id='idle-corrupt-item'")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT OR REPLACE INTO org_settings (key,value,updatedAt) VALUES ('default-priority','broken',1)"
+      )
+
+    sweep_liveness!(name)
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "idle_cleanup_refused" and &1.subject == "idle-child" and
+                 String.contains?(&1.detail, "invalid_priority"))
+           )
+
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM org_settings WHERE key='default-priority'")
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 0)
+    sweep_liveness!(name)
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "idle_cleanup_refused" and &1.subject == "idle-child" and
+                 String.contains?(&1.detail, "invalid_horizon"))
+           )
+
+    assert idle_cleanup_wakes(ctx.db) == []
+  end
+
+  defp idle_cleanup_fixture!(ctx, children) do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 60_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    for child <- children do
+      session(ctx.db, child, ctx.supervisor.session_key)
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET createdAt=1,updatedAt=1 WHERE sessionKey=?1", [
+          child
+        ])
+    end
+  end
+
+  defp idle_cleanup_wakes(db) do
+    Enum.filter(
+      Wakes.list_pending(db),
+      &String.starts_with?(&1.obligation_ref || "", "idle-cleanup-v1:")
+    )
+  end
+
+  defp idle_cleanup_elapsed!(db, wake) do
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET firedAt=?2 WHERE wakeId=?1", [
+        wake.wake_id,
+        System.system_time(:millisecond) - 61_000
+      ])
+  end
+
+  defp idle_cleanup_scheduler!(ctx) do
+    registry = start_supervised!({ConnRegistry, name: :idle_cleanup_delivery_registry})
+    lane = start_supervised!({LaneDoorbell, :idle_cleanup_delivery_lane})
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       deliver: delivery_fun(ctx.db, registry, lane),
+       tick_ms: 60_000,
+       name: :idle_cleanup_delivery_scheduler}
+    )
+  end
+
   test "startup refuses noncanonical liveness epoch provenance", ctx do
     {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_liveness_epoch")
 

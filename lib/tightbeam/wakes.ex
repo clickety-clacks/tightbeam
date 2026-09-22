@@ -4999,6 +4999,9 @@ defmodule Tightbeam.Wakes do
         end
 
       case {wake.consumer, delivery} do
+        {"prompt", {:ok, {:idle_cleanup_deferred, _reason}}} ->
+          :ok
+
         {"prompt", {:ok, {:terminal_notice_undeliverable, _evidence}}} ->
           :ok
 

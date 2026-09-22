@@ -3480,7 +3480,7 @@ defmodule Tightbeam.Supervision do
     |> Map.new(&{&1.session_key, &1})
   end
 
-  defp idle_cleanup_candidate_in_txn(txn, session, snapshot_at, sessions) do
+  defp idle_cleanup_candidate_in_txn(txn, session, snapshot_at, sessions, ignored_wake \\ nil) do
     with true <- session.state == "active" and not session.built_in,
          [] <-
            Txn.q(
@@ -3491,8 +3491,8 @@ defmodule Tightbeam.Supervision do
          [] <-
            Txn.q(
              txn,
-             "SELECT 1 FROM wakes WHERE state='pending' AND consumer='prompt' AND sessionKey=?1 LIMIT 1",
-             [session.session_key]
+             "SELECT 1 FROM wakes WHERE state='pending' AND consumer='prompt' AND sessionKey=?1 AND (?2 IS NULL OR wakeId<>?2) LIMIT 1",
+             [session.session_key, ignored_wake]
            ),
          {:ok, activity} <- idle_cleanup_activity_in_txn(txn, session),
          {:ok, last_assignment} <- idle_cleanup_last_assignment_in_txn(txn, session.session_key),
@@ -3505,9 +3505,12 @@ defmodule Tightbeam.Supervision do
       gate = HarnessHealth.prod_shape_gate_in_txn(txn, session.harness, session.host, snapshot_at)
       group_digest = idle_cleanup_digest("idle-cleanup-group-v1\0" <> parent_group)
       activity_fingerprint = idle_cleanup_activity_fingerprint(session.session_key, activity)
-      member_token = idle_cleanup_member_token(session.session_key, activity_fingerprint)
+      occurrence = idle_cleanup_occurrence_in_txn(txn, session.session_key, ignored_wake)
 
-      {delivered_count, last_delivered_at} =
+      member_token =
+        idle_cleanup_member_token(session.session_key, activity_fingerprint <> occurrence)
+
+      {delivered_count, last_delivered_at, delivered_depth, delivered_main} =
         idle_cleanup_delivery_history_in_txn(txn, group_digest, member_token)
 
       %{
@@ -3521,6 +3524,8 @@ defmodule Tightbeam.Supervision do
         member_token: member_token,
         delivered_count: delivered_count,
         last_delivered_at: last_delivered_at,
+        delivered_depth: delivered_depth,
+        delivered_main: delivered_main,
         last_assignment: last_assignment,
         custody: custody,
         priority: priority,
@@ -3533,8 +3538,38 @@ defmodule Tightbeam.Supervision do
         harness_available: gate == :available
       }
     else
-      _ -> nil
+      {:error, reason} ->
+        idle_cleanup_refusal_in_txn(txn, session.session_key, reason)
+        nil
+
+      _ ->
+        nil
     end
+  end
+
+  # Incoming wakes end eligibility even when canceled before firing. Their
+  # existing rows distinguish occurrences without changing the activity clock
+  # or remembering which sweeps happened to observe the pending interval.
+  defp idle_cleanup_occurrence_in_txn(txn, session_key, ignored_wake) do
+    Txn.q(
+      txn,
+      """
+      SELECT wakeId,canceledAt FROM wakes
+      WHERE sessionKey=?1 AND consumer='prompt' AND (?2 IS NULL OR wakeId<>?2)
+      ORDER BY rowid DESC LIMIT 1
+      """,
+      [session_key, ignored_wake]
+    )
+    |> JSON.encode!()
+  end
+
+  defp idle_cleanup_refusal_in_txn(txn, subject, reason) do
+    EventLog.lifecycle_in_txn(
+      txn,
+      "idle_cleanup_refused",
+      subject,
+      "cause=#{inspect(reason)} principal=process:tightbeam remedy=repair_named_ledger_or_configuration_evidence"
+    )
   end
 
   defp idle_cleanup_activity_in_txn(txn, session) do
@@ -3614,7 +3649,7 @@ defmodule Tightbeam.Supervision do
                [work_item_id]
              ) do
           [] -> {:ok, %{kind: "terminal:" <> state, holders: []}}
-          _ -> {:error, :terminal_work_item_still_held}
+          _ -> {:error, {:terminal_work_item_still_held, work_item_id}}
         end
 
       [["open"]] ->
@@ -3633,7 +3668,7 @@ defmodule Tightbeam.Supervision do
         end
 
       _ ->
-        {:error, :missing_work_item}
+        {:error, {:missing_work_item, work_item_id}}
     end
   end
 
@@ -3649,8 +3684,14 @@ defmodule Tightbeam.Supervision do
            """,
            [assignment_id, work_item_id]
          ) do
-      [[priority]] when is_integer(priority) and priority in 0..8 -> {:ok, priority}
-      _ -> {:error, :invalid_priority}
+      [[priority]] when is_integer(priority) and priority in 0..8 ->
+        case idle_cleanup_default_priority_in_txn(txn) do
+          default when is_integer(default) and default in 0..8 -> {:ok, priority}
+          _ -> {:error, :invalid_priority}
+        end
+
+      _ ->
+        {:error, :invalid_priority}
     end
   end
 
@@ -3731,24 +3772,28 @@ defmodule Tightbeam.Supervision do
     do: :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
 
   defp idle_cleanup_delivery_history_in_txn(txn, group_digest, member_token) do
-    case Txn.q(
-           txn,
-           """
-           SELECT COUNT(*),MAX(w.firedAt)
-           FROM wakes w
-           WHERE w.origin='process:tightbeam' AND w.state='fired'
-             AND w.obligationRef LIKE ?1
-             AND w.obligationRef LIKE ?2
-             AND EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId)
-           """,
-           [
-             @idle_cleanup_prefix <> group_digest <> "|%",
-             "%|" <> member_token <> "|%"
-           ]
-         ) do
-      [[count, last_delivered_at]] -> {count, last_delivered_at}
-      _ -> {0, nil}
-    end
+    Txn.q(
+      txn,
+      """
+      SELECT w.firedAt,w.obligationRef
+      FROM wakes w
+      WHERE w.origin='process:tightbeam' AND w.state='fired'
+        AND w.obligationRef LIKE ?1
+        AND w.obligationRef LIKE ?2
+        AND EXISTS (SELECT 1 FROM turns t WHERE t.wakeId=w.wakeId)
+      """,
+      [@idle_cleanup_prefix <> group_digest <> "|%", "%|" <> member_token <> "|%"]
+    )
+    |> Enum.reduce({0, nil, 0, false}, fn [at, ref], {count, last, depth, main} ->
+      case idle_cleanup_metadata(ref) do
+        {:ok, metadata} ->
+          {count + 1, max(last || at, at), max(depth, metadata["depth"]),
+           main or metadata["main"]}
+
+        :error ->
+          raise "invalid idle cleanup delivery evidence for group #{group_digest}"
+      end
+    end)
   end
 
   defp idle_cleanup_pending_group_in_txn(txn, group_digest) do
@@ -3790,12 +3835,24 @@ defmodule Tightbeam.Supervision do
       true ->
         requested_depth =
           due_members
-          |> Enum.map(&idle_cleanup_requested_depth(&1.delivered_count, n))
+          |> Enum.map(
+            &max(idle_cleanup_requested_depth(&1.delivered_count, n), &1.delivered_depth)
+          )
           |> Enum.max()
 
         owner = hd(due_members).owner_user_id
 
-        case idle_cleanup_target(sessions, dormant, owner, parent_group, requested_depth) do
+        route_group =
+          if Enum.any?(due_members, & &1.delivered_main),
+            do: "owner-main:" <> owner,
+            else: parent_group
+
+        route_depth =
+          if Enum.any?(due_members, & &1.delivered_main),
+            do: due_members |> Enum.map(& &1.delivered_depth) |> Enum.max(),
+            else: requested_depth
+
+        case idle_cleanup_target(sessions, dormant, owner, route_group, route_depth) do
           nil ->
             EventLog.lifecycle_in_txn(
               txn,
@@ -3806,15 +3863,22 @@ defmodule Tightbeam.Supervision do
 
             :unresolvable
 
-          target ->
+          {target, actual_depth} ->
             wake_id = "idle-cleanup:" <> group_digest <> ":" <> Tightbeam.Id.uuid4()
-            tokens = Enum.map(due_members, & &1.member_token)
 
-            obligation_ref =
-              @idle_cleanup_prefix <> group_digest <> "|" <> Enum.join(tokens, "|") <> "|"
+            metadata = %{
+              "group" => parent_group,
+              "owner" => owner,
+              "n" => n,
+              "depth" => actual_depth,
+              "main" => target.session_key == Org.personal_session_key(owner),
+              "members" => Map.new(due_members, &{&1.session_key, &1.member_token})
+            }
+
+            obligation_ref = idle_cleanup_obligation_ref(group_digest, due_members, metadata)
 
             prompt =
-              idle_cleanup_prompt(parent_group, snapshot_at, due_members, n, requested_depth)
+              idle_cleanup_prompt(parent_group, snapshot_at, due_members, n, actual_depth)
 
             result =
               case HarnessHealth.prod_shape_gate_in_txn(
@@ -3862,7 +3926,7 @@ defmodule Tightbeam.Supervision do
                   txn,
                   "idle_cleanup_prompt_claimed",
                   wake.wake_id,
-                  "group=#{parent_group} target=#{target.session_key} depth=#{requested_depth} members=#{length(due_members)} cause=idle_cleanup_quiet principal=process:tightbeam"
+                  "group=#{parent_group} target=#{target.session_key} depth=#{actual_depth} members=#{length(due_members)} cause=idle_cleanup_quiet principal=process:tightbeam"
                 )
             end
 
@@ -3876,15 +3940,169 @@ defmodule Tightbeam.Supervision do
 
   defp idle_cleanup_requested_depth(delivered_count, _n), do: delivered_count + 1
 
-  defp idle_cleanup_target(sessions, _dormant, owner, "owner-main:" <> _owner, _requested_depth),
-    do: idle_cleanup_owner_main(sessions, owner)
+  # The wake already owns its batch identity. Append the delivery inputs to
+  # that identity so restart needs neither a cleanup table nor prompt parsing.
+  defp idle_cleanup_obligation_ref(group_digest, members, metadata) do
+    tokens = members |> Enum.map(& &1.member_token) |> Enum.sort()
+
+    @idle_cleanup_prefix <>
+      group_digest <>
+      "|" <>
+      Enum.join(tokens, "|") <>
+      "|\n" <>
+      JSON.encode!(metadata)
+  end
+
+  defp idle_cleanup_metadata(ref) do
+    with [identity, json] <- String.split(ref, "\n", parts: 2),
+         {:ok,
+          %{
+            "group" => group,
+            "owner" => owner,
+            "n" => n,
+            "depth" => depth,
+            "main" => main,
+            "members" => members
+          } = metadata} <- JSON.decode(json),
+         true <- is_binary(group) and is_binary(owner) and is_integer(n) and n >= 0,
+         true <- is_integer(depth) and depth >= 0 and is_boolean(main),
+         true <- is_map(members) and map_size(members) > 0,
+         true <- Enum.all?(members, fn {key, token} -> is_binary(key) and is_binary(token) end),
+         digest = idle_cleanup_digest("idle-cleanup-group-v1\0" <> group),
+         tokens = members |> Map.values() |> Enum.sort(),
+         true <-
+           identity == @idle_cleanup_prefix <> digest <> "|" <> Enum.join(tokens, "|") <> "|" do
+      {:ok, metadata}
+    else
+      _ -> :error
+    end
+  end
+
+  @doc false
+  def idle_cleanup_delivery_in_txn(txn, wake_id, snapshot_at) when is_binary(wake_id) do
+    case Wakes.get_in_txn(txn, wake_id) do
+      %{origin: "process:tightbeam", obligation_ref: @idle_cleanup_prefix <> _} = wake ->
+        if wake.state == "pending" do
+          idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at)
+        else
+          :stale
+        end
+
+      _ ->
+        :ordinary
+    end
+  end
+
+  def idle_cleanup_delivery_in_txn(_txn, _wake_id, _snapshot_at), do: :ordinary
+
+  defp idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at) do
+    with {:ok, metadata} <- idle_cleanup_metadata(wake.obligation_ref) do
+      sessions = idle_cleanup_sessions_in_txn(txn)
+
+      eligible =
+        sessions
+        |> Map.values()
+        |> Enum.map(&idle_cleanup_candidate_in_txn(txn, &1, snapshot_at, sessions, wake.wake_id))
+        |> Enum.reject(&is_nil/1)
+
+      dormant = MapSet.new(eligible, & &1.session_key)
+
+      members =
+        eligible
+        |> Enum.filter(fn member ->
+          metadata["members"][member.session_key] == member.member_token and
+            member.parent_group == metadata["group"] and
+            member.owner_user_id == metadata["owner"] and member.due
+        end)
+        |> Enum.sort_by(& &1.session_key)
+
+      cond do
+        length(members) != map_size(metadata["members"]) ->
+          EventLog.lifecycle_in_txn(
+            txn,
+            "idle_cleanup_stale",
+            wake.wake_id,
+            "cause=member_changed principal=process:tightbeam remedy=recompute_due_batch"
+          )
+
+          :stale
+
+        Enum.any?(members, &(not &1.harness_available)) ->
+          {:idle_cleanup_deferred, :shared_harness_incident}
+
+        true ->
+          depth = Enum.reduce(members, metadata["depth"], &max(&1.delivered_depth, &2))
+          main = metadata["main"] or Enum.any?(members, & &1.delivered_main)
+          group = if main, do: "owner-main:" <> metadata["owner"], else: metadata["group"]
+
+          case idle_cleanup_target(sessions, dormant, metadata["owner"], group, depth) do
+            nil ->
+              idle_cleanup_refusal_in_txn(txn, wake.wake_id, :target_unresolvable)
+              {:idle_cleanup_deferred, :target_unresolvable}
+
+            {target, actual_depth} ->
+              case HarnessHealth.prod_shape_gate_in_txn(
+                     txn,
+                     target.harness,
+                     target.host,
+                     snapshot_at
+                   ) do
+                :available ->
+                  metadata = %{
+                    metadata
+                    | "depth" => actual_depth,
+                      "main" => target.session_key == Org.personal_session_key(metadata["owner"])
+                  }
+
+                  ref = idle_cleanup_obligation_ref(hd(members).group_digest, members, metadata)
+
+                  prompt =
+                    idle_cleanup_prompt(
+                      metadata["group"],
+                      snapshot_at,
+                      members,
+                      metadata["n"],
+                      actual_depth
+                    )
+
+                  # Gateway appends the turn and fires this wake in the same
+                  # transaction, so history cannot observe a claimed depth as
+                  # a delivered generation or lose it across a crash.
+                  Txn.q(
+                    txn,
+                    "UPDATE wakes SET sessionKey=?2,prompt=?3,obligationRef=?4 WHERE wakeId=?1 AND state='pending'",
+                    [wake.wake_id, target.session_key, prompt, ref]
+                  )
+
+                  {:deliver,
+                   %{wake | session_key: target.session_key, prompt: prompt, obligation_ref: ref}}
+
+                {:unavailable, _gate} ->
+                  {:idle_cleanup_deferred, :shared_harness_incident}
+              end
+          end
+      end
+    else
+      :error ->
+        idle_cleanup_refusal_in_txn(txn, wake.wake_id, :invalid_delivery_metadata)
+        :stale
+    end
+  end
+
+  defp idle_cleanup_target(sessions, _dormant, owner, "owner-main:" <> _owner, requested_depth) do
+    case idle_cleanup_owner_main(sessions, owner) do
+      nil -> nil
+      target -> {target, requested_depth}
+    end
+  end
 
   defp idle_cleanup_target(sessions, dormant, owner, parent_group, requested_depth) do
     chain = idle_cleanup_lineage(parent_group, sessions, owner, MapSet.new(), [])
 
     chain
+    |> Enum.with_index()
     |> Enum.drop(max(requested_depth, 0))
-    |> Enum.find(fn key ->
+    |> Enum.find(fn {key, _depth} ->
       case Map.get(sessions, key) do
         %{state: "active", built_in: built_in} when not built_in ->
           not MapSet.member?(dormant, key)
@@ -3897,8 +4115,17 @@ defmodule Tightbeam.Supervision do
       end
     end)
     |> case do
-      nil -> idle_cleanup_owner_main(sessions, owner)
-      key -> Map.fetch!(sessions, key)
+      nil ->
+        case idle_cleanup_owner_main(sessions, owner) do
+          nil ->
+            nil
+
+          target ->
+            {target, Enum.find_index(chain, &(&1 == target.session_key)) || length(chain)}
+        end
+
+      {key, depth} ->
+        {Map.fetch!(sessions, key), depth}
     end
   end
 
