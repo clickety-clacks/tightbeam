@@ -1845,7 +1845,30 @@ defmodule Tightbeam.Gateway do
   defp deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts) do
     case Wakes.terminal_notice_delivery_in_txn(txn, opts[:wake_id]) do
       :ordinary ->
-        deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+        case Supervision.idle_cleanup_delivery_in_txn(
+               txn,
+               opts[:wake_id],
+               System.system_time(:millisecond)
+             ) do
+          :ordinary ->
+            deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+
+          :stale ->
+            fire_wake_in_txn(txn, Keyword.put(opts, :fire_wake_in_txn, true))
+            :skipped
+
+          {:idle_cleanup_deferred, _} = deferred ->
+            deferred
+
+          {:deliver, wake} ->
+            opts =
+              opts
+              |> Keyword.put(:target_gate, nil)
+              |> Keyword.put(:sender, wake.origin)
+              |> Keyword.put(:fire_wake_in_txn, true)
+
+            deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts)
+        end
 
       {:terminal_notice, wake} ->
         # Resolution and enqueue share this transaction. Only the persisted
@@ -2217,6 +2240,7 @@ defmodule Tightbeam.Gateway do
   end
 
   def complete_delivery(_db, :skipped), do: :skipped
+  def complete_delivery(_db, {:idle_cleanup_deferred, _} = deferred), do: deferred
   def complete_delivery(_db, {:duplicate, _message}), do: :duplicate
   def complete_delivery(_db, {:conflict, _message}), do: :conflict
 
