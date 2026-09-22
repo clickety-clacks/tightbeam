@@ -75,6 +75,25 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
     end)
   end
 
+  test "parses capsule ids before punctuation or trailing prose through evaluate" do
+    with_guidance_lines(
+      [
+        "- **em-dash** — trailing prose",
+        "- **colon**: trailing prose",
+        "- **other**; trailing prose",
+        "- **bare**"
+      ],
+      fn path ->
+        {status, diff} = Diff.evaluate(inventories(["bare", "colon", "em-dash"]), path)
+
+        assert status == 1
+        assert diff.working_set == ["bare", "colon", "em-dash", "other"]
+        assert diff.missing_from_catalog == ["other"]
+        assert diff.new_arrivals == []
+      end
+    )
+  end
+
   test "raises a classified error when the working-set section is absent" do
     with_guidance(["known"], fn path ->
       File.write!(path, "# Preferred models\n")
@@ -156,6 +175,10 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
   end
 
   defp with_guidance(refs, fun) do
+    with_guidance_lines(Enum.map(refs, &"- **#{&1}** — capsule"), fun)
+  end
+
+  defp with_guidance_lines(lines, fun) do
     dir =
       Path.join(
         System.tmp_dir!(),
@@ -171,7 +194,7 @@ defmodule Mix.Tasks.Tightbeam.Catalog.DiffTest do
 
       ## Working set (capsules)
 
-      #{Enum.map_join(refs, "\n", &"- **#{&1}** — capsule")}
+      #{Enum.join(lines, "\n")}
       - [Flynn: confirm the set — add/drop as needed]
 
       ## Activity
