@@ -1,23 +1,32 @@
 defmodule Tightbeam.Harness.AdapterPatch do
   @moduledoc false
 
+  require Logger
+
   @doc false
   def ensure!(binary_path, package_name, bundle_name, version, replacements, label, opts \\ []) do
     {package, bundle} = installed_paths(binary_path, package_name, bundle_name, opts)
     %{"version" => installed_version} = package |> File.read!() |> JSON.decode!()
-    ^version = installed_version
-    source = File.read!(bundle)
-    patched = patch(source, replacements, label, version)
 
-    if patched != source do
-      # Preserve the bundle's own mode: npm marks bin-target bundles executable,
-      # and node_modules/.bin symlinks exec them directly — a hardcoded 644 here
-      # stripped the x-bit and broke every codex adapter spawn (Permission denied).
-      %File.Stat{mode: mode} = File.stat!(bundle)
-      temporary = bundle <> ".tightbeam-patch"
-      File.write!(temporary, patched)
-      File.chmod!(temporary, mode)
-      File.rename!(temporary, bundle)
+    if installed_version == version do
+      source = File.read!(bundle)
+      patched = patch(source, replacements, label, version)
+
+      if patched != source do
+        # Preserve the bundle's own mode: npm marks bin-target bundles executable,
+        # and node_modules/.bin symlinks exec them directly — a hardcoded 644 here
+        # stripped the x-bit and broke every codex adapter spawn (Permission denied).
+        %File.Stat{mode: mode} = File.stat!(bundle)
+        temporary = bundle <> ".tightbeam-patch"
+        File.write!(temporary, patched)
+        File.chmod!(temporary, mode)
+        File.rename!(temporary, bundle)
+      end
+    else
+      Logger.warning(
+        "skipping #{label} adapter patch for unsupported installed version #{installed_version}; " <>
+          "expected #{version}"
+      )
     end
 
     :ok
@@ -36,8 +45,10 @@ defmodule Tightbeam.Harness.AdapterPatch do
     version_check =
       case Keyword.fetch(opts, :version) do
         {:ok, version} ->
+          expected = JSON.encode!(version)
+
           "const v=JSON.parse(fs.readFileSync(#{JSON.encode!(package)},'utf8')).version;" <>
-            "if(v!==#{JSON.encode!(version)})throw new Error('unsupported #{label} adapter version '+v);"
+            "if(v!==#{expected}){console.warn('skipping unsupported #{label} adapter version '+v+'; expected '+#{expected});process.exit(0);}"
 
         :error ->
           ""
@@ -47,7 +58,7 @@ defmodule Tightbeam.Harness.AdapterPatch do
     const fs=require('fs');#{version_check}const p=#{JSON.encode!(bundle)};
     const rs=JSON.parse(Buffer.from(#{JSON.encode!(encoded)},'base64').toString());
     let s=fs.readFileSync(p,'utf8');
-    for(const row of rs){const a=row[0],b=row[1],optional=row[2]&&row[2].optional;if(s.includes(b))continue;if(!s.includes(a)){if(optional)continue;throw new Error('unsupported #{label} adapter bundle');}s=s.replace(a,b);}
+    for(const row of rs){const a=row[0],b=row[1],opts=row[2]||{},optional=opts.optional,global=opts.global;if(global&&s.includes(a)){s=s.split(a).join(b);continue;}if(s.includes(b))continue;if(!s.includes(a)){if(optional)continue;throw new Error('unsupported #{label} adapter bundle');}s=s.replace(a,b);}
     fs.writeFileSync(p,s);
     """
     |> String.replace("\n", "")
@@ -59,6 +70,9 @@ defmodule Tightbeam.Harness.AdapterPatch do
       {before, replacement, opts} = normalize_replacement(entry)
 
       cond do
+        Keyword.get(opts, :global, false) and String.contains?(bytes, before) ->
+          String.replace(bytes, before, replacement)
+
         String.contains?(bytes, replacement) ->
           bytes
 

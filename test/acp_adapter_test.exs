@@ -212,7 +212,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     { id: "effort", currentValue: efforts[sid] || "default" },
     { id: "reasoning_effort", currentValue: efforts[sid] || "medium" }
   ] });
-  const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, mcpServers: m.params.mcpServers, modeId: m.params.modeId, configId: m.params.configId, value: m.params.value, cwd: m.params.cwd, sessionId: m.params.sessionId, prompt: m.params.prompt, meta: m.params._meta }) + "\n");
+  const capture = (m) => fs.appendFileSync(capturePath, JSON.stringify({ method: m.method, clientCapabilities: m.params.clientCapabilities, mcpServers: m.params.mcpServers, modeId: m.params.modeId, configId: m.params.configId, value: m.params.value, cwd: m.params.cwd, sessionId: m.params.sessionId, prompt: m.params.prompt, meta: m.params._meta }) + "\n");
   let pendingPrompt = null;
   let stalledPrompt = null;
   let stalledSession = null;
@@ -230,6 +230,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     }
     switch (m.method) {
       case "initialize":
+        capture(m);
         if (gateMode === "delay-setup") return setTimeout(() => send({ id: m.id, result: { protocolVersion: 1 } }), 75);
         return send({ id: m.id, result: { protocolVersion: 1 } });
       case "session/new": {
@@ -747,7 +748,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     refute Adapter.knows_session?(adapter, "sess-1")
 
-    assert ["session/load", "session/set_mode"] =
+    assert ["initialize", "session/load", "session/set_mode"] =
              captured_requests(capture_path)
              |> Enum.map(& &1["method"])
   end
@@ -1236,6 +1237,9 @@ defmodule Tightbeam.Acp.AdapterTest do
              %{"method" => "session/new", "mcpServers" => []},
              %{"method" => "session/load", "mcpServers" => []}
            ] = session_requests(capture_path)
+
+    assert [%{"method" => "initialize", "clientCapabilities" => %{"subagents" => %{}}}] =
+             Enum.filter(captured_requests(capture_path), &(&1["method"] == "initialize"))
   end
 
   test "bounded continuity guidance uses the harness-accurate metadata channel on new and load" do
@@ -1297,21 +1301,12 @@ defmodule Tightbeam.Acp.AdapterTest do
          "sessionId" => "sess-1",
          "update" => %{
            "sessionUpdate" => "session_info_update",
-           "_meta" => %{
-             "codex" => %{"accountUpdated" => %{"authMode" => nil, "planType" => nil}}
-           }
+           "authStatus" => %{"kind" => "none"}
          }
        }}
     )
 
-    assert_receive {:auth, :terminal,
-                    %{
-                      "_meta" => %{
-                        "codex" => %{
-                          "accountUpdated" => %{"authMode" => nil, "planType" => nil}
-                        }
-                      }
-                    }}
+    assert_receive {:auth, :terminal, %{"authStatus" => %{"kind" => "none"}}}
   end
 
   # FAIL-BEFORE: against the tree preceding #99 new returned the raw JSON-RPC
@@ -1679,12 +1674,12 @@ defmodule Tightbeam.Acp.AdapterTest do
     end
   end
 
-  test "auth-event divergence keeps claude unknown while codex classifies terminal and transient" do
-    terminal = %{"authMode" => nil, "planType" => nil}
-    transient = %{"authMode" => "chatgpt", "planType" => "plus"}
+  test "authStatus classifies both harnesses terminal and transient" do
+    terminal = %{"authStatus" => %{"kind" => "none"}}
+    transient = %{"authStatus" => %{"kind" => "account"}}
 
-    assert Tightbeam.Harness.Claude.classify_auth_event(terminal) == :unknown
-    assert Tightbeam.Harness.Claude.classify_auth_event(transient) == :unknown
+    assert Tightbeam.Harness.Claude.classify_auth_event(terminal) == :terminal
+    assert Tightbeam.Harness.Claude.classify_auth_event(transient) == :transient
     assert Tightbeam.Harness.Codex.classify_auth_event(terminal) == :terminal
     assert Tightbeam.Harness.Codex.classify_auth_event(transient) == :transient
   end
@@ -1742,14 +1737,14 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     send(
       adapter,
-      {:acp_notification, "account/updated", %{"authMode" => nil, "planType" => "plus"}}
+      {:acp_notification, "_auth/status_update", %{"authStatus" => %{"kind" => "account"}}}
     )
 
     refute_receive :parked
 
     send(
       adapter,
-      {:acp_notification, "account/updated", %{"authMode" => nil, "planType" => nil}}
+      {:acp_notification, "_auth/status_update", %{"authStatus" => %{"kind" => "none"}}}
     )
 
     assert_receive :parked
@@ -1833,7 +1828,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     send(
       adapter,
-      {:acp_notification, "account/updated", %{"authMode" => nil, "planType" => nil}}
+      {:acp_notification, "_auth/status_update", %{"authStatus" => %{"kind" => "none"}}}
     )
 
     receive do
@@ -1877,6 +1872,57 @@ defmodule Tightbeam.Acp.AdapterTest do
     )
 
     assert_receive {:subagent, "sess-1", ^update}
+  end
+
+  test "nested native subagent updates retain the accountable root session identity" do
+    owner = self()
+
+    {adapter, _capture_path} =
+      start_adapter(
+        harness: :codex,
+        on_subagent_event: &send(owner, {:subagent, &1, &2}),
+        on_ready: fn -> send(owner, :booted) end
+      )
+
+    assert_ready(adapter, :booted)
+
+    child_started = %{
+      "sessionUpdate" => "subagent_spawned",
+      "subagentSessionId" => "thread-child-1"
+    }
+
+    grandchild_started = %{
+      "sessionUpdate" => "subagent_spawned",
+      "subagentSessionId" => "thread-grandchild-1"
+    }
+
+    grandchild_stopped = %{
+      "sessionUpdate" => "subagent_state_update",
+      "subagentSessionId" => "thread-grandchild-1",
+      "state" => "completed"
+    }
+
+    send(
+      adapter,
+      {:acp_notification, "session/update",
+       %{"sessionId" => "sess-root", "update" => child_started}}
+    )
+
+    send(
+      adapter,
+      {:acp_notification, "session/update",
+       %{"sessionId" => "thread-child-1", "update" => grandchild_started}}
+    )
+
+    send(
+      adapter,
+      {:acp_notification, "session/update",
+       %{"sessionId" => "thread-child-1", "update" => grandchild_stopped}}
+    )
+
+    assert_receive {:subagent, "sess-root", ^child_started}
+    assert_receive {:subagent, "sess-root", ^grandchild_started}
+    assert_receive {:subagent, "sess-root", ^grandchild_stopped}
   end
 
   test "placement subagent callback does not block the adapter on matching wake delivery" do
@@ -1958,17 +2004,9 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert_ready(adapter, :booted)
 
     update = %{
-      "sessionUpdate" => "tool_call_update",
-      "toolCallId" => "call-codex-1",
-      "status" => "completed",
-      "_meta" => %{
-        "codex" => %{
-          "subagentTerminated" => %{
-            "agentThreadId" => "thread-child-1",
-            "threadStatus" => %{"type" => "idle"}
-          }
-        }
-      }
+      "sessionUpdate" => "subagent_state_update",
+      "subagentSessionId" => "thread-child-1",
+      "state" => "completed"
     }
 
     send(
@@ -2050,17 +2088,9 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert_ready(adapter, :booted)
 
     update = %{
-      "sessionUpdate" => "tool_call_update",
-      "toolCallId" => "call-codex-failure",
-      "status" => "completed",
-      "_meta" => %{
-        "codex" => %{
-          "subagentTerminated" => %{
-            "agentThreadId" => "thread-child-failure",
-            "threadStatus" => %{"type" => "idle"}
-          }
-        }
-      }
+      "sessionUpdate" => "subagent_state_update",
+      "subagentSessionId" => "thread-child-failure",
+      "state" => "completed"
     }
 
     log =
@@ -2404,6 +2434,9 @@ defmodule Tightbeam.Acp.AdapterTest do
       )
 
     assert_ready(adapter, :plain_ready)
-    assert captured_requests(capture_path) == []
+
+    assert ["initialize"] =
+             captured_requests(capture_path)
+             |> Enum.map(& &1["method"])
   end
 end

@@ -40,4 +40,75 @@ defmodule Tightbeam.AdapterPatchModeTest do
     assert %File.Stat{mode: mode} = File.stat!(bundle)
     assert band(mode, 0o111) != 0, "patch write stripped the execute bit"
   end
+
+  test "unknown installed versions skip local patching" do
+    root = Path.join(System.tmp_dir!(), "tb-patch-unknown-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    package_dir = Path.join([root, "node_modules", "@agentclientprotocol", "smoke-acp"])
+    bundle = Path.join([package_dir, "dist", "index.js"])
+    File.mkdir_p!(Path.dirname(bundle))
+    File.write!(Path.join(package_dir, "package.json"), ~s({"version":"9.9.9"}))
+    File.write!(bundle, "BEFORE\n")
+
+    assert :ok =
+             AdapterPatch.ensure!(
+               Path.join([root, "node_modules", ".bin", "smoke-acp"]),
+               "smoke-acp",
+               "index.js",
+               "1.0.0",
+               [{"BEFORE", "AFTER"}],
+               "smoke"
+             )
+
+    assert File.read!(bundle) == "BEFORE\n"
+  end
+
+  test "global replacements cover repeated and partially patched anchors locally and remotely" do
+    root = Path.join(System.tmp_dir!(), "tb-patch-global-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    package_dir = Path.join([root, "node_modules", "@agentclientprotocol", "smoke-acp"])
+    bundle = Path.join([package_dir, "dist", "index.js"])
+    File.mkdir_p!(Path.dirname(bundle))
+    File.write!(Path.join(package_dir, "package.json"), ~s({"version":"1.0.0"}))
+
+    binary = Path.join([root, "node_modules", ".bin", "smoke-acp"])
+    replacements = [{"BEFORE", "AFTER", global: true}]
+    File.write!(bundle, "AFTER\nBEFORE\n")
+
+    assert :ok =
+             AdapterPatch.ensure!(
+               binary,
+               "smoke-acp",
+               "index.js",
+               "1.0.0",
+               replacements,
+               "smoke"
+             )
+
+    assert File.read!(bundle) == "AFTER\nAFTER\n"
+
+    assert :ok =
+             AdapterPatch.ensure!(binary, "smoke-acp", "index.js", "1.0.0", replacements, "smoke")
+
+    assert File.read!(bundle) == "AFTER\nAFTER\n"
+
+    File.write!(bundle, "AFTER\nBEFORE\n")
+
+    script =
+      AdapterPatch.remote_script(
+        binary,
+        "smoke-acp",
+        "index.js",
+        replacements,
+        "smoke",
+        version: "1.0.0"
+      )
+
+    assert {_output, 0} = System.cmd(System.find_executable("node"), ["-e", script])
+    assert File.read!(bundle) == "AFTER\nAFTER\n"
+    assert {_output, 0} = System.cmd(System.find_executable("node"), ["-e", script])
+    assert File.read!(bundle) == "AFTER\nAFTER\n"
+  end
 end

@@ -58,6 +58,7 @@ defmodule Tightbeam.Acp.Adapter do
     chunks: %{},
     progress: %{},
     subagent_tasks: %{},
+    subagent_roots: %{},
     known: MapSet.new(),
     models: %{},
     unprompted: MapSet.new(),
@@ -426,7 +427,10 @@ defmodule Tightbeam.Acp.Adapter do
            "initialize",
            %{
              protocolVersion: 1,
-             clientCapabilities: %{fs: %{readTextFile: false, writeTextFile: false}}
+             clientCapabilities: %{
+               fs: %{readTextFile: false, writeTextFile: false},
+               subagents: %{}
+             }
            },
            timeout: :infinity
          ) do
@@ -536,7 +540,8 @@ defmodule Tightbeam.Acp.Adapter do
             switchable_models: Map.delete(state.switchable_models, sid),
             config_options: Map.delete(state.config_options, sid),
             chunks: Map.delete(state.chunks, sid),
-            progress: Map.delete(state.progress, sid)
+            progress: Map.delete(state.progress, sid),
+            subagent_roots: drop_subagent_root(state.subagent_roots, sid)
         }
 
         {:reply, :ok, state}
@@ -1005,6 +1010,11 @@ defmodule Tightbeam.Acp.Adapter do
     {:noreply, state}
   end
 
+  def handle_info({:acp_notification, "_auth/status_update", params}, state) do
+    emit_auth_classification(state, params)
+    {:noreply, state}
+  end
+
   def handle_info({:acp_notification, "session/update", params}, state) do
     sid = params["sessionId"]
     update = params["update"] || %{}
@@ -1152,6 +1162,8 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp maybe_emit_subagent_event(state, sid, update) do
+    {sid, state} = accountable_subagent_root(state, sid, update)
+
     case state.on_subagent_event do
       handler when is_function(handler, 2) ->
         case handler.(sid, update) do
@@ -1182,6 +1194,25 @@ defmodule Tightbeam.Acp.Adapter do
       _other ->
         state
     end
+  end
+
+  # Native nested-child updates name their immediate parent ACP session. Only
+  # top-level sessions have durable harness pointers, so remember the root when
+  # each child is announced and attribute every descendant update to that root.
+  defp accountable_subagent_root(state, sid, update) do
+    root_sid = Map.get(state.subagent_roots, sid, sid)
+
+    case Harness.module!(state.harness).classify_subagent_event(update) do
+      {:subagent_start, %{subagent_ref: child_sid}} when is_binary(child_sid) ->
+        {root_sid, put_in(state.subagent_roots[child_sid], root_sid)}
+
+      _other ->
+        {root_sid, state}
+    end
+  end
+
+  defp drop_subagent_root(roots, sid) do
+    Map.reject(roots, fn {child_sid, root_sid} -> child_sid == sid or root_sid == sid end)
   end
 
   defp clear_subagent_task(state, event_ref) do

@@ -48,8 +48,8 @@ defmodule Tightbeam.SubagentMarkersTest do
       scheduler: scheduler,
       codex: codex,
       claude: claude,
-      codex_fixture: fixture("codex-acp-1.1.4.jsonc"),
-      claude_fixture: fixture("claude-agent-acp-0.59.0.jsonc")
+      codex_fixture: fixture("codex-acp-1.12.0.jsonc"),
+      claude_fixture: fixture("claude-agent-acp-0.79.0.jsonc")
     }
   end
 
@@ -57,26 +57,22 @@ defmodule Tightbeam.SubagentMarkersTest do
        ctx do
     fixture = ctx.codex_fixture
     assert fixture["version"] == Tightbeam.Harness.Codex.adapter_version()
-    assert fixture["semantic"]["spawn_operation_terminal"] =~ "child thread remains"
-    assert fixture["semantic"]["child_termination_terminal"] =~ "entering idle"
+    assert fixture["semantic"]["spawn_operation_terminal"] =~ "independently live"
+    assert fixture["semantic"]["child_termination_terminal"] =~ "entering completed"
 
     start = consume(ctx, :codex, "sid-codex", fixture["live_started"])
     assert start.appended
     assert :skip = consume(ctx, :codex, "sid-codex", fixture["live_interacted"])
 
-    completed_spawn =
-      consume(ctx, :codex, "sid-codex", fixture["spawn_operation_terminal"])
-
-    refute completed_spawn.appended
-    assert completed_spawn.kind == "subagent_start"
+    assert :skip = consume(ctx, :codex, "sid-codex", fixture["spawn_operation_terminal"])
 
     stop = consume(ctx, :codex, "sid-codex", fixture["patched_termination"])
     assert stop.appended
     assert stop.principal == ctx.codex.session_key
     assert stop.subagent_ref == start.subagent_ref
 
-    interrupted = consume(ctx, :codex, "sid-codex", fixture["live_interrupted"])
-    refute interrupted.appended
+    assert :skip =
+             consume(ctx, :codex, "sid-codex", fixture["live_interrupted"])
 
     assert Enum.map(SubagentMarkers.list(ctx.db), & &1.kind) == [
              "subagent_start",
@@ -87,9 +83,9 @@ defmodule Tightbeam.SubagentMarkersTest do
   test "proof 4: claude fixture ignores spawn completion and stops at live task settlement",
        ctx do
     fixture = ctx.claude_fixture
-    assert fixture["version"] == "0.59.0"
-    assert fixture["semantic"]["spawn_operation_terminal"] =~ "liveBackgroundTasks"
-    assert fixture["semantic"]["child_termination_terminal"] =~ "settlement"
+    assert fixture["version"] == "0.79.0"
+    assert fixture["semantic"]["spawn_operation_terminal"] =~ "independent lifecycle"
+    assert fixture["semantic"]["child_termination_terminal"] =~ "child settlement"
 
     start = consume(ctx, :claude, "sid-claude", fixture["live_agent_started"])
     assert start.appended
@@ -112,7 +108,7 @@ defmodule Tightbeam.SubagentMarkersTest do
       consume(ctx, :codex, "sid-codex", ctx.codex_fixture["live_started"])
 
     condition_wake =
-      register_wake(ctx, ctx.codex, "call-codex-1",
+      register_wake(ctx, ctx.codex, "thread-child-1",
         after_ms: 60_000,
         idempotency_key: "condition"
       )
@@ -133,7 +129,7 @@ defmodule Tightbeam.SubagentMarkersTest do
       )
 
     fallback_wake =
-      register_wake(ctx, ctx.claude, "call-claude-1",
+      register_wake(ctx, ctx.claude, "claude-child-1",
         after_ms: 0,
         idempotency_key: "fallback",
         nudge: false
@@ -159,7 +155,7 @@ defmodule Tightbeam.SubagentMarkersTest do
              code: "subagent_already_stopped",
              subagent_ref: subagent_ref
            } =
-             register_wake(ctx, ctx.codex, "call-codex-1",
+             register_wake(ctx, ctx.codex, "thread-child-1",
                after_ms: 0,
                idempotency_key: "stop-wins"
              )
@@ -185,7 +181,7 @@ defmodule Tightbeam.SubagentMarkersTest do
     refute first_start.source_event_ref == second_start.source_event_ref
 
     wake =
-      register_wake(ctx, ctx.codex, "call-codex-1",
+      register_wake(ctx, ctx.codex, "thread-child-1",
         after_ms: 60_000,
         idempotency_key: "collision"
       )
@@ -224,7 +220,7 @@ defmodule Tightbeam.SubagentMarkersTest do
     assert start.kind == "subagent_start"
 
     wake =
-      register_wake(ctx, ctx.codex, "call-codex-replayed",
+      register_wake(ctx, ctx.codex, "thread-child-replayed",
         after_ms: 60_000,
         idempotency_key: "replay"
       )
