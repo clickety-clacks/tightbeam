@@ -345,25 +345,18 @@ defmodule Tightbeam.Harness.Cursor do
   def prepare_projection_runtime!(home) do
     # Cursor 2026.08.11 writes ACP session state beneath CURSOR_CONFIG_DIR.
     # The dedicated execution account reaches this operator-owned projection
-    # through tightbeam-workspace. Keep the writable surface to the projection
-    # root and the runtime directory. cli-config.json is projected separately as
-    # a non-secret 0640 copy; the API key remains environment-only.
-    runtime_dirs = [home, Path.join(home, "acp-sessions")]
+    # through tightbeam-workspace. Identity provisioning creates acp-sessions;
+    # normal delivery must never touch that execution-writable child because it
+    # may have been replaced with a symlink. cli-config.json is projected
+    # separately as a non-secret 0640 copy; the API key remains environment-only.
+    File.mkdir_p!(home)
+    File.chmod!(home, 0o2770)
 
-    Enum.each(runtime_dirs, fn path ->
-      File.mkdir_p!(path)
-      File.chmod!(path, 0o2770)
-    end)
+    stat = File.stat!(home)
 
-    root_gid = File.stat!(home).gid
-
-    Enum.each(runtime_dirs, fn path ->
-      stat = File.stat!(path)
-
-      if stat.gid != root_gid or Bitwise.band(stat.mode, 0o7777) != 0o2770 do
-        raise "Cursor runtime projection #{path} must inherit the projection group and mode 2770"
-      end
-    end)
+    if Bitwise.band(stat.mode, 0o7777) != 0o2770 do
+      raise "Cursor runtime projection #{home} must have mode 2770"
+    end
 
     :ok
   end

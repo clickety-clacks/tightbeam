@@ -1822,10 +1822,8 @@ defmodule Tightbeam.PlacementTest do
     refute File.exists?(Path.join(execution_home, "cli-config.json"))
 
     projection_stat = File.stat!(projected)
-    sessions_stat = File.stat!(Path.join(projected, "acp-sessions"))
     assert Bitwise.band(projection_stat.mode, 0o7777) == 0o2770
-    assert Bitwise.band(sessions_stat.mode, 0o7777) == 0o2770
-    assert sessions_stat.gid == projection_stat.gid
+    refute File.exists?(Path.join(projected, "acp-sessions"))
 
     credential = Path.join(projected, "cli-config.json")
     assert {:ok, %File.Stat{type: :regular}} = File.lstat(credential)
@@ -1834,6 +1832,53 @@ defmodule Tightbeam.PlacementTest do
     assert File.stat!(credential).gid == projection_stat.gid
     assert Bitwise.band(File.stat!(auth_dir).mode, 0o777) == 0o700
     assert Bitwise.band(File.stat!(auth_file).mode, 0o777) == 0o600
+  end
+
+  test "Cursor delivery does not follow a planted runtime-directory symlink", %{
+    base_dir: base_dir,
+    db: db
+  } do
+    execution_home = Path.join(base_dir, "dedicated-cursor-home-runtime-custody")
+    auth_dir = Path.join(base_dir, "auth/cursor")
+    auth_file = Path.join(auth_dir, "cli-config.json")
+    File.mkdir_p!(auth_dir)
+    File.write!(auth_file, ~s({"authInfo":{"email":"cursor@example.com"}}))
+    File.chmod!(auth_dir, 0o700)
+    File.chmod!(auth_file, 0o600)
+    File.mkdir_p!(Path.join(execution_home, ".cursor"))
+    File.mkdir_p!(Path.join(execution_home, ".tightbeam"))
+
+    config = %{
+      base_dir: base_dir,
+      db: db,
+      cwd: "/work",
+      cli_bin: "/local/bin",
+      default_model: Model.new("auto"),
+      cursor_execution_home: execution_home,
+      cursor_rails_publisher: @release_binary
+    }
+
+    projected = Placement.deliver_home(config, {:cursor, "default", "testhost"})
+    runtime_dir = Path.join(projected, "acp-sessions")
+    external = Path.join(base_dir, "external-operator-directory")
+    sentinel = Path.join(external, "operator-state")
+    File.mkdir_p!(external)
+    File.write!(sentinel, "operator-owned-bytes")
+    File.chmod!(external, 0o700)
+    File.chmod!(sentinel, 0o600)
+    File.ln_s!(external, runtime_dir)
+
+    directory_before = stat_identity(File.stat!(external))
+    sentinel_before = stat_identity(File.stat!(sentinel))
+
+    assert Placement.deliver_home(config, {:cursor, "default", "testhost"}) == projected
+    assert {:ok, %File.Stat{type: :symlink}} = File.lstat(runtime_dir)
+    assert File.read_link!(runtime_dir) == external
+    assert File.read!(sentinel) == "operator-owned-bytes"
+    assert stat_identity(File.stat!(external)) == directory_before
+    assert stat_identity(File.stat!(sentinel)) == sentinel_before
+    assert Bitwise.band(File.stat!(external).mode, 0o777) == 0o700
+    assert Bitwise.band(File.stat!(sentinel).mode, 0o777) == 0o600
   end
 
   # wi_263814d3 — accepted-then-dead: the claude adapter's offered/accepted model
@@ -1910,6 +1955,10 @@ defmodule Tightbeam.PlacementTest do
       |> binary_part(0, 12)
 
     Path.join([base_dir, "work", digest])
+  end
+
+  defp stat_identity(%File.Stat{} = stat) do
+    Map.take(stat, [:type, :size, :mode, :links, :major, :minor, :inode, :uid, :gid, :mtime])
   end
 
   test "the hosts table is the one registry; register_host records and updates in place", %{
