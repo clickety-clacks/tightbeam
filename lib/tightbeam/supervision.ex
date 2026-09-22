@@ -3384,9 +3384,9 @@ defmodule Tightbeam.Supervision do
   defp sweep(state), do: legacy_sweep(state)
 
   # Session cleanup is deliberately a production of this existing sweep. Its
-  # only durable output is an ordinary prompt wake; the existing wakes table
-  # carries enough identity to suppress a pending group and count delivered
-  # generations without introducing a cleanup registry or timer.
+  # ordinary wakes carry claims and delivered generations. Existing lifecycle
+  # events retain classifier observations that cannot be recovered from a
+  # canceled wake alone, without introducing a cleanup registry or timer.
   defp idle_cleanup_sweep(%{db: db, n: n}) do
     case DB.transaction(db, fn txn -> idle_cleanup_sweep_in_txn(txn, n, now()) end) do
       {:ok, _} -> :ok
@@ -3411,6 +3411,7 @@ defmodule Tightbeam.Supervision do
   end
 
   defp idle_cleanup_sweep_in_txn(txn, n, snapshot_at) do
+    idle_cleanup_observe_pending_in_txn(txn)
     sessions = idle_cleanup_sessions_in_txn(txn)
 
     eligible =
@@ -3547,16 +3548,47 @@ defmodule Tightbeam.Supervision do
     end
   end
 
-  # Incoming wakes end eligibility even when canceled before firing. Their
-  # existing rows distinguish occurrences without changing the activity clock
-  # or remembering which sweeps happened to observe the pending interval.
+  # Only a committed sweep observation ends the occurrence. Cancellation
+  # before this transaction leaves no observation and preserves its history.
+  # Record each wake once, in the same transaction as classification, so both
+  # repeated sweeps and recovery retain the original commit ordering.
+  defp idle_cleanup_observe_pending_in_txn(txn) do
+    Txn.q(
+      txn,
+      """
+      SELECT w.wakeId,w.sessionKey FROM wakes w
+      JOIN sessions s ON s.sessionKey=w.sessionKey
+      WHERE w.state='pending' AND w.consumer='prompt'
+        AND s.state='active' AND s.isBuiltIn=0
+        AND NOT EXISTS (
+          SELECT 1 FROM lifecycle_events e
+          WHERE e.kind='idle_cleanup_pending_observed' AND e.subject=w.wakeId
+        )
+      ORDER BY w.rowid
+      """
+    )
+    |> Enum.each(fn [wake_id, session_key] ->
+      EventLog.lifecycle_in_txn(
+        txn,
+        "idle_cleanup_pending_observed",
+        wake_id,
+        JSON.encode!(%{
+          "session" => session_key,
+          "cause" => "wake_pending",
+          "principal" => "process:tightbeam"
+        })
+      )
+    end)
+  end
+
   defp idle_cleanup_occurrence_in_txn(txn, session_key, ignored_wake) do
     Txn.q(
       txn,
       """
-      SELECT wakeId,canceledAt FROM wakes
-      WHERE sessionKey=?1 AND consumer='prompt' AND (?2 IS NULL OR wakeId<>?2)
-      ORDER BY rowid DESC LIMIT 1
+      SELECT e.subject FROM lifecycle_events e
+      WHERE e.kind='idle_cleanup_pending_observed'
+        AND json_extract(e.detail,'$.session')=?1 AND (?2 IS NULL OR e.subject<>?2)
+      ORDER BY e.id DESC LIMIT 1
       """,
       [session_key, ignored_wake]
     )
@@ -3872,6 +3904,9 @@ defmodule Tightbeam.Supervision do
               "n" => n,
               "depth" => actual_depth,
               "main" => target.session_key == Org.personal_session_key(owner),
+              "snapshot" => snapshot_at,
+              "evidence" =>
+                idle_cleanup_evidence_digest(parent_group, snapshot_at, due_members, n),
               "members" => Map.new(due_members, &{&1.session_key, &1.member_token})
             }
 
@@ -3940,6 +3975,15 @@ defmodule Tightbeam.Supervision do
 
   defp idle_cleanup_requested_depth(delivered_count, _n), do: delivered_count + 1
 
+  # Bind the claimed evidence independently of the mutable recipient/depth.
+  # Reuse the renderer at the original clock so passing time is not a mismatch.
+  defp idle_cleanup_evidence_digest(parent_group, snapshot_at, members, n) do
+    members = Enum.map(members, &%{&1 | age_ms: snapshot_at - &1.activity.at})
+
+    idle_cleanup_prompt(parent_group, snapshot_at, members, n, "*")
+    |> idle_cleanup_digest()
+  end
+
   # The wake already owns its batch identity. Append the delivery inputs to
   # that identity so restart needs neither a cleanup table nor prompt parsing.
   defp idle_cleanup_obligation_ref(group_digest, members, metadata) do
@@ -3996,7 +4040,10 @@ defmodule Tightbeam.Supervision do
   def idle_cleanup_delivery_in_txn(_txn, _wake_id, _snapshot_at), do: :ordinary
 
   defp idle_cleanup_resolve_delivery_in_txn(txn, wake, snapshot_at) do
-    with {:ok, metadata} <- idle_cleanup_metadata(wake.obligation_ref) do
+    with {:ok, %{"snapshot" => claimed_at, "evidence" => evidence} = metadata} <-
+           idle_cleanup_metadata(wake.obligation_ref),
+         true <- is_integer(claimed_at) and claimed_at >= 0 and claimed_at <= snapshot_at,
+         true <- is_binary(evidence) do
       sessions = idle_cleanup_sessions_in_txn(txn)
 
       eligible =
@@ -4015,9 +4062,12 @@ defmodule Tightbeam.Supervision do
             member.owner_user_id == metadata["owner"] and member.due
         end)
         |> Enum.sort_by(& &1.session_key)
+        |> Enum.map(&%{&1 | age_ms: claimed_at - &1.activity.at})
 
       cond do
-        length(members) != map_size(metadata["members"]) ->
+        length(members) != map_size(metadata["members"]) or
+            idle_cleanup_evidence_digest(metadata["group"], claimed_at, members, metadata["n"]) !=
+              evidence ->
           EventLog.lifecycle_in_txn(
             txn,
             "idle_cleanup_stale",
@@ -4059,7 +4109,7 @@ defmodule Tightbeam.Supervision do
                   prompt =
                     idle_cleanup_prompt(
                       metadata["group"],
-                      snapshot_at,
+                      claimed_at,
                       members,
                       metadata["n"],
                       actual_depth
@@ -4083,7 +4133,7 @@ defmodule Tightbeam.Supervision do
           end
       end
     else
-      :error ->
+      _ ->
         idle_cleanup_refusal_in_txn(txn, wake.wake_id, :invalid_delivery_metadata)
         :stale
     end

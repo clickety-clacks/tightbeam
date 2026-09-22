@@ -542,6 +542,64 @@ defmodule Tightbeam.SupervisionTest do
              DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [replacement.wake_id])
   end
 
+  test "idle cleanup declines changed claimed evidence without changing activity or eligibility",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child", "idle-sibling"])
+    assignment(ctx.db, "idle-last", "idle-child", "private subject", 1)
+    attach_work_item!(ctx.db, "idle-last", "idle-item")
+    persist_terminal_race!(ctx.db, "idle-last", 1)
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_claim_evidence)
+
+    changes = [
+      {fn -> attach_work_item!(ctx.db, "asg_1", "idle-item") end, "custody=held-elsewhere"},
+      {fn ->
+         DB.query(ctx.db, "INSERT INTO work_item_priorities (workItemId,priority) VALUES (?,?)", [
+           "idle-item",
+           5
+         ])
+       end, "priority=5; thresholdMs=30000"},
+      {fn -> Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 120_000) end,
+       "priority=5; thresholdMs=60000"},
+      {fn ->
+         DB.query(ctx.db, "UPDATE sessions SET displayName=? WHERE sessionKey='idle-child'", [
+           "renamed child"
+         ])
+       end, "name=\"renamed child\""}
+    ]
+
+    for {change, expected} <- changes do
+      [claimed] = idle_cleanup_wakes(ctx.db)
+      [_, json] = String.split(claimed.obligation_ref, "\n", parts: 2)
+      claimed_members = JSON.decode!(json)["members"]
+      change.()
+
+      assert :skipped = admit_supervision_wake!(ctx.db, claimed)
+      assert Wakes.get(ctx.db, claimed.wake_id).prompt == claimed.prompt
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [claimed.wake_id])
+
+      sweep_liveness!(name)
+      [replacement] = idle_cleanup_wakes(ctx.db)
+      assert replacement.wake_id != claimed.wake_id
+      assert replacement.prompt =~ expected
+      assert replacement.prompt =~ "child=idle-sibling;"
+      assert length(Regex.scan(~r/delivered=0;/, replacement.prompt)) == 2
+      [_, replacement_json] = String.split(replacement.obligation_ref, "\n", parts: 2)
+      assert JSON.decode!(replacement_json)["members"] == claimed_members
+    end
+
+    [current] = idle_cleanup_wakes(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, current)
+    assert Wakes.get(ctx.db, current.wake_id).prompt == current.prompt
+
+    assert {:ok, [[1, 1], [1, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT createdAt,updatedAt FROM sessions WHERE sessionKey IN ('idle-child','idle-sibling')"
+             )
+  end
+
   test "idle cleanup scheduler defers a post-claim incident without consuming a generation",
        ctx do
     idle_cleanup_fixture!(ctx, ["idle-child"])
@@ -631,12 +689,18 @@ defmodule Tightbeam.SupervisionTest do
     assert delivered.state == "fired"
   end
 
-  test "idle cleanup resets canceled incoming wake occurrences with unchanged activity across restart",
+  test "idle cleanup resets only sweep-observed canceled wakes and preserves cancellation-first history",
        ctx do
     idle_cleanup_fixture!(ctx, ["observed-child", "unobserved-child"])
     name = start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_occurrence)
     [batch] = idle_cleanup_wakes(ctx.db)
     assert :appended = admit_supervision_wake!(ctx.db, batch)
+    idle_cleanup_elapsed!(ctx.db, batch)
+    sweep_liveness!(name)
+    [second] = idle_cleanup_wakes(ctx.db)
+    assert second.session_key == ctx.main.session_key
+    assert second.prompt =~ "delivered=1; N=1; requestedDepth=1; targetDepth=1"
+    assert :appended = admit_supervision_wake!(ctx.db, second)
 
     observed =
       Wakes.schedule(ctx.db, %{
@@ -646,6 +710,7 @@ defmodule Tightbeam.SupervisionTest do
         due_at: System.system_time(:millisecond) + 60_000
       })
 
+    sweep_liveness!(name)
     sweep_liveness!(name)
     cancel_wake!(ctx.db, observed)
 
@@ -659,15 +724,33 @@ defmodule Tightbeam.SupervisionTest do
 
     cancel_wake!(ctx.db, unobserved)
 
+    observations =
+      Enum.filter(
+        EventLog.lifecycle_events(ctx.db),
+        &(&1.kind == "idle_cleanup_pending_observed")
+      )
+
+    assert Enum.count(observations, &(&1.subject == observed.wake_id)) == 1
+    refute Enum.any?(observations, &(&1.subject == unobserved.wake_id))
+    delivered_before = [Wakes.get(ctx.db, batch.wake_id), Wakes.get(ctx.db, second.wake_id)]
+
     assert :ok = stop_supervised(Supervision)
-    start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_occurrence_restart)
+    name = start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_occurrence_restart)
     [next] = idle_cleanup_wakes(ctx.db)
     assert next.session_key == "supervisor"
     assert next.prompt =~ "child=observed-child;"
-    assert next.prompt =~ "child=unobserved-child;"
+    refute next.prompt =~ "child=unobserved-child;"
 
     assert length(Regex.scan(~r/delivered=0; N=1; requestedDepth=0; targetDepth=0/, next.prompt)) ==
-             2
+             1
+
+    sweep_liveness!(name)
+    assert [^next] = idle_cleanup_wakes(ctx.db)
+
+    assert delivered_before == [
+             Wakes.get(ctx.db, batch.wake_id),
+             Wakes.get(ctx.db, second.wake_id)
+           ]
 
     assert {:ok, [[1, 1], [1, 1]]} =
              DB.query(
@@ -676,6 +759,14 @@ defmodule Tightbeam.SupervisionTest do
              )
 
     assert :appended = admit_supervision_wake!(ctx.db, next)
+    idle_cleanup_elapsed!(ctx.db, second)
+    sweep_liveness!(name)
+    [survivor] = idle_cleanup_wakes(ctx.db)
+    assert survivor.session_key == ctx.main.session_key
+    assert survivor.prompt =~ "child=unobserved-child;"
+    refute survivor.prompt =~ "child=observed-child;"
+    assert survivor.prompt =~ "delivered=2; N=1; requestedDepth=2; targetDepth=1"
+    assert :appended = admit_supervision_wake!(ctx.db, survivor)
   end
 
   test "idle cleanup retains actual ancestor depth and Main across recovery with N greater than one",
