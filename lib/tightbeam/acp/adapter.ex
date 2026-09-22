@@ -986,22 +986,42 @@ defmodule Tightbeam.Acp.Adapter do
             "session/prompt",
             %{sessionId: sid, prompt: [%{type: "text", text: text}]},
             timeout: :infinity,
-            notify_dispatched: {parent, {:prompt_dispatched, dispatched}}
+            notify_dispatched: {parent, dispatched}
           )
 
-        send(parent, {:prompt_done, sid, from, result})
+        receive do
+          {:prompt_dispatch_classified, ^dispatched} ->
+            send(parent, {:prompt_done, sid, from, result})
+        end
       end)
 
     receive do
-      {:prompt_dispatched, ^dispatched} ->
+      {:acp_request_dispatched, ^dispatched, _request_id} ->
         Process.demonitor(conn_monitor, [:flush])
+        send(prompt_worker, {:prompt_dispatch_classified, dispatched})
+        {:noreply, state}
+
+      {:acp_request_not_dispatched, ^dispatched, reason} ->
+        Process.demonitor(conn_monitor, [:flush])
+        Process.exit(prompt_worker, :kill)
+
+        settle_prompt(
+          state,
+          sid,
+          from,
+          {:error, {:acp_request_not_dispatched, reason}}
+        )
 
       {:DOWN, ^conn_monitor, :process, _pid, _reason} ->
         Process.exit(prompt_worker, :kill)
-        send(parent, {:prompt_done, sid, from, {:error, :prompt_dispatch_failed}})
-    end
 
-    {:noreply, state}
+        settle_prompt(
+          state,
+          sid,
+          from,
+          {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}}
+        )
+    end
   end
 
   @impl true
@@ -1039,6 +1059,10 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   def handle_info({:prompt_done, sid, from, result}, state) do
+    settle_prompt(state, sid, from, result)
+  end
+
+  defp settle_prompt(state, sid, from, result) do
     messages = state.chunks |> Map.get(sid, []) |> assistant_messages()
     text = Enum.map_join(messages, & &1.text)
 

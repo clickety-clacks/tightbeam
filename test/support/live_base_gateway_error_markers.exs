@@ -49,11 +49,18 @@ defmodule GuardErrorMarkers do
 
         runner = Keyword.fetch!(lane_opts, :runner)
 
+        pre_dispatch? = input["mode"] == "pre_dispatch"
+
+        prompt =
+          if pre_dispatch?,
+            do: "fail before dispatch",
+            else: "fail with " <> JSON.encode!(input["reason"])
+
         assert :appended =
                  Gateway.deliver_prompt(
                    "k1",
                    "user:flynn",
-                   "fail with " <> JSON.encode!(input["reason"]),
+                   prompt,
                    db: db,
                    conn_registry: exact_registry,
                    lane_manager: lane,
@@ -63,8 +70,13 @@ defmodule GuardErrorMarkers do
 
         assert {:ok, turn} = Ledger.claim_next(db, "k1", "test")
 
-        assert {:error, %{reason: _, terminal_publish: publish, record_in_txn: record}} =
+        assert {:error,
+                %{reason: runner_reason, terminal_publish: publish, record_in_txn: record}} =
                  runner.(Map.put(turn, :session_key, "k1"))
+
+        if pre_dispatch? do
+          assert runner_reason == {:acp_request_not_dispatched, :closed}
+        end
 
         assert {:ok, true} =
                  DB.transaction(db, fn txn ->
@@ -81,16 +93,23 @@ defmodule GuardErrorMarkers do
         # interrupted, no reason given" that Flynn hit on gibson twice.
         frames = collect_pushes(9, [])
 
+        expected =
+          if pre_dispatch?,
+            do: "{:acp_request_not_dispatched, :closed}",
+            else: input["expected"]
+
         assert Enum.any?(frames, fn frame ->
                  frame["type"] == "message" and
                    frame["content"] ==
-                     "[turn failed]\n\nThe agent could not answer the message above: " <>
-                       input["expected"]
+                     "[turn failed]\n\nThe agent could not answer the message above: " <> expected
                end)
 
-        assert Enum.any?(EventLog.lifecycle_events(db), fn event ->
-                 event.kind == "harness_turn_error" and event.subject == "k1"
-               end)
+        lifecycle =
+          Enum.find(EventLog.lifecycle_events(db), fn event ->
+            event.kind == "harness_turn_error" and event.subject == "k1"
+          end)
+
+        assert lifecycle
 
         assert Enum.any?(
                  frames,
@@ -99,6 +118,31 @@ defmodule GuardErrorMarkers do
                    &1
                  )
                )
+
+        if pre_dispatch? do
+          assert lifecycle.detail =~ "prompt"
+          assert lifecycle.detail =~ "acp_request_not_dispatched"
+          assert lifecycle.detail =~ "closed"
+
+          refute Enum.any?(frames, fn frame ->
+                   frame["type"] == "message" and frame["role"] == "assistant" and
+                     not String.starts_with?(frame["content"] || "", "[turn failed]")
+                 end)
+
+          refute Enum.any?(frames, fn frame ->
+                   match?(
+                     %{"event" => "prompt_turn_state", "payload" => %{"state" => "delivered"}},
+                     frame
+                   )
+                 end)
+
+          assert Enum.count(frames, fn frame ->
+                   match?(
+                     %{"event" => "prompt_turn_state", "payload" => %{"state" => "failed"}},
+                     frame
+                   )
+                 end) == 1
+        end
       after
         GenServer.stop(coordinator)
         GenServer.stop(adapter)

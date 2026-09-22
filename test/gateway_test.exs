@@ -6612,6 +6612,24 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  @tag error_reason: nil,
+       expected_error: nil,
+       cold_gateway: true,
+       gateway_error_markers: true,
+       tmp_dir: true
+  test "a pre-dispatch prompt failure preserves its cause and never fabricates success", ctx do
+    File.write!(
+      Path.join(ctx.tmp_dir, "error-case.json"),
+      JSON.encode!(%{mode: "pre_dispatch"})
+    )
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      ctx.tmp_dir,
+      "live_base_gateway_error_markers.exs",
+      "guarded-gateway-error-markers: ok"
+    )
+  end
+
   # AC6 (spec 1ae8fa52 §O6/I7+I9). O6 RATIFIES the existing turn-path refuse-by-name
   # (`unonboarded_refusal`): a turn onto a {host, harness} whose catalog health is
   # `unavailable({:needs_onboarding, :missing})` is refused with the EXACT

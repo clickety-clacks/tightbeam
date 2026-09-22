@@ -350,6 +350,9 @@ defmodule Tightbeam.Acp.AdapterTest do
         const sid = m.params.sessionId;
         capture(m);
         const text = m.params.prompt?.[0]?.text;
+        if (text === "fail after dispatch") {
+          return send({ id: m.id, error: { code: -32000, message: "post-dispatch failure" } });
+        }
         if (gateMode === "stall-turn") {
           stalledPrompt = m.id;
           stalledSession = sid;
@@ -1046,17 +1049,99 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     :sys.replace_state(adapter, &%{&1 | conn: dead_conn})
 
-    assert {:error, :prompt_dispatch_failed} = Adapter.prompt(adapter, "sess-1", "never sent")
+    assert {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}} =
+             Adapter.prompt(adapter, "sess-1", "never sent")
+
     assert Adapter.conn(adapter) == dead_conn
+  end
+
+  test "a closed connection preserves the pre-dispatch cause through the adapter" do
+    {adapter, _capture_path} = start_adapter()
+    conn = Adapter.conn(adapter)
+
+    Tightbeam.Acp.Conn.close(conn)
+    assert :sys.get_state(conn).closed
+
+    assert {:error, {:acp_request_not_dispatched, :closed}} =
+             Adapter.prompt(adapter, "sess-1", "never sent")
+
+    assert Adapter.conn(adapter) == conn
+  end
+
+  test "confirmed write loss settles before an already queued ACP exit" do
+    {adapter, _capture_path} = start_adapter()
+    owner = self()
+
+    ordered_conn =
+      spawn(fn ->
+        receive do
+          {:"$gen_call", from, {:request, "session/prompt", _params, opts}} ->
+            {subscriber, dispatched} = Keyword.fetch!(opts, :notify_dispatched)
+
+            # Suspend the receiver itself so sender order is also a receiver
+            # barrier: Adapter cannot consume the first notification until both
+            # are observably queued. Old self-queued prompt_done handling then
+            # loses to the already-queued exit, while synchronous settlement wins.
+            :erlang.suspend_process(subscriber)
+            not_dispatched = {:acp_request_not_dispatched, dispatched, :closed}
+            acp_exit = {:acp_exit, 137}
+            send(subscriber, not_dispatched)
+            send(subscriber, acp_exit)
+            GenServer.reply(from, {:error, :closed})
+            send(owner, {:combined_ordering_queued, self(), subscriber, dispatched})
+
+            release =
+              receive do
+                :release_adapter -> :continue
+                :stop -> :stop
+              end
+
+            :erlang.resume_process(subscriber)
+
+            if release == :continue do
+              receive do
+                :stop -> :ok
+              end
+            end
+        end
+      end)
+
+    on_exit(fn -> send(ordered_conn, :stop) end)
+    :sys.replace_state(adapter, &%{&1 | conn: ordered_conn})
+    monitor = Process.monitor(adapter)
+
+    prompt = Task.async(fn -> Adapter.prompt(adapter, "sess-1", "lost before dispatch") end)
+    assert_receive {:combined_ordering_queued, ^ordered_conn, ^adapter, dispatched}
+
+    not_dispatched = {:acp_request_not_dispatched, dispatched, :closed}
+    acp_exit = {:acp_exit, 137}
+    assert {:messages, messages} = Process.info(adapter, :messages)
+
+    assert Enum.filter(messages, &(&1 in [not_dispatched, acp_exit])) == [
+             not_dispatched,
+             acp_exit
+           ]
+
+    send(ordered_conn, :release_adapter)
+
+    assert {:error, {:acp_request_not_dispatched, :closed}} = Task.await(prompt)
+    assert assert_down(adapter, monitor) == {:acp_exit, 137}
   end
 
   test "a missing prompt dispatch acknowledgement stays live until the connection dies" do
     {adapter, _capture_path} = start_adapter()
 
+    owner = self()
+
     inert_conn =
       spawn(fn ->
         receive do
-          :stop -> :ok
+          {:"$gen_call", _from, {:request, "session/prompt", _params, _opts}} ->
+            send(owner, :prompt_waiting_without_dispatch_ack)
+
+            receive do
+              :stop -> :ok
+            end
         end
       end)
 
@@ -1064,12 +1149,21 @@ defmodule Tightbeam.Acp.AdapterTest do
     :sys.replace_state(adapter, &%{&1 | conn: inert_conn})
 
     prompt = Task.async(fn -> Adapter.prompt(adapter, "sess-1", "never acknowledged") end)
-    assert Task.yield(prompt, 50) == nil
+    assert_receive :prompt_waiting_without_dispatch_ack
 
     send(inert_conn, :stop)
-    assert {:error, :prompt_dispatch_failed} = Task.await(prompt)
+
+    assert {:error, {:acp_request_not_dispatched, :prompt_dispatch_failed}} =
+             Task.await(prompt)
 
     assert Adapter.conn(adapter) == inert_conn
+  end
+
+  test "a post-dispatch ACP failure retains its existing error semantics" do
+    {adapter, _capture_path} = start_adapter()
+
+    assert {:error, %{"code" => -32000, "message" => "post-dispatch failure"}} =
+             Adapter.prompt(adapter, "sess-1", "fail after dispatch")
   end
 
   test "caller death preserves existing monitor ownership and requires explicit cancel" do

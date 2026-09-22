@@ -105,6 +105,9 @@ defmodule Tightbeam.GatewayTurnFixture do
          {:error, %{"message" => "Internal error", "data" => %{"details" => "auth expired"}}},
          parent}
 
+    def handle_call({:prompt, _sid, "fail before dispatch", _opts}, _from, parent),
+      do: {:reply, {:error, {:acp_request_not_dispatched, :closed}}, parent}
+
     def handle_call({:prompt, _sid, "fail with " <> json, _opts}, _from, parent),
       do: {:reply, {:error, JSON.decode!(json)}, parent}
 

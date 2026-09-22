@@ -105,28 +105,38 @@ defmodule Tightbeam.Acp.Conn do
   @impl true
   def handle_call({:request, method, params, opts}, {pid, _} = from, state) do
     if state.closed do
-      notify_dispatched(opts)
+      notify_not_dispatched(opts, :closed)
       {:reply, {:error, :closed}, state}
     else
       id = state.next_id
-      notify_dispatched(opts)
-      send_json(state.port, %{jsonrpc: "2.0", id: id, method: method, params: params})
-      timeout = Keyword.get(opts, :timeout, 60_000)
 
-      if timeout != :infinity do
-        Process.send_after(self(), {:req_timeout, id}, timeout)
+      if send_request_json(state.port, %{
+           jsonrpc: "2.0",
+           id: id,
+           method: method,
+           params: params
+         }) do
+        notify_dispatched(opts, id)
+        timeout = Keyword.get(opts, :timeout, 60_000)
+
+        if timeout != :infinity do
+          Process.send_after(self(), {:req_timeout, id}, timeout)
+        end
+
+        entry = %{
+          from: from,
+          monitor: Process.monitor(pid),
+          session_id: Keyword.get(opts, :session_id),
+          method: method,
+          orphaned: false,
+          replied: false
+        }
+
+        {:noreply, %{state | next_id: id + 1, pending: Map.put(state.pending, id, entry)}}
+      else
+        notify_not_dispatched(opts, :closed)
+        {:reply, {:error, :closed}, %{state | closed: true}}
       end
-
-      entry = %{
-        from: from,
-        monitor: Process.monitor(pid),
-        session_id: Keyword.get(opts, :session_id),
-        method: method,
-        orphaned: false,
-        replied: false
-      }
-
-      {:noreply, %{state | next_id: id + 1, pending: Map.put(state.pending, id, entry)}}
     end
   end
 
@@ -242,10 +252,35 @@ defmodule Tightbeam.Acp.Conn do
   defp emit(%{subscriber: nil}, _msg), do: :ok
   defp emit(%{subscriber: pid}, msg), do: send(pid, msg)
 
-  defp notify_dispatched(opts) do
+  defp notify_dispatched(opts, request_id) do
     case Keyword.get(opts, :notify_dispatched) do
-      {pid, message} -> send(pid, message)
+      {pid, ref} -> send(pid, {:acp_request_dispatched, ref, request_id})
       nil -> :ok
+    end
+  end
+
+  defp notify_not_dispatched(opts, reason) do
+    case Keyword.get(opts, :notify_dispatched) do
+      {pid, ref} -> send(pid, {:acp_request_not_dispatched, ref, reason})
+      nil -> :ok
+    end
+  end
+
+  # A request is dispatched only after its bytes reach the Port. The OS process
+  # can exit after `closed` was read above but before this write; only that
+  # observable closed-port ArgumentError becomes `false`. Encoding happens
+  # outside the rescue, and a write ArgumentError while the Port is still open
+  # remains a programming error rather than being mislabeled as lifecycle loss.
+  defp send_request_json(port, map) do
+    payload = JSON.encode!(map) <> "\n"
+
+    try do
+      Port.command(port, payload)
+    rescue
+      error in ArgumentError ->
+        if Port.info(port) == nil,
+          do: false,
+          else: reraise(error, __STACKTRACE__)
     end
   end
 

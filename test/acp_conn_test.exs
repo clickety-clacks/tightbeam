@@ -49,6 +49,68 @@ defmodule Tightbeam.Acp.ConnTest do
     assert {:error, %{"code" => -32000}} = Conn.request(conn, "fail", %{})
   end
 
+  test "successful and rejected requests report dispatch only after the write" do
+    conn = start_conn("dispatch")
+    dispatched = make_ref()
+
+    assert {:ok, %{"protocolVersion" => 1}} =
+             Conn.request(conn, "initialize", %{}, notify_dispatched: {self(), dispatched})
+
+    assert_receive {:acp_request_dispatched, ^dispatched, 1}
+
+    rejected = make_ref()
+
+    assert {:error, %{"code" => -32000}} =
+             Conn.request(conn, "fail", %{}, notify_dispatched: {self(), rejected})
+
+    assert_receive {:acp_request_dispatched, ^rejected, 2}
+    refute_receive {:acp_request_not_dispatched, ^rejected, _reason}
+  end
+
+  test "a request against an already closed connection reports not dispatched" do
+    conn = start_conn("closed_before_send")
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
+
+    Conn.close(conn)
+    assert :sys.get_state(conn).closed
+
+    not_dispatched = make_ref()
+
+    assert {:error, :closed} =
+             Conn.request(conn, "echo", %{}, notify_dispatched: {self(), not_dispatched})
+
+    assert_receive {:acp_request_not_dispatched, ^not_dispatched, :closed}
+    refute_receive {:acp_request_dispatched, ^not_dispatched, _request_id}
+  end
+
+  test "a port closed after the open-state check reports not dispatched" do
+    conn = start_conn("closed_port_race")
+    assert {:ok, %{"protocolVersion" => 1}} = Conn.request(conn, "initialize", %{})
+
+    port = :sys.get_state(conn).port
+    :ok = :sys.suspend(conn)
+    call_ref = make_ref()
+    dispatched = make_ref()
+
+    send(
+      conn,
+      {:"$gen_call", {self(), call_ref},
+       {:request, "echo", %{boundary: true}, [notify_dispatched: {self(), dispatched}]}}
+    )
+
+    true = Port.close(port)
+    :ok = :sys.resume(conn)
+
+    assert_receive {^call_ref, {:error, :closed}}
+    assert_receive {:acp_request_not_dispatched, ^dispatched, :closed}
+    refute_receive {:acp_request_dispatched, ^dispatched, _request_id}
+
+    state = :sys.get_state(conn)
+    assert state.closed
+    assert state.pending == %{}
+    assert state.next_id == 2
+  end
+
   test "notifications reach the subscriber" do
     conn = start_conn("notif")
     # `notify` is fire-and-forget, so with nothing waited on first the budget below covers
