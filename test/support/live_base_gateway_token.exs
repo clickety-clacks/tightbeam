@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(Application.app_dir(:tightbeam)) == Path.expand(payload)
 {:ok, _} = Application.ensure_all_started(:exqlite)
 {:ok, _} = Application.ensure_all_started(:crypto)
@@ -10,7 +10,7 @@ alias Tightbeam.{Boot, DB, Gateway, Model}
 import ExUnit.Assertions
 
 {:ok, db} =
-  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [lock_dir: locks])
+  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
 
 :ignore = Boot.start_link(%{base_dir: base})
 marker = File.read!(Path.join(base, "build-owner.json"))

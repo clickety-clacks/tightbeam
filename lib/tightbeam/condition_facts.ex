@@ -25,6 +25,7 @@ defmodule Tightbeam.ConditionFacts do
     harness-model-unavailable harness-model-restored
     harness-task-crash harness-task-restored
     harness-interrupted-outcome-unknown harness-interrupted-outcome-reconciled
+    harness-other-unavailable harness-other-restored
     cli-incompatible cli-compatible
   )
   @agent_only_kinds ~w(work-blocked work-unblocked)
@@ -38,6 +39,7 @@ defmodule Tightbeam.ConditionFacts do
     "harness-model-unavailable" => "harness-model-restored",
     "harness-task-crash" => "harness-task-restored",
     "harness-interrupted-outcome-unknown" => "harness-interrupted-outcome-reconciled",
+    "harness-other-unavailable" => "harness-other-restored",
     "cli-incompatible" => "cli-compatible"
   }
 
@@ -53,11 +55,13 @@ defmodule Tightbeam.ConditionFacts do
     {"task_crash", :assert} => "harness-task-crash",
     {"task_crash", :retract} => "harness-task-restored",
     {"interrupted-outcome-unknown", :assert} => "harness-interrupted-outcome-unknown",
-    {"interrupted-outcome-unknown", :retract} => "harness-interrupted-outcome-reconciled"
+    {"interrupted-outcome-unknown", :retract} => "harness-interrupted-outcome-reconciled",
+    {"other", :assert} => "harness-other-unavailable",
+    {"other", :retract} => "harness-other-restored"
   }
   @harness_failure_classes ~w(
     auth-dead rate-limit-dead adapter_unavailable model_unavailable task_crash
-    interrupted-outcome-unknown
+    interrupted-outcome-unknown other
   )
 
   @ddl """

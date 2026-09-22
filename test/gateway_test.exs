@@ -3,15 +3,22 @@ defmodule Tightbeam.GatewayTest do
   use Tightbeam.TestCase, async: false
   alias Tightbeam.Model
 
+  # The committed packaging shim, for the writer→consumer seam test below.
+  @shim Path.expand("../packaging/tightbeam-gateway", __DIR__)
+
   test "handler registry preserves current verbs and rejects invalid effect bindings" do
     handlers = Tightbeam.Gateway.handlers(%{db: :registry_test_unused})
     effects = Tightbeam.Gateway.handler_effects(%{db: :registry_test_unused})
 
     expected =
-      ~w(post wake condition facts-read artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent retire assignment-commitref-correct)
+      ~w(post wake condition facts-read artifact-record artifact-get artifacts rule effort-rule waive revoke-waiver withdraw operator-ask operator-rule operator-withdraw decision-requests decision-request approve-device deny-device revoke-device host-env-set host-env-list host-env-unset host-toolchain-set register-host update-clients identity-edit identity-status identity-relearn identity-repoint learn unlearn kungfu-list identity-apply kungfu-scaffold onboard promote-user add-user config harness-processes role-create role-bind role-rm role-list work-item-create work-item-get work-item-trace transcript attend execution-map execution-map-select toplines topline topline-create topline-update topline-close topline-reopen topline-link-work topline-unlink-work topline-concern-create topline-concern-link-work topline-concern-unlink-work topline-work-leave-unlinked topline-placement-list work-item-list work-item-update work-item-icebox work-item-reopen work-item-close work-item-fail assign dispatch attest attests assignment-get revoke-assignment reopen-assignment repair-assignment assignments inspect cancel critical spawn tune session-reparent session-po-set retire assignment-commitref-correct)
 
     expected =
       expected ++ ~w(ask answer return read-marker-set read-marker-clear artifact-content-fetch)
+
+    expected =
+      expected ++
+        ~w(harness-health-observe-other harness-health-resolve-other harness-health-review-other harness-health-close-promotion harness-health-evidence-other)
 
     assert Enum.sort(Map.keys(handlers)) == Enum.sort(expected)
     assert Enum.sort(Map.keys(effects)) == Enum.sort(expected)
@@ -19,6 +26,7 @@ defmodule Tightbeam.GatewayTest do
     assert effects["reopen-assignment"] == ["assignment.reopened"]
     assert effects["artifact-content-fetch"] == []
     assert effects["repair-assignment"] == ["message.created", "session.updated"]
+    assert effects["session-po-set"] == ["wake.scheduled"]
 
     assert effects["wake"] == [
              "wake.scheduled",
@@ -1030,6 +1038,26 @@ defmodule Tightbeam.GatewayTest do
     )
   end
 
+  @tag cold_gateway: true, tmp_dir: true
+  test "children writes the instance's ACTUAL RELEASE_NODE and owned pid into the descriptor, fresh every boot",
+       %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_descriptor.exs",
+      "guarded-gateway-descriptor: ok"
+    )
+  end
+
+  @tag cold_gateway: true, tmp_dir: true
+  test "the node the REAL writer persists is what rpc resolves; ambient node+cookie cannot override (writer→consumer seam)",
+       %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_descriptor.exs",
+      "guarded-gateway-descriptor: ok"
+    )
+  end
+
   for {override, script} <- [
         {%{}, "live_base_gateway_liveness_default.exs"},
         {%{supervision_interval_ms: 4_321}, "live_base_gateway_liveness_override.exs"}
@@ -1078,8 +1106,7 @@ defmodule Tightbeam.GatewayTest do
 
     {:ok, _turn} = Ledger.claim_next(ctx.db, "k1", "test-lane")
 
-    :ok =
-      Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown")
+    :ok = Ledger.finish(ctx.db, source_seq, "failed_unknown", "interrupted: outcome unknown")
 
     assert {:opened, incident} =
              HarnessHealth.observe(ctx.db, %{
@@ -2342,8 +2369,7 @@ defmodule Tightbeam.GatewayTest do
              harness: "fixture",
              provider: "fixture_provider",
              model: %Model{family: "fixture-model"}
-           } =
-             Org.get(ctx.db, spawned_key)
+           } = Org.get(ctx.db, spawned_key)
 
     assert %{ok: true, harness: "fixture", model: "fixture-model", effort: nil} =
              handlers["tune"].(%{
@@ -3451,8 +3477,7 @@ defmodule Tightbeam.GatewayTest do
              host: ^host,
              dirs: [],
              effect: "this host's adapter PATH now keeps the inherited value unchanged"
-           } =
-             set.(%{origin: "user:flynn", params: %{host: host, dirs: []}})
+           } = set.(%{origin: "user:flynn", params: %{host: host, dirs: []}})
 
     assert {:ok, []} = DB.query(ctx.db, "SELECT host FROM host_toolchain_dirs")
   end
@@ -3801,8 +3826,7 @@ defmodule Tightbeam.GatewayTest do
       start: {ConnRegistry, :start_link, [[name: Tightbeam.ConnRegistry]]}
     })
 
-    spawn =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
 
     assert %{session_key: session_key} =
              spawn.(%{
@@ -3884,8 +3908,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert %{ok: true} = retune.("gateway-only-model")
 
-    assert %{code: "model_unavailable", message: gateway_message} =
-             retune.("worker-only-model")
+    assert %{code: "model_unavailable", message: gateway_message} = retune.("worker-only-model")
 
     assert gateway_message =~ "on host testhost"
   end
@@ -4093,8 +4116,7 @@ defmodule Tightbeam.GatewayTest do
       {"", 0}
     end
 
-    spawn =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
 
     invalid = [
       nil,
@@ -4890,8 +4912,7 @@ defmodule Tightbeam.GatewayTest do
 
     status = Gateway.session_status("k-wire", ctx.db)
 
-    wide =
-      Enum.find(status.modelCatalog.models, &(&1.context == "1m"))
+    wide = Enum.find(status.modelCatalog.models, &(&1.context == "1m"))
 
     # OUTBOUND: the fields are named. `context` is a field a client can read,
     # not a bracket it would have to split off a string itself.
@@ -5698,8 +5719,7 @@ defmodule Tightbeam.GatewayTest do
       if hd(command) == "rsync", do: {"copy failed", 23}, else: {"", 0}
     end
 
-    tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
 
     result =
       tune.(%{
@@ -5722,8 +5742,7 @@ defmodule Tightbeam.GatewayTest do
       {"", 0}
     end
 
-    tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
 
     assert tune.(%{
              origin: "user:flynn",
@@ -5742,8 +5761,7 @@ defmodule Tightbeam.GatewayTest do
       if String.contains?(List.last(command), "test -f"), do: {"", 1}, else: {"", 0}
     end
 
-    tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+    tune = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
 
     assert %{code: "host_unready", message: message} =
              tune.(%{
@@ -6255,8 +6273,7 @@ defmodule Tightbeam.GatewayTest do
       sender: "process:tightbeam"
     ]
 
-    assert :appended =
-             Gateway.deliver_prompt("k1", "user:flynn", "conversation", common)
+    assert :appended = Gateway.deliver_prompt("k1", "user:flynn", "conversation", common)
 
     assert :appended =
              Gateway.deliver_prompt(
@@ -6539,6 +6556,15 @@ defmodule Tightbeam.GatewayTest do
       tmp,
       "live_base_gateway_reattach.exs",
       "guarded-gateway-reattach: ok"
+    )
+  end
+
+  @tag cold_gateway: true, gateway_reattach_mode_failure: true, tmp_dir: true
+  test "reattach mode refusal fails the turn without fallback or prompting", %{tmp_dir: tmp} do
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_reattach_mode_failure.exs",
+      "guarded-gateway-reattach-mode-failure: ok"
     )
   end
 
@@ -7041,8 +7067,7 @@ defmodule Tightbeam.GatewayTest do
                  root_archetype: "orchestrator"
                }
              ]
-           } =
-             list.(%{origin: "agent:k1", params: %{}})
+           } = list.(%{origin: "agent:k1", params: %{}})
 
     assert purpose =~ "turn product ideas and bug reports into shipped software"
     assert "I want my code reviewed before it merges." in phrases
@@ -8350,6 +8375,37 @@ defmodule Tightbeam.GatewayTest do
                       "type" => "stream_updated",
                       "stream" => %{"sessionKey" => ^key, "adopted" => false}
                     }}
+  end
+
+  # A temp copy of the packaged layout: the committed shim forwarding (per its
+  # own DIR resolution) to a raw FAKE release probe that echoes the RELEASE_NODE
+  # it was handed and the RAW inherited RELEASE_COOKIE — enough to prove the real
+  # writer→consumer node seam and that the shim strips the cookie. The real
+  # launcher's baked-cookie resolution is proven in release_cookie_resolution_test.
+  defp faked_release_shim! do
+    root = Path.join(System.tmp_dir!(), "tb-rel-#{System.unique_integer([:positive])}")
+    bin = Path.join(root, "release/bin")
+    rel_bin = Path.join(root, "release/release/bin")
+    File.mkdir_p!(bin)
+    File.mkdir_p!(rel_bin)
+
+    shim = Path.join(bin, "tightbeam-gateway")
+    File.cp!(@shim, shim)
+    File.chmod!(shim, 0o755)
+
+    fake = Path.join(rel_bin, "tightbeam_gateway")
+
+    File.write!(
+      fake,
+      "#!/bin/sh\n" <>
+        "printf 'REL_NODE=%s\\n' \"$RELEASE_NODE\"\n" <>
+        "printf 'REL_COOKIE=%s\\n' \"${RELEASE_COOKIE-<unset>}\"\n" <>
+        "for a in \"$@\"; do printf 'ARG=%s\\n' \"$a\"; done\n"
+    )
+
+    File.chmod!(fake, 0o755)
+    on_exit(fn -> File.rm_rf!(root) end)
+    shim
   end
 
   defp gateway_config(base_dir, db, port) do

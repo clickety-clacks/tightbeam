@@ -170,6 +170,80 @@ When a dispute claims that two unchanged sources differ, hash the exact bytes at
 locations. Matching hashes settle their identity and end that verification. Do not repeat
 the comparison because paths, labels, messages, or memories disagree with the bytes.
 
+## Harness failure other
+
+When a harness failure does not match a named class, record one evidence-bearing `other`
+observation instead of guessing a class. A good entry reuses the WORLD FACT format:
+observed state, the exact probe, an output digest (or the exact observed error), `validUntil`,
+and `PROVEN` or `UNKNOWN`. It also states the recovery condition and includes one line
+explaining why the failure is not a known class. Confirm redaction before admission; do not
+put credentials or credential-shaped output in the evidence.
+
+An `other` incident pauses prodding for that harness, routes to a living authority for review,
+and expires after its bounded validity interval. A normal successful turn may resolve it only
+with explicit, matching recovery evidence. Every incident is reviewed: confirm the class,
+reclassify it, or open a promotion case when the same description recurs. The shared
+prod-shape gate is the one suppression seam for all consumers; individual sweeps must not
+carry a second harness-health check.
+
+For a probe-backed observation, preserve the exact field names and the observed status:
+
+```text
+description: provider returned an unclassified transport failure
+descriptionDigest: <sha256(description)>
+observedState: provider connection was unavailable
+evidenceMode: probe_digest
+exactProbe: GET provider health endpoint
+outputDigest: <sha256(exact probe output)>
+recoveryCondition: a normal provider turn completes
+recoveryConditionDigest: <sha256(recoveryCondition)>
+notKnownClassReason: no auth, quota, adapter, model, task, or interruption signal
+validUntil: <bounded timestamp>
+worldStatus: PROVEN
+redactionConfirmed: true
+```
+
+The following are complete CLI examples. The first records a PROVEN probe digest; the
+second records an UNKNOWN exact error. Keep the command's idempotency key stable on a
+retry, and do not replace either example with an ordinary turn or an invented class.
+
+```sh
+description='provider returned an unclassified transport failure'
+condition='a normal provider turn completes'
+at=$(date +%s%3N)
+probe_digest=$(printf '%s' 'GET provider health endpoint: 503 transport reset' | sha256sum | cut -d' ' -f1)
+condition_digest=$(printf '%s' "$condition" | sha256sum | cut -d' ' -f1)
+tightbeam harness-health-observe-other \
+  --harness claude --host host-b --source-session agent:example:worker \
+  --description "$description" --evidence-mode probe_digest \
+  --observed-state 'provider connection was unavailable' \
+  --exact-probe 'GET provider health endpoint' --output-digest "$probe_digest" \
+  --recovery-condition "$condition" \
+  --not-known-class 'no auth, quota, adapter, model, task, or interruption signal' \
+  --valid-until "$((at + 900000))" --world-status PROVEN \
+  --redaction-confirmed --key other-proven-001
+```
+
+```sh
+at=$(date +%s%3N)
+tightbeam harness-health-observe-other \
+  --harness claude --host host-b --source-session agent:example:worker \
+  --description 'provider returned an unclassified transport failure' \
+  --evidence-mode exact_error --observed-state 'provider response was unavailable' \
+  --exact-probe 'GET provider health endpoint' \
+  --exact-error 'transport reset by peer' \
+  --recovery-condition 'a normal provider turn completes' \
+  --not-known-class 'the captured error does not identify a named failure class' \
+  --valid-until "$((at + 900000))" --world-status UNKNOWN \
+  --redaction-confirmed --key other-unknown-001
+```
+
+When the world is unknown, retain the exact observed error instead of inventing a probe
+digest, and keep `worldStatus: UNKNOWN`. Recovery evidence is a separate normal-turn row:
+it carries the opening `descriptionDigest`, the matching `recoveryConditionDigest`, a
+successful probe/output digest, `recoverySatisfied: true`, `worldStatus: PROVEN`, and no
+opening-only description, exact error, or validity interval.
+
 - Record what you produced OUTSIDE your workdir as an artifact:
 
     tightbeam artifact-record --kind report --title "nginx config on host-b" \

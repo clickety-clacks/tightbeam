@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:exqlite)
@@ -11,6 +11,5 @@ Application.put_env(:tightbeam, :base_dir, base)
 
 Tightbeam.IdentityPublicationFixture.run_case!(
   String.to_integer(System.fetch_env!("DD36_SCENARIO")),
-  base,
-  locks
+  base
 )

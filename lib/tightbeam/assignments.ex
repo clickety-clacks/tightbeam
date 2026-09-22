@@ -28,6 +28,11 @@ defmodule Tightbeam.Assignments do
     defexception message: "assignment closed"
   end
 
+  defmodule TerminalNotificationRefused do
+    @moduledoc false
+    defexception [:code, :message]
+  end
+
   defmodule UnknownWorkItem do
     @moduledoc false
     defexception [:work_item_id]
@@ -524,8 +529,12 @@ defmodule Tightbeam.Assignments do
         [assignment_id, session_key, ts]
       )
 
-      append_substrate(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
+      # Incomplete notice cancellation must see the real remaining-work bracket.
+      # Both the bracket and notice still roll back with this terminal transition.
       Tightbeam.WorkItems.arm_slate_in_txn(txn, work_item_id)
+      admit_revocation_notice!(txn, assignment_id, revocation_id)
+
+      append_substrate(txn, session_key, "[assignment interrupted by retire: #{assignment_id}]")
 
       liveness_trigger = disposition_liveness_trigger!(txn, work_item_id)
 
@@ -1303,6 +1312,9 @@ defmodule Tightbeam.Assignments do
       end
     end
   rescue
+    refusal in TerminalNotificationRefused ->
+      error(refusal.code, refusal.message)
+
     TransitionRace ->
       if call[:terminal_surrender] do
         terminal_surrender_after_race(db, call)
@@ -1533,7 +1545,11 @@ defmodule Tightbeam.Assignments do
       Map.delete(result, :revocation_replayed)
     end
   rescue
-    TransitionRace -> assignment_closed()
+    TransitionRace ->
+      assignment_closed()
+
+    refusal in TerminalNotificationRefused ->
+      error(refusal.code, refusal.message)
   end
 
   # Reopening is an agent-reachable repair for a closed assignment. It records
@@ -2135,6 +2151,16 @@ defmodule Tightbeam.Assignments do
                 closed_assignment = fetch_assignment!(txn, assignment_id)
                 Tightbeam.WorkItems.arm_slate_in_txn(txn, closed_assignment.workItemId)
 
+                case Wakes.admit_terminal_notification_in_txn(txn, assignment_id) do
+                  {:ok, _wake} ->
+                    :ok
+
+                  {:error, refusal} ->
+                    raise TerminalNotificationRefused,
+                      code: refusal.code,
+                      message: refusal.message
+                end
+
                 liveness_trigger =
                   disposition_liveness_trigger!(txn, closed_assignment.workItemId)
 
@@ -2415,6 +2441,7 @@ defmodule Tightbeam.Assignments do
               if Txn.changes(txn) != 1, do: raise(TransitionRace)
               revoked_assignment = fetch_assignment!(txn, assignment_id)
               Tightbeam.WorkItems.arm_slate_in_txn(txn, revoked_assignment.workItemId)
+              admit_revocation_notice!(txn, assignment_id, revocation_id)
 
               liveness_trigger =
                 disposition_liveness_trigger!(txn, revoked_assignment.workItemId)
@@ -2447,6 +2474,16 @@ defmodule Tightbeam.Assignments do
               revoked_assignment
             end
         end
+    end
+  end
+
+  defp admit_revocation_notice!(txn, assignment_id, revocation_id) do
+    case Wakes.admit_terminal_revocation_in_txn(txn, assignment_id, revocation_id) do
+      {:ok, _wake} ->
+        :ok
+
+      {:error, refusal} ->
+        raise TerminalNotificationRefused, code: refusal.code, message: refusal.message
     end
   end
 

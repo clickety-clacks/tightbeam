@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:exqlite)
@@ -8,7 +8,7 @@ Application.put_env(:tightbeam, :base_dir, base)
 import ExUnit.Assertions
 alias Tightbeam.{DB, Model, Org, Schema, SessionReparent}
 {:ok, hub} = Tightbeam.Firehose.Hub.start_link(name: Tightbeam.Firehose.Hub)
-opts = [path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks]]
+opts = [path: Path.join(base, "state.db"), name: nil, guard_inputs: []]
 {:ok, db} = DB.start_link(opts)
 :ok = Schema.ensure_all(db)
 :ok = DB.execute(db, "INSERT INTO users(userId,isAdmin,createdAt) VALUES ('owner',0,1)")

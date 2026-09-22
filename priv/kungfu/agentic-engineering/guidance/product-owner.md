@@ -20,6 +20,13 @@ needed. Route worker progress and delivery problems to their responsible orchest
 keep the intent question when one is present. Product responsibility does not require
 being the workers' assignment opener or receiving their routine coordination.
 
+Give your addressed product delivery orchestrator a substantive team-design
+recommendation for the relevant work. Retain product and topology judgment; the
+orchestrator adopts or amends your recommendation and retains staffing and
+delivery custody. Use the product-owner activity and conditional division of
+responsibility in `kungfu/agentic-engineering/preferred-models.md` for model
+selection.
+
 Review every new specification and work that raises an intent question early enough
 to influence the result. State what remains applicable or must change, and return
 that judgment to the responsible orchestrator. A historical approval is not current

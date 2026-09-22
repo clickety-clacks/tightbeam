@@ -197,6 +197,182 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
             }
             Ok(request(identity, "condition", vec![], params))
         }
+        Command::HarnessHealthObserveOther {
+            identity,
+            harness,
+            host,
+            source_session,
+            description,
+            evidence_mode,
+            observed_state,
+            exact_error,
+            exact_probe,
+            output_digest,
+            recovery_condition,
+            not_known_class,
+            observed_at,
+            valid_until,
+            world_status,
+            redaction_confirmed,
+            idempotency_key,
+            correlation_id,
+        } => {
+            let mut params = vec![
+                string_field("harness", harness),
+                string_field("host", host),
+                string_field("sourceSessionKey", source_session),
+                string_field("description", description),
+                string_field("evidenceMode", evidence_mode),
+                string_field("observedState", observed_state),
+                string_field("exactProbe", exact_probe),
+                string_field("recoveryCondition", recovery_condition),
+                string_field("notKnownClassReason", not_known_class),
+                format!("\"validUntil\":{valid_until}"),
+                string_field("worldStatus", world_status),
+                format!("\"redactionConfirmed\":{redaction_confirmed}"),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+            for (name, value) in [
+                ("exactObservedError", exact_error),
+                ("outputDigest", output_digest),
+                ("correlationId", correlation_id),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            if let Some(value) = observed_at {
+                params.push(format!("\"observedAt\":{value}"));
+            }
+            Ok(request(
+                identity,
+                "harness-health-observe-other",
+                vec![],
+                params,
+            ))
+        }
+        Command::HarnessHealthResolveOther {
+            identity,
+            harness,
+            host,
+            incident_id,
+            observed_state,
+            exact_probe,
+            output_digest,
+            recovery_condition_digest,
+            cause,
+            observed_at,
+            accepted_at,
+            idempotency_key,
+            session_key,
+            correlation_id,
+        } => {
+            let mut params = vec![
+                string_field("harness", harness),
+                string_field("host", host),
+                string_field("observedState", observed_state),
+                string_field("exactProbe", exact_probe),
+                string_field("outputDigest", output_digest),
+                string_field("recoveryConditionDigest", recovery_condition_digest),
+                string_field("cause", cause),
+                string_field("idempotencyKey", idempotency_key),
+                "\"recoverySatisfied\":true".to_owned(),
+                "\"worldStatus\":\"PROVEN\"".to_owned(),
+                "\"redactionConfirmed\":true".to_owned(),
+            ];
+            for (name, value) in [
+                ("incidentId", incident_id),
+                ("sessionKey", session_key),
+                ("correlationId", correlation_id),
+            ] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            if let Some(value) = observed_at {
+                params.push(format!("\"observedAt\":{value}"));
+            }
+            if let Some(value) = accepted_at {
+                params.push(format!("\"acceptedAt\":{value}"));
+            }
+            Ok(request(
+                identity,
+                "harness-health-resolve-other",
+                vec![],
+                params,
+            ))
+        }
+        Command::HarnessHealthReviewOther {
+            identity,
+            incident_id,
+            outcome,
+            named_class,
+            cause,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("incidentId", incident_id),
+                string_field("outcome", outcome),
+            ];
+            for (name, value) in [("namedClass", named_class), ("cause", cause)] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+            params.push(string_field("idempotencyKey", idempotency_key));
+            Ok(request(
+                identity,
+                "harness-health-review-other",
+                vec![],
+                params,
+            ))
+        }
+        Command::HarnessHealthClosePromotion {
+            identity,
+            promotion_id,
+            named_class,
+            spec_artifact_id,
+            spec_ref,
+            spec_sha256,
+            review_artifact_id,
+            review_attest_id,
+            review_assignment_id,
+            candidate_commit,
+            idempotency_key,
+        } => {
+            let mut params = vec![
+                string_field("promotionId", promotion_id),
+                string_field("namedClass", named_class),
+                string_field("specArtifactId", spec_artifact_id),
+                string_field("reviewArtifactId", review_artifact_id),
+                string_field("reviewAttestId", review_attest_id),
+                string_field("candidateCommit", candidate_commit),
+                string_field("reviewAssignmentId", review_assignment_id),
+                string_field("idempotencyKey", idempotency_key),
+            ];
+
+            for (name, value) in [("specRef", spec_ref), ("specSha256", spec_sha256)] {
+                if let Some(value) = value {
+                    params.push(string_field(name, value));
+                }
+            }
+
+            Ok(request(
+                identity,
+                "harness-health-close-promotion",
+                vec![],
+                params,
+            ))
+        }
+        Command::HarnessHealthEvidenceOther {
+            identity,
+            incident_id,
+        } => Ok(request(
+            identity,
+            "harness-health-evidence-other",
+            vec![],
+            vec![string_field("incidentId", incident_id)],
+        )),
         Command::ArtifactContentFetch {
             identity,
             artifact_id,
@@ -321,6 +497,21 @@ pub fn build_request(command: &Command) -> Result<RequestSpec, String> {
                 string_field("sessionKey", session_key),
                 string_field("parentSessionKey", parent_session_key),
                 string_field("assignmentId", assignment_id),
+                string_field("idempotencyKey", idempotency_key),
+            ],
+        )),
+        Command::SessionPoSet {
+            identity,
+            session_key,
+            po_role,
+            idempotency_key,
+        } => Ok(request(
+            identity,
+            "session-po-set",
+            vec![],
+            vec![
+                string_field("sessionKey", session_key),
+                string_field("poRole", po_role),
                 string_field("idempotencyKey", idempotency_key),
             ],
         )),
@@ -1801,6 +1992,11 @@ fn command_identity(command: &Command) -> Option<&Identity> {
     match command {
         Command::Wake { identity, .. }
         | Command::Condition { identity, .. }
+        | Command::HarnessHealthObserveOther { identity, .. }
+        | Command::HarnessHealthResolveOther { identity, .. }
+        | Command::HarnessHealthReviewOther { identity, .. }
+        | Command::HarnessHealthClosePromotion { identity, .. }
+        | Command::HarnessHealthEvidenceOther { identity, .. }
         | Command::ArtifactRecord { identity, .. }
         | Command::ArtifactContentFetch { identity, .. }
         | Command::Artifacts { identity, .. }
@@ -1809,6 +2005,7 @@ fn command_identity(command: &Command) -> Option<&Identity> {
         | Command::Retire { identity, .. }
         | Command::Tune { identity, .. }
         | Command::SessionReparent { identity, .. }
+        | Command::SessionPoSet { identity, .. }
         | Command::Assign { identity, .. }
         | Command::Dispatch { identity, .. }
         | Command::EffortRule { identity, .. }
@@ -2104,6 +2301,38 @@ mod tests {
                 ("--parent", "parent"),
                 ("--assignment", "asg_one"),
                 ("--key", "correction"),
+            ] {
+                if flag != missing {
+                    args.extend([flag, value]);
+                }
+            }
+            assert!(crate::args::parse(args.iter().map(|v| (*v).to_owned()).collect()).is_err());
+        }
+    }
+
+    #[test]
+    fn session_po_set_preserves_exact_role_and_requires_explicit_retry_key() {
+        assert_eq!(
+            body(&[
+                "session-po-set",
+                "--session",
+                "orchestrator with space",
+                "--po-role",
+                "product-owner:news",
+                "--key",
+                "association-one",
+                "--as",
+                "orchestrator:delivery"
+            ]),
+            r#"{"as":"orchestrator:delivery","verb":"session-po-set","params":{"sessionKey":"orchestrator with space","poRole":"product-owner:news","idempotencyKey":"association-one"}}"#
+        );
+
+        for missing in ["--session", "--po-role", "--key"] {
+            let mut args = vec!["session-po-set"];
+            for (flag, value) in [
+                ("--session", "orchestrator"),
+                ("--po-role", "product-owner:news"),
+                ("--key", "association-one"),
             ] {
                 if flag != missing {
                     args.extend([flag, value]);

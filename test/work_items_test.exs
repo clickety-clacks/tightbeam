@@ -647,6 +647,22 @@ defmodule Tightbeam.WorkItemsTest do
     era = assign(ctx, "holder", "era", first.id)
     revoked = Assignments.__handle__(ctx.db, "revoke-assignment", revoke_call(era.id))
     assert revoked.state == "closed"
+    # The last-close slate is the actual liveness carrier for the open item;
+    # unavailable terminal notification admission must not invent or omit it.
+    assert {:ok, [["canceled", nil, "routing_bracket", item_id, "pending"]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT notice.state,notice.firedAt,c.livenessTriggerKind,c.livenessTriggerId,slate.state
+               FROM wakes notice JOIN wake_cancellations c ON c.wakeId=notice.wakeId
+               JOIN work_items wi ON wi.id=notice.work_item_id
+               JOIN wakes slate ON slate.wakeId=wi.slateWakeId
+               WHERE notice.assignmentId=?1 AND notice.obligationRef=?2
+               """,
+               [era.id, "terminal-child-owner-notification:" <> era.id]
+             )
+
+    assert item_id == first.id
     restaffed = assign(ctx, "other-holder", "restaffed", first.id)
     aspect = assign(ctx, "holder", "aspect", first.id)
 

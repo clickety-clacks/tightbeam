@@ -15,8 +15,8 @@ defmodule Tightbeam.Acp.Adapter do
      session/set_config_option {configId:"model"}, and the effort — Tightbeam's
      own field — via the harness's effort config id. Nothing outside this
      module builds or reads a packed model string.
-  3. Permission requests auto-allowed by Conn (YOLO); sessions run in the
-     harness's bypass mode set at session/new time.
+  3. Permission requests auto-allowed by Conn (YOLO); session preparation
+     reasserts the harness's configured mode after new, load, and fork.
   """
 
   use GenServer
@@ -58,6 +58,7 @@ defmodule Tightbeam.Acp.Adapter do
     chunks: %{},
     progress: %{},
     subagent_tasks: %{},
+    subagent_roots: %{},
     known: MapSet.new(),
     models: %{},
     unprompted: MapSet.new(),
@@ -424,7 +425,10 @@ defmodule Tightbeam.Acp.Adapter do
            "initialize",
            %{
              protocolVersion: 1,
-             clientCapabilities: %{fs: %{readTextFile: false, writeTextFile: false}}
+             clientCapabilities: %{
+               fs: %{readTextFile: false, writeTextFile: false},
+               subagents: %{}
+             }
            },
            timeout: :infinity
          ) do
@@ -534,7 +538,8 @@ defmodule Tightbeam.Acp.Adapter do
             switchable_models: Map.delete(state.switchable_models, sid),
             config_options: Map.delete(state.config_options, sid),
             chunks: Map.delete(state.chunks, sid),
-            progress: Map.delete(state.progress, sid)
+            progress: Map.delete(state.progress, sid),
+            subagent_roots: drop_subagent_root(state.subagent_roots, sid)
         }
 
         {:reply, :ok, state}
@@ -770,28 +775,33 @@ defmodule Tightbeam.Acp.Adapter do
            timeout: request_timeout
          ) do
       {:ok, result} ->
-        state =
-          state
-          |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
-          |> put_in([Access.key(:models)], Map.delete(state.models, sid))
-          |> put_in([Access.key(:unprompted)], MapSet.delete(state.unprompted, sid))
-          |> remember_switchable_models(sid, result)
-          |> remember_config_options(sid, result)
-          |> put_in([Access.key(:chunks), sid], [])
+        with :ok <- set_mode(state, sid, request_timeout) do
+          state =
+            state
+            |> put_in([Access.key(:known)], MapSet.put(state.known, sid))
+            |> put_in([Access.key(:models)], Map.delete(state.models, sid))
+            |> put_in([Access.key(:unprompted)], MapSet.delete(state.unprompted, sid))
+            |> remember_switchable_models(sid, result)
+            |> remember_config_options(sid, result)
+            |> put_in([Access.key(:chunks), sid], [])
 
-        case model do
-          %Model{} = model ->
-            case apply_model_to_session(state, sid, model, request_timeout) do
-              {:ok, applied_model} ->
-                {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
+          case model do
+            %Model{} = model ->
+              case apply_model_to_session(state, sid, model, request_timeout) do
+                {:ok, applied_model} ->
+                  {:reply, {:ok, applied_model}, put_in(state.models[sid], applied_model)}
 
-              {:error, reason} ->
-                {:reply, {:error, {:model_apply_failed, reason}},
-                 drop_model_residency(state, sid)}
-            end
+                {:error, reason} ->
+                  {:reply, {:error, {:model_apply_failed, reason}},
+                   drop_model_residency(state, sid)}
+              end
 
-          _unknown ->
-            {:reply, {:ok, :unknown}, state}
+            _unknown ->
+              {:reply, {:ok, :unknown}, state}
+          end
+        else
+          {:error, reason} ->
+            {:reply, {:error, reason}, state}
         end
 
       {:error, error} ->
@@ -1012,6 +1022,11 @@ defmodule Tightbeam.Acp.Adapter do
     {:noreply, state}
   end
 
+  def handle_info({:acp_notification, "_auth/status_update", params}, state) do
+    emit_auth_classification(state, params)
+    {:noreply, state}
+  end
+
   def handle_info({:acp_notification, "session/update", params}, state) do
     sid = params["sessionId"]
     update = params["update"] || %{}
@@ -1159,6 +1174,8 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp maybe_emit_subagent_event(state, sid, update) do
+    {sid, state} = accountable_subagent_root(state, sid, update)
+
     case state.on_subagent_event do
       handler when is_function(handler, 2) ->
         case handler.(sid, update) do
@@ -1189,6 +1206,25 @@ defmodule Tightbeam.Acp.Adapter do
       _other ->
         state
     end
+  end
+
+  # Native nested-child updates name their immediate parent ACP session. Only
+  # top-level sessions have durable harness pointers, so remember the root when
+  # each child is announced and attribute every descendant update to that root.
+  defp accountable_subagent_root(state, sid, update) do
+    root_sid = Map.get(state.subagent_roots, sid, sid)
+
+    case Harness.module!(state.harness).classify_subagent_event(update) do
+      {:subagent_start, %{subagent_ref: child_sid}} when is_binary(child_sid) ->
+        {root_sid, put_in(state.subagent_roots[child_sid], root_sid)}
+
+      _other ->
+        {root_sid, state}
+    end
+  end
+
+  defp drop_subagent_root(roots, sid) do
+    Map.reject(roots, fn {child_sid, root_sid} -> child_sid == sid or root_sid == sid end)
   end
 
   defp clear_subagent_task(state, event_ref) do
@@ -1734,18 +1770,18 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp set_mode(state, sid, request_timeout) do
-    _ =
-      Conn.request(
-        state.conn,
-        "session/set_mode",
-        %{
-          sessionId: sid,
-          modeId: state.preset.permission_mode
-        },
-        timeout: request_timeout
-      )
-
-    :ok
+    case Conn.request(
+           state.conn,
+           "session/set_mode",
+           %{
+             sessionId: sid,
+             modeId: state.preset.permission_mode
+           },
+           timeout: request_timeout
+         ) do
+      {:ok, _result} -> :ok
+      {:error, reason} -> {:error, {:mode_apply_failed, reason}}
+    end
   end
 
   defp adapter_ready(opts) do

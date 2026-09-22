@@ -796,6 +796,20 @@ defmodule Tightbeam.CliIntegrationTest do
 
     assert revoked =~ "revoked"
 
+    assert {:ok, [["cli-other", "cli-worker", "flynn", "flynn"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT a.openedBySession,a.holderKey,a.closedByUser,r.revokedByUser FROM assignments a JOIN assignment_revocations r ON r.assignmentId=a.id WHERE a.id=?1",
+               [assignment_id]
+             )
+
+    assert {:ok, [["other", "cli-other"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT ownerUserId,sessionKey FROM wakes WHERE assignmentId=?1 AND obligationRef=?2",
+               [assignment_id, "terminal-child-owner-notification:" <> assignment_id]
+             )
+
     assert_receive {:cli_call,
                     %{
                       verb: "revoke-assignment",

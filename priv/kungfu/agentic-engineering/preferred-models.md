@@ -16,11 +16,39 @@ need. Strong planning and independent review can support a cheaper coder; do not
 transfer continual deep reasoning into corrective supervision. A failed Luna
 attempt is not required before choosing a stronger model.
 
+## Conditional product delivery orchestration
+
+A product delivery orchestrator (PDO) holds explicitly assigned responsibility for
+routing, staffing and delivery custody. A role name, product suffix or ancestor
+match establishes neither that responsibility nor an addressed-PO association.
+
+Use the conditional PDO activity below only after both an explicit current
+addressed-PO association and receipt of that PO's substantive team-design advice
+for the relevant work. Reference the association and attributable advice in
+ordinary staffing/model-selection context. An association row, consultation
+invitation, silence or notification count alone does not qualify. Use existing
+messages and attests; add no consultation-completed record or acknowledgement.
+
+The product-owner activity retains its Astra high default and product/topology
+judgment. The PDO adopts or amends the PO's recommendation, staffs and retains
+delivery custody. Consultation does not veto or block otherwise authorized
+staffing, including before advice arrives.
+
+Keep generic and deep-technical orchestration on their existing activity rows.
+When the PDO's remaining work requires continual deep technical judgment, use the
+stronger activity or planning/escalation path with an attributable reason; do not
+shift that judgment into repeated corrective supervision. Explicit operator
+choices and shared qualification, family and access restrictions still govern.
+Use authorized explicit selection through existing spawn/tune mechanics; an
+association or its notice must not automatically switch a model. These defaults
+authorize no live session tuning, identity application or runtime change.
+
 ## Mixed-family order
 
 | Activity | Minds in order | Capability floor |
 |---|---|---|
 | Product ownership and spirit | astra[high], fable[high], opus[xhigh], sol[xhigh] | Can challenge a technically sound result against product intent and sustain product context. |
+| Product delivery orchestration, conditional on PO advice above | luna[medium] | Can route, staff and retain delivery custody after PO team design, escalating consequential product/topology questions to the addressed PO and technical questions to the qualified owner. |
 | Delivery orchestration, bounded and familiar | sol[medium], sonnet[high], opus[high], astra[high], fable[high] | Can interpret coordination detail, manage dependencies and recognize when to seek deeper judgment. |
 | Delivery orchestration, sustained or coupled | sol[high], opus[high], sonnet[high], astra[high], fable[high] | Can maintain obligations and reasoning across a long run. Move to the difficult-scope row when familiar coordination becomes insufficient. |
 | Orchestration with continual deep technical judgment | astra[high], fable[high], sol[xhigh], opus[xhigh] | Can reason about the dependencies directly, rather than merely relay a planner's decisions. |
@@ -41,6 +69,7 @@ attempt is not required before choosing a stronger model.
 | Activity | Minds in order |
 |---|---|
 | Product ownership and spirit | astra[high], sol[xhigh] |
+| Product delivery orchestration, conditional on PO advice above | luna[medium] |
 | Delivery orchestration, bounded and familiar | sol[medium], astra[high] |
 | Delivery orchestration, sustained or coupled | sol[high], astra[high] |
 | Orchestration with continual deep technical judgment | astra[high], sol[xhigh] |

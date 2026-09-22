@@ -80,6 +80,67 @@ pub enum Command {
         idempotency_key: Option<String>,
         payload: Option<String>,
     },
+    HarnessHealthObserveOther {
+        identity: Identity,
+        harness: String,
+        host: String,
+        source_session: String,
+        description: String,
+        evidence_mode: String,
+        observed_state: String,
+        exact_error: Option<String>,
+        exact_probe: String,
+        output_digest: Option<String>,
+        recovery_condition: String,
+        not_known_class: String,
+        observed_at: Option<String>,
+        valid_until: String,
+        world_status: String,
+        redaction_confirmed: bool,
+        idempotency_key: String,
+        correlation_id: Option<String>,
+    },
+    HarnessHealthResolveOther {
+        identity: Identity,
+        harness: String,
+        host: String,
+        incident_id: Option<String>,
+        observed_state: String,
+        exact_probe: String,
+        output_digest: String,
+        recovery_condition_digest: String,
+        cause: String,
+        observed_at: Option<String>,
+        accepted_at: Option<String>,
+        idempotency_key: String,
+        session_key: Option<String>,
+        correlation_id: Option<String>,
+    },
+    HarnessHealthReviewOther {
+        identity: Identity,
+        incident_id: String,
+        outcome: String,
+        named_class: Option<String>,
+        cause: Option<String>,
+        idempotency_key: String,
+    },
+    HarnessHealthClosePromotion {
+        identity: Identity,
+        promotion_id: String,
+        named_class: String,
+        spec_artifact_id: String,
+        spec_ref: Option<String>,
+        spec_sha256: Option<String>,
+        review_artifact_id: String,
+        review_attest_id: String,
+        review_assignment_id: String,
+        candidate_commit: String,
+        idempotency_key: String,
+    },
+    HarnessHealthEvidenceOther {
+        identity: Identity,
+        incident_id: String,
+    },
     ArtifactRecord {
         identity: Identity,
         kind: String,
@@ -138,6 +199,12 @@ pub enum Command {
         session_key: String,
         parent_session_key: String,
         assignment_id: String,
+        idempotency_key: String,
+    },
+    SessionPoSet {
+        identity: Identity,
+        session_key: String,
+        po_role: String,
         idempotency_key: String,
     },
     Tune {
@@ -554,6 +621,26 @@ COMMANDS:
       File an observable fact. Matching condition wakes receive the fact as a new
       notification turn; they never resume or replay prior work.
 
+  harness-health-observe-other --harness <harness> --host <host>
+      --source-session <session> --description <text> --evidence-mode exact_error|probe_digest
+      --observed-state <text> --exact-probe <text> --recovery-condition <text>
+      --not-known-class <text> --valid-until <epochMs> --world-status PROVEN|UNKNOWN
+      --redaction-confirmed --key <idempotencyKey>
+      Admit a redacted, bounded evidence observation for a not-yet-named failure.
+  harness-health-resolve-other --harness <harness> --host <host>
+      --observed-state <text> --exact-probe <text> --output-digest <sha256>
+      --recovery-condition <text> --cause <text>
+      Record a PROVEN recovery observation for an open other incident.
+  harness-health-review-other <incidentId>
+      --outcome confirmed_other|reclassified|promotion_required
+      Close the mandatory review for an other incident.
+  harness-health-close-promotion <promotionId> --named-class <class>
+      --spec-artifact <artifactId> --review-artifact <artifactId>
+      --review-attest <attestId> --review-assignment <assignmentId> --candidate-commit <commit> --key <idempotencyKey>
+      Close a recurrence promotion after the Gateway verifies canonical provenance.
+  harness-health-evidence-other <incidentId>
+      Read exact retained evidence as the authorized source, custodian, owner, or admin.
+
   artifact-record --kind <kind> --title <title> --path <originPath>
                   [--description <text>] [--work-item <workItemId>] [--sha256 <hex>]
                   [--produced-by-assignment <assignmentId>]
@@ -590,6 +677,9 @@ COMMANDS:
 
   session-reparent --session <key> --parent <key> --assignment <id> --key <key>
       Owner-as-user correction of one custom session and its sole open assignment.
+
+  session-po-set --session <key> --po-role <role> --key <key>
+      Explicitly associate an exact session with its addressed product-owner role.
 
   retire --session <key> [--key <idempotencyKey>]
       End a session deliberately.
@@ -910,6 +1000,7 @@ const BOOLEAN_FLAGS: &[&str] = &[
     "history",
     "json",
     "manifest",
+    "redaction-confirmed",
     "resolve",
     "rm",
     "tree",
@@ -1519,6 +1610,228 @@ fn parse_with_optional_catalog(
                 payload: nonempty(flags, "payload"),
             })
         }
+        "harness-health-observe-other" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "harness",
+                "host",
+                "source-session",
+                "description",
+                "evidence-mode",
+                "observed-state",
+                "exact-error",
+                "exact-probe",
+                "output-digest",
+                "recovery-condition",
+                "not-known-class",
+                "observed-at",
+                "valid-until",
+                "world-status",
+                "redaction-confirmed",
+                "key",
+                "correlation-id",
+            ];
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-observe-other --harness <harness> --host <host> --source-session <session> --description <text> --evidence-mode exact_error|probe_digest --observed-state <text> --exact-probe <text> --recovery-condition <text> --not-known-class <text> --valid-until <ms> --world-status PROVEN|UNKNOWN --redaction-confirmed --key <idempotencyKey>".to_owned());
+            }
+            let evidence_mode = nonempty(flags, "evidence-mode")
+                .ok_or_else(|| "--evidence-mode is required".to_owned())?;
+            if !matches!(evidence_mode.as_str(), "exact_error" | "probe_digest") {
+                return Err("--evidence-mode must be exact_error or probe_digest".to_owned());
+            }
+            let world_status = nonempty(flags, "world-status")
+                .ok_or_else(|| "--world-status is required".to_owned())?;
+            if !matches!(world_status.as_str(), "PROVEN" | "UNKNOWN") {
+                return Err("--world-status must be PROVEN or UNKNOWN".to_owned());
+            }
+            let exact_error = nonempty(flags, "exact-error");
+            let output_digest = nonempty(flags, "output-digest");
+            if evidence_mode == "exact_error" && exact_error.is_none() {
+                return Err("--exact-error is required for exact_error evidence".to_owned());
+            }
+            if evidence_mode == "probe_digest" && output_digest.is_none() {
+                return Err("--output-digest is required for probe_digest evidence".to_owned());
+            }
+            if !flags.contains_key("redaction-confirmed") {
+                return Err("--redaction-confirmed is required".to_owned());
+            }
+            Ok(Command::HarnessHealthObserveOther {
+                identity: identity(flags)?,
+                harness: nonempty(flags, "harness")
+                    .ok_or_else(|| "--harness is required".to_owned())?,
+                host: nonempty(flags, "host").ok_or_else(|| "--host is required".to_owned())?,
+                source_session: nonempty(flags, "source-session")
+                    .ok_or_else(|| "--source-session is required".to_owned())?,
+                description: nonempty(flags, "description")
+                    .ok_or_else(|| "--description is required".to_owned())?,
+                evidence_mode,
+                observed_state: nonempty(flags, "observed-state")
+                    .ok_or_else(|| "--observed-state is required".to_owned())?,
+                exact_error,
+                exact_probe: nonempty(flags, "exact-probe")
+                    .ok_or_else(|| "--exact-probe is required".to_owned())?,
+                output_digest,
+                recovery_condition: nonempty(flags, "recovery-condition")
+                    .ok_or_else(|| "--recovery-condition is required".to_owned())?,
+                not_known_class: nonempty(flags, "not-known-class")
+                    .ok_or_else(|| "--not-known-class is required".to_owned())?,
+                observed_at: nonempty(flags, "observed-at")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                valid_until: js_number_json(number_coercion(
+                    &nonempty(flags, "valid-until")
+                        .ok_or_else(|| "--valid-until is required".to_owned())?,
+                )),
+                world_status,
+                redaction_confirmed: true,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+                correlation_id: nonempty(flags, "correlation-id"),
+            })
+        }
+        "harness-health-resolve-other" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "harness",
+                "host",
+                "incident",
+                "observed-state",
+                "exact-probe",
+                "output-digest",
+                "recovery-condition-digest",
+                "cause",
+                "observed-at",
+                "accepted-at",
+                "key",
+                "session",
+                "correlation-id",
+            ];
+            if parsed.positional.len() != 1
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-resolve-other --harness <harness> --host <host> --incident <id> --observed-state <text> --exact-probe <text> --output-digest <sha256> --recovery-condition-digest <sha256> --cause <text> --key <idempotencyKey>".to_owned());
+            }
+            Ok(Command::HarnessHealthResolveOther {
+                identity: identity(flags)?,
+                harness: nonempty(flags, "harness")
+                    .ok_or_else(|| "--harness is required".to_owned())?,
+                host: nonempty(flags, "host").ok_or_else(|| "--host is required".to_owned())?,
+                incident_id: nonempty(flags, "incident"),
+                observed_state: nonempty(flags, "observed-state")
+                    .ok_or_else(|| "--observed-state is required".to_owned())?,
+                exact_probe: nonempty(flags, "exact-probe")
+                    .ok_or_else(|| "--exact-probe is required".to_owned())?,
+                output_digest: nonempty(flags, "output-digest")
+                    .ok_or_else(|| "--output-digest is required".to_owned())?,
+                recovery_condition_digest: nonempty(flags, "recovery-condition-digest")
+                    .ok_or_else(|| "--recovery-condition-digest is required".to_owned())?,
+                cause: nonempty(flags, "cause").ok_or_else(|| "--cause is required".to_owned())?,
+                observed_at: nonempty(flags, "observed-at")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                accepted_at: nonempty(flags, "accepted-at")
+                    .map(|value| js_number_json(number_coercion(&value))),
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+                session_key: nonempty(flags, "session"),
+                correlation_id: nonempty(flags, "correlation-id"),
+            })
+        }
+        "harness-health-review-other" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "outcome",
+                "named-class",
+                "cause",
+                "key",
+            ];
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-review-other <incidentId> --outcome confirmed_other|reclassified|promotion_required [--named-class <class>] [--cause <text>] --key <idempotencyKey>".to_owned());
+            }
+            let outcome =
+                nonempty(flags, "outcome").ok_or_else(|| "--outcome is required".to_owned())?;
+            if !matches!(
+                outcome.as_str(),
+                "confirmed_other" | "reclassified" | "promotion_required"
+            ) {
+                return Err("--outcome is invalid".to_owned());
+            }
+            Ok(Command::HarnessHealthReviewOther {
+                identity: identity(flags)?,
+                incident_id: parsed.positional[1].clone(),
+                outcome,
+                named_class: nonempty(flags, "named-class"),
+                cause: nonempty(flags, "cause"),
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+            })
+        }
+        "harness-health-close-promotion" => {
+            let allowed = [
+                "as",
+                "as-user",
+                "as-process",
+                "named-class",
+                "spec-artifact",
+                "spec-ref",
+                "spec-sha256",
+                "review-artifact",
+                "review-attest",
+                "review-assignment",
+                "candidate-commit",
+                "key",
+            ];
+
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err("usage: tightbeam harness-health-close-promotion <promotionId> --named-class <class> --spec-artifact <artifactId> --review-artifact <artifactId> --review-attest <attestId> --review-assignment <assignmentId> --candidate-commit <commit> --key <idempotencyKey>".to_owned());
+            }
+
+            Ok(Command::HarnessHealthClosePromotion {
+                identity: identity(flags)?,
+                promotion_id: parsed.positional[1].clone(),
+                named_class: nonempty(flags, "named-class")
+                    .ok_or_else(|| "--named-class is required".to_owned())?,
+                spec_artifact_id: nonempty(flags, "spec-artifact")
+                    .ok_or_else(|| "--spec-artifact is required".to_owned())?,
+                spec_ref: nonempty(flags, "spec-ref"),
+                spec_sha256: nonempty(flags, "spec-sha256"),
+                review_artifact_id: nonempty(flags, "review-artifact")
+                    .ok_or_else(|| "--review-artifact is required".to_owned())?,
+                review_attest_id: nonempty(flags, "review-attest")
+                    .ok_or_else(|| "--review-attest is required".to_owned())?,
+                review_assignment_id: nonempty(flags, "review-assignment")
+                    .ok_or_else(|| "--review-assignment is required".to_owned())?,
+                candidate_commit: nonempty(flags, "candidate-commit")
+                    .ok_or_else(|| "--candidate-commit is required".to_owned())?,
+                idempotency_key: nonempty(flags, "key")
+                    .ok_or_else(|| "--key is required".to_owned())?,
+            })
+        }
+        "harness-health-evidence-other" => {
+            let allowed = ["as", "as-user", "as-process"];
+            if parsed.positional.len() != 2
+                || flags.keys().any(|flag| !allowed.contains(&flag.as_str()))
+            {
+                return Err(
+                    "usage: tightbeam harness-health-evidence-other <incidentId>".to_owned(),
+                );
+            }
+
+            Ok(Command::HarnessHealthEvidenceOther {
+                identity: identity(flags)?,
+                incident_id: parsed.positional[1].clone(),
+            })
+        }
         "artifact-content-fetch" => {
             if parsed.positional.len() != 2
                 || parsed.positional[1].is_empty()
@@ -1637,6 +1950,23 @@ fn parse_with_optional_catalog(
                 session_key: nonempty(flags, "session").ok_or("--session is required")?,
                 parent_session_key: nonempty(flags, "parent").ok_or("--parent is required")?,
                 assignment_id: nonempty(flags, "assignment").ok_or("--assignment is required")?,
+                idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
+            })
+        }
+        "session-po-set" => {
+            if parsed.positional.len() != 1
+                || nonempty(flags, "role").is_some()
+                || nonempty(flags, "user").is_some()
+            {
+                return Err(
+                    "usage: tightbeam session-po-set --session <key> --po-role <role> --key <key>"
+                        .to_owned(),
+                );
+            }
+            Ok(Command::SessionPoSet {
+                identity: identity(flags)?,
+                session_key: nonempty(flags, "session").ok_or("--session is required")?,
+                po_role: nonempty(flags, "po-role").ok_or("--po-role is required")?,
                 idempotency_key: nonempty(flags, "key").ok_or("--key is required")?,
             })
         }
@@ -2872,6 +3202,36 @@ mod tests {
     }
 
     #[test]
+    fn harness_health_close_promotion_round_trips_candidate_commit() {
+        let candidate_commit = "c".repeat(40);
+        let command = parse(strings(&[
+            "harness-health-close-promotion",
+            "promotion-1",
+            "--named-class",
+            "provider-network-drift",
+            "--spec-artifact",
+            "spec-1",
+            "--review-artifact",
+            "report-1",
+            "--review-attest",
+            "attest-1",
+            "--review-assignment",
+            "review-1",
+            "--candidate-commit",
+            &candidate_commit,
+            "--key",
+            "close-1",
+        ]))
+        .expect("candidate commit must be accepted by the real CLI parser");
+
+        let body = crate::dispatch::build_request(&command)
+            .expect("candidate commit must reach the Gateway request")
+            .body_json;
+
+        assert!(body.contains(&format!(r#""candidateCommit":"{candidate_commit}""#)));
+    }
+
+    #[test]
     fn successor_assignment_input_parses_and_missing_values_refuse_locally() {
         assert!(matches!(
             parse(strings(&[
@@ -3628,6 +3988,11 @@ mod tests {
                 "doctor",
                 "effort-rule",
                 "harness-process",
+                "harness-health-observe-other",
+                "harness-health-resolve-other",
+                "harness-health-review-other",
+                "harness-health-close-promotion",
+                "harness-health-evidence-other",
                 "host-env-list",
                 "host-env-set",
                 "host-env-unset",
@@ -3642,6 +4007,7 @@ mod tests {
                 "operator-withdraw",
                 "retire",
                 "session-reparent",
+                "session-po-set",
                 "repair-assignment",
                 "assignment-commitref-correct",
                 "revoke-assignment",

@@ -107,7 +107,7 @@ defmodule Tightbeam.AttentionTierFixture do
     end
   end
 
-  def run_case!(scenario, _base, _locks) do
+  def run_case!(scenario, _base) do
     Tightbeam.GuardGatewayFixture.run!(fn %{db: db, base: base_dir, config: guarded} ->
       {:ok, fixtures} = Supervisor.start_link([], strategy: :one_for_one)
       Process.put({__MODULE__, :supervisor}, fixtures)
@@ -466,21 +466,5 @@ defmodule Tightbeam.AttentionTierFixture do
     sup = Process.get({__MODULE__, :supervisor})
     :ok = Supervisor.terminate_child(sup, id)
     :ok = Supervisor.delete_child(sup, id)
-  end
-
-  defp await_lock!(base, locks, remaining \\ 100) do
-    path = Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    case Tightbeam.LiveBaseLock.acquire(path) do
-      {:ok, lock} ->
-        :ok = Tightbeam.LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when remaining > 0 ->
-        Process.sleep(10)
-        await_lock!(base, locks, remaining - 1)
-
-      other ->
-        raise "fixture lock did not release: #{inspect(other)}"
-    end
   end
 end

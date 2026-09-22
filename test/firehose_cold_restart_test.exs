@@ -122,7 +122,6 @@ defmodule Tightbeam.FirehoseColdRestartTest do
         assert live["pid"] != other["pid"]
         assert live["port"] != other["port"]
         assert live["base"] != other["base"]
-        assert survivor_plan.locks != doomed_plan.locks
 
         {:ok, user} =
           SimClient.pair("127.0.0.1", live["port"],

@@ -1,4 +1,4 @@
-[payload, base, locks | args] = System.argv()
+[payload, base | args] = System.argv()
 scenario = List.first(args) || "clean"
 payload = Path.expand(payload)
 ^payload = Application.app_dir(:tightbeam) |> Path.expand()
@@ -9,31 +9,14 @@ Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 Application.put_env(:tightbeam, :fixture_harness, true)
 Application.put_env(:tightbeam, :local_host_name, "testhost")
-alias Tightbeam.{AdapterCoordinator, Boot, DB, HarnessProcess, LiveBaseLock, Model}
+alias Tightbeam.{AdapterCoordinator, Boot, DB, HarnessProcess, Model}
 
 {:ok, db} =
-  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [lock_dir: locks])
+  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
 
 :ignore = Boot.start_link(%{base_dir: base})
 :ok = GenServer.stop(db)
-key = :crypto.hash(:sha256, base) |> Base.encode16(case: :lower)
-lock_path = Path.join(locks, key <> ".lock")
 
-await_lock = fn recur, remaining ->
-  case LiveBaseLock.acquire(lock_path) do
-    {:ok, lock} ->
-      :ok = LiveBaseLock.release(lock)
-
-    {:error, :lock_busy} when remaining > 0 ->
-      Process.sleep(10)
-      recur.(recur, remaining - 1)
-
-    other ->
-      raise "lock did not release: #{inspect(other)}"
-  end
-end
-
-await_lock.(await_lock, 100)
 File.write!(Path.join(base, ".soak-arena"), "tightbeam recovery acceptance arena v1\n")
 fixture = Tightbeam.RecoveryFixture.place_adapter!(base, seed_credential: false)
 escape_identity = Path.join(base, "application-stop-escapee.identity")
@@ -95,7 +78,6 @@ Application.put_env(:tightbeam, :cwd, Path.join(base, "work"))
 Application.put_env(:tightbeam, :port, 0)
 Application.put_env(:tightbeam, :default_harness, :fixture)
 Application.put_env(:tightbeam, :default_model, Model.new("fixture-model"))
-Application.put_env(:tightbeam, :live_base_guard, lock_dir: locks)
 Application.put_env(:tightbeam, :autostart, true)
 Application.put_env(:tightbeam, :drain_timeout_ms, 1_000)
 {:ok, _apps} = Application.ensure_all_started(:tightbeam)
@@ -165,13 +147,12 @@ if scenario == "failure" do
 end
 
 :ok = Application.stop(:tightbeam)
-await_lock.(await_lock, 100)
 
 {:ok, evidence_db} =
   DB.start_link(
     path: Path.join(base, "state.db"),
     name: :application_stop_evidence_db,
-    guard_inputs: [lock_dir: locks]
+    guard_inputs: []
   )
 
 alive? = fn ->

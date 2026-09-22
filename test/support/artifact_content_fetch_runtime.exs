@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:exqlite)
@@ -6,7 +6,7 @@ false = File.exists?(base)
 import ExUnit.Assertions
 alias Tightbeam.{ArtifactContent, Artifacts, DB, Schema}
 
-opts = [path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks]]
+opts = [path: Path.join(base, "state.db"), name: nil, guard_inputs: []]
 {:ok, db} = DB.start_link(opts)
 :ok = Schema.ensure_all(db)
 :ok = DB.assert_base_admitted!(db, base)

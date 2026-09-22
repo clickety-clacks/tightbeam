@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 payload = Path.expand(payload)
 ^payload = Application.app_dir(:tightbeam) |> Path.expand()
 false = File.exists?(base)
@@ -9,7 +9,7 @@ Application.put_env(:tightbeam, :base_dir, base)
 alias Tightbeam.{Boot, DB, Gateway, Schema}
 
 {:ok, db} =
-  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [lock_dir: locks])
+  DB.start_link(path: Path.join(base, "state.db"), name: DB, guard_inputs: [])
 
 false = File.exists?(Path.join(base, "identity"))
 false = File.exists?(Path.join(base, "build-owner.json"))

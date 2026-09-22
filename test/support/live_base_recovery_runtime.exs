@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 payload = Path.expand(payload)
 ^payload = Application.app_dir(:tightbeam) |> Path.expand()
 false = File.exists?(base)
@@ -7,7 +7,7 @@ false = File.exists?(base)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 alias Tightbeam.{Boot, DB, Escalation, Model, Org, RuleRuntime, Wakes}
-opts = [path: Path.join(base, "state.db"), name: DB, guard_inputs: [lock_dir: locks]]
+opts = [path: Path.join(base, "state.db"), name: DB, guard_inputs: []]
 {:ok, seed} = DB.start_link(opts)
 :ignore = Boot.start_link(%{base_dir: base})
 
@@ -53,24 +53,7 @@ call = %{
 marker = File.read!(Path.join(base, "build-owner.json"))
 [] = Enum.filter(Wakes.list_pending(seed), &(&1.prompt == "boot recovered retired decision"))
 :ok = GenServer.stop(seed)
-key = :crypto.hash(:sha256, base) |> Base.encode16(case: :lower)
-lock_path = Path.join(locks, key <> ".lock")
 
-await = fn recur, remaining ->
-  case Tightbeam.LiveBaseLock.acquire(lock_path) do
-    {:ok, lock} ->
-      :ok = Tightbeam.LiveBaseLock.release(lock)
-
-    {:error, :lock_busy} when remaining > 0 ->
-      Process.sleep(10)
-      recur.(recur, remaining - 1)
-
-    other ->
-      raise "lock did not release: #{inspect(other)}"
-  end
-end
-
-await.(await, 100)
 rules_dir = Path.join(base, "identity/rules")
 File.mkdir_p!(rules_dir)
 
@@ -91,7 +74,7 @@ prompt = "boot recovered retired decision"
 
 {:ok, sup} =
   Supervisor.start_link(
-    Tightbeam.Application.children(%{base_dir: base, guard_inputs: [lock_dir: locks]}),
+    Tightbeam.Application.children(%{base_dir: base, guard_inputs: []}),
     strategy: :rest_for_one
   )
 
@@ -106,5 +89,4 @@ true = is_pid(db)
 ^marker = File.read!(Path.join(base, "build-owner.json"))
 :ok = DB.assert_base_admitted!(db, base)
 :ok = Supervisor.stop(sup)
-await.(await, 100)
 IO.puts("guarded-business-recovery: ok")

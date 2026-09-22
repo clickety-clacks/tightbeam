@@ -1,28 +1,19 @@
 defmodule Tightbeam.LiveBaseAdmission do
   @moduledoc false
-  alias Tightbeam.{LiveBaseGuard, LiveBaseLock, Schema}
+  alias Tightbeam.{LiveBaseGuard, Schema}
 
   defmodule Refusal do
     defexception [:message]
   end
 
-  # Options name immutable inputs, never a verified/admitted Boolean. The
-  # manifest cannot choose the observed file set. No base writes occur here.
-  def prepare!(base, options), do: prepare_locked!(base, options, nil)
-
-  # Reread before a handoff/write, without releasing or reacquiring exclusion.
-  # This remains an observation, not a public permission flag. The eventual
-  # DB owner retains its own context and must also recheck inside migration.
+  # Reread before a handoff/write. This remains an observation, not a public
+  # permission flag. The eventual DB owner retains its own context and must
+  # also recheck inside migration.
   def revalidate!(previous) do
     current =
-      prepare_locked!(
-        previous.base,
-        [
-          payload_root: previous.payload_root,
-          lock_dir: previous.lock_dir,
-          transition: previous.transition
-        ],
-        previous.lock
+      prepare!(previous.base,
+        payload_root: previous.payload_root,
+        transition: previous.transition
       )
 
     fields = [:base, :payload_root, :files, :marker, :stamp, :identity, :decision]
@@ -66,16 +57,8 @@ defmodule Tightbeam.LiveBaseAdmission do
 
   def validate_owned_files!(previous) do
     unless canonical!(previous.base) == previous.base and
-             canonical!(previous.payload_root) == previous.payload_root and
-             canonical!(previous.lock_dir) == previous.lock_dir,
+             canonical!(previous.payload_root) == previous.payload_root,
            do: refuse!("guard paths changed after admission")
-
-    key = :crypto.hash(:sha256, previous.base) |> Base.encode16(case: :lower)
-
-    case LiveBaseLock.assert_path(previous.lock, Path.join(previous.lock_dir, key <> ".lock")) do
-      :ok -> :ok
-      {:error, reason} -> refuse!(inspect(reason))
-    end
 
     files = payload_files!(previous.payload_root)
 
@@ -105,110 +88,108 @@ defmodule Tightbeam.LiveBaseAdmission do
     :ok
   end
 
-  defp prepare_locked!(base, options, held_lock) do
+  # Options name immutable inputs, never a verified/admitted Boolean. The
+  # manifest cannot choose the observed file set. No base writes occur here.
+  def prepare!(base, options) do
     base = canonical!(Path.expand(base))
     payload = canonical!(Keyword.fetch!(options, :payload_root))
     files = payload_files!(payload)
     manifest = payload |> Path.join("build-manifest.json") |> File.read!() |> JSON.decode!()
     identity = checked!(LiveBaseGuard.verify_manifest(manifest, files))
-    lock_dir = canonical!(Keyword.fetch!(options, :lock_dir))
 
-    if lock_dir == base or String.starts_with?(lock_dir, base <> "/"),
-      do: refuse!("lock directory inside base")
+    # Reread the payload after the first observation: a set that changed under
+    # us is dirt to report, not a race to serialize away.
+    observed = payload_files!(payload)
 
-    stat = File.lstat!(lock_dir)
+    current_manifest =
+      payload |> Path.join("build-manifest.json") |> File.read!() |> JSON.decode!()
 
-    if stat.type != :directory or Bitwise.band(stat.mode, 0o777) != 0o700,
-      do: refuse!("lock directory must already be private mode0700")
+    unless observed == files and
+             checked!(LiveBaseGuard.verify_manifest(current_manifest, observed)) == identity,
+           do: refuse!("payload changed during admission")
 
-    key = :crypto.hash(:sha256, base) |> Base.encode16(case: :lower)
-    lock_path = Path.join(lock_dir, key <> ".lock")
+    marker_path = Path.join(base, "build-owner.json")
 
-    lock =
-      if held_lock do
-        case LiveBaseLock.assert_path(held_lock, lock_path) do
-          :ok -> held_lock
-          {:error, reason} -> refuse!(inspect(reason))
-        end
-      else
-        checked!(LiveBaseLock.acquire(lock_path))
+    marker =
+      case File.lstat(marker_path) do
+        {:error, :enoent} ->
+          :absent
+
+        {:ok, %{type: :regular}} ->
+          marker_path |> File.read!() |> LiveBaseGuard.decode_marker() |> checked!()
+
+        other ->
+          refuse!("invalid marker file: #{inspect(other)}")
       end
 
-    try do
-      # Payload checks also run under exclusion, not only before acquisition.
-      observed = payload_files!(payload)
+    state =
+      case File.ls(base) do
+        {:error, :enoent} -> :new_empty
+        {:ok, []} -> :new_empty
+        {:ok, _} -> :existing
+        other -> refuse!("invalid base: #{inspect(other)}")
+      end
 
-      current_manifest =
-        payload |> Path.join("build-manifest.json") |> File.read!() |> JSON.decode!()
+    transition =
+      case Keyword.get(options, :transition) do
+        nil -> nil
+        bytes when is_binary(bytes) -> checked!(LiveBaseGuard.decode_transition(bytes))
+        _ -> refuse!("transition must be exact serialized input")
+      end
 
-      unless observed == files and
-               checked!(LiveBaseGuard.verify_manifest(current_manifest, observed)) == identity,
-             do: refuse!("payload changed during admission")
+    admission = checked!(LiveBaseGuard.admit_build(base, identity, marker, state, transition))
+    database = Path.join(base, "state.db")
+    stamp = qualify_readonly!(database, state, admission)
 
-      marker_path = Path.join(base, "build-owner.json")
-
-      marker =
-        case File.lstat(marker_path) do
-          {:error, :enoent} ->
-            :absent
-
-          {:ok, %{type: :regular}} ->
-            marker_path |> File.read!() |> LiveBaseGuard.decode_marker() |> checked!()
-
-          other ->
-            refuse!("invalid marker file: #{inspect(other)}")
-        end
-
-      state =
-        case File.ls(base) do
-          {:error, :enoent} -> :new_empty
-          {:ok, []} -> :new_empty
-          {:ok, _} -> :existing
-          other -> refuse!("invalid base: #{inspect(other)}")
-        end
-
-      transition =
-        case Keyword.get(options, :transition) do
-          nil -> nil
-          bytes when is_binary(bytes) -> checked!(LiveBaseGuard.decode_transition(bytes))
-          _ -> refuse!("transition must be exact serialized input")
-        end
-
-      admission = checked!(LiveBaseGuard.admit_build(base, identity, marker, state, transition))
-      database = Path.join(base, "state.db")
-      stamp = qualify_readonly!(database, state, admission, lock)
-
-      %{
-        base: base,
-        lock: lock,
-        lock_dir: lock_dir,
-        transition: Keyword.get(options, :transition),
-        decision: admission,
-        stamp: stamp,
-        identity: identity,
-        payload_root: payload,
-        files: files,
-        marker: marker
-      }
-    rescue
-      error ->
-        if is_nil(held_lock), do: :ok = LiveBaseLock.release(lock)
-        reraise error, __STACKTRACE__
-    end
+    %{
+      base: base,
+      transition: Keyword.get(options, :transition),
+      decision: admission,
+      stamp: stamp,
+      identity: identity,
+      payload_root: payload,
+      files: files,
+      marker: marker
+    }
   end
 
-  defp qualify_readonly!(path, state, admission, lock) do
+  defp qualify_readonly!(path, state, admission) do
     case File.lstat(path) do
       {:error, :enoent} when state == :new_empty ->
         :fresh
 
       {:ok, %{type: :regular}} ->
-        rows = LiveBaseLock.inspect_schema!(lock, path)
+        rows = read_schema_stamp!(path)
         :ok = Schema.qualify_guard_stamp!(admission, rows)
         rows
 
       other ->
         refuse!("invalid persistent database: #{inspect(other)}")
+    end
+  end
+
+  # A plain read-only observation of the stamp, nothing more. Every sidecar the
+  # connection may touch must already be an ordinary file: a symlink here would
+  # let an unadmitted base redirect the read at a target outside it, so refuse
+  # rather than open. A read-only connection cannot checkpoint or write the main
+  # database or committed WAL frames; it may create only the SHM.
+  defp read_schema_stamp!(path) do
+    alias Exqlite.Sqlite3
+
+    for file <- [path, path <> "-wal", path <> "-shm", path <> "-journal"] do
+      case File.lstat(file) do
+        {:ok, %{type: :regular}} -> :ok
+        {:error, :enoent} -> :ok
+        other -> raise "schema inspection file refused: #{inspect(other)}"
+      end
+    end
+
+    {:ok, conn} = Sqlite3.open(path, mode: :readonly)
+
+    try do
+      Tightbeam.DB.run_query(conn, "SELECT shape FROM schema_stamp", [])
+    after
+      :ok = Sqlite3.close(conn)
     end
   end
 

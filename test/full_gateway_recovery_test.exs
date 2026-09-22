@@ -129,7 +129,8 @@ defmodule Tightbeam.FullGatewayRecoveryTest do
                    "process:tightbeam",
                    nil
                  ]
-               ] = post_health -- prior_health
+               ] =
+                 Enum.map(post_health -- prior_health, &Enum.take(&1, 12))
 
         # Exactly the expected observation is allowed, never a provider incident
         # or an unrelated auth/adapter/rate-limit/model degradation observation.

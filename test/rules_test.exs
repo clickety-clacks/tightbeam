@@ -1199,6 +1199,9 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "P3 review and artifact statutes deny before attest and allow after proof", ctx do
+    :ok =
+      DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('other',1)")
+
     holder = session(ctx.db, "gate-holder", "flynn", archetype: "coder")
     reviewer = session(ctx.db, "gate-reviewer", "other", archetype: "reviewer")
     assignment = assignment(ctx, holder.session_key, {:user, "flynn"}, effect_kind: "policy")
@@ -1541,6 +1544,9 @@ defmodule Tightbeam.RulesTest do
   end
 
   test "typed completion keeps code reviewed while receipt exemptions stay narrow", ctx do
+    :ok =
+      DB.execute(ctx.db, "INSERT INTO users (userId,createdAt) VALUES ('flynn',1),('reviewer',1)")
+
     coder = session(ctx.db, "receipt-closed", "flynn", archetype: "coder")
     noncoder = session(ctx.db, "receipt-orchestrator", "flynn", archetype: "orchestrator")
     reviewer = session(ctx.db, "receipt-exempt-reviewer", "reviewer", archetype: "reviewer")

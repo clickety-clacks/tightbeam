@@ -284,8 +284,9 @@ defmodule Tightbeam.Schema do
   @row_driven_waits_previous_shape "row-driven-rules-v1-019"
   @row_driven_rules_previous_shape "liveness-progress-receipts-v1-019"
   @pi_shape "pi-providers-artifact-content-v1-019"
+  @addressed_po_shape "addressed-po-consultation-v1-019"
   @cursor_provider_shape "cursor-provider-v1-020"
-  @cursor_provider_previous_shape @pi_shape
+  @cursor_provider_previous_shape @addressed_po_shape
   @liveness_progress_receipts_previous_shape "identity-universal-root-render-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_shape "effort-request-exit-v1-019"
@@ -1278,6 +1279,7 @@ defmodule Tightbeam.Schema do
   def guard_compatible_stamps do
     [
       @cursor_provider_shape,
+      @addressed_po_shape,
       @pi_shape,
       @durability_shape,
       @reparent_shape,
@@ -1333,7 +1335,14 @@ defmodule Tightbeam.Schema do
         bootstrap_module(
           db,
           module,
-          predecessor in [@firehose_shape, @reparent_shape, @durability_shape, @pi_shape]
+          predecessor in [
+            @firehose_shape,
+            @reparent_shape,
+            @durability_shape,
+            @pi_shape,
+            @addressed_po_shape,
+            @cursor_provider_shape
+          ]
         )
     end)
 
@@ -1370,8 +1379,10 @@ defmodule Tightbeam.Schema do
     :ok = upgrade_session_reparent(db)
     :ok = upgrade_artifact_durability(db)
     :ok = upgrade_pi_providers(db)
-    :ok = upgrade_cursor_provider_v1_020(db)
+    :ok = upgrade_addressed_po_consultation(db)
+    :ok = Tightbeam.QueuedMessageSuppression.ensure_schema(db)
     Enum.each(@schema_modules, fn module -> :ok = module.ensure_schema(db) end)
+    :ok = upgrade_cursor_provider_v1_020(db)
     :ok = Tightbeam.ReadMarkers.ensure_schema(db)
 
     case DB.finish_schema(db) do
@@ -1438,9 +1449,15 @@ defmodule Tightbeam.Schema do
     [[shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
     enforcement_objects =
-      if shape in [@reparent_shape, @durability_shape, @pi_shape, @cursor_provider_shape],
-        do: reparent_liveness_enforcement_objects(),
-        else: @supervision_liveness_enforcement_objects
+      if shape in [
+           @reparent_shape,
+           @durability_shape,
+           @pi_shape,
+           @addressed_po_shape,
+           @cursor_provider_shape
+         ],
+         do: reparent_liveness_enforcement_objects(),
+         else: @supervision_liveness_enforcement_objects
 
     Enum.each(enforcement_objects, fn object ->
       if owned_object_present?(txn, object) do
@@ -1956,6 +1973,9 @@ defmodule Tightbeam.Schema do
       {:ok, [[@cursor_provider_shape]]} ->
         :ok
 
+      {:ok, [[@addressed_po_shape]]} ->
+        :ok
+
       {:ok, [[@pi_shape]]} ->
         :ok
 
@@ -2088,6 +2108,7 @@ defmodule Tightbeam.Schema do
 
              [[stamp]]
              when stamp in [
+                    @addressed_po_shape,
                     @pi_shape,
                     @durability_shape,
                     @reparent_shape,
@@ -2142,7 +2163,13 @@ defmodule Tightbeam.Schema do
         :ok
 
       {:ok, [[stamp]]}
-      when stamp in [@pi_shape, @durability_shape, @reparent_shape, @firehose_shape] ->
+      when stamp in [
+             @addressed_po_shape,
+             @pi_shape,
+             @durability_shape,
+             @reparent_shape,
+             @firehose_shape
+           ] ->
         :ok
 
       {:ok, [[@r1_shape]]} ->
@@ -2219,6 +2246,9 @@ defmodule Tightbeam.Schema do
              [[@cursor_provider_shape]] ->
                :ok
 
+             [[@addressed_po_shape]] ->
+               :ok
+
              [[@pi_shape]] ->
                :ok
 
@@ -2269,6 +2299,9 @@ defmodule Tightbeam.Schema do
     case DB.transaction(db, fn txn ->
            case Txn.q(txn, "SELECT shape FROM schema_stamp") do
              [[@cursor_provider_shape]] ->
+               validate_artifact_content_schema!(txn)
+
+             [[@addressed_po_shape]] ->
                validate_artifact_content_schema!(txn)
 
              [[@pi_shape]] ->
@@ -2349,6 +2382,9 @@ defmodule Tightbeam.Schema do
   defp upgrade_o2(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@cursor_provider_shape]]} ->
+        :ok
+
+      {:ok, [[@addressed_po_shape]]} ->
         :ok
 
       {:ok, [[@pi_shape]]} ->
@@ -2725,8 +2761,7 @@ defmodule Tightbeam.Schema do
 
     try do
       case DB.transaction(db, fn txn ->
-             [[^predecessor]] =
-               Txn.q(txn, "SELECT shape FROM schema_stamp")
+             [[^predecessor]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
 
              Txn.q(
                txn,
@@ -3374,10 +3409,88 @@ defmodule Tightbeam.Schema do
   defp upgrade_pi_providers(db) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
       {:ok, [[@cursor_provider_shape]]} -> :ok
+      {:ok, [[@addressed_po_shape]]} -> :ok
       {:ok, [[@pi_shape]]} -> :ok
       {:ok, [[@durability_shape]]} -> migrate_sessions_provider_shape(db, @durability_shape)
       rows -> raise ShapeError, message: "incompatible Pi provider predecessor: #{inspect(rows)}"
     end
+  end
+
+  defp upgrade_addressed_po_consultation(db) do
+    case DB.query(db, "SELECT shape FROM schema_stamp") do
+      {:ok, [[@cursor_provider_shape]]} ->
+        :ok
+
+      {:ok, [[@addressed_po_shape]]} ->
+        :ok
+
+      {:ok, [[@pi_shape]]} ->
+        case DB.transaction(db, &migrate_addressed_po_consultation_in_txn/1) do
+          {:ok, :ok} ->
+            :ok
+
+          {:error, %ShapeError{} = error} ->
+            raise error
+
+          {:error, error} ->
+            raise ShapeError,
+              message:
+                "migration #{@pi_shape} -> #{@addressed_po_shape} failed and was rolled back: #{Exception.message(error)}"
+        end
+
+      rows ->
+        raise ShapeError,
+          message: "incompatible addressed-PO predecessor: #{inspect(rows)}"
+    end
+  end
+
+  defp migrate_addressed_po_consultation_in_txn(%Txn{} = txn) do
+    [[@pi_shape]] = Txn.q(txn, "SELECT shape FROM schema_stamp")
+    [[idempotency_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wire_idempotency")
+
+    :ok =
+      Txn.exec(
+        txn,
+        """
+        CREATE TABLE wire_idempotency_addressed_po (
+          ownerUserId TEXT NOT NULL,
+          operation TEXT NOT NULL CHECK (operation IN
+            ('spawn','retire','wake','assign','condition','work-item-create','session-reparent','session-po-set')),
+          idempotencyKey TEXT NOT NULL,
+          sessionKey TEXT NOT NULL,
+          requestFingerprint TEXT,
+          canonicalResponse TEXT,
+          PRIMARY KEY(ownerUserId,operation,idempotencyKey),
+          CHECK (operation NOT IN ('session-reparent','session-po-set') OR
+            (requestFingerprint IS NOT NULL AND canonicalResponse IS NOT NULL))
+        );
+        INSERT INTO wire_idempotency_addressed_po
+          (ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse)
+          SELECT ownerUserId,operation,idempotencyKey,sessionKey,requestFingerprint,canonicalResponse
+          FROM wire_idempotency;
+        DROP TABLE wire_idempotency;
+        ALTER TABLE wire_idempotency_addressed_po RENAME TO wire_idempotency;
+        """
+      )
+
+    [[^idempotency_count]] = Txn.q(txn, "SELECT COUNT(*) FROM wire_idempotency")
+    :ok = Tightbeam.SessionPoAssociations.migrate_in_txn(txn)
+    [] = Txn.q(txn, "PRAGMA foreign_key_check")
+
+    Txn.q(txn, "UPDATE schema_stamp SET shape=?1,stampedAt=?2 WHERE shape=?3", [
+      @addressed_po_shape,
+      System.system_time(:millisecond),
+      @pi_shape
+    ])
+
+    if Txn.changes(txn) != 1,
+      do:
+        raise(ShapeError,
+          message:
+            "migration #{@pi_shape} -> #{@addressed_po_shape} lost its exact stamp transition"
+        )
+
+    :ok
   end
 
   defp migrate_sessions_provider_shape(db, source_shape) do

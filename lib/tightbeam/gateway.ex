@@ -88,6 +88,7 @@ defmodule Tightbeam.Gateway do
     Rules,
     Roles,
     Schema,
+    SessionPoAssociations,
     Spinup,
     StateResources,
     SubagentMarkers,
@@ -170,7 +171,33 @@ defmodule Tightbeam.Gateway do
         _ -> "tbc_" <> (:crypto.strong_rand_bytes(24) |> Base.url_encode64(padding: false))
       end
 
-    File.write!(gateway_path, JSON.encode!(%{port: config.port, cliToken: cli_token}))
+    # R5: round-trip the OWNED pid so the lifecycle `stop` verb can SIGTERM this
+    # exact process by identity — no Erlang node, no cookie, no handshake. The
+    # identity is the TRIPLE pid + command + START TIME, all captured now (the VM
+    # is up by the time this runs) and all re-checked before any signal. The pid
+    # alone is a reusable name, and pid + command is still not an identity: a
+    # LATER process can carry the same command line (a second gateway started the
+    # same way), and only the start time tells this process apart from such a
+    # successor.
+    # R1/R4: also record `node` — the instance's ACTUAL booted RELEASE_NODE — so
+    # the debug verbs `rpc`/`remote` resolve the node FROM the descriptor (custom
+    # `TIGHTBEAM_NODE` instances included), never from an ambient/inherited node.
+    # `cliToken` is preserved (read above); `port`/`node`/`ownedPid`/
+    # `ownedCommand`/`ownedStart` are overwritten every boot.
+    owned_pid = System.pid()
+
+    File.write!(
+      gateway_path,
+      JSON.encode!(%{
+        port: config.port,
+        cliToken: cli_token,
+        node: System.get_env("RELEASE_NODE"),
+        ownedPid: owned_pid,
+        ownedCommand: ps_field(owned_pid, "command"),
+        ownedStart: ps_field(owned_pid, "lstart")
+      })
+    )
+
     File.chmod!(gateway_path, 0o600)
     provision_host_endpoints(db, config, cli_token)
     cli_bin = install_cli_bin(config.base_dir)
@@ -296,6 +323,7 @@ defmodule Tightbeam.Gateway do
       [
         {ModelCatalog, base_dir: config.base_dir, db: db},
         {Tightbeam.ConnRegistry, name: Tightbeam.ConnRegistry},
+        {Task, fn -> HarnessHealth.resume_other_routes(db) end},
         {Tightbeam.Firehose.Hub, name: Tightbeam.Firehose.Hub},
         # Ahead of Supervision and Bandit deliberately: both can reach a check-tier
         # statute, and the episode writer must already own the ordering before the first
@@ -541,6 +569,42 @@ defmodule Tightbeam.Gateway do
   # same way rather than reaching for the global name directly.
   defp gateway_db(config), do: Map.get(config, :db, Tightbeam.DB)
 
+  # One `ps` field of our own OS pid, for the descriptor's identity triple
+  # (`ownedPid` + `ownedCommand` + `ownedStart`). The `stop` verb re-derives these
+  # exact fields with the same command (`LC_ALL=C ps -ww -o <field>= -p <pid>`)
+  # and signals ONLY on a full match, so neither a pid the OS has recycled onto an
+  # unrelated process nor a LATER process that happens to share our command line
+  # is mis-signalled — a successor cannot also share our start time.
+  #
+  # LC_ALL=C is load-bearing, not tidiness: `lstart` is locale-formatted on macOS
+  # (measured on eezo — LC_TIME=de_DE.UTF-8 renders "Fr.  4 Sep. 23:20:39 2026"
+  # for the same instant the C locale renders "Fri Sep  4 23:20:39 2026"). The
+  # writer here and the `stop` shim both force C so they compare one spelling; an
+  # operator shell in another locale must not be able to refuse a valid stop.
+  #
+  # nil (ps failed) writes JSON null, which the stop path treats as a refusal —
+  # never a fall-through to a node-based stop.
+  defp ps_field(pid, field) do
+    case System.cmd("ps", ["-ww", "-o", field <> "=", "-p", pid],
+           env: [{"LC_ALL", "C"}],
+           stderr_to_stdout: true
+         ) do
+      {out, 0} ->
+        case String.trim(out) do
+          "" -> nil
+          value -> value
+        end
+
+      _ ->
+        nil
+    end
+  rescue
+    # `ps` off PATH (System.cmd raises :enoent) must not crash the boot. A nil
+    # field makes the `stop` verb refuse rather than mis-signal — the safe
+    # degradation, never a fall-through to a node-based stop.
+    _ -> nil
+  end
+
   defp provision_host_endpoints(db, config, cli_token) do
     config.base_dir
     |> Placement.hosts(db)
@@ -721,7 +785,10 @@ defmodule Tightbeam.Gateway do
               %{code: "unknown_caller"}
 
             true ->
-              wake_result(config, db, call)
+              case call[:txn] do
+                %DB.Txn{} = txn -> wake_result_in_txn(config, txn, call)
+                _ -> wake_result(config, db, call)
+              end
           end
         end,
       {"condition", ["condition_fact.filed", "wake.fired", "message.created", "session.updated"]} =>
@@ -921,8 +988,7 @@ defmodule Tightbeam.Gateway do
         admin_call_handler(db, fn call ->
           p = call.params
 
-          result =
-            Placement.unset_env_overlay_with_firehose(db, p.host, p.harness, p.name, call)
+          result = Placement.unset_env_overlay_with_firehose(db, p.host, p.harness, p.name, call)
 
           %{
             host_environment:
@@ -1237,6 +1303,48 @@ defmodule Tightbeam.Gateway do
       {"repair-assignment", ["message.created", "session.updated"]} => fn call ->
         repair_assignment_result(config, db, call)
       end,
+      {"harness-health-observe-other", []} => fn call ->
+        params =
+          call.params
+          |> Map.put_new(:source_session_key, call.session_key)
+          |> Map.put(:principal, call.principal)
+
+        case HarnessHealth.observe_other(db, params) do
+          {:error, error} -> error
+          {status, detail} -> %{ok: true, status: status, incident: detail}
+        end
+      end,
+      {"harness-health-resolve-other", []} => fn call ->
+        params = call.params |> Map.put(:principal, call.principal)
+
+        case HarnessHealth.resolve_other(db, params) do
+          {:error, error} -> error
+          {status, detail} -> %{ok: true, status: status, incident: detail}
+          :already_healthy -> %{ok: true, status: :already_healthy}
+        end
+      end,
+      {"harness-health-review-other", []} => fn call ->
+        params = call.params |> Map.put(:principal, call.principal)
+
+        case HarnessHealth.review_other(db, params) do
+          {:error, error} -> error
+          {:ok, detail} -> %{ok: true, review: detail}
+        end
+      end,
+      {"harness-health-close-promotion", []} => fn call ->
+        params = call.params |> Map.put(:principal, call.principal)
+
+        case HarnessHealth.close_other_promotion(db, params) do
+          {:error, error} -> error
+          {:ok, detail} -> %{ok: true, promotion: detail}
+        end
+      end,
+      {"harness-health-evidence-other", []} => fn call ->
+        case HarnessHealth.read_other_evidence(db, call.params.incident_id, call.principal) do
+          {:error, error} -> error
+          {:ok, detail} -> %{ok: true, evidence: detail}
+        end
+      end,
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
       {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,
@@ -1246,6 +1354,9 @@ defmodule Tightbeam.Gateway do
         tune_result(config, db, call)
       end,
       {"session-reparent", []} => fn call -> Tightbeam.SessionReparent.handle(db, call) end,
+      {"session-po-set", ["wake.scheduled"]} => fn call ->
+        SessionPoAssociations.handle(db, call)
+      end,
       {"retire", ["session.retired", "wake.scheduled"]} => fn call ->
         retire_result(config, db, call)
       end
@@ -1699,7 +1810,7 @@ defmodule Tightbeam.Gateway do
   then broadcasts the echo and nudges the lane. Returns the dedupe outcome.
   """
   @spec deliver_prompt(String.t(), String.t(), String.t(), keyword()) ::
-          :appended | :duplicate | :conflict | :skipped
+          :appended | :duplicate | :conflict | :skipped | {:terminal_notice_undeliverable, map()}
   def deliver_prompt(session_key, origin, prompt, opts \\ []) do
     db = Keyword.get(opts, :db, Tightbeam.DB)
 
@@ -1728,6 +1839,7 @@ defmodule Tightbeam.Gateway do
           | {:duplicate, map()}
           | {:conflict, map()}
           | :skipped
+          | {:terminal_notice_undeliverable, map()}
   def deliver_prompt_in_txn(%DB.Txn{} = txn, session_key, origin, prompt, opts \\ []) do
     case remedy_wake_delivery_admission_in_txn(txn, opts[:wake_id]) do
       :skip ->
@@ -1735,9 +1847,58 @@ defmodule Tightbeam.Gateway do
 
       :continue ->
         case existing_wake_turn_in_txn(txn, opts[:wake_id]) do
-          nil -> deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+          nil -> deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts)
           duplicate -> duplicate
         end
+    end
+  end
+
+  defp deliver_resolved_prompt_in_txn(txn, session_key, origin, prompt, opts) do
+    case Wakes.terminal_notice_delivery_in_txn(txn, opts[:wake_id]) do
+      :ordinary ->
+        case Supervision.idle_cleanup_delivery_in_txn(
+               txn,
+               opts[:wake_id],
+               System.system_time(:millisecond)
+             ) do
+          :ordinary ->
+            deliver_prompt_once_in_txn(txn, session_key, origin, prompt, opts)
+
+          :stale ->
+            fire_wake_in_txn(txn, Keyword.put(opts, :fire_wake_in_txn, true))
+            :skipped
+
+          {:idle_cleanup_deferred, _} = deferred ->
+            deferred
+
+          {:deliver, wake} ->
+            opts =
+              opts
+              |> Keyword.put(:target_gate, nil)
+              |> Keyword.put(:sender, wake.origin)
+              |> Keyword.put(:fire_wake_in_txn, true)
+
+            deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts)
+        end
+
+      {:terminal_notice, wake} ->
+        # Resolution and enqueue share this transaction. Only the persisted
+        # terminal event and its freshly authorized recipient may supply content
+        # and routing; the caller's stale gate/lineage/prompt cannot override them.
+        opts =
+          opts
+          |> Keyword.put(:target_gate, nil)
+          |> Keyword.put(:sender, wake.origin)
+          |> Keyword.put(:assignment_id, wake.assignment_id)
+          |> Keyword.put(:job_ref, wake.work_item_id)
+          |> Keyword.put(:role_ref, nil)
+          |> Keyword.put(:role_fallback, false)
+          |> Keyword.put(:fire_wake_in_txn, true)
+
+        deliver_prompt_once_in_txn(txn, wake.session_key, wake.origin, wake.prompt, opts)
+
+      {:terminal_notice_undeliverable, _} = incomplete ->
+        incomplete
     end
   end
 
@@ -1875,7 +2036,8 @@ defmodule Tightbeam.Gateway do
             role_fallback: role_fallback || opts[:role_fallback] || false,
             assignment_id: assignment_id,
             job_ref: job_ref,
-            request_ref: opts[:request_ref]
+            request_ref: opts[:request_ref],
+            queue_message_kind: opts[:queue_message_kind]
           })
 
         case enqueued do
@@ -2065,7 +2227,8 @@ defmodule Tightbeam.Gateway do
   end
 
   @doc "Publish and lane-nudge a delivery after its transaction commits."
-  @spec complete_delivery(DB.server(), term()) :: :appended | :duplicate | :conflict | :skipped
+  @spec complete_delivery(DB.server(), term()) ::
+          :appended | :duplicate | :conflict | :skipped | {:terminal_notice_undeliverable, map()}
   def complete_delivery(db, {:appended, actual_session_key, message, opts}) do
     registry = Keyword.get(opts, :conn_registry, Tightbeam.ConnRegistry)
     publish_message(db, actual_session_key, message, registry)
@@ -2088,8 +2251,11 @@ defmodule Tightbeam.Gateway do
   end
 
   def complete_delivery(_db, :skipped), do: :skipped
+  def complete_delivery(_db, {:idle_cleanup_deferred, _} = deferred), do: deferred
   def complete_delivery(_db, {:duplicate, _message}), do: :duplicate
   def complete_delivery(_db, {:conflict, _message}), do: :conflict
+
+  def complete_delivery(_db, {:terminal_notice_undeliverable, _} = incomplete), do: incomplete
 
   @doc false
   def delivery_target(_txn, session_key, nil), do: {session_key, nil, false}
@@ -2598,22 +2764,25 @@ defmodule Tightbeam.Gateway do
 
   # An agent reading `inspect` sees the identity as FIELDS, the same way it
   # supplies them back on spawn.
-  defp inspect_session(session) do
-    session
-    |> Map.take([
-      :session_key,
-      :display_name,
-      :handle,
-      :archetype,
-      :host,
-      :harness,
-      :origin,
-      :spawned_by,
-      :current_parent,
-      :state,
-      :created_at
-    ])
-    |> Map.merge(published_identity(session.model))
+  defp inspect_session(db, session) do
+    item =
+      session
+      |> Map.take([
+        :session_key,
+        :display_name,
+        :handle,
+        :archetype,
+        :host,
+        :harness,
+        :origin,
+        :spawned_by,
+        :current_parent,
+        :state,
+        :created_at
+      ])
+      |> Map.merge(published_identity(session.model))
+
+    Map.put(item, :po_association, SessionPoAssociations.get(db, session.session_key))
   end
 
   # A catalog entry for a reader who has to pick one — an operator reading a
@@ -3340,6 +3509,9 @@ defmodule Tightbeam.Gateway do
                       {:error, {:model_apply_failed, _reason}} = error ->
                         error
 
+                      {:error, {:mode_apply_failed, _reason}} = error ->
+                        error
+
                       # An adapter that could not answer has NOT told us the harness
                       # lost the session; falling back would forfeit the model
                       # context over an adapter fault and record a false
@@ -3497,8 +3669,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp append_transcript_self_inspection(guidance, session_key) do
-    transcript_command =
-      "tightbeam transcript --session #{inspect(session_key)} --limit 50"
+    transcript_command = "tightbeam transcript --session #{inspect(session_key)} --limit 50"
 
     guidance <>
       "\n\n## Inspect recent Tightbeam transcript\n\n" <>
@@ -3935,7 +4106,8 @@ defmodule Tightbeam.Gateway do
         reasons =
           [
             if(
-              is_nil(session.identity_render_contract) or is_nil(session.identity_guidance_digest),
+              is_nil(session.identity_render_contract) or
+                is_nil(session.identity_guidance_digest),
               do: "missing_render_stamp"
             ),
             if(session.identity_revision != live, do: "revision_mismatch"),
@@ -4587,8 +4759,7 @@ defmodule Tightbeam.Gateway do
        ) do
     case DB.transaction(db, fn txn ->
            if Archetypes.get(archetype_name) do
-             result =
-               Org.put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
+             result = Org.put_setting_projected_in_txn(txn, "default-archetype", archetype_name)
 
              Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
 
@@ -4759,8 +4930,7 @@ defmodule Tightbeam.Gateway do
   defp replay_identity_publication(config, db, %{verb: "unlearn"} = call, marker) do
     name = call.params.name
 
-    archetypes =
-      Identity.bundle_archetype_names_at!(config.base_dir, marker.expected_prior, name)
+    archetypes = Identity.bundle_archetype_names_at!(config.base_dir, marker.expected_prior, name)
 
     candidate = identity_candidate_from_marker(marker)
 
@@ -4888,7 +5058,7 @@ defmodule Tightbeam.Gateway do
         }
 
         result = %{
-          sessions: Enum.map(sessions, &inspect_session/1),
+          sessions: Enum.map(sessions, &inspect_session(db, &1)),
           wakes: wakes,
           roles: role_list_result(db).roles,
           archetypes: org_shape.archetypes,
@@ -5030,36 +5200,7 @@ defmodule Tightbeam.Gateway do
         due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
 
         result =
-          DB.transaction(db, fn txn ->
-            prior =
-              if p[:idempotency_key],
-                do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
-
-            if prior do
-              wake = Wakes.get_in_txn(txn, prior.session_key)
-
-              if is_map(wake),
-                do: Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
-
-              wake
-            else
-              wake = schedule_wake_in_txn(txn, call, session_key, due_at)
-
-              if p[:idempotency_key] && is_binary(wake[:wake_id]) do
-                Idempotency.put_in_txn(txn, %{
-                  owner_user_id: call.origin,
-                  operation: "wake",
-                  idempotency_key: p.idempotency_key,
-                  session_key: wake.wake_id
-                })
-              end
-
-              if is_map(wake) and is_binary(wake[:wake_id]),
-                do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, wake)
-
-              wake
-            end
-          end)
+          DB.transaction(db, fn txn -> wake_result_in_txn(config, txn, call) end)
 
         wake =
           case result do
@@ -5080,6 +5221,45 @@ defmodule Tightbeam.Gateway do
 
       _ ->
         %{code: "not_found"}
+    end
+  end
+
+  @doc false
+  def wake_in_txn(config, %DB.Txn{} = txn, call),
+    do: wake_result_in_txn(config, txn, call)
+
+  defp wake_result_in_txn(_config, txn, call) do
+    p = call.params
+    session_key = call.session_key
+    due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
+
+    prior =
+      if p[:idempotency_key],
+        do: Idempotency.get_in_txn(txn, call.origin, "wake", p.idempotency_key)
+
+    if prior do
+      wake = Wakes.get_in_txn(txn, prior.session_key)
+
+      if is_map(wake),
+        do: Tightbeam.Firehose.Publisher.maybe_observed_accepted_in_txn(txn, call)
+
+      wake
+    else
+      wake = schedule_wake_in_txn(txn, call, session_key, due_at)
+
+      if p[:idempotency_key] && is_map(wake) && is_binary(wake[:wake_id]) do
+        Idempotency.put_in_txn(txn, %{
+          owner_user_id: call.origin,
+          operation: "wake",
+          idempotency_key: p.idempotency_key,
+          session_key: wake.wake_id
+        })
+      end
+
+      if is_map(wake) and is_binary(wake[:wake_id]),
+        do: Tightbeam.Firehose.Publisher.maybe_accepted_in_txn(txn, call, wake)
+
+      wake
     end
   end
 
@@ -5118,7 +5298,7 @@ defmodule Tightbeam.Gateway do
           nil ->
             %{
               code: "subagent_not_found",
-              message: "no subagent for this session and tool call"
+              message: "no subagent for this session and adapter handle"
             }
 
           subagent_ref ->
@@ -7457,8 +7637,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp elected_attention(db, turn_seq) do
-    {:ok, [[tier]]} =
-      DB.query(db, "SELECT replyAttention FROM turns WHERE seq = ?1", [turn_seq])
+    {:ok, [[tier]]} = DB.query(db, "SELECT replyAttention FROM turns WHERE seq = ?1", [turn_seq])
 
     tier
   end

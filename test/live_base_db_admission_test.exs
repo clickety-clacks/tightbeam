@@ -20,10 +20,10 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
   @moduletag :tmp_dir
 
   @tag :runtime_payload
-  test "cold loaded payload admits persistent DB, refreshes stamp and hands off ownership", %{
+  test "cold loaded payload admits persistent DB and refreshes stamp", %{
     tmp_dir: tmp
   } do
-    run_cold_runtime(tmp, "live_base_runtime.exs", "persistent-owner-refresh-handoff: ok")
+    run_cold_runtime(tmp, "live_base_runtime.exs", "persistent-owner-refresh-reopen: ok")
   end
 
   @tag :boot_ordering
@@ -47,7 +47,7 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
   @tag :marker_publication
   test "Application child construction does not create or initialize the base", %{tmp_dir: tmp} do
     base = Path.join(tmp, "children-only")
-    config = %{base_dir: base, guard_inputs: [lock_dir: tmp]}
+    config = %{base_dir: base, guard_inputs: []}
     children = Tightbeam.Application.children(config)
     assert [{DB, options}, {Tightbeam.Boot, ^config} | _] = children
     assert options[:guard_inputs] == config.guard_inputs
@@ -65,17 +65,6 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
   end
 
   @tag :db_refusal
-  test "a public true handoff cannot admit a persistent database", %{tmp_dir: tmp} do
-    base = Path.join(tmp, "boolean-handoff")
-
-    assert {:error, {%ArgumentError{message: message}, _}} =
-             refused_start(path: Path.join(base, "state.db"), name: nil, guard_context: true)
-
-    assert message =~ "owned native capability"
-    refute File.exists?(base)
-  end
-
-  @tag :db_refusal
   test "raw inputs cannot substitute an arbitrary running payload", %{tmp_dir: tmp} do
     base = Path.join(tmp, "fake-payload")
 
@@ -83,10 +72,10 @@ defmodule Tightbeam.LiveBaseDBAdmissionTest do
              refused_start(
                path: Path.join(base, "state.db"),
                name: nil,
-               guard_inputs: [lock_dir: tmp, payload_root: tmp]
+               guard_inputs: [payload_root: tmp]
              )
 
-    assert message =~ "only lock_dir and exact transition"
+    assert message =~ "only an exact transition"
     refute File.exists?(base)
   end
 

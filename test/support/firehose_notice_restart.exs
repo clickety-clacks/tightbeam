@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 {:ok, _} = Application.ensure_all_started(:exqlite)
@@ -6,10 +6,10 @@ false = File.exists?(base)
 Application.put_env(:tightbeam, :autostart, false)
 Application.put_env(:tightbeam, :base_dir, base)
 import ExUnit.Assertions
-alias Tightbeam.{DB, LiveBaseLock, NoticeBatcher, Org, Schema, Wakes}
+alias Tightbeam.{DB, NoticeBatcher, Org, Schema, Wakes}
 
 {:ok, db} =
-  DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks])
+  DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
 try do
   :ok = Schema.ensure_all(db)
@@ -52,27 +52,8 @@ try do
   :ok = GenServer.stop(db)
   refute Process.alive?(db)
 
-  lock_path =
-    Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-  await = fn recur, remaining ->
-    case LiveBaseLock.acquire(lock_path) do
-      {:ok, lock} ->
-        :ok = LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when remaining > 0 ->
-        Process.sleep(10)
-        recur.(recur, remaining - 1)
-
-      other ->
-        raise "lock did not release: #{inspect(other)}"
-    end
-  end
-
-  await.(await, 100)
-
   {:ok, reopened} =
-    DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks])
+    DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
   try do
     :ok = Schema.ensure_all(reopened)
@@ -94,7 +75,6 @@ try do
     GenServer.stop(reopened)
   end
 
-  await.(await, 100)
   IO.puts("guarded-notice-batch-reopen: ok")
 after
   if Process.alive?(db), do: GenServer.stop(db)

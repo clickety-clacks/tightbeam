@@ -155,7 +155,7 @@ defmodule Tightbeam.Productions.Bubble do
 
   defp harness_unavailable?(db, %{harness: harness, host: host})
        when is_binary(harness) and is_binary(host),
-       do: HarnessHealth.unavailable?(db, harness, host)
+       do: match?({:unavailable, _}, HarnessHealth.prod_shape_gate(db, harness, host))
 
   defp harness_unavailable?(_db, _legacy_turn), do: false
 

@@ -319,14 +319,14 @@ defmodule Tightbeam.AdapterCoordinator do
       reusable_entry?(entry) ->
         {:reply, checkout(entry), state}
 
+      entry.circuit == :open ->
+        {:reply, {:error, :degraded}, state}
+
       readiness_pending?(entry) ->
         {:noreply, add_waiter(key, from, state)}
 
       Tightbeam.HarnessProcess.fenced?(state.db, key) ->
         {:reply, {:error, {:park_fenced, key_name(key)}}, state}
-
-      entry.circuit == :open ->
-        {:reply, {:error, :degraded}, state}
 
       true ->
         {:noreply, begin_readiness(key, entry, state, :capture, from)}
@@ -423,7 +423,7 @@ defmodule Tightbeam.AdapterCoordinator do
             {:reply, error, state}
         end
 
-      reusable_entry?(entry) ->
+      reusable_entry?(entry) or (authoritative? and live_entry?(entry)) ->
         {:reply, checkout(entry), state}
 
       readiness_pending?(entry) ->
@@ -1027,15 +1027,7 @@ defmodule Tightbeam.AdapterCoordinator do
           # this adapter checked out, and the only one it can ask about.
           died_at = entry.generation
           generation = entry.generation + 1
-
-          timer =
-            if circuit == :closed do
-              Process.send_after(
-                self(),
-                {:restart_adapter, key, generation},
-                backoff(state, failures)
-              )
-            end
+          timer = schedule_restart(state, key, generation, failures, circuit)
 
           entry = %{
             entry
@@ -1141,7 +1133,7 @@ defmodule Tightbeam.AdapterCoordinator do
 
   def handle_info({:restart_adapter, key, generation}, state) do
     case state.adapters[key] do
-      %{generation: ^generation, pid: nil} = entry ->
+      %{generation: ^generation, pid: nil, circuit: :closed} = entry ->
         cond do
           readiness_pending?(entry) ->
             {:noreply, state}
@@ -1347,11 +1339,14 @@ defmodule Tightbeam.AdapterCoordinator do
         circuit = if failures >= state.failure_circuit, do: :open, else: :closed
         generation = max(entry.generation, 1)
 
+        timer = schedule_restart(state, key, generation, failures, circuit)
+
         entry = %{
           entry
           | generation: generation,
             failures: failures,
             circuit: circuit,
+            timer: timer,
             ready: false,
             last_failure: {generation, {:adapter_start_failed, start_reason}}
         }
@@ -1388,12 +1383,23 @@ defmodule Tightbeam.AdapterCoordinator do
     do: MapSet.put(ready_refs, monitor)
 
   defp put_ready_ref(ready_refs, _monitor), do: ready_refs
+  defp schedule_restart(_state, _key, _generation, _failures, :open), do: nil
+
+  defp schedule_restart(state, key, generation, failures, :closed) do
+    Process.send_after(
+      self(),
+      {:restart_adapter, key, generation},
+      backoff(state, failures)
+    )
+  end
 
   defp ready_entry?(entry),
     do: entry.ready == true and is_pid(entry.pid) and Process.alive?(entry.pid)
 
   defp reusable_entry?(entry),
-    do: ready_entry?(entry) or (not entry.rendezvous and live_entry?(entry))
+    do:
+      entry.circuit == :closed and
+        (ready_entry?(entry) or (not entry.rendezvous and live_entry?(entry)))
 
   defp readiness_pending?(entry),
     do:

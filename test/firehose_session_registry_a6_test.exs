@@ -1,7 +1,19 @@
 defmodule Tightbeam.Firehose.SessionRegistryA6Test do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, Model, Org, Projection, Schema, StateResources}
+  alias Tightbeam.{
+    DB,
+    Gateway,
+    Ledger,
+    Model,
+    Org,
+    Projection,
+    Roles,
+    Schema,
+    SessionPoAssociations,
+    StateResources
+  }
+
   alias Tightbeam.Firehose.Hub
 
   setup do
@@ -80,6 +92,56 @@ defmodule Tightbeam.Firehose.SessionRegistryA6Test do
 
     assert model == newer["payload"]
     assert model == canonical_session(ctx.db, ctx.worker.session_key)
+  end
+
+  test "PO association leaves canonical session notices and row versions unchanged", ctx do
+    po = create_session(ctx.db, "a6-po", "A6 PO")
+    Roles.create!(ctx.db, "product-owner:a6", "flynn", po.session_key)
+    before = canonical_session(ctx.db, ctx.worker.session_key)
+
+    result =
+      Gateway.handlers(%{db: ctx.db})["session-po-set"].(%{
+        verb: "session-po-set",
+        origin: "user:flynn",
+        principal: {:user, "flynn"},
+        session_key: nil,
+        params: %{
+          session_key: ctx.worker.session_key,
+          po_role: "product-owner:a6",
+          idempotency_key: "a6-association"
+        }
+      })
+
+    assert result["changed"]
+    assert SessionPoAssociations.get(ctx.db, ctx.worker.session_key) == result["association"]
+    assert canonical_session(ctx.db, ctx.worker.session_key) == before
+    assert before["rowVersion"] == before["updatedAt"]
+    refute Enum.any?(Map.keys(before), &String.starts_with?(&1, "po"))
+
+    renamed = Org.rename(ctx.db, ctx.worker.session_key, "Associated worker")
+    updated = receive_notice()
+    assert updated["class"] == "session.updated"
+    assert updated["payload"] == StateResources.session(renamed)
+    assert updated["payload"] == canonical_session(ctx.db, ctx.worker.session_key)
+    assert updated["payload"]["rowVersion"] == renamed.updated_at
+    refute Enum.any?(Map.keys(updated["payload"]), &String.starts_with?(&1, "po"))
+
+    :ok =
+      Hub.register(Hub, self(), %{
+        mode: :subscribed,
+        db: ctx.db,
+        user_id: "review-admin",
+        is_admin: true
+      })
+
+    retired = Org.retire(ctx.db, ctx.worker.session_key, "user:flynn", 1_000)
+    retirement = receive_notice()
+    assert retirement["class"] == "session.retired"
+    assert retirement["payload"] == StateResources.session(retired)
+    assert retirement["payload"] == canonical_session(ctx.db, ctx.worker.session_key)
+    assert retirement["payload"]["rowVersion"] == retired.updated_at
+    refute Enum.any?(Map.keys(retirement["payload"]), &String.starts_with?(&1, "po"))
+    assert SessionPoAssociations.get(ctx.db, ctx.worker.session_key) == result["association"]
   end
 
   test "visibility and exact session filtering run before delivery", ctx do

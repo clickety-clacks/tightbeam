@@ -39,10 +39,16 @@ defmodule Tightbeam.R1SchemaMigrationTest do
 
     assert rows(db, "SELECT reminderState,closedByProcess FROM assignments") == [[nil, nil]]
     assert rows(db, "SELECT * FROM condition_facts") == Enum.map(facts, &(&1 ++ [nil]))
-    object_names = Enum.map(objects, &Enum.at(&1, 1))
+    # HarnessHealth owns a stamped copy migration after R1/O2 activation; its
+    # old six-class guards are intentionally replaced by the exact other-class
+    # target set and are covered by harness_health_test.
+    preserved_objects =
+      Enum.reject(objects, &String.starts_with?(Enum.at(&1, 1), "harness_health_"))
+
+    object_names = Enum.map(preserved_objects, &Enum.at(&1, 1))
 
     assert Enum.filter(guards(db), &(Enum.at(&1, 1) in object_names)) ==
-             Enum.map(objects, fn [type, name, sql] ->
+             Enum.map(preserved_objects, fn [type, name, sql] ->
                [type, name, successor_guard(name, sql)]
              end)
 

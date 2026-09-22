@@ -77,12 +77,26 @@ defmodule Tightbeam.Acp.Conn do
 
     shell_cmd = Enum.map_join(cmd, " ", &shell_escape/1) <> " 2>>" <> shell_escape(stderr)
 
+    # R3: Erlang's `:env` OVERLAYS the emulator's full environment, so without
+    # this the child would INHERIT this gateway's production identity —
+    # RELEASE_*, TIGHTBEAM_BASE_DIR/PORT/NODE, ROOTDIR/BINDIR. Remove every such
+    # inherited var with `{name, false}` FIRST, then let the explicit session
+    # env (which carries TIGHTBEAM_HOME/MACHINE/LINEAGE) win by coming last. A
+    # spawned session must resolve its OWN instance, never the ambient one — the
+    # RELEASE_NODE-wins vector that let a test teardown reach production.
+    scrub =
+      for {name, _value} <- System.get_env(),
+          Tightbeam.ProductionIdentityEnv.production_identity?(name),
+          do: {String.to_charlist(name), false}
+
+    provided = Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)
+
     port =
       Port.open({:spawn_executable, System.find_executable("sh")}, [
         :binary,
         :exit_status,
         {:args, ["-c", "exec " <> shell_cmd]},
-        {:env, Enum.map(env, fn {k, v} -> {String.to_charlist(k), String.to_charlist(v)} end)}
+        {:env, scrub ++ provided}
       ])
 
     {:ok, %__MODULE__{port: port, subscriber: Keyword.get(opts, :subscriber)}}

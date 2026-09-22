@@ -3,10 +3,11 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
 
   alias Tightbeam.Harness.{Claude, Codex}
 
-  test "codex patch carries identity, account, and child-thread settlement idempotently" do
+  test "codex retains only the developerInstructions compatibility patch idempotently" do
     source =
       [
         "      modelProvider: this.getModelProvider(),\n      cwd: request.cwd\n",
+        "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
         "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
         "      case \"account/updated\":\n      case \"fs/changed\":",
         "  activeSubAgentActivities = /* @__PURE__ */ new Set();\n",
@@ -16,15 +17,25 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
       |> Enum.join("\n")
 
     patched = Codex.patch_adapter_source(source)
-    assert patched =~ "developerInstructions: request._meta?.developerInstructions"
-    assert patched =~ "accountUpdated: notification.params"
-    assert patched =~ "subAgentActivityCallIds"
-    assert patched =~ "subagentTerminated"
-    assert patched =~ ~s(["idle", "systemError", "notLoaded"])
+
+    assert length(
+             Regex.scan(
+               ~r/developerInstructions: request\._meta\?\.developerInstructions/,
+               patched
+             )
+           ) ==
+             3
+
+    refute patched =~
+             "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n"
+
+    refute patched =~ "accountUpdated: notification.params"
+    refute patched =~ "subAgentActivityCallIds"
+
     assert Codex.patch_adapter_source(patched) == patched
   end
 
-  test "claude patch emits at both liveBackgroundTasks settlement bookends idempotently" do
+  test "claude obsolete settlement source is consumed unpatched after native lifecycle adoption" do
     source =
       [
         "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
@@ -32,10 +43,26 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
       ]
       |> Enum.join("\n")
 
+    assert Claude.patch_adapter_source(source) == source
+  end
+
+  test "claude landed settlement anchors remain byte-identical after native lifecycle adoption" do
+    source =
+      [
+        "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                await subagents.finishTask(message.task_id, message.status, sendUpdate, message.tool_use_id);\n                                await asyncTasks.taskNotification({\n                                    task_id: message.task_id,\n                                    status: message.status,\n                                    summary: message.summary,\n                                    output_file: message.output_file,\n                                });\n                                if (message.tool_use_id)\n                                    subagents.discardPending(message.tool_use_id);\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
+        "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }"
+      ]
+      |> Enum.join("\n")
+
     patched = Claude.patch_adapter_source(source)
-    assert patched =~ "const record = session.liveBackgroundTasks.get(message.task_id)"
-    assert patched =~ "subagentTerminated"
-    assert patched =~ "toolCallId: record.parentToolUseId"
-    assert Claude.patch_adapter_source(patched) == patched
+
+    assert patched =~
+             "await subagents.finishTask(message.task_id, message.status, sendUpdate, message.tool_use_id);"
+
+    assert patched =~
+             "await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);"
+
+    assert patched == source
+    refute patched =~ "subagentTerminated"
   end
 end

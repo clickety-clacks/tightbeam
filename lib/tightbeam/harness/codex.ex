@@ -7,7 +7,7 @@ defmodule Tightbeam.Harness.Codex do
   alias Tightbeam.Harness.Support
   alias Tightbeam.Model
 
-  @adapter_version "1.1.4"
+  @adapter_version "1.12.0"
   @adapter_package "codex-acp"
   # Two routes, one per credential kind, because they are two different accounts'
   # worth of entitlement expressed two different ways.
@@ -71,23 +71,8 @@ defmodule Tightbeam.Harness.Codex do
     },
     {
       "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId\n",
-      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions\n"
-    },
-    {
-      "      case \"account/updated\":\n      case \"fs/changed\":",
-      "      case \"account/updated\":\n        return this.createCodexSessionInfoUpdate({ accountUpdated: notification.params });\n      case \"fs/changed\":"
-    },
-    {
-      "  activeSubAgentActivities = /* @__PURE__ */ new Set();\n",
-      "  activeSubAgentActivities = /* @__PURE__ */ new Set();\n  subAgentActivityCallIds = /* @__PURE__ */ new Map();\n"
-    },
-    {
-      "      case \"thread/status/changed\":\n        return this.createCodexSessionInfoUpdate({\n          threadStatus: notification.params.status\n        });",
-      "      case \"thread/status/changed\": {\n        const childToolCallId = this.subAgentActivityCallIds.get(notification.params.threadId);\n        if (childToolCallId && [\"idle\", \"systemError\", \"notLoaded\"].includes(notification.params.status.type)) {\n          return {\n            sessionUpdate: \"tool_call_update\",\n            toolCallId: childToolCallId,\n            status: notification.params.status.type === \"idle\" ? \"completed\" : \"failed\",\n            _meta: { codex: { subagentTerminated: { agentThreadId: notification.params.threadId, threadStatus: notification.params.status } } }\n          };\n        }\n        return this.createCodexSessionInfoUpdate({\n          threadStatus: notification.params.status\n        });\n      }"
-    },
-    {
-      "      case \"subAgentActivity\":\n        this.activeSubAgentActivities.add(event.item.id);\n        return createSubAgentActivityUpdate(event.item, \"in_progress\", \"tool_call\");",
-      "      case \"subAgentActivity\":\n        this.activeSubAgentActivities.add(event.item.id);\n        this.subAgentActivityCallIds.set(event.item.agentThreadId, event.item.id);\n        return createSubAgentActivityUpdate(event.item, \"in_progress\", \"tool_call\");"
+      "      modelProvider: await this.getResumeModelProvider(),\n      threadId: request.sessionId,\n      developerInstructions: request._meta?.developerInstructions\n",
+      global: true
     }
   ]
 
@@ -376,20 +361,15 @@ defmodule Tightbeam.Harness.Codex do
   end
 
   @impl true
-  def classify_auth_event(%{
-        "_meta" => %{
-          "codex" => %{"accountUpdated" => %{"authMode" => nil, "planType" => nil}}
-        }
-      }),
-      do: :terminal
+  def classify_auth_event(%{"authStatus" => %{"kind" => "none"}}), do: :terminal
 
-  def classify_auth_event(%{"authMode" => nil, "planType" => nil}), do: :terminal
-
-  def classify_auth_event(%{
-        "_meta" => %{"codex" => %{"accountUpdated" => %{"authMode" => mode}}}
-      })
-      when mode in ["apiKey", "chatgpt", "chatgptAuthTokens"],
+  def classify_auth_event(%{"authStatus" => %{"kind" => kind}})
+      when kind in ["account", "api_key", "gateway", "external"],
       do: :transient
+
+  # Keep the public account/updated payload compatible for older ACP peers; the
+  # current adapters use authStatus above and no longer need a source rewrite.
+  def classify_auth_event(%{"authMode" => nil, "planType" => nil}), do: :terminal
 
   def classify_auth_event(%{"authMode" => mode})
       when mode in ["apiKey", "chatgpt", "chatgptAuthTokens"],
@@ -399,28 +379,19 @@ defmodule Tightbeam.Harness.Codex do
 
   @impl true
   def classify_subagent_event(%{
-        "toolCallId" => source,
-        "_meta" => %{"codex" => %{"subagentTerminated" => %{"agentThreadId" => subagent}}}
+        "sessionUpdate" => "subagent_spawned",
+        "subagentSessionId" => subagent
       }) do
-    {:subagent_stop, %{source_event_ref: source, subagent_ref: subagent}}
+    {:subagent_start, %{source_event_ref: subagent, subagent_ref: subagent}}
   end
 
   def classify_subagent_event(%{
-        "toolCallId" => source,
-        "_meta" => %{
-          "codex" => %{"subagent" => %{"threadId" => subagent, "activity" => "started"}}
-        }
-      }) do
-    {:subagent_start, %{source_event_ref: source, subagent_ref: subagent}}
-  end
-
-  def classify_subagent_event(%{
-        "toolCallId" => source,
-        "_meta" => %{
-          "codex" => %{"subagent" => %{"threadId" => subagent, "activity" => "interrupted"}}
-        }
-      }) do
-    {:subagent_stop, %{source_event_ref: source, subagent_ref: subagent}}
+        "sessionUpdate" => "subagent_state_update",
+        "subagentSessionId" => subagent,
+        "state" => state
+      })
+      when state in ["completed", "failed", "cancelled", "disconnected"] do
+    {:subagent_stop, %{source_event_ref: subagent, subagent_ref: subagent}}
   end
 
   def classify_subagent_event(_update), do: :skip
@@ -638,13 +609,7 @@ defmodule Tightbeam.Harness.Codex do
       auth_events: [
         %{
           case: "positive",
-          envelope: %{
-            "_meta" => %{
-              "codex" => %{
-                "accountUpdated" => %{"authMode" => nil, "planType" => nil}
-              }
-            }
-          },
+          envelope: %{"authStatus" => %{"kind" => "none"}},
           expected: :terminal
         },
         %{case: "negative", envelope: %{"unrelated" => true}, expected: :unknown}
@@ -652,32 +617,19 @@ defmodule Tightbeam.Harness.Codex do
       subagent_events: [
         %{
           case: "positive_start",
-          envelope: %{
-            "toolCallId" => "codex-call",
-            "_meta" => %{
-              "codex" => %{
-                "subagent" => %{
-                  "threadId" => "codex-thread",
-                  "activity" => "started"
-                }
-              }
-            }
-          },
+          envelope: %{"sessionUpdate" => "subagent_spawned", "subagentSessionId" => "codex-child"},
           expected:
-            {:subagent_start, %{source_event_ref: "codex-call", subagent_ref: "codex-thread"}}
+            {:subagent_start, %{source_event_ref: "codex-child", subagent_ref: "codex-child"}}
         },
         %{
           case: "positive_stop",
           envelope: %{
-            "toolCallId" => "codex-call",
-            "_meta" => %{
-              "codex" => %{
-                "subagentTerminated" => %{"agentThreadId" => "codex-thread"}
-              }
-            }
+            "sessionUpdate" => "subagent_state_update",
+            "subagentSessionId" => "codex-child",
+            "state" => "completed"
           },
           expected:
-            {:subagent_stop, %{source_event_ref: "codex-call", subagent_ref: "codex-thread"}}
+            {:subagent_stop, %{source_event_ref: "codex-child", subagent_ref: "codex-child"}}
         },
         %{case: "negative", envelope: %{"toolCallId" => "codex-call"}, expected: :skip}
       ],
@@ -979,7 +931,8 @@ defmodule Tightbeam.Harness.Codex do
       @adapter_package,
       @adapter_bundle,
       @adapter_replacements,
-      wire_name()
+      wire_name(),
+      version: @adapter_version
     )
   end
 end

@@ -174,7 +174,7 @@ defmodule Tightbeam.HarnessSeamTest do
                       claude-opus-4-6 claude-opus-4-5-20251101 claude-sonnet-4-5-20250929
                       claude-opus-4-1-20250805) do
       refute refused in selectable,
-             "#{refused} is refused by claude-agent-acp 0.73.0 and must not be listed " <>
+             "#{refused} is refused by claude-agent-acp 0.79.0 and must not be listed " <>
                "as selectable; if a newer adapter accepts it, re-probe and update the " <>
                "note in claude.ex together with the version stamp"
     end
@@ -182,10 +182,9 @@ defmodule Tightbeam.HarnessSeamTest do
     # The note is the load-bearing half — it must carry the version it was probed at.
     source = File.read!(Path.join(File.cwd!(), "lib/tightbeam/harness/claude.ex"))
     assert source =~ "claude CLI 2.1.220"
-    assert source =~ "claude-agent-acp 0.59.0"
-    assert source =~ ~s(@adapter_version "0.73.0")
-    assert source =~ "SDK 0.3.257"
-    assert source =~ "Claude Code 2.1.257"
+    assert source =~ "claude-agent-acp 0.79.0"
+    assert source =~ ~s(@adapter_version "0.79.0")
+    assert source =~ "SDK 0.3.274"
     assert source =~ "silent downgrade"
 
     # The codex half is PROBED now, and kind-scoped: the 2026-07-28 api-key
@@ -199,11 +198,11 @@ defmodule Tightbeam.HarnessSeamTest do
     refute source =~ "divergence is structurally unlikely"
   end
 
-  test "claude 0.73.0 aliases select Fable 5.1 at both context widths" do
+  test "claude 0.79.0 aliases select Fable 5.1 at both context widths" do
     config = Tightbeam.Harness.Claude.session_config(%{}, "guidance")
 
     assert config.model_option_aliases["fable"] == "claude-fable-5-1"
     assert config.model_option_aliases["fable[1m]"] == "claude-fable-5-1[1m]"
-    assert Tightbeam.Harness.Claude.adapter_version() == "0.73.0"
+    assert Tightbeam.Harness.Claude.adapter_version() == "0.79.0"
   end
 end

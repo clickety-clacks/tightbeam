@@ -232,6 +232,9 @@ defmodule Tightbeam.EffortCheckinTest do
 
   test "priority inherits from the work item, scales the four-hour window, and reprioritizes live probes",
        ctx do
+    # This proof closes a card: its holder, recorded opener and work owner must
+    # share the valid durable relation, unlike the suite's cross-owner setup.
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET ownerUserId='h1' WHERE sessionKey='holder'")
     config = Map.put(ctx.config, :effort_checkin_horizon_ms, 14_400_000)
     ctx = %{ctx | config: config}
 
@@ -302,10 +305,23 @@ defmodule Tightbeam.EffortCheckinTest do
                [assignment.id]
              )
 
-    assignment(ctx, "attest", {:session, "holder"}, nil, %{
-      assignment_id: assignment.id,
-      kind: "completion"
-    })
+    assert [["parent", "h1", "h1", "h1"]] =
+             rows(
+               ctx.db,
+               """
+               SELECT a.openedBySession,p.ownerUserId,h.ownerUserId,w.ownerUserId
+               FROM assignments a JOIN sessions p ON p.sessionKey=a.openedBySession
+               JOIN sessions h ON h.sessionKey=a.holderKey JOIN work_items w ON w.id=a.workItemId
+               WHERE a.id=?1
+               """,
+               [assignment.id]
+             )
+
+    assert %{assignment: %{state: "closed", outcome: "completed"}} =
+             assignment(ctx, "attest", {:session, "holder"}, nil, %{
+               assignment_id: assignment.id,
+               kind: "completion"
+             })
 
     assert bracket_state(ctx.db, assignment.id) == "canceled"
 
@@ -580,6 +596,8 @@ defmodule Tightbeam.EffortCheckinTest do
 
   test "proofs 5 and 8b: continue doubles/caps, effect resets, dismiss refreshes, close supersedes",
        ctx do
+    # Keep the same parent/holder routing, but use a valid same-owner close fixture.
+    {:ok, _} = DB.query(ctx.db, "UPDATE sessions SET ownerUserId='h1' WHERE sessionKey='holder'")
     item = dispatch(ctx, {:session, "parent"}, "holder", "rulings")
     first = escalate(ctx, item.id)
 
@@ -650,10 +668,22 @@ defmodule Tightbeam.EffortCheckinTest do
 
     open = escalate(ctx, item.id)
 
-    assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
-      assignment_id: item.id,
-      reason: "effort disposition"
-    })
+    assert [["parent", "h1", "h1"]] =
+             rows(
+               ctx.db,
+               """
+               SELECT a.openedBySession,p.ownerUserId,h.ownerUserId
+               FROM assignments a JOIN sessions p ON p.sessionKey=a.openedBySession
+               JOIN sessions h ON h.sessionKey=a.holderKey WHERE a.id=?1
+               """,
+               [item.id]
+             )
+
+    assert %{state: "closed", outcome: "revoked"} =
+             assignment(ctx, "revoke-assignment", {:session, "parent"}, nil, %{
+               assignment_id: item.id,
+               reason: "effort disposition"
+             })
 
     assert request(ctx.db, open.id).status == "superseded"
     assert Wakes.get(ctx.db, open.deadline_wake_id).state == "canceled"

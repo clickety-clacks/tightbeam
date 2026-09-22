@@ -1,4 +1,4 @@
-[payload, base, locks] = System.argv()
+[payload, base] = System.argv()
 true = Path.expand(payload) == Path.expand(Application.app_dir(:tightbeam))
 false = File.exists?(base)
 
@@ -13,7 +13,7 @@ alias Tightbeam.{AssignmentCommitRefCorrections, DB, Model, Schema}
 
 db = :commitref_restart
 path = Path.join(base, "state.db")
-{:ok, first} = DB.start_link(path: path, name: db, guard_inputs: [lock_dir: locks])
+{:ok, first} = DB.start_link(path: path, name: db, guard_inputs: [])
 
 try do
   :ok = Schema.ensure_all(db)
@@ -124,7 +124,7 @@ try do
            AssignmentCommitRefCorrections.__handle__(db, "assignment-commitref-correct", call)
 
   :ok = GenServer.stop(first)
-  {:ok, second} = DB.start_link(path: path, name: db, guard_inputs: [lock_dir: locks])
+  {:ok, second} = DB.start_link(path: path, name: db, guard_inputs: [])
 
   try do
     :ok = Schema.ensure_all(db)

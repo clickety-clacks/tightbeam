@@ -19,9 +19,9 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert output =~ "notice-batcher-case: #{scenario}: ok"
   end
 
-  def run_case!(scenario, base, locks) do
+  def run_case!(scenario, base) do
     {:ok, db} =
-      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [lock_dir: locks])
+      DB.start_link(path: Path.join(base, "state.db"), name: nil, guard_inputs: [])
 
     Process.put({__MODULE__, :schedulers}, [])
 
@@ -39,24 +39,6 @@ defmodule Tightbeam.NoticeBatcherFixture do
       if Process.alive?(db), do: GenServer.stop(db)
     end
 
-    lock_path =
-      Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    await = fn recur, remaining ->
-      case Tightbeam.LiveBaseLock.acquire(lock_path) do
-        {:ok, lock} ->
-          :ok = Tightbeam.LiveBaseLock.release(lock)
-
-        {:error, :lock_busy} when remaining > 0 ->
-          Process.sleep(10)
-          recur.(recur, remaining - 1)
-
-        other ->
-          raise "notice fixture lock did not release: #{inspect(other)}"
-      end
-    end
-
-    await.(await, 100)
     IO.puts("notice-batcher-case: #{scenario}: ok")
   end
 

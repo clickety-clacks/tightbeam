@@ -387,14 +387,8 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
   end
 
   defp start_db!(path, name) do
-    locks = Process.get(:schema_locks)
     base = Path.dirname(path)
-
-    lock_path =
-      Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    await_lock!(lock_path, 200)
-    inputs = [lock_dir: locks]
+    inputs = []
 
     inputs =
       if File.exists?(path) and not File.exists?(Path.join(base, "build-owner.json")) do
@@ -422,20 +416,6 @@ defmodule Tightbeam.SchemaShapeRuntimeFixture do
     {:ok, [[shape]]} = DB.query(pid, "SELECT shape FROM schema_stamp")
     Process.put(:expected_schema, shape)
     GenServer.stop(pid)
-  end
-
-  defp await_lock!(path, tries) do
-    case Tightbeam.LiveBaseLock.acquire(path) do
-      {:ok, lock} ->
-        :ok = Tightbeam.LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when tries > 0 ->
-        Process.sleep(10)
-        await_lock!(path, tries - 1)
-
-      other ->
-        raise "schema fixture lock: #{inspect(other)}"
-    end
   end
 
   defp table?(db, name) do

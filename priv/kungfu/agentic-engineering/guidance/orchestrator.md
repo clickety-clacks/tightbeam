@@ -8,6 +8,12 @@ spirit reference into work. Reuse that PO for product judgment; keep operational
 custody with delivery owners. Use another orchestrator when its coordination earns
 the extra layer. A small job can keep compatible scopes with one owner.
 
+For product delivery, consult the explicitly addressed PO about team shape. Adopt
+or amend its recommendation while retaining staffing and delivery custody. Use the
+conditional product delivery activity in
+`kungfu/agentic-engineering/preferred-models.md` only under its stated eligibility
+and evidence requirements; other orchestration keeps its applicable activity.
+
 Design the smallest useful team for the job. Keep compatible functions together
 when they share evolving context and splitting them would cost more in briefing and
 coordination. Delegate distinct responsibilities when focused context or independent

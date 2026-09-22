@@ -1,7 +1,16 @@
 defmodule Tightbeam.LaneTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{DB, Ledger, EventLog, LaneManager, Placement, Schema, SessionLane}
+  alias Tightbeam.{
+    DB,
+    EventLog,
+    HarnessHealth,
+    LaneManager,
+    Ledger,
+    Placement,
+    Schema,
+    SessionLane
+  }
 
   setup do
     db = :"db_#{System.unique_integer([:positive])}"
@@ -72,6 +81,215 @@ defmodule Tightbeam.LaneTest do
     :ok = LaneManager.reconcile(mgr)
     assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
     assert Agent.get(agent, &Enum.reverse(&1)) == ["first", "second"]
+  end
+
+  test "a real lane terminal settles the current rung and publishes the next rung", ctx do
+    parent = self()
+    at = System.system_time(:millisecond)
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "testhost",
+               source_session_key: "k2",
+               principal: {:session, "k2"},
+               description: "lane route settlement",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "lane route reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 5_000,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "lane-route-settlement"
+             })
+
+    assert {:ok, [[first_wake, route_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               [opened.id]
+             )
+
+    assert is_binary(first_wake)
+    assert is_integer(route_turn)
+
+    runner = fn _turn ->
+      {:error,
+       %{
+         reason: "route delivery failed",
+         terminal_publish: fn terminal -> send(parent, {:route_terminal, terminal}) end,
+         record_in_txn: fn _txn -> nil end
+       }}
+    end
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :"mgr_#{System.unique_integer([:positive])}"
+      )
+
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:route_terminal, "failed"}
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert {:ok, [["non_delivered", "failed"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               [opened.id]
+             )
+
+    assert {:ok, [["skipped", "inactive"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=1",
+               [opened.id]
+             )
+
+    assert {:ok, [["skipped", "cycle", nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=2",
+               [opened.id]
+             )
+
+    assert {:ok, [["alerted", "no_active_main", nil, nil]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason,noticeWakeId,turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=3",
+               [opened.id]
+             )
+
+    assert route_turn > 0
+  end
+
+  test "public route cancellation settles the real turn and advances to the owner terminus",
+       ctx do
+    parent = self()
+    at = System.system_time(:millisecond)
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "testhost",
+               source_session_key: "k2",
+               principal: {:session, "k2"},
+               description: "lane route cancellation",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "lane cancel reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 5_000,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "lane-route-cancel"
+             })
+
+    assert {:ok, [[route_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               [opened.id]
+             )
+
+    runner = fn turn ->
+      send(parent, {:cancel_started, turn.seq})
+      receive do: (:never -> :ok)
+    end
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        on_terminal: fn session_key, seq -> send(parent, {:cancel_terminal, session_key, seq}) end,
+        name: :"mgr_#{System.unique_integer([:positive])}"
+      )
+
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:cancel_started, ^route_turn}
+    assert {:ok, %{seq: ^route_turn}} = SessionLane.cancel_current("k1")
+    assert_receive {:cancel_terminal, "k1", ^route_turn}
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert {:ok, [["non_delivered", "canceled"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               [opened.id]
+             )
+
+    assert {:ok, [["alerted", "no_active_main"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=3",
+               [opened.id]
+             )
+  end
+
+  test "public route crash recovery settles the running turn once and advances", ctx do
+    at = System.system_time(:millisecond)
+
+    assert {:opened, opened} =
+             HarnessHealth.observe_other(ctx.db, %{
+               harness: "claude",
+               host: "testhost",
+               source_session_key: "k2",
+               principal: {:session, "k2"},
+               description: "lane route crash recovery",
+               evidence_mode: "exact_error",
+               observed_state: "provider route failed",
+               exact_observed_error: "lane crash reset",
+               exact_probe: "provider health probe",
+               recovery_condition: "a normal provider turn completes",
+               not_known_class_reason: "not one of the named classes",
+               observed_at: at,
+               accepted_at: at,
+               valid_until: at + 5_000,
+               world_status: "UNKNOWN",
+               redaction_confirmed: true,
+               idempotency_key: "lane-route-crash-recovery"
+             })
+
+    assert {:ok, [[route_turn]]} =
+             DB.query(
+               ctx.db,
+               "SELECT turnSeq FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               [opened.id]
+             )
+
+    assert {:ok, %{seq: ^route_turn}} = Ledger.claim_next(ctx.db, "k1", "crash-recovery")
+    assert [^route_turn] = Ledger.recover_running(ctx.db)
+    assert Ledger.recover_running(ctx.db) == []
+
+    assert {:ok, [["non_delivered", "failed_unknown"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=0",
+               [opened.id]
+             )
+
+    assert {:ok, [["alerted", "no_active_main"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state,closedReason FROM harness_health_other_routes WHERE incidentId=?1 AND ordinal=3",
+               [opened.id]
+             )
   end
 
   test "a delivered runner mutation commits with the terminal CAS and publishes afterward", ctx do

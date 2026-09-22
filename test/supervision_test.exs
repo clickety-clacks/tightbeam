@@ -152,6 +152,779 @@ defmodule Tightbeam.SupervisionTest do
     refute "pendingTarget" in names
   end
 
+  test "the prod-shape gate authorizes assignment prodding and rejects other consumers", ctx do
+    assert {:ok, :acted} =
+             DB.transaction(ctx.db, fn txn ->
+               HarnessHealth.prod_shape_act_in_txn(
+                 txn,
+                 "assignment_prodder",
+                 "asg_1",
+                 "claude",
+                 "gibson",
+                 fn -> :acted end
+               )
+             end)
+
+    assert {:error, %ArgumentError{message: "unreviewed_prod_shape_consumer"}} =
+             DB.transaction(ctx.db, fn txn ->
+               HarnessHealth.prod_shape_act_in_txn(
+                 txn,
+                 "test_sink",
+                 "asg_1",
+                 "claude",
+                 "gibson",
+                 fn -> flunk("unreviewed sink was executed") end
+               )
+             end)
+  end
+
+  test "the real prod wake sink runs behind the gate transaction and denial has no effect",
+       ctx do
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    parent = self()
+    actual_wake = ctx.handlers["wake"]
+
+    instrumented =
+      Map.put(ctx.handlers, "wake", fn call ->
+        send(parent, {:prod_wake_sink, match?(%DB.Txn{}, call[:txn])})
+        actual_wake.(call)
+      end)
+
+    terminal = terminal!(ctx.db, "holder")
+
+    assert {:prodded, 1} =
+             Supervision.evaluate(ctx.db, instrumented, 3, "holder", terminal)
+
+    assert_receive {:prod_wake_sink, true}
+    before_denial = Enum.map(Wakes.list_pending(ctx.db), & &1.wake_id)
+    assert length(before_denial) == 1
+
+    open_rate_limit_incident!(ctx)
+    denial_terminal = terminal!(ctx.db, "holder")
+
+    assert :harness_unavailable =
+             Supervision.evaluate(ctx.db, instrumented, 3, "holder", denial_terminal)
+
+    refute_receive {:prod_wake_sink, _}
+    assert Enum.map(Wakes.list_pending(ctx.db), & &1.wake_id) == before_denial
+  end
+
+  test "idle cleanup backfills quiet sessions with private evidence and no retirement", ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=1,updatedAt=1 WHERE sessionKey='supervisor'"
+      )
+
+    main_key = ctx.main.session_key
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_backfill_supervision)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert [%{session_key: ^main_key} = wake] = cleanup_wakes
+    assert wake.prompt =~ "child=supervisor"
+    assert wake.prompt =~ "ageMs="
+    assert wake.prompt =~ "lastAssignment=none"
+    assert wake.prompt =~ "outcome=none"
+    assert wake.prompt =~ "workItem=none"
+    assert wake.prompt =~ "custody=none"
+    assert wake.prompt =~ "cause=idle_cleanup_quiet; principal=process:tightbeam"
+    refute wake.prompt =~ "ship it"
+    refute wake.prompt =~ "assignment:"
+
+    assert {:ok, [["active"]]} =
+             DB.query(ctx.db, "SELECT state FROM sessions WHERE sessionKey='supervisor'")
+
+    assert [%{kind: "idle_cleanup_prompt_claimed"}] =
+             Enum.filter(EventLog.lifecycle_events(ctx.db), &(&1.subject == wake.wake_id))
+  end
+
+  test "idle cleanup applies its horizon and excludes open or pending sessions", ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 10_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    pending = session(ctx.db, "pending-child", ctx.supervisor.session_key)
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey IN ('supervisor','pending-child')",
+        [now - 9_000]
+      )
+
+    pending_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: pending.session_key,
+        origin: "user:flynn",
+        prompt: "pending ordinary wake",
+        due_at: now + 60_000
+      })
+
+    main_key = ctx.main.session_key
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_horizon_supervision)
+
+    refute Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
+             is_binary(wake.obligation_ref) and
+               String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+           end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey='supervisor'",
+        [System.system_time(:millisecond) - 11_000]
+      )
+
+    sweep_liveness!(:idle_cleanup_horizon_supervision)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert [%{session_key: ^main_key}] = cleanup_wakes
+    assert Wakes.get(ctx.db, pending_wake.wake_id).state == "pending"
+  end
+
+  test "idle cleanup mixes sibling eligibility, deduplicates, and escalates one group", ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    child_a = session(ctx.db, "child-a", ctx.supervisor.session_key)
+    child_b = session(ctx.db, "child-b", ctx.supervisor.session_key)
+    supervisor_key = ctx.supervisor.session_key
+    main_key = ctx.main.session_key
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey='child-a'",
+        [
+          now - 3_000
+        ]
+      )
+
+    Wakes.schedule(ctx.db, %{
+      session_key: ctx.supervisor.session_key,
+      origin: "user:flynn",
+      prompt: "parent activity",
+      due_at: now + 60_000
+    })
+
+    start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_cleanup_group_supervision)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert [%{session_key: ^supervisor_key, prompt: first_prompt} = first] = cleanup_wakes
+    assert first_prompt =~ "child=child-a"
+    refute first_prompt =~ "child=child-b"
+    assert first_prompt =~ "delivered=0"
+    assert first_prompt =~ "targetDepth=0"
+
+    # A second sweep and a second Supervision process see the same pending wake.
+    sweep_liveness!(:idle_cleanup_group_supervision)
+    assert :ok = stop_supervised(Supervision)
+    start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_cleanup_group_restart)
+
+    assert 1 ==
+             Enum.count(Wakes.list_pending(ctx.db), fn wake ->
+               is_binary(wake.obligation_ref) and
+                 String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+             end)
+
+    assert {:ok, _} =
+             Ledger.enqueue(ctx.db, %{
+               session_key: first.session_key,
+               message_id: "idle-cleanup-generation-1",
+               wake_id: first.wake_id,
+               origin: first.origin,
+               prompt: first.prompt
+             })
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE wakes SET state='fired',firedAt=?2 WHERE wakeId=?1",
+        [first.wake_id, System.system_time(:millisecond) - 2_000]
+      )
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey='child-b'",
+        [
+          System.system_time(:millisecond) - 3_000
+        ]
+      )
+
+    sweep_liveness!(:idle_cleanup_group_restart)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert [%{session_key: ^main_key, prompt: second_prompt}] = cleanup_wakes
+    assert second_prompt =~ "child=child-a"
+    assert second_prompt =~ "child=child-b"
+    assert second_prompt =~ "child=child-a;"
+    assert second_prompt =~ "delivered=1"
+    assert second_prompt =~ "targetDepth=1"
+    assert child_a.session_key == "child-a"
+    assert child_b.session_key == "child-b"
+
+    assert {:ok, [["active"], ["active"]]} =
+             DB.query(
+               ctx.db,
+               "SELECT state FROM sessions WHERE sessionKey IN ('child-a','child-b') ORDER BY sessionKey"
+             )
+  end
+
+  test "idle cleanup climbs dormant or retired parents and routes living ancestors or Main",
+       ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    dormant_parent = session(ctx.db, "dormant-parent", ctx.supervisor.session_key)
+    _dormant_child = session(ctx.db, "dormant-child", dormant_parent.session_key)
+    retired_parent = session(ctx.db, "retired-parent", ctx.supervisor.session_key)
+    _retired_child = session(ctx.db, "retired-child", retired_parent.session_key)
+    living_parent = session(ctx.db, "living-parent", ctx.supervisor.session_key)
+    living_child = session(ctx.db, "living-child", living_parent.session_key)
+    _orphan = session(ctx.db, "orphan", nil)
+    now = System.system_time(:millisecond)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='retired-parent'")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=?1,updatedAt=?1 WHERE sessionKey IN ('supervisor','dormant-parent','dormant-child','retired-child','living-child','orphan')",
+        [now - 3_000]
+      )
+
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_routing_supervision)
+
+    cleanup_wakes =
+      Enum.filter(Wakes.list_pending(ctx.db), fn wake ->
+        is_binary(wake.obligation_ref) and
+          String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+      end)
+
+    assert Enum.any?(cleanup_wakes, fn wake -> wake.session_key == living_parent.session_key end)
+
+    assert Enum.all?(cleanup_wakes, fn wake ->
+             wake.session_key in [ctx.main.session_key, living_parent.session_key]
+           end)
+
+    main_prompts =
+      cleanup_wakes
+      |> Enum.filter(&(&1.session_key == ctx.main.session_key))
+      |> Enum.map(& &1.prompt)
+      |> Enum.join("\n")
+
+    assert main_prompts =~ "child=dormant-child"
+    assert main_prompts =~ "child=retired-child"
+    assert main_prompts =~ "child=orphan"
+    assert living_child.session_key == "living-child"
+  end
+
+  test "idle cleanup pauses on the existing shared harness incident", ctx do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 1_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=1,updatedAt=1 WHERE sessionKey='supervisor'"
+      )
+
+    open_rate_limit_incident!(ctx)
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_cleanup_incident_supervision)
+
+    refute Enum.any?(Wakes.list_pending(ctx.db), fn wake ->
+             is_binary(wake.obligation_ref) and
+               String.starts_with?(wake.obligation_ref, "idle-cleanup-v1:")
+           end)
+
+    assert [%{kind: "harness_health_incident_opened"}] =
+             Enum.filter(
+               EventLog.lifecycle_events(ctx.db),
+               &(&1.kind == "harness_health_incident_opened")
+             )
+  end
+
+  test "idle cleanup declines a stale batch at actual delivery and replaces only due siblings",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-a", "idle-b", "idle-c"])
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_revalidation)
+    [batch] = idle_cleanup_wakes(ctx.db)
+
+    assignment(
+      ctx.db,
+      "idle-a-assignment",
+      "idle-a",
+      "new work",
+      System.system_time(:millisecond)
+    )
+
+    pending =
+      Wakes.schedule(ctx.db, %{
+        session_key: "idle-b",
+        origin: "user:flynn",
+        prompt: "causal operator notice",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    assert :skipped = admit_supervision_wake!(ctx.db, batch)
+    assert Wakes.get(ctx.db, batch.wake_id).state == "fired"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+
+    assert Wakes.get(ctx.db, pending.wake_id).state == "pending"
+
+    sweep_liveness!(name)
+    [replacement] = idle_cleanup_wakes(ctx.db)
+    assert replacement.prompt =~ "child=idle-c;"
+    refute replacement.prompt =~ "child=idle-a;"
+    refute replacement.prompt =~ "child=idle-b;"
+    assert :appended = admit_supervision_wake!(ctx.db, replacement)
+    assert {:duplicate, _} = admit_supervision_wake!(ctx.db, replacement)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [replacement.wake_id])
+  end
+
+  test "idle cleanup declines changed claimed evidence without changing activity or eligibility",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child", "idle-sibling"])
+    assignment(ctx.db, "idle-last", "idle-child", "private subject", 1)
+    attach_work_item!(ctx.db, "idle-last", "idle-item")
+    persist_terminal_race!(ctx.db, "idle-last", 1)
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_claim_evidence)
+
+    changes = [
+      {fn -> attach_work_item!(ctx.db, "asg_1", "idle-item") end, "custody=held-elsewhere"},
+      {fn ->
+         DB.query(ctx.db, "INSERT INTO work_item_priorities (workItemId,priority) VALUES (?,?)", [
+           "idle-item",
+           5
+         ])
+       end, "priority=5; thresholdMs=30000"},
+      {fn -> Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 120_000) end,
+       "priority=5; thresholdMs=60000"},
+      {fn ->
+         DB.query(ctx.db, "UPDATE sessions SET displayName=? WHERE sessionKey='idle-child'", [
+           "renamed child"
+         ])
+       end, "name=\"renamed child\""}
+    ]
+
+    for {change, expected} <- changes do
+      [claimed] = idle_cleanup_wakes(ctx.db)
+      [_, json] = String.split(claimed.obligation_ref, "\n", parts: 2)
+      claimed_members = JSON.decode!(json)["members"]
+      change.()
+
+      assert :skipped = admit_supervision_wake!(ctx.db, claimed)
+      assert Wakes.get(ctx.db, claimed.wake_id).prompt == claimed.prompt
+
+      assert {:ok, [[0]]} =
+               DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [claimed.wake_id])
+
+      sweep_liveness!(name)
+      [replacement] = idle_cleanup_wakes(ctx.db)
+      assert replacement.wake_id != claimed.wake_id
+      assert replacement.prompt =~ expected
+      assert replacement.prompt =~ "child=idle-sibling;"
+      assert length(Regex.scan(~r/delivered=0;/, replacement.prompt)) == 2
+      [_, replacement_json] = String.split(replacement.obligation_ref, "\n", parts: 2)
+      assert JSON.decode!(replacement_json)["members"] == claimed_members
+    end
+
+    [current] = idle_cleanup_wakes(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, current)
+    assert Wakes.get(ctx.db, current.wake_id).prompt == current.prompt
+
+    assert {:ok, [[1, 1], [1, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT createdAt,updatedAt FROM sessions WHERE sessionKey IN ('idle-child','idle-sibling')"
+             )
+  end
+
+  test "idle cleanup scheduler defers a post-claim incident without consuming a generation",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_incident_delivery)
+    [batch] = idle_cleanup_wakes(ctx.db)
+    open_rate_limit_incident!(ctx)
+    scheduler = idle_cleanup_scheduler!(ctx)
+
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, batch.wake_id).state == "pending"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+
+    resolve_rate_limit_incident!(ctx, 1)
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(ctx.db, batch.wake_id).state == "fired"
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+
+    assert :ok = Wakes.fire_due(scheduler)
+
+    assert {:ok, [[1]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+  end
+
+  test "idle cleanup rechecks a recipient incident separately from eligible children", ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET host='other-host' WHERE sessionKey='idle-child'")
+
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_target_incident)
+    [batch] = idle_cleanup_wakes(ctx.db)
+    open_rate_limit_incident!(ctx)
+
+    assert {:idle_cleanup_deferred, :shared_harness_incident} =
+             admit_supervision_wake!(ctx.db, batch)
+
+    assert Wakes.get(ctx.db, batch.wake_id).state == "pending"
+    resolve_rate_limit_incident!(ctx, 2)
+    assert :appended = admit_supervision_wake!(ctx.db, batch)
+  end
+
+  test "idle cleanup delivery reroutes a retired or newly dormant parent in the enqueue transaction",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+    start_liveness!(ctx, sweep_ms: 60_000, name: :idle_target_delivery)
+    [batch] = idle_cleanup_wakes(ctx.db)
+    assert batch.session_key == "supervisor"
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET createdAt=1,updatedAt=1 WHERE sessionKey='supervisor'"
+      )
+
+    assert {:error, %RuntimeError{message: "rollback delivery"}} =
+             DB.transaction(ctx.db, fn txn ->
+               assert {:appended, target, _, _} =
+                        Gateway.deliver_prompt_in_txn(
+                          txn,
+                          batch.session_key,
+                          batch.origin,
+                          batch.prompt,
+                          wake_id: batch.wake_id
+                        )
+
+               assert target == ctx.main.session_key
+               raise "rollback delivery"
+             end)
+
+    assert Wakes.get(ctx.db, batch.wake_id).state == "pending"
+    assert Wakes.get(ctx.db, batch.wake_id).session_key == "supervisor"
+
+    assert {:ok, [[0]]} =
+             DB.query(ctx.db, "SELECT COUNT(*) FROM turns WHERE wakeId=?1", [batch.wake_id])
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='supervisor'")
+
+    assert :appended = admit_supervision_wake!(ctx.db, batch)
+    delivered = Wakes.get(ctx.db, batch.wake_id)
+    assert delivered.session_key == ctx.main.session_key
+    assert delivered.prompt =~ "requestedDepth=0; targetDepth=1"
+    assert delivered.state == "fired"
+  end
+
+  test "idle cleanup resets only sweep-observed canceled wakes and preserves cancellation-first history",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["observed-child", "unobserved-child"])
+    name = start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_occurrence)
+    [batch] = idle_cleanup_wakes(ctx.db)
+    assert :appended = admit_supervision_wake!(ctx.db, batch)
+    idle_cleanup_elapsed!(ctx.db, batch)
+    sweep_liveness!(name)
+    [second] = idle_cleanup_wakes(ctx.db)
+    assert second.session_key == ctx.main.session_key
+    assert second.prompt =~ "delivered=1; N=1; requestedDepth=1; targetDepth=1"
+    assert :appended = admit_supervision_wake!(ctx.db, second)
+
+    observed =
+      Wakes.schedule(ctx.db, %{
+        session_key: "observed-child",
+        origin: "user:flynn",
+        prompt: "parent intervention",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    sweep_liveness!(name)
+    sweep_liveness!(name)
+    cancel_wake!(ctx.db, observed)
+
+    unobserved =
+      Wakes.schedule(ctx.db, %{
+        session_key: "unobserved-child",
+        origin: "user:flynn",
+        prompt: "between sweeps",
+        due_at: System.system_time(:millisecond) + 60_000
+      })
+
+    cancel_wake!(ctx.db, unobserved)
+
+    observations =
+      Enum.filter(
+        EventLog.lifecycle_events(ctx.db),
+        &(&1.kind == "idle_cleanup_pending_observed")
+      )
+
+    assert Enum.count(observations, &(&1.subject == observed.wake_id)) == 1
+    refute Enum.any?(observations, &(&1.subject == unobserved.wake_id))
+    delivered_before = [Wakes.get(ctx.db, batch.wake_id), Wakes.get(ctx.db, second.wake_id)]
+
+    assert :ok = stop_supervised(Supervision)
+    name = start_liveness!(ctx, prod_limit: 1, sweep_ms: 60_000, name: :idle_occurrence_restart)
+    [next] = idle_cleanup_wakes(ctx.db)
+    assert next.session_key == "supervisor"
+    assert next.prompt =~ "child=observed-child;"
+    refute next.prompt =~ "child=unobserved-child;"
+
+    assert length(Regex.scan(~r/delivered=0; N=1; requestedDepth=0; targetDepth=0/, next.prompt)) ==
+             1
+
+    sweep_liveness!(name)
+    assert [^next] = idle_cleanup_wakes(ctx.db)
+
+    assert delivered_before == [
+             Wakes.get(ctx.db, batch.wake_id),
+             Wakes.get(ctx.db, second.wake_id)
+           ]
+
+    assert {:ok, [[1, 1], [1, 1]]} =
+             DB.query(
+               ctx.db,
+               "SELECT createdAt,updatedAt FROM sessions WHERE sessionKey IN ('observed-child','unobserved-child')"
+             )
+
+    assert :appended = admit_supervision_wake!(ctx.db, next)
+    idle_cleanup_elapsed!(ctx.db, second)
+    sweep_liveness!(name)
+    [survivor] = idle_cleanup_wakes(ctx.db)
+    assert survivor.session_key == ctx.main.session_key
+    assert survivor.prompt =~ "child=unobserved-child;"
+    refute survivor.prompt =~ "child=observed-child;"
+    assert survivor.prompt =~ "delivered=2; N=1; requestedDepth=2; targetDepth=1"
+    assert :appended = admit_supervision_wake!(ctx.db, survivor)
+  end
+
+  test "idle cleanup retains actual ancestor depth and Main across recovery with N greater than one",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+    session(ctx.db, "grandparent", ctx.main.session_key)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET spawnedBy='grandparent',createdAt=1,updatedAt=1 WHERE sessionKey='supervisor'"
+      )
+
+    name = start_liveness!(ctx, prod_limit: 3, sweep_ms: 60_000, name: :idle_depth)
+
+    first =
+      Enum.find(idle_cleanup_wakes(ctx.db), &String.contains?(&1.prompt, "child=idle-child;"))
+
+    assert first.session_key == "grandparent"
+    assert first.prompt =~ "requestedDepth=0; targetDepth=1"
+    assert :appended = admit_supervision_wake!(ctx.db, first)
+    idle_cleanup_elapsed!(ctx.db, first)
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET updatedAt=?1 WHERE sessionKey='supervisor'", [
+        System.system_time(:millisecond)
+      ])
+
+    assert :ok = stop_supervised(Supervision)
+    name = start_liveness!(ctx, prod_limit: 3, sweep_ms: 60_000, name: name)
+
+    second =
+      Enum.find(idle_cleanup_wakes(ctx.db), &String.contains?(&1.prompt, "child=idle-child;"))
+
+    assert second.session_key == "grandparent"
+    assert second.prompt =~ "delivered=1; N=3; requestedDepth=0; targetDepth=1"
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE sessions SET state='retired' WHERE sessionKey='grandparent'")
+
+    assert :appended = admit_supervision_wake!(ctx.db, second)
+    assert Wakes.get(ctx.db, second.wake_id).session_key == ctx.main.session_key
+    assert Wakes.get(ctx.db, second.wake_id).prompt =~ "targetDepth=2"
+    idle_cleanup_elapsed!(ctx.db, second)
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET state='active',updatedAt=?1 WHERE sessionKey='grandparent'",
+        [System.system_time(:millisecond)]
+      )
+
+    sweep_liveness!(name)
+
+    third =
+      Enum.find(idle_cleanup_wakes(ctx.db), &String.contains?(&1.prompt, "child=idle-child;"))
+
+    assert third.session_key == ctx.main.session_key
+    assert third.prompt =~ "delivered=2; N=3; requestedDepth=0; targetDepth=2"
+  end
+
+  test "idle cleanup refuses corrupt custody and configuration with row identities and remedy",
+       ctx do
+    idle_cleanup_fixture!(ctx, ["idle-child"])
+    assignment(ctx.db, "idle-last", "idle-child", "private subject", 1)
+    attach_work_item!(ctx.db, "idle-last", "idle-corrupt-item")
+    persist_terminal_race!(ctx.db, "idle-last", 1)
+    attach_work_item!(ctx.db, "asg_1", "idle-corrupt-item")
+
+    {:ok, _} =
+      DB.query(ctx.db, "UPDATE work_items SET state='closed' WHERE id='idle-corrupt-item'")
+
+    name = start_liveness!(ctx, sweep_ms: 60_000, name: :idle_invalid_evidence)
+    assert idle_cleanup_wakes(ctx.db) == []
+    refusal = Enum.find(EventLog.lifecycle_events(ctx.db), &(&1.kind == "idle_cleanup_refused"))
+    assert refusal.subject == "idle-child"
+    assert refusal.detail =~ "terminal_work_item_still_held"
+    assert refusal.detail =~ "idle-corrupt-item"
+    assert refusal.detail =~ "remedy=repair_named_ledger_or_configuration_evidence"
+    refute refusal.detail =~ "private subject"
+
+    {:ok, _} = DB.query(ctx.db, "UPDATE work_items SET state='open' WHERE id='idle-corrupt-item'")
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "INSERT OR REPLACE INTO org_settings (key,value,updatedAt) VALUES ('default-priority','broken',1)"
+      )
+
+    sweep_liveness!(name)
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "idle_cleanup_refused" and &1.subject == "idle-child" and
+                 String.contains?(&1.detail, "invalid_priority"))
+           )
+
+    {:ok, _} = DB.query(ctx.db, "DELETE FROM org_settings WHERE key='default-priority'")
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 0)
+    sweep_liveness!(name)
+
+    assert Enum.any?(
+             EventLog.lifecycle_events(ctx.db),
+             &(&1.kind == "idle_cleanup_refused" and &1.subject == "idle-child" and
+                 String.contains?(&1.detail, "invalid_horizon"))
+           )
+
+    assert idle_cleanup_wakes(ctx.db) == []
+  end
+
+  defp idle_cleanup_fixture!(ctx, children) do
+    previous = Application.get_env(:tightbeam, :effort_checkin_horizon_ms)
+    Application.put_env(:tightbeam, :effort_checkin_horizon_ms, 60_000)
+
+    on_exit(fn ->
+      if is_nil(previous),
+        do: Application.delete_env(:tightbeam, :effort_checkin_horizon_ms),
+        else: Application.put_env(:tightbeam, :effort_checkin_horizon_ms, previous)
+    end)
+
+    for child <- children do
+      session(ctx.db, child, ctx.supervisor.session_key)
+
+      {:ok, _} =
+        DB.query(ctx.db, "UPDATE sessions SET createdAt=1,updatedAt=1 WHERE sessionKey=?1", [
+          child
+        ])
+    end
+  end
+
+  defp idle_cleanup_wakes(db) do
+    Enum.filter(
+      Wakes.list_pending(db),
+      &String.starts_with?(&1.obligation_ref || "", "idle-cleanup-v1:")
+    )
+  end
+
+  defp idle_cleanup_elapsed!(db, wake) do
+    {:ok, _} =
+      DB.query(db, "UPDATE wakes SET firedAt=?2 WHERE wakeId=?1", [
+        wake.wake_id,
+        System.system_time(:millisecond) - 61_000
+      ])
+  end
+
+  defp idle_cleanup_scheduler!(ctx) do
+    registry = start_supervised!({ConnRegistry, name: :idle_cleanup_delivery_registry})
+    lane = start_supervised!({LaneDoorbell, :idle_cleanup_delivery_lane})
+
+    start_supervised!(
+      {Wakes,
+       db: ctx.db,
+       deliver: delivery_fun(ctx.db, registry, lane),
+       tick_ms: 60_000,
+       name: :idle_cleanup_delivery_scheduler}
+    )
+  end
+
   test "startup refuses noncanonical liveness epoch provenance", ctx do
     {:ok, _} = DB.query(ctx.db, "DELETE FROM supervision_liveness_epoch")
 
@@ -255,6 +1028,109 @@ defmodule Tightbeam.SupervisionTest do
 
     assert [%{"decision" => "none", "ref" => "asg_1", "statute" => nil}] =
              rail_sweep_details(ctx.db, "holder")
+  end
+
+  # GH #23. asg_1 is open with no entitlement, which is the storm population: the
+  # prod ladder answers :unarmed, the one branch that returned without a
+  # watermark, so before the fix every tick re-ran the shift, re-adjudicated the
+  # rail to the same :allow, and appended another identical
+  # rail_sweep(decision=none). One host held 1,059,688 of them, 100% decision none.
+  test "an unarmed assignment records its no-op once per terminal, not once per tick", ctx do
+    seq = terminal!(ctx.db, "holder")
+
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert [%{"decision" => "none", "ref" => "asg_1"}] = rail_sweep_details(ctx.db, "holder")
+
+    # The audit evidence is written; what must stop is the repetition.
+    for _ <- 1..25 do
+      assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    end
+
+    assert [%{"decision" => "none", "ref" => "asg_1"}] = rail_sweep_details(ctx.db, "holder")
+    assert %{lastEvaluatedTerminal: ^seq} = Supervision.watermark(ctx.db, "holder")
+  end
+
+  test "a later meaningful change is still evaluated after an allowed no-op", ctx do
+    first = terminal!(ctx.db, "holder")
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", first)
+    assert :duplicate = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", first)
+    assert length(rail_sweep_details(ctx.db, "holder")) == 1
+
+    # A new terminal is new evidence: suppression is per-terminal, never permanent.
+    second = terminal!(ctx.db, "holder")
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", second)
+    assert length(rail_sweep_details(ctx.db, "holder")) == 2
+
+    # And the assignment stays eligible to be acted on once it is armed, which is
+    # what recover_liveness does for exactly this population on a later tick.
+    insert_entitlement!(ctx.db, "asg_1", generation: 1, due_at: 0)
+    third = terminal!(ctx.db, "holder")
+    assert {:prodded, 1} = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", third)
+    assert %{attemptCount: 1, prodCount: 1} = Supervision.prod_state(ctx.db, "asg_1")
+  end
+
+  # The unarmed branch marks the terminal evaluated; it does not act, so it must
+  # not disturb the pending columns. write_terminal_watermark_in_txn updates
+  # lastEvaluatedTerminal only, unlike write_watermark/4, whose ON CONFLICT nulls
+  # all four — correct for the acting arms that just resolved what they clear.
+  test "the unarmed no-op advances only lastEvaluatedTerminal", ctx do
+    seq = terminal!(ctx.db, "holder")
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+
+    assert {:ok, [[^seq, nil, nil, nil, nil]]} =
+             DB.query(
+               ctx.db,
+               """
+               SELECT lastEvaluatedTerminal, pendingBranch, pendingAssignment, pendingK, pendingN
+               FROM supervision_watermarks WHERE sessionKey='holder' AND assignmentId='asg_1'
+               """
+             )
+  end
+
+  # The suppression is keyed on the assignment and lives in the branch that runs
+  # only for a matched production, so a retractable no-match is untouched: a
+  # work-blocked holder must still re-match this very terminal when the block is
+  # lifted. That contract is asserted in full at "a standing work-blocked fact
+  # unmatches the prod production until it is retracted"; this pins the watermark
+  # specifically, since that is what the fix adds.
+  test "a work-blocked holder is left re-matchable at the same terminal", ctx do
+    file_fact(ctx.db, "work-blocked", "holder")
+    seq = terminal!(ctx.db, "holder")
+
+    assert :blocked = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert Supervision.watermark(ctx.db, "holder") == nil
+
+    file_fact(ctx.db, "work-unblocked", "holder")
+    assert {:match, %{id: "asg_1"}} = Supervision.prod_production_matches?(ctx.db, "holder", seq)
+  end
+
+  # The suppression is keyed on the rail having adjudicated and allowed. A
+  # pending self-created continuation short-circuits rail_step before it decides
+  # anything, so that pass says nothing about whether the obligation is
+  # satisfied, and cancelling the continuation must leave this same terminal
+  # re-matchable. The remedy that then fires is asserted at "only a durable
+  # self-created continuation suppresses the turn-end remedy"; this pins the
+  # watermark, which is what the fix adds.
+  test "a continuation-suppressed pass leaves the terminal re-matchable", ctx do
+    self_wake =
+      Wakes.schedule(ctx.db, %{
+        session_key: "holder",
+        target_role: nil,
+        origin: "user:flynn",
+        prompt: "self continuation",
+        due_at: System.system_time(:millisecond) + 60_000,
+        creator_session_key: "holder"
+      })
+
+    seq = terminal!(ctx.db, "holder")
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert rail_sweep_details(ctx.db, "holder") == []
+    assert Supervision.watermark(ctx.db, "holder") == nil
+
+    cancel_wake!(ctx.db, self_wake)
+    assert :idle = Supervision.evaluate(ctx.db, ctx.handlers, 3, "holder", seq)
+    assert [%{"decision" => "none", "ref" => "asg_1"}] = rail_sweep_details(ctx.db, "holder")
+    assert %{lastEvaluatedTerminal: ^seq} = Supervision.watermark(ctx.db, "holder")
   end
 
   test "an internal effort wake does not suppress the no-filing prod", ctx do

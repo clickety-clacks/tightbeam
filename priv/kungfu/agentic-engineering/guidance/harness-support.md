@@ -22,8 +22,8 @@ Claude or Codex. Its column states only a local contract or a named divergence.
 | CAP-015 hash-gated homes | parity | parity | local home projection | Cursor owns only `cli-config.json` and compiled `hooks.json`; write-set vectors prove preservation. |
 | CAP-016 harness switching | parity | parity | local history barrier | Generic history barrier applies to every registry harness. |
 | CAP-017 auth-event classification | `DIV-AUTH-CLAUDE-UNKNOWN` | parity | `DIV-AUTH-CURSOR-UNSUPPORTED` | Cursor positive and negative envelopes are negative-tested as exact `:unknown`. |
-| CAP-018 credential liveness | parity | parity | `DIV-CREDENTIAL-LIVE-CURSOR-NO-FIXTURES` | Cursor returns `{:unknown, :no_captured_cursor_liveness_fixtures}`; unknown is INCOMPLETE. |
-| Parent-attributed subagent markers | parity | parity | `DIV-SUBAGENT-CURSOR-UNSUPPORTED` | Cursor start/stop envelopes are negative-tested as `:skip`; never predicate obligations on them. |
+| CAP-018 credential liveness | authenticated Anthropic models probe | authenticated ChatGPT account probe | `DIV-CREDENTIAL-LIVE-CURSOR-NO-FIXTURES` | Claude and Codex classify bounded injected-transport probes as live, dead, or unknown. Cursor returns `{:unknown, :no_captured_cursor_liveness_fixtures}`; unknown is INCOMPLETE. The fixture harness names `DIV-CREDENTIAL-LIVE-FIXTURE-NO-PROBE`. |
+| Parent-attributed subagent markers | claude-agent-acp 0.79.0 native lifecycle updates | codex-acp 1.12.0 native lifecycle updates | `DIV-SUBAGENT-CURSOR-UNSUPPORTED` | Tight Beam consumes public `subagent_spawned` and `subagent_state_update` events without private source rewrites. Cursor start/stop envelopes are negative-tested as `:skip`; never predicate obligations on subagent markers. |
 
 All Cursor support above is local-only. No live Cursor turn or feature-smoke leg
 has run yet.

@@ -28,12 +28,12 @@ defmodule Tightbeam.RowWaitReliefFixture do
     def handle_call({:ensure_lane, _key}, _from, state), do: {:reply, :ok, state}
   end
 
-  def run!(base, locks) do
+  def run!(base) do
     {:ok, fixtures} = Supervisor.start_link([], strategy: :one_for_one)
     Process.put({__MODULE__, :supervisor}, fixtures)
 
     try do
-      ctx = setup!(base, locks)
+      ctx = setup!(base)
       :ok = DB.assert_base_admitted!(ctx.db, base)
       marker = File.read!(Path.join(base, "build-owner.json"))
       prove(ctx)
@@ -41,19 +41,15 @@ defmodule Tightbeam.RowWaitReliefFixture do
     after
       if Process.alive?(fixtures), do: Supervisor.stop(fixtures)
     end
-
-    await_lock!(base, locks)
   end
 
-  defp setup!(base, locks) do
+  defp setup!(base) do
     db = :"row_wait_db_#{System.unique_integer([:positive])}"
     scheduler = :"row_wait_scheduler_#{System.unique_integer([:positive])}"
     registry = :"row_wait_registry_#{System.unique_integer([:positive])}"
     lane = :"row_wait_lane_#{System.unique_integer([:positive])}"
 
-    start_supervised!(
-      {DB, path: Path.join(base, "state.db"), name: db, guard_inputs: [lock_dir: locks]}
-    )
+    start_supervised!({DB, path: Path.join(base, "state.db"), name: db, guard_inputs: []})
 
     :ok = ensure_all_schemas(db)
     start_supervised!({ConnRegistry, name: registry})
@@ -105,7 +101,7 @@ defmodule Tightbeam.RowWaitReliefFixture do
 
     Rules.load!(base, ~w(wake attest))
 
-    %{db: db, scheduler: scheduler, registry: registry, lane: lane, base: base, locks: locks}
+    %{db: db, scheduler: scheduler, registry: registry, lane: lane, base: base}
   end
 
   defp prove(ctx) do
@@ -139,12 +135,8 @@ defmodule Tightbeam.RowWaitReliefFixture do
     # Close and reopen the admitted file under a fresh database owner.
     stop_supervised!(Wakes)
     stop_supervised!(DB)
-    await_lock!(ctx.base, ctx.locks)
 
-    start_supervised!(
-      {DB,
-       path: Path.join(ctx.base, "state.db"), name: ctx.db, guard_inputs: [lock_dir: ctx.locks]}
-    )
+    start_supervised!({DB, path: Path.join(ctx.base, "state.db"), name: ctx.db, guard_inputs: []})
 
     restarted = ctx.db
     :ok = DB.assert_base_admitted!(restarted, ctx.base)
@@ -348,21 +340,5 @@ defmodule Tightbeam.RowWaitReliefFixture do
     sup = Process.get({__MODULE__, :supervisor})
     :ok = Supervisor.terminate_child(sup, id)
     :ok = Supervisor.delete_child(sup, id)
-  end
-
-  defp await_lock!(base, locks, remaining \\ 100) do
-    path = Path.join(locks, Base.encode16(:crypto.hash(:sha256, base), case: :lower) <> ".lock")
-
-    case Tightbeam.LiveBaseLock.acquire(path) do
-      {:ok, lock} ->
-        :ok = Tightbeam.LiveBaseLock.release(lock)
-
-      {:error, :lock_busy} when remaining > 0 ->
-        Process.sleep(10)
-        await_lock!(base, locks, remaining - 1)
-
-      other ->
-        raise "fixture lock did not release: #{inspect(other)}"
-    end
   end
 end

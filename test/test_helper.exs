@@ -65,7 +65,7 @@ if System.get_env("TIGHTBEAM_AUTHORITATIVE_GATE") == "1" do
     }
 
     libraries =
-      for {app, file} <- [{:tightbeam, "live_base_lock.so"}, {:exqlite, "sqlite3_nif.so"}] do
+      for {app, file} <- [{:exqlite, "sqlite3_nif.so"}] do
         path = Tightbeam.LiveBaseAdmission.canonical!(Application.app_dir(app, "priv/" <> file))
 
         %{

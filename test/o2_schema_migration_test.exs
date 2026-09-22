@@ -57,10 +57,45 @@ defmodule Tightbeam.O2SchemaMigrationTest do
              Enum.map(before_episode, &(&1 ++ [nil]))
 
     # Only the explicit rowVersion and current-lineage trigger upgrades change old SQL.
-    before_names = Enum.map(before_triggers, &hd/1)
+    before_names =
+      before_triggers
+      |> Enum.reject(fn [name, _sql] -> String.starts_with?(name, "harness_health_") end)
+      |> Enum.map(&hd/1)
 
     assert Enum.filter(triggers(db), &(hd(&1) in before_names)) ==
-             Enum.map(before_triggers, fn [name, sql] -> [name, successor_guard(name, sql)] end)
+             before_triggers
+             |> Enum.filter(fn [name, _sql] -> name in before_names end)
+             |> Enum.map(fn [name, sql] -> [name, successor_guard(name, sql)] end)
+
+    assert rows(
+             db,
+             "SELECT name FROM sqlite_master WHERE type='trigger' AND name GLOB 'harness_health_*' ORDER BY name"
+           ) ==
+             Enum.map(
+               ~w(
+                 harness_health_assignment_holder harness_health_assignment_immutable_delete
+                 harness_health_assignment_immutable_update
+                 harness_health_class_promotion_close_once harness_health_incident_identity_immutable
+                 harness_health_incident_no_delete harness_health_incident_resolution_once
+                 harness_health_member_immutable_delete harness_health_member_immutable_update
+                 harness_health_observation_assignment_holder harness_health_observation_attachment_once
+                 harness_health_observation_evidence_immutable
+                 harness_health_observation_identity_immutable harness_health_observation_no_delete
+                 harness_health_other_review_event_append_only_delete
+                 harness_health_other_review_event_append_only_update
+                 harness_health_other_route_identity_immutable harness_health_other_route_no_delete
+                 harness_health_other_route_pending_terminal harness_health_other_route_terminal_once
+               ),
+               &[&1]
+             )
+
+    assert rows(
+             db,
+             "SELECT sql FROM sqlite_master WHERE name='harness_health_incident_resolution_once'"
+           )
+           |> hd()
+           |> hd() =~
+             "OLD.failureClass = 'other'"
 
     assert rows(db, "PRAGMA foreign_key_check") == []
     assert rows(db, "PRAGMA foreign_keys") == [[1]]

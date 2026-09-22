@@ -357,6 +357,762 @@ defmodule Tightbeam.Wakes do
 
   ## Store (pure DB ops — callable without the scheduler process, e.g. by inspect)
 
+  @terminal_notice_purpose "terminal-child-owner-notification"
+  @terminal_notice_marker @terminal_notice_purpose <> ":"
+  @terminal_notice_fields ~w(source_kind source_token assignment_id work_item_id child_session_key owner_user_id opened_by_kind opened_by_id outcome terminal_at)a
+
+  @doc """
+  Build a terminal-event identity and payload without admitting or delivering a wake.
+
+  The caller must derive the event from durable rows in its owning transaction.
+  `opened_by_*` records the assignment's durable relation, not the current recipient.
+  Recipient resolution and authorization are deliberately outside this pure helper.
+  The returned `wake_id` and `prompt` can feed `schedule_in_txn/2`; this function
+  neither calls that seam nor proves that the terminal event committed.
+
+  Pass the existing wake on replay to refuse a conflicting immutable payload.
+  Mutable delivery fields (including the recipient) do not participate in identity
+  or replay comparison. A later admission caller must perform this comparison in
+  the same transaction as its lookup and insert.
+  """
+  @spec terminal_notification(map(), map() | nil) :: {:ok, map()} | {:error, map()}
+  def terminal_notification(event, existing_wake \\ nil)
+
+  def terminal_notification(event, existing_wake) when is_map(event) do
+    event = Map.take(event, @terminal_notice_fields)
+
+    strings =
+      ~w(source_token assignment_id child_session_key owner_user_id opened_by_id)a
+
+    valid? =
+      Enum.all?(strings, fn key ->
+        value = event[key]
+        is_binary(value) and String.valid?(value) and String.trim(value) != ""
+      end) and
+        Map.has_key?(event, :work_item_id) and
+        (is_nil(event.work_item_id) or
+           (is_binary(event.work_item_id) and String.valid?(event.work_item_id) and
+              String.trim(event.work_item_id) != "")) and
+        event[:opened_by_kind] in ["user", "session"] and
+        is_integer(event[:terminal_at]) and event.terminal_at >= 0 and
+        ((event[:source_kind] == "attest" and event[:outcome] in ["completed", "surrendered"]) or
+           (event[:source_kind] == "assignment_revocation" and event[:outcome] == "revoked" and
+              event.source_token != event.assignment_id))
+
+    if valid? do
+      # A JSON array is ordered and unambiguous even when tokens contain delimiters.
+      identity = JSON.encode!([@terminal_notice_purpose, event.source_kind, event.source_token])
+      digest = :crypto.hash(:sha256, identity) |> Base.encode16(case: :lower)
+
+      prompt =
+        Enum.map_join(@terminal_notice_fields, "\n", fn key ->
+          "#{key}=#{JSON.encode!(Map.fetch!(event, key))}"
+        end)
+
+      notice = %{
+        wake_id: "w_terminal_" <> digest,
+        prompt: @terminal_notice_purpose <> "\n" <> prompt
+      }
+
+      case existing_wake do
+        nil ->
+          {:ok, notice}
+
+        %{wake_id: wake_id, prompt: prompt}
+        when wake_id == notice.wake_id and prompt == notice.prompt ->
+          {:ok, notice}
+
+        _ ->
+          {:error,
+           %{
+             code: "terminal_notification_conflict",
+             message: "existing wake does not match the immutable terminal event"
+           }}
+      end
+    else
+      {:error,
+       %{
+         code: "invalid_terminal_notification",
+         message: "terminal event identity is incomplete or invalid"
+       }}
+    end
+  end
+
+  def terminal_notification(_event, _existing_wake),
+    do:
+      {:error,
+       %{
+         code: "invalid_terminal_notification",
+         message: "terminal event identity is incomplete or invalid"
+       }}
+
+  @doc """
+  Admit the current terminal notice in the terminal owner's transaction.
+
+  All event fields come from the closed assignment and its matching closing source.
+  This is admission only: replay never resets delivery state or changes the recipient.
+  The caller must roll back its terminal transition on an error result.
+  """
+  def admit_terminal_notification_in_txn(%Txn{} = txn, assignment_id) do
+    with {:ok, event} <- terminal_event_in_txn(txn, assignment_id) do
+      admit_terminal_event_in_txn(txn, event)
+    end
+  end
+
+  @doc "Admit or replay the exact immutable revocation event, including after reopening."
+  def admit_terminal_revocation_in_txn(%Txn{} = txn, assignment_id, revocation_id)
+      when is_binary(revocation_id) do
+    with {:ok, event} <- terminal_revocation_event_in_txn(txn, assignment_id, revocation_id) do
+      admit_terminal_event_in_txn(txn, event)
+    end
+  end
+
+  defp admit_terminal_event_in_txn(txn, event) do
+    with {:ok, notice} <- terminal_notification(event),
+         existing = get_in_txn(txn, notice.wake_id),
+         {:ok, ^notice} <- terminal_notification(event, existing) do
+      relation = terminal_notice_relation(event)
+
+      case existing do
+        nil ->
+          case terminal_notice_recipient_in_txn(txn, event) do
+            {:ok, recipient} ->
+              {:ok, schedule_terminal_notice_in_txn(txn, event, notice, relation, recipient)}
+
+            {:error, %{code: "terminal_notification_recipient_unavailable"} = refusal} ->
+              # A durable address is not a claim that an eligible recipient exists.
+              # Preserve the exact intent, then use the existing undeliverable
+              # delivery disposition; no turn is enqueued and no poll is armed.
+              address =
+                if event.opened_by_kind == "session",
+                  do: event.opened_by_id,
+                  else: Tightbeam.Org.personal_session_key(event.owner_user_id)
+
+              wake = schedule_terminal_notice_in_txn(txn, event, notice, relation, address)
+              terminal_notice_undeliverable_in_txn(txn, wake, refusal.code)
+              {:ok, get_in_txn(txn, wake.wake_id)}
+
+            {:error, _} = refusal ->
+              refusal
+          end
+
+        wake ->
+          if Map.take(wake, Map.keys(relation)) == relation do
+            {:ok, wake}
+          else
+            wait_error(
+              "terminal_notification_conflict",
+              "existing wake does not match the durable terminal relation"
+            )
+          end
+      end
+    end
+  end
+
+  defp schedule_terminal_notice_in_txn(txn, event, notice, relation, address) do
+    schedule_in_txn(
+      txn,
+      relation
+      |> Map.merge(notice)
+      |> Map.merge(%{session_key: address, due_at: event.terminal_at})
+    )
+  end
+
+  defp terminal_notice_relation(event) do
+    %{
+      origin: "process:tightbeam",
+      consumer: "prompt",
+      creator_session_key: event.child_session_key,
+      assignment_id: event.assignment_id,
+      work_item_id: event.work_item_id,
+      owner_user_id: event.owner_user_id,
+      obligation_ref: @terminal_notice_marker <> event.assignment_id
+    }
+  end
+
+  @doc false
+  def terminal_notice_delivery_in_txn(%Txn{} = txn, wake_id) when is_binary(wake_id) do
+    # Read the durable discriminator, not a caller's gate, prompt, or target.
+    case get_in_txn(txn, wake_id) do
+      %{obligation_ref: @terminal_notice_marker <> _} = wake ->
+        resolve_terminal_notice_in_txn(txn, wake)
+
+      _ ->
+        :ordinary
+    end
+  end
+
+  def terminal_notice_delivery_in_txn(%Txn{}, _wake_id), do: :ordinary
+
+  defp resolve_terminal_notice_in_txn(_txn, %{state: state} = wake) when state != "pending" do
+    {:terminal_notice_undeliverable,
+     %{wake_id: wake.wake_id, reason: "terminal_notice_not_pending"}}
+  end
+
+  defp resolve_terminal_notice_in_txn(txn, wake) do
+    case terminal_notice_resolution_in_txn(txn, wake) do
+      {:ok, recipient} ->
+        Txn.q(txn, "UPDATE wakes SET sessionKey=?2 WHERE wakeId=?1 AND state='pending'", [
+          wake.wake_id,
+          recipient
+        ])
+
+        {:terminal_notice, %{wake | session_key: recipient}}
+
+      {:error, refusal} ->
+        terminal_notice_undeliverable_in_txn(txn, wake, refusal.code)
+    end
+  end
+
+  defp terminal_notice_resolution_in_txn(txn, wake) do
+    with {:ok, identity_wake} <- terminal_notice_identity_in_txn(txn, wake),
+         {:ok, event} <- terminal_event_for_wake_in_txn(txn, identity_wake),
+         {:ok, _notice} <- terminal_notification(event, identity_wake),
+         true <- wake.prompt == identity_wake.prompt,
+         relation = terminal_notice_relation(event),
+         true <- Map.take(wake, Map.keys(relation)) == relation,
+         {:ok, recipient} <- terminal_notice_recipient_in_txn(txn, event) do
+      {:ok, recipient}
+    else
+      false -> wait_error("terminal_notification_conflict", "terminal wake relation changed")
+      {:error, _} = error -> error
+    end
+  end
+
+  defp recognize_undeliverable_terminal_notice(db, %{
+         consumer: "prompt",
+         obligation_ref: @terminal_notice_marker <> _,
+         wake_id: wake_id
+       }) do
+    result =
+      DB.transaction(db, fn txn ->
+        with %{state: "pending"} = wake <- get_in_txn(txn, wake_id),
+             [] <- Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1 LIMIT 1", [wake_id]),
+             {:error, refusal} <- terminal_notice_resolution_in_txn(txn, wake) do
+          terminal_notice_undeliverable_in_txn(txn, wake, refusal.code)
+        else
+          _ -> :unchanged
+        end
+      end)
+
+    case result do
+      {:ok, {:terminal_notice_undeliverable, evidence}} ->
+        {:disposed, evidence}
+
+      {:ok, :unchanged} ->
+        :unchanged
+
+      {:error, error} ->
+        reason =
+          case error do
+            %MatchError{term: :none} -> :missing_liveness_trigger
+            %DB.Error{} -> :persistence_refused
+            _ -> :recognition_failed
+          end
+
+        # The DB has rolled back this notice. Do not invent cancellation or
+        # lifecycle evidence after its failed transaction, or leak SQL/payloads.
+        Logger.warning("terminal notice #{wake_id} recognition deferred: #{reason}")
+        {:deferred, %{wake_id: wake_id, reason: reason}}
+    end
+  end
+
+  defp recognize_undeliverable_terminal_notice(_db, _wake), do: :unchanged
+
+  # A recovery attempt keeps a distinct transport wakeId; the existing retry
+  # row binds it to the original immutable semantic notification.
+  defp terminal_notice_identity_in_txn(txn, wake) do
+    case Txn.q(txn, "SELECT rootWakeId FROM wake_retry_attempts WHERE wakeId=?1", [wake.wake_id]) do
+      [] ->
+        {:ok, wake}
+
+      [[root]] when root == wake.wake_id ->
+        {:ok, wake}
+
+      [[root]] ->
+        case get_in_txn(txn, root) do
+          %{obligation_ref: ref} = identity when ref == wake.obligation_ref ->
+            {:ok, identity}
+
+          _ ->
+            wait_error("terminal_recovery_inconsistent", "recovery lacks its exact terminal root")
+        end
+
+      _ ->
+        wait_error("terminal_recovery_inconsistent", "ambiguous terminal recovery root")
+    end
+  end
+
+  @doc """
+  Explicit internal recovery admission for one terminal-owner notification.
+
+  This is not automatic retry or a public repair verb. The accountable owner
+  must elect this call after reconciling possible effects of failed_unknown.
+  A canceled unavailable intent with exact evidence and no invocation may also
+  advance once; it never fabricates a failed turn or resets its cancellation.
+  One deterministic successor is admitted per root; replay returns that same
+  admission without resetting it. Delivery still uses the existing scheduler.
+  """
+  def recover_terminal_notification_in_txn(%Txn{} = txn, root_id, principal) do
+    with %{obligation_ref: @terminal_notice_marker <> _} = root <- get_in_txn(txn, root_id),
+         {:ok, event} <- terminal_event_for_wake_in_txn(txn, root),
+         {:ok, _} <- terminal_notification(event, root),
+         true <-
+           Map.take(root, Map.keys(terminal_notice_relation(event))) ==
+             terminal_notice_relation(event),
+         {:ok, recipient} <- terminal_notice_recipient_in_txn(txn, event),
+         true <- principal in ["user:" <> event.owner_user_id, "session:" <> recipient] do
+      evidence =
+        delivery_outcomes_in_txn(txn, %{
+          root_wake_id: root_id,
+          recovery_wake_ids: [],
+          assignment_id: event.assignment_id
+        })
+
+      recover_terminal_evidence_in_txn(txn, root, recipient, principal, evidence)
+    else
+      {:error, _} = refusal ->
+        refusal
+
+      _ ->
+        wait_error(
+          "terminal_recovery_not_authorized",
+          "recovery requires the exact terminal root and current accountable owner"
+        )
+    end
+  end
+
+  defp recover_terminal_evidence_in_txn(txn, root, recipient, principal, evidence) do
+    successor_id = retry_wake_id(root.wake_id, 1)
+
+    source =
+      Txn.q(txn, "SELECT seq,status,assignmentId FROM turns WHERE wakeId=?1", [root.wake_id])
+
+    existing = get_in_txn(txn, successor_id)
+
+    cond do
+      evidence.inconsistencies != [] ->
+        wait_error("terminal_recovery_inconsistent", "wake/turn/repair lineage is inconsistent")
+
+      evidence.delivered != [] ->
+        wait_error(
+          "terminal_recovery_delivered",
+          "semantic notification already has delivered evidence"
+        )
+
+      existing != nil ->
+        # This is a read-only replay, not permission for a second attempt.
+        case Txn.q(
+               txn,
+               """
+               SELECT source.sourceTurnSeq FROM wake_retry_attempts source
+               JOIN wake_retry_attempts next ON next.predecessorWakeId=source.wakeId
+               WHERE source.wakeId=?1 AND source.rootWakeId=?1 AND source.attempt=0
+                 AND source.retryWakeId=?2 AND next.wakeId=?2 AND next.rootWakeId=?1 AND next.attempt=1
+                 AND ((source.sourceTurnSeq IS NULL AND source.outcome='canceled')
+                   OR (source.sourceTurnSeq IS NOT NULL AND source.outcome='failed'))
+               """,
+               [root.wake_id, successor_id]
+             ) do
+          [[seq]] ->
+            if source == [[seq, "failed", root.assignment_id]] or
+                 source == [[seq, "failed_unknown", root.assignment_id]] or
+                 (is_nil(seq) and source == [] and
+                    terminal_unavailable_intent_in_txn?(txn, root)) do
+              relation =
+                ~w(origin consumer creator_session_key assignment_id work_item_id owner_user_id obligation_ref)a
+
+              if Map.take(existing, relation) == Map.take(root, relation) and
+                   existing.prompt == root.prompt,
+                 do: {:ok, %{wake: existing, replay: true}},
+                 else:
+                   wait_error(
+                     "terminal_recovery_inconsistent",
+                     "successor identity conflicts with root"
+                   )
+            else
+              wait_error(
+                "terminal_recovery_inconsistent",
+                "source turn does not match recovery lineage"
+              )
+            end
+
+          _ ->
+            wait_error(
+              "terminal_recovery_inconsistent",
+              "deterministic successor lacks matching retry lineage"
+            )
+        end
+
+      evidence.outstanding != [] ->
+        wait_error("terminal_recovery_outstanding", "semantic notification has outstanding work")
+
+      root.state not in ["fired", "canceled"] or length(evidence.terminal) != 1 ->
+        wait_error(
+          "terminal_recovery_not_failed",
+          "recovery requires one failed delivery or evidenced unavailable intent"
+        )
+
+      true ->
+        recoverable =
+          case {source, evidence.terminal} do
+            {[[seq, status, assignment]],
+             [%{repairs: [], cancellations: [], retries: [], retry_roots: []}]}
+            when status in ["failed", "failed_unknown"] and assignment == root.assignment_id and
+                   root.state == "fired" ->
+              {:ok, seq, status, "failed"}
+
+            {[], [%{turns: [], repairs: [], retries: [], retry_roots: []}]} ->
+              if terminal_unavailable_intent_in_txn?(txn, root),
+                do: {:ok, nil, "undelivered", "canceled"},
+                else: :inconsistent
+
+            _ ->
+              :inconsistent
+          end
+
+        case recoverable do
+          {:ok, seq, status, source_outcome} ->
+            now = now()
+
+            successor =
+              schedule_in_txn(txn, %{
+                wake_id: successor_id,
+                session_key: recipient,
+                origin: root.origin,
+                prompt: root.prompt,
+                consumer: "prompt",
+                due_at: now,
+                creator_session_key: root.creator_session_key,
+                assignment_id: root.assignment_id,
+                work_item_id: root.work_item_id,
+                owner_user_id: root.owner_user_id,
+                obligation_ref: root.obligation_ref
+              })
+
+            Txn.q(
+              txn,
+              """
+              INSERT INTO wake_retry_attempts
+                (wakeId,rootWakeId,predecessorWakeId,attempt,sourceTurnSeq,outcome,retryWakeId,observedAt)
+              VALUES (?1,?1,NULL,0,?3,?5,?2,?4), (?2,?1,?1,1,NULL,'pending',NULL,?4)
+              """,
+              [root.wake_id, successor_id, seq, now, source_outcome]
+            )
+
+            EventLog.lifecycle_in_txn(
+              txn,
+              "terminal_notice_recovery_admitted",
+              root.wake_id,
+              JSON.encode!(%{
+                root_wake_id: root.wake_id,
+                recovery_wake_id: successor_id,
+                source_turn_seq: seq,
+                source_status: status,
+                principal: principal
+              })
+            )
+
+            {:ok, %{wake: successor, replay: false}}
+
+          _ ->
+            wait_error(
+              "terminal_recovery_inconsistent",
+              "terminal lineage is not a single unrecovered failed source"
+            )
+        end
+    end
+  end
+
+  defp terminal_unavailable_intent_in_txn?(txn, root) do
+    expected = %{
+      "wake_id" => root.wake_id,
+      "assignment_id" => root.assignment_id,
+      "purpose" => @terminal_notice_purpose,
+      "outcome" => "undelivered",
+      "reason" => "terminal_notification_recipient_unavailable"
+    }
+
+    root.state == "canceled" and is_nil(root.fired_at) and
+      Txn.q(txn, "SELECT seq FROM turns WHERE wakeId=?1", [root.wake_id]) == [] and
+      Txn.q(
+        txn,
+        """
+        SELECT requesterKind,requesterId,reasonKind,causalSourceKind,causalSourceId,outcomeKind
+        FROM wake_cancellations WHERE wakeId=?1
+        """,
+        [root.wake_id]
+      ) == [
+        [
+          "process",
+          "tightbeam:wake-scheduler",
+          "target_unresolvable",
+          "scheduler_delivery",
+          root.wake_id,
+          "no_replacement"
+        ]
+      ] and
+      case Txn.q(
+             txn,
+             "SELECT detail FROM lifecycle_events WHERE kind='wake_undeliverable' AND subject=?1",
+             [root.wake_id]
+           ) do
+        [[detail]] -> JSON.decode(detail) == {:ok, expected}
+        _ -> false
+      end
+  end
+
+  defp terminal_notice_undeliverable_in_txn(txn, wake, reason) do
+    # Preserve the existing cancellation invariant for any linked work that is
+    # still open. Do not invent a replacement notice or weaken its liveness law.
+    {:ok, primary} = primary_work(txn, wake)
+
+    outcome =
+      if primary.impact == "linked_work_open" do
+        kind = if primary.kind == "assignment", do: :assignment, else: :work_item
+        {:ok, trigger} = Supervision.liveness_trigger_in_txn(txn, {kind, primary.id})
+        %{kind: "no_replacement", liveness_trigger: trigger}
+      else
+        %{kind: "no_replacement"}
+      end
+
+    true =
+      cancel_in_txn(txn, %{
+        wake_id: wake.wake_id,
+        requester: %{kind: "process", id: "tightbeam:wake-scheduler"},
+        reason_kind: "target_unresolvable",
+        causal_source: %{kind: "scheduler_delivery", id: wake.wake_id},
+        outcome: outcome
+      })
+
+    evidence = %{
+      wake_id: wake.wake_id,
+      assignment_id: wake.assignment_id,
+      purpose: @terminal_notice_purpose,
+      outcome: "undelivered",
+      reason: reason
+    }
+
+    EventLog.lifecycle_in_txn(txn, "wake_undeliverable", wake.wake_id, JSON.encode!(evidence))
+    {:terminal_notice_undeliverable, evidence}
+  end
+
+  defp terminal_event_in_txn(txn, assignment_id) do
+    case terminal_attest_event_in_txn(txn, assignment_id) do
+      {:ok, _} = event ->
+        event
+
+      {:error, _} = refusal ->
+        case terminal_revocation_event_in_txn(txn, assignment_id, nil) do
+          {:ok, _} = event -> event
+          {:error, _} -> refusal
+        end
+    end
+  end
+
+  # Match the deterministic identity against durable source rows, never prompt
+  # text. An earlier revocation keeps its identity after revoke/reopen/revoke.
+  # Attest delivery retains its existing current-close validation.
+  defp terminal_event_for_wake_in_txn(txn, wake) do
+    case terminal_attest_event_in_txn(txn, wake.assignment_id) do
+      {:ok, event} ->
+        case terminal_notification(event) do
+          {:ok, %{wake_id: id}} when id == wake.wake_id ->
+            {:ok, event}
+
+          _ ->
+            case terminal_revocation_for_wake_in_txn(txn, wake) do
+              {:ok, _} = revocation -> revocation
+              {:error, _} -> {:ok, event}
+            end
+        end
+
+      {:error, _} = refusal ->
+        case terminal_revocation_for_wake_in_txn(txn, wake) do
+          {:ok, _} = revocation -> revocation
+          {:error, _} -> refusal
+        end
+    end
+  end
+
+  defp terminal_revocation_for_wake_in_txn(txn, wake) do
+    terminal_revocation_events_in_txn(txn, wake.assignment_id)
+    |> Enum.find(fn event ->
+      case terminal_notification(event) do
+        {:ok, %{wake_id: id}} -> id == wake.wake_id
+        _ -> false
+      end
+    end)
+    |> terminal_event_result()
+  end
+
+  defp terminal_revocation_event_in_txn(txn, assignment_id, token) do
+    events = terminal_revocation_events_in_txn(txn, assignment_id)
+
+    event =
+      if token do
+        Enum.find(events, &(&1.source_token == token))
+      else
+        # Only the current closed generation is an implicit admission request.
+        case Txn.q(
+               txn,
+               """
+               SELECT g.revocationId FROM assignments a
+               JOIN assignment_revocation_generations g ON g.assignmentId=a.id
+               WHERE a.id=?1 AND a.state='closed' AND a.outcome='revoked'
+                 AND g.reopeningId IS (SELECT MAX(id) FROM assignment_reopenings WHERE assignmentId=a.id)
+               """,
+               [assignment_id]
+             ) do
+          [[current]] -> Enum.find(events, &(&1.source_token == current))
+          _ -> nil
+        end
+      end
+
+    terminal_event_result(event)
+  end
+
+  defp terminal_event_result(nil),
+    do:
+      wait_error(
+        "invalid_terminal_notification_relation",
+        "terminal source lacks exact closing evidence and authorized owner relation"
+      )
+
+  defp terminal_event_result(event), do: {:ok, event}
+
+  defp terminal_revocation_events_in_txn(txn, assignment_id) do
+    Txn.q(
+      txn,
+      """
+      SELECT a.id,a.workItemId,a.holderKey,owner.userId,a.openedByUser,a.openedBySession,
+             r.id,r.revokedAt
+      FROM assignments a
+      JOIN sessions h ON h.sessionKey=a.holderKey
+      JOIN assignment_revocation_generations g ON g.assignmentId=a.id
+      JOIN assignment_revocations r ON r.id=g.revocationId AND r.assignmentId=a.id
+      LEFT JOIN work_items w ON w.id=a.workItemId
+      LEFT JOIN sessions parent ON parent.sessionKey=a.openedBySession
+      JOIN users owner ON owner.userId=CASE
+        WHEN a.openedBySession IS NULL THEN a.openedByUser ELSE parent.ownerUserId END
+      WHERE a.id=?1
+        AND (a.workItemId IS NULL OR w.ownerUserId=owner.userId)
+        AND ((a.openedBySession IS NULL AND a.openedByUser IS NOT NULL)
+          OR (a.openedByUser IS NULL AND a.openedBySession IS NOT NULL))
+        AND (
+          (a.state='closed' AND a.outcome='revoked' AND a.closingAttestId IS NULL
+           AND a.closedAt=r.revokedAt AND a.closedByUser IS r.revokedByUser
+           AND a.closedBySession IS r.revokedBySession AND a.closedByProcess IS r.revokedByProcess
+           AND g.reopeningId IS (SELECT MAX(id) FROM assignment_reopenings WHERE assignmentId=a.id))
+          OR EXISTS (
+            SELECT 1 FROM assignment_reopenings next
+            WHERE next.assignmentId=a.id AND next.id=(
+              SELECT MIN(id) FROM assignment_reopenings
+              WHERE assignmentId=a.id AND (g.reopeningId IS NULL OR id>g.reopeningId))
+              AND next.priorOutcome='revoked' AND next.priorClosingAttestId IS NULL
+              AND next.priorClosedAt=r.revokedAt AND next.priorClosedByUser IS r.revokedByUser
+              AND next.priorClosedBySession IS r.revokedBySession
+              AND next.priorClosedByProcess IS r.revokedByProcess))
+      ORDER BY r.id
+      """,
+      [assignment_id]
+    )
+    |> Enum.map(fn [id, item, child, owner, opened_user, opened_session, token, ts] ->
+      %{
+        source_kind: "assignment_revocation",
+        source_token: token,
+        assignment_id: id,
+        work_item_id: item,
+        child_session_key: child,
+        owner_user_id: owner,
+        opened_by_kind: if(opened_session, do: "session", else: "user"),
+        opened_by_id: opened_session || opened_user,
+        outcome: "revoked",
+        terminal_at: ts
+      }
+    end)
+  end
+
+  defp terminal_attest_event_in_txn(txn, assignment_id) do
+    # The durable opener owns the accountable parent relation. A lawfully
+    # assigned independent holder may have another owner; closer provenance
+    # remains exact and does not elect the notification recipient.
+    rows =
+      Txn.q(
+        txn,
+        """
+        SELECT a.id,a.workItemId,a.holderKey,owner.userId,a.openedByUser,a.openedBySession,
+               a.outcome,a.closedAt,a.closingAttestId
+        FROM assignments a
+        JOIN sessions h ON h.sessionKey=a.holderKey
+        JOIN attests t ON t.id=a.closingAttestId AND t.assignmentId=a.id
+        LEFT JOIN work_items w ON w.id=a.workItemId
+        LEFT JOIN sessions parent ON parent.sessionKey=a.openedBySession
+        JOIN users owner ON owner.userId=CASE
+          WHEN a.openedBySession IS NULL THEN a.openedByUser ELSE parent.ownerUserId END
+        WHERE a.id=?1 AND a.state='closed' AND a.closedBySession=a.holderKey
+          AND a.closedByUser IS NULL AND t.bySession=a.holderKey AND t.byUser IS NULL
+          AND t.ts=a.closedAt
+          AND ((a.outcome='completed' AND t.kind='completion')
+            OR (a.outcome='surrendered' AND t.kind='surrender'))
+          AND (a.workItemId IS NULL OR w.ownerUserId=owner.userId)
+          AND ((a.openedBySession IS NULL AND a.openedByUser IS NOT NULL)
+            OR (a.openedByUser IS NULL AND a.openedBySession IS NOT NULL))
+        """,
+        [assignment_id]
+      )
+
+    case rows do
+      [[id, work_item, child, owner, opened_user, opened_session, outcome, closed_at, token]] ->
+        {:ok,
+         %{
+           source_kind: "attest",
+           source_token: token,
+           assignment_id: id,
+           work_item_id: work_item,
+           child_session_key: child,
+           owner_user_id: owner,
+           opened_by_kind: if(opened_session, do: "session", else: "user"),
+           opened_by_id: opened_session || opened_user,
+           outcome: outcome,
+           terminal_at: closed_at
+         }}
+
+      _ ->
+        wait_error(
+          "invalid_terminal_notification_relation",
+          "assignment lacks an exact completion/surrender attest and authorized owner relation"
+        )
+    end
+  end
+
+  defp terminal_notice_recipient_in_txn(txn, event) do
+    personal = Tightbeam.Org.personal_session_key(event.owner_user_id)
+
+    candidates =
+      if event.opened_by_kind == "session",
+        do: [event.opened_by_id, personal],
+        else: [personal]
+
+    recipient =
+      Enum.find(candidates, fn key ->
+        Txn.q(
+          txn,
+          "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+          [key, event.owner_user_id]
+        ) == [[1]]
+      end)
+
+    if recipient do
+      {:ok, recipient}
+    else
+      wait_error(
+        "terminal_notification_recipient_unavailable",
+        "no active accountable recipient for the durable terminal relation"
+      )
+    end
+  end
+
   @doc "Persist a pending wake (id minted here, prefix `w_`). Returns the row."
   @spec schedule(db(), %{
           session_key: String.t(),
@@ -4182,16 +4938,40 @@ defmodule Tightbeam.Wakes do
     {:ok, rows} =
       DB.query(
         db,
-        select_wake_sql() <>
+        select_wake_sql(
+          ", (SELECT routingWakeId FROM work_items WHERE id=wakes.work_item_id), (SELECT slateWakeId FROM work_items WHERE id=wakes.work_item_id)"
+        ) <>
           " WHERE state = 'pending' AND dueAt <= ?1 AND conditionKind IS NULL AND waitMode IS NULL" <>
           " AND NOT (digest = 0 AND (deliveryRule IS ?2 OR deliveryRule IS ?3))" <>
           " ORDER BY dueAt ASC",
         [now(), @digest_rule, @legacy_digest_rule]
       )
 
-    for row <- rows do
-      wake = to_wake(row)
+    # Keep the exact carrier references from this due snapshot. A failed
+    # recognition rolls back only its notice, and holds that notice plus its
+    # linked carriers for this pass, never the unrelated due batch. Consumed
+    # carriers are not reset; absent liveness remains a visible pending notice.
+    entries =
+      Enum.map(rows, fn row ->
+        {wake_row, carriers} = Enum.split(row, -2)
+        {to_wake(wake_row), Enum.reject(carriers, &is_nil/1)}
+      end)
 
+    deferred =
+      Enum.reduce(entries, MapSet.new(), fn {wake, carriers}, held ->
+        case recognize_undeliverable_terminal_notice(db, wake) do
+          {:deferred, _failure} ->
+            Enum.reduce([wake.wake_id | carriers], held, &MapSet.put(&2, &1))
+
+          {:disposed, _evidence} ->
+            MapSet.put(held, wake.wake_id)
+
+          :unchanged ->
+            held
+        end
+      end)
+
+    for {wake, _carriers} <- entries, not MapSet.member?(deferred, wake.wake_id) do
       if wake.digest, do: NoticeBatcher.delivery_attempted(db, wake.wake_id)
 
       delivery =
@@ -4219,6 +4999,12 @@ defmodule Tightbeam.Wakes do
         end
 
       case {wake.consumer, delivery} do
+        {"prompt", {:ok, {:idle_cleanup_deferred, _reason}}} ->
+          :ok
+
+        {"prompt", {:ok, {:terminal_notice_undeliverable, _evidence}}} ->
+          :ok
+
         {"prompt", {:ok, :skipped}} when wake.digest ->
           NoticeBatcher.delivery_terminal_failure(db, wake.wake_id, :skipped)
 
@@ -4980,8 +5766,8 @@ defmodule Tightbeam.Wakes do
     )
   end
 
-  defp select_wake_sql do
-    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition FROM wakes"
+  defp select_wake_sql(extra_columns \\ "") do
+    "SELECT wakeId, sessionKey, targetRole, origin, prompt, consumer, dueAt, state, createdAt, firedAt, reresolve, reresolveSeed, reresolveRung, conditionKind, conditionScope, conditionAfterId, firedBy, creatorSessionKey, rumination, work_item_id, assignmentId, canceledAt, targetGate, class, classElection, deliveryRule, digest, summon, ownerUserId, obligationRef, waitMode, predicate, resolverKind, resolverId, resolverHolder, resolverAddressee, necessity, verificationAssignmentId, verificationHolderKey, selectedPolicyName, verificationState, verificationAttestId, verificationNoticeWakeId, originatingTurnSeq, recognitionAt, recognitionPath, recognitionReason, recognitionEvidence, recognitionDisposition, recognitionTransition#{extra_columns} FROM wakes"
   end
 
   defp to_wake([
