@@ -9,7 +9,9 @@ activities live in `kungfu/agentic-engineering/preferred-models.md`.
 - **gpt-6-astra** — (nickname: astra): deep product, architecture, planning and review judgment. Use high or higher reasoning for sustained work.
 - **gpt-5.6-sol** — (nickname: sol): general engineering and delivery orchestration; increase effort for sustained or coupled work. Can commission a stronger planner.
 - **gpt-5.6-terra** — (nickname: terra): bounded engineering implementation and mechanical work with an inspectable contract.
-- **gpt-5.6-luna** — (nickname: luna): default well-scoped engineering coder at xhigh; lower effort for bounded factual or mechanical tasks. Escalate consequential uncertainty.
+- **gpt-5.6-luna** — (nickname: luna): retain the existing medium-effort PDO and mechanical selections and low-effort factual selections.
+- **gpt-6-luna**: use max effort for well-scoped and sustained implementation under an understood architecture. Escalate consequential uncertainty.
+- **claude-opus-5-5**: requested replacement for Fable in specification drafting and independent code review. Keep it out of active defaults while supported exact-ID use on a permitted host and harness remains unproven. No effort or context setting is assumed; retain unknown capability as unknown.
 - **claude-fable-5** — (nickname: fable): deep product judgment, difficult planning, implementation and whole-system review.
 - **claude-opus-5** — (nickname: opus): sustained engineering, orchestration, specification and independent review. This policy explicitly replaces the previous Opus 4.8 mapping.
 - **claude-sonnet-5** — (nickname: sonnet): bounded orchestration, specification and implementation under an understood contract.
@@ -43,6 +45,17 @@ for mixed, Codex-only or Claude-only operation before choosing. Qualification st
 requires the activity's capability floor, allowed host and harness, supported model
 and effort, and runnable access. Catalog presence alone does not establish access.
 Suggested order can change; explicit family, authority and budget restrictions cannot.
+
+For an explicitly requested Claude slug, absence from a compiled inventory or the
+provider's `/v1/models` response does not establish provider rejection. Preserve
+unknown-slug pass-through on a supported route without alias substitution; do not
+turn these preference tables into an offered-set allowlist. Retain actual host,
+harness, version and credential validation and report provider refusals truthfully.
+An explicit pass-through request does not qualify an unsupported active default.
+If the installed route refuses the request, report that limitation to the existing
+model-access owner. Do not bypass the refusal or claim that pending routing work
+is already available.
+
 Use an applicable activity for the actual outcome; the rows are not required stages.
 Commission stronger planning or use a stronger agent throughout when the work needs it.
 
