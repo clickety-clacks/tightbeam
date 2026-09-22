@@ -578,8 +578,7 @@ defmodule Tightbeam.Wire.RouterTest do
 
     assert listed.status == 200
 
-    ids =
-      JSON.decode!(listed.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
+    ids = JSON.decode!(listed.resp_body)["result"]["decisionRequests"] |> Enum.map(& &1["id"])
 
     assert dr_id in ids
 
@@ -2458,8 +2457,7 @@ defmodule Tightbeam.Wire.RouterTest do
           {"artifact-get", %{artifactId: "art_12345678"}},
           {"artifacts", %{workItemId: "wi_1", sessionKey: "artifact-writer", kind: "spec"}}
         ] do
-      response =
-        dispatch_cli(ctx, "tbc_test", %{verb: verb, asUser: "flynn", params: params})
+      response = dispatch_cli(ctx, "tbc_test", %{verb: verb, asUser: "flynn", params: params})
 
       assert response.status == 200
       assert_receive {:call, %{verb: ^verb}}
@@ -2716,8 +2714,7 @@ defmodule Tightbeam.Wire.RouterTest do
       assert error["message"] =~ "held"
     end
 
-    wrong_user =
-      dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"})
+    wrong_user = dispatch_cli(ctx, holder.cli_token, %{verb: "inspect", asUser: "mike"})
 
     assert wrong_user.status == 403
 
@@ -2747,8 +2744,7 @@ defmodule Tightbeam.Wire.RouterTest do
     Org.retire(ctx.db, holder.session_key, "user:flynn", 1_000)
     assert dispatch_cli(ctx, holder.cli_token, %{verb: "inspect"}).status == 401
 
-    {:ok, principals} =
-      DB.query(ctx.db, "SELECT principal FROM events ORDER BY id")
+    {:ok, principals} = DB.query(ctx.db, "SELECT principal FROM events ORDER BY id")
 
     assert ["session:holder-token"] in principals
     assert ["session:main-token"] in principals
@@ -3019,6 +3015,55 @@ defmodule Tightbeam.Wire.RouterTest do
     assert response.status == 404
     assert %{"error" => %{"code" => "not_found"}} = JSON.decode!(response.resp_body)
     refute_received {:call, %{verb: "tune"}}
+  end
+
+  test "authenticated session-control clears a stranded turn with an auditable payload", ctx do
+    key = "clear-stranded-control"
+    create_session(ctx.db, key, ctx.device.user_id)
+
+    opts =
+      with_handler(ctx.opts, "clear-stranded", fn call ->
+        send_call(call)
+        %{ok: true, turn_seq: 12, replayed: false}
+      end)
+
+    response =
+      conn(
+        :post,
+        "/api/session-control",
+        JSON.encode!(%{
+          "sessionKey" => key,
+          "action" => "clear_stranded_run",
+          "turnSeq" => 12,
+          "reason" => "provider outcome unknown",
+          "idempotencyKey" => "clear-wire-1"
+        })
+      )
+      |> put_req_header("authorization", "Bearer #{ctx.device.token}")
+      |> Router.call(Router.init(opts))
+
+    assert response.status == 200
+
+    assert %{
+             "ok" => true,
+             "action" => "clear_stranded_run",
+             "turnSeq" => 12,
+             "replayed" => false
+           } = JSON.decode!(response.resp_body)
+
+    assert_received {:call,
+                     %{
+                       verb: "clear-stranded",
+                       principal: {:user, user_id},
+                       session_key: ^key,
+                       params: %{
+                         turn_seq: 12,
+                         reason: "provider outcome unknown",
+                         idempotency_key: "clear-wire-1"
+                       }
+                     }}
+
+    assert user_id == ctx.device.user_id
   end
 
   # SPAWN, through the real wire payload. The session-control test below covers

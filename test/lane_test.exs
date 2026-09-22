@@ -2,12 +2,15 @@ defmodule Tightbeam.LaneTest do
   use Tightbeam.TestCase, async: false
 
   alias Tightbeam.{
+    ConnRegistry,
     DB,
     EventLog,
+    Gateway,
     HarnessHealth,
     LaneManager,
     Ledger,
     Placement,
+    Projection,
     Schema,
     SessionLane
   }
@@ -60,6 +63,13 @@ defmodule Tightbeam.LaneTest do
     fn turn ->
       Agent.update(agent, &[turn.prompt | &1])
       {:ok, %{text: String.upcase(turn.prompt)}}
+    end
+  end
+
+  defp ensure_global_registry do
+    case ConnRegistry.start_link(name: Tightbeam.ConnRegistry) do
+      {:ok, _pid} -> :ok
+      {:error, {:already_started, _pid}} -> :ok
     end
   end
 
@@ -559,5 +569,469 @@ defmodule Tightbeam.LaneTest do
     assert_receive {:published, ^seq, "failed", error}
     assert error =~ "no session row"
     assert Ledger.non_terminal_older_than(ctx.db, -1) == []
+  end
+
+  test "provider error with a foreign-held assignment cannot strand the lane", ctx do
+    parent = self()
+
+    :ok =
+      DB.execute(ctx.db, """
+      INSERT INTO assignments
+        (id,subject,holderKey,openedBySession,openedAt,state,holderHarness,holderProvider)
+      VALUES ('asg_foreign','foreign assignment','k2','k2',1,'open','claude','anthropic')
+      """)
+
+    {:ok, seq} =
+      Ledger.enqueue(ctx.db, %{
+        session_key: "k1",
+        message_id: "m_foreign_provider",
+        origin: "user:t",
+        prompt: "provider error",
+        assignment_id: "asg_foreign"
+      })
+
+    session = Tightbeam.Org.get(ctx.db, "k1")
+
+    runner = fn turn ->
+      if turn.seq == seq do
+        {:error,
+         %{
+           reason: %{"data" => %{"codexErrorInfo" => "usageLimitExceeded"}},
+           terminal_publish: fn terminal -> send(parent, {:provider_terminal, terminal}) end,
+           record_in_txn: fn txn ->
+             HarnessHealth.observe_turn_failure_in_txn(
+               txn,
+               session,
+               %{seq: seq, session_key: "k1", origin: "user:t"},
+               "provider",
+               %{"data" => %{"codexErrorInfo" => "usageLimitExceeded"}}
+             )
+
+             raise "simulated finalize bookkeeping crash"
+           end
+         }}
+      else
+        send(parent, :provider_survivor_ran)
+        {:ok, %{text: "survivor"}}
+      end
+    end
+
+    enqueue!(ctx.db, "k1", "survivor")
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :lane_finalize_recurrence_mgr
+      )
+
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive :provider_survivor_ran
+    assert_receive {:provider_terminal, "failed"}
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert {:ok, [["failed", error]]} =
+             DB.query(ctx.db, "SELECT status,error FROM turns WHERE seq=?1", [seq])
+
+    assert error =~ "usageLimitExceeded"
+
+    assert {:ok, []} =
+             DB.query(
+               ctx.db,
+               "SELECT assignmentId FROM harness_health_observations WHERE correlationId=?1",
+               ["harness-turn:#{seq}:rate-limit-dead"]
+             )
+  end
+
+  test "finalize preparation failures remain eligible for abandoned-owner recovery", ctx do
+    parent = self()
+    {:ok, runs} = Agent.start_link(fn -> [] end)
+    first = enqueue!(ctx.db, "k1", "normal finalize failure")
+    second = enqueue!(ctx.db, "k1", "crash finalize failure")
+    later = enqueue!(ctx.db, "k1", "later eligible")
+
+    runner = fn turn ->
+      Agent.update(runs, &[turn.seq | &1])
+
+      case turn.prompt do
+        "normal finalize failure" ->
+          send(parent, {:finalize_ready, turn.seq, self()})
+          receive do: (:release_finalize -> {:ok, %{text: "normal"}})
+
+        "crash finalize failure" ->
+          send(parent, {:finalize_ready, turn.seq, self()})
+          receive do: (:release_finalize -> raise "simulated task crash")
+
+        "later eligible" ->
+          send(parent, {:later_ready, turn.seq, self()})
+
+          receive do
+            :release_later ->
+              send(parent, {:later_ran, turn.seq})
+              {:ok, %{text: "later"}}
+          end
+      end
+    end
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        terminal_publisher: fn row ->
+          send(parent, {:recovery_published, Map.get(row, :seq), row.status, row.error})
+        end,
+        name: :lane_finalize_preparation_recovery_mgr
+      )
+
+    assert_receive {:finalize_ready, ^first, first_pid}
+    first_trigger = "block_finalize_#{first}"
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER #{first_trigger}
+      BEFORE UPDATE OF status ON turns
+      WHEN OLD.seq = #{first} AND OLD.status = 'running' AND NEW.status != 'running'
+      BEGIN
+        SELECT RAISE(ABORT, 'simulated finalize preparation failure');
+      END;
+      """)
+
+    send(first_pid, :release_finalize)
+
+    assert eventually(fn ->
+             finalize_events =
+               EventLog.lifecycle_events(ctx.db)
+               |> Enum.filter(&(&1.subject == "k1:#{first}"))
+               |> Enum.map(& &1.kind)
+               |> Enum.sort()
+
+             finalize_events == [
+               "turn_finalize_fallback_failed",
+               "turn_finalize_transaction_failed"
+             ]
+           end)
+
+    assert {:ok, [["running", first_owner]]} =
+             DB.query(ctx.db, "SELECT status,owner FROM turns WHERE seq=?1", [first])
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER #{first_trigger}")
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:finalize_ready, ^second, second_pid}
+
+    second_trigger = "block_finalize_#{second}"
+
+    :ok =
+      DB.execute(ctx.db, """
+      CREATE TRIGGER #{second_trigger}
+      BEFORE UPDATE OF status ON turns
+      WHEN OLD.seq = #{second} AND OLD.status = 'running' AND NEW.status != 'running'
+      BEGIN
+        SELECT RAISE(ABORT, 'simulated finalize preparation failure');
+      END;
+      """)
+
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:recovery_published, ^first, "failed_unknown", first_error}
+    assert first_error == "interrupted: outcome unknown"
+
+    send(second_pid, :release_finalize)
+
+    assert eventually(fn ->
+             finalize_events =
+               EventLog.lifecycle_events(ctx.db)
+               |> Enum.filter(&(&1.subject == "k1:#{second}"))
+               |> Enum.map(& &1.kind)
+               |> Enum.sort()
+
+             finalize_events == [
+               "turn_finalize_fallback_failed",
+               "turn_finalize_transaction_failed"
+             ]
+           end)
+
+    assert {:ok, [["running", second_owner]]} =
+             DB.query(ctx.db, "SELECT status,owner FROM turns WHERE seq=?1", [second])
+
+    :ok = DB.execute(ctx.db, "DROP TRIGGER #{second_trigger}")
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:later_ready, ^later, later_pid}
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:recovery_published, ^second, "failed_unknown", second_error}
+    assert second_error == "interrupted: outcome unknown"
+
+    send(later_pid, :release_later)
+    assert_receive {:later_ran, ^later}
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:recovery_published, nil, "delivered", nil}
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert {:ok, [["failed_unknown", ^first_owner]]} =
+             DB.query(ctx.db, "SELECT status,owner FROM turns WHERE seq=?1", [first])
+
+    assert {:ok, [["failed_unknown", ^second_owner]]} =
+             DB.query(ctx.db, "SELECT status,owner FROM turns WHERE seq=?1", [second])
+
+    assert Agent.get(runs, &Enum.sort/1) == Enum.sort([first, second, later])
+  end
+
+  test "operator clear uses the real Gateway terminal publication and acknowledges once", ctx do
+    parent = self()
+    ensure_global_registry()
+
+    {:ok, _ref, nil} =
+      ConnRegistry.register(Tightbeam.ConnRegistry, %{
+        pid: self(),
+        user_id: "t",
+        device_id: "lane-clear-#{System.unique_integer([:positive])}",
+        is_admin: false,
+        subscriptions: MapSet.new(["chat"])
+      })
+
+    seq = enqueue!(ctx.db, "k1", "gateway clear")
+    assert {:ok, %{seq: ^seq}} = Ledger.claim_next(ctx.db, "k1", "dead-owner")
+
+    {:ok, lane_pid} =
+      SessionLane.start_link(
+        session_key: "k1",
+        db: ctx.db,
+        task_sup: ctx.task_sup,
+        runner: fn _ -> flunk("cleared turns must not invoke the provider runner") end,
+        terminal_publisher: Gateway.terminal_publisher_for_test(ctx.db),
+        on_terminal: fn session_key, terminal_seq ->
+          send(parent, {:clear_terminal, session_key, terminal_seq})
+        end
+      )
+
+    on_exit(fn -> if Process.alive?(lane_pid), do: GenServer.stop(lane_pid) end)
+
+    assert {:ok, %{seq: ^seq, replayed: false, error: error}} =
+             SessionLane.clear_stranded(
+               "k1",
+               seq,
+               "provider outcome unknown",
+               "gateway-clear",
+               "user:t"
+             )
+
+    assert error == "operator cleared stranded turn: provider outcome unknown"
+
+    assert_receive {:push,
+                    %{
+                      "event" => "prompt_turn_state",
+                      "payload" => %{
+                        "state" => "failed",
+                        "terminalState" => true,
+                        "error" => ^error
+                      }
+                    }}
+
+    assert_receive {:push,
+                    %{
+                      "type" => "agent_progress",
+                      "state" => "failed"
+                    }}
+
+    assert_receive {:clear_terminal, "k1", ^seq}
+
+    assert {:ok, [[published_at]]} =
+             DB.query(ctx.db, "SELECT publishedAt FROM turns WHERE seq=?1", [seq])
+
+    assert is_integer(published_at)
+
+    assert Enum.any?(
+             Projection.list_after(ctx.db, "k1", nil, 100),
+             &(&1.content =~ "side effects are UNKNOWN")
+           )
+
+    assert {:ok, %{seq: ^seq, replayed: true}} =
+             SessionLane.clear_stranded(
+               "k1",
+               seq,
+               "provider outcome unknown",
+               "gateway-clear",
+               "user:t"
+             )
+
+    refute_receive {:clear_terminal, "k1", ^seq}, 100
+  end
+
+  test "periodic reconciliation replaces an abandoned generation and fences late finalize", ctx do
+    parent = self()
+    {:ok, agent} = Agent.start_link(fn -> [] end)
+
+    {:ok, _mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: recording_runner(agent),
+        interval: 20,
+        terminal_publisher: fn row ->
+          send(parent, {:periodic_terminal, row.status, row.message_id})
+        end,
+        name: :"lane_periodic_replacement_#{System.unique_integer([:positive])}"
+      )
+
+    first = enqueue!(ctx.db, "k1", "abandoned periodic")
+
+    {:ok, [[first_message_id]]} =
+      DB.query(ctx.db, "SELECT messageId FROM turns WHERE seq=?1", [first])
+
+    assert {:ok, %{seq: ^first}} = Ledger.claim_next(ctx.db, "k1", "dead-generation")
+    second = enqueue!(ctx.db, "k1", "replacement periodic")
+
+    {:ok, [[second_message_id]]} =
+      DB.query(ctx.db, "SELECT messageId FROM turns WHERE seq=?1", [second])
+
+    assert eventually(fn -> Agent.get(agent, &Enum.reverse(&1)) == ["replacement periodic"] end)
+    assert_receive {:periodic_terminal, "delivered", ^second_message_id}, 5_000
+    assert_receive {:periodic_terminal, "failed_unknown", ^first_message_id}, 5_000
+
+    assert {:ok, [["failed_unknown", "dead-generation"]]} =
+             DB.query(ctx.db, "SELECT status,owner FROM turns WHERE seq=?1", [first])
+
+    assert {:ok, [["delivered", replacement_owner]]} =
+             DB.query(ctx.db, "SELECT status,owner FROM turns WHERE seq=?1", [second])
+
+    assert replacement_owner =~ "lane:"
+    refute replacement_owner == "dead-generation"
+    assert :already_terminal = Ledger.finish(ctx.db, first, "delivered")
+    refute_receive {:periodic_terminal, "failed_unknown", ^first_message_id}, 100
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+  end
+
+  test "reconciliation reaps an abandoned owner and makes the next turn eligible", ctx do
+    first = enqueue!(ctx.db, "k1", "abandoned")
+    assert {:ok, %{seq: ^first}} = Ledger.claim_next(ctx.db, "k1", "dead-owner")
+    second = enqueue!(ctx.db, "k1", "replacement")
+    {:ok, agent} = Agent.start_link(fn -> [] end)
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: recording_runner(agent),
+        interval: 60_000,
+        name: :lane_reaper_mgr
+      )
+
+    :ok = LaneManager.reconcile(mgr)
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+    assert Agent.get(agent, &Enum.reverse(&1)) == ["replacement"]
+
+    assert {:ok, [["failed_unknown"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [first])
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [second])
+  end
+
+  test "committed clear replay precedes active successor refusal", ctx do
+    first = enqueue!(ctx.db, "k1", "already cleared")
+    assert {:ok, %{seq: ^first}} = Ledger.claim_next(ctx.db, "k1", "dead-owner")
+
+    assert {:ok, %{seq: ^first, replayed: false}} =
+             Ledger.clear_stranded(
+               ctx.db,
+               "k1",
+               first,
+               "provider outcome lost",
+               "clear-replay",
+               "user:t"
+             )
+
+    parent = self()
+    second = enqueue!(ctx.db, "k1", "active successor")
+
+    runner = fn _turn ->
+      send(parent, {:successor_active, self()})
+
+      receive do
+        :release_successor -> {:ok, %{text: "successor"}}
+      end
+    end
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :lane_clear_replay_mgr
+      )
+
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:successor_active, successor_pid}
+
+    assert {:ok, %{seq: ^first, replayed: true}} =
+             SessionLane.clear_stranded(
+               "k1",
+               first,
+               "provider outcome lost",
+               "clear-replay",
+               "user:t"
+             )
+
+    assert {:error, %{code: "idempotency_key_conflict"}} =
+             SessionLane.clear_stranded("k1", first, "different reason", "clear-replay", "user:t")
+
+    assert {:error, %{code: "turn_active"}} =
+             SessionLane.clear_stranded(
+               "k1",
+               first,
+               "provider outcome lost",
+               "clear-new",
+               "user:t"
+             )
+
+    assert {:ok, [["running"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [second])
+
+    send(successor_pid, :release_successor)
+    assert eventually(fn -> Ledger.pending_sessions(ctx.db) == [] end)
+
+    assert {:ok, [["delivered"]]} =
+             DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [second])
+  end
+
+  test "operator clear refuses an active owner", ctx do
+    parent = self()
+    seq = enqueue!(ctx.db, "k1", "active")
+
+    runner = fn _turn ->
+      send(parent, {:active_turn_started, self()})
+
+      receive do
+        :release_active -> {:ok, %{text: "released"}}
+      end
+    end
+
+    {:ok, mgr} =
+      LaneManager.start_link(
+        db: ctx.db,
+        lane_sup: ctx.lane_sup,
+        task_sup: ctx.task_sup,
+        runner: runner,
+        interval: 60_000,
+        name: :lane_active_refusal_mgr
+      )
+
+    :ok = LaneManager.reconcile(mgr)
+    assert_receive {:active_turn_started, task_pid}
+
+    assert {:error, %{code: "turn_active"}} =
+             SessionLane.clear_stranded("k1", seq, "operator check", "active-clear", "user:t")
+
+    assert {:ok, [["running"]]} = DB.query(ctx.db, "SELECT status FROM turns WHERE seq=?1", [seq])
+
+    send(task_pid, :release_active)
   end
 end

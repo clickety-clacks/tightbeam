@@ -16,6 +16,8 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     "artifacts_released_requires_content_update"
   ]
 
+  @clear_attempt_objects ["turn_clear_attempts", "turn_clear_attempts_turn"]
+
   setup do
     db = start_supervised!({DB, name: :artifact_durability_migration, path: ":memory:"})
     sql = File.read!(@fixture)
@@ -33,6 +35,7 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     assert :ok = Schema.ensure_all(db)
     assert rows(db, "SELECT shape FROM schema_stamp") == [[@successor]]
     assert content_objects(db) == @content_objects
+    assert clear_attempt_objects(db) == @clear_attempt_objects
     assert rows(db, "PRAGMA foreign_key_check") == []
 
     seed_artifact(db, "art_use_1", "in-workspace")
@@ -346,6 +349,7 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     end
 
     assert snapshot(db) == before
+    assert clear_attempt_objects(db) == []
   end
 
   defp seed(db) do
@@ -397,6 +401,14 @@ defmodule Tightbeam.ArtifactDurabilityMigrationTest do
     rows(
       db,
       "SELECT name FROM sqlite_master WHERE name IN ('artifact_contents','artifacts_released_requires_content_insert','artifacts_released_requires_content_update','artifact_contents_released_immutable','artifact_contents_released_retained') ORDER BY name"
+    )
+    |> List.flatten()
+  end
+
+  defp clear_attempt_objects(db) do
+    rows(
+      db,
+      "SELECT name FROM sqlite_master WHERE name IN ('turn_clear_attempts','turn_clear_attempts_turn') ORDER BY name"
     )
     |> List.flatten()
   end

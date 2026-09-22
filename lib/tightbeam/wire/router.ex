@@ -490,7 +490,15 @@ defmodule Tightbeam.Wire.Router do
          {:ok, _session} <- visible_session(key, device, conn),
          {:ok, verb, params} <- control_call(body) do
       action = body["action"]
-      call = %{verb: verb, origin: "user:#{device.user_id}", session_key: key, params: params}
+
+      call = %{
+        verb: verb,
+        origin: "user:#{device.user_id}",
+        principal: {:user, device.user_id},
+        session_key: key,
+        params: params
+      }
+
       control_response(conn, call, key, action)
     else
       {:error, status, code, message} -> error(conn, status, code, message)
@@ -1780,6 +1788,15 @@ defmodule Tightbeam.Wire.Router do
 
   defp control_call(%{"action" => "cancel_current_run"}), do: {:ok, "cancel", %{}}
 
+  defp control_call(%{"action" => "clear_stranded_run"} = body),
+    do:
+      {:ok, "clear-stranded",
+       %{
+         turn_seq: body["turnSeq"],
+         reason: body["reason"],
+         idempotency_key: body["idempotencyKey"]
+       }}
+
   defp control_call(%{"action" => action}) when action in ~w(adopt unadopt),
     do: {:ok, "tune", %{setting: "adopt", adopted: action == "adopt"}}
 
@@ -1895,6 +1912,8 @@ defmodule Tightbeam.Wire.Router do
         }
         |> put_optional("code", code)
         |> put_optional("message", result[:message])
+        |> put_optional("turnSeq", result[:turn_seq])
+        |> put_optional("replayed", result[:replayed])
         |> then(&json(conn, 200, &1))
     end
   end

@@ -37,7 +37,7 @@ defmodule Tightbeam.Ledger do
 
   @type db :: GenServer.server()
 
-  @ddl """
+  @historical_ddl """
   CREATE TABLE IF NOT EXISTS turns (
     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
     sessionKey TEXT NOT NULL,
@@ -109,7 +109,28 @@ defmodule Tightbeam.Ledger do
   );
   CREATE INDEX IF NOT EXISTS assignment_repair_history
     ON assignment_repair_attempts (assignmentId, createdAt, id);
+
   """
+
+  @clear_attempts_ddl """
+  CREATE TABLE IF NOT EXISTS turn_clear_attempts (
+    sessionKey         TEXT NOT NULL,
+    idempotencyKey     TEXT NOT NULL,
+    turnSeq            INTEGER NOT NULL REFERENCES turns(seq),
+    requestFingerprint TEXT NOT NULL CHECK(length(trim(requestFingerprint)) > 0),
+    principal          TEXT NOT NULL CHECK(length(trim(principal)) > 0),
+    createdAt          INTEGER NOT NULL CHECK(createdAt >= 0),
+    PRIMARY KEY (sessionKey, idempotencyKey)
+  );
+  CREATE INDEX IF NOT EXISTS turn_clear_attempts_turn
+    ON turn_clear_attempts (turnSeq, createdAt);
+  """
+
+  @ddl @historical_ddl <> @clear_attempts_ddl
+
+  @doc false
+  @spec ensure_historical_schema(db()) :: :ok | {:error, term()}
+  def ensure_historical_schema(db \\ Tightbeam.DB), do: DB.execute(db, @historical_ddl)
 
   @spec ensure_schema(db()) :: :ok | {:error, term()}
   def ensure_schema(db \\ Tightbeam.DB), do: DB.execute(db, @ddl)
@@ -825,13 +846,35 @@ defmodule Tightbeam.Ledger do
   """
   @spec recover_running(db()) :: [integer()]
   def recover_running(db \\ Tightbeam.DB) do
+    recover_running_where(db, "1=1", [])
+  end
+
+  @doc "Recover abandoned running turns for one replacement lane."
+  @spec recover_running_for_session(db(), String.t(), String.t()) :: [integer()]
+  def recover_running_for_session(db \\ Tightbeam.DB, session_key, replacement_owner) do
+    recover_running_where(
+      db,
+      "sessionKey = ?1 AND (owner IS NULL OR owner <> ?2)",
+      [session_key, replacement_owner]
+    )
+  end
+
+  defp recover_running_where(db, predicate, predicate_params) do
     now = System.system_time(:millisecond)
 
     {:ok, {seqs, publications}} =
       DB.transaction_then(
         db,
         fn txn ->
-          rows = Txn.q(txn, "SELECT seq, sessionKey FROM turns WHERE status = 'running'")
+          update_predicate = shift_sql_params(predicate)
+
+          rows =
+            Txn.q(
+              txn,
+              "SELECT seq, sessionKey FROM turns WHERE status = 'running' AND " <> predicate,
+              predicate_params
+            )
+
           seqs = Enum.map(rows, fn [seq, _session_key] -> seq end)
 
           transitions =
@@ -842,9 +885,9 @@ defmodule Tightbeam.Ledger do
             """
               UPDATE turns SET status = 'failed_unknown', endedAt = ?1,
                                error = COALESCE(error, 'interrupted: outcome unknown')
-              WHERE status = 'running'
+              WHERE status = 'running' AND #{update_predicate}
             """,
-            [now]
+            [now | predicate_params]
           )
 
           publications =
@@ -892,6 +935,187 @@ defmodule Tightbeam.Ledger do
     end)
 
     seqs
+  end
+
+  defp shift_sql_params(sql) do
+    Regex.replace(~r/\?(\d+)/, sql, fn _, index ->
+      "?" <> Integer.to_string(String.to_integer(index) + 1)
+    end)
+  end
+
+  @doc "Check a committed stranded-clear idempotency result without changing state."
+  @spec clear_attempt(db(), String.t(), integer(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, :idempotency_conflict | term()} | :none
+  def clear_attempt(db \\ Tightbeam.DB, session_key, seq, reason, idempotency_key) do
+    fingerprint = clear_fingerprint(session_key, seq, reason)
+
+    case DB.query(
+           db,
+           "SELECT turnSeq, requestFingerprint FROM turn_clear_attempts WHERE sessionKey=?1 AND idempotencyKey=?2",
+           [session_key, idempotency_key]
+         ) do
+      {:ok, [[^seq, ^fingerprint]]} ->
+        {:ok, %{seq: seq, replayed: true}}
+
+      {:ok, [[_other_seq, _other_fingerprint]]} ->
+        {:error, :idempotency_conflict}
+
+      {:ok, []} ->
+        :none
+
+      {:error, reason} ->
+        {:error, {:storage, reason}}
+    end
+  end
+
+  @doc "Clear an abandoned running turn without contacting its provider."
+  @spec clear_stranded(db(), String.t(), integer(), String.t(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def clear_stranded(db \\ Tightbeam.DB, session_key, seq, reason, idempotency_key, principal) do
+    result =
+      DB.transaction_then(
+        db,
+        fn txn ->
+          clear_stranded_in_txn(
+            txn,
+            session_key,
+            seq,
+            reason,
+            idempotency_key,
+            principal
+          )
+        end,
+        fn txn, result ->
+          Tightbeam.Wakes.row_commit_in_txn(txn, [])
+          result
+        end
+      )
+
+    case result do
+      {:ok, {:ok, %{publications: publications} = detail}} ->
+        Enum.each(publications, fn publication ->
+          cond do
+            is_function(publication, 0) -> publication.()
+            is_map(publication) -> Tightbeam.EventLog.publish(publication.plan)
+            true -> :ok
+          end
+        end)
+
+        {:ok, Map.delete(detail, :publications)}
+
+      {:ok, {:error, reason}} ->
+        {:error, reason}
+
+      {:error, reason} ->
+        {:error, {:storage, reason}}
+    end
+  end
+
+  @doc "Clear one running row inside the caller's transaction."
+  @spec clear_stranded_in_txn(Txn.t(), String.t(), integer(), String.t(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def clear_stranded_in_txn(%Txn{} = txn, session_key, seq, reason, idempotency_key, principal) do
+    fingerprint = clear_fingerprint(session_key, seq, reason)
+
+    case Txn.q(
+           txn,
+           "SELECT turnSeq, requestFingerprint FROM turn_clear_attempts WHERE sessionKey=?1 AND idempotencyKey=?2",
+           [session_key, idempotency_key]
+         ) do
+      [[^seq, ^fingerprint]] ->
+        {:ok, %{seq: seq, replayed: true, publications: []}}
+
+      [[_other_seq, _other_fingerprint]] ->
+        {:error, :idempotency_conflict}
+
+      [] ->
+        case Txn.q(
+               txn,
+               "SELECT messageId,status FROM turns WHERE seq=?1 AND sessionKey=?2",
+               [seq, session_key]
+             ) do
+          [[message_id, "running"]] ->
+            transition = turn_terminal_transition_in_txn(txn, seq, "running", "failed_unknown")
+
+            clear_error = "operator cleared stranded turn: " <> reason
+
+            Txn.q(
+              txn,
+              "UPDATE turns SET status='failed_unknown',endedAt=?3,error=?4 WHERE seq=?1 AND sessionKey=?2 AND status='running'",
+              [
+                seq,
+                session_key,
+                System.system_time(:millisecond),
+                clear_error
+              ]
+            )
+
+            if Txn.changes(txn) == 1 do
+              if transition, do: DB.record_row_commit(txn, transition)
+              Publisher.turn_in_txn(txn, "turn.ended", seq)
+              Org.sync_mechanical_status_in_txn(txn, session_key)
+
+              health_publication =
+                HarnessHealth.observe_terminal_in_txn(
+                  txn,
+                  seq,
+                  "interrupted-outcome-unknown",
+                  "operator cleared a stranded turn; outcome unknown",
+                  principal
+                )
+
+              route_publication =
+                HarnessHealth.settle_other_route_in_txn(
+                  txn,
+                  seq,
+                  "failed_unknown",
+                  System.system_time(:millisecond)
+                )
+
+              Tightbeam.EventLog.lifecycle_in_txn(
+                txn,
+                "stranded_turn_cleared",
+                "#{session_key}:#{seq}",
+                "principal=#{principal} idempotency=#{fingerprint}"
+              )
+
+              Txn.q(
+                txn,
+                "INSERT INTO turn_clear_attempts(sessionKey,idempotencyKey,turnSeq,requestFingerprint,principal,createdAt) VALUES(?1,?2,?3,?4,?5,?6)",
+                [
+                  session_key,
+                  idempotency_key,
+                  seq,
+                  fingerprint,
+                  principal,
+                  System.system_time(:millisecond)
+                ]
+              )
+
+              {:ok,
+               %{
+                 seq: seq,
+                 message_id: message_id,
+                 error: clear_error,
+                 replayed: false,
+                 publications: [health_publication, route_publication]
+               }}
+            else
+              {:error, :not_running}
+            end
+
+          [[_message_id, _status]] ->
+            {:error, :not_running}
+
+          [] ->
+            {:error, :not_found}
+        end
+    end
+  end
+
+  defp clear_fingerprint(session_key, seq, reason) do
+    :crypto.hash(:sha256, JSON.encode!([session_key, seq, reason]))
+    |> Base.encode16(case: :lower)
   end
 
   @doc "Sessions with pending work — the Reconciler's feed (liveness scan)."

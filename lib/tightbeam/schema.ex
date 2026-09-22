@@ -2109,6 +2109,12 @@ defmodule Tightbeam.Schema do
        when module in [Tightbeam.Org, Tightbeam.Escalation, Tightbeam.Artifacts],
        do: module.ensure_r1_schema(db)
 
+  # Current-only clear-attempt storage must not precede a later migration
+  # refusal. Keep Ledger's historical objects available to the bootstrap pass;
+  # the final schema pass installs the clear-attempt table after migrations.
+  defp bootstrap_module(db, Tightbeam.Ledger, _current?),
+    do: Tightbeam.Ledger.ensure_historical_schema(db)
+
   # The correction table is additive current-build storage. Keep its DDL out
   # of the bootstrap pass so a refused migration preserves the exact
   # predecessor snapshot; the final schema pass installs it after migrations.

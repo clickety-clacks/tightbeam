@@ -102,6 +102,7 @@ defmodule Tightbeam.LaneManager do
 
     for session_key <- Ledger.pending_sessions(state.db) do
       ensure(state, session_key)
+      SessionLane.reap_abandoned(session_key)
       SessionLane.nudge(session_key)
     end
 

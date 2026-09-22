@@ -1337,6 +1337,9 @@ defmodule Tightbeam.Gateway do
       {"assignments", []} => fn call -> Assignments.__handle__(db, "assignments", call) end,
       {"inspect", []} => fn call -> inspect_result(config, db, call) end,
       {"cancel", ["turn.ended", "session.updated"]} => fn call -> cancel_result(db, call) end,
+      {"clear-stranded", ["turn.ended", "session.updated"]} => fn call ->
+        clear_stranded_result(config, db, call)
+      end,
       {"critical", ["critical_lease.updated"]} => fn call -> critical_result(config, db, call) end,
       {"spawn", ["session.spawned"]} => fn call -> spawn_result(config, db, call) end,
       {"tune", ["message.created", "session.updated"]} => fn call ->
@@ -3166,7 +3169,8 @@ defmodule Tightbeam.Gateway do
       # the "interrupted: outcome unknown" case, the one most likely to
       # otherwise read as a swallowed prompt. Exactly-once: callers invoke
       # this only on the ledger's CAS transition / unpublished-terminal scan.
-      if state == "failed", do: append_turn_failed_marker(db, session_key, error)
+      if state == "failed",
+        do: append_turn_failed_marker(db, session_key, error, status == "failed_unknown")
 
       publish_turn_state(db, session_key, correlation, state, error)
 
@@ -3315,6 +3319,55 @@ defmodule Tightbeam.Gateway do
   # the CAS-then-kill; here we broadcast the terminal frames and best-effort
   # tell the harness to stop generating (ACP session/cancel notification —
   # fire-and-forget; the substrate's truth is the ledger row either way).
+  defp clear_stranded_result(config, db, call) do
+    p = call.params
+
+    with {:ok, seq} <- clear_seq(p[:turn_seq]),
+         {:ok, reason} <- clear_reason(p[:reason]),
+         {:ok, idempotency_key} <- clear_idempotency_key(p[:idempotency_key]),
+         :ok <-
+           Tightbeam.LaneManager.ensure_lane_quiet(
+             Map.get(config, :lane_manager, Tightbeam.LaneManager),
+             call.session_key
+           ) do
+      case Tightbeam.SessionLane.clear_stranded(
+             call.session_key,
+             seq,
+             reason,
+             idempotency_key,
+             call.origin
+           ) do
+        {:ok, %{seq: clear_seq, replayed: replayed}} ->
+          %{ok: true, turn_seq: clear_seq, replayed: replayed}
+
+        {:ok, %{replayed: replayed}} ->
+          %{ok: true, turn_seq: seq, replayed: replayed}
+
+        {:error, error} ->
+          error
+
+        :no_lane ->
+          %{code: "lane_unavailable", message: "session lane is unavailable"}
+      end
+    else
+      {:error, code, message} -> %{code: code, message: message}
+    end
+  end
+
+  defp clear_seq(seq) when is_integer(seq) and seq > 0, do: {:ok, seq}
+  defp clear_seq(_), do: {:error, "invalid_turn_seq", "turnSeq must be a positive integer"}
+
+  defp clear_reason(reason) when is_binary(reason) and byte_size(reason) in 1..512,
+    do: {:ok, reason}
+
+  defp clear_reason(_), do: {:error, "invalid_reason", "reason must be 1-512 bytes"}
+
+  defp clear_idempotency_key(key) when is_binary(key) and byte_size(key) in 1..200,
+    do: {:ok, key}
+
+  defp clear_idempotency_key(_),
+    do: {:error, "invalid_idempotency_key", "idempotencyKey must be 1-200 bytes"}
+
   defp cancel_result(db, call) do
     case Tightbeam.SessionLane.cancel_current(call.session_key) do
       {:ok, %{message_id: message_id, seq: seq}} ->
@@ -8113,12 +8166,19 @@ defmodule Tightbeam.Gateway do
 
   defp error_sentence(reason), do: inspect(reason)
 
-  defp append_turn_failed_marker(db, session_key, reason) do
+  defp append_turn_failed_marker(db, session_key, reason),
+    do: append_turn_failed_marker(db, session_key, reason, false)
+
+  defp append_turn_failed_marker(db, session_key, reason, unknown_outcome?) do
+    warning =
+      if unknown_outcome?,
+        do: unknown_outcome_warning("interrupted: outcome unknown"),
+        else: unknown_outcome_warning(reason)
+
     append_substrate(
       db,
       session_key,
-      "[turn failed]\n\nThe agent could not answer the message above: #{reason}" <>
-        unknown_outcome_warning(reason)
+      "[turn failed]\n\nThe agent could not answer the message above: #{reason}" <> warning
     )
   end
 

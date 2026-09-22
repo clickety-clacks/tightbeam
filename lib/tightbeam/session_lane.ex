@@ -25,6 +25,7 @@ defmodule Tightbeam.SessionLane do
     :db,
     :runner,
     :task_sup,
+    :lane_owner,
     terminal_publisher: nil,
     on_terminal: nil,
     task_ref: nil,
@@ -58,6 +59,32 @@ defmodule Tightbeam.SessionLane do
     case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
       [{pid, _}] -> GenServer.cast(pid, :nudge)
       [] -> :no_lane
+    end
+  end
+
+  @doc "Reap running turns left by a dead lane."
+  @spec reap_abandoned(String.t()) :: {:ok, [integer()]} | :active | :no_lane
+  def reap_abandoned(session_key) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] -> GenServer.call(pid, :reap_abandoned, :infinity)
+      [] -> :no_lane
+    end
+  end
+
+  @doc "Clear one stranded running turn without invoking its provider."
+  @spec clear_stranded(String.t(), integer(), String.t(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, map()} | :no_lane
+  def clear_stranded(session_key, seq, reason, idempotency_key, principal) do
+    case Registry.lookup(Tightbeam.LaneRegistry, session_key) do
+      [{pid, _}] ->
+        GenServer.call(
+          pid,
+          {:clear_stranded, seq, reason, idempotency_key, principal},
+          :infinity
+        )
+
+      [] ->
+        :no_lane
     end
   end
 
@@ -124,7 +151,8 @@ defmodule Tightbeam.SessionLane do
       # cancel races) — without it a crashed turn leaves the client's typing
       # indicator stuck forever. No-op default keeps unit tests standalone.
       terminal_publisher: Keyword.get(opts, :terminal_publisher, fn _ -> :ok end),
-      on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end)
+      on_terminal: Keyword.get(opts, :on_terminal, fn _, _ -> :ok end),
+      lane_owner: "lane:#{inspect(self())}:#{System.unique_integer([:positive])}"
     }
 
     send(self(), :nudge)
@@ -168,6 +196,96 @@ defmodule Tightbeam.SessionLane do
 
       false ->
         {:reply, :not_running, state}
+    end
+  end
+
+  def handle_call(:reap_abandoned, _from, %{task_ref: ref} = state) when not is_nil(ref),
+    do: {:reply, :active, state}
+
+  def handle_call(:reap_abandoned, _from, state) do
+    seqs =
+      Ledger.recover_running_for_session(
+        state.db,
+        state.session_key,
+        state.lane_owner <> ":recovery"
+      )
+
+    {:reply, {:ok, seqs}, maybe_start(state)}
+  end
+
+  def handle_call(
+        {:clear_stranded, seq, reason, idempotency_key, principal},
+        _from,
+        %{task_ref: ref} = state
+      )
+      when not is_nil(ref) do
+    case Ledger.clear_attempt(state.db, state.session_key, seq, reason, idempotency_key) do
+      {:ok, result} ->
+        {:reply, {:ok, result}, state}
+
+      {:error, :idempotency_conflict} ->
+        {:reply,
+         {:error,
+          %{code: "idempotency_key_conflict", message: "idempotency key names another clear"}},
+         state}
+
+      {:error, storage_reason} ->
+        {:reply, {:error, %{code: "stranded_clear_failed", message: inspect(storage_reason)}},
+         state}
+
+      :none ->
+        _ = principal
+
+        {:reply,
+         {:error,
+          %{code: "turn_active", message: "a live lane owns a turn; stranded clearing refused"}},
+         state}
+    end
+  end
+
+  def handle_call(
+        {:clear_stranded, seq, reason, idempotency_key, principal},
+        _from,
+        state
+      ) do
+    case Ledger.clear_stranded(
+           state.db,
+           state.session_key,
+           seq,
+           reason,
+           idempotency_key,
+           principal
+         ) do
+      {:ok, %{replayed: true} = result} ->
+        {:reply, {:ok, result}, maybe_start(state)}
+
+      {:ok, %{seq: clear_seq, message_id: message_id, error: error, replayed: false} = result} ->
+        state.terminal_publisher.(%{
+          session_key: state.session_key,
+          message_id: message_id,
+          status: "failed_unknown",
+          error: error
+        })
+
+        Ledger.mark_published(state.db, clear_seq)
+        state.on_terminal.(state.session_key, clear_seq)
+        {:reply, {:ok, result}, maybe_start(state)}
+
+      {:error, :not_found} ->
+        {:reply, {:error, %{code: "turn_not_found", message: "turn does not exist"}}, state}
+
+      {:error, :not_running} ->
+        {:reply, {:error, %{code: "turn_not_running", message: "turn is already terminal"}},
+         state}
+
+      {:error, :idempotency_conflict} ->
+        {:reply,
+         {:error,
+          %{code: "idempotency_key_conflict", message: "idempotency key names another clear"}},
+         state}
+
+      {:error, reason} ->
+        {:reply, {:error, %{code: "stranded_clear_failed", message: inspect(reason)}}, state}
     end
   end
 
@@ -264,7 +382,7 @@ defmodule Tightbeam.SessionLane do
   end
 
   defp claim_next(state) do
-    case Ledger.claim_next(state.db, state.session_key, "lane:#{inspect(self())}") do
+    case Ledger.claim_next(state.db, state.session_key, state.lane_owner) do
       {:ok, turn} ->
         runner = state.runner
 
@@ -339,7 +457,7 @@ defmodule Tightbeam.SessionLane do
           {"failed", error_text(reason), nil, nil, nil}
       end
 
-    {:ok, {won, recorded}} =
+    transaction =
       DB.transaction_then(
         state.db,
         fn txn ->
@@ -365,6 +483,60 @@ defmodule Tightbeam.SessionLane do
         end
       )
 
+    case transaction do
+      {:ok, {won, recorded}} ->
+        finish_result(state, seq, terminal, error, publish, after_commit, won, recorded)
+
+      {:error, reason} ->
+        EventLog.lifecycle(
+          state.db,
+          "turn_finalize_transaction_failed",
+          "#{state.session_key}:#{seq}",
+          inspect(reason, limit: 20)
+        )
+
+        fallback =
+          DB.transaction_then(
+            state.db,
+            fn txn ->
+              if Ledger.finish_in_txn(txn, seq, terminal, error) do
+                route_publication =
+                  HarnessHealth.settle_other_route_in_txn(
+                    txn,
+                    seq,
+                    terminal,
+                    System.system_time(:millisecond)
+                  )
+
+                {true, {:terminal_recorded, nil, route_publication}}
+              else
+                {false, nil}
+              end
+            end,
+            fn txn, result ->
+              Tightbeam.Wakes.row_commit_in_txn(txn, [])
+              result
+            end
+          )
+
+        case fallback do
+          {:ok, {won, recorded}} ->
+            finish_result(state, seq, terminal, error, publish, nil, won, recorded)
+
+          {:error, fallback_reason} ->
+            EventLog.lifecycle(
+              state.db,
+              "turn_finalize_fallback_failed",
+              "#{state.session_key}:#{seq}",
+              inspect(fallback_reason, limit: 20)
+            )
+
+            :ok
+        end
+    end
+  end
+
+  defp finish_result(state, seq, terminal, error, publish, after_commit, won, recorded) do
     {finish_result, recorded} = {if(won, do: :ok, else: :already_terminal), recorded}
 
     case finish_result do

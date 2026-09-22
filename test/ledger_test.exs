@@ -495,8 +495,7 @@ defmodule Tightbeam.LedgerTest do
   test "unclaimable turns age into failed carrying the reason", %{db: db} do
     seq = insert_orphan_turn(db, "agent:main:clawline:flynn:main")
 
-    assert [^seq] =
-             Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
+    assert [^seq] = Ledger.fail_unclaimable(db, "agent:main:clawline:flynn:main", :no_session)
 
     assert {:ok, [["failed", error]]} =
              DB.query(db, "SELECT status, error FROM turns WHERE seq = ?1", [seq])
@@ -600,5 +599,56 @@ defmodule Tightbeam.LedgerTest do
     index_names = Enum.map(indexes, &Enum.at(&1, 1))
     assert "turns_job_ref" in index_names
     assert "turns_assignment_id" in index_names
+  end
+
+  test "operator stranded clear is unknown, audited, idempotent, and frees the lane", %{db: db} do
+    first = enqueue!(db, "k1", "provider outage")
+    assert {:ok, %{seq: ^first}} = Ledger.claim_next(db, "k1", "lane")
+
+    assert {:ok, %{seq: ^first, replayed: false}} =
+             Ledger.clear_stranded(
+               db,
+               "k1",
+               first,
+               "provider request outcome was lost",
+               "clear-1",
+               "user:operator"
+             )
+
+    assert {:ok, %{seq: ^first, replayed: true}} =
+             Ledger.clear_stranded(
+               db,
+               "k1",
+               first,
+               "provider request outcome was lost",
+               "clear-1",
+               "user:operator"
+             )
+
+    assert {:error, :idempotency_conflict} =
+             Ledger.clear_stranded(
+               db,
+               "k1",
+               first,
+               "a different reason",
+               "clear-1",
+               "user:operator"
+             )
+
+    assert {:error, :not_running} =
+             Ledger.clear_stranded(db, "k1", first, "another attempt", "clear-2", "user:operator")
+
+    assert {:ok, [["failed_unknown", error]]} =
+             DB.query(db, "SELECT status,error FROM turns WHERE seq=?1", [first])
+
+    assert error == "operator cleared stranded turn: provider request outcome was lost"
+
+    assert Enum.any?(
+             Tightbeam.EventLog.lifecycle_events(db),
+             &(&1.kind == "stranded_turn_cleared")
+           )
+
+    second = enqueue!(db, "k1", "eligible after clear")
+    assert {:ok, %{seq: ^second}} = Ledger.claim_next(db, "k1", "replacement-lane")
   end
 end
