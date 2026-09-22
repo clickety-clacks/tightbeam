@@ -344,22 +344,111 @@ defmodule Tightbeam.Credentials do
 
   @doc false
   def credential_secret_paths(base_dir) do
-    active =
-      for module <- Harness.all(),
-          path <-
-            Path.wildcard(
-              Path.join([
-                base_dir,
-                "homes",
-                "*",
-                Atom.to_string(module.id()),
-                credential_filename(module.credential_provider())
-              ])
-            ),
-          do: path
-
-    legacy = Path.wildcard(Path.join([base_dir, "auth", "**", "*"]))
+    base_dir = Path.expand(base_dir)
+    active = active_credential_secret_paths(base_dir)
+    legacy = legacy_credential_secret_paths(Path.join(base_dir, "auth"))
     Enum.uniq(active ++ legacy)
+  end
+
+  defp active_credential_secret_paths(base_dir) do
+    case directory_entries(Path.join(base_dir, "homes")) do
+      {:ok, machines} ->
+        Enum.flat_map(machines, fn machine ->
+          machine_dir = Path.join([base_dir, "homes", machine])
+
+          case File.lstat(machine_dir) do
+            {:ok, %File.Stat{type: :directory}} ->
+              Enum.flat_map(Harness.all(), fn module ->
+                credential_dir = Path.join(machine_dir, Atom.to_string(module.id()))
+
+                case File.lstat(credential_dir) do
+                  {:ok, %File.Stat{type: :directory}} ->
+                    credential_path =
+                      Path.join(credential_dir, credential_filename(module.credential_provider()))
+
+                    case File.lstat(credential_path) do
+                      {:ok, _stat} -> [credential_path]
+                      {:error, :enoent} -> []
+                      {:error, reason} -> raise_lookup_error(credential_path, reason)
+                    end
+
+                  {:ok, %File.Stat{}} ->
+                    []
+
+                  {:error, :enoent} ->
+                    []
+
+                  {:error, reason} ->
+                    raise_lookup_error(credential_dir, reason)
+                end
+              end)
+
+            {:ok, %File.Stat{}} ->
+              []
+
+            {:error, :enoent} ->
+              []
+
+            {:error, reason} ->
+              raise_lookup_error(machine_dir, reason)
+          end
+        end)
+
+      :absent ->
+        []
+
+      :not_directory ->
+        []
+    end
+  end
+
+  defp legacy_credential_secret_paths(auth_dir) do
+    case directory_entries(auth_dir) do
+      {:ok, _entries} -> legacy_entries(auth_dir)
+      :absent -> []
+      :not_directory -> []
+    end
+  end
+
+  defp legacy_entries(directory) do
+    case File.ls(directory) do
+      {:ok, entries} ->
+        Enum.flat_map(entries, fn entry ->
+          path = Path.join(directory, entry)
+
+          case File.lstat(path) do
+            {:ok, %File.Stat{type: :directory}} -> [path | legacy_entries(path)]
+            {:ok, _stat} -> [path]
+            {:error, reason} -> raise_lookup_error(path, reason)
+          end
+        end)
+
+      {:error, reason} ->
+        raise_lookup_error(directory, reason)
+    end
+  end
+
+  defp directory_entries(path) do
+    case File.lstat(path) do
+      {:ok, %File.Stat{type: :directory}} ->
+        case File.ls(path) do
+          {:ok, entries} -> {:ok, entries}
+          {:error, reason} -> raise_lookup_error(path, reason)
+        end
+
+      {:ok, %File.Stat{}} ->
+        :not_directory
+
+      {:error, :enoent} ->
+        :absent
+
+      {:error, reason} ->
+        raise_lookup_error(path, reason)
+    end
+  end
+
+  defp raise_lookup_error(path, reason) do
+    raise File.Error, action: "discover credential bank", path: path, reason: reason
   end
 
   @impl true

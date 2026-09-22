@@ -12,7 +12,7 @@ defmodule Tightbeam.Identity do
 
   require Logger
 
-  alias Tightbeam.{Archetypes, Harness}
+  alias Tightbeam.{Archetypes, Credentials, Harness}
   alias Tightbeam.Harness.Support
   alias Tightbeam.Identity.Renderer
 
@@ -69,6 +69,9 @@ defmodule Tightbeam.Identity do
     manifest_path = Path.join(["kungfu", name, "manifest.toml"])
     installed? = File.dir?(Path.join(dir, ".git")) and path_exists_at?(dir, @live, manifest_path)
 
+    banked_secret_values =
+      if installed? or not is_nil(available), do: banked_secret_values(base_dir), else: []
+
     cond do
       installed? ->
         revision = git_output!(dir, ["rev-parse", @live])
@@ -78,7 +81,12 @@ defmodule Tightbeam.Identity do
           for path <- ~w(README.md capabilities.md preferred-models.md),
               relative = Path.join(["kungfu", name, path]),
               path_exists_at?(dir, revision, relative),
-              do: public_document(path, git_show_bytes!(dir, revision, relative))
+              do:
+                public_document(
+                  path,
+                  git_show_bytes!(dir, revision, relative),
+                  banked_secret_values
+                )
 
         %{
           "name" => name,
@@ -96,7 +104,7 @@ defmodule Tightbeam.Identity do
           for path <- ~w(README.md capabilities.md preferred-models.md),
               full = Path.join(bundle_dir(name), path),
               File.regular?(full),
-              do: public_document(path, File.read!(full))
+              do: public_document(path, File.read!(full), banked_secret_values)
 
         %{
           "name" => name,
@@ -114,12 +122,75 @@ defmodule Tightbeam.Identity do
     end
   end
 
-  defp public_document(path, bytes),
-    do: %{
+  defp public_document(path, bytes, banked_secret_values) do
+    bytes = replace_banked_secret_values(bytes, banked_secret_values)
+
+    %{
       "path" => path,
       "content" => bytes,
       "sha256" => :crypto.hash(:sha256, bytes) |> Base.encode16(case: :lower)
     }
+  end
+
+  defp banked_secret_values(base_dir) do
+    base_dir
+    |> Credentials.credential_secret_paths()
+    |> Enum.sort()
+    |> Enum.flat_map(fn path ->
+      if regular_banked_file?(base_dir, path) do
+        bytes = File.read!(path)
+
+        if bytes != "" and String.valid?(bytes) do
+          [bytes, String.trim(bytes)]
+        else
+          []
+        end
+      else
+        []
+      end
+    end)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+    |> Enum.sort_by(&byte_size/1, :desc)
+  end
+
+  defp regular_banked_file?(base_dir, path) do
+    base_dir = Path.expand(base_dir)
+    path = Path.expand(path)
+    relative = Path.relative_to(path, base_dir)
+    parts = Path.split(relative)
+    final_index = length(parts) - 1
+
+    if relative == path or relative in ["", "."] or ".." in parts do
+      false
+    else
+      parts
+      |> Enum.with_index()
+      |> Enum.reduce_while(base_dir, fn {part, index}, current ->
+        candidate = Path.join(current, part)
+
+        case File.lstat(candidate) do
+          {:ok, %File.Stat{type: :directory}} when index < final_index ->
+            {:cont, candidate}
+
+          {:ok, %File.Stat{type: :regular}} when index == final_index ->
+            {:halt, :regular}
+
+          {:ok, %File.Stat{}} ->
+            {:halt, :ignore}
+
+          {:error, reason} ->
+            raise File.Error, action: "inspect credential bank", path: candidate, reason: reason
+        end
+      end) == :regular
+    end
+  end
+
+  defp replace_banked_secret_values(content, banked_secret_values) do
+    Enum.reduce(banked_secret_values, content, fn value, sanitized ->
+      String.replace(sanitized, value, "[redacted-secret]")
+    end)
+  end
 
   @doc false
   def init_after_admission!(base_dir, db) do

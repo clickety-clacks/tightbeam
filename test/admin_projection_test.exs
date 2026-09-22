@@ -4,6 +4,7 @@ defmodule Tightbeam.AdminProjectionTest do
   alias Tightbeam.{
     AdminProjection,
     Archetypes,
+    Credentials,
     DB,
     Devices,
     Harness,
@@ -672,6 +673,135 @@ defmodule Tightbeam.AdminProjectionTest do
 
     refute host_bytes =~ "/synthetic/"
     refute host_bytes =~ "synthetic@host"
+  end
+
+  @tag admin_fixture: true
+  test "kungfu redacts banked values before shared and Firehose encoding", ctx do
+    secret = "opaque-bank-value-7f4d3c2b1a998877"
+    long_secret = secret <> "-extended"
+    symlink_value = "unreadable-synthetic-secret"
+    directory_value = "directory-synthetic-secret"
+    credential = Credentials.credential_path(ctx.base_dir, "synthetic-machine", :fixture_provider)
+    legacy_credential = Path.join([ctx.base_dir, "auth", "synthetic", "legacy.json"])
+    symlink_target = Path.join(ctx.base_dir, "outside-synthetic-secret")
+    symlink_credential = Credentials.credential_path(ctx.base_dir, "symlink-machine", :openai)
+    directory_credential = Credentials.credential_path(ctx.base_dir, "directory-machine", :openai)
+
+    File.mkdir_p!(Path.dirname(credential))
+    File.write!(credential, secret <> "\n")
+    File.mkdir_p!(Path.dirname(legacy_credential))
+    File.write!(legacy_credential, long_secret <> "\n")
+    File.write!(symlink_target, symlink_value)
+    File.mkdir_p!(Path.dirname(symlink_credential))
+    File.ln_s!(symlink_target, symlink_credential)
+    File.mkdir_p!(directory_credential)
+
+    bundle = Path.join(ctx.base_dir, "identity/kungfu/redaction-proof")
+    File.mkdir_p!(bundle)
+
+    File.write!(
+      Path.join(bundle, "manifest.toml"),
+      "purpose = \"Redaction proof.\"\nphrases = [\"synthetic\"]\nroot_archetype = \"default\"\n"
+    )
+
+    File.write!(
+      Path.join(bundle, "README.md"),
+      "raw=#{secret}\ntrimmed=#{secret}\noverlap=#{long_secret}\n" <>
+        "symlink=#{symlink_value}\ndirectory=#{directory_value}\n"
+    )
+
+    File.write!(Path.join(bundle, "capabilities.md"), "ordinary synthetic content\n")
+    File.write!(Path.join(bundle, "preferred-models.md"), "ordinary model content\n")
+    git!(Path.join(ctx.base_dir, "identity"), ["add", "kungfu/redaction-proof"])
+
+    git!(Path.join(ctx.base_dir, "identity"), [
+      "-c",
+      "user.name=projection-test",
+      "-c",
+      "user.email=projection@test.invalid",
+      "commit",
+      "-m",
+      "synthetic bank redaction fixture"
+    ])
+
+    dir = Path.join(ctx.base_dir, "identity")
+    revision = git!(dir, ["rev-parse", "main"])
+    git!(dir, ["update-ref", "refs/heads/tightbeam/live", revision])
+
+    item = Identity.public_kungfu(ctx.base_dir, "redaction-proof")
+    documents = Map.new(item["documents"], &{&1["path"], &1})
+
+    assert documents["README.md"]["content"] ==
+             "raw=[redacted-secret]trimmed=[redacted-secret]overlap=[redacted-secret]" <>
+               "symlink=#{symlink_value}\ndirectory=#{directory_value}\n"
+
+    assert documents["capabilities.md"]["content"] == "ordinary synthetic content\n"
+    assert documents["preferred-models.md"]["content"] == "ordinary model content\n"
+
+    for document <- Map.values(documents) do
+      assert document["sha256"] ==
+               :crypto.hash(:sha256, document["content"]) |> Base.encode16(case: :lower)
+
+      refute document["content"] =~ secret
+      refute document["content"] =~ long_secret
+    end
+
+    shared = StateResources.kungfu(item)
+    shared_bytes = StateResources.encode_admin_item("kungfu", shared)
+    notice = Publisher.committed_notice("kungfu.updated", item, %{"name" => "redaction-proof"})
+    wire_bytes = Publisher.encode_wire_notice(notice)
+
+    assert wire_bytes =~ ~s("payload":#{shared_bytes})
+    refute shared_bytes =~ secret
+    refute wire_bytes =~ secret
+
+    available_source = Path.join(ctx.base_dir, "available-bundle")
+    File.mkdir_p!(available_source)
+
+    File.write!(
+      Path.join(available_source, "manifest.toml"),
+      "purpose = \"Available redaction proof.\"\nphrases = [\"synthetic\"]\nroot_archetype = \"default\"\n"
+    )
+
+    File.write!(Path.join(available_source, "README.md"), "available=#{secret}")
+    File.write!(Path.join(available_source, "capabilities.md"), "available ordinary content")
+    File.write!(Path.join(available_source, "preferred-models.md"), "available model content")
+
+    previous_source = Application.get_env(:tightbeam, :identity_source_dir)
+    Application.put_env(:tightbeam, :identity_source_dir, available_source)
+
+    on_exit(fn ->
+      if previous_source,
+        do: Application.put_env(:tightbeam, :identity_source_dir, previous_source),
+        else: Application.delete_env(:tightbeam, :identity_source_dir)
+    end)
+
+    available = Identity.public_kungfu(ctx.base_dir, "agentic-engineering")
+    available_documents = Map.new(available["documents"], &{&1["path"], &1})
+
+    assert available["status"] == "available"
+    assert available_documents["README.md"]["content"] == "available=[redacted-secret]"
+
+    for document <- Map.values(available_documents) do
+      assert document["sha256"] ==
+               :crypto.hash(:sha256, document["content"]) |> Base.encode16(case: :lower)
+
+      refute document["content"] =~ secret
+    end
+  end
+
+  @tag admin_fixture: true
+  test "kungfu refuses unreadable bank directories instead of treating them as absent", ctx do
+    private_dir = Path.join([ctx.base_dir, "auth", "private"])
+    File.mkdir_p!(private_dir)
+    File.write!(Path.join(private_dir, "secret"), "synthetic-lookup-failure")
+    File.chmod!(private_dir, 0o000)
+
+    on_exit(fn -> File.chmod(private_dir, 0o700) end)
+
+    assert_raise File.Error, ~r/discover credential bank/, fn ->
+      Identity.public_kungfu(ctx.base_dir, "agentic-engineering")
+    end
   end
 
   defp firehose_call(verb, params) do
