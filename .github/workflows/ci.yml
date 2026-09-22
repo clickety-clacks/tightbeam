@@ -37,6 +37,9 @@ jobs:
       - name: Shipped assets contain no internal identifiers
         run: python3 scripts/verify_shipped_privacy.py
 
+      - name: Astra overlay apply and rollback safety
+        run: python3 -m unittest discover -s packaging -p test_astra_overlay.py
+
       - name: Public rule facts never shrink
         run: python3 scripts/verify_public_rule_facts.py
 
