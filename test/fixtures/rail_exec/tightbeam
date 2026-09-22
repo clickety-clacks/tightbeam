@@ -17,6 +17,7 @@ case "${script##*/}" in
   # substrate has to carry that reason onto a row that outlives the scratch dir.
   # The double states the same observable so the plumbing is asserted, not assumed.
   rail-contained-refused)
+    IFS= read -r _input
     echo "rail-exec: containment not applied: fixture refusal" >&2
     exit 30
     ;;
