@@ -267,7 +267,7 @@ defmodule Tightbeam.IdentityTest do
         assert review.guidance =~ "a tests-passed receipt is not a precondition"
       end
 
-      assert review.skills == %{}
+      assert Map.keys(review.skills) == ["repository-retirement"]
 
       if role == "reviewer-code" do
         assert review.guidance =~ "# Repository custody"

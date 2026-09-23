@@ -1,5 +1,5 @@
 name = "product-owner"
-skills = ["tightbeam-dispatching"]
+skills = ["repository-retirement", "tightbeam-dispatching"]
 
 [guidance]
 text = """

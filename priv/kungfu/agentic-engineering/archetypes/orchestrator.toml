@@ -1,5 +1,5 @@
 name = "orchestrator"
-skills = []
+skills = ["repository-retirement"]
 
 [guidance]
 text = """

@@ -1,5 +1,5 @@
 name = "reviewer-spec"
-skills = []
+skills = ["repository-retirement"]
 
 [guidance]
 text = """

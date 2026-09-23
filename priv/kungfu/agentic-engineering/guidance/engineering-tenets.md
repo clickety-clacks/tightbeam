@@ -28,3 +28,6 @@ for delivery choices already delegated to the responsible owner.
 Choose mechanical protection for a concrete invariant, not to enforce a preferred
 workflow. The guidance writer and reviewer carry its policy design and review;
 runtime implementation stays with its commissioned engineering owner.
+
+When repository work lands, completes, or a neutral session-cleanup prompt arrives,
+load repository-retirement before disposing of repository material or its agent session.

@@ -8517,13 +8517,13 @@ defmodule Tightbeam.GatewayTest do
     manifest_path = Path.join([base_dir, "identity", "archetypes", "coder.toml"])
     manifest = File.read!(manifest_path)
 
-    assert manifest =~ ~s(skills = [])
+    assert manifest =~ ~s(skills = ["repository-retirement"])
 
     fixture_manifest =
       String.replace(
         manifest,
-        ~s(skills = []),
-        ~s(skills = ["human-communication", "model-release-intake"]),
+        ~s(skills = ["repository-retirement"]),
+        ~s(skills = ["human-communication", "model-release-intake", "repository-retirement"]),
         global: false
       )
 

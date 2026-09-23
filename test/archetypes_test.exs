@@ -304,10 +304,17 @@ defmodule Tightbeam.ArchetypesTest do
     assert Map.keys(loaded) |> Enum.sort() ==
              ~w(coder default guidance-reviewer guidance-writer integrator orchestrator product-owner recon reviewer-code reviewer-spec spec-writer team-planner)
 
-    assert loaded["product-owner"].skills == ["tightbeam-dispatching"]
+    engineering_roles =
+      ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator)
 
-    for role <-
-          ~w(coder orchestrator product-owner reviewer-code reviewer-spec recon spec-writer team-planner guidance-writer guidance-reviewer integrator) do
+    assert loaded["product-owner"].skills ==
+             ["repository-retirement", "tightbeam-dispatching"]
+
+    for role <- engineering_roles do
+      assert "repository-retirement" in loaded[role].skills
+    end
+
+    for role <- engineering_roles do
       refute Enum.any?(
                loaded[role].skills,
                &(&1 in ~w(worktree-session team-design feature-cycle work-tracking unblocking product-discovery spirit-review bug-provenance committing-and-pushing))
@@ -360,7 +367,7 @@ defmodule Tightbeam.ArchetypesTest do
         :codex
       )
 
-    assert product_owner.skills == %{}
+    assert Map.keys(product_owner.skills) == ["repository-retirement"]
     refute product_owner.guidance =~ "# Repository custody"
     assert product_owner.guidance =~ "You retain\ncontent ownership"
     assert product_owner.guidance =~ "publication through its repository custodian"
@@ -377,10 +384,30 @@ defmodule Tightbeam.ArchetypesTest do
       snapshot =
         Identity.snapshot_at!(ctx.base_dir, Identity.live_revision!(ctx.base_dir), role, :codex)
 
-      assert snapshot.skills == %{}
+      assert Map.keys(snapshot.skills) == ["repository-retirement"]
       assert snapshot.guidance =~ "# Operating tightbeam"
       refute Regex.match?(~r/^#include/m, snapshot.guidance)
     end
+
+    retirement = coder.skills["repository-retirement"]
+    assert retirement =~ "An owner acts only on a direct child"
+    assert retirement =~ "all of these facts are fresh and true"
+    assert retirement =~ "seven days"
+    assert retirement =~ "thirty days"
+    assert retirement =~ "closure plus ninety days"
+    assert retirement =~ "live process"
+    assert retirement =~ "common object store"
+    assert retirement =~ "artifact-effect proof"
+    assert retirement =~ "retained retirement\n  workspace"
+    assert retirement =~ "resets the affected\nretention clock"
+    assert retirement =~ "Final governing closure"
+    assert retirement =~ "candidate generation"
+    assert retirement =~ "stable action identity"
+    assert retirement =~ "durably record intent"
+    assert retirement =~ "Reuse an existing\ncompleted disposition"
+    assert retirement =~ "Retirement is last"
+    assert retirement =~ "reconcile it before"
+    refute retirement =~ "git push origin --delete"
 
     writer = Identity.snapshot!(ctx.base_dir, "guidance-writer", :codex)
     reviewer = Identity.snapshot!(ctx.base_dir, "guidance-reviewer", :codex)
