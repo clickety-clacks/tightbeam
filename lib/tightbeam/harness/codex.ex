@@ -5,7 +5,7 @@ defmodule Tightbeam.Harness.Codex do
   require Logger
 
   alias Tightbeam.Harness.Support
-  alias Tightbeam.Model
+  alias Tightbeam.{Model, Placement}
 
   @adapter_version "1.12.0"
   @adapter_package "codex-acp"
@@ -438,6 +438,7 @@ defmodule Tightbeam.Harness.Codex do
 
   defp probe(state, kind) do
     sh = Map.get(state.options, :sh, &Support.system_cmd_out/1)
+    executable = catalog_executable(state, kind)
 
     auth =
       Tightbeam.Credentials.credential_path(
@@ -450,10 +451,28 @@ defmodule Tightbeam.Harness.Codex do
     |> Support.catalog_probe(
       Support.catalog_probe_argv(
         Map.get(state, :host_config, %{ssh: nil}).ssh,
-        probe_script(kind, auth)
+        probe_script(kind, auth, executable)
       )
     )
-    |> classify_extraction(kind, auth)
+    |> classify_extraction(kind, auth, executable)
+  end
+
+  # codex-acp receives the exact host/harness environment overlay when it
+  # launches, so subscription discovery must derive `client_version` from that
+  # same executable selection. Without a stored CODEX_PATH, retain the existing
+  # non-login PATH lookup. API-key discovery does not ask for a client version
+  # at all and deliberately never consults this binding.
+  defp catalog_executable(_state, :api_key), do: :bare_path
+
+  defp catalog_executable(state, :subscription) do
+    with {:ok, db} <- Map.fetch(state.options, :db),
+         host <- Map.get(state, :host_name, Placement.local_host_name()),
+         %{value: path} <-
+           Enum.find(Placement.env_overlays(db, host, wire_name()), &("CODEX_PATH" == &1.name)) do
+      {:bound, path}
+    else
+      _ -> :bare_path
+    end
   end
 
   # Codex owns `auth.json` and rewrites it IN PLACE as it rotates (established
@@ -465,7 +484,15 @@ defmodule Tightbeam.Harness.Codex do
   # repair it would imply (re-onboard) is both wrong and destructive of a working
   # login. The extraction step exits on a distinct code per state so the three
   # cannot collapse into one opaque failure.
-  defp classify_extraction({:error, {:probe_failed, 66, _output}}, _kind, auth),
+  defp classify_extraction(
+         {:error, {:probe_failed, 69, _output}},
+         :subscription,
+         _auth,
+         {:bound, path}
+       ),
+       do: {:error, {:codex_path_unusable, path}}
+
+  defp classify_extraction({:error, {:probe_failed, 66, _output}}, _kind, auth, _executable),
     do: {:error, {:missing_credential, auth}}
 
   # 75 is structurally near-impossible on an api-key host, and the branch stays
@@ -474,19 +501,34 @@ defmodule Tightbeam.Harness.Codex do
   # same fact that removes codex's shared-runtime anchor on such a host. A
   # hand-run `codex login` is still a writer, so the state stays reachable and
   # stays retryable.
-  defp classify_extraction({:error, {:probe_failed, 75, _output}}, _kind, _auth),
-    do: {:error, {:credential_read_torn, :retry_next_refresh}}
+  defp classify_extraction(
+         {:error, {:probe_failed, 75, _output}},
+         _kind,
+         _auth,
+         _executable
+       ),
+       do: {:error, {:credential_read_torn, :retry_next_refresh}}
 
   # The 67 reason names the field the host was supposed to hold. An api-key host
   # has no `access_token` to be missing, and saying it did would send the
   # operator hunting the wrong key in the right file.
-  defp classify_extraction({:error, {:probe_failed, 67, _output}}, :subscription, auth),
-    do: {:error, {:credential_missing_access_token, auth}}
+  defp classify_extraction(
+         {:error, {:probe_failed, 67, _output}},
+         :subscription,
+         auth,
+         _executable
+       ),
+       do: {:error, {:credential_missing_access_token, auth}}
 
-  defp classify_extraction({:error, {:probe_failed, 67, _output}}, :api_key, auth),
-    do: {:error, {:credential_missing_api_key, auth}}
+  defp classify_extraction(
+         {:error, {:probe_failed, 67, _output}},
+         :api_key,
+         auth,
+         _executable
+       ),
+       do: {:error, {:credential_missing_api_key, auth}}
 
-  defp classify_extraction(result, _kind, _auth), do: result
+  defp classify_extraction(result, _kind, _auth, _executable), do: result
 
   # `client_version` is a SILENT filter ON THIS BRANCH ONLY: every model carries
   # a `minimal_client_version` and the account route drops the ones the caller is
@@ -496,7 +538,7 @@ defmodule Tightbeam.Harness.Codex do
   # to nothing and blame the account. It rides back on the status line so the
   # refusal can name the version that produced an empty answer. The platform
   # route has no such filter — see the api-key clause below.
-  defp probe_script(:subscription, auth_path) do
+  defp probe_script(:subscription, auth_path, executable) do
     # Exit codes are sysexits: 66 EX_NOINPUT (no readable auth.json — a real
     # "this host holds no grant"), 75 EX_TEMPFAIL (present but unparseable — a
     # torn read, transient), 67 EX_NOUSER (parsed, but carries no access token —
@@ -516,11 +558,28 @@ defmodule Tightbeam.Harness.Codex do
         " ${raw##* }"
       )
 
+    version =
+      case executable do
+        :bare_path ->
+          "raw=$(codex --version)"
+
+        {:bound, path} ->
+          """
+          codex_path=#{Support.shell_quote(path)}
+          case "$codex_path" in
+            /*) ;;
+            *) exit 69 ;;
+          esac
+          if [ ! -f "$codex_path" ] || [ ! -x "$codex_path" ]; then exit 69; fi
+          raw=$("$codex_path" --version)
+          """
+      end
+
     """
     exec 2>&1
     set -eu
     token=$(node -e '#{node_program}')
-    raw=$(codex --version)
+    #{version}
     exec #{curl}
     """
   end
@@ -537,7 +596,7 @@ defmodule Tightbeam.Harness.Codex do
   # api-key host must not be the one place a torn read reports as a bad
   # credential. As on the other branch the credential is expanded by the REMOTE
   # shell and never appears in a command line on either machine.
-  defp probe_script(:api_key, auth_path) do
+  defp probe_script(:api_key, auth_path, _executable) do
     node_program =
       ~s|const fs=require("fs");let raw;| <>
         ~s|try{raw=fs.readFileSync("#{auth_path}","utf8")}catch(e){process.exit(66)}| <>

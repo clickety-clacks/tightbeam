@@ -1296,7 +1296,8 @@ defmodule Tightbeam.ModelCatalogTest do
       refute script =~ ctx.satellite_base
     end
 
-    test "the codex client_version comes from the binary on the owning host", ctx do
+    test "without CODEX_PATH the codex client_version comes from bare PATH on the owning host",
+         ctx do
       parent = self()
 
       sh = fn command ->
@@ -1314,11 +1315,153 @@ defmodule Tightbeam.ModelCatalogTest do
       # the codex binary ON THAT HOST reports. A constant in our source would
       # return 200 with an empty list and blame the account.
       assert line =~ "raw=$(codex --version)"
+      refute line =~ "codex_path="
       assert line =~ "client_version=${raw##* }"
       refute line =~ ~r/client_version=\d/
 
       # It is read from the host that runs the turn: the satellite's own auth.json.
       assert line =~ Path.join([ctx.satellite_base, "homes", "satellite", "codex", "auth.json"])
+    end
+
+    test "a subscription catalog executes the exact shell-safe CODEX_PATH binding", ctx do
+      auth = Path.join([ctx.base_dir, "homes", @host, "codex", "auth.json"])
+      File.mkdir_p!(Path.dirname(auth))
+      File.write!(auth, JSON.encode!(%{tokens: %{access_token: "fixture-token"}}))
+
+      codex_path = Path.join([ctx.base_dir, "Codex Builds", "O'Brien", "codex"])
+      File.mkdir_p!(Path.dirname(codex_path))
+      File.write!(codex_path, "#!/bin/sh\nprintf 'codex-cli 0.155.1\\n'\n")
+      File.chmod!(codex_path, 0o755)
+
+      fake_bin = Path.join(ctx.base_dir, "catalog-bin")
+      body_path = Path.join(ctx.base_dir, "codex-catalog.json")
+      curl_path = Path.join(fake_bin, "curl")
+      File.mkdir_p!(fake_bin)
+      File.write!(body_path, ctx.codex_json)
+      File.write!(curl_path, "#!/bin/sh\ncat \"$CATALOG_BODY\"\nprintf '\\n200 0.155.1\\n'\n")
+      File.chmod!(curl_path, 0o755)
+
+      assert {:ok, _row} =
+               Placement.set_env_overlay(
+                 ctx.db,
+                 @host,
+                 "codex",
+                 "CODEX_PATH",
+                 codex_path,
+                 "agent:test"
+               )
+
+      parent = self()
+
+      sh = fn [command | args] = argv ->
+        send(parent, {:probe, argv})
+
+        System.cmd(command, args,
+          env: [
+            {"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")},
+            {"CATALOG_BODY", body_path}
+          ]
+        )
+      end
+
+      catalog = start_catalog(ctx, sh: sh)
+      await_fresh(catalog, "codex")
+
+      assert {[%{family: "gpt-5.6-sol"}], :fresh} = ModelCatalog.get(@host, "codex", catalog)
+      assert ["sh", "-c", script] = probe_command!(:codex, :local)
+      assert script =~ "codex_path=#{Support.shell_quote(codex_path)}"
+      assert script =~ "raw=$(\"$codex_path\" --version)"
+      refute script =~ "raw=$(codex --version)"
+    end
+
+    test "invalid or non-executable CODEX_PATH bindings fail closed without PATH fallback", ctx do
+      auth = Path.join([ctx.base_dir, "homes", @host, "codex", "auth.json"])
+      File.mkdir_p!(Path.dirname(auth))
+      File.write!(auth, JSON.encode!(%{tokens: %{access_token: "fixture-token"}}))
+
+      fake_bin = Path.join(ctx.base_dir, "fallback-bin")
+      bare_marker = Path.join(ctx.base_dir, "bare-codex-ran")
+      curl_marker = Path.join(ctx.base_dir, "curl-ran")
+      File.mkdir_p!(fake_bin)
+
+      File.write!(
+        Path.join(fake_bin, "codex"),
+        "#!/bin/sh\nprintf ran > #{Support.shell_quote(bare_marker)}\nprintf 'codex-cli 9.9.9\\n'\n"
+      )
+
+      File.write!(
+        Path.join(fake_bin, "curl"),
+        "#!/bin/sh\nprintf ran > #{Support.shell_quote(curl_marker)}\nprintf '{\"models\":[]}\\n200 9.9.9\\n'\n"
+      )
+
+      File.chmod!(Path.join(fake_bin, "codex"), 0o755)
+      File.chmod!(Path.join(fake_bin, "curl"), 0o755)
+
+      non_executable = Path.join(ctx.base_dir, "pinned-codex")
+      File.write!(non_executable, "#!/bin/sh\nexit 0\n")
+      File.chmod!(non_executable, 0o644)
+
+      sh = fn [command | args] ->
+        System.cmd(command, args,
+          env: [{"PATH", fake_bin <> ":" <> (System.get_env("PATH") || "")}]
+        )
+      end
+
+      for binding <- ["codex", non_executable] do
+        assert {:ok, _row} =
+                 Placement.set_env_overlay(
+                   ctx.db,
+                   @host,
+                   "codex",
+                   "CODEX_PATH",
+                   binding,
+                   "agent:test"
+                 )
+
+        catalog = start_catalog(ctx, sh: sh)
+
+        await(fn ->
+          ModelCatalog.get(@host, "codex", catalog) ==
+            {[], {:unavailable, {:codex_path_unusable, binding}}}
+        end)
+      end
+
+      refute File.exists?(bare_marker)
+      refute File.exists?(curl_marker)
+    end
+
+    test "an API-key catalog ignores CODEX_PATH and preserves the platform route", ctx do
+      codex_path = "/opt/ignored subscription codex"
+
+      assert {:ok, _row} =
+               Placement.set_env_overlay(
+                 ctx.db,
+                 @host,
+                 "codex",
+                 "CODEX_PATH",
+                 codex_path,
+                 "agent:test"
+               )
+
+      parent = self()
+
+      sh = fn command ->
+        send(parent, {:probe, command})
+        catalog_reply(~s({"data":[{"id":"gpt-5.6-sol","object":"model"}]}))
+      end
+
+      catalog =
+        start_catalog(ctx,
+          sh: sh,
+          credential_kind: fn _provider -> :api_key end
+        )
+
+      await_fresh(catalog, "codex")
+      assert ["sh", "-c", script] = probe_command!(:codex, :local)
+      assert script =~ "api.openai.com/v1/models"
+      refute script =~ codex_path
+      refute script =~ "CODEX_PATH"
+      refute script =~ "codex --version"
     end
 
     test "a 200 with an empty model list names the client_version that produced it", ctx do
