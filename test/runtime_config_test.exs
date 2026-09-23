@@ -16,6 +16,7 @@ defmodule Tightbeam.RuntimeConfigTest do
     "TIGHTBEAM_WORK_ITEM_TRIAGE_DEADLINE_MS" => "404",
     "TIGHTBEAM_ADVERTISED_URL" => "ws://runtime-poison:9999",
     "TIGHTBEAM_DRAIN_TIMEOUT_MS" => "505",
+    "TIGHTBEAM_DB_CALL_TIMEOUT_MS" => "606",
     "TIGHTBEAM_LOCAL_HOST_NAME" => "runtime-poison-host"
   }
 
@@ -58,6 +59,7 @@ defmodule Tightbeam.RuntimeConfigTest do
         work_item_triage_deadline_ms: 404,
         advertised_url: "ws://runtime-poison:9999",
         drain_timeout_ms: 505,
+        db_call_timeout_ms: 606,
         local_host_name: "runtime-poison-host"
       ]
     ]

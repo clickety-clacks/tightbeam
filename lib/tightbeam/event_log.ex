@@ -562,10 +562,24 @@ defmodule Tightbeam.EventLog do
   (`c:Application.prep_stop/1`, not stop) or the next boot infers a dirty
   exit.
   """
-  @spec clean_shutdown(db(), pos_integer()) :: :ok
-  def clean_shutdown(db \\ Tightbeam.DB, epoch) do
+  @spec clean_shutdown(db(), pos_integer(), integer() | :infinity) :: :ok
+  def clean_shutdown(db \\ Tightbeam.DB, epoch, deadline \\ :infinity) do
     {:ok, _} =
-      DB.query(db, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [epoch, now()])
+      case deadline do
+        :infinity ->
+          DB.query(db, "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1", [
+            epoch,
+            now()
+          ])
+
+        deadline when is_integer(deadline) ->
+          DB.query_until(
+            db,
+            "UPDATE boot_epochs SET cleanShutdownAt = ?2 WHERE epoch = ?1",
+            [epoch, now()],
+            deadline
+          )
+      end
 
     :ok
   end

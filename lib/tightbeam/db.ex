@@ -31,7 +31,32 @@ defmodule Tightbeam.DB do
     defexception [:message]
   end
 
+  defmodule DeadlineExceeded do
+    @moduledoc false
+    defexception message: "database transaction deadline exceeded"
+  end
+
   ## Client
+  @default_call_timeout_ms 30_000
+
+  @doc "Configured client wait for a DB call in milliseconds."
+  @spec call_timeout() :: pos_integer()
+  def call_timeout do
+    Application.get_env(:tightbeam, :db_call_timeout_ms, @default_call_timeout_ms)
+  end
+
+  @doc false
+  @spec validate_call_timeout!() :: pos_integer()
+  def validate_call_timeout! do
+    case Application.get_env(:tightbeam, :db_call_timeout_ms, @default_call_timeout_ms) do
+      ms when is_integer(ms) and ms > 0 ->
+        ms
+
+      bad ->
+        raise ArgumentError,
+              ":db_call_timeout_ms must be a positive integer of milliseconds, got #{inspect(bad)}"
+    end
+  end
 
   @doc "Start the owner. Required: `:path` (SQLite file or `\":memory:\"`). Optional `:name`."
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -39,16 +64,34 @@ defmodule Tightbeam.DB do
     GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
   end
 
+  @doc false
+  @spec query_until(server(), String.t(), [term()], integer()) ::
+          {:ok, [row()]} | {:error, Exception.t() | term()}
+  def query_until(server, sql, params, deadline) when is_integer(deadline) do
+    remaining = deadline - System.monotonic_time(:millisecond)
+
+    if remaining <= 0 do
+      {:error, %DeadlineExceeded{}}
+    else
+      try do
+        GenServer.call(server, {:query, sql, params}, min(call_timeout(), remaining))
+      catch
+        :exit, {:timeout, _} -> {:error, %DeadlineExceeded{}}
+        :exit, reason -> {:error, reason}
+      end
+    end
+  end
+
   @doc "Run one SQL statement with params; returns `{:ok, rows}` (rows are positional lists)."
   @spec query(server(), String.t(), [term()]) :: {:ok, [row()]} | {:error, Exception.t()}
   def query(server \\ __MODULE__, sql, params \\ []) do
-    GenServer.call(server, {:query, sql, params})
+    GenServer.call(server, {:query, sql, params}, call_timeout())
   end
 
   @doc "Execute DDL / statements without results."
   @spec execute(server(), String.t()) :: :ok | {:error, term()}
   def execute(server \\ __MODULE__, sql) do
-    GenServer.call(server, {:execute, sql})
+    GenServer.call(server, {:execute, sql}, call_timeout())
   end
 
   @doc """
@@ -61,7 +104,7 @@ defmodule Tightbeam.DB do
           {:ok, result} | {:error, Exception.t()}
         when result: term()
   def transaction(server \\ __MODULE__, fun) when is_function(fun, 1) do
-    GenServer.call(server, {:transaction, fun})
+    GenServer.call(server, {:transaction, fun}, call_timeout())
   end
 
   ## Txn handle passed to transaction callbacks (runs inside the owner process)
@@ -96,6 +139,8 @@ defmodule Tightbeam.DB do
 
   @impl true
   def init(opts) do
+    _ = validate_call_timeout!()
+
     path = Keyword.fetch!(opts, :path)
     {:ok, conn} = Sqlite3.open(path)
 
