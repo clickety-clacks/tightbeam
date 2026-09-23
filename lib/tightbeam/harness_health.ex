@@ -40,9 +40,14 @@ defmodule Tightbeam.HarnessHealth do
   @other_max_validity_ms 900_000
   @harness_health_schema_stamp "harness-health-other-v1-019"
   # Schema.ensure_all invokes module bootstraps before the repository's final
-  # stamp is installed. HarnessHealth must not migrate at any intermediate
-  # stamp: this one exact stamp is the reviewed execution-time predecessor.
-  @harness_health_predecessor_stamp "addressed-po-consultation-v1-019"
+  # stamp is installed. HarnessHealth migrates only at the protected branch's
+  # reviewed predecessor or PR31's final successor. The latter admits an
+  # existing PR31 database to the same exact object-set migration.
+  @harness_health_predecessor_stamps [
+    "addressed-po-consultation-v1-019",
+    "cursor-provider-v1-020",
+    "cursor-provider-addressed-po-v1-020"
+  ]
   @legacy_object_set_sha256 "97ec5ee389c4f1b8d1b932dcfbc9fc59472a9c721a82968b013f63f54b52ebaf"
   @legacy_two_class_object_set_sha256 "be16933e4a429970358325fe941e258e6838e0e0b789a5d0b470bdb1269dcc3e"
   @target_object_set_sha256 "c811a7a0584197a7111e317f128b1bd9c08b21450511654b84f691ecc325a150"
@@ -508,7 +513,7 @@ defmodule Tightbeam.HarnessHealth do
   @spec ensure_schema(DB.server()) :: :ok | {:error, term()}
   def ensure_schema(db \\ DB) do
     case DB.query(db, "SELECT shape FROM schema_stamp") do
-      {:ok, [[@harness_health_predecessor_stamp]]} ->
+      {:ok, [[stamp]]} when stamp in @harness_health_predecessor_stamps ->
         ensure_current_schema(db)
 
       {:ok, [[@harness_health_schema_stamp]]} ->
@@ -585,7 +590,7 @@ defmodule Tightbeam.HarnessHealth do
   defp migrate_predecessor!(db) do
     {:ok, [[predecessor_stamp]]} = DB.query(db, "SELECT shape FROM schema_stamp")
 
-    unless predecessor_stamp == @harness_health_predecessor_stamp do
+    unless predecessor_stamp in @harness_health_predecessor_stamps do
       raise_schema_conflict!("unknown predecessor stamp #{inspect(predecessor_stamp)}")
     end
 

@@ -9,7 +9,7 @@ defmodule Tightbeam.Spinup do
 
   require Logger
 
-  alias Tightbeam.{EventLog, Harness, Homes, Placement}
+  alias Tightbeam.{Credentials, EventLog, Harness, Homes, Placement}
   alias Tightbeam.Harness.Support
   alias Tightbeam.LocalOpenAi.Providers
 
@@ -133,7 +133,12 @@ defmodule Tightbeam.Spinup do
   # the harness modules; this seam only asks each of them for its own.
   defp install_command(target, install_dir, locality) do
     packages =
-      Enum.map_join(Harness.all(), " ", &"#{&1.install_package()}@#{&1.adapter_version()}")
+      Harness.all()
+      # Cursor is not an npm adapter: its pinned bundle is installed by Cursor's
+      # own installer under the dedicated execution account and verified by
+      # Cursor.verify_installed_cli/1 (`cursor-agent@<version>` is not published).
+      |> Enum.reject(&(&1 == Tightbeam.Harness.Cursor))
+      |> Enum.map_join(" ", &"#{&1.install_package()}@#{&1.adapter_version()}")
 
     # `--no-save`, because npm records a CARET RANGE for a version it installed
     # exactly: `npm install pkg@1.1.4` writes `"^1.1.4"` into package.json, so the
@@ -144,7 +149,7 @@ defmodule Tightbeam.Spinup do
     script = "npm install --prefix #{shell_quote(install_dir)} --no-save " <> packages
 
     case locality do
-      :local -> ["sh", "-c", script]
+      :local -> ["/bin/sh", "-c", script]
       {:remote, _check} -> remote_command(target.host_config.ssh, script)
     end
   end
@@ -213,7 +218,7 @@ defmodule Tightbeam.Spinup do
 
         case dirs_result do
           {:error, path, reason} when is_binary(path) ->
-            location = if path, do: " at #{path}", else: ""
+            location = " at #{path}"
 
             message =
               "host #{target.host_name} is not ready for #{module.wire_name()}: directory setup failed#{location}: #{:file.format_error(reason)} " <>
@@ -231,7 +236,7 @@ defmodule Tightbeam.Spinup do
           :ok ->
             home = Homes.home_path(host.base_dir, target.host_name, module.id())
 
-            case module.ensure_adapter(target) do
+            case Harness.ensure_adapter(module, target) do
               {:error, denial} ->
                 {{:error, denial}, "reached; directories ensured; DENIED: #{denial.message}"}
 
@@ -245,18 +250,27 @@ defmodule Tightbeam.Spinup do
                    ) do
                   {:ok, "reached; directories ensured; #{adapter_detail}; credentials present"}
                 else
-                  auth_dir =
-                    if credential_provider == :local_openai,
-                      do: Providers.providers_dir(host.base_dir),
-                      else: home
+                  credential_location =
+                    cond do
+                      module == Tightbeam.Harness.Cursor ->
+                        store = Credentials.store_dir(host.base_dir, :cursor)
+                        "Tightbeam keeps its own credential under #{store}."
+
+                      credential_provider == :local_openai ->
+                        auth_dir = Providers.providers_dir(host.base_dir)
+                        "The credential belongs only in #{auth_dir}."
+
+                      true ->
+                        "The credential belongs only in #{home}."
+                    end
 
                   message =
                     "host #{target.host_name} is not ready for #{module.wire_name()}: " <>
                       "Tightbeam has no credential for #{credential_provider} on " <>
                       "#{target.host_name}. It does not use or import your normal " <>
-                      "#{module.wire_name()} CLI login. The credential belongs only in " <>
-                      "#{auth_dir}. Run on #{target.host_name}: " <>
-                      Tightbeam.Credentials.onboard_command(credential_provider)
+                      "#{module.wire_name()} CLI login. #{credential_location} " <>
+                      "Run on #{target.host_name}: " <>
+                      Credentials.onboard_command(credential_provider)
 
                   {{:error, host_unready(message)},
                    "reached; directories ensured; #{adapter_detail}; DENIED: #{message}"}

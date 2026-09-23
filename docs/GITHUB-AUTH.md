@@ -74,6 +74,18 @@ One shared dir, not per-hostname: `GH_CONFIG_DIR` is single-valued while gh's
 `hosts.yml` natively holds every hostname. The dir is 0700, the files inside
 0600, and gh owns their format — Tightbeam never parses them.
 
+One layout exception, and only on a host provisioned for the dedicated Cursor
+execution identity: the bank is granted read-only to the `tightbeam-workspace`
+group on its canonical path (`auth` and `auth/github` 0710, `gh` 0750, and
+exactly gh's `config.yml` and `hosts.yml` 0640 —
+`Tightbeam.Harness.Cursor.grant_bank_access!`), so the execution
+account uses the operator's credential with no copy and exactly the bank's
+rotation semantics. `tightbeam onboard github` detects that grant by the group
+NAME on the gh dir and preserves it through re-onboarding (`BankLayout` in
+`cli/src/github_auth/bank.rs`), including on the `hosts.yml` gh rewrites;
+everything else under `gh` stays operator-only, and any other group on the
+dir — or the operator's own primary group — is not a grant and is reset.
+
 GHE and other non-github.com hostnames onboard and operate through gh's
 native multi-host support in that same store, but the shell guard's remote
 extraction and doctor's hostname recognition currently know only github.com —
@@ -340,7 +352,9 @@ Session/project status should expose only non-secret fields. Suggested display:
   such as `provider_error=ghp_...`.
 - Before onboarding reports success, every banked directory is 0700 and every
   banked file is 0600, including a provider-created `hosts.yml` that began
-  with a permissive mode.
+  with a permissive mode — or, on a host carrying the Cursor execution grant,
+  the grant's 0710/0750/0640 on the `tightbeam-workspace` group, which
+  re-onboarding (credential rotation) must never revoke.
 - A timeout or unreachable host reports `unknown` and does not authorize GitHub
   work.
 
@@ -378,7 +392,7 @@ The 0.1.8 GitHub E2E inventory is:
 
 | Row | Required evidence |
 | --- | --- |
-| Bank and private storage | The real CLI uses browser/device login with `--web --git-protocol https --insecure-storage`; it never uses `--with-token`; directories are 0700 and files are 0600. |
+| Bank and private storage | The real CLI uses browser/device login with `--web --git-protocol https --insecure-storage`; it never uses `--with-token`; directories are 0700 and files are 0600, except under the Cursor execution grant (0710/0750/0640 on `tightbeam-workspace`), which onboarding preserves. |
 | Host isolation | A satellite cannot borrow the local bank or ambient `GH_CONFIG_DIR`. Every fixture call sees only that host's bank. |
 | Environment projection | Local adapter options and satellite SSH commands receive the correct host-local `GH_CONFIG_DIR` and `TIGHTBEAM_MACHINE`. No token bytes are projected. |
 | Refusal and repair | A GitHub operation is refused before `git` runs. The refusal names host, hostname, failed phase, state, exact onboarding command, and the no-PAT rule. Quoted brief text and description prose do not trigger the guard. |

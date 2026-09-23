@@ -1630,7 +1630,7 @@ defmodule Tightbeam.GatewayTest do
     # this line sent the operator to the gateway to fix a satellite's grant.
     assert message =~ "anthropic has no usable credential on testhost"
     assert message =~ ":no_credential"
-    assert message =~ "run tightbeam onboard anthropic on testhost"
+    assert message =~ "run tightbeam onboard anthropic --as-user <userId> on testhost"
     refute message =~ "GATEWAY host"
 
     # ...and never regresses to the bare inspected health term, which named
@@ -2871,7 +2871,7 @@ defmodule Tightbeam.GatewayTest do
     assert message =~ "eurisko: cannot route gpt-5.6-sol (effort medium) on eurisko"
     assert message =~ "upgrade codex on eurisko"
     assert message =~ "racter: cannot route gpt-5.6-sol (effort medium) on racter"
-    assert message =~ "run tightbeam onboard openai on racter"
+    assert message =~ "run tightbeam onboard openai --as-user <userId> on racter"
   end
 
   test "spawn uses the next where host when the first fails live spinup", ctx do
@@ -3998,7 +3998,7 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert message =~ "anthropic has no usable credential on testhost"
-    assert message =~ "run tightbeam onboard anthropic on testhost"
+    assert message =~ "run tightbeam onboard anthropic --as-user <userId> on testhost"
     refute message =~ "GATEWAY host"
     refute message =~ "onboard anthropic on worker"
   end
@@ -6245,6 +6245,19 @@ defmodule Tightbeam.GatewayTest do
     assert {:ok, [[1]]} = DB.query(ctx.db, "SELECT COUNT(*) FROM turns")
   end
 
+  @tag :tmp_dir
+  test "a checkout refusal keeps its stable code through the real runner and turn wire", %{
+    tmp_dir: tmp
+  } do
+    File.write!(Path.join(tmp, "checkout-case.txt"), "cursor")
+
+    Tightbeam.GuardRuntimeFixture.run!(
+      tmp,
+      "live_base_gateway_checkout_refusal.exs",
+      "guarded-gateway-cursor-refusal: ok"
+    )
+  end
+
   test "conversational turns stay unattributed and bracket-1 nags reverse-link jobRef only",
        ctx do
     :ok =
@@ -8457,15 +8470,6 @@ defmodule Tightbeam.GatewayTest do
     after
       :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
     end
-  end
-
-  defp gateway_children_base! do
-    suffix = :crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false)
-    base = Path.join(System.tmp_dir!(), "gateway_children_#{suffix}")
-    File.rm_rf!(base)
-    File.mkdir!(base)
-    on_exit(fn -> File.rm_rf!(base) end)
-    base
   end
 
   defp role_test_base(suffix, ready? \\ true) do

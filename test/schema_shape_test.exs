@@ -11,9 +11,11 @@ end
 defmodule Tightbeam.SchemaShapeTest do
   use Tightbeam.TestCase, async: false
 
-  alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, Wakes}
+  alias Tightbeam.{Assignments, ConnRegistry, DB, Schema, SessionPoAssociations, Wakes}
 
-  @shape "addressed-po-consultation-v1-019"
+  @shape "cursor-provider-addressed-po-v1-020"
+  @legacy_cursor_provider_shape "cursor-provider-v1-020"
+  @cursor_provider_previous_shape "addressed-po-consultation-v1-019"
   @row_driven_rules_shape "row-driven-rules-v1-019"
   @identity_render_stamp_previous_shape "effort-request-exit-v1-019"
   @effort_request_exit_previous_shape "notice-batching-v1-019"
@@ -164,6 +166,34 @@ defmodule Tightbeam.SchemaShapeTest do
     :ok
   end
 
+  defp load_previous_pr31_fixture(db) do
+    fixture = File.read!(Path.join(__DIR__, "fixtures/previous_pr31_7f0c77d2.sql"))
+
+    assert Base.encode16(:crypto.hash(:sha256, fixture), case: :lower) ==
+             "a1409d2605af26623800065ee9314569ffe7a74d653a07ac4e9659fbebd15be5"
+
+    :ok = DB.execute(db, fixture)
+    :ok = DB.execute(db, "PRAGMA foreign_keys=ON")
+
+    assert {:ok, [[@legacy_cursor_provider_shape]]} =
+             DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, []} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_master WHERE type='table' AND name='session_po_associations'"
+             )
+
+    assert {:ok, [[wire_ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wire_idempotency'"
+             )
+
+    refute wire_ddl =~ "session-po-set"
+    :ok
+  end
+
   setup do
     name = :"schema_shape_#{System.unique_integer([:positive])}"
     start_supervised!({DB, path: ":memory:", name: name})
@@ -190,6 +220,96 @@ defmodule Tightbeam.SchemaShapeTest do
 
     assert operator_index =~ "(ownerUserId, raiserId, actionKey)"
     assert operator_index =~ ~r/WHERE\s+kind\s*=\s*'operator'\s+AND\s+status\s*=\s*'open'/
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO users (userId, isAdmin, createdAt) VALUES ('george', 1, 1);
+             INSERT INTO sessions
+               (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+                provider, model, createdAt, updatedAt)
+             VALUES ('cursor-session', 'cursor', 'george', 'user:george', 'coder',
+                     'cursor', 'cursor', 'auto', 1, 1);
+             INSERT INTO subagent_markers
+               (kind, principal, subagentRef, sourceEventRef, harness, at)
+             VALUES ('subagent_start', 'cursor-session', 'sub', 'event', 'cursor', 1);
+             """)
+  end
+
+  test "the real previous PR31 schema gains addressed-PO storage before admission", %{db: db} do
+    assert :ok = load_previous_pr31_fixture(db)
+    assert :ok = Schema.ensure_all(db)
+
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["session_po_associations"]]} =
+             DB.query(
+               db,
+               "SELECT name FROM sqlite_master WHERE type='table' AND name='session_po_associations'"
+             )
+
+    assert {:ok, [[wire_ddl]]} =
+             DB.query(
+               db,
+               "SELECT sql FROM sqlite_master WHERE type='table' AND name='wire_idempotency'"
+             )
+
+    assert wire_ddl =~ "session-po-set"
+    assert SessionPoAssociations.get(db, "missing-session") == nil
+    assert {:ok, []} = DB.query(db, "PRAGMA foreign_key_check")
+    assert :ok = Schema.ensure_all(db)
+  end
+
+  test "liveness-receipt shape advances through the cursor-provider migration", %{db: db} do
+    assert :ok = Schema.ensure_all(db)
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO users (userId, isAdmin, createdAt) VALUES ('mike', 1, 1);
+             INSERT INTO sessions
+               (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+                provider, model, createdAt, updatedAt)
+             VALUES ('existing', 'existing', 'mike', 'user:mike', 'coder',
+                     'codex', 'openai', 'fixture-model', 1, 1);
+             INSERT INTO subagent_markers
+               (kind, principal, subagentRef, sourceEventRef, harness, at)
+             VALUES ('subagent_start', 'existing', 'sub-existing', 'event-existing',
+                     'codex', 2);
+             INSERT INTO subagent_markers
+               (id, kind, principal, subagentRef, sourceEventRef, harness, at)
+             VALUES (100, 'subagent_start', 'existing', 'sub-deleted', 'event-deleted',
+                     'codex', 3);
+             DELETE FROM subagent_markers WHERE id = 100;
+             """)
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE schema_stamp SET shape = ?1", [@cursor_provider_previous_shape])
+
+    assert :ok = Schema.ensure_all(db)
+    assert {:ok, [[@shape]]} = DB.query(db, "SELECT shape FROM schema_stamp")
+
+    assert {:ok, [["existing", "codex", "openai"]]} =
+             DB.query(db, "SELECT sessionKey, harness, provider FROM sessions")
+
+    assert {:ok, [["sub-existing", "codex"]]} =
+             DB.query(db, "SELECT subagentRef, harness FROM subagent_markers")
+
+    assert :ok =
+             DB.execute(db, """
+             INSERT INTO sessions
+               (sessionKey, displayName, ownerUserId, origin, archetype, harness,
+                provider, model, createdAt, updatedAt)
+             VALUES ('cursor-after-migration', 'cursor', 'mike', 'user:mike', 'coder',
+                     'cursor', 'cursor', 'auto', 3, 3);
+             INSERT INTO subagent_markers
+               (kind, principal, subagentRef, sourceEventRef, harness, at)
+             VALUES ('subagent_start', 'cursor-after-migration', 'sub-cursor',
+                     'event-cursor', 'cursor', 4);
+             """)
+
+    assert {:ok, [[next_marker_id]]} =
+             DB.query(db, "SELECT id FROM subagent_markers WHERE subagentRef='sub-cursor'")
+
+    assert next_marker_id > 100
   end
 
   test "historical late-routing and successor markers require unique owning-row provenance", %{

@@ -652,13 +652,14 @@ defmodule Tightbeam.Gateway do
 
         {:ok, for({harness, {:ok, _}} <- results, do: harness)}
 
-      Enum.all?(results, fn {_harness, result} -> result == {:error, :not_found} end) ->
+      Enum.all?(results, fn {_harness, result} -> harness_cli_absent?(result) end) ->
         binaries = Enum.map_join(Harness.all(), " or ", &"`#{&1.cli_binary()}`")
 
         {:error,
          {:no_harness_cli,
-          "Tight Beam cannot start because no registered harness CLI is installed. " <>
-            "That is expected on a fresh machine. Install #{binaries}, ensure it is on PATH, " <>
+          "Tight Beam cannot start because no usable harness CLI is installed. " <>
+            "That is expected on a fresh machine. Install a registered harness CLI " <>
+            "(#{binaries}), ensure it is on PATH, " <>
             "then start Tight Beam again. Run `tightbeam doctor` to check this machine."}}
 
       true ->
@@ -668,6 +669,7 @@ defmodule Tightbeam.Gateway do
               case result do
                 {:error, :not_found} -> "not found"
                 {:error, {:exec_failed, exec_detail}} -> "exec failed: #{exec_detail}"
+                {:error, %{code: code, message: message}} -> "#{code}: #{message}"
               end
 
             "#{harness}: #{reason}"
@@ -683,6 +685,15 @@ defmodule Tightbeam.Gateway do
     do: "its CLI is on PATH but failed to execute (#{String.trim(detail)})"
 
   defp describe_probe_failure(other), do: inspect(other)
+
+  defp harness_cli_absent?({:error, :not_found}), do: true
+
+  defp harness_cli_absent?(
+         {:error, %{code: "cursor_cli_integrity_mismatch", reason: :not_found}}
+       ),
+       do: true
+
+  defp harness_cli_absent?(_result), do: false
 
   @doc """
   Install the pinned ACP adapters for every registered harness on the local host.
@@ -2562,7 +2573,7 @@ defmodule Tightbeam.Gateway do
          {:ok, result} <-
            at_session_turn_boundary(config, session.session_key, fn ->
              run_session_mutation(session.session_key, fn ->
-               with {:ok, adapter, generation} <- checkout_adapter(session),
+               with {:ok, adapter, generation} <- checkout_adapter(session, config),
                     {:ok, sid} <- harness_session(config, db, adapter, generation, session, nil),
                     {:ok, %Model{}} <- Adapter.current_model(adapter, sid) do
                  :ok
@@ -2965,7 +2976,7 @@ defmodule Tightbeam.Gateway do
 
       outcome =
         with {:ok, adapter, generation} <-
-               stage(:checkout, checkout_adapter(session)),
+               stage(:checkout, checkout_adapter(session, config)),
              {:ok, harness_session_id} <-
                stage(
                  :session,
@@ -3043,7 +3054,7 @@ defmodule Tightbeam.Gateway do
               # its message, and a failure that lost its brief showed Flynn
               # "agent progress interrupted" with no reason attached.
               append_turn_failed_marker(db, turn.session_key, error_sentence(reason))
-              publish_turn_state(db, turn.session_key, correlation, "failed", inspect(reason))
+              publish_turn_state(db, turn.session_key, correlation, "failed", reason)
               publish_session_indicator(db, turn.session_key, session.owner_user_id)
 
               broadcast(
@@ -3160,9 +3171,18 @@ defmodule Tightbeam.Gateway do
 
       {state, error} =
         case status do
-          "delivered" -> {"delivered", nil}
-          "canceled" -> {"canceled", nil}
-          _ -> {"failed", Map.get(row, :error) || "interrupted: outcome unknown"}
+          "delivered" ->
+            {"delivered", nil}
+
+          "canceled" ->
+            {"canceled", nil}
+
+          _ ->
+            {"failed",
+             row
+             |> Map.get(:error)
+             |> decode_public_error()
+             |> Kernel.||("interrupted: outcome unknown")}
         end
 
       # Crash-recovered failures get the in-chat marker too — this path IS
@@ -3413,10 +3433,11 @@ defmodule Tightbeam.Gateway do
     :exit, _ -> :ok
   end
 
-  defp checkout_adapter(session) do
+  defp checkout_adapter(session, config) do
     key = {Harness.parse!(session.harness).id(), "shared", session.host}
+    coordinator = Map.get(config, :adapter_coordinator, Tightbeam.AdapterCoordinator)
 
-    case AdapterCoordinator.adapter_for_turn(Tightbeam.AdapterCoordinator, key) do
+    case AdapterCoordinator.adapter_for_turn(coordinator, key) do
       {:ok, adapter, generation} ->
         {:ok, adapter, generation}
 
@@ -3433,11 +3454,19 @@ defmodule Tightbeam.Gateway do
         {:error,
          "adapter for #{session.harness} on host #{session.host} remains fenced by an incomplete park: #{inspect(detail)}"}
 
+      {:error, {:launch_refused, refusal}} ->
+        {:error, adapter_launch_refusal(refusal)}
+
       {:error, reason} ->
         {:error,
          "adapter for #{session.harness}/#{session.identity_name} on host #{session.host} is unavailable: #{inspect(reason)}"}
     end
   end
+
+  @doc false
+  def adapter_launch_refusal(%{code: code, message: message})
+      when is_binary(code) and is_binary(message),
+      do: %{code: code, message: message}
 
   @doc false
   def mcp_servers_for_archetype(archetype_name, archetypes \\ Archetypes) do
@@ -4344,7 +4373,7 @@ defmodule Tightbeam.Gateway do
   defp apply_failure(%{"message" => message}) when is_binary(message), do: message
   defp apply_failure(reason), do: inspect(reason)
 
-  @onboarding_providers ["openai", "anthropic", "opencode-go", "local-openai"] ++
+  @onboarding_providers ["openai", "anthropic", "cursor", "opencode-go", "local-openai"] ++
                           if(Application.compile_env(:tightbeam, :fixture_harness, false),
                             do: ["fixture-provider"],
                             else: []
@@ -4402,7 +4431,8 @@ defmodule Tightbeam.Gateway do
   defp onboard_result(_config, %{params: %{provider: provider}}) do
     %{
       code: "interactive_required",
-      message: "run tightbeam onboard #{provider} from a terminal on this machine"
+      message:
+        "run #{Tightbeam.Credentials.onboard_command(provider)} from a terminal on this machine"
     }
   end
 
@@ -4580,6 +4610,7 @@ defmodule Tightbeam.Gateway do
 
   defp provider_atom("openai"), do: :openai
   defp provider_atom("anthropic"), do: :anthropic
+  defp provider_atom("cursor"), do: :cursor
   defp provider_atom("opencode-go"), do: :opencode_go
   defp provider_atom("local-openai"), do: :local_openai
   defp provider_atom("fixture-provider"), do: :fixture_provider
@@ -8306,6 +8337,17 @@ defmodule Tightbeam.Gateway do
         )
     end
   end
+
+  defp decode_public_error(nil), do: nil
+
+  defp decode_public_error(error) when is_binary(error) do
+    case JSON.decode(error) do
+      {:ok, %{"code" => code} = decoded} when is_binary(code) -> decoded
+      _ -> error
+    end
+  end
+
+  defp decode_public_error(error), do: error
 
   defp broadcast(_db, owner, payload),
     do: Tightbeam.ConnRegistry.broadcast(Tightbeam.ConnRegistry, owner, payload, &deliver/2)

@@ -143,7 +143,8 @@ defmodule Tightbeam.Unroutable do
 
     "no #{harness} model catalog there, because #{provider} has no usable credential on " <>
       "#{host} (#{inspect(reason)}). A catalog is derived on the host that runs the turn, so " <>
-      "this is #{host}'s grant to fix; run tightbeam onboard #{provider} on #{host}"
+      "this is #{host}'s grant to fix; run " <>
+      "#{Tightbeam.Credentials.onboard_command(provider)} on #{host}"
   end
 
   # The codex models endpoint filters by the caller's client_version and says

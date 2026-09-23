@@ -246,6 +246,8 @@ defmodule Tightbeam.Harness.Pi do
 
   @impl true
   def reconcile_home(target, home, desired) do
+    desired = Map.put_new(desired, :auth_dir, home)
+
     rails =
       case desired.rails do
         nil ->

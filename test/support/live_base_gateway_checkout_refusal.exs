@@ -28,7 +28,7 @@ defmodule GuardCheckoutRefusal do
   def run do
     Tightbeam.GuardGatewayFixture.run!(fn %{base: base, db: db, config: config} ->
       mode = Path.join(Path.dirname(base), "checkout-case.txt") |> File.read!()
-      assert mode in ["missing", "fresh", "transient", "pi-local"]
+      assert mode in ["missing", "fresh", "transient", "cursor", "pi-local"]
 
       {harness, provider, model} =
         if mode == "pi-local" do
@@ -51,8 +51,19 @@ defmodule GuardCheckoutRefusal do
 
       {:ok, lane} = GenServer.start_link(GuardCheckoutDoorbell, self())
       # Checkout refuses before any adapter exists. No engine can receive a request.
-      {:ok, coordinator} =
-        CoordinatorStub.start_link({fn _key -> {:error, :degraded} end, self()})
+      checkout =
+        if mode == "cursor" do
+          refusal = %{
+            code: "DIV-CURSOR-API-KEY-ONLY",
+            message: "Cursor requires a banked API key"
+          }
+
+          fn _key -> {:error, {:launch_refused, refusal}} end
+        else
+          fn _key -> {:error, :degraded} end
+        end
+
+      {:ok, coordinator} = CoordinatorStub.start_link({checkout, self()})
 
       {:ok, catalog} =
         ModelCatalog.start_link(
@@ -116,6 +127,7 @@ defmodule GuardCheckoutRefusal do
                   "missing" => "o6-refuse",
                   "fresh" => "o6-pbu",
                   "transient" => "o6-transient",
+                  "cursor" => "cursor-refusal-wire",
                   "pi-local" => "o6-pi-local"
                 },
                 mode
@@ -151,6 +163,45 @@ defmodule GuardCheckoutRefusal do
         GenServer.stop(lane)
       end
     end)
+  end
+
+  defp prove("cursor", db, lane, exact_registry, runner) do
+    refusal = %{
+      code: "DIV-CURSOR-API-KEY-ONLY",
+      message: "Cursor requires a banked API key"
+    }
+
+    assert :appended =
+             Gateway.deliver_prompt("k1", "user:flynn", "cursor refusal",
+               db: db,
+               conn_registry: exact_registry,
+               lane_manager: lane,
+               device_id: "cursor-refusal-wire",
+               client_message_id: "c_cursor_refusal"
+             )
+
+    assert_receive {:ensure_lane, "k1"}, 2_000
+    assert {:ok, turn} = Ledger.claim_next(db, "k1", "test")
+
+    assert {:error, %{reason: ^refusal, terminal_publish: publish}} =
+             runner.(Map.put(turn, :session_key, "k1"))
+
+    publish.("failed")
+
+    assert_receive {:push,
+                    %{
+                      "event" => "prompt_turn_state",
+                      "payload" => %{
+                        "state" => "failed",
+                        "error" => %{
+                          code: "DIV-CURSOR-API-KEY-ONLY",
+                          message: "Cursor requires a banked API key"
+                        }
+                      }
+                    }},
+                   2_000
+
+    IO.puts("guarded-gateway-cursor-refusal: ok")
   end
 
   defp prove("missing", db, lane, exact_registry, runner) do

@@ -7,7 +7,7 @@ Tightbeam.GuardGatewayFixture.run!(fn %{base: base, config: config} ->
   Application.put_env(:tightbeam, :fixture_harness, false)
   System.put_env("PATH", empty)
 
-  assert_raise RuntimeError, ~r/no registered harness CLI is installed/, fn ->
+  assert_raise RuntimeError, ~r/no usable harness CLI is installed/, fn ->
     Gateway.children(config)
   end
 

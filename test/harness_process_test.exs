@@ -3,6 +3,9 @@ defmodule Tightbeam.HarnessProcessTest do
   @moduletag tmp_dir: true
   @moduletag timeout: 120_000
 
+  alias Tightbeam.{DB, HarnessProcess}
+  @helper Path.expand("../cli/target/release/tightbeam", __DIR__)
+
   test "a bare executable name is resolved to a path rather than handed over unresolved", %{
     tmp_dir: tmp
   } do
@@ -21,6 +24,12 @@ defmodule Tightbeam.HarnessProcessTest do
     Tightbeam.HarnessProcessFixture.run!(tmp, 3)
   end
 
+  test "the ruled-out shared listener seam stays absent" do
+    refute function_exported?(HarnessProcess, :assert_zero_listeners, 2)
+    refute function_exported?(HarnessProcess, :assert_zero_listeners, 3)
+    refute function_exported?(Tightbeam.Acp.Adapter, :listener_guard_for_test, 6)
+  end
+
   test "the coordinator records group identity during real adapter boot", %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 4)
   end
@@ -35,6 +44,79 @@ defmodule Tightbeam.HarnessProcessTest do
 
   test "identity capture cannot mutate an already-resolved launch", %{tmp_dir: tmp} do
     Tightbeam.HarnessProcessFixture.run!(tmp, 7)
+  end
+
+  test "local Cursor launch switches identity before the session helper records it", %{
+    tmp_dir: tmp
+  } do
+    db = String.to_atom("cursor_harness_process_#{System.unique_integer([:positive])}")
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
+
+    opts =
+      HarnessProcess.prepare_launch(
+        [
+          cmd: [Path.join(tmp, "adapters/cursor-agent"), "acp"],
+          cursor_execution_identity: true,
+          cursor_rails_sha256: String.duplicate("a", 64),
+          process_helper: @helper,
+          process_identity_dir: tmp
+        ],
+        db,
+        {:cursor, "shared", "testhost"}
+      )
+
+    assert [
+             "/usr/bin/sudo",
+             "-n",
+             "-H",
+             "-u",
+             "tightbeam-cursor",
+             "--",
+             "/usr/local/libexec/tightbeam-cursor-launcher",
+             "cursor-exec",
+             "launch",
+             base,
+             org_base,
+             operator_uid,
+             operator_home,
+             rails_sha256,
+             "--",
+             identity_path,
+             launch_id,
+             "--",
+             adapter,
+             "acp"
+           ] = Keyword.fetch!(opts, :cmd)
+
+    assert base == Tightbeam.Harness.Cursor.execution_base(nil)
+    assert org_base == @helper |> Path.dirname() |> Path.dirname()
+    assert operator_uid == System.cmd("/usr/bin/id", ["-u"]) |> elem(0) |> String.trim()
+    assert operator_home == System.user_home!()
+    assert rails_sha256 == String.duplicate("a", 64)
+    assert identity_path =~ "/harness-processes/"
+    assert is_binary(launch_id)
+    assert adapter == Path.join(tmp, "adapters/cursor-agent")
+    assert Bitwise.band(File.stat!(Path.dirname(identity_path)).mode, 0o7777) == 0o2770
+  end
+
+  test "Cursor execution identity refuses an SSH launch before wrapping it" do
+    db = String.to_atom("remote_cursor_harness_process_#{System.unique_integer([:positive])}")
+    start_supervised!(Supervisor.child_spec({DB, path: ":memory:", name: db}, id: db))
+
+    assert_raise ArgumentError, ~r/local-only; SSH hosts are unsupported/, fn ->
+      HarnessProcess.prepare_launch(
+        [
+          cmd: ["ssh", "worker", "cursor-agent", "acp"],
+          process_ssh: "worker",
+          cursor_execution_identity: true,
+          cursor_rails_sha256: String.duplicate("a", 64),
+          process_helper: @helper,
+          process_identity_dir: "/remote/cursor"
+        ],
+        db,
+        {:cursor, "shared", "worker"}
+      )
+    end
   end
 
   test "identity capture accepts an unbounded wait", %{tmp_dir: tmp} do
