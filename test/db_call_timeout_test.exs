@@ -3,7 +3,7 @@ defmodule Tightbeam.DBCallTimeoutTest do
 
   import ExUnit.CaptureLog
 
-  alias Tightbeam.DB
+  alias Tightbeam.{DB, Gateway, Org, WorkItems}
 
   # The suspended owner answers nothing, so every call below waits out its own
   # timeout rather than racing real work. The elapsed bounds are deliberately
@@ -109,5 +109,41 @@ defmodule Tightbeam.DBCallTimeoutTest do
     deadline = System.monotonic_time(:millisecond) + 30_000
 
     assert {:ok, [[1]]} = DB.query_until(db, "SELECT 1", [], deadline)
+  end
+
+  @tag timeout: 20_000
+  test "a gateway read survives a transient owner queue longer than the legacy 5s default" do
+    Application.delete_env(:tightbeam, :db_call_timeout_ms)
+    db = start_supervised!({DB, path: ":memory:", name: nil})
+    :ok = Org.ensure_schema(db)
+    :ok = WorkItems.ensure_schema(db)
+    parent = self()
+
+    blocker =
+      Task.async(fn ->
+        DB.transaction(db, fn _txn ->
+          send(parent, {:db_owner_blocked, self()})
+
+          receive do
+            :release_db_owner -> :ok
+          end
+        end)
+      end)
+
+    assert_receive {:db_owner_blocked, ^db}
+    Process.send_after(db, :release_db_owner, 5_250)
+
+    {elapsed, result} =
+      elapsed_ms(fn ->
+        Gateway.handlers(%{db: db})["work-item-list"].(%{
+          principal: {:user, "flynn"},
+          params: %{}
+        })
+      end)
+
+    assert %{workItems: []} = result
+    assert elapsed >= 5_000
+    assert elapsed < 15_000
+    assert {:ok, :ok} = Task.await(blocker, 10_000)
   end
 end
