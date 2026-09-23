@@ -113,8 +113,12 @@ defmodule Tightbeam.Harness do
               {:subagent_start | :subagent_stop, map()} | :skip
   @callback fetch_catalog(map()) :: {:ok, [map()]} | {:error, term()}
 
+  @doc "Whether this harness's installed local client owns acceptance of an uncataloged model id."
+  @callback local_client_model_authority?(Tightbeam.Model.t()) :: boolean()
+
   @optional_callbacks preflight_launch: 3,
-                      warm_home: 2
+                      warm_home: 2,
+                      local_client_model_authority?: 1
 
   @spec preflight_launch(module(), target(), String.t(), keyword()) :: preflight_result()
   def preflight_launch(module, target, home, opts) do
@@ -143,6 +147,15 @@ defmodule Tightbeam.Harness do
 
   @spec probe_cli(module(), target()) :: probe_result()
   def probe_cli(module, target), do: module.probe_cli(target)
+
+  @doc "Ask a harness whether its installed local client, rather than its catalog, accepts this id."
+  @spec local_client_model_authority?(binary(), Tightbeam.Model.t()) :: boolean()
+  def local_client_model_authority?(harness, model) when is_binary(harness) do
+    module = parse!(harness)
+
+    function_exported?(module, :local_client_model_authority?, 1) and
+      module.local_client_model_authority?(model)
+  end
 
   @callback conformance_vectors() :: %{
               required(String.t()) => [

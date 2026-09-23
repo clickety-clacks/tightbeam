@@ -214,7 +214,6 @@ defmodule Tightbeam.Harness.Pi do
       permission_mode: "medium",
       effort_config: "thought_level",
       resident_model_switch: :in_place,
-      model_option_aliases: %{},
       canonical_model_prefixes: canonical_model_prefixes(session)
     }
   end

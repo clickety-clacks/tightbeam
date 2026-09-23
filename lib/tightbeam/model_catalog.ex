@@ -254,8 +254,7 @@ defmodule Tightbeam.ModelCatalog do
 
   @doc """
   A catalog entry as prose, for a refusal that has to say what IS available.
-  Harness-agnostic, and for claude it reflects the selectable filter rather than
-  the raw API list.
+  Harness-agnostic; it describes the provider-derived inventory entry unchanged.
   """
   @spec describe_entry(entry()) :: String.t()
   def describe_entry(entry) do

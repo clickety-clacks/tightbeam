@@ -4370,6 +4370,23 @@ defmodule Tightbeam.Gateway do
   # verb's named refusal rather than as a raw JSON-RPC envelope from three layers
   # down. The general error-boundary seam is its own ticket; this is one call
   # site's error made legible.
+  defp apply_failure(:model_unavailable),
+    do: "the installed local client rejected the requested model as unsupported"
+
+  defp apply_failure(:model_readback_unavailable),
+    do: "the installed local client reported success but did not confirm the requested model"
+
+  defp apply_failure({:model_apply_failed, reason}), do: apply_failure(reason)
+
+  defp apply_failure({:adapter_unavailable, reason}),
+    do:
+      "the requested model is unsupported because the installed local client could not " <>
+        "launch it: #{Adapter.failure_text(reason)}"
+
+  defp apply_failure(:adapter_unavailable),
+    do:
+      "the requested model is unsupported because the installed local client could not launch it"
+
   defp apply_failure(%{"message" => message}) when is_binary(message), do: message
   defp apply_failure(reason), do: inspect(reason)
 
@@ -5876,7 +5893,7 @@ defmodule Tightbeam.Gateway do
   end
 
   defp route_spawn_candidate(host, harness, %Model{} = model),
-    do: ModelCatalog.route(host, harness, model, ModelCatalog)
+    do: route_requested_model(host, harness, model)
 
   defp route_spawn_candidate(_host, _harness, _model),
     do: {:error, %{code: "model_unavailable", message: "model must be specified"}}
@@ -6750,8 +6767,8 @@ defmodule Tightbeam.Gateway do
   # cannot re-read the projected home, so the harness refused any model its offered set
   # did not already hold (mike's opus-5 picker-pain) and the raw refusal reached the
   # client as `inspect(reason)` term soup. The fix (apply_tuned_model's resident
-  # branch) forks the conversation, resolves the requested canonical model
-  # through that fork's offered alias vocabulary, and verifies the readback
+  # branch) forks the conversation, sends the requested canonical model exactly,
+  # and verifies the readback
   # before projection -- but that move must never land mid-turn, so it runs at
   # the turn boundary. Ordering is
   # `at_turn_boundary` OUTER, `run_session_mutation` INNER: the lane IS the
@@ -6814,6 +6831,14 @@ defmodule Tightbeam.Gateway do
               |> Map.put(:projection_committed, false)
           end
 
+        {:ok, {:error, {:initial_runtime_config_mismatch, %Model{} = actual}}} ->
+          tune_error(
+            "runtime_config_mismatch",
+            "the prepared local-client runtime reported a different model; the request was not committed"
+          )
+          |> Map.merge(runtime_actual(actual))
+          |> Map.put(:projection_committed, false)
+
         {:ok, {:error, {:runtime_config_unknown, _reason}}} ->
           tune_error(
             "runtime_config_unknown",
@@ -6832,7 +6857,11 @@ defmodule Tightbeam.Gateway do
         {:ok, {:error, reason}} ->
           %{
             ok: false,
-            code: "model_apply_failed",
+            code:
+              if(model_unsupported_reason?(reason),
+                do: "model_unavailable",
+                else: "model_apply_failed"
+              ),
             message:
               "could not switch this session to #{Model.describe(new_ref)}: " <>
                 "#{apply_failure(reason)} (the session could not prepare the new model " <>
@@ -6860,6 +6889,15 @@ defmodule Tightbeam.Gateway do
     }
   end
 
+  defp model_unsupported_reason?(:model_unavailable), do: true
+  defp model_unsupported_reason?(:adapter_unavailable), do: true
+
+  defp model_unsupported_reason?({:model_apply_failed, reason}),
+    do: model_unsupported_reason?(reason)
+
+  defp model_unsupported_reason?({:adapter_unavailable, _reason}), do: true
+  defp model_unsupported_reason?(_reason), do: false
+
   defp project_verified_mismatch(db, session, actual, provider) do
     try do
       _ = Org.set_model(db, session.session_key, actual, provider)
@@ -6885,10 +6923,10 @@ defmodule Tightbeam.Gateway do
                  {harness, "shared", session.host}
                ) do
           case Adapter.knows_session?(adapter, pointer.harness_session_id) do
-            # RESIDENT: Claude bound its offered-model set when it created this
+            # RESIDENT: Claude binds model availability when it creates this
             # session. The adapter moves the conversation to a fresh fork,
-            # chooses only an alias that fork actually advertises, and returns
-            # success only after the harness reads that alias back. Harnesses
+            # sends the exact requested id, and returns success only after the
+            # harness reads the same model back. Harnesses
             # with a live model set update in place. The caller holds the turn
             # boundary, so no switch can land mid-turn. The old Claude session
             # remains resident until the verified model and replacement
@@ -7027,6 +7065,11 @@ defmodule Tightbeam.Gateway do
             _cleanup = close_runtime(db, adapter, sid, error, principal)
             {:error, {:session_config_commit_failed, error}}
         end
+
+      {:candidate_prepare_failed, {:runtime_config_mismatch, %Model{} = actual} = reason, sid,
+       cleanup} ->
+        _cleanup = report_candidate_cleanup(db, sid, reason, principal, cleanup)
+        {:error, {:initial_runtime_config_mismatch, actual}}
 
       {:candidate_prepare_failed, reason, sid, cleanup} ->
         _cleanup = report_candidate_cleanup(db, sid, reason, principal, cleanup)
@@ -7186,19 +7229,46 @@ defmodule Tightbeam.Gateway do
     end
   end
 
-  # A RELAY, not a second opinion. `ModelCatalog.route/3` owns which selections
-  # are routable and why, so every refusal here names the harness, the HOST that
-  # owns the catalog, and the repair on that host — including the lessons this
-  # copy used to hold alone (the client_version filter) and the one it used to
-  # get wrong (a missing tier reported as a missing model).
+  # A harness may make its installed local client authoritative for an exact
+  # model id. Remote inventory cannot establish whether that client accepts the
+  # id, so no remote-catalog state gates the existing local launch path.
+  defp route_requested_model(host, harness, %Model{} = model) do
+    cond do
+      Harness.local_client_model_authority?(harness, model) and
+          not Model.valid_effort?(model.effort) ->
+        {:error,
+         %{
+           code: "invalid",
+           message: "unknown reasoning effort: #{inspect(model.effort)}"
+         }}
+
+      Harness.local_client_model_authority?(harness, model) ->
+        module = Harness.parse!(harness)
+
+        {:ok,
+         %{
+           harness: harness,
+           provider: Atom.to_string(module.credential_provider())
+         }}
+
+      true ->
+        ModelCatalog.route(host, harness, model, ModelCatalog)
+    end
+  end
+
+  # A RELAY, not a second opinion. `route_requested_model/3` owns which
+  # selections reach the local client and which remain catalog-routed.
   #
   # It returns the ROUTED answer, so its callers no longer look the entry up a
   # second time to learn the provider.
   defp validate_catalog_model(host, harness, model, configured_default?) do
     with %Model{} <- model,
-         {:ok, routed} <- ModelCatalog.route(host, harness, model, ModelCatalog) do
+         {:ok, routed} <- route_requested_model(host, harness, model) do
       {:ok, routed}
     else
+      {:error, %{code: _code} = denial} ->
+        {:error, denial}
+
       {:error, %Unroutable{} = unroutable} ->
         warn_dead_default(host, harness, model, configured_default?)
         {:error, routing_error(unroutable)}

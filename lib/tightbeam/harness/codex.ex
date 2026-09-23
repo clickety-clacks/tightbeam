@@ -44,8 +44,7 @@ defmodule Tightbeam.Harness.Codex do
   # anyway, so a platform id is NOT translatable into the adapter's vocabulary
   # by any mapping this repo can compute from spelling — substituting a
   # near-miss would be the silent-downgrade `harness/claude.ex` refuses. Hence a
-  # FILTER to the demonstrably-selectable set, claude's `@adapter_selectable_models`
-  # precedent exactly.
+  # FILTER to the demonstrably-selectable set for the platform route.
   #
   # Injectable (`codex_selectable_models` in the catalog's options, `:all` to
   # disable): the accepted set is the ADAPTER VERSION's, and an operator on a
@@ -226,7 +225,6 @@ defmodule Tightbeam.Harness.Codex do
       permission_mode: "agent-full-access",
       effort_config: "reasoning_effort",
       resident_model_switch: :in_place,
-      model_option_aliases: %{},
       canonical_model_prefixes: ["gpt-"]
     }
   end
@@ -897,17 +895,15 @@ defmodule Tightbeam.Harness.Codex do
   # `gpt-5.1-codex`, recorded on the same adapter+auth that accepted and ran
   # `gpt-5.6-sol`). So the api-key kind defaults to the pinned
   # `@adapter_selectable_models` set — a PURE FILTER over the already-derived
-  # entries, claude's precedent exactly: no probe, no extra fetch, nothing at
-  # boot, and never a substitution.
+  # entries: no probe, no extra fetch, nothing at boot, and never a substitution.
   #
   # The SUBSCRIPTION kind stays unfiltered: its catalog comes from the account
   # route the CLI itself consults, so the two vocabularies share one source
   # there. That claim is now kind-scoped — it was once believed to cover codex
-  # wholesale (see the note on claude's `@adapter_selectable_models`), and the
-  # api-key exercise disproved it for the platform route.
+  # wholesale, and the api-key exercise disproved it for the platform route.
   #
-  # Injectable through the same `state.options` seam claude's pin uses
-  # (`:all` disables): the accepted set is the adapter version's, and a test
+  # Injectable through `state.options` (`:all` disables): the accepted set is
+  # the adapter version's, and a test
   # must be able to exercise derivation without coupling to the table.
   defp selectable_models(state, :subscription),
     do: Map.get(state.options, :codex_selectable_models, :all)

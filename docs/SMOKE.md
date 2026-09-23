@@ -189,13 +189,10 @@ on 2026-07-25:
   mix run --no-start scripts/feature_smoke.exs
   ```
 
-  The claude model must be one the ADAPTER accepts, which is a narrower set than the
-  derived catalog — `fable` and `claude-fable-5` are both refused, and a refusal fails
-  the model apply on every `session/new` and `session/load`. The recipe above used to
-  say `fable`; every real run on record used `claude-sonnet-5` at effort `medium`
-  instead, which is why the stale value was never caught. The accepted list and how to
-  re-probe it live in the note above `@adapter_selectable_models` in
-  `lib/tightbeam/harness/claude.ex`.
+  Claude model ids are passed exactly to the installed local client. The catalog is
+  useful discovery data, not an admission list: the smoke succeeds only when that
+  client accepts the requested id and its readback confirms the same model. A client
+  rejection fails the model apply; Tightbeam never substitutes an alias or older model.
 
   Replace `<catalog-listed-cursor-model>` with a model returned by the target
   org's Cursor catalog. It is an input placeholder, not a default or a claim of

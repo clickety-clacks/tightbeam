@@ -107,6 +107,38 @@ defmodule Tightbeam.Acp.AdapterTest do
              |> Enum.map(& &1["value"])
   end
 
+  test "an exact future Claude id reaches the local client and its rejection is explicit" do
+    exact = Model.new("claude-opus-5-5")
+    {accepted, accepted_capture} = start_adapter(harness: :claude)
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_session(accepted, exact, "/tmp", [], "guidance")
+
+    assert {:ok, ^exact} = Adapter.current_model(accepted, "sess-1")
+
+    assert ["claude-opus-5-5"] =
+             accepted_capture
+             |> captured_requests()
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+             )
+             |> Enum.map(& &1["value"])
+
+    {rejected, rejected_capture} =
+      start_adapter(harness: :claude, fail_mode: "model-invalid-params")
+
+    assert {:error, :model_unavailable} =
+             Adapter.new_session(rejected, exact, "/tmp", [], "guidance")
+
+    assert ["claude-opus-5-5"] =
+             rejected_capture
+             |> captured_requests()
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and &1["configId"] == "model")
+             )
+             |> Enum.map(& &1["value"])
+  end
+
   test "Fast is normalized from Claude fast and Codex fast-mode live options" do
     {claude, _capture_path} = start_adapter(fail_mode: "fast-live")
     assert {:ok, "sess-1"} = Adapter.new_session(claude, nil, "/tmp", [], "guidance")
@@ -366,6 +398,18 @@ defmodule Tightbeam.Acp.AdapterTest do
         }
 
         if (failMode === "silent-model-no-take" && m.params.configId === "model") {
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "model-success-different" && m.params.configId === "model") {
+          models[m.params.sessionId] = "sonnet";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "candidate-concrete-default-effort" && m.params.configId === "model") {
+          models[m.params.sessionId] = m.params.value;
+          efforts[m.params.sessionId] = "medium";
+          return send({ id: m.id, result: configOptions(m.params.sessionId) });
+        }
+        if (failMode === "candidate-concrete-default-effort" && m.params.configId === "effort") {
           return send({ id: m.id, result: configOptions(m.params.sessionId) });
         }
         if (m.params.configId === "model") models[m.params.sessionId] = m.params.value;
@@ -810,7 +854,7 @@ defmodule Tightbeam.Acp.AdapterTest do
              |> Enum.map(& &1["method"])
   end
 
-  test "Claude model switch forks the conversation and applies the model to the new session" do
+  test "Claude model switch sends the exact id once and never falls back to an alias" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "canonical-no-take-then-alias")
 
@@ -822,7 +866,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     switched_model = Model.new("claude-opus-4-8", context: "1m", effort: "high")
 
-    assert {:ok, "sess-fork-1"} =
+    assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -831,16 +875,6 @@ defmodule Tightbeam.Acp.AdapterTest do
                [],
                "new guidance"
              )
-
-    assert Adapter.knows_session?(adapter, "sess-1")
-    assert Adapter.knows_session?(adapter, "sess-fork-1")
-
-    assert {:ok, ^switched_model} = Adapter.current_model(adapter, "sess-fork-1")
-
-    assert {:ok, switchable} = Adapter.switchable_models(adapter, "sess-fork-1")
-    assert Model.new("claude-opus-4-8", context: "1m") in switchable
-    assert Model.new("claude-sonnet-5") in switchable
-    refute Model.new("claude-opus-5") in switchable
 
     requests = captured_requests(capture_path)
 
@@ -855,7 +889,11 @@ defmodule Tightbeam.Acp.AdapterTest do
           request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
       end)
 
-    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]", "opus[1m]"]
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]"]
+
+    assert Enum.any?(requests, fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-fork-1"
+           end)
   end
 
   test "Claude model switch accepts canonical Opus 5 only when public readback identifies Opus 5" do
@@ -902,7 +940,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
-    assert {:error, {:model_apply_failed, :model_unavailable}} =
+    assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -919,7 +957,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
       end)
 
-    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]", "opus[1m]"]
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]"]
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-fork-1")
 
     assert Enum.any?(captured_requests(capture_path), fn request ->
@@ -927,7 +965,7 @@ defmodule Tightbeam.Acp.AdapterTest do
            end)
   end
 
-  test "Claude model switch refuses a canonical model absent from the fork vocabulary" do
+  test "Claude model switch reports a successful response whose readback omits the model" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "canonical-opus5-unavailable")
 
@@ -936,7 +974,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
-    assert {:error, {:model_apply_failed, :model_unavailable}} =
+    assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -970,7 +1008,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
-    assert {:error, {:model_apply_failed, :model_unavailable}} =
+    assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -1605,6 +1643,83 @@ defmodule Tightbeam.Acp.AdapterTest do
              request["method"] == "session/close" and
                request["sessionId"] == "sess-1"
            end)
+  end
+
+  test "a candidate whose successful readback names another model is closed and rejected" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "model-success-different")
+
+    assert {:error,
+            {:session_prepare_failed,
+             {:runtime_config_mismatch, %Model{family: "sonnet", effort: nil, context: nil}},
+             "sess-1", %{status: "verified", reason: nil}}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("claude-opus-5-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+
+    refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "a candidate accepts the client's concrete effort when the request omitted effort" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "candidate-concrete-default-effort")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("claude-opus-5-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert {:ok, %Model{family: "claude-opus-5-5", effort: "medium", context: nil}} =
+             Adapter.current_model(adapter, "sess-1")
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and request["configId"] == "effort"
+           end)
+
+    refute Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+  end
+
+  test "a candidate rejects a concrete effort that differs from an explicit request" do
+    {adapter, capture_path} =
+      start_adapter(harness: :claude, fail_mode: "candidate-concrete-default-effort")
+
+    assert {:error,
+            {:session_prepare_failed,
+             {:runtime_config_mismatch,
+              %Model{family: "claude-opus-5-5", effort: "medium", context: nil}}, "sess-1",
+             %{status: "verified", reason: nil}}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("claude-opus-5-5", effort: "high"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/set_config_option" and
+               request["configId"] == "effort" and request["value"] == "high"
+           end)
+
+    assert Enum.any?(captured_requests(capture_path), fn request ->
+             request["method"] == "session/close" and request["sessionId"] == "sess-1"
+           end)
+
+    refute Adapter.knows_session?(adapter, "sess-1")
   end
 
   test "strict apply does not retry an invalid-params model refusal" do

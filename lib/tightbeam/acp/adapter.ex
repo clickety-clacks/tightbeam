@@ -723,6 +723,7 @@ defmodule Tightbeam.Acp.Adapter do
 
         with {:ok, applied_model} <-
                establish_new_session_model(state, sid, model, result, request_timeout),
+             :ok <- verify_candidate_model(report_cleanup?, model, applied_model),
              :ok <- set_mode(state, sid, request_timeout) do
           state =
             state
@@ -761,6 +762,14 @@ defmodule Tightbeam.Acp.Adapter do
       {:error, reason} -> %{status: "unverified", reason: reason}
     end
   end
+
+  defp verify_candidate_model(true, %Model{} = requested, %Model{} = actual)
+       when requested.family != actual.family or
+              requested.context != actual.context or
+              (not is_nil(requested.effort) and requested.effort != actual.effort),
+       do: {:error, {:runtime_config_mismatch, actual}}
+
+  defp verify_candidate_model(_report_cleanup?, _requested, _actual), do: :ok
 
   defp load_session_reply(state, sid, model, cwd, mcp_servers, guidance, request_timeout) do
     case Conn.request(
@@ -859,12 +868,10 @@ defmodule Tightbeam.Acp.Adapter do
     end
   end
 
-  # Claude's alias vocabulary changes meaning across adapter releases. The
-  # canonical model is therefore always the first candidate; offered aliases
-  # are fallback candidates only. Neither a successful RPC nor the static alias
-  # table proves what ran. Only the public config readback -- currentValue plus
-  # the selected option's init-derived name/description -- may confirm the
-  # requested canonical identity before the caller projects it into the DB.
+  # The exact canonical id is the only candidate. Neither a successful RPC nor
+  # an offered alias proves what ran. Only the public config readback --
+  # currentValue plus the selected option's init-derived name/description -- may
+  # confirm the requested canonical identity before the caller projects it.
   defp apply_fork_model(state, sid, %Model{} = model, offered, request_timeout) do
     with {:ok, model_result} <-
            apply_fork_model_candidates(state, sid, model, offered, request_timeout),
@@ -905,7 +912,7 @@ defmodule Tightbeam.Acp.Adapter do
         if readback_confirms_model?(model_result, state.preset, model) do
           {:ok, model_result}
         else
-          try_fork_model_candidates(remaining, state, sid, model, request_timeout)
+          {:error, :model_readback_unavailable}
         end
 
       {:error, :model_unavailable} ->
@@ -1334,7 +1341,7 @@ defmodule Tightbeam.Acp.Adapter do
     canonical = Model.to_ref(model_ref)
 
     aliases =
-      state.preset.model_option_aliases
+      Map.get(state.preset, :model_option_aliases, %{})
       |> Enum.filter(fn {_wire, public} -> public == canonical end)
       |> Enum.map(&elem(&1, 0))
 
@@ -1354,9 +1361,10 @@ defmodule Tightbeam.Acp.Adapter do
 
       case result do
         {:ok, response} ->
-          if read_back?(response, "model", value),
-            do: {:halt, {:ok, response}},
-            else: {:halt, {:error, :model_verification_failed}}
+          if Harness.local_client_model_authority?(to_string(state.harness), model_ref) or
+               read_back?(response, "model", value),
+             do: {:halt, {:ok, response}},
+             else: {:halt, {:error, :model_verification_failed}}
 
         {:error, :model_unavailable} ->
           {:cont, {:error, :model_unavailable}}
@@ -1382,7 +1390,7 @@ defmodule Tightbeam.Acp.Adapter do
     canonical = Model.to_ref(model_ref)
 
     aliases =
-      state.preset.model_option_aliases
+      Map.get(state.preset, :model_option_aliases, %{})
       |> Enum.filter(fn {_wire, public} -> public == canonical end)
       |> Enum.map(&elem(&1, 0))
 
@@ -1569,12 +1577,18 @@ defmodule Tightbeam.Acp.Adapter do
   defp model_value_candidates(preset, result, %Model{} = model) do
     canonical_ref = Model.to_ref(model)
 
-    aliases =
-      result
-      |> model_option_values()
-      |> Enum.filter(&(Map.get(preset.model_option_aliases, &1) == canonical_ref))
+    if Map.get(preset, :model_wire_by_name, false) do
+      aliases =
+        result
+        |> model_option_values()
+        |> Enum.filter(
+          &(Map.get(Map.get(preset, :model_option_aliases, %{}), &1) == canonical_ref)
+        )
 
-    Enum.uniq([canonical_ref | aliases] ++ wire_values_by_name(preset, result, model))
+      Enum.uniq([canonical_ref | aliases] ++ wire_values_by_name(preset, result, model))
+    else
+      [canonical_ref]
+    end
   end
 
   # Cursor's ACP publishes each selectable model as a decorated wire value
@@ -1615,20 +1629,9 @@ defmodule Tightbeam.Acp.Adapter do
   end
 
   defp confirmed_option_models(preset, option) do
-    public_model = public_option_model(preset, option)
-
-    mapped_candidates =
-      case Map.get(preset.model_option_aliases, option["value"]) do
-        value when is_binary(value) -> [Model.parse_ref(value)]
-        _ -> []
-      end
-
-    confirmed_candidates =
-      Enum.filter(mapped_candidates, &public_option_confirms_model?(option, public_model, &1))
-
-    case {confirmed_candidates, public_model} do
-      {[], %Model{} = model} -> [model]
-      {models, _} -> models
+    case public_option_model(preset, option) do
+      %Model{} = model -> [model]
+      nil -> []
     end
   end
 
@@ -1707,7 +1710,7 @@ defmodule Tightbeam.Acp.Adapter do
       # the static alias table already names the option's public identity
       # (`auto`, whose display name "Auto Balance" is a label, not a ref).
       Map.get(preset, :model_wire_by_name, false) and is_binary(option["name"]) and
-          not Map.has_key?(preset.model_option_aliases, value) ->
+          not Map.has_key?(Map.get(preset, :model_option_aliases, %{}), value) ->
         Model.parse_ref(option["name"])
 
       true ->
@@ -1731,8 +1734,6 @@ defmodule Tightbeam.Acp.Adapter do
         nil
     end
   end
-
-  defp public_option_confirms_model?(_option, nil, _requested), do: false
 
   defp public_option_confirms_model?(option, %Model{} = public, %Model{} = requested) do
     public.family == requested.family and

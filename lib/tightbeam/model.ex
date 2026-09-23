@@ -35,6 +35,13 @@ defmodule Tightbeam.Model do
           context: String.t() | nil
         }
 
+  @efforts ~w(low medium high xhigh max ultra)
+
+  @doc "Whether an effort is in Tightbeam reasoning vocabulary."
+  @spec valid_effort?(String.t() | nil) :: boolean()
+  def valid_effort?(nil), do: true
+  def valid_effort?(effort), do: effort in @efforts
+
   @doc """
   Build an identity from a family and optional `:effort` / `:context`.
 
