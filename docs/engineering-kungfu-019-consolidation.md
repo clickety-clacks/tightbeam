@@ -648,3 +648,58 @@ retained context and total completion cost. The engineering tables no longer use
 without a compulsory cheaper-model trial or reassessment cadence. The installed
 0.1.8 overlay carries the same policy. Runtime model changes use supported tuning
 and preserve existing authority, work holds and custody.
+
+## 23 September amendment: team consultation and durable staffing
+
+This source-only correction reconciles early PO team advice with delivery authority
+and distinguishes harness helpers from durable staffing. The orchestrator kernel
+owns the consultation trigger and sole-coupled-lane discretion. The product-owner
+kernel points to that contract; team-planner retains its existing advisory role and
+no-fixed-graph rule. The operating manual owns helper accountability and adoption;
+the baseline tightbeam-dispatching skill owns effect classification. Harness-support's
+observability-only subagent semantics remain unchanged.
+
+At canonical base `012d2f86b3f56d72eb22cc916f8951818c1ec772`, neither
+`product-delivery` nor `team-design` exists as a source skill or an election. The
+blanket pre-staff PO card, closure wait and mandatory child-owner language reported
+in the installed product-delivery skill is absent from this source composition.
+Do not recreate that skill to amend it. The addressed-PO duty already lives in the
+kernel; its consultation contract replaces the source's unqualified consultation
+sentence. Model activity eligibility remains in preferred-models and is unchanged.
+
+Source, published identity and session uptake are separate. An organization's
+`guidance/operating-manual.md` overrides the shipped manual; retained local skills
+and manifests can also differ. This amendment does not update the historical
+`ops/engineering-kungfu/gibson-018/overlay`, its publication receipts or any installed
+identity. A later authorized publication must reconcile those local differences,
+including any retained product-delivery skill, through the supported identity seam.
+Source acceptance alone establishes neither live applicability nor session refresh.
+
+### Offline cold-read examples
+
+Read the complete orchestrator, PO and team-planner compositions, their included
+fragments, elected and baseline skills, manual and model activity contract against
+these cases. They are author/reviewer judgment examples, not a simulated agent run
+or a runtime staffing gate. Ordinary source/projection checks prove composition and
+mechanism names; independent guidance review judges the resulting instructions.
+
+| Situation | Expected decision and evidence |
+| --- | --- |
+| The user asks for an appropriate number of orchestrators on a broad feature. | Ask the addressed PO for bounded team advice early enough to affect staffing. Adopt or amend with a reason; an appropriate count can be zero additional orchestrators. Report actual durable custody, not task labels. |
+| An established product starts a substantial feature with plausible independent lanes. | Existing product status does not waive consultation. Ask for advice on that decomposition; give child orchestrators only the independently managed lanes whose decisions and traffic justify them. |
+| A familiar repair has one coupled producer/reviewer lane. | The current delivery owner proceeds without a new PO gate or relay manager; use durable producer and independent reviewer assignments as needed. Record why another orchestrator would only forward traffic. |
+| A prior combined spirit/team judgment addresses the same owners, lanes and custody. | Reuse its applicable content without another consultation card. Staffing authority stays with delivery; administrative card state does not replace reading the judgment. |
+| A spirit-only card is approved, completed or surrendered before a consequential topology choice. | Its product judgment remains usable where applicable, but it supplies no missing team advice. Ask the bounded team question rather than infer a topology judgment from approval or closure. |
+| The addressed PO is unavailable. | Keep the dependency and recovery owner visible and continue separable authorized work. A queued notice is not advice. Consultation adds no permission token or veto over otherwise authorized staffing; conditional model-activity eligibility still has its own requirements. |
+| Two harness helpers return analysis or code. | Call them helpers under the supervising Tightbeam holder. Markers do not add sessions, archetypes, assignments, lane owners or independent reviewers. Preserve exact outputs and verification limits; internal steps need no separate cards. |
+| A qualified existing Tightbeam session accepts helper output. | Reconcile active writes and record exactly what that owner accepts under an assignment on the same work item. Verify session, archetype, spawnedBy, holder and opener. Adoption is current custody, not retroactive authorship, new spawning ancestry or independent acceptance of helper self-report. |
+| A PO recommends a team or guidance correction; another assignment authors/publishes policy and a third reviews it. | Bounded consultation is coordination, findings-only assessment evidence, the authoritative guidance change policy, and independent review review with applicable producer linkage. Record and route a historical classification mismatch; neither a dummy code review nor relabeling policy as coordination is a remedy. |
+
+Mechanism references: `Identity.snapshot_at!/4` composes role includes, universal
+roots and elected non-baseline skills, with the org manual taking precedence over
+the shipped fallback. Baseline skills are supplied separately by `Homes`.
+`Gateway.create_spawn` records the selected archetype and spawning caller;
+`list` exposes session identity and ancestry. `Assignments` exposes holder, opener,
+work-item and producer-review links. Its omitted effect defaults to code and a
+producer-linked review resolves to review. No automatic helper promotion, marker
+obligation or retrospective custody is introduced by this amendment.

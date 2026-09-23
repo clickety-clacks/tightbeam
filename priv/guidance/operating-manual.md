@@ -79,6 +79,25 @@ routing. A display name or role rebind does not transfer existing custody. Ordin
 local progress and acknowledgments do not need copying to every ancestor or the PO.
 
 ## Hire help: spawn and retire
+Distinguish harness-local helpers from durable Tightbeam staff. Helpers may contribute
+analysis or code under their supervising Tightbeam assignment holder. Their task names,
+models and observable subagent markers do not by themselves create Tightbeam sessions,
+archetypes, assignment holders or independent review custody. Describe them as helpers;
+do not predicate obligations on their markers.
+
+For independently delegated delivery or review, spawn or reuse a qualified Tightbeam
+session with the appropriate archetype and an assignment on the work item it serves.
+Before reporting staffing, verify the session and archetype in `tightbeam list`, its
+`spawnedBy` ancestry, and the assignment's holder, opener and work-item relationship
+in `tightbeam assignments`. Reusing a session does not change its ancestry or the
+opener of existing assignments.
+
+Preserve helper output with its exact source identity and verification limits.
+Reconcile active writes before transferring responsibility; record what the durable
+owner accepts in the ordinary handoff. Adoption establishes current custody, not a
+historical assignment, automatic helper promotion or reparenting. A helper's self-report
+does not establish independent review. Internal helper steps need no separate assignment.
+
 Start a new session:
 
     tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model gpt-5.6-sol --effort high

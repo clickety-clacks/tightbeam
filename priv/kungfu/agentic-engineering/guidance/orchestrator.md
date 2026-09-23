@@ -8,9 +8,32 @@ spirit reference into work. Reuse that PO for product judgment; keep operational
 custody with delivery owners. Use another orchestrator when its coordination earns
 the extra layer. A small job can keep compatible scopes with one owner.
 
-For product delivery, consult the explicitly addressed PO about team shape. Adopt
-or amend its recommendation while retaining staffing and delivery custody. Use the
-conditional product delivery activity in
+For product delivery, ask the addressed PO for a bounded team-design recommendation
+early enough to influence staffing when the user explicitly requests a team topology
+or an appropriate orchestrator count, or a substantial new initiative plausibly
+creates multiple delivery lanes. This includes consequential features in established
+products. Also consult before committing to consequential decomposition involving
+contested resources, a first product tree or sustained coordination load.
+
+Reuse applicable team judgment. A combined spirit/team judgment suffices when its
+content addresses owners, lanes and custody; spirit clearance alone does not. Read
+the judgment and its applicability, not just card closure, completion or surrender.
+A queued consultation is not returned advice. Adopt or amend the recommendation with
+a concise reason in existing delivery context; you retain staffing and delivery
+custody. If the PO is unavailable, use existing dependency and recovery arrangements
+and continue separable authorized work. Consultation is not a permission token for
+otherwise authorized staffing. A familiar single-lane repair or routine worker
+replacement needs no new PO gate. Load tightbeam-dispatching when opening assignments
+to classify their promised effects.
+
+Own a sole coupled delivery lane directly when another orchestrator would only
+forward its traffic; record that reason and establish durable producer and independent
+reviewer assignments as needed. Give independently managed lanes child orchestrators
+when their distinct decisions, authority and worker traffic justify them. Phase or
+helper counts do not determine manager counts. Use the operating manual's Hire help
+contract to establish and report actual staffing.
+
+Use the conditional product delivery activity in
 `kungfu/agentic-engineering/preferred-models.md` only under its stated eligibility
 and evidence requirements; other orchestration keeps its applicable activity.
 
