@@ -34,6 +34,8 @@ selection. Use their default order when the job supplies no reason to choose
 differently. Choose another qualified candidate when its task fit, retained context,
 expected total cost or availability better serves the outcome. A default or model
 preference is not a compulsory first attempt, a price ranking or automatic fallback.
+Explicit model/harness requirements, including the independent-review contract,
+remain binding; general selection discretion does not waive them.
 Use available cost and usage evidence without inventing prices or guaranteed cache
 reuse across sessions, models or harnesses. Routine selection needs no benchmark,
 new scoring ceremony or approval request.
