@@ -1155,7 +1155,7 @@ defmodule Tightbeam.GatewayTest do
       {"", 0}
     end
 
-    Gateway.children(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, sh))
+    Gateway.children(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, versioned_sh(sh)))
 
     token =
       base_dir
@@ -2134,6 +2134,7 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(Path.dirname(adapter))
     File.write!(adapter, "#!/bin/sh\n")
     File.chmod!(adapter, 0o755)
+    stage_adapter_manifest!(base_dir, Tightbeam.Harness.Fixture)
     Archetypes.load!(base_dir)
     candidate = start_supervised!({CandidateAdapterStub, self()})
     start_supervised!({CoordinatorStub, candidate})
@@ -2193,6 +2194,7 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(Path.dirname(adapter))
     File.write!(adapter, "#!/bin/sh\n")
     File.chmod!(adapter, 0o755)
+    stage_adapter_manifest!(base_dir, Tightbeam.Harness.Fixture)
     learn_engineering_identity!(base_dir)
     candidate = start_supervised!({CandidateAdapterStub, self()})
     start_supervised!({CoordinatorStub, candidate})
@@ -2290,6 +2292,7 @@ defmodule Tightbeam.GatewayTest do
     File.mkdir_p!(Path.dirname(adapter))
     File.write!(adapter, "#!/bin/sh\n")
     File.chmod!(adapter, 0o755)
+    stage_adapter_manifest!(base_dir, Tightbeam.Harness.Fixture)
     Archetypes.load!(base_dir)
     candidate = start_supervised!({CandidateAdapterStub, self()})
     start_supervised!({CoordinatorStub, candidate})
@@ -2517,7 +2520,7 @@ defmodule Tightbeam.GatewayTest do
         :openai, "eurisko" -> {:needs_onboarding, :missing}
         :openai, "racter" -> :onboarded
       end)
-      |> Map.put(:sh, fn _command -> {"", 0} end)
+      |> Map.put(:sh, versioned_sh(fn _command -> {"", 0} end))
 
     assert %{session_key: session_key} =
              Gateway.handlers(config)["spawn"].(%{
@@ -2550,7 +2553,7 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
-      |> Map.put(:sh, fn _command -> {"", 0} end)
+      |> Map.put(:sh, versioned_sh(fn _command -> {"", 0} end))
 
     assert %{session_key: session_key} =
              Gateway.handlers(config)["spawn"].(%{
@@ -2631,7 +2634,7 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
-      |> Map.put(:sh, sh)
+      |> Map.put(:sh, versioned_sh(sh))
 
     assert %{session_key: session_key} =
              Gateway.handlers(config)["spawn"].(%{
@@ -2673,7 +2676,7 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
-      |> Map.put(:sh, sh)
+      |> Map.put(:sh, versioned_sh(sh))
 
     assert %{session_key: session_key} =
              Gateway.handlers(config)["spawn"].(%{
@@ -2717,7 +2720,7 @@ defmodule Tightbeam.GatewayTest do
       |> Map.put(:default_harness, :codex)
       |> Map.put(:default_model, Model.new("gpt-5.6-sol", effort: "medium"))
       |> Map.put(:credential_status, fn :openai, _host -> :onboarded end)
-      |> Map.put(:sh, sh)
+      |> Map.put(:sh, versioned_sh(sh))
 
     assert %{session_key: session_key} =
              Gateway.handlers(config)["spawn"].(%{
@@ -2858,7 +2861,7 @@ defmodule Tightbeam.GatewayTest do
     config =
       gateway_config(base_dir, ctx.db, 0)
       |> Map.delete(:credential_status)
-      |> Map.put(:sh, sh)
+      |> Map.put(:sh, versioned_sh(sh))
 
     handlers = Gateway.handlers(config)
     child_id = {Credentials, machine}
@@ -3428,7 +3431,8 @@ defmodule Tightbeam.GatewayTest do
       {"", 0}
     end
 
-    handlers = Gateway.handlers(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, sh))
+    handlers =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 11_373) |> Map.put(:sh, versioned_sh(sh)))
 
     assert %{host: ^machine} =
              handlers["register-host"].(%{
@@ -3533,7 +3537,9 @@ defmodule Tightbeam.GatewayTest do
     })
 
     spawn =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, versioned_sh(sh)))[
+        "spawn"
+      ]
 
     assert %{session_key: session_key} =
              spawn.(%{
@@ -3578,7 +3584,10 @@ defmodule Tightbeam.GatewayTest do
     put_host_catalog("testhost", "claude", ["gateway-only-model"])
     put_host_catalog("worker", "claude", ["worker-only-model"])
 
-    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+    spawn =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, versioned_sh(sh)))[
+        "spawn"
+      ]
 
     place = fn host, model, key ->
       spawn.(%{
@@ -3676,7 +3685,10 @@ defmodule Tightbeam.GatewayTest do
     put_host_catalog("worker", "claude", ["worker-only-model"])
     degrade_host_catalog("testhost", "claude", {:needs_onboarding, :no_credential})
 
-    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+    spawn =
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, versioned_sh(sh)))[
+        "spawn"
+      ]
 
     assert %{session_key: session_key} =
              spawn.(%{
@@ -3827,7 +3839,9 @@ defmodule Tightbeam.GatewayTest do
     end
 
     spawn =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["spawn"]
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, versioned_sh(sh)))[
+        "spawn"
+      ]
 
     invalid = [
       nil,
@@ -5389,7 +5403,9 @@ defmodule Tightbeam.GatewayTest do
     end
 
     tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, versioned_sh(sh)))[
+        "tune"
+      ]
 
     result =
       tune.(%{
@@ -5413,7 +5429,9 @@ defmodule Tightbeam.GatewayTest do
     end
 
     tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, versioned_sh(sh)))[
+        "tune"
+      ]
 
     assert tune.(%{
              origin: "user:flynn",
@@ -5433,7 +5451,9 @@ defmodule Tightbeam.GatewayTest do
     end
 
     tune =
-      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, sh))["tune"]
+      Gateway.handlers(gateway_config(base_dir, ctx.db, 0) |> Map.put(:sh, versioned_sh(sh)))[
+        "tune"
+      ]
 
     assert %{code: "host_unready", message: message} =
              tune.(%{
@@ -6582,7 +6602,7 @@ defmodule Tightbeam.GatewayTest do
 
     config =
       gateway_config(base, ctx.db, 4_321)
-      |> Map.put(:sh, sh)
+      |> Map.put(:sh, versioned_sh(sh))
       |> Map.put(:sh_out, sh_out)
 
     children = Gateway.children(config)
@@ -9010,6 +9030,38 @@ defmodule Tightbeam.GatewayTest do
     }
   end
 
+  defp versioned_sh(sh) do
+    fn command ->
+      joined = Enum.join(command, " ")
+
+      if String.contains?(joined, "node -p") do
+        module =
+          Enum.find(
+            Tightbeam.Harness.all(),
+            &String.contains?(joined, &1.install_package())
+          )
+
+        if module, do: {module.adapter_version() <> "\n", 0}, else: sh.(command)
+      else
+        sh.(command)
+      end
+    end
+  end
+
+  defp stage_adapter_manifest!(base_dir, module) do
+    manifest =
+      Path.join([
+        base_dir,
+        "adapters",
+        "node_modules",
+        module.install_package(),
+        "package.json"
+      ])
+
+    File.mkdir_p!(Path.dirname(manifest))
+    File.write!(manifest, JSON.encode!(%{version: module.adapter_version()}))
+  end
+
   defp make_model_unknown(db, session_key) do
     :ok = DB.execute(db, "PRAGMA foreign_keys=OFF")
 
@@ -9058,6 +9110,21 @@ defmodule Tightbeam.GatewayTest do
       File.mkdir_p!(Path.dirname(adapter))
       File.write!(adapter, "#!/bin/sh\nexit 0\n")
       File.chmod!(adapter, 0o755)
+
+      module =
+        if bin == "claude-agent-acp", do: Tightbeam.Harness.Claude, else: Tightbeam.Harness.Codex
+
+      manifest =
+        Path.join([
+          base_dir,
+          "adapters",
+          "node_modules",
+          module.install_package(),
+          "package.json"
+        ])
+
+      File.mkdir_p!(Path.dirname(manifest))
+      File.write!(manifest, JSON.encode!(%{version: module.adapter_version()}))
     end
 
     if ready? do

@@ -405,7 +405,7 @@ defmodule Tightbeam.Harness.Support do
   defp observe_adapter(module, profile, locality, presence) do
     with_tmp("adapter", fn base ->
       adapter = adapter_path(base, profile.adapter_bin, locality)
-      bundle = install_fake_adapter!(adapter, profile)
+      bundle = install_fake_adapter!(adapter, profile, module)
       File.chmod!(bundle, 0o751)
       if presence == :absent, do: File.rm!(adapter)
 
@@ -430,6 +430,9 @@ defmodule Tightbeam.Harness.Support do
             File.write!(adapter, "#!/bin/sh\n")
             File.chmod!(adapter, 0o755)
             {"", 0}
+
+          String.contains?(joined, "node -p") ->
+            {profile.adapter_version <> "\n", 0}
 
           true ->
             {"", 0}
@@ -947,7 +950,7 @@ defmodule Tightbeam.Harness.Support do
   defp adapter_path(base, adapter_bin, _locality),
     do: Path.join([base, "adapters", "node_modules", ".bin", adapter_bin])
 
-  defp install_fake_adapter!(adapter, profile) do
+  defp install_fake_adapter!(adapter, profile, module) do
     node_modules = adapter |> Path.dirname() |> Path.dirname()
     package_dir = Path.join([node_modules, "@agentclientprotocol", profile.adapter_package])
     bundle = Path.join([package_dir, "dist", profile.adapter_bundle])
@@ -959,6 +962,13 @@ defmodule Tightbeam.Harness.Support do
       Path.join(package_dir, "package.json"),
       JSON.encode!(%{"version" => profile.adapter_version})
     )
+
+    # Spinup checks the install package's version before invoking the adapter's
+    # patcher. The fixture's install package has a different scope from its
+    # fake patch bundle, so stage both pieces of truthful metadata.
+    install_manifest = Path.join([node_modules, module.install_package(), "package.json"])
+    File.mkdir_p!(Path.dirname(install_manifest))
+    File.write!(install_manifest, JSON.encode!(%{"version" => profile.adapter_version}))
 
     File.write!(bundle, profile.source)
     bundle
