@@ -117,21 +117,21 @@ underlying evidence. Message reduction must not hide a consequential failure.
 
 Canonical names and selection mechanics live in guidance/preferred-models.md.
 Engineering activity orders and capability floors live in the bundle's preferred-models.md.
-The initial policy covers mixed, Codex-only and Claude-only organizations, with complete
-single-family fallback orders. Family restrictions apply before availability fallback.
-A missing credential does not authorize another family.
+Use the current activity table for exact candidates, efforts, capability floors and
+availability fallback. It specifies gpt-6-sol/low for PDO and orchestration,
+gpt-6-luna/max for ordinary implementation with stronger-model discretion, and
+Claude Opus 5.5/high for specification. Preserve historical evaluation results as
+actually run; they do not override current defaults.
 
-Use Sol for bounded or sustained familiar delivery, Astra/Fable for deep planning and
-product judgment, and Luna xhigh for well-scoped coding with stronger independent review.
-Choose a stronger coder directly when architecture, critical behavior or difficult bugs
-require it. Astra low is not a sustained-work fallback. A quality failure requires
-reassessment; availability fallback is not a prescription to use a weaker model.
-
-Mixed-mode review prefers the other provider family among qualified candidates in its
-review row, preserving each family's internal order. Same-family independent review
-remains eligible, including single-family organizations. Provider diversity is not a
-new completion gate. When both families materially produced the work, use the ordinary
-ordered row with fresh independent authorship.
+The complete workflow requires both Codex and Claude. Claude-only operation cannot
+supply the current Codex orchestration/implementation choices or Codex review of
+Claude-authored work. Codex-only operation cannot supply Claude specification or
+Claude review of Codex-authored work. Useful single-harness tasks remain possible;
+they do not establish end-to-end support. Review uses the harness opposite the actual
+producer: Opus 5.5/high for Codex-produced work and Astra 6/high for Claude-produced
+work. A missing credential does not authorize a same-harness substitute or a new
+model choice. Apply the shared selection guidance's mixed-producer rule when both
+harnesses authored work.
 
 Model choices remain decisions performed by the assigning agent through supported
 spawn/tune operations. Archetype preference metadata does not automatically execute
