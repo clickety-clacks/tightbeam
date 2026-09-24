@@ -15,6 +15,8 @@
    together, and remove instructions that oppose each other across those homes.
 7. Write direct, concise instructions. Role voice, concrete verbs, enough context to act
    without the conversation history.
+   Unless the authoring prompt explicitly names the user, never use their name in
+   guidance. Write "the user".
 8. Revise proportionately. Batch coherent changes, preserve useful content, and do not add a
    procedural layer for every incident.
 

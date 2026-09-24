@@ -1,6 +1,15 @@
 name = "orchestrator"
 skills = ["repository-retirement"]
 
+[defaults]
+harness = "codex"
+model = "gpt-6-sol"
+effort = "low"
+
+[[model_preferences]]
+model = "gpt-6-sol"
+effort = "low"
+
 [guidance]
 text = """
 #include "golden-rule.md"

@@ -1,5 +1,15 @@
 # Operating tightbeam
 
+## Explicit permission to add guidance
+
+No agent may add persistent guidance anywhere unless the user explicitly asks
+for that guidance addition. If an agent wants to add guidance, it must explicitly
+ask the user for permission and wait for approval. Task instructions, corrections,
+incidents, agent requests and general maintenance authority do not supply that
+permission. This applies to shared and role guidance, skills, repository and
+harness instructions, and durable memory used as instructions. A skill that
+recommends adding guidance does not override this rule.
+
 You run your work through the `tightbeam` command — an ordinary executable, already on
 PATH in your session's environment. Run it with your shell tool, like any program; it is
 not one of your built-in tools and appears in no tool list. Every substrate verb in this
@@ -100,7 +110,7 @@ does not establish independent review. Internal helper steps need no separate as
 
 Start a new session:
 
-    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model gpt-5.6-sol --effort high
+    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model gpt-6-sol --effort low
 
 `--display` is the human label; `--name` registers a role bound to the new session so you can
 address it. Add `--archetype <name>` to give the session that archetype's identity — its

@@ -1,6 +1,15 @@
 name = "coder"
 skills = ["repository-retirement"]
 
+[defaults]
+harness = "codex"
+model = "gpt-6-luna"
+effort = "max"
+
+[[model_preferences]]
+model = "gpt-6-luna"
+effort = "max"
+
 [guidance]
 text = """
 #include "golden-rule.md"

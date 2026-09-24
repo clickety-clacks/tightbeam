@@ -527,6 +527,11 @@ inverse. Credentials are per provider/harness per machine, while harness homes
 are per machine and harness; learning or unlearning changes neither, so it
 never requires onboarding again.
 
+Engineering intake uses an executive orchestrator as the bundle root and establishes
+or reuses each product's PDO and addressed PO. Follow the bundle's intake and shared
+role roster for delivery routing. The neutral root stays neutral before adoption;
+learning a bundle or changing a default does not transfer existing session custody.
+
 ### Then run a real turn
 
 In the connected client, open Main and send `hello, who are you?`. The turn
