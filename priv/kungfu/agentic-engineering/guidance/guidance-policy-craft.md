@@ -15,6 +15,8 @@
    together, and remove instructions that oppose each other across those homes.
 7. Write direct, concise instructions. Role voice, concrete verbs, enough context to act
    without the conversation history.
+   Unless the authoring prompt explicitly names the user, never use their name in
+   guidance. Write "the user".
 8. Revise proportionately. Batch coherent changes, preserve useful content, and do not add a
    procedural layer for every incident.
 
@@ -63,7 +65,8 @@ Mechanical behavior must route and verify without inventing an agent's judgment.
 Whatever must work when inference cannot run belongs in runtime code. Where a process
 needs both, separate deterministic preparation, agent resolution and mechanical
 verification. Preserve constitutional data integrity and attributable independent
-review. Do not hardcode a team graph or require a provider family. Verify the recovery
+review. Do not hardcode a team graph or model policy into the neutral substrate.
+Keep authorized model and harness selection in its shared guidance. Verify the recovery
 route reaches an accountable owner; notification alone is not staffing or fulfillment.
 Prefer existing dependency and completion mechanisms to new workflow markers.
 

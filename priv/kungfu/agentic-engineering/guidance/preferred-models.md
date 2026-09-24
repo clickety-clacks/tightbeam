@@ -7,13 +7,11 @@ activities live in `kungfu/agentic-engineering/preferred-models.md`.
 ## Working set (capsules)
 
 - **gpt-6-astra** — (nickname: astra): deep product, architecture, planning and review judgment. Use high or higher reasoning for sustained work.
-- **gpt-5.6-sol** — (nickname: sol): general engineering and delivery orchestration; increase effort for sustained or coupled work. Can commission a stronger planner.
+- **gpt-6-sol** — (nickname: sol): orchestration at low effort; stronger implementation when unresolved judgment warrants it. Keep technical production with qualified workers.
 - **gpt-5.6-terra** — (nickname: terra): bounded engineering implementation and mechanical work with an inspectable contract.
-- **gpt-5.6-luna** — (nickname: luna): retain the existing medium-effort PDO and mechanical selections and low-effort factual selections.
-- **gpt-6-luna**: use max effort for well-scoped and sustained implementation under an understood architecture. Escalate consequential uncertainty.
-- **claude-opus-5-5**: requested replacement for Fable in specification drafting and independent code review. Keep it out of active defaults while supported exact-ID use on a permitted host and harness remains unproven. No effort or context setting is assumed; retain unknown capability as unknown.
-- **claude-fable-5** — (nickname: fable): deep product judgment, difficult planning, implementation and whole-system review.
-- **claude-opus-5** — (nickname: opus): sustained engineering, orchestration, specification and independent review. This policy explicitly replaces the previous Opus 4.8 mapping.
+- **gpt-6-luna** — (nickname: luna): the coder default at max effort for well-scoped and sustained implementation under an understood architecture. Select a stronger generation-6 model when consequential uncertainty warrants it.
+- **claude-opus-5-5** — (nickname: opus): specification drafting at high effort and independent review of actual Codex-authored work. Qualify each host and harness; success elsewhere does not establish local access. Do not infer an unobserved context setting.
+- **claude-fable-5** — (nickname: fable): retained qualified choice for product judgment, difficult planning and implementation; independent review uses the actual-producer contract below.
 - **claude-sonnet-5** — (nickname: sonnet): bounded orchestration, specification and implementation under an understood contract.
 - **claude-haiku-4-5-20251001** — (nickname: haiku): narrow factual extraction and classification with inspectable evidence. No effort setting is assumed.
 
@@ -36,6 +34,8 @@ selection. Use their default order when the job supplies no reason to choose
 differently. Choose another qualified candidate when its task fit, retained context,
 expected total cost or availability better serves the outcome. A default or model
 preference is not a compulsory first attempt, a price ranking or automatic fallback.
+Explicit model/harness requirements, including the independent-review contract,
+remain binding; general selection discretion does not waive them.
 Use available cost and usage evidence without inventing prices or guaranteed cache
 reuse across sessions, models or harnesses. Routine selection needs no benchmark,
 new scoring ceremony or approval request.
@@ -64,11 +64,14 @@ permitted harness explicitly when spawning. Verify supported settings rather tha
 inventing a similarly named model. Archetype metadata does not make the selection
 or implement fallback on the caller's behalf.
 
-Independent review requires independent session and judgment. In mixed mode, prefer
-the other provider family when candidates are otherwise comparably suitable and
-frugal. That is a default preference, not an acceptance gate. A qualified same-family
-reviewer remains eligible; single-family operation stays within its permitted family.
-Choose the deeper review activity when the subject requires it.
+Independent review requires an independent session and judgment on the opposite
+harness from actual authorship: Codex-authored work uses Claude claude-opus-5-5/high;
+Claude-authored work uses Codex gpt-6-astra/high. Apply this to guidance, code and spec
+review, including producer model overrides. Read actual authorship, not the producer
+archetype's default. For mixed authorship, preserve opposite-harness coverage of each
+portion and review the exact integrated subject. A fixed reviewer default cannot
+claim both. A family/access conflict is an unresolved review limitation; do not
+silently substitute same-harness review or add a generic provider enforcement gate.
 
 On an unavailable route, reassess the remaining qualified candidates using the same
 selection judgment. The suggested fallback order remains useful when there is no
@@ -96,5 +99,5 @@ decisions through ordinary ownership, not every successful staffing choice.
 | General user conversation | breadth and proportionate judgment | sol[medium], sonnet[medium], opus[medium], astra[high], fable[high] |
 | Onboarding or product discovery | intent and constraints | astra[high], fable[high], sol[high], opus[high] |
 | Narrow failure classification or log triage | inspectable factual evidence | luna[low], haiku, terra[low], sol[medium], sonnet[medium] |
-| Guidance or law authoring | coherent authority and composed behavior | astra[high], fable[high], sol[xhigh], opus[xhigh] |
-| Guidance or law review | independent judgment of authority, consistency and supported behavior | astra[high], fable[high], sol[xhigh], opus[xhigh] |
+| Guidance or law authoring | coherent authority and composed behavior | astra[high], sol[xhigh], fable[high] |
+| Guidance or law review | independent judgment of authority, consistency and supported behavior | Actual Codex producer: claude-opus-5-5[high]; actual Claude producer: gpt-6-astra[high]. Apply the opposite-harness contract above. |

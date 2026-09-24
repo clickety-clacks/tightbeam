@@ -94,24 +94,18 @@ remain available without giving ordinary engineering roles a second responsibili
 
 ## Resulting organization
 
-The bundle's default root is an orchestrator. It establishes a standing product-owner
-role alongside delivery, passes that address and the product spirit reference to
-relevant work, and opens delegated outcome assignments. A feature orchestrator opens
-its specialists' and reviewers' assignments. This makes delivery custody follow the
-coordination structure instead of using the PO as a mailbox for worker traffic.
+The bundle's default root is an executive orchestrator. Intake establishes or reuses
+one accountable PDO and addressed PO per product. The shared engineering roster owns
+their relationship. The PO decides and revises topology; the PDO staffs and carries
+delivery without producing its deliverables. Lane orchestrators execute delegated
+scope and open their workers' assignments. Small work may have specialists directly
+under its PDO.
 
-A delivery owner can plan directly or commission team-planner for a bounded
-recommendation. Sol can manage familiar delivery while Astra or Fable reasons about
-a difficult decomposition. A strong model may own orchestration throughout when
-judgment stays difficult. Each owner can adapt its own subtree within authority;
-changes affecting other owners' commitments travel to those owners. A planner can
-recommend the whole initial tree when coupling warrants it, but has no standing
-approval authority over all local team changes.
-
-The planner recommends; the delivery owner adopts or amends the plan and establishes
-actual assignments and recovery responsibility. No planner, integrator or stage is
+The PO can plan directly or obtain bounded team-planner advice through delivery
+ownership. Delivery resolves execution details inside that plan and returns proposed
+topology changes for the PO's decision. No planner, integrator or extra layer is
 mandatory. New archetypes require a distinct reusable responsibility, supported
-identity authoring and the applicable review. A task label supplies no new capability.
+identity authoring and applicable review; a task label supplies no new capability.
 
 Workers may exchange technical questions directly or ask the PO about intent. They
 keep the responsible orchestrator informed when the answer changes delivery, scope,
@@ -295,11 +289,11 @@ The lead received all three review parts, messages `30a53ac0`, `38358f76` and
 collision was already resolved by Fable's handoff and subsequent review. The commission
 is now quoted here so a reviewer need not reconstruct it from channel history.
 
-The live-application concern is accepted at its proper scope. Administrative runtime
-changes need the concrete before/after plan and must respect the present no-turn
-restriction and protected custody. That does not create another permission gate for
-this authorized source branch, isolated validation or ordinary coordination records.
-No live modification is claimed or performed by this branch.
+The live-application concern belonged to that preparation phase. Its no-turn
+restriction was task-scoped and is not a continuing org-wide pause. Historical
+receipts remain evidence of that phase, not current instructions. Current live work
+requires its actual authority and supported mechanism; source validation and
+ordinary coordination do not imply live modification.
 
 | Churn finding | Lead disposition and guidance home |
 | --- | --- |
@@ -651,21 +645,19 @@ and preserve existing authority, work holds and custody.
 
 ## 23 September amendment: team consultation and durable staffing
 
-This source-only correction reconciles early PO team advice with delivery authority
-and distinguishes harness helpers from durable staffing. The orchestrator kernel
-owns the consultation trigger and sole-coupled-lane discretion. The product-owner
-kernel points to that contract; team-planner retains its existing advisory role and
-no-fixed-graph rule. The operating manual owns helper accountability and adoption;
-the baseline tightbeam-dispatching skill owns effect classification. Harness-support's
-observability-only subagent semantics remain unchanged.
+The 23 September correction distinguished harness helpers from durable staffing and
+introduced early PO team advice. Its delivery-owned adoption/amendment contract is
+superseded by the 24 September role split below. The operating manual remains the
+home for helper accountability and adoption; baseline tightbeam-dispatching remains
+the effect-classification home. Harness-support's observability-only semantics are
+unchanged.
 
 At canonical base `012d2f86b3f56d72eb22cc916f8951818c1ec772`, neither
 `product-delivery` nor `team-design` exists as a source skill or an election. The
 blanket pre-staff PO card, closure wait and mandatory child-owner language reported
 in the installed product-delivery skill is absent from this source composition.
-Do not recreate that skill to amend it. The addressed-PO duty already lives in the
-kernel; its consultation contract replaces the source's unqualified consultation
-sentence. Model activity eligibility remains in preferred-models and is unchanged.
+Those absent skills are not recreated. The current consultation duty lives in the
+PDO kernel, and model activity eligibility lives in preferred-models.
 
 Source, published identity and session uptake are separate. An organization's
 `guidance/operating-manual.md` overrides the shipped manual; retained local skills
@@ -675,9 +667,44 @@ identity. A later authorized publication must reconcile those local differences,
 including any retained product-delivery skill, through the supported identity seam.
 Source acceptance alone establishes neither live applicability nor session refresh.
 
+## 24 September alignment: current composition contract
+
+The PDO role obtains and executes the PO's returned plan for each incoming delivery
+item. Covered child assignments reuse applicable judgment on that item. Only the PO
+revises topology. Shared delivery-coordination includes the existing records and
+recovery homes; engineering-tenets includes the role roster once for every engineering
+archetype. The neutral root remains neutral before bundle adoption. Bundle import
+derives ownership inventory from shipped paths, including the new PDO and fragments;
+there is no hand-maintained second receipt in source.
+
+GPT-6 Sol low is the PDO and orchestrator default/preference, with explicit PDO
+mixed/Codex rows. Current `sol`, `luna` and `opus` names expand to GPT-6 Sol,
+GPT-6 Luna and Claude Opus5.5. Coders start at GPT-6 Luna max with discretion for
+stronger generation-6 choices; spec writers use Opus5.5 high. Independent guidance,
+code and spec review uses the opposite actual producer harness: Codex authors to
+Opus5.5 high, Claude authors to Astra high. Defaults do not replace actual-authorship
+inspection. Family/access conflicts stay explicit limitations. Historical evaluations
+retain the models actually run; a bounded local availability exception is not a new
+default or general generation ban.
+Exact Opus 5.5 high use is route-qualified; preference guidance does not prove access
+on every host or settle separately owned model-runtime qualification. The generic-user
+writing rule belongs in policy craft and explicit permission to add persistent
+guidance belongs in the universal manual. Existing explicit user authorization is
+not a reason to ask again.
+
+The shipped external `tightbeam-cli` skill is a neutral assignment-scoped interface
+documented by the README. A legacy local `tightbeam` skill is a different artifact;
+correcting its active copies does not establish a canonical distribution history.
+Keep their provenance and applicability separate during publication review.
+
+The historical `ops/engineering-kungfu/gibson-018` overlay is not shipped guidance
+and is not a current restoration payload. Reapplication requires reconciliation to
+current authorized source and release capabilities, preserving local restrictions
+that still apply without reviving superseded task restrictions or topology authority.
+
 ### Offline cold-read examples
 
-Read the complete orchestrator, PO and team-planner compositions, their included
+Read the complete Main/orchestrator, PDO, PO and team-planner compositions, their included
 fragments, elected and baseline skills, manual and model activity contract against
 these cases. They are author/reviewer judgment examples, not a simulated agent run
 or a runtime staffing gate. Ordinary source/projection checks prove composition and
@@ -685,15 +712,20 @@ mechanism names; independent guidance review judges the resulting instructions.
 
 | Situation | Expected decision and evidence |
 | --- | --- |
-| The user asks for an appropriate number of orchestrators on a broad feature. | Ask the addressed PO for bounded team advice early enough to affect staffing. Adopt or amend with a reason; an appropriate count can be zero additional orchestrators. Report actual durable custody, not task labels. |
-| An established product starts a substantial feature with plausible independent lanes. | Existing product status does not waive consultation. Ask for advice on that decomposition; give child orchestrators only the independently managed lanes whose decisions and traffic justify them. |
-| A familiar repair has one coupled producer/reviewer lane. | The current delivery owner proceeds without a new PO gate or relay manager; use durable producer and independent reviewer assignments as needed. Record why another orchestrator would only forward traffic. |
-| A prior combined spirit/team judgment addresses the same owners, lanes and custody. | Reuse its applicable content without another consultation card. Staffing authority stays with delivery; administrative card state does not replace reading the judgment. |
-| A spirit-only card is approved, completed or surrendered before a consequential topology choice. | Its product judgment remains usable where applicable, but it supplies no missing team advice. Ask the bounded team question rather than infer a topology judgment from approval or closure. |
-| The addressed PO is unavailable. | Keep the dependency and recovery owner visible and continue separable authorized work. A queued notice is not advice. Consultation adds no permission token or veto over otherwise authorized staffing; conditional model-activity eligibility still has its own requirements. |
+| The user asks for an appropriate number of orchestrators on a broad feature. | PDO obtains the addressed PO's returned plan before staffing. The PO can choose zero additional orchestrators with actual workers. Report durable custody, not task labels. |
+| An established product starts a substantial feature with plausible independent lanes. | Route to its existing PDO and consult for the incoming item. The PO decides which independent decisions and traffic warrant lane owners. |
+| A familiar repair has one coupled producer/reviewer lane. | Reuse applicable returned judgment for unchanged work; a new incoming item receives proportionate consultation. No relay manager is required, and PDO does not perform the repair itself. |
+| A prior combined spirit/team judgment addresses the same owners, lanes and custody. | Reuse its applicable returned decision without another consultation card. Record topology with attribution; administrative card state does not replace reading the judgment. |
+| A spirit-only card is approved, completed or surrendered before a consequential topology choice. | Preserve applicable intent judgment but obtain the missing topology decision. Do not infer it from approval, closure or surrender. |
+| The addressed PO is unavailable. | Keep the dependency and recovery owner visible and continue separable authorized work within the existing plan. A queued notice is not a decision and does not authorize a substitute topology. |
 | Two harness helpers return analysis or code. | Call them helpers under the supervising Tightbeam holder. Markers do not add sessions, archetypes, assignments, lane owners or independent reviewers. Preserve exact outputs and verification limits; internal steps need no separate cards. |
 | A qualified existing Tightbeam session accepts helper output. | Reconcile active writes and record exactly what that owner accepts under an assignment on the same work item. Verify session, archetype, spawnedBy, holder and opener. Adoption is current custody, not retroactive authorship, new spawning ancestry or independent acceptance of helper self-report. |
-| A PO recommends a team or guidance correction; another assignment authors/publishes policy and a third reviews it. | Bounded consultation is coordination, findings-only assessment evidence, the authoritative guidance change policy, and independent review review with applicable producer linkage. Record and route a historical classification mismatch; neither a dummy code review nor relabeling policy as coordination is a remedy. |
+| A PO decides a team or recommends a guidance correction; another assignment authors/publishes policy and a third reviews it. | Use coordination for bounded consultation, evidence for findings-only assessment, policy for authoritative guidance changes, and review with applicable producer linkage for independent review. Route historical mismatches to their owner; do not invent reviews or relabel history. |
+| The same authorized request arrives through Main, PO or PDO. | Preserve its full facts, scope and intended start time; reach the same accountable PDO and item. A file-only backlog request does not start delivery. |
+| A worker needs an intent answer while another reports routine progress. | The substantive question can reach the PO directly. Routine progress and recovery stay with the worker's delivery owner. |
+| An owner must be replaced or a retained worker adopted. | Accept output and unresolved obligations through supported custody operations; verify holder, opener and recovery route. Preserve historical ancestry and avoid competing producers. |
+| A concise wake points at a title-only assignment. | The brief is incomplete. Supply the facts, constraints and completion condition in readable durable context before expecting execution; do not rely on transcript scavenging. |
+| The sequence completes but the worker's artifact overstates supplied facts. | Content acceptance fails independently of coordination success. Preserve the original result before interviews or corrective prompts. |
 
 Mechanism references: `Identity.snapshot_at!/4` composes role includes, universal
 roots and elected non-baseline skills, with the org manual taking precedence over
