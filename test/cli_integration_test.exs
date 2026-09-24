@@ -985,7 +985,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     Archetypes.load!(ctx.base_dir)
 
-    for file <- ["engineering.toml", "verification.toml"] do
+    for file <- ["engineering.toml", "topology.toml", "verification.toml"] do
       assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
              "learn did not deliver rules/#{file} into the org's identity tree"
     end
@@ -1035,6 +1035,22 @@ defmodule Tightbeam.CliIntegrationTest do
     coder_dir = session_workdir!(ctx, coder)
     reviewer_dir = session_workdir!(ctx, reviewer)
 
+    owner =
+      Org.create(ctx.db, %{
+        session_key: "cli-po",
+        display_name: "CLI Product owner",
+        owner_user_id: "flynn",
+        origin: "user:flynn",
+        archetype: "product-owner",
+        host: "testhost",
+        harness: "codex",
+        provider: "openai",
+        model: Model.new("test")
+      })
+
+    Roles.create!(ctx.db, "cli-po", "flynn", owner.session_key)
+    owner_dir = session_workdir!(ctx, owner)
+
     {created, 0} =
       System.cmd(
         ctx.binary,
@@ -1044,6 +1060,64 @@ defmodule Tightbeam.CliIntegrationTest do
       )
 
     item_id = JSON.decode!(created)["id"]
+
+    {premature, premature_status} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "premature staffing",
+          "--session",
+          "cli-coder",
+          "--work-item",
+          item_id,
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    assert premature_status != 0
+    assert premature =~ "assign-worker-staffing-needs-topology"
+
+    {consultation, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "recommend topology",
+          "--session",
+          "cli-po",
+          "--effect-kind",
+          "coordination",
+          "--work-item",
+          item_id,
+          "--as-user",
+          "flynn"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    {_decision, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "attest",
+          JSON.decode!(consultation)["id"],
+          "--kind",
+          "verdict",
+          "--verdict",
+          "topology-decided",
+          "--note",
+          "One coder and independent reviewer for this coupled repair."
+        ],
+        cd: owner_dir,
+        stderr_to_stdout: true
+      )
 
     {assigned, 0} =
       System.cmd(

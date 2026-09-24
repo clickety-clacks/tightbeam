@@ -176,10 +176,26 @@ defmodule Tightbeam.ImplementationRequiresPostureTest do
   end
 
   defp work_item(ctx) do
-    WorkItems.__handle__(ctx.db, "work-item-create", %{
-      principal: {:user, "flynn"},
-      params: %{title: "Proportionate work #{System.unique_integer([:positive])}"}
-    })
+    item =
+      WorkItems.__handle__(ctx.db, "work-item-create", %{
+        principal: {:user, "flynn"},
+        params: %{title: "Proportionate work #{System.unique_integer([:positive])}"}
+      })
+
+    # Topology is required independently of the retired posture-token workflow.
+    # Keep these tests about posture by recording the returned team advice first.
+    intake = assign_call(ctx.orchestrator.session_key, item.id, "record returned team advice")
+    intake = put_in(intake.params[:effect_kind], "coordination")
+    assert {:ok, assignment} = Dispatch.dispatch(ctx.db, ctx.handlers, intake)
+
+    assert {:ok, _} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.orchestrator.session_key, assignment.id, "topology-decided")
+             )
+
+    item
   end
 
   defp assign_call(holder_key, item_id, subject) do

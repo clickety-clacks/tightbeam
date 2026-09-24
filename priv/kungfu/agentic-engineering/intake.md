@@ -4,9 +4,11 @@ Use existing organization instructions and supported defaults. Resolve missing
 information when it affects the next authorized work; do not turn intake into a
 mandatory questionnaire or a hold on separable work.
 
-Establish the product outcome, constraints, addressed delivery owner and PO, and the
-product spirit reference. Reuse an adequate existing arrangement. Team-design helps
-when the arrangement itself needs deliberate reasoning.
+Understand the product outcome and constraints, identify the addressed delivery owner
+and PO, and read the existing product spirit. Reuse an adequate existing arrangement.
+Each new work item follows the PO consultation contract in guidance/orchestrator.md
+before delivery staffing. Use decision requests for unresolved ambiguity about the
+work or scope; do not invent intent or repeat settled questions.
 
 Determine permitted model families, hosts and runnable harnesses. Use the shared
 working set and engineering activity orders as the starting policy, adapting them

@@ -8,23 +8,33 @@ spirit reference into work. Reuse that PO for product judgment; keep operational
 custody with delivery owners. Use another orchestrator when its coordination earns
 the extra layer. A small job can keep compatible scopes with one owner.
 
-For product delivery, ask the addressed PO for a bounded team-design recommendation
-early enough to influence staffing when the user explicitly requests a team topology
-or an appropriate orchestrator count, or a substantial new initiative plausibly
-creates multiple delivery lanes. This includes consequential features in established
-products. Also consult before committing to consequential decomposition involving
-contested resources, a first product tree or sustained coordination load.
+For every new work item, ask the addressed PO for a topology recommendation before
+staffing delivery. Understand the spirit of the work: the user's intended outcome,
+scope and constraints. Read the request, existing product intent and prior decisions.
+When the work or scope remains vague, ask the user through the operating manual's
+decision-request procedure. Resolve the affected question before committing dependent
+work; continue separable authorized work. Do not invent a new product spirit or ask
+the user to repeat decisions already recorded.
 
-Reuse applicable team judgment. A combined spirit/team judgment suffices when its
-content addresses owners, lanes and custody; spirit clearance alone does not. Read
-the judgment and its applicability, not just card closure, completion or surrender.
-A queued consultation is not returned advice. Adopt or amend the recommendation with
-a concise reason in existing delivery context; you retain staffing and delivery
-custody. If the PO is unavailable, use existing dependency and recovery arrangements
-and continue separable authorized work. Consultation is not a permission token for
-otherwise authorized staffing. A familiar single-lane repair or routine worker
-replacement needs no new PO gate. Load tightbeam-dispatching when opening assignments
-to classify their promised effects.
+Open the PO consultation on that work item with coordination effect. Give the PO the
+work, known constraints and unresolved questions. Record its returned recommendation
+as a topology-decided verdict on the same item, with the team and reasoning in the
+note or a referenced artifact. The PO may file it directly, or you may record its
+returned advice with attribution. The rail checks that a decision exists; it does
+not choose the team or its author. Initial coordination intake and PO consultation
+remain available before the decision; delivery staffing through assign or dispatch
+requires it. File the returned recommendation with:
+
+    tightbeam attest <consultation-assignment> --kind verdict --verdict topology-decided --note "<recommended team, reasoning and source>"
+
+Load tightbeam-dispatching for the assignment mechanics.
+
+Read and apply the recommendation, or explain an amendment within your authority.
+You retain staffing and delivery custody. A spirit verdict, queued consultation or
+closed card alone does not supply topology advice. A familiar repair is still new
+work and requires consultation. Reuse applicable advice for further assignments on
+the same item; obtain new advice when its scope or constraints change. Recover an
+unavailable PO through existing ownership and dependency procedures.
 
 Own a sole coupled delivery lane directly when another orchestrator would only
 forward its traffic; record that reason and establish durable producer and independent
@@ -44,10 +54,10 @@ judgment earns the handoff. Use existing qualified agents when their retained
 understanding helps. A skill can serve an occasional procedure within one coherent
 responsibility; a broad skill menu does not justify several unrelated jobs.
 
-Plan directly within your competence, commission a bounded team-planner for a
-consequential decomposition, or use a stronger model throughout when judgment is
-continuous. Define the planning question, scope, evidence and effort boundary. The
-planner advises; you adopt or amend its plan and establish actual custody. Each
+After the PO's topology recommendation, plan delivery within that context. Commission
+a bounded team-planner for a technical decomposition when useful, or use a stronger
+model throughout when judgment is continuous. Define the question, scope, evidence
+and effort boundary. Specialist advice does not replace the PO consultation. Each
 child owner may redesign its subtree within authority and reports effects on other
 commitments. A product-wide planner is neither a mandatory stage nor a local approval
 body. Count briefing, supervision and rework as well as agent usage; use preferred-models

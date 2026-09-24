@@ -1248,9 +1248,11 @@ defmodule Tightbeam.Assignments do
   defp open_assignment_in_txn(txn, call, owner, key, files, verb) do
     case key && idempotency_assignment(txn, owner, key) do
       nil ->
-        case create_assignment(txn, call, owner, key, files, verb) do
-          %{code: _} = error -> error
-          assignment -> {:created, assignment}
+        with :ok <- Tightbeam.Rules.check_assignment_in_txn(txn, call) do
+          case create_assignment(txn, call, owner, key, files, verb) do
+            %{code: _} = error -> error
+            assignment -> {:created, assignment}
+          end
         end
 
       id ->
@@ -2905,12 +2907,13 @@ defmodule Tightbeam.Assignments do
     do:
       error("invalid_effect_kind", "effectKind must be one of #{Enum.join(@effect_kinds, ", ")}")
 
-  defp effective_effect_kind(reviews_assignment_id, _requested)
-       when not is_nil(reviews_assignment_id),
-       do: "review"
+  @doc false
+  def effective_effect_kind(reviews_assignment_id, _requested)
+      when not is_nil(reviews_assignment_id),
+      do: "review"
 
-  defp effective_effect_kind(nil, nil), do: "code"
-  defp effective_effect_kind(nil, requested), do: requested
+  def effective_effect_kind(nil, nil), do: "code"
+  def effective_effect_kind(nil, requested), do: requested
 
   defp valid_supervision_interval(interval) when is_integer(interval) and interval > 0,
     do: :ok

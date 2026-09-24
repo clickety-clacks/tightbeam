@@ -8,7 +8,9 @@ defmodule Tightbeam.Rules do
   best-effort point-in-time snapshots. Their reads are intentionally not
   synchronized with concurrent organization changes. A stale snapshot can
   miss or spuriously fire a statute, but any call statutes allow still runs
-  the live constitutional checks in its handler.
+  the live constitutional checks in its handler. Assignment insertion also
+  rechecks row-only deny rules inside its transaction, protecting exceptions
+  such as a work item's first coordination assignment against concurrent calls.
 
   A nil fact never satisfies any operator, including `ne` and `not_in`.
   An empty list is present, however: `caller.roles not_in ["admin"]` fires
@@ -37,6 +39,12 @@ defmodule Tightbeam.Rules do
   `dispatch`, the assignment facts project the latest completed fix for the
   supplied work item so a re-fix gate can inspect its commissioned verdicts
   before the next assignment exists.
+
+  On assign/dispatch, work-item facts use only the proposed assignment's stored
+  binding: work_item_id, or assign's reviewed producer. An unrelated assignment_id
+  is not a binding for new staffing. `assign.has_work_item` reports that binding;
+  `assign.is_first_on_work_item` reports whether its item has no assignments;
+  `assign.effect_kind` uses the same classification as assignment storage.
 
   Rule denials and fact errors are written as `kind = "denied"` events by
   dispatch. That audit write is best-effort: an unavailable event sink never
@@ -153,6 +161,9 @@ defmodule Tightbeam.Rules do
     "work_item.verdict_kinds" => {:list, :string},
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
+    "assign.effect_kind" => :string,
+    "assign.has_work_item" => :bool,
+    "assign.is_first_on_work_item" => :bool,
     "assign.declared_files_overlap_open" => :bool,
     "decision_request.status" => :string,
     "artifact.present" => :bool,
@@ -284,6 +295,24 @@ defmodule Tightbeam.Rules do
     rules
     |> Enum.filter(&(&1.verb == verb and edge in &1.edges))
     |> decide_rules(db, call, %{}, [], [])
+  end
+
+  @doc "Recheck row-only assignment denials in the insertion transaction."
+  def check_assignment_in_txn(%DB.Txn{} = txn, call) do
+    # In particular, two callers must not both consume a first-assignment
+    # exception from separate preflight snapshots. Scripts, remedies and notices
+    # remain at the dispatch chokepoint; none runs inside this transaction.
+    rules =
+      :persistent_term.get(@persist_key, [])
+      |> Enum.filter(fn rule ->
+        rule.verb == call.verb and "verb" in rule.edges and
+          rule.effect == "deny" and is_nil(rule.check)
+      end)
+
+    case decide_rules(rules, txn, call, %{}, [], []) do
+      {:allow, [], []} -> :ok
+      {{:deny, error}, [], []} -> error
+    end
   end
 
   @doc false
@@ -2390,6 +2419,40 @@ defmodule Tightbeam.Rules do
     {value, cache}
   end
 
+  defp compute_fact("assign.effect_kind", _db, %{verb: verb} = call, cache)
+       when verb in ["assign", "dispatch"] do
+    review = if call.verb == "assign", do: call.params[:reviews_assignment_id]
+    {Assignments.effective_effect_kind(review, call.params[:effect_kind]), cache}
+  end
+
+  defp compute_fact("assign.has_work_item", db, %{verb: verb} = call, cache)
+       when verb in ["assign", "dispatch"] do
+    with_dependency("$work_item_id", db, call, cache, fn id, cache ->
+      {is_binary(id), cache}
+    end)
+  end
+
+  defp compute_fact("assign.is_first_on_work_item", db, %{verb: verb} = call, cache)
+       when verb in ["assign", "dispatch"] do
+    with_dependency("$work_item_id", db, call, cache, fn id, cache ->
+      {:ok, rows} =
+        DB.query(
+          db,
+          """
+          SELECT NOT EXISTS(SELECT 1 FROM assignments a WHERE a.workItemId = w.id)
+            FROM work_items w WHERE w.id = ?1
+          """,
+          [id]
+        )
+
+      {rows == [[1]], cache}
+    end)
+  end
+
+  defp compute_fact(fact, _db, _call, cache)
+       when fact in ~w(assign.effect_kind assign.has_work_item assign.is_first_on_work_item),
+       do: {nil, cache}
+
   defp compute_fact("$target", db, call, cache) do
     target =
       case Map.get(call, :session_key) do
@@ -2398,6 +2461,29 @@ defmodule Tightbeam.Rules do
       end
 
     {target, cache}
+  end
+
+  defp compute_fact("$work_item_id", db, %{verb: verb} = call, cache)
+       when verb in ["assign", "dispatch"] do
+    case call.params[:work_item_id] do
+      id when is_binary(id) ->
+        {id, cache}
+
+      _ ->
+        if verb == "assign" and is_binary(call.params[:reviews_assignment_id]) do
+          {:ok, rows} =
+            DB.query(db, "SELECT workItemId FROM assignments WHERE id = ?1", [
+              call.params.reviews_assignment_id
+            ])
+
+          {case rows do
+             [[id]] -> id
+             [] -> nil
+           end, cache}
+        else
+          {nil, cache}
+        end
+    end
   end
 
   defp compute_fact("$work_item_id", db, call, cache) do

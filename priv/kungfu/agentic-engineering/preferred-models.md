@@ -27,12 +27,14 @@ addressed-PO association and receipt of that PO's substantive team-design advice
 for the relevant work. Reference the association and attributable advice in
 ordinary staffing/model-selection context. An association row, consultation
 invitation, silence or notification count alone does not qualify. Use existing
-messages and attests; add no consultation-completed record or acknowledgement.
+messages and the topology decision recorded under guidance/orchestrator.md; add
+no separate model-eligibility acknowledgement.
 
 The product-owner activity retains its Astra high default and product/topology
 judgment. The PDO adopts or amends the PO's recommendation, staffs and retains
-delivery custody. Consultation does not veto or block otherwise authorized
-staffing, including before advice arrives.
+delivery custody. Every new work item needs the PO topology recommendation before
+delivery staffing under guidance/orchestrator.md. Model eligibility does not waive
+that consultation or require a separate product-spirit approval.
 
 Keep generic and deep-technical orchestration on their existing activity rows.
 When the PDO's remaining work requires continual deep technical judgment, use the

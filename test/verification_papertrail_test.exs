@@ -38,6 +38,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     holder = session(db, "vp-coder", "coder", "claude", "anthropic")
     reviewer = session(db, "vp-reviewer", "reviewer-code", "codex", "openai")
+    owner = session(db, "vp-owner", "product-owner", "codex", "openai")
     Roles.create!(db, "reviewer-code", "flynn", reviewer.session_key)
 
     test_pid = self()
@@ -70,7 +71,14 @@ defmodule Tightbeam.VerificationPapertrailTest do
       :persistent_term.erase(Archetypes)
     end)
 
-    %{db: db, base_dir: base_dir, handlers: handlers, holder: holder, reviewer: reviewer}
+    %{
+      db: db,
+      base_dir: base_dir,
+      handlers: handlers,
+      holder: holder,
+      reviewer: reviewer,
+      owner: owner
+    }
   end
 
   # The statutes are NOT copied in: `learn!` performs the real shipped-bundle
@@ -81,7 +89,7 @@ defmodule Tightbeam.VerificationPapertrailTest do
     assert {:ok, _revision} =
              Identity.learn!(ctx.base_dir, "agentic-engineering", "flynn")
 
-    for file <- ["engineering.toml", "verification.toml"] do
+    for file <- ["engineering.toml", "topology.toml", "verification.toml"] do
       assert File.exists?(Path.join([ctx.base_dir, "identity", "rules", file])),
              "learn did not deliver rules/#{file} into the org's identity tree"
     end
@@ -95,6 +103,15 @@ defmodule Tightbeam.VerificationPapertrailTest do
         principal: {:user, "flynn"},
         params: %{title: "papertrail #{System.unique_integer([:positive])}", is_bug: false}
       })
+
+    advice = assign(ctx, ctx.owner.session_key, item.id, "recommend topology")
+
+    assert {:ok, _} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               attest_call(ctx.owner.session_key, advice.id, "verdict", "topology-decided")
+             )
 
     work = assign(ctx, ctx.holder.session_key, item.id, "implement the feature")
 
@@ -345,6 +362,14 @@ defmodule Tightbeam.VerificationPapertrailTest do
 
     assert Enum.map(loaded, & &1.name) == [
              "completion-requires-review",
+             "assign-staffing-needs-work-item",
+             "assign-worker-staffing-needs-topology",
+             "assign-delivery-needs-topology",
+             "assign-child-orchestration-needs-topology",
+             "dispatch-staffing-needs-work-item",
+             "dispatch-worker-staffing-needs-topology",
+             "dispatch-delivery-needs-topology",
+             "dispatch-child-orchestration-needs-topology",
              @verification_rule,
              @artifact_rule,
              "wake-obligation-registration-authority"
