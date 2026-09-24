@@ -1201,17 +1201,24 @@ defmodule Tightbeam.EffortCheckinTest do
     race = :counters.new(1, [])
 
     sh = fn invocation ->
-      if String.contains?(Enum.join(invocation, " "), "priorState=") do
-        :counters.add(race, 1, 1)
+      joined = Enum.join(invocation, " ")
 
-        if :counters.get(race, 1) == 1 do
-          raced = dispatch(ctx, {:session, "parent"}, "holder", "concurrent motion dispatch")
-          send(test_pid, {:raced_assignment, raced.id})
-        end
+      cond do
+        String.contains?(joined, "node -p") ->
+          {Tightbeam.Harness.Claude.adapter_version() <> "\n", 0}
 
-        {"B\tobserved\t0\n/srv/tightbeam/work\n", 0}
-      else
-        {"", 0}
+        String.contains?(joined, "priorState=") ->
+          :counters.add(race, 1, 1)
+
+          if :counters.get(race, 1) == 1 do
+            raced = dispatch(ctx, {:session, "parent"}, "holder", "concurrent motion dispatch")
+            send(test_pid, {:raced_assignment, raced.id})
+          end
+
+          {"B\tobserved\t0\n/srv/tightbeam/work\n", 0}
+
+        true ->
+          {"", 0}
       end
     end
 

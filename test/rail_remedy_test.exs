@@ -54,6 +54,21 @@ defmodule Tightbeam.RailRemedyTest do
       File.mkdir_p!(Path.dirname(adapter))
       File.write!(adapter, "#!/bin/sh\nexit 0\n")
       File.chmod!(adapter, 0o755)
+
+      module =
+        if bin == "claude-agent-acp", do: Tightbeam.Harness.Claude, else: Tightbeam.Harness.Codex
+
+      manifest =
+        Path.join([
+          base_dir,
+          "adapters",
+          "node_modules",
+          module.install_package(),
+          "package.json"
+        ])
+
+      File.mkdir_p!(Path.dirname(manifest))
+      File.write!(manifest, JSON.encode!(%{version: module.adapter_version()}))
     end
 
     handlers =
