@@ -110,7 +110,7 @@ does not establish independent review. Internal helper steps need no separate as
 
 Start a new session:
 
-    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness codex --model gpt-6-sol --effort low
+    tightbeam spawn --display "Helper — auth check" --name helper:auth-check --harness <harness> --model <model> --effort <effort>
 
 `--display` is the human label; `--name` registers a role bound to the new session so you can
 address it. Add `--archetype <name>` to give the session that archetype's identity — its
