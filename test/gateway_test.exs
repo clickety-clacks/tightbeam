@@ -247,6 +247,21 @@ defmodule Tightbeam.GatewayTest do
     end
   end
 
+  defmodule MismatchedCandidateAdapterStub do
+    use GenServer
+    def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
+    def init(parent), do: {:ok, parent}
+
+    def handle_call({:new_candidate_session, model, _cwd, _mcp, _guidance}, _from, parent) do
+      send(parent, {:mismatched_candidate_requested, model})
+
+      {:reply,
+       {:error,
+        {:session_prepare_failed, {:runtime_config_mismatch, Model.new("haiku")},
+         "candidate-mismatch", %{status: "verified", reason: nil}}}, parent}
+    end
+  end
+
   defmodule CloseErrorAdapterStub do
     use GenServer
     def start_link(parent), do: GenServer.start_link(__MODULE__, parent)
@@ -593,7 +608,6 @@ defmodule Tightbeam.GatewayTest do
       db: db,
       credential_status: fn _provider -> :onboarded end,
       credential_kind: fn _provider -> :subscription end,
-      claude_selectable_models: :all,
       claude_fetch: fn _, _ -> {:ok, claude_models} end,
       sh: fn command ->
         case catalog_probe_harness(command) do
@@ -1281,58 +1295,32 @@ defmodule Tightbeam.GatewayTest do
              ModelCatalog.route("testhost", "claude", Model.new("tiered-here"))
   end
 
-  # Task #41. A model the adapter cannot select must be refused by NAME and the
-  # operator told what IS available — before, this died deep in the adapter as
-  # "Invalid value for config option model", on every session/new and session/load.
-  test "an unavailable model is refused by name and names what is offered", ctx do
-    base_dir = role_test_base("model-not-offered")
-    Archetypes.load!(base_dir)
-    config = gateway_config(base_dir, ctx.db, 0)
+  test "the catalog still names an unavailable model and its offered alternatives", _ctx do
+    assert {:error, unroutable} =
+             ModelCatalog.route("testhost", "claude", Model.new("claude-opus-5"), ModelCatalog)
 
-    assert %{code: "model_unavailable", message: message} =
-             Gateway.handlers(config)["tune"].(%{
-               origin: "user:flynn",
-               session_key: "k1",
-               params: %{setting: "set_model", model: "claude-opus-5"}
-             })
-
+    message = Tightbeam.Unroutable.message(unroutable)
     assert message =~ ~s("claude-opus-5" is not offered by claude on host testhost)
-
-    # The hint is the point: naming only the rejection makes the operator guess.
     assert message =~ "offered:"
     assert message =~ "claude-sonnet-4-6"
-
-    # ...and it must not recommend the very thing it just refused.
     refute message =~ "offered: claude-opus-5"
   end
 
-  test "a catalog missing for want of a GATEWAY credential says so, with the repair", ctx do
-    base_dir = role_test_base("catalog-cred-legible")
-    Archetypes.load!(base_dir)
-    config = gateway_config(base_dir, ctx.db, 0)
-
-    # Force the session host's OWN derivation to have failed for a missing
-    # credential — the catalog belongs to the host that will run the turn.
+  test "the catalog still names a missing host credential without guessing model support", _ctx do
     empty_catalog({:needs_onboarding, :no_credential})
 
-    assert %{code: "catalog_unavailable", message: message} =
-             Gateway.handlers(config)["tune"].(%{
-               origin: "user:flynn",
-               session_key: "k1",
-               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
-             })
+    assert {:error, unroutable} =
+             ModelCatalog.route(
+               "testhost",
+               "claude",
+               Model.new("claude-sonnet-4-6"),
+               ModelCatalog
+             )
 
-    # Names what is missing, on WHICH HOST, for which provider, and the repair —
-    # and the host is the SESSION's, not the gateway's. Before per-host catalogs
-    # this line sent the operator to the gateway to fix a satellite's grant.
+    message = Tightbeam.Unroutable.message(unroutable)
     assert message =~ "anthropic has no usable credential on testhost"
     assert message =~ ":no_credential"
     assert message =~ "run tightbeam onboard anthropic on testhost"
-    refute message =~ "GATEWAY host"
-
-    # ...and never regresses to the bare inspected health term, which named
-    # neither the provider, the host, nor the fix (sat-e2e mac-0726a S2).
-    refute message =~ "for claude on host testhost: {:unavailable,"
   end
 
   test "children refuses a broken harness on PATH without creating any org artifact", ctx do
@@ -3521,7 +3509,7 @@ defmodule Tightbeam.GatewayTest do
     assert Placement.hosts(base_dir, ctx.db)[machine].base_dir == "/remote/failed"
   end
 
-  test "spawn proceeds after a live remote readiness probe", ctx do
+  test "spawn passes an uncataloged exact Claude id to the selected host", ctx do
     base_dir = move_test_base(ctx.db, "spawn-ready")
     parent = self()
 
@@ -3532,6 +3520,7 @@ defmodule Tightbeam.GatewayTest do
     })
 
     await_host_catalog("worker", "claude")
+    put_host_catalog("worker", "claude", ["claude-sonnet-4-6"])
 
     sh = fn command ->
       send(parent, {:spinup_command, command})
@@ -3553,11 +3542,13 @@ defmodule Tightbeam.GatewayTest do
                params: %{
                  display_name: "Remote",
                  host: "worker",
+                 model: "claude-opus-5-5",
                  idempotency_key: "spawn-remote"
                }
              })
 
     assert Org.get(ctx.db, session_key).host == "worker"
+    assert Org.get(ctx.db, session_key).model == Model.new("claude-opus-5-5")
     assert_receive {:spinup_command, ["ssh" | _]}
   end
 
@@ -3951,18 +3942,18 @@ defmodule Tightbeam.GatewayTest do
              Gateway.handlers(config)["tune"].(%{
                origin: "user:flynn",
                session_key: "k1",
-               params: %{setting: "set_model", model: "claude-sonnet-4-6"}
+               params: %{setting: "set_model", model: "claude-opus-5-5"}
              })
 
     assert_receive {:adapter_key, {:claude, "shared", ^local_host}}
     assert_receive {:tune_residency_checked, "existing-session"}
 
-    assert_receive {:tune_session_switched, "existing-session",
-                    %Model{family: "claude-sonnet-4-6"}, _cwd, _mcp_servers, guidance}
+    assert_receive {:tune_session_switched, "existing-session", %Model{family: "claude-opus-5-5"},
+                    _cwd, _mcp_servers, guidance}
 
     assert guidance =~ "Tightbeam · default"
     assert_receive {:tune_session_closed, "existing-session"}
-    assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
+    assert Org.get(ctx.db, "k1").model == Model.new("claude-opus-5-5")
 
     assert %{harness_session_id: "switched-session", reason: "loaded"} =
              Org.current_pointer(ctx.db, "k1")
@@ -3974,7 +3965,7 @@ defmodule Tightbeam.GatewayTest do
 
     assert marker_facts.kind == "model-retune"
     assert marker_facts.from == "fable"
-    assert marker_facts.to == "claude-sonnet-4-6"
+    assert marker_facts.to == "claude-opus-5-5"
   end
 
   test "runtime tune hides unknown, foreign, retired, and process targets behind one refusal",
@@ -4123,7 +4114,7 @@ defmodule Tightbeam.GatewayTest do
                params: %{setting: "set_model", model: "claude-sonnet-4-6"}
              })
 
-    assert message =~ "model_unavailable"
+    assert message =~ "installed local client rejected the requested model"
     assert message =~ "could not prepare the new model"
 
     assert_receive {:tune_session_switched, "resident-session",
@@ -4451,7 +4442,7 @@ defmodule Tightbeam.GatewayTest do
 
     log =
       ExUnit.CaptureLog.capture_log(fn ->
-        assert %{code: "model_unavailable"} =
+        assert %{code: "invalid", message: "unknown reasoning effort: \"bogus\""} =
                  Gateway.handlers(config)["spawn"].(%{
                    origin: "user:flynn",
                    session_key: nil,
@@ -4864,6 +4855,29 @@ defmodule Tightbeam.GatewayTest do
              })
 
     assert Org.get(ctx.db, "k1").model == Model.new("claude-sonnet-4-6")
+  end
+
+  test "initial set_model leaves stored selection unchanged when the candidate reports another model",
+       ctx do
+    base_dir = role_test_base("initial-model-mismatch")
+    Archetypes.load!(base_dir)
+    make_model_unknown(ctx.db, "k1")
+    before = Org.get(ctx.db, "k1").model
+    start_lane!(ctx.db, "k1")
+
+    adapter = start_supervised!({MismatchedCandidateAdapterStub, self()})
+    start_supervised!({CoordinatorStub, adapter})
+
+    assert %{ok: false, code: "runtime_config_mismatch", projection_committed: false} =
+             Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["tune"].(%{
+               origin: "user:flynn",
+               session_key: "k1",
+               params: %{setting: "set_model", model: "claude-opus-5-5"}
+             })
+
+    assert_receive {:mismatched_candidate_requested, %Model{family: "claude-opus-5-5"}}
+    assert Org.get(ctx.db, "k1").model == before
+    assert Org.current_pointer(ctx.db, "k1") == nil
   end
 
   test "a ref emitted by modelCatalog.models round-trips through set_model", ctx do

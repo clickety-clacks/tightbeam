@@ -85,12 +85,7 @@ defmodule Tightbeam.ModelCatalogRotationE2ETest do
     end
 
     start_supervised!(
-      {ModelCatalog,
-       name: ModelCatalog,
-       base_dir: ctx.base_dir,
-       db: DB,
-       claude_fetch: fetch,
-       claude_selectable_models: :all}
+      {ModelCatalog, name: ModelCatalog, base_dir: ctx.base_dir, db: DB, claude_fetch: fetch}
     )
 
     await(fn ->

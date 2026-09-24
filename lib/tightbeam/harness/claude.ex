@@ -5,9 +5,11 @@ defmodule Tightbeam.Harness.Claude do
   alias Tightbeam.Harness.Support
   alias Tightbeam.Model
 
-  require Logger
+  @impl true
+  def local_client_model_authority?(%Model{family: "claude-" <> _}), do: true
+  def local_client_model_authority?(%Model{}), do: false
 
-  @adapter_version "0.66.0"
+  @adapter_version "0.79.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
   @warm_timeout_ms 30_000
@@ -18,116 +20,11 @@ defmodule Tightbeam.Harness.Claude do
 
   @api_base "https://api.anthropic.com"
 
-  # NOTE FOR FUTURE AGENTS — the claude model vocabulary is NARROWER than the catalog.
-  #
-  # The derived catalog for claude comes from the Anthropic API (`fetch_catalog/1` hits
-  # `/v1/models`), which currently lists 11 models. The claude ACP adapter's
-  # `session/set_config_option {configId: "model"}` accepts only TEN values, and the
-  # adapter seam renders the identity verbatim — family plus the vendor's context variant,
-  # with our effort on its own config option — so there is NO translation layer to fix. A model
-  # the adapter refuses fails the apply, which runs after EVERY `session/new` and every
-  # `session/load` (never-trust-the-advertised-model), so it recurs on resume, not just
-  # spawn.
-  #
-  # RECORDED LIVE 2026-07-26 against: claude CLI 2.1.220, claude-agent-acp 0.59.0,
-  # @anthropic-ai/claude-agent-sdk 0.3.207. Probe each value with
-  # `session/set_config_option` before trusting this table — it WILL rot, because the
-  # accepted set is whatever the installed CLI currently offers.
-  #
-  #   ACCEPTED  alias `default`  -> Sonnet 5      (same as `sonnet`)
-  #   ACCEPTED  alias `sonnet`   -> Sonnet 5
-  #   ACCEPTED  alias `opus`     -> Opus 4.8      (NOT Opus 5 — see below)
-  #   ACCEPTED  alias `haiku`    -> Haiku 4.5
-  #   ACCEPTED  id `claude-sonnet-5`
-  #   ACCEPTED  id `claude-opus-4-8`
-  #   ACCEPTED  id `claude-haiku-4-5-20251001`
-  #   ACCEPTED  alias `fable` / id `claude-fable-5`  (re-measured 2026-08-05; July
-  #             refusal was environmental — the projected-home pin offers it)
-  #   ACCEPTED  id `claude-opus-5`  (re-measured 2026-08-06; the REJECTED row below
-  #             measured the DEFAULT-PIN vocabulary, not the grant — a pin-probed
-  #             home offered+accepted it and a live prompt answered as Opus 5)
-  #   REJECTED  claude-opus-4-7, claude-sonnet-4-6, claude-opus-4-6,
-  #             claude-opus-4-5-20251101, claude-sonnet-4-5-20250929,
-  #             claude-opus-4-1-20250805
-  #
-  # The accepted ids were EXACTLY the models the aliases resolved to until the pin
-  # lesson (fable, then opus-5) showed the offered set follows the HOME PIN. So
-  # this is not an API-vs-CLI version lag that a mapping table can paper over: the
-  # adapter only accepts the models it is presently offering, by either name.
-  #
-  # WHY THERE IS NO SUBSTITUTION MAP HERE, deliberately: every candidate substitution is
-  # a silent downgrade. `claude-opus-5` -> `opus` delivers Opus 4.8, a different and
-  # older model. `claude-fable-5` has NO equivalent on this adapter version at all.
-  # Mapping either would make a request appear to succeed while delivering something
-  # else, which is the one outcome worse than failing. If a requested claude model is not
-  # in the ACCEPTED list above, it must fail and say so — do not quietly rewrite it.
-  #
-  # WHEN THIS ROTS (a new alias appears, or an accepted value stops being accepted):
-  # re-probe the adapter rather than editing from a changelog. Boot
-  # `node <adapters>/claude-agent-acp`, `initialize`, `session/new`, then read the
-  # `model` entry of the returned `configOptions` for the offered set, and confirm each
-  # candidate with `session/set_config_option`. Update this table and the version stamp
-  # together.
-  #
-  # ALSO GRANT- AND HOME-DEPENDENT, not only version-dependent. A smoke run recorded
-  # opus-5 and fable-5 "refused on this grant", and JOURNAL.md:804 records the offered
-  # list changing with the home's `settings.json` and the session cwd. So this table
-  # pins THREE things at once, and a different account may legitimately accept more.
-  # That is why the set is injectable (`claude_selectable_models` in the catalog's
-  # options, `:all` to disable) rather than only editable here.
-  #
-  # ON CODEX, kind-scoped: the shared-source argument holds only for the
-  # SUBSCRIPTION kind, whose catalog comes from the same account endpoint the
-  # CLI itself consults (codex.ex). The API-KEY kind derives from the platform
-  # route — the account's whole model universe — and the 2026-07-28 api-key
-  # exercise (#99) proved live that codex-acp refuses platform ids at
-  # set_config_option (-32602 for `gpt-5.1-codex`) while accepting codex-native
-  # slugs (`gpt-5.6-sol` ran a real turn). Codex's api-key catalog now carries
-  # its own `@adapter_selectable_models` guard on this precedent.
-  # RE-MEASURED 2026-08-05 on gibson (claude CLI 2.1.221, the production grant):
-  # `claude -p --model claude-fable-5` answered a real prompt — the 2026-07-26
-  # REJECTED row for fable was one environment's snapshot, not a property of the
-  # account or the CLI (Flynn was literally talking to Fable while this table
-  # said his account could not). The offered list is environment-dependent
-  # (JOURNAL.md:804); the projected-home model pin (ops-hardening-v1 §3) is what
-  # makes it deterministic. Keep re-probing per the note above before trusting
-  # any row here, in either direction.
-  # RE-MEASURED 2026-08-06 on gibson (adapter 0.59.0, the production grant):
-  # a pin-probe home (settings.json model=claude-opus-5) OFFERED and ACCEPTED
-  # claude-opus-5, and a live prompt through the production adapter+credential
-  # answered as Opus 5 — the 2026-07-26 REJECTED row for opus-5 was, like
-  # fable's, one environment's snapshot ("refused on this grant" measured a
-  # default-pin vocabulary, not the grant; the operator's own picker offered
-  # Opus 5 all along). Same lesson, second occurrence: re-probe from a second
-  # vantage before trusting any row here, in either direction.
-  # UPGRADED 2026-08-08 on gibson to claude-agent-acp 0.66.0 / SDK 0.3.220.
-  # Its public picker still exposes aliases, but their meaning changed: opus[1m]
-  # now identifies Opus 5. Tightbeam therefore tries a requested canonical id
-  # first and treats this table only as fallback candidates. The selected
-  # configOption's public currentValue plus init-derived name/description is the
-  # switch-time authority; a real next-turn modelUsage probe is the release gate.
-
-  @adapter_selectable_models ~w(default sonnet opus haiku fable claude-sonnet-5
-                                claude-opus-4-8 claude-haiku-4-5-20251001 claude-fable-5
-                                claude-opus-5)
-
-  @doc """
-  Model values this adapter version accepts at `session/set_config_option`.
-
-  Narrower than the derived catalog — see the note above the attribute. Anything outside
-  this list is refused by the adapter; it is never silently substituted.
-  """
-  def adapter_selectable_models, do: @adapter_selectable_models
-
   @adapter_replacements [
-    {
-      "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
-      "                            case \"task_notification\": {\n                                // The task settled — emit the correlated child-termination\n                                // carrier before dropping its parent tool-use bookkeeping.\n                                const record = session.liveBackgroundTasks.get(message.task_id);\n                                if (record?.isSubagent) {\n                                    await sendUpdate({\n                                        sessionId: message.session_id,\n                                        update: {\n                                            sessionUpdate: \"tool_call_update\",\n                                            toolCallId: record.parentToolUseId,\n                                            status: \"completed\",\n                                            _meta: { claudeCode: { subagentTerminated: { taskId: message.task_id, status: \"completed\" } } },\n                                        },\n                                    });\n                                }\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;\n                            }"
-    },
-    {
-      "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }",
-      "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    const record = session.liveBackgroundTasks.get(message.task_id);\n                                    if (record?.isSubagent) {\n                                        await sendUpdate({\n                                            sessionId: message.session_id,\n                                            update: {\n                                                sessionUpdate: \"tool_call_update\",\n                                                toolCallId: record.parentToolUseId,\n                                                status: message.patch.status === \"completed\" ? \"completed\" : \"failed\",\n                                                _meta: { claudeCode: { subagentTerminated: { taskId: message.task_id, status: message.patch.status } } },\n                                            },\n                                        });\n                                    }\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }"
-    }
+    {"                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;\n                            case \"task_updated\":",
+     "                                const record = session.liveBackgroundTasks.get(message.task_id);\n                                if (record?.isSubagent) {\n                                    await sendUpdate({\n                                        sessionId: message.session_id,\n                                        update: {\n                                            sessionUpdate: \"tool_call_update\",\n                                            toolCallId: record.parentToolUseId,\n                                            status: message.status === \"completed\" ? \"completed\" : \"failed\",\n                                            _meta: { claudeCode: { subagentTerminated: { taskId: message.task_id, status: message.status } } },\n                                        },\n                                    });\n                                }\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;\n                            case \"task_updated\":"},
+    {"                                    await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);\n                                    session.liveBackgroundTasks.delete(message.task_id);",
+     "                                    await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);\n                                    const record = session.liveBackgroundTasks.get(message.task_id);\n                                    if (record?.isSubagent) {\n                                        await sendUpdate({\n                                            sessionId: message.session_id,\n                                            update: {\n                                                sessionUpdate: \"tool_call_update\",\n                                                toolCallId: record.parentToolUseId,\n                                                status: message.patch.status === \"completed\" ? \"completed\" : \"failed\",\n                                                _meta: { claudeCode: { subagentTerminated: { taskId: message.task_id, status: message.patch.status } } },\n                                            },\n                                        });\n                                    }\n                                    session.liveBackgroundTasks.delete(message.task_id);"}
   ]
 
   @doc false
@@ -269,14 +166,6 @@ defmodule Tightbeam.Harness.Claude do
       permission_mode: "bypassPermissions",
       effort_config: "effort",
       resident_model_switch: :fork,
-      model_option_aliases: %{
-        "sonnet" => "claude-sonnet-5",
-        "haiku" => "claude-haiku-4-5-20251001",
-        "opus" => "claude-opus-4-8",
-        "opus[1m]" => "claude-opus-4-8[1m]",
-        "fable" => "claude-fable-5",
-        "fable[1m]" => "claude-fable-5[1m]"
-      },
       canonical_model_prefixes: ["claude-"]
     }
   end
@@ -515,7 +404,6 @@ defmodule Tightbeam.Harness.Claude do
          {:ok, models} <- decode_catalog(body),
          {:ok, models} <- fill_capabilities(models, get),
          {:ok, entries} <- derive_catalog_entries(models),
-         entries <- keep_selectable(entries, selectable_models(state)),
          entries when entries != [] <- entries do
       {:ok, entries}
     else
@@ -630,83 +518,6 @@ defmodule Tightbeam.Harness.Claude do
       end
     end
   end
-
-  # The catalog must not advertise what the adapter will refuse. A PURE FILTER over
-  # the already-derived entries — no probe, no extra fetch, nothing at boot; the
-  # journal records this path being reverted once for adding live I/O, so it stays
-  # a filter. Effort suffixes are preserved: only the base ref is matched.
-  #
-  # This is a PIN, and it pins three things at once — the CLI version, the grant
-  # (a smoke run recorded opus-5 "refused on this grant"), and any model pins in
-  # the projected home's settings.json. When claude ships a version that accepts
-  # more, or a different grant offers more, THE TABLE is what to re-probe and
-  # update; nothing here discovers it. See the note on @adapter_selectable_models.
-  # Injectable through the same `state.options` seam as claude_fetch/codex_read/
-  # credential_status, for two reasons: a test must be able to exercise catalog
-  # derivation without being coupled to this table, and an operator on a DIFFERENT
-  # GRANT (the accepted set is grant-dependent — a smoke run recorded opus-5
-  # "refused on this grant") must be able to lift the ceiling without editing code.
-  # `:all` disables the filter entirely.
-  # What the adapter will actually accept, asked of the harness rather than remembered.
-  #
-  # The static list alone is a frozen snapshot of somebody's entitlements, and it starved:
-  # the API stopped returning the concrete ids in it, so the intersection went empty and a
-  # correctly onboarded claude reported ZERO models. The account's real extras -- a
-  # 1M-context Opus, Fable -- live in the harness's own `additionalModelOptionsCache`, which
-  # Claude Code fills from the server on first use. That is why onboarding warms the home:
-  # cold, this reads nothing and the catalog is a subset; warmed, it reads what the account
-  # actually has.
-  #
-  # The static aliases stay as the floor. They are SDK aliases rather than account
-  # entitlements, so they are true for every account and cost nothing to keep.
-  #
-  # Remote homes are not read here -- that needs the ssh path -- so a satellite falls back to
-  # the floor until someone teaches this to read over ssh. Stated rather than silent: the
-  # symptom is a satellite offering fewer models than the gateway, not a failure.
-  defp selectable_models(state) do
-    case Map.get(state.options, :claude_selectable_models) do
-      nil -> @adapter_selectable_models ++ home_offered_models(state)
-      override -> override
-    end
-  end
-
-  defp home_offered_models(%{host_config: %{ssh: ssh}}) when not is_nil(ssh), do: []
-
-  defp home_offered_models(state) do
-    home = Tightbeam.Homes.home_path(state.base_dir, state.host_name, id())
-
-    with {:ok, body} <- File.read(Path.join(home, ".claude.json")),
-         {:ok, %{"additionalModelOptionsCache" => options}} when is_list(options) <-
-           JSON.decode(body) do
-      options
-      |> Enum.map(&Map.get(&1, "value"))
-      |> Enum.filter(&is_binary/1)
-    else
-      _ -> []
-    end
-  end
-
-  defp keep_selectable(entries, :all), do: entries
-
-  defp keep_selectable(entries, selectable) do
-    {kept, dropped} =
-      Enum.split_with(entries, &(vendor_ref(&1) in selectable))
-
-    if dropped != [] do
-      Logger.info(
-        "claude catalog: #{length(dropped)} model(s) the API offers are not selectable by " <>
-          "claude-agent-acp #{@adapter_version} and were withheld: " <>
-          Enum.map_join(dropped, ", ", &vendor_ref/1) <>
-          " — if an expected model is here, the harness home has not been used yet and its " <>
-          "model cache is empty; onboarding warms it, and first use fills it"
-      )
-    end
-
-    kept
-  end
-
-  defp vendor_ref(entry),
-    do: Model.to_ref(Model.new(entry.family, context: entry.context))
 
   @impl true
   def conformance_vectors do
@@ -874,7 +685,7 @@ defmodule Tightbeam.Harness.Claude do
         %{
           base_dir: base,
           credential_kind: kind,
-          options: %{claude_fetch: fetch, claude_selectable_models: :all}
+          options: %{claude_fetch: fetch}
         }
       end,
       wire_projection: %{

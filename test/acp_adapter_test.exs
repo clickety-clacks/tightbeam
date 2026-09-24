@@ -709,7 +709,7 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, %{stop_reason: "end_turn"}} = Adapter.prompt(a, "sess-1", "again")
   end
 
-  test "Claude model switch forks the conversation and applies the model to the new session" do
+  test "Claude model switch sends the exact id once and refuses a nonconfirming readback" do
     {adapter, capture_path} =
       start_adapter(harness: :claude, fail_mode: "canonical-no-take-then-alias")
 
@@ -719,42 +719,37 @@ defmodule Tightbeam.Acp.AdapterTest do
     assert {:ok, %{stop_reason: "end_turn"}} =
              Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
-    switched_model = Model.new("claude-opus-4-8", context: "1m", effort: "high")
+    requested = Model.new("claude-opus-4-8", context: "1m", effort: "high")
 
-    assert {:ok, "sess-fork-1"} =
+    assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
-               switched_model,
+               requested,
                "/tmp",
                [],
                "new guidance"
              )
 
-    assert Adapter.knows_session?(adapter, "sess-1")
-    assert Adapter.knows_session?(adapter, "sess-fork-1")
-
-    assert {:ok, ^switched_model} = Adapter.current_model(adapter, "sess-fork-1")
-
-    assert {:ok, switchable} = Adapter.switchable_models(adapter, "sess-fork-1")
-    assert Model.new("claude-opus-4-8", context: "1m") in switchable
-    assert Model.new("claude-sonnet-5") in switchable
-    refute Model.new("claude-opus-5") in switchable
-
     requests = captured_requests(capture_path)
-
-    assert Enum.any?(requests, fn request ->
-             request["method"] == "session/fork" and request["sessionId"] == "sess-1" and
-               request["cwd"] == "/tmp"
-           end)
+    assert Enum.any?(requests, &(&1["method"] == "session/fork" and &1["sessionId"] == "sess-1"))
 
     model_writes =
-      Enum.filter(requests, fn request ->
-        request["method"] == "session/set_config_option" and
-          request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
-      end)
+      Enum.filter(
+        requests,
+        &(&1["method"] == "session/set_config_option" and
+            &1["sessionId"] == "sess-fork-1" and &1["configId"] == "model")
+      )
 
-    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]", "opus[1m]"]
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]"]
+
+    assert Enum.any?(
+             requests,
+             &(&1["method"] == "session/close" and
+                 &1["sessionId"] == "sess-fork-1")
+           )
+
+    assert Adapter.knows_session?(adapter, "sess-1")
   end
 
   test "Claude model switch accepts canonical Opus 5 only when public readback identifies Opus 5" do
@@ -801,7 +796,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
-    assert {:error, {:model_apply_failed, :model_unavailable}} =
+    assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -818,7 +813,7 @@ defmodule Tightbeam.Acp.AdapterTest do
           request["sessionId"] == "sess-fork-1" and request["configId"] == "model"
       end)
 
-    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]", "opus[1m]"]
+    assert Enum.map(model_writes, & &1["value"]) == ["claude-opus-4-8[1m]"]
     assert {:error, :model_readback_unavailable} = Adapter.current_model(adapter, "sess-fork-1")
 
     assert Enum.any?(captured_requests(capture_path), fn request ->
@@ -835,7 +830,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
-    assert {:error, {:model_apply_failed, :model_unavailable}} =
+    assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -869,7 +864,7 @@ defmodule Tightbeam.Acp.AdapterTest do
 
     assert {:ok, _turn} = Adapter.prompt(adapter, "sess-1", "persist this conversation")
 
-    assert {:error, {:model_apply_failed, :model_unavailable}} =
+    assert {:error, {:model_apply_failed, :model_readback_unavailable}} =
              Adapter.switch_model_session(
                adapter,
                "sess-1",
@@ -1244,6 +1239,69 @@ defmodule Tightbeam.Acp.AdapterTest do
              request["method"] == "session/close" and
                request["sessionId"] == "sess-1"
            end)
+  end
+
+  test "an uncataloged Claude id reaches the client exactly and records acceptance" do
+    {adapter, capture_path} = start_adapter(harness: :claude)
+    requested = Model.new("claude-opus-5-5", effort: "high")
+
+    assert {:ok, "sess-1"} =
+             Adapter.new_candidate_session(adapter, requested, "/tmp", [], "guidance")
+
+    assert {:ok, ^requested} = Adapter.current_model(adapter, "sess-1")
+
+    assert ["claude-opus-5-5"] =
+             capture_path
+             |> captured_requests()
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and
+                   &1["configId"] == "model")
+             )
+             |> Enum.map(& &1["value"])
+  end
+
+  test "an uncataloged Claude id rejected by the client closes the candidate" do
+    {adapter, capture_path} = start_adapter(harness: :claude, fail_mode: "model-invalid-params")
+
+    assert {:error, {:session_prepare_failed, :model_unavailable, "sess-1", cleanup}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("claude-opus-5-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert cleanup.status == "verified"
+
+    assert ["claude-opus-5-5"] =
+             capture_path
+             |> captured_requests()
+             |> Enum.filter(
+               &(&1["method"] == "session/set_config_option" and
+                   &1["configId"] == "model")
+             )
+             |> Enum.map(& &1["value"])
+
+    refute Adapter.knows_session?(adapter, "sess-1")
+  end
+
+  test "a candidate whose successful response names another model is closed" do
+    {adapter, capture_path} = start_adapter(harness: :claude, fail_mode: "silent-model-no-take")
+
+    assert {:error,
+            {:session_prepare_failed, {:runtime_config_mismatch, %Model{family: "haiku"}},
+             "sess-1", %{status: "verified"}}} =
+             Adapter.new_candidate_session(
+               adapter,
+               Model.new("claude-opus-5-5"),
+               "/tmp",
+               [],
+               "guidance"
+             )
+
+    assert Enum.any?(captured_requests(capture_path), &(&1["method"] == "session/close"))
+    refute Adapter.knows_session?(adapter, "sess-1")
   end
 
   test "strict apply does not retry an invalid-params model refusal" do

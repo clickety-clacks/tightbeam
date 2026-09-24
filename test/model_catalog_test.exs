@@ -1474,13 +1474,9 @@ defmodule Tightbeam.ModelCatalogTest do
         claude_fetch: ctx.claude_fetch,
         sh: ctx.codex_sh,
         credential_status: fn _provider -> :onboarded end,
-        credential_kind: fn _provider -> :subscription end,
+        credential_kind: fn _provider -> :subscription end
         # These tests exercise catalog DERIVATION (field mapping, effort parsing,
         # health, sorting) with synthetic and fixture model ids. The claude
-        # selectable-model pin is a separate subject with its own tests below, so
-        # it is disabled here — otherwise every derivation test would silently
-        # become a test of that table.
-        claude_selectable_models: :all
       ]
       |> Keyword.merge(overrides)
 
@@ -1503,48 +1499,21 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
-  # Task #41. The catalog must not advertise a model the adapter will refuse, and no
-  # substitution may be smuggled in at the only place a mapping could live.
-  describe "claude selectable-model pin" do
-    test "withholds models the adapter refuses and keeps the ones it accepts", ctx do
-      catalog =
-        start_catalog(ctx,
-          claude_selectable_models: Tightbeam.Harness.Claude.adapter_selectable_models()
-        )
-
+  describe "Claude provider inventory" do
+    test "preserves entries even when an older adapter did not offer them", ctx do
+      catalog = start_catalog(ctx)
       await_fresh(catalog, "claude")
       {claude, :fresh} = ModelCatalog.get(@host, "claude", catalog)
-      families = claude |> Enum.map(& &1.family) |> Enum.uniq()
+      families = Enum.map(claude, & &1.family)
 
-      # Only selectable models survive, and the fixture's refused ones are gone.
-      assert "claude-haiku-4-5-20251001" in families
-      # Re-measured 2026-08-06 on gibson (production grant): a pin-probed home
-      # offered and accepted claude-opus-5 and it answered a live prompt — the
-      # earlier REJECTED row was the default-pin vocabulary, not the grant.
+      assert "claude-sonnet-4-6" in families
       assert "claude-opus-5" in families
-      # Re-measured 2026-08-05 on gibson (CLI 2.1.221, production grant):
-      # fable answers a real prompt; the July REJECTED row was one
-      # environment's snapshot. Fable is now offered.
       assert "claude-fable-5" in families
-      refute "claude-sonnet-4-6" in families
 
-      assert Enum.all?(families, &(&1 in Tightbeam.Harness.Claude.adapter_selectable_models())),
-             "catalog offered a model the adapter refuses: #{inspect(families)}"
-
-      # The filter matches the vendor IDENTITY. Efforts are a property of the
-      # kept entry, not part of what is matched, so they survive INTACT — which
-      # means the values the fixture declares, not merely "a list". `is_list/1`
-      # stayed green against every list being emptied, which is exactly the
-      # damage a filter keyed on the wrong thing would do.
-      sonnet_5 = Enum.find(claude, &(&1.family == "claude-sonnet-5"))
-
-      assert MapSet.new(sonnet_5.efforts) ==
+      assert MapSet.new(Enum.find(claude, &(&1.family == "claude-sonnet-5")).efforts) ==
                MapSet.new(["low", "medium", "high", "xhigh", "max"])
 
-      # …and an untiered model keeps its empty list, so "intact" is not read as
-      # "non-empty" and the two cases stay distinguishable.
-      haiku = Enum.find(claude, &(&1.family == "claude-haiku-4-5-20251001"))
-      assert haiku.efforts == []
+      assert Enum.find(claude, &(&1.family == "claude-haiku-4-5-20251001")).efforts == []
     end
 
     # Where a substitution WOULD live: `Model.parse_ref/1` is the only transform

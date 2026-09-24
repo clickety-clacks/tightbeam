@@ -710,6 +710,7 @@ defmodule Tightbeam.Acp.Adapter do
       {:ok, %{"sessionId" => sid} = result} when is_binary(sid) ->
         with {:ok, applied_model} <-
                establish_new_session_model(state, sid, model, result, request_timeout),
+             :ok <- verify_candidate_model(report_cleanup?, model, applied_model),
              :ok <- set_mode(state, sid, request_timeout) do
           state =
             state
@@ -737,6 +738,14 @@ defmodule Tightbeam.Acp.Adapter do
         {:reply, {:error, error}, state}
     end
   end
+
+  defp verify_candidate_model(true, %Model{} = requested, %Model{} = actual)
+       when requested.family != actual.family or
+              requested.context != actual.context or
+              (not is_nil(requested.effort) and requested.effort != actual.effort),
+       do: {:error, {:runtime_config_mismatch, actual}}
+
+  defp verify_candidate_model(_report_cleanup?, _requested, _actual), do: :ok
 
   defp close_failed_new_session(state, sid) do
     case Conn.request(state.conn, "session/close", %{sessionId: sid}) do
@@ -883,7 +892,7 @@ defmodule Tightbeam.Acp.Adapter do
         if readback_confirms_model?(model_result, state.preset, model) do
           {:ok, model_result}
         else
-          try_fork_model_candidates(remaining, state, sid, model, request_timeout)
+          {:error, :model_readback_unavailable}
         end
 
       {:error, :model_unavailable} ->
@@ -1447,12 +1456,18 @@ defmodule Tightbeam.Acp.Adapter do
   defp model_value_candidates(preset, result, %Model{} = model) do
     canonical_ref = Model.to_ref(model)
 
-    aliases =
-      result
-      |> model_option_values()
-      |> Enum.filter(&(Map.get(preset.model_option_aliases, &1) == canonical_ref))
+    if preset.canonical_model_prefixes == ["claude-"] do
+      [canonical_ref]
+    else
+      aliases =
+        result
+        |> model_option_values()
+        |> Enum.filter(
+          &(Map.get(Map.get(preset, :model_option_aliases, %{}), &1) == canonical_ref)
+        )
 
-    Enum.uniq([canonical_ref | aliases])
+      Enum.uniq([canonical_ref | aliases])
+    end
   end
 
   defp canonical_offered_models(preset, result) do
@@ -1466,7 +1481,7 @@ defmodule Tightbeam.Acp.Adapter do
     public_model = public_option_model(preset, option)
 
     mapped_candidates =
-      case Map.get(preset.model_option_aliases, option["value"]) do
+      case Map.get(Map.get(preset, :model_option_aliases, %{}), option["value"]) do
         value when is_binary(value) -> [Model.parse_ref(value)]
         _ -> []
       end

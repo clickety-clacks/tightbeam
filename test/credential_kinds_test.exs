@@ -252,7 +252,7 @@ defmodule Tightbeam.CredentialKindsTest do
                Claude.fetch_catalog(%{
                  base_dir: ctx.base,
                  credential_kind: :api_key,
-                 options: %{claude_fetch: fetch, claude_selectable_models: :all}
+                 options: %{claude_fetch: fetch}
                })
 
       assert {entry.family, entry.context, entry.efforts} == {"claude-sonnet-5", nil, ["low"]}
@@ -285,7 +285,7 @@ defmodule Tightbeam.CredentialKindsTest do
                Claude.fetch_catalog(%{
                  base_dir: ctx.base,
                  credential_kind: :subscription,
-                 options: %{claude_fetch: fetch, claude_selectable_models: :all}
+                 options: %{claude_fetch: fetch}
                })
 
       assert_receive {:claude_probe, headers}
