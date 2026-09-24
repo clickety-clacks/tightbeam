@@ -589,8 +589,11 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                )
              )
 
-    for misleading_effect <- ["coordination", "review"] do
-      assert {:error, %{rule: "engineering-assign-production-needs-responsibility"}} =
+    for {misleading_effect, rule} <- [
+          {"coordination", "engineering-assign-labeled-coordination-needs-responsibility"},
+          {"review", "engineering-assign-production-needs-responsibility"}
+        ] do
+      assert {:error, %{rule: ^rule}} =
                Dispatch.dispatch(
                  db,
                  assignment_handlers,
@@ -650,6 +653,19 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     bootstrap_a(db)
 
+    assert {:ok, %{holderKey: "pdo-a", effectKind: "coordination"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call(
+                 "assign",
+                 Org.personal_session_key("owner"),
+                 "pdo-a",
+                 "wi_a1",
+                 effect_kind: "coordination"
+               )
+             )
+
     for archetype <- [nil, "coder", "orchestrator"] do
       assert {:error,
               %{
@@ -675,8 +691,11 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert message =~ "Current accountable owner: session:pdo-a"
     assert message =~ "Record topology-decided"
 
-    for misleading_effect <- ["coordination", "review"] do
-      assert {:error, %{rule: "engineering-assign-production-needs-topology"}} =
+    for {misleading_effect, rule} <- [
+          {"coordination", "engineering-assign-labeled-coordination-needs-topology"},
+          {"review", "engineering-assign-production-needs-topology"}
+        ] do
+      assert {:error, %{rule: ^rule}} =
                Dispatch.dispatch(
                  db,
                  assignment_handlers,
@@ -693,6 +712,19 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert {:ok, _} =
              DB.query(db, "UPDATE sessions SET archetype='orchestrator' WHERE sessionKey='pdo-a'")
+
+    assert {:ok, %{holderKey: "pdo-a", effectKind: "coordination"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call(
+                 "assign",
+                 Org.personal_session_key("owner"),
+                 "pdo-a",
+                 "wi_a1",
+                 effect_kind: "coordination"
+               )
+             )
 
     for {caller, target, effect_kind, rule} <- [
           {Org.personal_session_key("owner"), "consult-po", "policy",

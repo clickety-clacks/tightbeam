@@ -1045,6 +1045,94 @@ defmodule Tightbeam.CliIntegrationTest do
 
     item_id = JSON.decode!(created)["id"]
 
+    Roles.create!(ctx.db, "product-owner:papertrail", "flynn", ctx.session.session_key)
+
+    for args <- [
+          [
+            "session-po-set",
+            "--session",
+            ctx.session.session_key,
+            "--po-role",
+            "product-owner:papertrail",
+            "--key",
+            "papertrail-association",
+            "--as-user",
+            "flynn"
+          ],
+          [
+            "delivery-scope-owner-set",
+            "--session",
+            ctx.session.session_key,
+            "--association-revision",
+            "1",
+            "--expected-revision",
+            "0",
+            "--key",
+            "papertrail-owner",
+            "--as-user",
+            "flynn"
+          ],
+          [
+            "work-item-delivery-scope-set",
+            item_id,
+            "--association-session",
+            ctx.session.session_key,
+            "--association-revision",
+            "1",
+            "--expected-revision",
+            "0",
+            "--key",
+            "papertrail-scope",
+            "--as-user",
+            "flynn"
+          ]
+        ] do
+      assert {_output, 0} = System.cmd(ctx.binary, args, cd: ctx.workdir, stderr_to_stdout: true)
+    end
+
+    assert :ok = Wakes.fire_due(Tightbeam.WakeScheduler)
+    assert_receive {:wake_delivered, association_wake}, 5_000
+    assert association_wake.prompt =~ "Your addressed PO is `product-owner:papertrail`"
+
+    {topology, 0} =
+      System.cmd(
+        ctx.binary,
+        [
+          "assign",
+          "--subject",
+          "decide the papertrail topology",
+          "--session",
+          ctx.session.session_key,
+          "--effect-kind",
+          "coordination",
+          "--work-item",
+          item_id,
+          "--as",
+          "cli-holder"
+        ],
+        cd: ctx.workdir,
+        stderr_to_stdout: true
+      )
+
+    topology_id = JSON.decode!(topology)["id"]
+
+    assert {_verdict, 0} =
+             System.cmd(
+               ctx.binary,
+               [
+                 "attest",
+                 topology_id,
+                 "--kind",
+                 "verdict",
+                 "--verdict",
+                 "topology-decided",
+                 "--as",
+                 "cli-holder"
+               ],
+               cd: ctx.workdir,
+               stderr_to_stdout: true
+             )
+
     {assigned, 0} =
       System.cmd(
         ctx.binary,
@@ -1055,11 +1143,11 @@ defmodule Tightbeam.CliIntegrationTest do
           "--session",
           "cli-coder",
           "--effect-kind",
-          "coordination",
+          "code",
           "--work-item",
           item_id,
-          "--as-user",
-          "flynn"
+          "--as",
+          "cli-holder"
         ],
         cd: ctx.workdir,
         stderr_to_stdout: true
@@ -1130,15 +1218,40 @@ defmodule Tightbeam.CliIntegrationTest do
     {_verdict, 0} =
       System.cmd(
         ctx.binary,
-        ["attest", review_id, "--kind", "verdict", "--verdict", "reviewed-clean"],
+        [
+          "attest",
+          review_id,
+          "--kind",
+          "verdict",
+          "--verdict",
+          "reviewed-clean",
+          "--commit-refs",
+          commit_refs
+        ],
         cd: reviewer_dir,
         stderr_to_stdout: true
       )
 
+    assert Assignments.qualifying_review_verdict_kinds(
+             ctx.db,
+             work_id,
+             "cli-coder",
+             JSON.decode!(commit_refs)
+           ) == ["reviewed-clean"]
+
+    completion_args = [
+      "attest",
+      work_id,
+      "--kind",
+      "completion",
+      "--commit-refs",
+      commit_refs
+    ]
+
     # A1 first denial: the completion is refused and the wake names the
     # missing verification verdict.
     {denied, denied_status} =
-      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -1173,7 +1286,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     # A1 second denial: the artifact statute prods next, naming its own record.
     {denied_again, denied_again_status} =
-      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
         stderr_to_stdout: true
       )
@@ -1238,7 +1351,7 @@ defmodule Tightbeam.CliIntegrationTest do
 
     # A2: the papertrail stands — the completion passes and the episodes close.
     {completed, 0} =
-      System.cmd(ctx.binary, ["attest", work_id, "--kind", "completion"],
+      System.cmd(ctx.binary, completion_args,
         cd: coder_dir,
         stderr_to_stdout: true
       )

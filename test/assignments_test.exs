@@ -120,6 +120,52 @@ defmodule Tightbeam.AssignmentsTest do
       end
     end
 
+    test "active exact-item delegated opener receives routine and review notices without crossing to a sibling item",
+         ctx do
+      {delegated, sibling, _delegation} = terminal_delegated_fixture(ctx)
+
+      for {assignment, expected, wake_id} <- [
+            {delegated, "notice-parent", "w_delegated_review"},
+            {sibling, "delivery-owner", "w_sibling_review"}
+          ] do
+        assert {:ok, {%{session_key: ^expected}, wake}} =
+                 DB.transaction(ctx.db, fn txn ->
+                   {:ok, recipient} = Gateway.review_notice_recipient_in_txn(txn, assignment.id)
+
+                   wake =
+                     Gateway.schedule_review_notice_in_txn(txn, recipient, %{
+                       wake_id: wake_id,
+                       prompt: "review #{assignment.id}",
+                       due_at: 1,
+                       assignment_id: assignment.id
+                     })
+
+                   {recipient, wake}
+                 end)
+
+        assert wake.session_key == expected
+        assert wake.assignment_id == assignment.id
+      end
+
+      assert %{assignment: %{outcome: "completed"}} =
+               handle(
+                 ctx,
+                 "attest",
+                 attest_call({:session, "holder"}, delegated.id, "completion")
+               )
+
+      assert %{assignment: %{outcome: "surrendered"}} =
+               handle(
+                 ctx,
+                 "attest",
+                 attest_call({:session, "holder"}, sibling.id, "surrender")
+               )
+
+      notices = Map.new(terminal_notices(ctx.db), &{&1.assignment_id, &1})
+      assert notices[delegated.id].session_key == "notice-parent"
+      assert notices[sibling.id].session_key == "delivery-owner"
+    end
+
     test "human opener without a work item admits to its durable owner's main", ctx do
       personal = Org.personal_session_key("flynn")
       session(ctx.db, personal, "flynn")
@@ -900,6 +946,30 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   describe "terminal notice explicit recovery" do
+    test "failed delegated delivery recovers to the still-active exact-item opener", ctx do
+      {assignment, _sibling, _delegation} = terminal_delegated_fixture(ctx)
+
+      assert %{assignment: %{state: "closed"}} =
+               handle(
+                 ctx,
+                 "attest",
+                 attest_call({:session, "holder"}, assignment.id, "completion")
+               )
+
+      assert [root] = terminal_notices(ctx.db)
+      assert root.session_key == "notice-parent"
+      assert {:appended, "notice-parent", _, _} = deliver_terminal_notice(ctx.db, root)
+      assert {:ok, source} = Ledger.claim_next(ctx.db, "notice-parent", "fixture")
+      assert :ok = Ledger.finish(ctx.db, source.seq, "failed", "fixture delivery failure")
+
+      assert {:ok, {:ok, %{wake: recovery, replay: false}}} =
+               recover_notice(ctx.db, root.wake_id, "session:notice-parent")
+
+      assert recovery.session_key == "notice-parent"
+      assert recovery.prompt == root.prompt
+      assert recovery.obligation_ref == root.obligation_ref
+    end
+
     test "failed delivery recovers to the current accountable successor", ctx do
       {assignment, _item} = terminal_successor_fixture(ctx)
 
@@ -1513,6 +1583,98 @@ defmodule Tightbeam.AssignmentsTest do
       )
 
     {assignment, item}
+  end
+
+  defp terminal_delegated_fixture(ctx) do
+    session(ctx.db, "notice-parent", "flynn")
+    session(ctx.db, "terminal-po", "flynn")
+    session(ctx.db, "delivery-owner", "flynn")
+    Roles.create!(ctx.db, "product-owner:terminal", "flynn", "terminal-po")
+
+    for session_key <- ["delivery-owner", "notice-parent"] do
+      assert %{"changed" => true} =
+               SessionPoAssociations.handle(ctx.db, %{
+                 principal: {:user, "flynn"},
+                 params: %{
+                   session_key: session_key,
+                   po_role: "product-owner:terminal",
+                   idempotency_key: "delegated-association-" <> session_key
+                 }
+               })
+    end
+
+    delegated_item = create_work_item(ctx, "delegated terminal")
+    sibling_item = create_work_item(ctx, "sibling terminal")
+
+    assert %{"changed" => true} =
+             DeliveryResponsibilities.handle(ctx.db, %{
+               verb: "delivery-scope-owner-set",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{
+                 session_key: "delivery-owner",
+                 association_revision: 1,
+                 expected_owner_session_key: nil,
+                 expected_owner_revision: 0,
+                 idempotency_key: "delegated-owner"
+               }
+             })
+
+    for {item, key} <- [{delegated_item, "delegated"}, {sibling_item, "sibling"}] do
+      assert %{"changed" => true} =
+               DeliveryResponsibilities.handle(ctx.db, %{
+                 verb: "work-item-delivery-scope-set",
+                 origin: "user:flynn",
+                 principal: {:user, "flynn"},
+                 params: %{
+                   work_item_id: item.id,
+                   association_session_key: "delivery-owner",
+                   association_revision: 1,
+                   expected_binding_revision: 0,
+                   idempotency_key: "#{key}-scope"
+                 }
+               })
+    end
+
+    delegation =
+      terminal_notice_assign_call(
+        {:session, "delivery-owner"},
+        "delegate exact terminal item",
+        delegated_item.id
+      )
+      |> Map.put(:session_key, "notice-parent")
+      |> put_in([:params, :delegates_delivery], true)
+      |> then(&handle(ctx, "assign", &1))
+
+    assert DeliveryResponsibilities.responsibility(ctx.db, "notice-parent", delegated_item.id) ==
+             "delegated"
+
+    assert DeliveryResponsibilities.responsibility(ctx.db, "notice-parent", sibling_item.id) ==
+             "none"
+
+    delegated =
+      handle(
+        ctx,
+        "assign",
+        terminal_notice_assign_call(
+          {:session, "notice-parent"},
+          "delegated child",
+          delegated_item.id
+        )
+      )
+
+    sibling =
+      handle(
+        ctx,
+        "assign",
+        terminal_notice_assign_call(
+          {:session, "notice-parent"},
+          "legacy sibling child",
+          sibling_item.id
+        )
+      )
+
+    {delegated, sibling, delegation}
   end
 
   defp deliver_terminal_notice(db, wake, overrides \\ []) do

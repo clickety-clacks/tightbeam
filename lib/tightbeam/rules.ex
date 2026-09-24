@@ -161,7 +161,7 @@ defmodule Tightbeam.Rules do
     "work_item.delivery_owner_state" => :string,
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
-    "assign.admission_context" => :string,
+    "assign.is_linked_review" => :bool,
     "assign.effect_kind" => :string,
     "assign.declared_files_overlap_open" => :bool,
     "assign.delegates_delivery" => :bool,
@@ -2534,33 +2534,32 @@ defmodule Tightbeam.Rules do
 
   defp compute_fact("assign.effect_kind", _db, _call, cache), do: {nil, cache}
 
-  defp compute_fact("assign.admission_context", db, %{verb: verb} = call, cache)
-       when verb in ["assign", "dispatch"] do
-    with_dependency("$target", db, call, cache, fn target, cache ->
-      review_target = if verb == "assign", do: call.params[:reviews_assignment_id]
-      effect_kind = Assignments.effective_effect_kind(review_target, call.params[:effect_kind])
+  defp compute_fact("assign.is_linked_review", db, %{verb: "assign"} = call, cache) do
+    review_assignment_id =
+      Map.get(call.params, :reviews_assignment_id) ||
+        Map.get(call.params, "reviews_assignment_id")
 
-      context =
-        cond do
-          is_binary(review_target) ->
-            "review"
+    with_dependency("$work_item_id", db, call, cache, fn
+      work_item_id, cache
+      when is_binary(review_assignment_id) and is_binary(work_item_id) ->
+        linked =
+          match?(
+            {:ok, [[1]]},
+            DB.query(
+              db,
+              "SELECT 1 FROM assignments WHERE id=?1 AND workItemId=?2 LIMIT 1",
+              [review_assignment_id, work_item_id]
+            )
+          )
 
-          effect_kind == "coordination" and match?({:user, _}, call.principal) and
-            target && target.archetype == "pdo" ->
-            "intake"
+        {linked, cache}
 
-          effect_kind == "coordination" and target && target.archetype == "product-owner" ->
-            "consultation"
-
-          true ->
-            "production"
-        end
-
-      {context, cache}
+      _work_item_id, cache ->
+        {false, cache}
     end)
   end
 
-  defp compute_fact("assign.admission_context", _db, _call, cache), do: {nil, cache}
+  defp compute_fact("assign.is_linked_review", _db, _call, cache), do: {false, cache}
 
   defp compute_fact("assign.delegates_delivery", _db, call, cache) do
     value =

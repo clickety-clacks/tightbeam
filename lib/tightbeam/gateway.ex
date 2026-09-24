@@ -5448,8 +5448,18 @@ defmodule Tightbeam.Gateway do
               nil
           end
 
+        delegated_opener =
+          if is_binary(opener) and is_binary(opened_by_session) and
+               DeliveryResponsibilities.responsibility_in_txn(
+                 txn,
+                 opened_by_session,
+                 work_item_id
+               ) == "delegated",
+             do: opener,
+             else: nil
+
         recipient =
-          [current, opener, Org.personal_session_key(owner)]
+          [delegated_opener, current, opener, Org.personal_session_key(owner)]
           |> Enum.reject(&is_nil/1)
           |> Enum.uniq()
           |> Enum.find(fn candidate ->

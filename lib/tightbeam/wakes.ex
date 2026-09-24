@@ -1096,9 +1096,19 @@ defmodule Tightbeam.Wakes do
         event.owner_user_id
       )
 
+    delegated_opener =
+      if event.opened_by_kind == "session" and
+           DeliveryResponsibilities.responsibility_in_txn(
+             txn,
+             event.opened_by_id,
+             event.work_item_id
+           ) == "delegated",
+         do: event.opened_by_id,
+         else: nil
+
     candidates =
       if event.opened_by_kind == "session",
-        do: [current, event.opened_by_id, personal],
+        do: [delegated_opener, current, event.opened_by_id, personal],
         else: [current, personal]
 
     recipient =
