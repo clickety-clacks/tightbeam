@@ -3,11 +3,11 @@ skills = ["repository-retirement", "human-communication"]
 
 [defaults]
 harness = "codex"
-model = "gpt-6-sol"
+model = "gpt-5.6-sol"
 effort = "low"
 
 [[model_preferences]]
-model = "gpt-6-sol"
+model = "gpt-5.6-sol"
 effort = "low"
 
 [guidance]
