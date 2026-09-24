@@ -1,0 +1,101 @@
+# Every new work item gets PO topology advice before delivery staffing.
+# The verdict records the returned decision, not approval of a fixed team graph.
+# Initial coordination intake and PO consultation remain reachable before it.
+# Authorship stays in ordinary attest records; the rail does not select a PO.
+
+[[rule]]
+name = "assign-staffing-needs-work-item"
+verb = "assign"
+text = "Link this assignment to its work item. For new work, ask the PO for topology advice before staffing."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.has_work_item", op = "eq", value = false },
+]
+
+[[rule]]
+name = "assign-worker-staffing-needs-topology"
+verb = "assign"
+text = "Ask the PO for a topology recommendation on this work item using a coordination assignment; record the returned decision as topology-decided, then staff the work."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+
+[[rule]]
+name = "assign-delivery-needs-topology"
+verb = "assign"
+text = "Obtain and record the PO topology recommendation on this work item as topology-decided before delivery. Initial orchestrator intake and PO consultation use coordination effect."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "in", value = ["orchestrator", "product-owner"] },
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+
+[[rule]]
+name = "assign-child-orchestration-needs-topology"
+verb = "assign"
+text = "Initial intake is already assigned. Ask the PO on this work item using a coordination assignment and record the returned topology-decided judgment before staffing further orchestration."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "eq", value = "orchestrator" },
+  { fact = "assign.is_first_on_work_item", op = "eq", value = false },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+
+[[rule]]
+name = "dispatch-staffing-needs-work-item"
+verb = "dispatch"
+text = "Link this assignment to its work item. For new work, ask the PO for topology advice before staffing."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.has_work_item", op = "eq", value = false },
+]
+
+[[rule]]
+name = "dispatch-worker-staffing-needs-topology"
+verb = "dispatch"
+text = "Ask the PO for a topology recommendation on this work item using a coordination assignment; record the returned decision as topology-decided, then staff the work."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+
+[[rule]]
+name = "dispatch-delivery-needs-topology"
+verb = "dispatch"
+text = "Obtain and record the PO topology recommendation on this work item as topology-decided before delivery. Initial orchestrator intake and PO consultation use coordination effect."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "in", value = ["orchestrator", "product-owner"] },
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+
+[[rule]]
+name = "dispatch-child-orchestration-needs-topology"
+verb = "dispatch"
+text = "Initial intake is already assigned. Ask the PO on this work item using a coordination assignment and record the returned topology-decided judgment before staffing further orchestration."
+external_producer = true
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "eq", value = "orchestrator" },
+  { fact = "assign.is_first_on_work_item", op = "eq", value = false },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+

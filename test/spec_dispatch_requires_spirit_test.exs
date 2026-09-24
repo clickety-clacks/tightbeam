@@ -47,6 +47,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
   test "spec-backed preparation proceeds without a historical spirit token", ctx do
     refute "spec-dispatch-requires-spirit" in Enum.map(ctx.rules, & &1.name)
     item = work_item(ctx)
+    record_topology(ctx, item)
 
     assert {:ok, assignment} =
              Dispatch.dispatch(
@@ -105,6 +106,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
            )
 
     item = work_item(ctx)
+    record_topology(ctx, item)
     call = dispatch_call(ctx.holder.session_key, item.id, "evidence under review")
     call = put_in(call, [:params, :effect_kind], "evidence")
     assert {:ok, subject} = Dispatch.dispatch(ctx.db, ctx.handlers, call)
@@ -127,6 +129,22 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
     end
   end
 
+  defp record_topology(ctx, item) do
+    assert {:ok, consultation} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               assign_call(ctx.owner.session_key, item.id, "recommend topology")
+             )
+
+    assert {:ok, _} =
+             Dispatch.dispatch(
+               ctx.db,
+               ctx.handlers,
+               verdict_call(ctx.owner.session_key, consultation.id, "topology-decided")
+             )
+  end
+
   defp work_item(ctx) do
     WorkItems.__handle__(ctx.db, "work-item-create", %{
       principal: {:user, "flynn"},
@@ -146,7 +164,7 @@ defmodule Tightbeam.SpecDispatchRequiresSpiritTest do
       session_key: holder_key,
       target_role: nil,
       role_fallback: false,
-      params: %{subject: subject, work_item_id: item_id}
+      params: %{subject: subject, work_item_id: item_id, effect_kind: "coordination"}
     }
   end
 

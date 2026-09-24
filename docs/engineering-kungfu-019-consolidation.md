@@ -651,6 +651,9 @@ and preserve existing authority, work holds and custody.
 
 ## 23 September amendment: team consultation and durable staffing
 
+The 24 September ruling below supersedes this amendment's conditional consultation
+trigger and familiar-repair exception. Its durable-staffing distinction remains.
+
 This source-only correction reconciles early PO team advice with delivery authority
 and distinguishes harness helpers from durable staffing. The orchestrator kernel
 owns the consultation trigger and sole-coupled-lane discretion. The product-owner
@@ -703,3 +706,50 @@ the shipped fallback. Baseline skills are supplied separately by `Homes`.
 work-item and producer-review links. Its omitted effect defaults to code and a
 producer-linked review resolves to review. No automatic helper promotion, marker
 obligation or retrospective custody is introduced by this amendment.
+
+
+## 24 September ruling: topology for every new work item
+
+The user explicitly requires the PO to be asked for topology on every new work item,
+including familiar repairs. The user also requests a rail ensuring a decision exists
+before staffing, without selecting or authenticating a particular PO as its author.
+This supersedes conditional consultation language above. The agent must understand the
+spirit of the work, not establish another spirit document. Resolve ambiguity about
+work or scope with the user through decision requests, using existing decisions first.
+
+The orchestrator kernel owns that contract. The PO kernel describes the recommendation;
+the neutral dispatching skill describes coordination assignment mechanics. The
+engineering kernel names the topology verdict and its filing command.
+The returned recommendation is a topology-decided verdict on the same work item. Its
+note or referenced artifact carries the actual team, reasoning and source. The PO can
+record it, or the delivery owner can record returned advice. The existing verdict
+fact checks presence, not authorship or quality. A spirit verdict, completed card or
+pending consultation is not topology evidence. No manager count or provider is fixed.
+
+The engineering bundle's topology rules cover assign and dispatch. Before the decision,
+the first assignment can be coordination intake for an orchestrator, and the PO can
+hold coordination consultations. All other delivery staffing needs the decision.
+Missing work-item linkage refuses with a remedy. Further assignments reuse the item’s
+decision; a new item cannot borrow it. Applicable advice for existing work can be
+recorded when adopting the rules; do not fabricate past consultation or label work as
+coordination to evade the requirement. Changed scope still needs agent judgment about
+new consultation, and the rail does not claim to assess that judgment.
+
+Three neutral facts describe the proposed assignment: assign.effect_kind uses the
+same classification as storage, assign.has_work_item resolves the direct or reviewed
+item, and assign.is_first_on_work_item tests whether that item has any assignments.
+Pure row-based deny rules are rechecked in the assignment insertion transaction so
+concurrent callers cannot both consume the first-intake exception. Idempotency replay
+still returns the original assignment. Scripts, remedies and notices stay outside the
+transaction. This adds no schema, topology registry or new workflow service.
+
+Tests exercise both staffing verbs, a fresh bug item without a spec, release after the
+decision, inability to borrow another item's verdict, reachable intake and consultation,
+spirit-only and closed-card insufficiency, a delivery owner's recording of returned
+advice, coordination misclassification, missing linkage, session callers, replay,
+concurrent intake preflight, and inherited review linkage.
+
+Publication must reconcile retained organization skills as well as shipped source.
+In particular, a retained product-delivery skill must defer to this consultation
+contract and remove both "establish the spirit" and compulsory child-orchestrator
+language. Source completion does not establish live publication or session uptake.

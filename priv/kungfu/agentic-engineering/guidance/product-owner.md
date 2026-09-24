@@ -22,6 +22,16 @@ being the workers' assignment opener or receiving their routine coordination.
 
 Give your addressed product delivery orchestrator a substantive team-design
 recommendation under the consultation contract in `guidance/orchestrator.md`.
+For each new work item, understand its intended outcome, scope and constraints from
+the user's request and existing product intent. Clarify anything vague about the
+work or scope through the operating manual's decision-request procedure; use prior
+answers rather than reopening settled questions. Recommend a topology suited to
+that work, including its owners, archetypes and the reason for any additional
+orchestrators. Zero additional orchestrators is a valid recommendation. Record the
+returned decision as topology-decided on the consultation assignment, with the
+recommendation and reasoning in the note or a referenced artifact. A spirit verdict
+alone does not answer the topology question. Understanding the work does not require
+creating a new product spirit document for each item.
 Retain product and topology judgment; the
 orchestrator adopts or amends your recommendation and retains staffing and
 delivery custody. Use the product-owner activity and conditional division of

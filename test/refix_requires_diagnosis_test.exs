@@ -34,6 +34,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
     holder = session(db, "fix-holder", "coder")
     recon = session(db, "recon-holder", "recon")
+    owner = session(db, "topology-po", "product-owner")
     Roles.create!(db, "recon", "flynn", recon.session_key)
 
     base_dir =
@@ -55,7 +56,7 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
       :persistent_term.erase(Archetypes)
     end)
 
-    %{db: db, handlers: handlers, holder: holder, rules: rules}
+    %{db: db, handlers: handlers, holder: holder, owner: owner, rules: rules}
   end
 
   test "the shipped bundle omits count-triggered mandatory diagnosis", ctx do
@@ -63,6 +64,14 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
 
     assert names == [
              "completion-requires-review",
+             "assign-staffing-needs-work-item",
+             "assign-worker-staffing-needs-topology",
+             "assign-delivery-needs-topology",
+             "assign-child-orchestration-needs-topology",
+             "dispatch-staffing-needs-work-item",
+             "dispatch-worker-staffing-needs-topology",
+             "dispatch-delivery-needs-topology",
+             "dispatch-child-orchestration-needs-topology",
              "completion-requires-verification",
              "completion-requires-results-artifact",
              "wake-obligation-registration-authority"
@@ -121,6 +130,35 @@ defmodule Tightbeam.RefixRequiresDiagnosisTest do
   end
 
   defp completed_evidence(ctx, work_item_id) do
+    # This fixture's concern is diagnosis after completed work, not topology intake.
+    consultation = dispatch_call(ctx.owner.session_key, work_item_id, "recommend topology")
+    consultation = %{consultation | verb: "assign"}
+    consultation = put_in(consultation.params[:effect_kind], "coordination")
+    assert {:ok, advice} = Dispatch.dispatch(ctx.db, ctx.handlers, consultation)
+
+    assert {:ok, _} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, %{
+               verb: "attest",
+               origin: "session:#{ctx.owner.session_key}",
+               principal: {:session, ctx.owner.session_key},
+               session_key: ctx.owner.session_key,
+               params: %{
+                 assignment_id: advice.id,
+                 kind: "verdict",
+                 verdict_kind: "topology-decided",
+                 note: "Use the existing coder with independent review; no child orchestrator."
+               }
+             })
+
+    assert {:ok, _} =
+             Dispatch.dispatch(ctx.db, ctx.handlers, %{
+               verb: "attest",
+               origin: "session:#{ctx.owner.session_key}",
+               principal: {:session, ctx.owner.session_key},
+               session_key: ctx.owner.session_key,
+               params: %{assignment_id: advice.id, kind: "completion"}
+             })
+
     assignment =
       Assignments.__handle__(ctx.db, "assign", %{
         verb: "assign",
