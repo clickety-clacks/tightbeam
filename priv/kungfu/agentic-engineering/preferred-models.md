@@ -4,8 +4,7 @@ Use shared `guidance/preferred-models.md` for exact names, nickname expansion,
 qualification, access, independent-review selection and recovery. Activity choices
 are starting policy, not runtime fallback or permission to expand a role's authority.
 
-Use gpt-5.6-sol at low effort for PDO defaults. Generic orchestrators retain
-gpt-6-sol at low effort. Use
+Use gpt-6-sol at low effort for PDO and generic orchestrator defaults. Use
 gpt-6-luna at max effort for coding under an understood architecture; choose a
 stronger generation-6 model when unresolved architecture, interacting failures or
 causal uncertainty warrants it. Importance alone does not justify a stronger coder,
@@ -28,23 +27,17 @@ shared roster for ownership. Reference the current addressed PO and applicable
 returned decision in ordinary delivery context; add no consultation-completed
 record, acknowledgement gate or model switch driven by a notice.
 
-The gpt-5.6-sol/low PDO default supports incoming consultation as well as subsequent
+The gpt-6-sol/low default supports incoming consultation as well as subsequent
 execution. It does not authorize staffing before the returned plan. Reconcile
 current records, manage dependencies and recognize when the plan needs revision;
 do not shift continual deep judgment into repeated corrective supervision.
 
 ## Activity choices and capability floors
 
-In the two PDO rows below, the leading `sol[low]` means exact `gpt-5.6-sol[low]`.
-Their explicit Sol fallback also preserves the PDO's qualified 5.6 choice. Other
-`sol` references retain the shared `gpt-6-sol` expansion; this PDO exception changes
-no non-PDO default or activity choice. These are starting choices, not automatic
-fallback or proof of observed delivery capability.
-
 | Activity | Starting choice | Capability floor |
 | --- | --- | --- |
 | Product ownership and spirit | gpt-6-astra[high], fable[high], opus[xhigh], sol[xhigh] | Challenge technically sound work against intent, sustain product context and decide topology. |
-| Product delivery orchestration | sol[low], terra[medium], gpt-5.6-sol[medium], astra[high], fable[high] | Obtain the PO's plan, reconcile current records, staff and execute within it, recognize revision needs and resolve routine traffic. |
+| Product delivery orchestration | gpt-6-sol[low] | Obtain the PO's plan, reconcile current records, staff and execute within it, recognize revision needs and resolve routine traffic. |
 | Executive or delegated lane orchestration | gpt-6-sol[low] | Coordinate within actual scope, carry dependencies and follow-through, route consequential judgment to its qualified owner. |
 | Bounded team design or recovery planning | astra[high], fable[high], sol[xhigh], opus[xhigh] | Discover coupling, ownership, communication and evidence that invalidates the plan. |
 | Difficult sustained topology or recovery exploration | astra[xhigh], fable[xhigh], sol[max], opus[xhigh] | Sustain investigation and revise advice from evidence; the PO decides topology. |
@@ -69,7 +62,7 @@ route; unavailable model-access work remains with its existing owner.
 
 | Activity | Starting choice |
 | --- | --- |
-| Product delivery orchestration | sol[low], terra[medium], gpt-5.6-sol[medium], astra[high] |
+| Product delivery orchestration | gpt-6-sol[low] |
 
 Other Codex-capable activities retain the applicable choices above. Claude spec
 writing and opposite-harness review remain explicit capability limitations when

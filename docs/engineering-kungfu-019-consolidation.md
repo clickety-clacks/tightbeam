@@ -677,10 +677,9 @@ archetype. The neutral root remains neutral before bundle adoption. Bundle impor
 derives ownership inventory from shipped paths, including the new PDO and fragments;
 there is no hand-maintained second receipt in source.
 
-GPT-5.6 Sol low is the PDO default/preference and leads both PDO mixed/Codex rows
-as `sol[low]`; that explicitly scoped label does not change the shared Sol nickname.
-Generic orchestrators retain GPT-6 Sol low. Current shared `sol`, `luna` and `opus`
-names expand to GPT-6 Sol, GPT-6 Luna and Claude Opus5.5. Coders start at GPT-6 Luna max with discretion for
+GPT-6 Sol low is the PDO and orchestrator default/preference, with explicit PDO
+mixed/Codex rows. Current `sol`, `luna` and `opus` names expand to GPT-6 Sol,
+GPT-6 Luna and Claude Opus5.5. Coders start at GPT-6 Luna max with discretion for
 stronger generation-6 choices; spec writers use Opus5.5 high. Independent guidance,
 code and spec review uses the opposite actual producer harness: Codex authors to
 Opus5.5 high, Claude authors to Astra high. Defaults do not replace actual-authorship
