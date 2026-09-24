@@ -98,6 +98,7 @@ jobs:
       # be built from the commit under test, every run. ~15s of dep recompile is the
       # price of a gate that tests what was pushed.
       - name: Cache cargo registry
+        id: cargo-cache
         uses: actions/cache@v4
         with:
           path: ~/.cargo/registry
@@ -127,6 +128,7 @@ jobs:
           cli/target/release/tightbeam contain-probe
 
       - name: Cache mix deps
+        id: mix-cache
         uses: actions/cache@v4
         with:
           path: |
@@ -140,11 +142,162 @@ jobs:
       - name: mix compile
         run: mix compile
 
+      - name: Prepare bounded Darwin failure evidence
+        if: matrix.name == 'macos'
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          directory=$(mktemp -d "$RUNNER_TEMP/dd36-darwin.XXXXXXXX")
+          directory=$(cd "$directory" && pwd -P)
+          printf 'DD36_DARWIN_DIAGNOSTIC_DIR=%s\n' "$directory" >> "$GITHUB_ENV"
+          python3 scripts/collect_darwin_diagnostic.py prepare "$directory" "$CANDIDATE_SHA"
+
+      # Keep the exact execution identity beside the bounded VM receipt. This is
+      # metadata only: no source, process memory, crash report, or secret enters
+      # the artifact. libraries.json is written by the existing authoritative
+      # test VM hook and carries the hashes of the libraries it loaded.
+      - name: Capture Darwin diagnostic provenance
+        if: matrix.name == 'macos'
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+          CARGO_CACHE_KEY: cargo-registry-${{ matrix.name }}-${{ hashFiles('cli/Cargo.lock') }}
+          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
+          MIX_CACHE_KEY: mix-${{ matrix.name }}-${{ hashFiles('mix.lock') }}
+          MIX_CACHE_HIT: ${{ steps.mix-cache.outputs.cache-hit }}
+        run: |
+          python3 - "$DD36_DARWIN_DIAGNOSTIC_DIR" "$CANDIDATE_SHA" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+
+          directory = Path(sys.argv[1])
+          candidate = sys.argv[2]
+
+
+          def command(*argv):
+              result = subprocess.run(argv, capture_output=True, text=True, check=False)
+              if result.returncode:
+                  raise SystemExit(f"provenance command failed: {argv[0]}")
+              return result.stdout.strip()
+
+
+          def digest(path):
+              hasher = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      hasher.update(chunk)
+              return {"path": str(path), "sha256": hasher.hexdigest()}
+
+
+          head = command("git", "rev-parse", "HEAD")
+          if head != candidate:
+              raise SystemExit("provenance candidate mismatch")
+
+          otp_root = Path(command(
+              "erl", "-noshell", "-eval",
+              'io:format("~s", [code:root_dir()]), halt().',
+          ))
+          otp_release = command(
+              "erl", "-noshell", "-eval",
+              'io:format("~s", [erlang:system_info(otp_release)]), halt().',
+          )
+          erts_version = command(
+              "erl", "-noshell", "-eval",
+              'io:format("~s", [erlang:system_info(version)]), halt().',
+          )
+          otp_version_file = otp_root / "releases" / otp_release / "OTP_VERSION"
+
+          receipt = {
+              "schema": "tightbeam-darwin-provenance/v1",
+              "candidate": candidate,
+              "git": {"head": head, "tree": command("git", "rev-parse", "HEAD^{tree}")},
+              "beam": {
+                  "elixir": command("elixir", "--version"),
+                  "mix": command("mix", "--version"),
+                  "otpRelease": otp_release,
+                  "otpVersion": otp_version_file.read_text(encoding="utf-8").strip(),
+                  "ertsVersion": erts_version,
+              },
+              "compilers": {
+                  "rustc": command("rustc", "--version", "--verbose"),
+                  "cargo": command("cargo", "--version"),
+                  "cc": command("cc", "--version"),
+              },
+              "dependencies": {
+                  "mixLock": digest(Path("mix.lock")),
+                  "cargoLock": digest(Path("cli/Cargo.lock")),
+                  "toplineCargoLock": digest(Path("native/topline_unicode/Cargo.lock")),
+              },
+              "caches": {
+                  "cargoRegistry": {
+                      "key": os.environ["CARGO_CACHE_KEY"],
+                      "cacheHit": os.environ["CARGO_CACHE_HIT"],
+                  },
+                  "mixDeps": {
+                      "key": os.environ["MIX_CACHE_KEY"],
+                      "cacheHit": os.environ["MIX_CACHE_HIT"],
+                  },
+              },
+          }
+          pending = directory / "provenance.json.pending"
+          with pending.open("x", encoding="utf-8") as stream:
+              json.dump(receipt, stream, sort_keys=True)
+              stream.write("\n")
+          pending.replace(directory / "provenance.json")
+          PY
+
       - name: mix format --check-formatted
         run: mix format --check-formatted
 
       - name: mix test
-        run: scripts/verify_mix.sh
+        id: gates
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            # Keep the observer in this step so the runner cannot reap it before
+            # failure-only collection. It attaches once to vm.json's owned PID,
+            # discards debugger text, and publishes only backtrace.json.
+            python3 scripts/collect_darwin_diagnostic.py watch \
+              "$DD36_DARWIN_DIAGNOSTIC_DIR" "$CANDIDATE_SHA" >/dev/null 2>&1 &
+            watcher_pid=$!
+            set +e
+            scripts/verify_mix.sh > "$DD36_DARWIN_DIAGNOSTIC_DIR/full.log" 2>&1
+            status=$?
+            printf '%s\n' "$status" > "$DD36_DARWIN_DIAGNOSTIC_DIR/exit.txt"
+            wait "$watcher_pid" 2>/dev/null || :
+            cat "$DD36_DARWIN_DIAGNOSTIC_DIR/full.log"
+            [ "$status" -eq 0 ] || exit "$status"
+            set -e
+          else
+            scripts/verify_mix.sh
+          fi
+
+      - name: Collect bounded Darwin failure evidence
+        if: failure() && matrix.name == 'macos' && steps.gates.outcome == 'failure'
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: python3 scripts/collect_darwin_diagnostic.py collect "$DD36_DARWIN_DIAGNOSTIC_DIR" "$CANDIDATE_SHA"
+
+      - uses: actions/upload-artifact@v4
+        if: failure() && matrix.name == 'macos' && steps.gates.outcome == 'failure'
+        with:
+          name: darwin-failure-${{ github.sha }}
+          retention-days: 1
+          if-no-files-found: warn
+          path: |
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/runtime.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/vm.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/libraries.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/provenance.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/exit.txt
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/crash.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/backtrace.json
+            ${{ env.DD36_DARWIN_DIAGNOSTIC_DIR }}/full.log
 
       - name: cargo fmt --check
         working-directory: cli
