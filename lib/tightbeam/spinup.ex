@@ -128,7 +128,7 @@ defmodule Tightbeam.Spinup do
     end
   end
 
-  defp valid_adapter_version?(version), do: Regex.match?(~r/^\d+\.\d+\.\d+$/, version)
+  defp valid_adapter_version?(version), do: match?({:ok, _}, Version.parse(version))
 
   defp adapter_version_error(target, module, reason) do
     "host #{target.host_name} is not ready for #{module.wire_name()}: could not read installed adapter version: #{reason}"

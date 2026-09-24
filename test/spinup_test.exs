@@ -390,9 +390,9 @@ defmodule Tightbeam.SpinupTest do
     assert detail =~ "deployed adapters"
   end
 
-  test "remote old Claude adapter provisions pinned version before patching", ctx do
+  test "remote valid prerelease Claude adapter provisions pinned version before patching", ctx do
     configure_remote(ctx)
-    {:ok, versions} = Agent.start_link(fn -> "0.66.0" end)
+    {:ok, versions} = Agent.start_link(fn -> "0.79.0-beta.1" end)
     parent = self()
 
     sh = fn command ->
