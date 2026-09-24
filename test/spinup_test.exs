@@ -45,6 +45,103 @@ defmodule Tightbeam.SpinupTest do
     assert detail =~ "credentials present"
   end
 
+  test "local old Claude adapter provisions the pinned release before patching", ctx do
+    adapter = stage_claude!(ctx.base_dir, "0.66.0")
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+      stage_claude!(ctx.base_dir)
+      {"", 0}
+    end
+
+    assert {:ok, "deployed adapters"} =
+             Tightbeam.Harness.Claude.ensure_adapter(%{
+               base_dir: ctx.base_dir,
+               host_config: %{base_dir: ctx.base_dir, ssh: nil},
+               host_name: "testhost",
+               sh: sh,
+               patch_adapter: fn ^adapter ->
+                 send(parent, :patched)
+                 :ok
+               end
+             })
+
+    assert [["sh", "-c", script]] = receive_commands(1)
+    assert script =~ "@agentclientprotocol/claude-agent-acp@0.79.0"
+    assert_received :patched
+  end
+
+  test "failed replacement reports host unready without patching the old Claude package", ctx do
+    stage_claude!(ctx.base_dir, "0.66.0")
+    parent = self()
+
+    target = %{
+      base_dir: ctx.base_dir,
+      host_config: %{base_dir: ctx.base_dir, ssh: nil},
+      host_name: "testhost",
+      sh: fn command ->
+        send(parent, {:command, command})
+        {"npm failed", 1}
+      end,
+      patch_adapter: fn _path ->
+        send(parent, :patched)
+        :ok
+      end
+    }
+
+    assert {:error, %{code: "host_unready", message: message}} =
+             Tightbeam.Harness.Claude.ensure_adapter(target)
+
+    assert message =~ "adapter deployment failed: npm failed"
+    assert [["sh", "-c", _script]] = receive_commands(1)
+    refute_received :patched
+
+    manifest =
+      Path.join([
+        ctx.base_dir,
+        "adapters",
+        "node_modules",
+        "@agentclientprotocol",
+        "claude-agent-acp",
+        "package.json"
+      ])
+
+    assert %{"version" => "0.66.0"} = manifest |> File.read!() |> JSON.decode!()
+  end
+
+  test "remote malformed Claude adapter version refuses without deployment", ctx do
+    configure_remote(ctx)
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+
+      if String.contains?(List.last(command), "node -p"),
+        do: {"undefined\n", 0},
+        else: {"", 0}
+    end
+
+    target = %{
+      base_dir: ctx.base_dir,
+      host_config: %{base_dir: "/remote/tb", ssh: "worker"},
+      host_name: "worker",
+      sh: sh,
+      remote_patch: fn _path, _detail ->
+        send(parent, :patched)
+        {:ok, "patched"}
+      end
+    }
+
+    assert {:error, %{code: "host_unready", message: message}} =
+             Tightbeam.Harness.Claude.ensure_adapter(target)
+
+    assert message =~ "invalid package version"
+    commands = receive_commands(2)
+    refute Enum.any?(commands, &String.contains?(List.last(&1), "npm install"))
+    refute_received :patched
+  end
+
   # The gateway host used to be the only machine that could not supply its own adapters:
   # it refused and told the operator to go install them by hand, on the host tightbeam
   # was standing on. It provisions now, through the same mechanism the remote path uses
@@ -213,7 +310,10 @@ defmodule Tightbeam.SpinupTest do
 
     sh = fn command ->
       send(parent, {:command, command})
-      {"", 0}
+
+      if String.contains?(List.last(command), "node -p"),
+        do: {Tightbeam.Harness.Claude.adapter_version() <> "\n", 0},
+        else: {"", 0}
     end
 
     assert :ok =
@@ -222,7 +322,7 @@ defmodule Tightbeam.SpinupTest do
                sh: sh
              )
 
-    commands = receive_commands(4)
+    commands = receive_commands(5)
 
     assert ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "worker.example", "true"] =
              hd(commands)
@@ -288,6 +388,51 @@ defmodule Tightbeam.SpinupTest do
     assert Enum.count(commands, &String.contains?(List.last(&1), "test -x")) == 2
     assert [%{detail: detail}] = EventLog.lifecycle_events(ctx.db)
     assert detail =~ "deployed adapters"
+  end
+
+  test "remote old Claude adapter provisions pinned version before patching", ctx do
+    configure_remote(ctx)
+    {:ok, versions} = Agent.start_link(fn -> "0.66.0" end)
+    parent = self()
+
+    sh = fn command ->
+      send(parent, {:command, command})
+      script = List.last(command)
+
+      cond do
+        String.contains?(script, "node -p") ->
+          {Agent.get(versions, &(&1 <> "\n")), 0}
+
+        String.contains?(script, "npm install") ->
+          Agent.update(versions, fn _ -> "0.79.0" end)
+          {"", 0}
+
+        true ->
+          {"", 0}
+      end
+    end
+
+    target = %{
+      base_dir: ctx.base_dir,
+      host_config: %{base_dir: "/remote/tb", ssh: "worker"},
+      host_name: "worker",
+      sh: sh,
+      remote_patch: fn _path, detail ->
+        send(parent, :patched)
+        {:ok, detail}
+      end
+    }
+
+    assert {:ok, "deployed adapters"} = Tightbeam.Harness.Claude.ensure_adapter(target)
+    commands = receive_commands(4)
+    assert Enum.any?(commands, &String.contains?(List.last(&1), "node -p"))
+
+    assert Enum.any?(
+             commands,
+             &String.contains?(List.last(&1), "@agentclientprotocol/claude-agent-acp@0.79.0")
+           )
+
+    assert_received :patched
   end
 
   test "remote npm failure denies with command output", ctx do
@@ -395,10 +540,27 @@ defmodule Tightbeam.SpinupTest do
   # Adapter presence only — patching has its own tests, and is injected as a
   # no-op here so these stay about presence and credentials.
   defp stage_claude!(base_dir) do
+    stage_claude!(base_dir, Tightbeam.Harness.Claude.adapter_version())
+  end
+
+  defp stage_claude!(base_dir, version) do
     path = Path.join([base_dir, "adapters", "node_modules", ".bin", "claude-agent-acp"])
     File.mkdir_p!(Path.dirname(path))
     File.write!(path, "#!/bin/sh\nexit 0\n")
     File.chmod!(path, 0o755)
+
+    manifest =
+      Path.join([
+        base_dir,
+        "adapters",
+        "node_modules",
+        "@agentclientprotocol",
+        "claude-agent-acp",
+        "package.json"
+      ])
+
+    File.mkdir_p!(Path.dirname(manifest))
+    File.write!(manifest, JSON.encode!(%{version: version}))
     path
   end
 

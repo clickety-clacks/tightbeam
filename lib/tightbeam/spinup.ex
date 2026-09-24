@@ -50,10 +50,21 @@ defmodule Tightbeam.Spinup do
 
   @doc false
   def ensure_adapter(target, module, path) do
+    expected_version = module.adapter_version()
+
     if Support.local?(target) do
       if File.exists?(path) do
-        target.patch_adapter.(path)
-        {:ok, "adapters present"}
+        case installed_adapter_version(target, module, :local) do
+          {:ok, ^expected_version} ->
+            target.patch_adapter.(path)
+            {:ok, "adapters present"}
+
+          {:ok, _older_version} ->
+            provision_adapter(target, module, path, :local)
+
+          {:error, reason} ->
+            {:error, host_unready(adapter_version_error(target, module, reason))}
+        end
       else
         provision_adapter(target, module, path, :local)
       end
@@ -62,12 +73,65 @@ defmodule Tightbeam.Spinup do
 
       case target.sh.(check) do
         {_output, 0} ->
-          target.remote_patch.(path, "adapters present")
+          case installed_adapter_version(target, module, {:remote, check}) do
+            {:ok, ^expected_version} ->
+              target.remote_patch.(path, "adapters present")
+
+            {:ok, _older_version} ->
+              provision_adapter(target, module, path, {:remote, check})
+
+            {:error, reason} ->
+              {:error, host_unready(adapter_version_error(target, module, reason))}
+          end
 
         {_output, _exit} ->
           provision_adapter(target, module, path, {:remote, check})
       end
     end
+  end
+
+  defp installed_adapter_version(target, module, locality) do
+    manifest =
+      Path.join([
+        target.host_config.base_dir,
+        "adapters",
+        "node_modules",
+        module.install_package(),
+        "package.json"
+      ])
+
+    case locality do
+      :local ->
+        with {:ok, bytes} <- File.read(manifest),
+             {:ok, %{"version" => version}} when is_binary(version) <- JSON.decode(bytes),
+             true <- valid_adapter_version?(version) do
+          {:ok, version}
+        else
+          {:error, reason} -> {:error, inspect(reason)}
+          _ -> {:error, "invalid package version in #{manifest}"}
+        end
+
+      {:remote, _check} ->
+        script = "node -p 'require(process.argv[1]).version' #{shell_quote(manifest)}"
+
+        case target.sh.(remote_command(target.host_config.ssh, script)) do
+          {version, 0} ->
+            version = String.trim(version)
+
+            if valid_adapter_version?(version),
+              do: {:ok, version},
+              else: {:error, "invalid package version in #{manifest}: #{inspect(version)}"}
+
+          {output, _exit} ->
+            {:error, String.trim(output)}
+        end
+    end
+  end
+
+  defp valid_adapter_version?(version), do: Regex.match?(~r/^\d+\.\d+\.\d+$/, version)
+
+  defp adapter_version_error(target, module, reason) do
+    "host #{target.host_name} is not ready for #{module.wire_name()}: could not read installed adapter version: #{reason}"
   end
 
   # One provisioning mechanism for both localities. The gateway host used to be the only
