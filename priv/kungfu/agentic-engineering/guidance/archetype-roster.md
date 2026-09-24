@@ -7,12 +7,29 @@ PDO staffs and carries delivery. Use lane orchestrators below the PDO when their
 distinct decisions and worker traffic justify them; ordinary modules and lanes do
 not acquire another PDO. Small work can have specialists directly under its PDO.
 
-Preserve the same intent, scope and delivery ownership whether a request arrives
-through Main, PO or PDO. Reuse the product's current owners and work item. Route a
-request to begin delivery to its PDO with the full task context; preserve a request
-to file for later as backlog. The PO supplies substantive judgment and opens no
-delivery assignments or workers. Routine worker outcomes and recovery go to their
-responsible delivery owner; specialists may ask the PO product questions directly.
+Accept intake through Main, PO or PDO with the full request, supplied facts,
+constraints, work-item identity and whether delivery is authorized now or the request
+is to file for later. Preserve file-only requests as nonexecuting backlog; do not
+create a permanent team just because a request was filed. Reuse current owners and
+covered judgment for authorized delivery.
+
+When no accountable PDO exists, the addressed PO retains the product question and
+routes the delivery/setup obligation to Main or the existing owner with supported
+bootstrap authority. Main reuses a suitable delivery owner or establishes the
+smallest missing PDO/PO arrangement within authority. Retain an existing addressed
+PO rather than creating a duplicate office. Bootstrap establishes or adopts delivery
+ownership; neither Main nor PO commissions production workers. The PO supplies
+setup/topology judgment and opens no delivery assignments.
+
+Keep a named agent accountable for intake until the receiving delivery owner
+explicitly accepts custody on the same work item. That owner obtains the applicable
+PO decision and staffs production. Carry the full context through this handoff;
+do not ask the user to set up routine seats, confirm again or repeat an already-
+authorized request. If supported setup is unavailable, retain an accountable
+recovery route and state the concrete limitation. Use the existing user-decision
+route only for a genuine new authority or scope choice. Routine worker outcomes
+and recovery go to their responsible delivery owner; specialists may ask the PO
+product questions directly.
 
 An archetype supplies responsibility and context, not permission from its name.
 Inspect actual assignments and accountable ownership. Session ancestry records who

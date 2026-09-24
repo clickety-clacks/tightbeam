@@ -46,6 +46,8 @@ before choosing. Qualification still requires the activity's capability floor,
 allowed host and harness, supported model and effort, and runnable access.
 Catalog presence alone does not establish access.
 Suggested order can change; explicit family, authority and budget restrictions cannot.
+An allowed candidate for one activity does not establish support for the complete
+engineering workflow; use the activity table's limits for both single-harness cases.
 
 For an explicitly requested Claude slug, absence from a compiled inventory or the
 provider's `/v1/models` response does not establish provider rejection. Preserve

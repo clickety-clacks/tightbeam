@@ -4,11 +4,11 @@ Use existing organization instructions and supported defaults. Resolve missing
 information when it affects the next authorized work; do not turn intake into a
 mandatory questionnaire or a hold on separable work.
 
-Establish the product outcome, constraints, addressed PDO and PO, and the product
-spirit reference. Use the shared engineering roster for their relationship. Under
-Main's coordination, reuse the current owners or establish the missing product
-offices within authority. Preserve a file-only request as backlog; send authorized
-delivery to its PDO with complete context for the PO's plan and subsequent staffing.
+Establish the product outcome, supplied facts, constraints, addressed PDO and PO,
+and the product spirit reference. Use the shared engineering roster's intake and
+bootstrap route when delivery ownership is missing. Preserve the complete request
+and work-item identity through acceptance by the delivery owner; distinguish a
+request to file for later from authorization to begin delivery.
 
 The bundle root remains executive orchestration; a bare-spawn default does not name
 a product's delivery owner. Learning supplies the PDO archetype and its shared

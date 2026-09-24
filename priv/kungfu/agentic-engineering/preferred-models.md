@@ -50,11 +50,14 @@ do not shift continual deep judgment into repeated corrective supervision.
 | Mechanical non-code transformations | luna[medium], terra[low], sonnet[low], sol[medium] | Apply an inspectable transformation; code production uses the coder rows. |
 
 Filter for the organization's permitted families and allowed hosts before selection.
-The current PDO, orchestration and implementation choices require Codex; Claude-only
-operation has no policy-approved candidate for those activities. Codex-only operation
-cannot satisfy Claude spec writing or review of Codex-authored work. Retain these
-explicit limitations and continue separable authorized work; do not silently replace
-the required choices. For mixed authorship, use the shared portion-coverage rule
+The complete engineering workflow under this policy requires both Codex and Claude.
+Claude-only operation cannot supply the required Codex orchestration choices or
+Codex review of Claude-authored work; the implementation rows also name Codex
+candidates. Codex-only operation cannot supply Claude specification or Claude review
+of Codex-authored work. State the precise unmet activity or review requirement.
+Preserve useful permitted tasks and existing evidence in a single-harness environment,
+but do not claim end-to-end support, override family restrictions or silently
+substitute a model. For mixed authorship, use the shared portion-coverage rule
 rather than pretending one default reviews every author.
 Do not silently substitute an old Opus/Fable reviewer, invent a generation-6 Terra,
 or infer access from a catalog entry. Use actual exact-ID responses on the intended
