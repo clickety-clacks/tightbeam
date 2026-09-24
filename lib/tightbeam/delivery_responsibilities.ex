@@ -115,9 +115,11 @@ defmodule Tightbeam.DeliveryResponsibilities do
     holderAssociationRevision INTEGER NOT NULL CHECK (holderAssociationRevision >= 1),
     delegatedByKind TEXT NOT NULL CHECK (delegatedByKind = 'session'),
     delegatedByRef TEXT NOT NULL,
+    grantorAssignmentId TEXT NULL REFERENCES assignments(id),
     createdAt INTEGER NOT NULL,
     CHECK (length(trim(poRole)) > 0),
-    CHECK (substr(delegatedByRef,1,8)='session:')
+    CHECK (substr(delegatedByRef,1,8)='session:'),
+    CHECK (grantorAssignmentId IS NULL OR grantorAssignmentId != assignmentId)
   );
   CREATE INDEX IF NOT EXISTS assignment_delivery_delegations_item
     ON assignment_delivery_delegations(workItemId,assignmentId);
@@ -190,6 +192,24 @@ defmodule Tightbeam.DeliveryResponsibilities do
         end
     end
   end
+
+  @doc false
+  def current_accountable_recipient_in_txn(%Txn{} = txn, work_item_id, owner_user_id)
+      when is_binary(work_item_id) and is_binary(owner_user_id) do
+    case current_owner_in_txn(txn, work_item_id) do
+      %{
+        "ownerUserId" => ^owner_user_id,
+        "deliveryState" => "current",
+        "accountableSessionKey" => session_key
+      } ->
+        session_key
+
+      _ ->
+        nil
+    end
+  end
+
+  def current_accountable_recipient_in_txn(%Txn{}, _work_item_id, _owner_user_id), do: nil
 
   @doc "Return accountable, delegated, stale, or none for a session and item."
   def responsibility(db \\ DB, session_key, work_item_id)
@@ -289,7 +309,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
         binding["poRole"]
       )
 
-    {:ok, {kind, by}} =
+    {:ok, {kind, by, grantor_assignment_id}} =
       authorize_delegation(txn, call.principal, assignment.workItemId, binding, owner)
 
     Txn.q(
@@ -298,8 +318,8 @@ defmodule Tightbeam.DeliveryResponsibilities do
       INSERT INTO assignment_delivery_delegations
         (assignmentId,workItemId,holderSessionKey,ownerUserId,poRole,
          scopeBindingEventId,scopeBindingRevision,ownerEventId,ownerRevision,
-         holderAssociationRevision,delegatedByKind,delegatedByRef,createdAt)
-      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+         holderAssociationRevision,delegatedByKind,delegatedByRef,grantorAssignmentId,createdAt)
+      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
       """,
       [
         assignment.id,
@@ -314,6 +334,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
         target_association.revision,
         kind,
         by,
+        grantor_assignment_id,
         System.system_time(:millisecond)
       ]
     )
@@ -612,10 +633,10 @@ defmodule Tightbeam.DeliveryResponsibilities do
          "the accountable owner association is stale or unavailable; the owner or Main must complete explicit recovery"}
 
       caller == owner["accountableSessionKey"] ->
-        {:ok, {"session", "session:" <> caller}}
+        {:ok, {"session", "session:" <> caller, nil}}
 
-      active_delegation_in_txn?(txn, caller, work_item_id) ->
-        {:ok, {"session", "session:" <> caller}}
+      grantor_assignment_id = active_delegation_assignment_in_txn(txn, caller, work_item_id) ->
+        {:ok, {"session", "session:" <> caller, grantor_assignment_id}}
 
       true ->
         {:error, "not_authorized",
@@ -809,8 +830,16 @@ defmodule Tightbeam.DeliveryResponsibilities do
   end
 
   defp active_delegation_in_txn?(txn, session_key, work_item_id) do
+    not is_nil(active_delegation_assignment_in_txn(txn, session_key, work_item_id))
+  end
+
+  defp active_delegation_assignment_in_txn(txn, session_key, work_item_id) do
     delegation_candidates(txn, session_key, work_item_id)
-    |> Enum.any?(&current_delegation?(txn, &1))
+    |> Enum.find(&current_delegation?(txn, &1))
+    |> case do
+      [assignment_id | _] -> assignment_id
+      nil -> nil
+    end
   end
 
   defp open_delegation_in_txn?(txn, session_key, work_item_id) do
@@ -873,7 +902,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
       SELECT d.assignmentId,d.holderSessionKey,d.ownerUserId,d.poRole,
              d.scopeBindingEventId,d.scopeBindingRevision,d.ownerEventId,
              d.ownerRevision,d.holderAssociationRevision,d.delegatedByRef,
-             d.createdAt,a.state,s.state
+             d.grantorAssignmentId,d.createdAt,a.state,s.state
       FROM assignment_delivery_delegations d
       JOIN assignments a ON a.id=d.assignmentId
       JOIN sessions s ON s.sessionKey=d.holderSessionKey
@@ -892,6 +921,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
                      owner_revision,
                      association_revision,
                      by,
+                     grantor_assignment_id,
                      at,
                      assignment_state,
                      session_state
@@ -922,6 +952,7 @@ defmodule Tightbeam.DeliveryResponsibilities do
         "ownerRevision" => owner_revision,
         "holderAssociationRevision" => association_revision,
         "delegatedByRef" => by,
+        "grantorAssignmentId" => grantor_assignment_id,
         "createdAt" => at,
         "assignmentState" => assignment_state,
         "sessionState" => session_state,

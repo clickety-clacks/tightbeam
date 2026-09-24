@@ -5279,8 +5279,7 @@ defmodule Tightbeam.Gateway do
       session_key when is_binary(session_key) ->
         due_at = p[:at] || System.system_time(:millisecond) + (p[:after_ms] || 0)
 
-        result =
-          DB.transaction(db, fn txn -> wake_result_in_txn(config, txn, call) end)
+        result = DB.transaction(db, fn txn -> wake_result_in_txn(config, txn, call) end)
 
         wake =
           case result do
@@ -5423,6 +5422,13 @@ defmodule Tightbeam.Gateway do
            [assignment_id]
          ) do
       [[opened_by_user, opened_by_session, work_item_id, owner]] ->
+        current =
+          DeliveryResponsibilities.current_accountable_recipient_in_txn(
+            txn,
+            work_item_id,
+            owner
+          )
+
         opener =
           cond do
             is_binary(opened_by_user) and opened_by_user == owner ->
@@ -5442,17 +5448,23 @@ defmodule Tightbeam.Gateway do
               nil
           end
 
-        recipient = opener || Org.personal_session_key(owner)
+        recipient =
+          [current, opener, Org.personal_session_key(owner)]
+          |> Enum.reject(&is_nil/1)
+          |> Enum.uniq()
+          |> Enum.find(fn candidate ->
+            DB.Txn.q(
+              txn,
+              "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
+              [candidate, owner]
+            ) == [[1]]
+          end)
 
-        case DB.Txn.q(
-               txn,
-               "SELECT 1 FROM sessions WHERE sessionKey=?1 AND ownerUserId=?2 AND state='active'",
-               [recipient, owner]
-             ) do
-          [[1]] ->
+        case recipient do
+          recipient when is_binary(recipient) ->
             {:ok, %{session_key: recipient, owner_user_id: owner, work_item_id: work_item_id}}
 
-          _ ->
+          nil ->
             {:error,
              %{
                reason: :missing_accountable_owner,

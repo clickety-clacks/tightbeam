@@ -220,6 +220,10 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     parent = assign(db, {:session, "pdo-a"}, "lane-a", "wi_a1", true)
     child = assign(db, {:session, "lane-a"}, "worker-a", "wi_a1", true)
 
+    grants = Map.new(get(db, {:user, "owner"}, "wi_a1")["delegations"], &{&1["assignmentId"], &1})
+    assert grants[parent.id]["grantorAssignmentId"] == nil
+    assert grants[child.id]["grantorAssignmentId"] == parent.id
+
     close_assignment(db, parent.id, "pdo-a")
 
     assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_a1") == "none"
@@ -230,6 +234,9 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     assert assignment = assign(db, {:session, "worker-a"}, "successor-a", "wi_a1", true)
     assert assignment.holderKey == "successor-a"
+
+    grants = Map.new(get(db, {:user, "owner"}, "wi_a1")["delegations"], &{&1["assignmentId"], &1})
+    assert grants[assignment.id]["grantorAssignmentId"] == child.id
 
     close_assignment(db, child.id, "lane-a")
     assert DeliveryResponsibilities.responsibility(db, "worker-a", "wi_a1") == "none"
@@ -267,8 +274,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_a1") == "stale"
     assert DeliveryResponsibilities.responsibility(db, "worker-a", "wi_a1") == "stale"
 
-    assert %{code: "not_authorized"} =
-             assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1", true)
+    assert %{code: "not_authorized"} = assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1", true)
 
     # Withdrawal affects future commissioning only. Existing obligations retain
     # their original holder/opener and can still reach a terminal outcome.
@@ -488,6 +494,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
 
     Rules.load!(tmp, ["spawn", "assign", "dispatch"])
     session(db, "consult-po", "owner", archetype: "product-owner")
+    session(db, "intake-pdo", "owner", archetype: "pdo")
 
     assignment_handlers = %{
       "assign" => fn call -> Assignments.__handle__(db, "assign", call) end,
@@ -495,15 +502,22 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     }
 
     for caller <- [Org.personal_session_key("owner"), "po-a"] do
-      assert {:error, %{rule: "engineering-assign-worker-needs-responsibility"}} =
+      assert {:error,
+              %{
+                rule: "engineering-assign-production-needs-responsibility",
+                message: message
+              }} =
                Dispatch.dispatch(
                  db,
                  assignment_handlers,
                  production_call("assign", caller, "worker-a", "wi_a1")
                )
+
+      assert message =~ "Current accountable owner: none"
+      assert message =~ "Route the request through that owner"
     end
 
-    assert {:error, %{rule: "engineering-dispatch-worker-needs-responsibility"}} =
+    assert {:error, %{rule: "engineering-dispatch-production-needs-responsibility"}} =
              Dispatch.dispatch(
                db,
                assignment_handlers,
@@ -522,6 +536,26 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                production_call("assign", "pdo-a", "worker-a", nil)
              )
 
+    assert {:error, %{rule: "engineering-assign-staffing-needs-work-item"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call("assign", "pdo-a", "worker-a", "wi_missing")
+             )
+
+    assert {:ok, %{holderKey: "intake-pdo", effectKind: "coordination"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call(
+                 "assign",
+                 {:user, "owner"},
+                 "intake-pdo",
+                 "wi_a1",
+                 effect_kind: "coordination"
+               )
+             )
+
     assert {:ok, %{holderKey: "consult-po", effectKind: "coordination"}} =
              Dispatch.dispatch(
                db,
@@ -535,17 +569,40 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                )
              )
 
-    assert {:error, %{rule: "engineering-assign-production-needs-responsibility"}} =
+    for target <- ["consult-po", "intake-pdo"] do
+      assert {:error, %{rule: "engineering-assign-production-office-target-refused"}} =
+               Dispatch.dispatch(
+                 db,
+                 assignment_handlers,
+                 production_call("assign", {:user, "owner"}, target, "wi_a1")
+               )
+    end
+
+    producer = assign(db, {:session, "pdo-a"}, "worker-a", "wi_a1", false)
+
+    assert {:ok, %{holderKey: "peer", effectKind: "review"}} =
              Dispatch.dispatch(
                db,
                assignment_handlers,
-               production_call(
-                 "assign",
-                 Org.personal_session_key("owner"),
-                 "consult-po",
-                 "wi_a1"
+               production_call("assign", {:user, "owner"}, "peer", "wi_a1",
+                 reviews_assignment_id: producer.id
                )
              )
+
+    for misleading_effect <- ["coordination", "review"] do
+      assert {:error, %{rule: "engineering-assign-production-needs-responsibility"}} =
+               Dispatch.dispatch(
+                 db,
+                 assignment_handlers,
+                 production_call(
+                   "assign",
+                   Org.personal_session_key("owner"),
+                   "worker-a",
+                   "wi_a1",
+                   effect_kind: misleading_effect
+                 )
+               )
+    end
 
     spawn_handlers = %{"spawn" => fn call -> %{archetype: call.params[:archetype]} end}
 
@@ -554,6 +611,20 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                db,
                spawn_handlers,
                spawn_call(Org.personal_session_key("owner"), nil, nil)
+             )
+
+    assert {:error, %{rule: "engineering-spawn-staffing-needs-work-item"}} =
+             Dispatch.dispatch(
+               db,
+               spawn_handlers,
+               spawn_call(Org.personal_session_key("owner"), "coder", "wi_missing")
+             )
+
+    assert {:error, %{rule: "engineering-spawn-referenced-work-item-must-exist"}} =
+             Dispatch.dispatch(
+               db,
+               spawn_handlers,
+               spawn_call(Org.personal_session_key("owner"), "orchestrator", "wi_missing")
              )
 
     assert {:error, %{rule: "engineering-spawn-staffing-needs-responsibility"}} =
@@ -570,17 +641,91 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
                spawn_call(Org.personal_session_key("owner"), "product-owner", nil)
              )
 
+    assert {:ok, %{archetype: "pdo"}} =
+             Dispatch.dispatch(
+               db,
+               spawn_handlers,
+               spawn_call(Org.personal_session_key("owner"), "pdo", nil)
+             )
+
     bootstrap_a(db)
 
-    assert {:ok, %{holderKey: "worker-a", effectKind: "code"}} =
+    for archetype <- [nil, "coder", "orchestrator"] do
+      assert {:error,
+              %{
+                rule: "engineering-spawn-staffing-needs-topology",
+                message: message
+              }} = Dispatch.dispatch(db, spawn_handlers, spawn_call("pdo-a", archetype, "wi_a1"))
+
+      assert message =~ "Current accountable owner: session:pdo-a"
+      assert message =~ "Record topology-decided"
+    end
+
+    assert {:error,
+            %{
+              rule: "engineering-assign-production-needs-topology",
+              message: message
+            }} =
              Dispatch.dispatch(
                db,
                assignment_handlers,
                production_call("assign", "pdo-a", "worker-a", "wi_a1")
              )
 
+    assert message =~ "Current accountable owner: session:pdo-a"
+    assert message =~ "Record topology-decided"
+
+    for misleading_effect <- ["coordination", "review"] do
+      assert {:error, %{rule: "engineering-assign-production-needs-topology"}} =
+               Dispatch.dispatch(
+                 db,
+                 assignment_handlers,
+                 production_call("assign", "pdo-a", "worker-a", "wi_a1",
+                   effect_kind: misleading_effect
+                 )
+               )
+    end
+
+    topology = assign(db, {:session, "pdo-a"}, "lane-a", "wi_a1", false)
+
+    assert %{attest: %{verdictKind: "topology-decided"}} =
+             attest_verdict(db, "lane-a", topology.id, "topology-decided")
+
+    assert {:ok, _} =
+             DB.query(db, "UPDATE sessions SET archetype='orchestrator' WHERE sessionKey='pdo-a'")
+
+    for {caller, target, effect_kind, rule} <- [
+          {Org.personal_session_key("owner"), "consult-po", "policy",
+           "engineering-assign-production-office-target-refused"},
+          {"po-a", "intake-pdo", "code", "engineering-assign-production-office-target-refused"},
+          {"pdo-a", "intake-pdo", "code", "engineering-assign-production-office-target-refused"},
+          {"pdo-a", "pdo-a", "code",
+           "engineering-assign-production-accountable-owner-target-refused"}
+        ] do
+      assert {:error, %{rule: ^rule}} =
+               Dispatch.dispatch(
+                 db,
+                 assignment_handlers,
+                 production_call("assign", caller, target, "wi_a1", effect_kind: effect_kind)
+               )
+    end
+
+    assert {:ok, %{holderKey: "lane-a", effectKind: "code"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call("assign", "pdo-a", "lane-a", "wi_a1", delegates_delivery: true)
+             )
+
+    assert {:ok, %{holderKey: "worker-a", effectKind: "code"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call("assign", "lane-a", "worker-a", "wi_a1", delegates_delivery: true)
+             )
+
     assert {:ok, %{archetype: "coder"}} =
-             Dispatch.dispatch(db, spawn_handlers, spawn_call("pdo-a", "coder", "wi_a1"))
+             Dispatch.dispatch(db, spawn_handlers, spawn_call("lane-a", "coder", "wi_a1"))
   end
 
   test "schema is additive and every authority history is immutable", %{db: db} do
@@ -700,6 +845,19 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
              })
   end
 
+  defp attest_verdict(db, holder, assignment_id, verdict_kind) do
+    Assignments.__handle__(db, "attest", %{
+      verb: "attest",
+      origin: "agent:" <> holder,
+      principal: {:session, holder},
+      params: %{
+        assignment_id: assignment_id,
+        kind: "verdict",
+        verdict_kind: verdict_kind
+      }
+    })
+  end
+
   defp rule_call(verb, caller, target, work_item_id, options \\ []) do
     params =
       %{work_item_id: work_item_id}
@@ -715,20 +873,22 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
   end
 
   defp production_call(verb, caller, target, work_item_id, options \\ []) do
+    principal = if is_tuple(caller), do: caller, else: {:session, caller}
+
     params = %{
       subject: "production #{System.unique_integer([:positive])}",
       idempotency_key: nil,
       work_item_id: work_item_id,
-      reviews_assignment_id: nil,
+      reviews_assignment_id: options[:reviews_assignment_id],
       effect_kind: options[:effect_kind],
       files: nil,
-      delegates_delivery: false
+      delegates_delivery: options[:delegates_delivery] || false
     }
 
     %{
       verb: verb,
-      origin: "agent:#{caller}",
-      principal: {:session, caller},
+      origin: origin(principal),
+      principal: principal,
       session_key: target,
       target_role: nil,
       role_fallback: false,

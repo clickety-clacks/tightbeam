@@ -1,33 +1,56 @@
-# Production staffing is admitted from exact work-item custody. Role names,
-# session ancestry, and a generic/default archetype are not authority. Initial
-# orchestration and PO consultation remain reachable as coordination work.
+# Production staffing is admitted from exact work-item custody and a returned,
+# attributable topology verdict. Role names, session ancestry, and a
+# generic/default archetype are not authority. Bootstrap, intake, consultation,
+# and review remain reachable through their actual archetype/effect context.
 [[rule]]
 name = "engineering-spawn-staffing-needs-work-item"
 verb = "spawn"
-text = "Worker staffing requires a known work item. Establish the item and its accountable delivery owner before spawning production workers."
+text = "Worker staffing requires a known work item. Current accountable owner: {delivery_owner_ref}. Create or link the work item and establish its explicit delivery scope before retrying."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "spawn.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
+  { fact = "spawn.archetype", op = "not_in", value = ["orchestrator", "product-owner", "pdo"] },
   { fact = "work_item.reference_state", op = "ne", value = "known" },
+]
+
+[[rule]]
+name = "engineering-spawn-referenced-work-item-must-exist"
+verb = "spawn"
+text = "A referenced work item must exist before spawning. Current accountable owner: {delivery_owner_ref}. Correct or create the item reference before retrying."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "work_item.reference_state", op = "eq", value = "unknown" },
 ]
 
 [[rule]]
 name = "engineering-spawn-staffing-needs-responsibility"
 verb = "spawn"
-text = "Worker staffing requires accountable or explicitly delegated delivery responsibility for this exact work item."
+text = "Worker staffing requires accountable or explicitly delegated responsibility for this exact work item. Current accountable owner: {delivery_owner_ref}. Route the request through that owner or obtain an active exact-item delegation before retrying."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "spawn.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
   { fact = "work_item.reference_state", op = "eq", value = "known" },
   { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
 ]
 
 [[rule]]
+name = "engineering-spawn-staffing-needs-topology"
+verb = "spawn"
+text = "Production staffing requires returned attributable topology for this work item. Current accountable owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item delegate retry."
+edges = ["verb"]
+effect = "deny"
+external_producer = true
+deny_when = [
+  { fact = "work_item.reference_state", op = "eq", value = "known" },
+  { fact = "caller.delivery_responsibility", op = "in", value = ["accountable", "delegated"] },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
+]
+
+[[rule]]
 name = "engineering-assign-staffing-needs-work-item"
 verb = "assign"
-text = "Engineering staffing requires a known work item. Link coordination and production assignments to their durable item."
+text = "Engineering staffing requires a known work item. Current accountable owner: {delivery_owner_ref}. Link intake, consultation, review, and production assignments to their durable item before retrying."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
@@ -35,32 +58,55 @@ deny_when = [
 ]
 
 [[rule]]
-name = "engineering-assign-worker-needs-responsibility"
+name = "engineering-assign-production-office-target-refused"
 verb = "assign"
-text = "Worker staffing requires accountable or explicitly delegated delivery responsibility for this exact work item."
+text = "Production work cannot be assigned to a PO or PDO office session. Current accountable owner: {delivery_owner_ref}. Assign an implementation worker, or use a genuine intake, consultation, or linked-review context."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
-  { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+  { fact = "assign.admission_context", op = "eq", value = "production" },
+  { fact = "target.archetype", op = "in", value = ["product-owner", "pdo"] },
+]
+
+[[rule]]
+name = "engineering-assign-production-accountable-owner-target-refused"
+verb = "assign"
+text = "Production work cannot be assigned to the accountable delivery owner. Current accountable owner: {delivery_owner_ref}. Keep that owner accountable and assign an implementation worker instead."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.admission_context", op = "eq", value = "production" },
+  { fact = "target.delivery_responsibility", op = "eq", value = "accountable" },
 ]
 
 [[rule]]
 name = "engineering-assign-production-needs-responsibility"
 verb = "assign"
-text = "Non-coordination delivery staffing requires accountable or explicitly delegated responsibility for this exact work item."
+text = "Production staffing requires accountable or explicitly delegated responsibility for this exact work item. Current accountable owner: {delivery_owner_ref}. Route the request through that owner or obtain an active exact-item delegation before retrying."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "in", value = ["orchestrator", "product-owner"] },
-  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "assign.admission_context", op = "eq", value = "production" },
   { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+]
+
+[[rule]]
+name = "engineering-assign-production-needs-topology"
+verb = "assign"
+text = "Production staffing requires returned attributable topology for this work item. Current accountable owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item delegate retry."
+edges = ["verb"]
+effect = "deny"
+external_producer = true
+deny_when = [
+  { fact = "assign.admission_context", op = "eq", value = "production" },
+  { fact = "caller.delivery_responsibility", op = "in", value = ["accountable", "delegated"] },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
 ]
 
 [[rule]]
 name = "engineering-dispatch-staffing-needs-work-item"
 verb = "dispatch"
-text = "Engineering staffing requires a known work item. Link coordination and production assignments to their durable item."
+text = "Engineering staffing requires a known work item. Current accountable owner: {delivery_owner_ref}. Link intake, consultation, review, and production assignments to their durable item before retrying."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
@@ -68,24 +114,47 @@ deny_when = [
 ]
 
 [[rule]]
-name = "engineering-dispatch-worker-needs-responsibility"
+name = "engineering-dispatch-production-office-target-refused"
 verb = "dispatch"
-text = "Worker staffing requires accountable or explicitly delegated delivery responsibility for this exact work item."
+text = "Production work cannot be dispatched to a PO or PDO office session. Current accountable owner: {delivery_owner_ref}. Dispatch an implementation worker, or use a genuine consultation context."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
-  { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+  { fact = "assign.admission_context", op = "eq", value = "production" },
+  { fact = "target.archetype", op = "in", value = ["product-owner", "pdo"] },
+]
+
+[[rule]]
+name = "engineering-dispatch-production-accountable-owner-target-refused"
+verb = "dispatch"
+text = "Production work cannot be dispatched to the accountable delivery owner. Current accountable owner: {delivery_owner_ref}. Keep that owner accountable and dispatch an implementation worker instead."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "assign.admission_context", op = "eq", value = "production" },
+  { fact = "target.delivery_responsibility", op = "eq", value = "accountable" },
 ]
 
 [[rule]]
 name = "engineering-dispatch-production-needs-responsibility"
 verb = "dispatch"
-text = "Non-coordination delivery staffing requires accountable or explicitly delegated responsibility for this exact work item."
+text = "Production staffing requires accountable or explicitly delegated responsibility for this exact work item. Current accountable owner: {delivery_owner_ref}. Route the request through that owner or obtain an active exact-item delegation before retrying."
 edges = ["verb"]
 effect = "deny"
 deny_when = [
-  { fact = "target.archetype", op = "in", value = ["orchestrator", "product-owner"] },
-  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "assign.admission_context", op = "eq", value = "production" },
   { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+]
+
+[[rule]]
+name = "engineering-dispatch-production-needs-topology"
+verb = "dispatch"
+text = "Production staffing requires returned attributable topology for this work item. Current accountable owner: {delivery_owner_ref}. Record topology-decided on the item, then have that owner or an active exact-item delegate retry."
+edges = ["verb"]
+effect = "deny"
+external_producer = true
+deny_when = [
+  { fact = "assign.admission_context", op = "eq", value = "production" },
+  { fact = "caller.delivery_responsibility", op = "in", value = ["accountable", "delegated"] },
+  { fact = "work_item.verdict_kinds", op = "not_in", value = ["topology-decided"] },
 ]

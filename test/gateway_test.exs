@@ -2220,6 +2220,9 @@ defmodule Tightbeam.GatewayTest do
   test "fresh PDO and orchestrator spawns resolve their defaults without changing coder choice",
        ctx do
     base_dir = role_test_base("engineering-default-spawn")
+    codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
+    File.mkdir_p!(codex_auth)
+    File.write!(Path.join(codex_auth, "auth.json"), "test-token")
     manifests = Path.join([base_dir, "identity", "archetypes"])
     File.mkdir_p!(manifests)
 
@@ -2261,8 +2264,7 @@ defmodule Tightbeam.GatewayTest do
                  }
                })
 
-      assert %{archetype: ^archetype, harness: "codex", provider: "openai"} =
-               Org.get(ctx.db, key)
+      assert %{archetype: ^archetype, harness: "codex", provider: "openai"} = Org.get(ctx.db, key)
 
       assert Org.get(ctx.db, key).model == Model.new("gpt-6-sol", effort: "low")
     end

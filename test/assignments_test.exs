@@ -5,12 +5,15 @@ defmodule Tightbeam.AssignmentsTest do
   alias Tightbeam.{
     Assignments,
     DB,
+    DeliveryResponsibilities,
     Dispatch,
     Gateway,
     Ledger,
     Org,
     Projection,
+    Roles,
     Rules,
+    SessionPoAssociations,
     Supervision,
     Wakes,
     WorkItems,
@@ -149,6 +152,41 @@ defmodule Tightbeam.AssignmentsTest do
       assert [wake] = terminal_notices(ctx.db)
       assert wake.session_key == personal
       assert wake.prompt =~ "opened_by_id=\"notice-parent\""
+    end
+
+    for {kind, outcome} <- [{"completion", "completed"}, {"surrender", "surrendered"}] do
+      @successor_kind kind
+      @successor_outcome outcome
+      test "#{kind} and review notices reach the current accountable successor after transfer",
+           ctx do
+        {assignment, _item} = terminal_successor_fixture(ctx)
+
+        assert {:ok,
+                {:ok,
+                 %{
+                   session_key: "delivery-successor",
+                   owner_user_id: "flynn",
+                   work_item_id: work_item_id
+                 }}} =
+                 DB.transaction(
+                   ctx.db,
+                   &Gateway.review_notice_recipient_in_txn(&1, assignment.id)
+                 )
+
+        assert work_item_id == assignment.workItemId
+
+        closed =
+          handle(
+            ctx,
+            "attest",
+            attest_call({:session, "holder"}, assignment.id, @successor_kind)
+          )
+
+        assert closed.assignment.outcome == @successor_outcome
+        assert [wake] = terminal_notices(ctx.db)
+        assert wake.session_key == "delivery-successor"
+        assert wake.prompt =~ "opened_by_id=\"notice-parent\""
+      end
     end
 
     test "conflicting persisted payload or immutable relation refuses without mutation", ctx do
@@ -862,6 +900,30 @@ defmodule Tightbeam.AssignmentsTest do
   end
 
   describe "terminal notice explicit recovery" do
+    test "failed delivery recovers to the current accountable successor", ctx do
+      {assignment, _item} = terminal_successor_fixture(ctx)
+
+      assert %{assignment: %{state: "closed"}} =
+               handle(
+                 ctx,
+                 "attest",
+                 attest_call({:session, "holder"}, assignment.id, "completion")
+               )
+
+      assert [root] = terminal_notices(ctx.db)
+      assert root.session_key == "delivery-successor"
+      assert {:appended, "delivery-successor", _, _} = deliver_terminal_notice(ctx.db, root)
+      assert {:ok, source} = Ledger.claim_next(ctx.db, "delivery-successor", "fixture")
+      assert :ok = Ledger.finish(ctx.db, source.seq, "failed", "fixture delivery failure")
+
+      assert {:ok, {:ok, %{wake: recovery, replay: false}}} =
+               recover_notice(ctx.db, root.wake_id, "session:delivery-successor")
+
+      assert recovery.session_key == "delivery-successor"
+      assert recovery.prompt == root.prompt
+      assert recovery.obligation_ref == root.obligation_ref
+    end
+
     for status <- ["failed", "failed_unknown"] do
       @recovery_status status
       test "#{status} recovers the same semantic notice once to its current owner", ctx do
@@ -1369,6 +1431,88 @@ defmodule Tightbeam.AssignmentsTest do
 
     assert [wake] = terminal_notices(ctx.db)
     {assignment, wake, personal}
+  end
+
+  defp terminal_successor_fixture(ctx) do
+    session(ctx.db, "notice-parent", "flynn")
+    session(ctx.db, "terminal-po", "flynn")
+    session(ctx.db, "delivery-successor", "flynn")
+    Roles.create!(ctx.db, "product-owner:terminal", "flynn", "terminal-po")
+
+    for session_key <- ["notice-parent", "delivery-successor"] do
+      assert %{"changed" => true} =
+               SessionPoAssociations.handle(ctx.db, %{
+                 principal: {:user, "flynn"},
+                 params: %{
+                   session_key: session_key,
+                   po_role: "product-owner:terminal",
+                   idempotency_key: "terminal-association-" <> session_key
+                 }
+               })
+    end
+
+    item = create_work_item(ctx, "terminal successor")
+
+    assert %{"changed" => true} =
+             DeliveryResponsibilities.handle(ctx.db, %{
+               verb: "delivery-scope-owner-set",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{
+                 session_key: "notice-parent",
+                 association_revision: 1,
+                 expected_owner_session_key: nil,
+                 expected_owner_revision: 0,
+                 idempotency_key: "terminal-owner-initial"
+               }
+             })
+
+    assert %{"changed" => true} =
+             DeliveryResponsibilities.handle(ctx.db, %{
+               verb: "work-item-delivery-scope-set",
+               origin: "user:flynn",
+               principal: {:user, "flynn"},
+               params: %{
+                 work_item_id: item.id,
+                 association_session_key: "notice-parent",
+                 association_revision: 1,
+                 expected_binding_revision: 0,
+                 idempotency_key: "terminal-scope"
+               }
+             })
+
+    assignment =
+      handle(
+        ctx,
+        "assign",
+        terminal_notice_assign_call(
+          {:session, "notice-parent"},
+          "deliver to current accountable successor",
+          item.id
+        )
+      )
+
+    assert %{"changed" => true} =
+             DeliveryResponsibilities.handle(ctx.db, %{
+               verb: "delivery-scope-owner-set",
+               origin: "agent:notice-parent",
+               principal: {:session, "notice-parent"},
+               params: %{
+                 session_key: "delivery-successor",
+                 association_revision: 1,
+                 expected_owner_session_key: "notice-parent",
+                 expected_owner_revision: 1,
+                 idempotency_key: "terminal-owner-transfer"
+               }
+             })
+
+    {:ok, _} =
+      DB.query(
+        ctx.db,
+        "UPDATE sessions SET state='retired' WHERE sessionKey='notice-parent'"
+      )
+
+    {assignment, item}
   end
 
   defp deliver_terminal_notice(db, wake, overrides \\ []) do
@@ -3089,8 +3233,7 @@ defmodule Tightbeam.AssignmentsTest do
         work_item_call("work-item-create", {:user, "flynn"}, %{title: "Second"})
       )
 
-    linked =
-      handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", first.id))
+    linked = handle(ctx, "assign", assign_call({:user, "flynn"}, "linked", "work-key", first.id))
 
     assert linked.workItemId == first.id
 
@@ -3964,8 +4107,7 @@ defmodule Tightbeam.AssignmentsTest do
       |> put_in([:params, :effect_kind], "coordination")
       |> then(&handle(ctx, "assign", &1))
 
-    progress =
-      handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "progress"))
+    progress = handle(ctx, "attest", attest_call({:session, "holder"}, completed.id, "progress"))
 
     verdict_call =
       attest_call({:session, "holder"}, completed.id, "verdict")
@@ -4026,8 +4168,7 @@ defmodule Tightbeam.AssignmentsTest do
     assignment = handle(ctx, "assign", assign_call({:user, "flynn"}, "marker failure"))
     :ok = DB.execute(ctx.db, "DROP TABLE messages")
 
-    result =
-      handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
+    result = handle(ctx, "attest", attest_call({:session, "holder"}, assignment.id, "progress"))
 
     assert result.assignment.id == assignment.id
     assert result.attest.kind == "progress"
@@ -4161,8 +4302,7 @@ defmodule Tightbeam.AssignmentsTest do
       attest_call({:user, "flynn"}, verdict_assignment.id, "verdict")
       |> put_in([:params, :verdict_kind], "tests-passed")
 
-    assert {:ok, %{attest: verdict}} =
-             Dispatch.dispatch(ctx.db, ctx.handlers, verdict_call)
+    assert {:ok, %{attest: verdict}} = Dispatch.dispatch(ctx.db, ctx.handlers, verdict_call)
 
     assert verdict.verdictKind == "tests-passed"
 
