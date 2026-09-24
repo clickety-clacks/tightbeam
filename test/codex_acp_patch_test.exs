@@ -27,8 +27,8 @@ defmodule Tightbeam.HarnessAdapterPatchTest do
   test "claude patch emits at both liveBackgroundTasks settlement bookends idempotently" do
     source =
       [
-        "                            case \"task_notification\":\n                                // The task settled — no further tool calls can originate\n                                // from it, so its registry entry can be dropped.\n                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;",
-        "                                if (message.patch.status === \"completed\" ||\n                                    message.patch.status === \"failed\" ||\n                                    message.patch.status === \"killed\") {\n                                    session.liveBackgroundTasks.delete(message.task_id);\n                                }"
+        "                                session.liveBackgroundTasks.delete(message.task_id);\n                                break;\n                            case \"task_updated\":",
+        "                                    await subagents.finishTask(message.task_id, message.patch.status, sendUpdate);\n                                    session.liveBackgroundTasks.delete(message.task_id);"
       ]
       |> Enum.join("\n")
 
