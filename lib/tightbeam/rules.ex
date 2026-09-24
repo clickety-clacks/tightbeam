@@ -47,6 +47,7 @@ defmodule Tightbeam.Rules do
     Artifacts,
     Assignments,
     DB,
+    DeliveryResponsibilities,
     Devices,
     Escalation,
     EventLog,
@@ -126,11 +127,13 @@ defmodule Tightbeam.Rules do
     "caller.user" => :string,
     "caller.is_admin" => :bool,
     "caller.roles" => {:list, :string},
+    "caller.delivery_responsibility" => :string,
     "target.owner" => :string,
     "target.archetype" => :string,
     "target.host" => :string,
     "target.kind" => :string,
     "target.state" => :string,
+    "target.delivery_responsibility" => :string,
     "org.live_sessions_owned_by_caller" => :int,
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
@@ -151,9 +154,14 @@ defmodule Tightbeam.Rules do
     "work_item.has_topline" => :bool,
     "work_item.has_spec_ref" => :bool,
     "work_item.verdict_kinds" => {:list, :string},
+    "work_item.reference_state" => :string,
+    "work_item.has_delivery_owner" => :bool,
+    "work_item.delivery_owner_ref" => :string,
+    "work_item.delivery_owner_state" => :string,
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
     "assign.declared_files_overlap_open" => :bool,
+    "assign.delegates_delivery" => :bool,
     "decision_request.status" => :string,
     "artifact.present" => :bool,
     "artifact.content_sha256" => :string,
@@ -1841,6 +1849,44 @@ defmodule Tightbeam.Rules do
     end
   end
 
+  defp compute_fact("caller.delivery_responsibility", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        value =
+          case Map.get(call, :principal) do
+            {:session, session_key} ->
+              DeliveryResponsibilities.responsibility(db, session_key, work_item_id)
+
+            _ ->
+              "none"
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("target.delivery_responsibility", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        value =
+          case Map.get(call, :session_key) do
+            session_key when is_binary(session_key) ->
+              DeliveryResponsibilities.responsibility(db, session_key, work_item_id)
+
+            _ ->
+              nil
+          end
+
+        {value, cache}
+    end)
+  end
+
   defp compute_fact("target." <> field, db, call, cache) do
     with_dependency("$target", db, call, cache, fn target, cache ->
       key = if field == "owner", do: :owner_user_id, else: String.to_existing_atom(field)
@@ -2050,6 +2096,65 @@ defmodule Tightbeam.Rules do
           case DB.query(db, sql, params) do
             {:ok, [[state]]} -> state
             {:ok, []} -> nil
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("work_item.reference_state", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {"missing", cache}
+
+      work_item_id, cache ->
+        value =
+          case DB.query(db, "SELECT 1 FROM work_items WHERE id=?1", [work_item_id]) do
+            {:ok, [[1]]} -> "known"
+            {:ok, []} -> "unknown"
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("work_item.has_delivery_owner", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {false, cache}
+
+      work_item_id, cache ->
+        value = not is_nil(DeliveryResponsibilities.current_owner(db, work_item_id))
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("work_item.delivery_owner_ref", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        value =
+          case DeliveryResponsibilities.current_owner(db, work_item_id) do
+            %{"accountableSessionKey" => session_key} -> "session:" <> session_key
+            nil -> nil
+          end
+
+        {value, cache}
+    end)
+  end
+
+  defp compute_fact("work_item.delivery_owner_state", db, call, cache) do
+    with_dependency("$work_item_id", db, call, cache, fn
+      nil, cache ->
+        {nil, cache}
+
+      work_item_id, cache ->
+        value =
+          case DeliveryResponsibilities.current_owner(db, work_item_id) do
+            %{"deliveryState" => state} -> state
+            nil -> nil
           end
 
         {value, cache}
@@ -2385,6 +2490,18 @@ defmodule Tightbeam.Rules do
 
         _ ->
           nil
+      end
+
+    {value, cache}
+  end
+
+  defp compute_fact("assign.delegates_delivery", _db, call, cache) do
+    value =
+      if call.verb in ["assign", "dispatch"] do
+        case Map.get(call.params, :delegates_delivery, false) do
+          value when is_boolean(value) -> value
+          _ -> nil
+        end
       end
 
     {value, cache}

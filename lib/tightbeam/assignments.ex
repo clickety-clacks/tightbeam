@@ -1657,6 +1657,15 @@ defmodule Tightbeam.Assignments do
               do: raise(UnknownWorkItem, work_item_id: work_item_id)
         end
 
+        case Tightbeam.DeliveryResponsibilities.validate_assignment_delegation_in_txn(
+               txn,
+               call,
+               call.session_key
+             ) do
+          :ok -> :ok
+          %{code: _} = error -> throw({:delivery_delegation_error, error})
+        end
+
         reviews_assignment_id =
           if verb == "assign", do: call.params[:reviews_assignment_id], else: nil
 
@@ -1778,6 +1787,14 @@ defmodule Tightbeam.Assignments do
         end
 
         assignment = fetch_assignment!(txn, id)
+
+        :ok =
+          Tightbeam.DeliveryResponsibilities.record_assignment_delegation_in_txn(
+            txn,
+            call,
+            assignment
+          )
+
         append_assignment_marker(txn, assignment, :opened)
 
         if succeeds_assignment_id do
@@ -1808,6 +1825,9 @@ defmodule Tightbeam.Assignments do
       error("review_of_review", "a review assignment cannot itself be reviewed")
 
     {:successor_error, error} ->
+      error
+
+    {:delivery_delegation_error, error} ->
       error
   end
 
