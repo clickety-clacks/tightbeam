@@ -36,17 +36,17 @@ do not shift continual deep judgment into repeated corrective supervision.
 
 | Activity | Starting choice | Capability floor |
 | --- | --- | --- |
-| Product ownership and spirit | gpt-6-astra[high] | Challenge technically sound work against intent, sustain product context and decide topology. |
+| Product ownership and spirit | gpt-6-astra[high], fable[high], opus[xhigh], sol[xhigh] | Challenge technically sound work against intent, sustain product context and decide topology. |
 | Product delivery orchestration | gpt-6-sol[low] | Obtain the PO's plan, reconcile current records, staff and execute within it, recognize revision needs and resolve routine traffic. |
 | Executive or delegated lane orchestration | gpt-6-sol[low] | Coordinate within actual scope, carry dependencies and follow-through, route consequential judgment to its qualified owner. |
-| Bounded team design or recovery planning | astra[high], sol[xhigh], fable[high] | Discover coupling, ownership, communication and evidence that invalidates the plan. |
-| Difficult sustained topology or recovery exploration | astra[xhigh], sol[max], fable[xhigh] | Sustain investigation and revise advice from evidence; the PO decides topology. |
+| Bounded team design or recovery planning | astra[high], fable[high], sol[xhigh], opus[xhigh] | Discover coupling, ownership, communication and evidence that invalidates the plan. |
+| Difficult sustained topology or recovery exploration | astra[xhigh], fable[xhigh], sol[max], opus[xhigh] | Sustain investigation and revise advice from evidence; the PO decides topology. |
 | Specification under product rulings | claude-opus-5-5[high] | Compose a coherent contract and expose unresolved intent. |
 | Independent guidance, code or spec review | Codex producer: claude-opus-5-5[high]; Claude producer: gpt-6-astra[high] | Independent opposite-harness judgment of the actual authored subject, omissions and interactions; use adequate depth for whole-system review. |
 | Well-scoped or sustained implementation under an understood architecture | gpt-6-luna[max] | Implement and verify the contract, expose gaps and carry delivery without growing corrective supervision. |
 | Implementation with unresolved architectural or causal judgment | gpt-6-astra[high], gpt-6-sol[xhigh] | Reason about architecture and interacting failure modes during implementation; choose by the actual uncertainty. |
-| Open-ended recon or investigation | sol[high], astra[high], opus[high], sonnet[high], fable[high] | Distinguish evidence from inference and identify consequential unknowns. |
-| Narrow factual scouting | luna[low], haiku, terra[low], sol[medium] | Bounded factual extraction from inspectable evidence. Broader judgment goes to recon/planning. |
+| Open-ended recon or investigation | sol[high], opus[high], sonnet[high], astra[high], fable[high] | Distinguish evidence from inference and identify consequential unknowns. |
+| Narrow factual scouting | luna[low], haiku, terra[low], sol[medium], sonnet[medium] | Bounded factual extraction from inspectable evidence. Broader judgment goes to recon/planning. |
 | Mechanical non-code transformations | luna[medium], terra[low], sonnet[low], sol[medium] | Apply an inspectable transformation; code production uses the coder rows. |
 
 Filter for the organization's permitted families and allowed hosts before selection.
