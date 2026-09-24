@@ -2223,26 +2223,7 @@ defmodule Tightbeam.GatewayTest do
     codex_auth = Tightbeam.Homes.home_path(base_dir, "testhost", :codex)
     File.mkdir_p!(codex_auth)
     File.write!(Path.join(codex_auth, "auth.json"), "test-token")
-    manifests = Path.join([base_dir, "identity", "archetypes"])
-    File.mkdir_p!(manifests)
-
-    for {name, family, effort} <- [
-          {"pdo", "gpt-6-sol", "low"},
-          {"orchestrator", "gpt-6-sol", "low"},
-          {"coder", "gpt-6-luna", "max"}
-        ] do
-      File.write!(Path.join(manifests, "#{name}.toml"), """
-      name = "#{name}"
-      where = ["testhost"]
-
-      [defaults]
-      harness = "codex"
-      model = "#{family}"
-      effort = "#{effort}"
-      """)
-    end
-
-    Archetypes.load!(base_dir)
+    learn_engineering_identity_without_apply_fixture_skills!(base_dir)
     ensure_global_registry()
 
     put_host_catalog("testhost", "codex", [
