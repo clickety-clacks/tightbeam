@@ -454,19 +454,20 @@ COMMANDS:
       (same key returns the same session). Omitted fields inherit the
       archetype's defaults.
         tightbeam spawn --display "Reviewer" --name reviewer:x \
-          --harness {{EXAMPLE_HARNESS}} --model <catalog-model> --effort <level> \
+          --harness {{EXAMPLE_HARNESS}} --model <model> --effort <level> \
           --as orchestrator:news
       --host picks a machine WITHIN the archetype's allowed set (see list's
       archetypes/hosts); omitted, the archetype's default placement applies.
       A model is named by FIELDS, never one packed string: --model is the
       model itself, --effort its reasoning level, --context the vendor's
-      context-window variant when it offers more than one. All must come from
-      list's model catalog — never invent one.
+      context-window variant when it offers more than one. For Claude, pass an
+      exact model ID; the installed client decides whether it can run. Other
+      harnesses use the model catalog shown by list.
 
   list
       Show the sessions you can address (with handles + provenance), the
       org's shape — archetypes (with allowed hosts), known hosts, and the
-      valid model catalog per harness — and, for admins, pending devices.
+      observed model catalog per harness — and, for admins, pending devices.
         tightbeam list --as orchestrator:news
 
   retire --session <key> [--key <idempotencyKey>]
