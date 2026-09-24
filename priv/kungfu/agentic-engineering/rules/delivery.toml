@@ -1,0 +1,91 @@
+# Production staffing is admitted from exact work-item custody. Role names,
+# session ancestry, and a generic/default archetype are not authority. Initial
+# orchestration and PO consultation remain reachable as coordination work.
+[[rule]]
+name = "engineering-spawn-staffing-needs-work-item"
+verb = "spawn"
+text = "Worker staffing requires a known work item. Establish the item and its accountable delivery owner before spawning production workers."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "spawn.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
+  { fact = "work_item.reference_state", op = "ne", value = "known" },
+]
+
+[[rule]]
+name = "engineering-spawn-staffing-needs-responsibility"
+verb = "spawn"
+text = "Worker staffing requires accountable or explicitly delegated delivery responsibility for this exact work item."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "spawn.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
+  { fact = "work_item.reference_state", op = "eq", value = "known" },
+  { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+]
+
+[[rule]]
+name = "engineering-assign-staffing-needs-work-item"
+verb = "assign"
+text = "Engineering staffing requires a known work item. Link coordination and production assignments to their durable item."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "work_item.reference_state", op = "ne", value = "known" },
+]
+
+[[rule]]
+name = "engineering-assign-worker-needs-responsibility"
+verb = "assign"
+text = "Worker staffing requires accountable or explicitly delegated delivery responsibility for this exact work item."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
+  { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+]
+
+[[rule]]
+name = "engineering-assign-production-needs-responsibility"
+verb = "assign"
+text = "Non-coordination delivery staffing requires accountable or explicitly delegated responsibility for this exact work item."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "in", value = ["orchestrator", "product-owner"] },
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+]
+
+[[rule]]
+name = "engineering-dispatch-staffing-needs-work-item"
+verb = "dispatch"
+text = "Engineering staffing requires a known work item. Link coordination and production assignments to their durable item."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "work_item.reference_state", op = "ne", value = "known" },
+]
+
+[[rule]]
+name = "engineering-dispatch-worker-needs-responsibility"
+verb = "dispatch"
+text = "Worker staffing requires accountable or explicitly delegated delivery responsibility for this exact work item."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "not_in", value = ["orchestrator", "product-owner"] },
+  { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+]
+
+[[rule]]
+name = "engineering-dispatch-production-needs-responsibility"
+verb = "dispatch"
+text = "Non-coordination delivery staffing requires accountable or explicitly delegated responsibility for this exact work item."
+edges = ["verb"]
+effect = "deny"
+deny_when = [
+  { fact = "target.archetype", op = "in", value = ["orchestrator", "product-owner"] },
+  { fact = "assign.effect_kind", op = "ne", value = "coordination" },
+  { fact = "caller.delivery_responsibility", op = "not_in", value = ["accountable", "delegated"] },
+]

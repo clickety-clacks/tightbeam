@@ -2925,12 +2925,13 @@ defmodule Tightbeam.Assignments do
     do:
       error("invalid_effect_kind", "effectKind must be one of #{Enum.join(@effect_kinds, ", ")}")
 
-  defp effective_effect_kind(reviews_assignment_id, _requested)
-       when not is_nil(reviews_assignment_id),
-       do: "review"
+  @doc false
+  def effective_effect_kind(reviews_assignment_id, _requested)
+      when not is_nil(reviews_assignment_id),
+      do: "review"
 
-  defp effective_effect_kind(nil, nil), do: "code"
-  defp effective_effect_kind(nil, requested), do: requested
+  def effective_effect_kind(nil, nil), do: "code"
+  def effective_effect_kind(nil, requested), do: requested
 
   defp valid_supervision_interval(interval) when is_integer(interval) and interval > 0,
     do: :ok

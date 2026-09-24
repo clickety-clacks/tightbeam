@@ -2217,6 +2217,70 @@ defmodule Tightbeam.GatewayTest do
     assert Idempotency.get(ctx.db, "flynn", "spawn", "spawn-taken") == nil
   end
 
+  test "fresh PDO and orchestrator spawns resolve their defaults without changing coder choice",
+       ctx do
+    base_dir = role_test_base("engineering-default-spawn")
+    manifests = Path.join([base_dir, "identity", "archetypes"])
+    File.mkdir_p!(manifests)
+
+    for {name, family, effort} <- [
+          {"pdo", "gpt-6-sol", "low"},
+          {"orchestrator", "gpt-6-sol", "low"},
+          {"coder", "gpt-6-luna", "max"}
+        ] do
+      File.write!(Path.join(manifests, "#{name}.toml"), """
+      name = "#{name}"
+      where = ["testhost"]
+
+      [defaults]
+      harness = "codex"
+      model = "#{family}"
+      effort = "#{effort}"
+      """)
+    end
+
+    Archetypes.load!(base_dir)
+    ensure_global_registry()
+
+    put_host_catalog("testhost", "codex", [
+      {"gpt-6-sol", ["low"], :openai},
+      {"gpt-6-luna", ["max"], :openai}
+    ])
+
+    spawn = Gateway.handlers(gateway_config(base_dir, ctx.db, 0))["spawn"]
+
+    for archetype <- ["pdo", "orchestrator"] do
+      assert %{session_key: key} =
+               spawn.(%{
+                 origin: "user:flynn",
+                 session_key: nil,
+                 params: %{
+                   display_name: "Fresh #{archetype}",
+                   archetype: archetype,
+                   idempotency_key: "fresh-#{archetype}"
+                 }
+               })
+
+      assert %{archetype: ^archetype, harness: "codex", provider: "openai"} =
+               Org.get(ctx.db, key)
+
+      assert Org.get(ctx.db, key).model == Model.new("gpt-6-sol", effort: "low")
+    end
+
+    assert %{session_key: coder_key} =
+             spawn.(%{
+               origin: "user:flynn",
+               session_key: nil,
+               params: %{
+                 display_name: "Fresh coder",
+                 archetype: "coder",
+                 idempotency_key: "fresh-coder"
+               }
+             })
+
+    assert Org.get(ctx.db, coder_key).model == Model.new("gpt-6-luna", effort: "max")
+  end
+
   test "spawn has no session-count gate when the cap is unset", ctx do
     base_dir = role_test_base("spawn-unlimited")
     Archetypes.load!(base_dir)

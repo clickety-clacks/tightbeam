@@ -134,6 +134,7 @@ defmodule Tightbeam.Rules do
     "target.kind" => :string,
     "target.state" => :string,
     "target.delivery_responsibility" => :string,
+    "spawn.archetype" => :string,
     "org.live_sessions_owned_by_caller" => :int,
     "caller.verb_count_24h" => :int,
     "attest.kind" => :string,
@@ -160,6 +161,7 @@ defmodule Tightbeam.Rules do
     "work_item.delivery_owner_state" => :string,
     "assignment.review_verdict_count" => :int,
     "assignment.prior_completed_fix_count" => :int,
+    "assign.effect_kind" => :string,
     "assign.declared_files_overlap_open" => :bool,
     "assign.delegates_delivery" => :bool,
     "decision_request.status" => :string,
@@ -1895,6 +1897,15 @@ defmodule Tightbeam.Rules do
     end)
   end
 
+  defp compute_fact("spawn.archetype", db, call, cache) do
+    value =
+      if call.verb == "spawn" do
+        Map.get(call.params, :archetype) || Org.get_setting(db, "default-archetype") || "default"
+      end
+
+    {value, cache}
+  end
+
   defp compute_fact("org.live_sessions_owned_by_caller", db, call, cache) do
     with_dependency("caller.user", db, call, cache, fn
       nil, cache -> {nil, cache}
@@ -2494,6 +2505,14 @@ defmodule Tightbeam.Rules do
 
     {value, cache}
   end
+
+  defp compute_fact("assign.effect_kind", _db, %{verb: verb} = call, cache)
+       when verb in ["assign", "dispatch"] do
+    review = if verb == "assign", do: call.params[:reviews_assignment_id]
+    {Assignments.effective_effect_kind(review, call.params[:effect_kind]), cache}
+  end
+
+  defp compute_fact("assign.effect_kind", _db, _call, cache), do: {nil, cache}
 
   defp compute_fact("assign.delegates_delivery", _db, call, cache) do
     value =

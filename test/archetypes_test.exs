@@ -793,7 +793,11 @@ defmodule Tightbeam.ArchetypesTest do
       Application.app_dir(:tightbeam, "priv/kungfu/agentic-engineering/preferred-models.md")
       |> File.read!()
 
-    assert activities =~ "Product delivery orchestration | gpt-6-sol[low]"
+    [mixed_family, codex_only] =
+      String.split(activities, "## Codex-only PDO activity", parts: 2)
+
+    assert mixed_family =~ "Product delivery orchestration | gpt-6-sol[low]"
+    assert codex_only =~ "Product delivery orchestration | gpt-6-sol[low]"
     assert activities =~ "Executive or delegated lane orchestration | gpt-6-sol[low]"
     assert policy =~ "Codex-authored work uses Claude claude-opus-5-5/high"
     assert policy =~ "Claude-authored work uses Codex gpt-6-astra/high"

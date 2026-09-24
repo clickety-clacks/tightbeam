@@ -5,6 +5,7 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     Assignments,
     DB,
     DeliveryResponsibilities,
+    Dispatch,
     Model,
     Org,
     Roles,
@@ -209,6 +210,30 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
     refute delegations[lane_assignment.id]["active"]
     refute delegations[child_assignment.id]["active"]
     refute Map.has_key?(delegations, plain.id)
+  end
+
+  test "an accepted child delegation survives parent revocation without extending the parent", %{
+    db: db
+  } do
+    bootstrap_a(db)
+
+    parent = assign(db, {:session, "pdo-a"}, "lane-a", "wi_a1", true)
+    child = assign(db, {:session, "lane-a"}, "worker-a", "wi_a1", true)
+
+    close_assignment(db, parent.id, "pdo-a")
+
+    assert DeliveryResponsibilities.responsibility(db, "lane-a", "wi_a1") == "none"
+    assert DeliveryResponsibilities.responsibility(db, "worker-a", "wi_a1") == "delegated"
+
+    assert %{code: "not_authorized"} =
+             assign(db, {:session, "lane-a"}, "successor-a", "wi_a1", true)
+
+    assert assignment = assign(db, {:session, "worker-a"}, "successor-a", "wi_a1", true)
+    assert assignment.holderKey == "successor-a"
+
+    close_assignment(db, child.id, "lane-a")
+    assert DeliveryResponsibilities.responsibility(db, "worker-a", "wi_a1") == "none"
+    assert DeliveryResponsibilities.responsibility(db, "successor-a", "wi_a1") == "delegated"
   end
 
   test "succession is expected-revision atomic and withdraws old commissioning grants", %{
@@ -448,6 +473,116 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
              )
   end
 
+  @tag :tmp_dir
+  test "engineering rules admit only exact-item production staffing through Dispatch", %{
+    db: db,
+    tmp_dir: tmp
+  } do
+    rules_dir = Path.join([tmp, "identity", "rules"])
+    File.mkdir_p!(rules_dir)
+
+    File.cp!(
+      Path.expand("../priv/kungfu/agentic-engineering/rules/delivery.toml", __DIR__),
+      Path.join(rules_dir, "delivery.toml")
+    )
+
+    Rules.load!(tmp, ["spawn", "assign", "dispatch"])
+    session(db, "consult-po", "owner", archetype: "product-owner")
+
+    assignment_handlers = %{
+      "assign" => fn call -> Assignments.__handle__(db, "assign", call) end,
+      "dispatch" => fn call -> Assignments.__handle__(db, "dispatch", call) end
+    }
+
+    for caller <- [Org.personal_session_key("owner"), "po-a"] do
+      assert {:error, %{rule: "engineering-assign-worker-needs-responsibility"}} =
+               Dispatch.dispatch(
+                 db,
+                 assignment_handlers,
+                 production_call("assign", caller, "worker-a", "wi_a1")
+               )
+    end
+
+    assert {:error, %{rule: "engineering-dispatch-worker-needs-responsibility"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call(
+                 "dispatch",
+                 Org.personal_session_key("owner"),
+                 "worker-a",
+                 "wi_a1"
+               )
+             )
+
+    assert {:error, %{rule: "engineering-assign-staffing-needs-work-item"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call("assign", "pdo-a", "worker-a", nil)
+             )
+
+    assert {:ok, %{holderKey: "consult-po", effectKind: "coordination"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call(
+                 "assign",
+                 Org.personal_session_key("owner"),
+                 "consult-po",
+                 "wi_a1",
+                 effect_kind: "coordination"
+               )
+             )
+
+    assert {:error, %{rule: "engineering-assign-production-needs-responsibility"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call(
+                 "assign",
+                 Org.personal_session_key("owner"),
+                 "consult-po",
+                 "wi_a1"
+               )
+             )
+
+    spawn_handlers = %{"spawn" => fn call -> %{archetype: call.params[:archetype]} end}
+
+    assert {:error, %{rule: "engineering-spawn-staffing-needs-work-item"}} =
+             Dispatch.dispatch(
+               db,
+               spawn_handlers,
+               spawn_call(Org.personal_session_key("owner"), nil, nil)
+             )
+
+    assert {:error, %{rule: "engineering-spawn-staffing-needs-responsibility"}} =
+             Dispatch.dispatch(
+               db,
+               spawn_handlers,
+               spawn_call(Org.personal_session_key("owner"), nil, "wi_a1")
+             )
+
+    assert {:ok, %{archetype: "product-owner"}} =
+             Dispatch.dispatch(
+               db,
+               spawn_handlers,
+               spawn_call(Org.personal_session_key("owner"), "product-owner", nil)
+             )
+
+    bootstrap_a(db)
+
+    assert {:ok, %{holderKey: "worker-a", effectKind: "code"}} =
+             Dispatch.dispatch(
+               db,
+               assignment_handlers,
+               production_call("assign", "pdo-a", "worker-a", "wi_a1")
+             )
+
+    assert {:ok, %{archetype: "coder"}} =
+             Dispatch.dispatch(db, spawn_handlers, spawn_call("pdo-a", "coder", "wi_a1"))
+  end
+
   test "schema is additive and every authority history is immutable", %{db: db} do
     assert {:ok,
             [
@@ -575,6 +710,45 @@ defmodule Tightbeam.DeliveryResponsibilitiesTest do
       origin: "agent:#{caller}",
       principal: {:session, caller},
       session_key: target,
+      params: params
+    }
+  end
+
+  defp production_call(verb, caller, target, work_item_id, options \\ []) do
+    params = %{
+      subject: "production #{System.unique_integer([:positive])}",
+      idempotency_key: nil,
+      work_item_id: work_item_id,
+      reviews_assignment_id: nil,
+      effect_kind: options[:effect_kind],
+      files: nil,
+      delegates_delivery: false
+    }
+
+    %{
+      verb: verb,
+      origin: "agent:#{caller}",
+      principal: {:session, caller},
+      session_key: target,
+      target_role: nil,
+      role_fallback: false,
+      supervision_interval_ms: 1_000,
+      params: params
+    }
+  end
+
+  defp spawn_call(caller, archetype, work_item_id) do
+    params =
+      %{work_item_id: work_item_id}
+      |> then(fn params ->
+        if archetype, do: Map.put(params, :archetype, archetype), else: params
+      end)
+
+    %{
+      verb: "spawn",
+      origin: "agent:#{caller}",
+      principal: {:session, caller},
+      session_key: nil,
       params: params
     }
   end
