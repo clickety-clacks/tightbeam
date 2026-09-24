@@ -9,7 +9,7 @@ defmodule Tightbeam.Harness.Claude do
   def local_client_model_authority?(%Model{family: "claude-" <> _}), do: true
   def local_client_model_authority?(%Model{}), do: false
 
-  @adapter_version "0.79.0"
+  @adapter_version "0.81.0"
   @adapter_package "claude-agent-acp"
   @adapter_bundle "acp-agent.js"
   @warm_timeout_ms 30_000
@@ -155,10 +155,6 @@ defmodule Tightbeam.Harness.Claude do
       if Map.get(session, :identity) == true and not String.starts_with?(guidance, prefix),
         do: prefix <> "\n\n" <> guidance,
         else: guidance
-
-    # Candidate vocabulary only. Adapter readback, never this static map,
-    # decides which canonical model an alias means in the running version.
-    # Keeping the 0.59 mappings here preserves fallback on old satellites.
 
     %{
       guidance: guidance,

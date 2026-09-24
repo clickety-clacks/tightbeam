@@ -68,7 +68,7 @@ defmodule Tightbeam.SpinupTest do
              })
 
     assert [["sh", "-c", script]] = receive_commands(1)
-    assert script =~ "@agentclientprotocol/claude-agent-acp@0.79.0"
+    assert script =~ "@agentclientprotocol/claude-agent-acp@0.81.0"
     assert_received :patched
   end
 
@@ -392,7 +392,7 @@ defmodule Tightbeam.SpinupTest do
 
   test "remote valid prerelease Claude adapter provisions pinned version before patching", ctx do
     configure_remote(ctx)
-    {:ok, versions} = Agent.start_link(fn -> "0.79.0-beta.1" end)
+    {:ok, versions} = Agent.start_link(fn -> "0.81.0-beta.1" end)
     parent = self()
 
     sh = fn command ->
@@ -404,7 +404,7 @@ defmodule Tightbeam.SpinupTest do
           {Agent.get(versions, &(&1 <> "\n")), 0}
 
         String.contains?(script, "npm install") ->
-          Agent.update(versions, fn _ -> "0.79.0" end)
+          Agent.update(versions, fn _ -> "0.81.0" end)
           {"", 0}
 
         true ->
@@ -429,7 +429,7 @@ defmodule Tightbeam.SpinupTest do
 
     assert Enum.any?(
              commands,
-             &String.contains?(List.last(&1), "@agentclientprotocol/claude-agent-acp@0.79.0")
+             &String.contains?(List.last(&1), "@agentclientprotocol/claude-agent-acp@0.81.0")
            )
 
     assert_received :patched
