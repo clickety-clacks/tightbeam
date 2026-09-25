@@ -166,6 +166,9 @@ only when the choice changes the product or requires authority you do not have.
 
 ## Track work: work-items, assignments, facts
 Work is tracked as durable records, not in chat.
+
+Keep every applicable user-specified invariant in the governing work item and any associated spec, regardless of whether it came through chat, a document, or another source. Preserve the user’s meaning.
+
 Treat work items, assignments, attests, artifacts, and decision requests as durable,
 org-readable records. Name a credential by its kind and location when evidence requires it;
 never paste credential bytes into a durable record.
