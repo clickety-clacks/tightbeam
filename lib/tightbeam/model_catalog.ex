@@ -22,7 +22,7 @@ defmodule Tightbeam.ModelCatalog do
 
   use GenServer
   require Logger
-  alias Tightbeam.{Harness, Model, PiProvider, Placement, Unroutable}
+  alias Tightbeam.{ErrorDiagnostic, Harness, Model, PiProvider, Placement, Unroutable}
 
   @default_ttl_ms :timer.minutes(15)
 
@@ -532,7 +532,20 @@ defmodule Tightbeam.ModelCatalog do
           {:error, reason}
       end
     rescue
-      error -> {:error, {:exception, Exception.message(error)}}
+      # The reason keeps the exception's type beside its message; the stack goes
+      # to the log, since doctor and catalog_diff render the reason inline.
+      error ->
+        diagnostic =
+          ErrorDiagnostic.exception(error, __STACKTRACE__,
+            operation: "derive_catalog",
+            host: host,
+            harness: harness
+          )
+
+        Logger.warning("model catalog derivation raised: #{JSON.encode!(diagnostic)}")
+
+        {:error,
+         {:exception, error.__struct__, ErrorDiagnostic.redact_text(Exception.message(error))}}
     catch
       kind, reason -> {:error, {kind, reason}}
     end

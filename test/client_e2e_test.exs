@@ -1088,6 +1088,27 @@ defmodule Tightbeam.ClientE2ETest do
       assert progress_line =~ "ACP adapters installing"
     end
 
+    test "an absent or unreadable log is named, not read as a silent gateway" do
+      dir = gate_dir!()
+      opts = [timeout_ms: 100, poll_ms: 20, progress: fn _ -> :ok end]
+
+      absent = %LegGateway{base_dir: dir, port: 0, log_path: Path.join(dir, "absent.log")}
+
+      assert {:error, {:no_verdict, detail}} =
+               LegGateway.await_runnable(absent, "claude", "testhost", opts)
+
+      assert detail =~ "was never created"
+
+      # A directory cannot be read as a file: the read error survives.
+      unreadable = %LegGateway{base_dir: dir, port: 0, log_path: dir}
+
+      assert {:error, {:no_verdict, detail}} =
+               LegGateway.await_runnable(unreadable, "claude", "testhost", opts)
+
+      assert detail =~ "could not be read: #{dir}: illegal operation on a directory"
+      refute detail =~ "never published"
+    end
+
     test "a closed install no longer reads as installing" do
       dir = gate_dir!()
 

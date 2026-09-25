@@ -191,6 +191,21 @@ defmodule Tightbeam.CredentialKindsTest do
       refute File.exists?(Credentials.credential_path(ctx.base, "eezo", :opencode_go))
     end
 
+    test "a Pi auth.json that is not JSON is refused with its offset, not its bytes", ctx do
+      {:ok, server} = Credentials.start_link(name: nil, base_dir: ctx.base, machine: "eezo")
+
+      {:ok, staging, lease_id} = Credentials.begin_onboard(:opencode_go, server)
+      sentinel = "sk-fixture-SENTINEL-0123456789abcdef"
+      File.write!(Path.join(staging, "auth.json"), ~s({"opencode-go" x "#{sentinel}"}))
+
+      assert {:error, {:hollow_credential, %{found: found}}} =
+               Credentials.finish_onboard(:opencode_go, :api_key, lease_id, server)
+
+      assert found =~ "the Pi auth.json is not valid JSON: invalid byte at offset 15"
+      refute found =~ sentinel
+      refute File.exists?(Credentials.credential_path(ctx.base, "eezo", :opencode_go))
+    end
+
     test "a subscription banks with its kind without inferring expiry", ctx do
       {:ok, server} =
         start_credentials(

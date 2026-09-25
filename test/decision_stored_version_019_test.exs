@@ -119,6 +119,38 @@ defmodule Tightbeam.DecisionStoredVersion019Test do
   end
 
   @tag rest_r7_closure: true
+  test "stored JSON that no longer decodes is refused with its offset, not shown as data", %{
+    db: db
+  } do
+    assert {:ok, _} =
+             DB.query(
+               db,
+               """
+               INSERT INTO decision_requests
+                 (id,kind,raiserId,raiserSessionKey,ownerUserId,assignmentId,
+                  raisedAt,deadlineAt,statuteName,actionKey,question,options,context,status)
+               VALUES
+                 ('dr_bad_context_r7','statute','session:raiser','agent:raiser','mike','asg_r7',
+                  10,20,'ship-law','ship-action','May this ship?',
+                  '["allow" "deny"]','{"verb": x}','open')
+               """
+             )
+
+    row = Escalation.raw_by_id(db, "dr_bad_context_r7")
+    assert {:invalid_json, {:invalid_byte, 9, _}} = row.context
+
+    assert_raise ArgumentError,
+                 "decision request context is projection_invalid: " <>
+                   "stored JSON has an invalid byte at offset 9",
+                 fn -> StateResources.decision_request(%{row | options: nil}) end
+
+    assert_raise ArgumentError,
+                 "decision request options are projection_invalid: " <>
+                   "stored JSON has an invalid byte at offset 9",
+                 fn -> StateResources.decision_request(row) end
+  end
+
+  @tag rest_r7_closure: true
   test "effort lineage projection refuses absent and non-integer stored values", %{db: db} do
     insert_decision_rows(db)
     effort = Escalation.raw_by_id(db, "dr_effort_r7")

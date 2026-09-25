@@ -3857,10 +3857,12 @@ defmodule Tightbeam.Escalation do
   defp decode_optional_safe(nil), do: nil
   defp decode_optional_safe(value), do: decode_json_safe(value)
 
+  # Stored JSON that no longer decodes stays a marked value carrying the parser's
+  # reason; projections refuse it instead of presenting it as decoded data.
   defp decode_json_safe(value) do
     case JSON.decode(value) do
       {:ok, decoded} -> decoded
-      {:error, _error} -> :invalid_json
+      {:error, error} -> {:invalid_json, error}
     end
   end
 

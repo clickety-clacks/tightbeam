@@ -269,6 +269,17 @@ defmodule Mix.Tasks.Tightbeam.DoctorTest do
     File.mkdir_p!(Path.join([ctx.base_dir, "identity", ".git"]))
     {1, empty} = Doctor.evaluate(ctx.catalog, ctx.inputs)
     refute find(empty, "base_dir_identity").ok
+    assert find(empty, "base_dir_identity").detail =~ "is missing"
+
+    # Searchable but unlistable: the listing failure is reported, not "missing".
+    identity = Path.join(ctx.base_dir, "identity")
+    File.chmod!(identity, 0o300)
+    on_exit(fn -> File.chmod(identity, 0o700) end)
+    {1, unlistable} = Doctor.evaluate(ctx.catalog, ctx.inputs)
+    refute find(unlistable, "base_dir_identity").ok
+
+    assert find(unlistable, "base_dir_identity").detail ==
+             "#{identity} could not be listed: permission denied"
   end
 
   test "injected advertised URL passes and absent URL without a fallback fails", ctx do

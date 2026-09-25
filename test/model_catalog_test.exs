@@ -497,6 +497,32 @@ defmodule Tightbeam.ModelCatalogTest do
     end
   end
 
+  test "a derivation that raises keeps the exception type, redacted, and logs its stack", ctx do
+    sentinel = "sk-fixture-SENTINEL-0123456789abcdef"
+    catalog = unique_name(:raising_catalog)
+
+    log =
+      capture_log(fn ->
+        start_catalog(ctx,
+          name: catalog,
+          credential_status: fn _provider -> :onboarded end,
+          credential_kind: fn _provider -> raise ArgumentError, "kind failed near #{sentinel}" end
+        )
+
+        expected =
+          {[], {:unavailable, {:exception, ArgumentError, "kind failed near [REDACTED:token]"}}}
+
+        await(fn -> ModelCatalog.get(@host, "claude", catalog) == expected end)
+        assert ModelCatalog.get(@host, "claude", catalog) == expected
+      end)
+
+    assert log =~ "model catalog derivation raised"
+    assert log =~ "derive_catalog"
+    assert log =~ "ArgumentError"
+    assert log =~ "stacktrace"
+    refute log =~ sentinel
+  end
+
   test "an unreadable credential store is the catalog health and warning reason", ctx do
     reason =
       {:credential_store_unreadable,

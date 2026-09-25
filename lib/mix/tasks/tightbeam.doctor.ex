@@ -498,14 +498,21 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
   defp identity_check(base_dir) do
     identity_dir = Path.join(base_dir, "identity")
 
-    populated? =
+    populated =
       File.dir?(base_dir) and File.dir?(identity_dir) and
-        File.dir?(Path.join(identity_dir, ".git")) and populated_identity?(identity_dir)
+        File.dir?(Path.join(identity_dir, ".git")) and populated_identity(identity_dir)
 
-    detail =
-      if populated?,
-        do: "#{identity_dir} is a populated identity repo",
-        else: "#{base_dir} or its populated identity repo is missing"
+    {populated?, detail} =
+      case populated do
+        true ->
+          {true, "#{identity_dir} is a populated identity repo"}
+
+        false ->
+          {false, "#{base_dir} or its populated identity repo is missing"}
+
+        {:error, reason} ->
+          {false, "#{identity_dir} could not be listed: #{:file.format_error(reason)}"}
+      end
 
     check("base_dir_identity", populated?, detail, "Run mix tightbeam.init.")
   end
@@ -590,14 +597,15 @@ defmodule Mix.Tasks.Tightbeam.Doctor do
     end
   end
 
-  defp populated_identity?(identity_dir) do
+  # An unlistable identity directory is not a missing one; keep the reason.
+  defp populated_identity(identity_dir) do
     case File.ls(identity_dir) do
       {:ok, entries} ->
         File.regular?(Path.join([identity_dir, ".git", "HEAD"])) and
           Enum.any?(entries, &(&1 != ".git"))
 
-      {:error, _reason} ->
-        false
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

@@ -2080,6 +2080,7 @@ defmodule Tightbeam.StateResources do
       |> Map.put(:row_version, row_version)
       |> public()
       |> Map.update!("options", &decision_options!/1)
+      |> decision_context!()
 
     validate_decision_deadline!(row)
 
@@ -2146,8 +2147,34 @@ defmodule Tightbeam.StateResources do
     end)
   end
 
+  defp decision_options!({:invalid_json, error}),
+    do:
+      raise(
+        ArgumentError,
+        "decision request options are projection_invalid: #{stored_json_error(error)}"
+      )
+
   defp decision_options!(_invalid),
     do: raise(ArgumentError, "decision request options are projection_invalid")
+
+  defp decision_context!(%{"context" => {:invalid_json, error}}),
+    do:
+      raise(
+        ArgumentError,
+        "decision request context is projection_invalid: #{stored_json_error(error)}"
+      )
+
+  defp decision_context!(row), do: row
+
+  # The parser's offset, not the bytes: stored context can carry anything.
+  defp stored_json_error({:invalid_byte, offset, _byte}),
+    do: "stored JSON has an invalid byte at offset #{offset}"
+
+  defp stored_json_error({:unexpected_end, offset}),
+    do: "stored JSON ends unexpectedly at offset #{offset}"
+
+  defp stored_json_error({:unexpected_sequence, offset, _bytes}),
+    do: "stored JSON has an unexpected sequence at offset #{offset}"
 
   defp session_model_selection(row) do
     row = Map.put(row, :row_version, value(row, :row_version) || value(row, :updated_at))

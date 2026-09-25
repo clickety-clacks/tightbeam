@@ -26,7 +26,7 @@ defmodule Tightbeam.Credentials do
 
   use GenServer
 
-  alias Tightbeam.{CommandEdge, Harness, Homes, LocalOpenAi.Providers, Rails}
+  alias Tightbeam.{CommandEdge, ErrorDiagnostic, Harness, Homes, LocalOpenAi.Providers, Rails}
   alias Tightbeam.CommandEdge.CredentialPark
 
   @ssh_opts ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
@@ -88,8 +88,13 @@ defmodule Tightbeam.Credentials do
   end
 
   @spec kind_at(String.t(), String.t(), provider()) :: kind() | :none
+  # The fallbacks below are existing policy and stay. Absent metadata is a legacy
+  # home and needs no note; metadata that exists but cannot be used is logged with
+  # its cause, so the fallback is not mistaken for what the file said.
   def kind_at(base_dir, machine, provider) do
-    case File.read(metadata_path(base_dir, machine, provider)) do
+    path = metadata_path(base_dir, machine, provider)
+
+    case File.read(path) do
       {:ok, bytes} ->
         case JSON.decode(bytes) do
           {:ok, metadata} when is_map(metadata) ->
@@ -97,14 +102,39 @@ defmodule Tightbeam.Credentials do
               do: decode_kind(metadata["kind"]),
               else: :none
 
-          _ ->
-            :none
+          {:ok, _other} ->
+            kind_fallback(provider, path, :none, "is not a JSON object")
+
+          {:error, error} ->
+            kind_fallback(provider, path, :none, "is not valid JSON: #{json_error_text(error)}")
         end
 
-      {:error, _reason} ->
+      {:error, :enoent} ->
         if credential_present_at?(base_dir, machine, provider), do: :subscription, else: :none
+
+      {:error, reason} ->
+        fallback =
+          if credential_present_at?(base_dir, machine, provider), do: :subscription, else: :none
+
+        kind_fallback(
+          provider,
+          path,
+          fallback,
+          "could not be read: #{:file.format_error(reason)}"
+        )
     end
   end
+
+  defp kind_fallback(provider, path, fallback, cause) do
+    Logger.warning("credential kind for #{provider} fell back to #{fallback}: #{path} #{cause}")
+    fallback
+  end
+
+  defp json_error_text({:invalid_byte, offset, _byte}), do: "invalid byte at offset #{offset}"
+  defp json_error_text({:unexpected_end, offset}), do: "unexpected end at offset #{offset}"
+
+  defp json_error_text({:unexpected_sequence, offset, _bytes}),
+    do: "unexpected sequence at offset #{offset}"
 
   @doc "Run the provider flow through the serialized gate/stop/write/start/resume lifecycle."
   @spec onboard(provider(), GenServer.server()) :: :ok | {:error, term()}
@@ -282,8 +312,8 @@ defmodule Tightbeam.Credentials do
       {:ok, _other} ->
         "the Pi auth.json has no opencode-go API-key record"
 
-      {:error, _reason} ->
-        "the Pi auth.json is not valid JSON"
+      {:error, error} ->
+        "the Pi auth.json is not valid JSON: #{json_error_text(error)}"
     end
   end
 
@@ -1217,7 +1247,20 @@ defmodule Tightbeam.Credentials do
   defp start_for_finish(state, provider, kind) do
     state.start.(provider, kind)
   rescue
-    error -> {:error, {:credential_start_failed, {:exception, Exception.message(error)}}}
+    # The refusal is persisted and returned, so it keeps the exception type and
+    # a redacted message; the stack goes only to the log.
+    error ->
+      diagnostic =
+        ErrorDiagnostic.exception(error, __STACKTRACE__,
+          operation: "credential_start",
+          provider: Atom.to_string(provider)
+        )
+
+      Logger.warning("credential start raised: #{JSON.encode!(diagnostic)}")
+
+      {:error,
+       {:credential_start_failed,
+        {:exception, error.__struct__, ErrorDiagnostic.redact_text(Exception.message(error))}}}
   catch
     caught_kind, reason -> {:error, {:credential_start_failed, {caught_kind, reason}}}
   end
