@@ -14,7 +14,7 @@ defmodule Tightbeam.NoticeBatcherTest do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 1)
   end
 
-  test "acceptance 3: urgent classes bypass while agent-authored fyi joins the selected lane", %{
+  test "acceptance 3: urgent classes and agent-authored fyi keep their pre-V2 paths", %{
     tmp_dir: tmp
   } do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 2)
@@ -134,6 +134,12 @@ defmodule Tightbeam.NoticeBatcherTest do
 
   test "the delivery envelope preserves trailing source payload bytes", %{tmp_dir: tmp} do
     Tightbeam.NoticeBatcherFixture.run!(tmp, 25)
+  end
+
+  test "V2 public authenticated --user, session and role lanes isolate information recipients", %{
+    tmp_dir: tmp
+  } do
+    Tightbeam.NoticeBatcherFixture.run!(tmp, 26)
   end
 
   @tag notice_guarded_restart: true

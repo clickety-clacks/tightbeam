@@ -5612,6 +5612,7 @@ defmodule Tightbeam.Gateway do
       Wakes.schedule_in_txn(txn, %{
         session_key: session_key,
         target_role: Map.get(call, :target_role),
+        target_user_id: Map.get(call, :target_user_id),
         origin: call.origin,
         prompt: p.prompt,
         due_at: due_at,

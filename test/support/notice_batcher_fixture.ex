@@ -87,10 +87,9 @@ defmodule Tightbeam.NoticeBatcherFixture do
     end
 
     agent_fyi = ordinary(db, "fyi", "pre-v2 agent message")
-    assert [%{batch_id: agent_batch}] = NoticeBatcher.source_refs(db, agent_fyi.wake_id)
-    assert agent_batch == batch_id(db, routine)
+    assert NoticeBatcher.source_refs(db, agent_fyi.wake_id) == []
 
-    assert NoticeBatcher.batch(db, batch_id(db, routine)).member_count == 2
+    assert NoticeBatcher.batch(db, batch_id(db, routine)).member_count == 1
   end
 
   defp scenario(3, db) do
@@ -564,6 +563,122 @@ defmodule Tightbeam.NoticeBatcherFixture do
     assert envelope =~ rendered_member_header(source.wake_id) <> payload <> "\n\n"
   end
 
+  defp scenario(26, db) do
+    {:ok, _} = Application.ensure_all_started(:plug)
+    seed_session(db, "agent:sender-session", "owner")
+    seed_session(db, "agent:other-session", "other")
+    Roles.create!(db, "sender", "owner", "agent:sender-session")
+    owner_session = Org.personal_session_key("owner")
+    Roles.create!(db, "recipient", "owner", owner_session)
+    set_lane_policy(db, [session: owner_session, target_user_id: "owner"], true)
+    set_lane_policy(db, [session: owner_session], true)
+    set_lane_policy(db, [session: owner_session, target_role: "recipient"], true)
+
+    sender = Org.get(db, "agent:sender-session")
+    scheduler = start_scheduler(db, fn _wake -> true end)
+
+    router =
+      Tightbeam.Wire.Router.init(
+        db: db,
+        cli_token: "tbc_test",
+        handlers: Gateway.handlers(%{db: db, wake_scheduler: scheduler}),
+        session_status: fn _ -> nil end
+      )
+
+    user = public_information(router, sender, "userId", "owner")
+    session = public_information(router, sender, "sessionKey", owner_session)
+    role = public_information(router, sender, "role", "recipient")
+
+    assert Enum.map([user, session, role], &Wakes.get(db, &1).session_key) ==
+             [owner_session, owner_session, owner_session]
+
+    for wake_id <- [user, session, role] do
+      source = Wakes.get(db, wake_id)
+      assert source.class == "information"
+      assert source.class_election == "sender"
+      assert source.creator_session_key == sender.session_key
+      assert source.origin == "agent:sender"
+      assert [%{batch_id: _}] = NoticeBatcher.source_refs(db, wake_id)
+    end
+
+    addresses =
+      for wake_id <- [user, session, role] do
+        {:ok, [[address, 1]]} =
+          DB.query(
+            db,
+            "SELECT recipientAddress, enabled FROM notice_delivery_policies WHERE sourceWakeId=?1",
+            [wake_id]
+          )
+
+        address
+      end
+
+    assert addresses == ["user:owner", "session:" <> owner_session, "role:recipient"]
+    batch_ids = Enum.map([user, session, role], &batch_id(db, Wakes.get(db, &1)))
+    assert length(Enum.uniq(batch_ids)) == 3
+
+    for {wake_id, batch_id} <- Enum.zip([user, session, role], batch_ids) do
+      assert [%{source_wake_id: ^wake_id, class: "information"}] =
+               NoticeBatcher.members(db, batch_id)
+
+      assert NoticeBatcher.read_batch(db, batch_id, {:user, "other"}) == nil
+    end
+
+    # The same public --user path is default-off for another intended recipient.
+    off = public_information(router, sender, "userId", "other")
+    assert NoticeBatcher.source_refs(db, off) == []
+
+    set_lane_policy(
+      db,
+      [session: Org.personal_session_key("other"), target_user_id: "other"],
+      true
+    )
+
+    other = public_information(router, sender, "userId", "other")
+    other_batch = batch_id(db, Wakes.get(db, other))
+    refute other_batch in batch_ids
+    assert [%{source_wake_id: ^other}] = NoticeBatcher.members(db, other_batch)
+    assert NoticeBatcher.read_batch(db, other_batch, {:user, "owner"}) == nil
+    assert NoticeBatcher.read_batch(db, other_batch, {:user, "other"}).member_count == 1
+
+    deadlines = Enum.map([user, session, role, other], &Wakes.get(db, &1).due_at)
+    _carriers = Wakes.materialize_digests(db, Enum.max(deadlines))
+    user_carrier_id = NoticeBatcher.batch(db, hd(batch_ids)).delivery_wake_id
+    user_carrier = Wakes.get(db, user_carrier_id)
+    assert user_carrier.session_key == owner_session
+    assert user_carrier.prompt =~ "class=information"
+    assert user_carrier.prompt =~ user
+    refute user_carrier.prompt =~ session
+    refute user_carrier.prompt =~ role
+    refute user_carrier.prompt =~ other
+
+    {:ok, _} = DB.query(db, "UPDATE wakes SET dueAt=0 WHERE wakeId=?1", [user_carrier_id])
+    assert :ok = Wakes.fire_due(scheduler)
+    assert Wakes.get(db, user_carrier_id).state == "fired"
+  end
+
+  defp public_information(router, sender, field, value) do
+    body = %{
+      "verb" => "wake",
+      "as" => "sender",
+      field => value,
+      "params" => %{"prompt" => "typed recipient report", "class" => "information"}
+    }
+
+    response =
+      Plug.Test.conn(:post, "/agent/dispatch", JSON.encode!(body))
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{sender.cli_token}")
+      |> Plug.Conn.put_req_header(
+        "x-tightbeam-cli-version",
+        Tightbeam.CliCompatibility.required_version()
+      )
+      |> Tightbeam.Wire.Router.call(router)
+
+    assert response.status == 200, response.resp_body
+    %{"result" => %{"wakeId" => wake_id}} = JSON.decode!(response.resp_body)
+    wake_id
+  end
+
   defp eligible(db, opts \\ []) do
     set_lane_policy(db, opts, true)
     fyi(db, opts)
@@ -596,7 +711,8 @@ defmodule Tightbeam.NoticeBatcherFixture do
   defp set_lane_policy(db, opts, enabled) do
     lane = %{
       session_key: Keyword.get(opts, :session, "agent:recipient"),
-      target_role: Keyword.get(opts, :target_role)
+      target_role: Keyword.get(opts, :target_role),
+      target_user_id: Keyword.get(opts, :target_user_id)
     }
 
     seq = System.unique_integer([:positive, :monotonic])

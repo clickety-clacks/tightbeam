@@ -207,6 +207,12 @@ defmodule Tightbeam.Wire.Router do
       }
 
       call =
+        case Map.get(target_meta, :user_id) do
+          user_id when is_binary(user_id) -> Map.put(call, :target_user_id, user_id)
+          _ -> call
+        end
+
+      call =
         case {verb, principal} do
           {"artifact-content-fetch", {kind, _}} when kind in [:user, :session] ->
             Map.put(call, :rest_principal, state_principal_view(principal, conn))
@@ -1597,7 +1603,9 @@ defmodule Tightbeam.Wire.Router do
 
       given == ["userId"] ->
         if Devices.user(db(conn), body["userId"]),
-          do: {:ok, Org.personal_session_key(body["userId"]), %{role: nil, fallback: false}},
+          do:
+            {:ok, Org.personal_session_key(body["userId"]),
+             %{role: nil, fallback: false, user_id: body["userId"]}},
           else: {:error, 404, "not_found", "unknown userId: #{body["userId"]}"}
 
       given == ["role"] ->

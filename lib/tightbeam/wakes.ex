@@ -1231,6 +1231,17 @@ defmodule Tightbeam.Wakes do
       recognition_transition: Map.get(input, :recognition_transition)
     }
 
+    # Only typed user targets carry this transient address. Existing wake result
+    # maps retain their shape, while the durable policy row records user:<id>.
+    wake =
+      case Map.get(input, :target_user_id) do
+        user_id when is_binary(user_id) and user_id != "" ->
+          Map.put(wake, :target_user_id, user_id)
+
+        _ ->
+          wake
+      end
+
     Txn.q(
       txn,
       """
@@ -1310,7 +1321,7 @@ defmodule Tightbeam.Wakes do
 
     file_policy_skew(txn, wake)
 
-    if v1_batch_source?(wake) do
+    if batch_source?(wake) do
       policy_ref = NoticeBatcher.record_policy_in_txn(txn, wake, enabled: true)
 
       case NoticeBatcher.enqueue_or_recover_in_txn(txn, wake.wake_id, policy_ref) do
@@ -2890,7 +2901,7 @@ defmodule Tightbeam.Wakes do
       policy.immediacy == :digest and batcher_inhibited?(input, condition_kind) ->
         {@inhibited_rule, Map.fetch!(input, :due_at)}
 
-      policy.immediacy == :digest and not v1_batch_eligible?(input, class, condition_kind) ->
+      policy.immediacy == :digest and not batch_eligible?(input, class, condition_kind) ->
         {@legacy_digest_rule, created_at + policy.ceiling_ms}
 
       policy.immediacy == :digest and not NoticeBatcher.lane_enabled_in_txn(txn, input) ->
@@ -2925,14 +2936,42 @@ defmodule Tightbeam.Wakes do
     origin = Map.fetch!(input, :origin)
 
     class == "fyi" and not String.starts_with?(origin, "user:") and
+      not agent_message?(input) and
       not Map.get(input, :digest, false) and not Map.get(input, :sender_scheduled, false) and
       not is_binary(condition_kind) and Map.get(input, :consumer, "prompt") == "prompt"
   end
 
+  defp v2_batch_eligible?(input, class, condition_kind) do
+    class == "information" and agent_message?(input) and
+      not Map.get(input, :digest, false) and not Map.get(input, :sender_scheduled, false) and
+      not is_binary(condition_kind) and Map.get(input, :consumer, "prompt") == "prompt"
+  end
+
+  defp batch_eligible?(input, class, condition_kind),
+    do:
+      v1_batch_eligible?(input, class, condition_kind) or
+        v2_batch_eligible?(input, class, condition_kind)
+
+  defp batch_source?(wake), do: v1_batch_source?(wake) or v2_batch_source?(wake)
+
   defp v1_batch_source?(wake) do
     wake.class == "fyi" and wake.delivery_rule == @digest_rule and not wake.digest and
-      not String.starts_with?(wake.origin, "user:")
+      not String.starts_with?(wake.origin, "user:") and not agent_message?(wake)
   end
+
+  defp v2_batch_source?(wake) do
+    wake.class == "information" and wake.class_election == "sender" and
+      wake.delivery_rule == @digest_rule and not wake.digest and agent_message?(wake)
+  end
+
+  defp agent_message?(message) do
+    Tightbeam.Origin.class(Map.get(message, :origin)) == "agent" and
+      agent_session?(Map.get(message, :creator_session_key)) and
+      agent_session?(Map.get(message, :session_key))
+  end
+
+  defp agent_session?("agent:" <> principal) when principal != "", do: true
+  defp agent_session?(_principal), do: false
 
   # FAIL QUIET AND VISIBLE (§5 policy-skew rule). An extended class this build
   # has no mapping for is delivered as `fyi` — never dropped, never promoted —
